@@ -139,13 +139,15 @@ pub fn execute_external_tool_with_policy_or_cancel(
 
     if let Some(mut stdin) = child.stdin.take() {
         if let Err(error) = stdin.write_all(args.as_bytes()) {
-            return ToolResult::failed(
+            process::kill_child_tree(&mut child);
+            let exit_code = child.wait().ok().and_then(|status| status.code());
+            return ToolResult::failed_after_start(
                 request,
                 format!(
                     "external tool '{}' failed to receive input: {error}",
                     config.name
                 ),
-                None,
+                exit_code,
             );
         }
     }
@@ -326,6 +328,49 @@ mod tests {
                 .contains("external tool 'slow_tool' cancelled"),
             "unexpected error: {:?}",
             result.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_tool_stdin_failure_reaps_started_process_before_returning() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("continued-after-stdin-failure");
+        let config = ExternalToolConfig {
+            name: "closed_stdin_tool".to_string(),
+            description: "closes stdin before arguments arrive".to_string(),
+            action_kind: ActionKind::Shell,
+            command: format!("exec 0<&-; sleep 0.4; printf survived > {marker:?}"),
+            schema: serde_json::json!({}),
+        };
+        let request = ToolRequest {
+            id: "external-stdin-failure".to_string(),
+            name: ToolName::External("closed_stdin_tool".to_string()),
+            action: ActionKind::Shell,
+            target: None,
+            raw_arguments: Some("x".repeat(128 * 1024)),
+        };
+
+        let result = execute_external_tool_with_policy(
+            &config,
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed to receive input")),
+            "unexpected result: {result:?}"
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !marker.exists(),
+            "external tool continued running after Orca recorded its terminal result"
         );
     }
 }
