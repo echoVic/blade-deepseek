@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -11,6 +11,9 @@ use std::os::unix::process::CommandExt;
 use serde_json::{Value, json};
 
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
+
+const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
+const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpElicitationMode {
@@ -97,8 +100,20 @@ struct StdioTransport {
 struct StdioState {
     child: StdioChild,
     stdin: ChildStdin,
-    responses: mpsc::Receiver<Result<Value, String>>,
+    responses: Option<mpsc::Receiver<Result<Value, String>>>,
     next_id: u64,
+}
+
+impl StdioState {
+    fn terminate(&mut self) {
+        self.responses.take();
+        self.child.terminate();
+    }
+
+    fn terminal_error<T>(&mut self, error: String) -> Result<T, String> {
+        self.terminate();
+        Err(error)
+    }
 }
 
 struct StdioChild {
@@ -162,7 +177,7 @@ impl StdioTransport {
             .stdout
             .take()
             .ok_or_else(|| format!("failed to open stdout for MCP server '{}'", config.name))?;
-        let (response_tx, responses) = mpsc::channel();
+        let (response_tx, responses) = mpsc::sync_channel(STDIO_RESPONSE_QUEUE_CAPACITY);
         std::thread::spawn(move || {
             let mut stdout = BufReader::new(stdout);
             loop {
@@ -185,7 +200,7 @@ impl StdioTransport {
             state: Mutex::new(StdioState {
                 child,
                 stdin,
-                responses,
+                responses: Some(responses),
                 next_id: 1,
             }),
             startup_timeout: timeout_from_ms(config.startup_timeout_ms),
@@ -314,23 +329,23 @@ impl StdioTransport {
             "method": method,
             "params": params
         });
-        write_json_line(&mut state.stdin, &message)?;
+        if let Err(error) = write_json_line(&mut state.stdin, &message) {
+            return state.terminal_error(error);
+        }
 
         let deadline = std::time::Instant::now() + timeout;
         let mut iterations = 0u32;
         loop {
             if should_cancel.is_some_and(|should_cancel| should_cancel()) {
-                state.child.terminate();
-                return Err("MCP tool call cancelled".to_string());
+                return state.terminal_error("MCP tool call cancelled".to_string());
             }
             if iterations >= 1000 {
-                return Err(format!(
+                return state.terminal_error(format!(
                     "MCP request '{method}' exceeded max notification count"
                 ));
             }
             if std::time::Instant::now() >= deadline {
-                state.child.terminate();
-                return Err(format!(
+                return state.terminal_error(format!(
                     "MCP request '{method}' timed out after {}",
                     format_duration(timeout)
                 ));
@@ -340,31 +355,39 @@ impl StdioTransport {
                 Some(_) => remaining.min(Duration::from_millis(25)),
                 None => remaining,
             };
-            let response = match state.responses.recv_timeout(wait) {
+            let received = match state.responses.as_ref() {
+                Some(responses) => responses.recv_timeout(wait),
+                None => {
+                    return state.terminal_error("MCP stdio reader is unavailable".to_string());
+                }
+            };
+            let response = match received {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => return state.terminal_error(error),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if should_cancel.is_some() {
                         continue;
                     }
-                    state.child.terminate();
-                    return Err(format!(
+                    return state.terminal_error(format!(
                         "MCP request '{method}' timed out after {}",
                         format_duration(timeout)
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("MCP stdio reader stopped before returning".to_string());
+                    return state
+                        .terminal_error("MCP stdio reader stopped before returning".to_string());
                 }
             };
             iterations += 1;
             if is_elicitation_create_request(&response) {
-                handle_elicitation_create_request(
+                if let Err(error) = handle_elicitation_create_request(
                     &self.server_name,
                     &mut state.stdin,
                     &response,
                     elicitation_handler,
-                )?;
+                ) {
+                    return state.terminal_error(error);
+                }
                 continue;
             }
             if response.get("id").and_then(Value::as_u64) != Some(id) {
@@ -373,10 +396,10 @@ impl StdioTransport {
             if let Some(error) = response.get("error") {
                 return Err(format!("MCP request '{method}' failed: {error}"));
             }
-            return response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| format!("MCP request '{method}' missing result"));
+            return match response.get("result").cloned() {
+                Some(result) => Ok(result),
+                None => state.terminal_error(format!("MCP request '{method}' missing result")),
+            };
         }
     }
 
@@ -385,14 +408,17 @@ impl StdioTransport {
             .state
             .lock()
             .map_err(|_| "MCP stdio transport lock poisoned".to_string())?;
-        write_json_line(
+        if let Err(error) = write_json_line(
             &mut state.stdin,
             &json!({
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params
             }),
-        )
+        ) {
+            return state.terminal_error(error);
+        }
+        Ok(())
     }
 }
 
@@ -522,15 +548,43 @@ fn write_json_line(stdin: &mut ChildStdin, message: &Value) -> Result<(), String
         .map_err(|error| format!("failed to write MCP request: {error}"))
 }
 
-fn read_json_line(stdout: &mut BufReader<ChildStdout>) -> Result<Value, String> {
-    let mut line = String::new();
-    let read = stdout
-        .read_line(&mut line)
-        .map_err(|error| format!("failed to read MCP response: {error}"))?;
-    if read == 0 {
-        return Err("MCP server closed stdout".to_string());
+fn read_json_line<R: BufRead>(stdout: &mut R) -> Result<Value, String> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = stdout
+            .fill_buf()
+            .map_err(|error| format!("failed to read MCP response: {error}"))?;
+        if buffer.is_empty() {
+            if line.is_empty() {
+                return Err("MCP server closed stdout".to_string());
+            }
+            break;
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let data_len = newline.unwrap_or(buffer.len());
+        if data_len > MAX_STDIO_RESPONSE_LINE_BYTES.saturating_sub(line.len()) {
+            return Err(format!(
+                "MCP response exceeded maximum line size of {MAX_STDIO_RESPONSE_LINE_BYTES} bytes"
+            ));
+        }
+        line.extend_from_slice(&buffer[..data_len]);
+        stdout.consume(data_len + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
     }
-    serde_json::from_str(line.trim()).map_err(|error| format!("invalid MCP response JSON: {error}"))
+
+    let start = line
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    serde_json::from_slice(&line[start..end])
+        .map_err(|error| format!("invalid MCP response JSON: {error}"))
 }
 
 struct SseTransport {
@@ -797,6 +851,399 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const STDIO_TEST_STARTUP_TIMEOUT_MS: u64 = 15_000;
+
+    #[test]
+    fn stdio_json_line_limit_is_enforced_across_small_read_buffers() {
+        let mut at_limit = vec![b' '; MAX_STDIO_RESPONSE_LINE_BYTES - 2];
+        at_limit.extend_from_slice(b"{}\n");
+        let mut reader = BufReader::with_capacity(7, std::io::Cursor::new(at_limit));
+        assert_eq!(
+            read_json_line(&mut reader).expect("JSON response at byte limit"),
+            json!({})
+        );
+
+        let mut over_limit = vec![b' '; MAX_STDIO_RESPONSE_LINE_BYTES - 1];
+        over_limit.extend_from_slice(b"{}\n");
+        let mut reader = BufReader::with_capacity(7, std::io::Cursor::new(over_limit));
+        assert!(
+            read_json_line(&mut reader)
+                .unwrap_err()
+                .contains("MCP response exceeded maximum line size")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_reader_backpressures_unsolicited_response_floods() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("flooding_mcp_server.sh");
+        let flood = temp_dir.path().join("responses.jsonl");
+        let completed = temp_dir.path().join("flood-completed");
+        let response = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"message\":\"{}\"}}}}\n",
+            "x".repeat(1024)
+        );
+        fs::write(&flood, response.repeat(2048)).expect("write MCP response flood");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"flood","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      cat "$1"
+      : > "$2"
+      sleep 5
+      ;;
+  esac
+done
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "flood",
+            &server,
+            vec![
+                flood.to_string_lossy().into_owned(),
+                completed.to_string_lossy().into_owned(),
+            ],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+
+        transport.initialize().expect("initialize MCP");
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert!(
+            !completed.exists(),
+            "MCP reader drained an unsolicited flood into memory instead of applying backpressure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_oversized_json_line_is_rejected_and_reaps_descendants() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("oversized_mcp_server.sh");
+        let response_file = temp_dir.path().join("oversized-response.jsonl");
+        let survivor_marker = temp_dir.path().join("oversized-survivor");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "payload": "x".repeat(MAX_STDIO_RESPONSE_LINE_BYTES) }
+        });
+        fs::write(
+            &response_file,
+            format!(
+                "{}\n",
+                serde_json::to_string(&response).expect("serialize response")
+            ),
+        )
+        .expect("write oversized response");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+IFS= read -r line
+(sleep 0.4; : > "$2") &
+cat "$1"
+wait
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "oversized",
+            &server,
+            vec![
+                response_file.to_string_lossy().into_owned(),
+                survivor_marker.to_string_lossy().into_owned(),
+            ],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("oversized response must fail");
+
+        assert!(
+            error.contains("MCP response exceeded maximum line size"),
+            "unexpected oversized response error: {error}"
+        );
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_reader_eof_reaps_descendant_processes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("closed_stdout_mcp_server.sh");
+        let survivor_marker = temp_dir.path().join("reader-eof-survivor");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+IFS= read -r line
+(sleep 0.4; : > "$1") >/dev/null 2>&1 &
+exec 1>&-
+wait
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "closed-stdout",
+            &server,
+            vec![survivor_marker.to_string_lossy().into_owned()],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("closed MCP stdout must fail");
+
+        assert_eq!(error, "MCP server closed stdout");
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_notification_limit_reaps_descendant_processes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("notification_flood_mcp_server.sh");
+        let flood = temp_dir.path().join("notifications.jsonl");
+        let survivor_marker = temp_dir.path().join("notification-survivor");
+        fs::write(
+            &flood,
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}
+"#
+            .repeat(1000),
+        )
+        .expect("write notification flood");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+IFS= read -r line
+(sleep 0.4; : > "$2") &
+cat "$1"
+wait
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "notification-flood",
+            &server,
+            vec![
+                flood.to_string_lossy().into_owned(),
+                survivor_marker.to_string_lossy().into_owned(),
+            ],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("notification flood must fail");
+
+        assert!(
+            error.contains("exceeded max notification count"),
+            "unexpected notification flood error: {error}"
+        );
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_malformed_elicitation_reaps_descendant_processes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("malformed_elicitation_mcp_server.sh");
+        let survivor_marker = temp_dir.path().join("elicitation-survivor");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+IFS= read -r line
+(sleep 0.4; : > "$1") &
+printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create"}\n'
+wait
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "malformed-elicitation",
+            &server,
+            vec![survivor_marker.to_string_lossy().into_owned()],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+
+        let error = transport
+            .initialize()
+            .expect_err("malformed elicitation must fail");
+
+        assert!(
+            error.contains("missing params"),
+            "unexpected malformed elicitation error: {error}"
+        );
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_elicitation_write_failure_reaps_descendant_processes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir
+            .path()
+            .join("closed_elicitation_stdin_mcp_server.sh");
+        let survivor_marker = temp_dir.path().join("elicitation-write-survivor");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"elicitation-write","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"authorize","description":"authorizes","inputSchema":{"type":"object"}}]}}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      exec 0<&-
+      (sleep 0.4; : > "$1") &
+      printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create","params":{"message":"Authorize"}}\n'
+      wait
+      ;;
+  esac
+done
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "elicitation-write",
+            &server,
+            vec![survivor_marker.to_string_lossy().into_owned()],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+        transport.initialize().expect("initialize MCP");
+        transport.list_tools().expect("list tools");
+
+        let error = transport
+            .call_tool("authorize", json!({}))
+            .expect_err("closed MCP stdin must reject elicitation response");
+
+        assert!(
+            error.contains("failed to write MCP request"),
+            "unexpected elicitation write failure: {error}"
+        );
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_request_write_failure_reaps_descendant_processes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("closed_stdin_mcp_server.sh");
+        let survivor_marker = temp_dir.path().join("write-survivor");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+exec 0<&-
+(sleep 0.4; : > "$1") &
+wait
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "closed-stdin",
+            &server,
+            vec![survivor_marker.to_string_lossy().into_owned()],
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let error = transport
+            .initialize()
+            .expect_err("closed MCP stdin must fail");
+
+        assert!(
+            error.contains("failed to write MCP request"),
+            "unexpected write failure: {error}"
+        );
+        assert_descendant_did_not_survive(&survivor_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_json_rpc_error_preserves_connection_for_later_requests() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("recoverable_rpc_error_mcp_server.sh");
+        write_executable_stdio_fixture(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"recoverable","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"tools unavailable"}}\n'
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"resources":[]}}\n'
+      ;;
+  esac
+done
+"#,
+        );
+        let transport = StdioTransport::start(&stdio_test_config(
+            "recoverable",
+            &server,
+            Vec::new(),
+            5_000,
+        ))
+        .expect("connect stdio MCP");
+        transport.initialize().expect("initialize MCP");
+
+        let error = transport.list_tools().expect_err("tools/list RPC error");
+
+        assert!(error.contains("tools unavailable"));
+        assert_eq!(
+            transport
+                .list_resources()
+                .expect("connection remains usable after JSON-RPC error"),
+            json!({ "resources": [] })
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_executable_stdio_fixture(path: &std::path::Path, contents: &str) {
+        fs::write(path, contents).expect("write MCP fixture");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod MCP fixture");
+    }
+
+    #[cfg(unix)]
+    fn stdio_test_config(
+        name: &str,
+        server: &std::path::Path,
+        args: Vec<String>,
+        timeout_ms: u64,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransportKind::Stdio,
+            command: Some("/bin/sh".to_string()),
+            args: std::iter::once(server.to_string_lossy().into_owned())
+                .chain(args)
+                .collect(),
+            url: None,
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(timeout_ms),
+            tool_timeout_ms: Some(timeout_ms),
+        }
+    }
 
     #[cfg(unix)]
     #[test]
