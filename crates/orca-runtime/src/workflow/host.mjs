@@ -39,6 +39,7 @@ const taskListState = loadTaskListState();
 let taskSeq = taskListState.nextTaskSeq;
 const taskLists = new Map(Object.entries(taskListState.lists));
 let stdinClosed = false;
+let workflowTerminal = false;
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -47,11 +48,15 @@ process.stdin.on("data", (chunk) => {
 });
 process.stdin.on("end", () => {
   stdinClosed = true;
+  if (workflowTerminal) {
+    pendingAgentResolvers.clear();
+    return;
+  }
   flushStdinResolvers();
 });
 
 function emit(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  writeFileSync(1, `${JSON.stringify(value)}\n`);
 }
 
 async function agent(prompt, opts = {}) {
@@ -981,8 +986,10 @@ try {
       ? await runWorkflowPhases(phaseDefinitions)
       : null;
   completeActiveMarkerPhase();
+  workflowTerminal = true;
   emit({ type: "workflow_completed", result: result ?? null });
 } catch (error) {
+  workflowTerminal = true;
   emit({ type: "workflow_failed", error: error?.stack ?? String(error) });
   process.exitCode = 1;
 }

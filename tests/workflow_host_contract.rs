@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -837,6 +839,90 @@ fn host_returns_workflow_failed_event_for_script_exceptions() {
             HostEvent::WorkflowFailed { error } if error.contains("boom from script")
         )
     }));
+}
+
+#[test]
+fn host_rejects_oversized_event_frames() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'oversized-frame', description: 'Oversized frame', phases: [] };\nexport default 'x'.repeat(1024 * 1024 + 1);",
+    )
+    .unwrap();
+
+    let result = WorkflowHost::run_collecting_events(&script, serde_json::json!(null));
+    let Err(error) = result else {
+        panic!("oversized workflow host frame should fail closed");
+    };
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("frame"));
+}
+
+#[test]
+fn host_rejects_event_floods() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'event-flood', description: 'Event flood', phases: [] };\nfor (let index = 0; index < 8200; index += 1) { phase(`phase-${index}`); }\nexport default 'done';",
+    )
+    .unwrap();
+
+    let result = WorkflowHost::run_collecting_events(&script, serde_json::json!(null));
+    let Err(error) = result else {
+        panic!("workflow host event flood should fail closed");
+    };
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("event"));
+}
+
+#[test]
+fn host_bounds_default_agent_call_worker_concurrency() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'bounded-workers', description: 'Bounded workers', phases: [] };\nconst calls = Array.from({ length: 32 }, (_, index) => agent(`agent-${index}`));\nexport default await parallel(calls);",
+    )
+    .unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+
+    WorkflowHost::run_collecting_events_with_agent(&script, serde_json::json!(null), {
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        move |call| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(25));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(orca_runtime::workflow::host::HostCommand::AgentResult {
+                call_id: call.call_id,
+                result: serde_json::json!(null),
+            })
+        }
+    })
+    .unwrap();
+
+    assert!(
+        max_active.load(Ordering::SeqCst) <= 16,
+        "default host worker count must bound callback concurrency"
+    );
 }
 
 #[test]

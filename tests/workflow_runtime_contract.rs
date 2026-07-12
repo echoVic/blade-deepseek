@@ -1964,6 +1964,182 @@ fn workflow_runner_stops_when_control_file_is_requested() {
 }
 
 #[test]
+fn workflow_runner_stops_silent_host_when_control_file_is_requested() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'silent-stop', description: 'Silent stop test', phases: [] };\nwhile (true) {}\nexport default 'unreachable';",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-silent-stop".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launch = runner
+        .launch_background(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+    let run_id = launch.output.run_id.as_deref().unwrap().to_string();
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+
+    thread::sleep(Duration::from_millis(150));
+    let started = Instant::now();
+    store.request_stop(&run_id).expect("request silent stop");
+    let result = launch.join().unwrap().unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(result.output.status, "stopped");
+    assert_eq!(
+        tasks.get(&result.task_id).expect("task record").status,
+        TaskStatus::Stopped
+    );
+    assert_eq!(
+        store.load_run(&run_id).expect("run state").status,
+        WorkflowRunStatus::Stopped
+    );
+}
+
+#[test]
+fn workflow_runner_stops_during_agent_min_hold() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'held-stop', description: 'Held stop test', phases: [] };\nexport default await agent('held', { minHoldMs: 30000 });",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-held-stop".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launch = runner
+        .launch_background(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+    let run_id = launch.output.run_id.as_deref().unwrap().to_string();
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if tasks.get(&launch.task_id).is_some_and(|task| {
+            task.workflow_agents
+                .iter()
+                .any(|agent| agent.status == WorkflowAgentStatus::Running)
+        }) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let started = Instant::now();
+    store.request_stop(&run_id).expect("request held stop");
+    let result = launch.join().unwrap().unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(result.output.status, "stopped");
+}
+
+#[test]
+fn workflow_runner_task_stop_interrupts_paused_agent() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'paused-stop', description: 'Paused stop test', phases: [] };\nexport default await agent('paused');",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-paused-stop".to_string());
+    let session_dir = temp.path().join("session");
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
+    let launch = runner
+        .launch_background(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+    let task_id = launch.task_id.clone();
+    let run_id = launch.output.run_id.as_deref().unwrap().to_string();
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    store.request_pause(&run_id).expect("request pause");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if store
+            .load_run(&run_id)
+            .is_ok_and(|state| state.status == WorkflowRunStatus::Paused)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        store.load_run(&run_id).expect("paused state").status,
+        WorkflowRunStatus::Paused
+    );
+
+    let started = Instant::now();
+    tasks.request_stop(&task_id).expect("request task stop");
+    let result = launch.join().unwrap().unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(result.output.status, "stopped");
+}
+
+#[test]
+fn workflow_runner_cancels_unawaited_agent_after_terminal_event() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'terminal-agent', description: 'Terminal agent test', phases: [] };\nagent('unawaited', { minHoldMs: 30000 });\nexport default 'done';",
+    )
+    .unwrap();
+
+    let config = mock_run_config(temp.path());
+    let tasks = TaskRegistry::new("session-terminal-agent".to_string());
+    let runner = WorkflowRunner::new(config, tasks.clone(), temp.path().join("session"));
+    let started = Instant::now();
+    let result = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .expect("terminal event should cancel unawaited work");
+
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(result.output.status, "completed");
+    assert_eq!(result.summary, "done");
+    assert_eq!(
+        tasks
+            .get(&result.task_id)
+            .expect("terminal workflow task")
+            .workflow_agents[0]
+            .status,
+        WorkflowAgentStatus::Cancelled
+    );
+}
+
+#[test]
 fn workflow_runner_pauses_and_resumes_from_control_file() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;

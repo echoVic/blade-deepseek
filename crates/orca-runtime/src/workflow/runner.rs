@@ -155,6 +155,7 @@ struct WorkflowChildAgentCallError {
     message: String,
     usage: Option<UsageTotals>,
     retryable: bool,
+    cancelled: bool,
     tool_events: Vec<WorkflowEvidenceToolEvent>,
     task: Option<WorkflowTaskLifecycleEvidence>,
 }
@@ -173,6 +174,7 @@ impl From<io::Error> for WorkflowChildAgentCallError {
             message: error.to_string(),
             usage: None,
             retryable: true,
+            cancelled: false,
             tool_events: Vec::new(),
             task: None,
         }
@@ -227,6 +229,7 @@ impl WorkflowExecutionGate {
         max_agents_per_run: u32,
         max_concurrent_agents: usize,
     ) -> io::Result<WorkflowAgentPermit> {
+        let max_concurrent_agents = max_concurrent_agents.max(1);
         let mut counters = self
             .counters
             .lock()
@@ -476,6 +479,7 @@ impl WorkflowRunner {
             ipc_paths.task_lists_path.clone(),
         )?;
         let workflow_limits = self.config.workflows.clone();
+        let workflow_cancel = CancelToken::new();
 
         if self.state.stop_requested(&run_id)? {
             return self.finish_stopped_run(
@@ -491,58 +495,78 @@ impl WorkflowRunner {
 
         let mut phase_agent_baselines = std::collections::HashMap::new();
         let mut agent_events_seen = 0u32;
-        let events =
-            match WorkflowHost::run_collecting_events_with_agent_and_event_callback_with_ipc_paths(
-                &resolved.persisted_path,
-                args,
-                &ipc_paths,
-                |call| {
-                    self.answer_agent_call(
-                        &run_id,
-                        &task_id,
-                        resume_from.as_deref(),
-                        restart_phase.as_deref(),
-                        &transcript_dir,
-                        call,
-                        Arc::clone(&cached_agents),
-                        &gate,
-                        &workflow_ipc,
-                        &workflow_limits,
-                    )
-                },
-                |event| {
-                    apply_host_event_to_state(
-                        event,
-                        &mut state,
-                        &mut phase_agent_baselines,
-                        &mut agent_events_seen,
-                        &mut completed_result,
-                        &mut failed_error,
-                    );
-                    self.state.write_state(&state)?;
-                    self.refresh_task_progress(&task_id, &state)
-                },
-            ) {
-                Ok(events) => events,
-                Err(error) => {
-                    let message = error.to_string();
-                    let counts = self.state.agent_status_counts(&run_id)?;
-                    let counters = gate.snapshot()?;
-                    state.total_agent_count =
-                        counters.total_agents.max(terminal_agent_count(&counts));
-                    state.status = WorkflowRunStatus::Failed;
-                    state.error = Some(message.clone());
-                    self.state.write_state(&state)?;
-                    self.write_evidence_for_state(&state, Some(&counters))?;
-                    self.tasks
-                        .fail(&task_id, message.clone())
-                        .map_err(io::Error::other)?;
-                    let _ = self.state.mark_worker_exited(&run_id);
-                    return Err(error);
+        match WorkflowHost::run_with_agent_event_control_and_ipc_paths(
+            &resolved.persisted_path,
+            args,
+            &ipc_paths,
+            workflow_limits.max_concurrent_agents,
+            |call| {
+                self.answer_agent_call(
+                    &run_id,
+                    &task_id,
+                    resume_from.as_deref(),
+                    restart_phase.as_deref(),
+                    &transcript_dir,
+                    call,
+                    Arc::clone(&cached_agents),
+                    &gate,
+                    &workflow_ipc,
+                    &workflow_limits,
+                    &workflow_cancel,
+                )
+            },
+            |event| {
+                apply_host_event_to_state(
+                    event,
+                    &mut state,
+                    &mut phase_agent_baselines,
+                    &mut agent_events_seen,
+                    &mut completed_result,
+                    &mut failed_error,
+                );
+                self.state.write_state(&state)?;
+                self.refresh_task_progress(&task_id, &state)
+            },
+            || {
+                let stopped =
+                    self.state.stop_requested(&run_id)? || self.tasks.is_cancelled(&task_id);
+                if stopped {
+                    workflow_cancel.cancel();
                 }
-            };
-
-        let _ = events;
+                Ok(stopped)
+            },
+            || workflow_cancel.cancel(),
+        ) {
+            Ok(()) => {}
+            Err(error) => {
+                let message = error.to_string();
+                if error.kind() == io::ErrorKind::Interrupted
+                    && (self.state.stop_requested(&run_id)? || self.tasks.is_cancelled(&task_id))
+                {
+                    return self.finish_stopped_run(
+                        state,
+                        resolved.meta.name,
+                        resolved.persisted_path,
+                        transcript_dir,
+                        task_id,
+                        run_id,
+                        gate.snapshot()?,
+                    );
+                }
+                let counts = self.state.agent_status_counts(&run_id)?;
+                let counters = gate.snapshot()?;
+                state.total_agent_count = counters.total_agents.max(terminal_agent_count(&counts));
+                state.status = WorkflowRunStatus::Failed;
+                state.error = Some(message.clone());
+                self.state.write_state(&state)?;
+                self.write_evidence_for_state(&state, Some(&counters))?;
+                self.tasks
+                    .fail(&task_id, message.clone())
+                    .map_err(io::Error::other)?;
+                let _ = self.state.mark_worker_exited(&run_id);
+                return Err(error);
+            }
+        }
 
         let counts = self.state.agent_status_counts(&run_id)?;
         state.total_agent_count = gate
@@ -645,14 +669,15 @@ impl WorkflowRunner {
         gate: &Arc<WorkflowExecutionGate>,
         workflow_ipc: &WorkflowIpcContext,
         workflow_limits: &orca_core::config::WorkflowConfig,
+        workflow_cancel: &CancelToken,
     ) -> io::Result<HostCommand> {
-        if self.state.stop_requested(run_id)? {
+        if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
             return Ok(HostCommand::AgentError {
                 call_id: call.call_id,
                 error: STOP_REQUESTED_ERROR.to_string(),
             });
         }
-        if self.wait_while_paused(run_id, task_id)? {
+        if self.wait_while_paused(run_id, task_id, workflow_cancel)? {
             return Ok(HostCommand::AgentError {
                 call_id: call.call_id,
                 error: STOP_REQUESTED_ERROR.to_string(),
@@ -743,7 +768,7 @@ impl WorkflowRunner {
         let max_attempts = execution_policy.max_agent_retries.saturating_add(1).max(1);
         let mut previous_errors = Vec::new();
         for attempt in 1..=max_attempts {
-            if self.state.stop_requested(run_id)? {
+            if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
                 return Ok(HostCommand::AgentError {
                     call_id: call.call_id,
                     error: STOP_REQUESTED_ERROR.to_string(),
@@ -761,6 +786,23 @@ impl WorkflowRunner {
                     });
                 }
             };
+            if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
+                self.record_cancelled_agent(
+                    run_id,
+                    task_id,
+                    transcript_dir,
+                    &call,
+                    &hash,
+                    attempt,
+                    max_attempts,
+                    &previous_errors,
+                    now_ms(),
+                )?;
+                return Ok(HostCommand::AgentError {
+                    call_id: call.call_id,
+                    error: STOP_REQUESTED_ERROR.to_string(),
+                });
+            }
             let started_at_ms = now_ms();
             self.state.record_agent_completed(
                 run_id,
@@ -788,11 +830,33 @@ impl WorkflowRunner {
             if let Ok(state) = self.state.load_run(run_id) {
                 let _ = self.refresh_task_progress(task_id, &state);
             }
-            if let Some(min_hold_ms) = workflow_agent_min_hold_ms(&call.opts) {
-                thread::sleep(std::time::Duration::from_millis(min_hold_ms));
+            if let Some(min_hold_ms) = workflow_agent_min_hold_ms(&call.opts)
+                && self.wait_for_agent_delay(
+                    run_id,
+                    task_id,
+                    workflow_cancel,
+                    std::time::Duration::from_millis(min_hold_ms),
+                )?
+            {
+                self.record_cancelled_agent(
+                    run_id,
+                    task_id,
+                    transcript_dir,
+                    &call,
+                    &hash,
+                    attempt,
+                    max_attempts,
+                    &previous_errors,
+                    started_at_ms,
+                )?;
+                return Ok(HostCommand::AgentError {
+                    call_id: call.call_id,
+                    error: STOP_REQUESTED_ERROR.to_string(),
+                });
             }
 
-            match self.run_child_agent_call(&call, workflow_ipc, &execution_policy) {
+            match self.run_child_agent_call(&call, workflow_ipc, &execution_policy, workflow_cancel)
+            {
                 Ok(child_output) => {
                     let completed_at_ms = now_ms();
                     let child_task = child_output.task.clone();
@@ -873,6 +937,7 @@ impl WorkflowRunner {
                         message: error_message,
                         usage,
                         retryable,
+                        cancelled,
                         tool_events,
                         task,
                     } = error;
@@ -887,7 +952,11 @@ impl WorkflowRunner {
                             opts: call.opts.clone(),
                             team: workflow_agent_team(&call.opts),
                             input_hash: hash.clone(),
-                            status: WorkflowAgentStatus::Failed,
+                            status: if cancelled {
+                                WorkflowAgentStatus::Cancelled
+                            } else {
+                                WorkflowAgentStatus::Failed
+                            },
                             attempt,
                             max_attempts,
                             previous_errors: previous_errors.clone(),
@@ -905,7 +974,7 @@ impl WorkflowRunner {
                         let _ = self.refresh_task_progress(task_id, &state);
                     }
 
-                    if attempt < max_attempts && retryable {
+                    if attempt < max_attempts && retryable && !cancelled {
                         previous_errors.push(error_message);
                         continue;
                     }
@@ -924,10 +993,91 @@ impl WorkflowRunner {
         })
     }
 
-    fn wait_while_paused(&self, run_id: &str, task_id: &str) -> io::Result<bool> {
+    fn workflow_stop_requested(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        workflow_cancel: &CancelToken,
+    ) -> io::Result<bool> {
+        if workflow_cancel.is_cancelled() || self.tasks.is_cancelled(task_id) {
+            return Ok(true);
+        }
+        self.state.stop_requested(run_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_cancelled_agent(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        transcript_dir: &std::path::Path,
+        call: &AgentCall,
+        input_hash: &str,
+        attempt: u32,
+        max_attempts: u32,
+        previous_errors: &[String],
+        started_at_ms: i64,
+    ) -> io::Result<()> {
+        let completed_at_ms = now_ms();
+        let transcript_path =
+            write_agent_transcript(transcript_dir, call, STOP_REQUESTED_ERROR, false)?;
+        self.state.record_agent_completed(
+            run_id,
+            WorkflowAgentRecord {
+                call_id: call.call_id.clone(),
+                call_path: call.call_path.clone(),
+                prompt: call.prompt.clone(),
+                opts: call.opts.clone(),
+                team: workflow_agent_team(&call.opts),
+                input_hash: input_hash.to_string(),
+                status: WorkflowAgentStatus::Cancelled,
+                attempt,
+                max_attempts,
+                previous_errors: previous_errors.to_vec(),
+                output: None,
+                error: Some(STOP_REQUESTED_ERROR.to_string()),
+                transcript_path: Some(transcript_path.display().to_string()),
+                started_at_ms: Some(started_at_ms),
+                completed_at_ms: Some(completed_at_ms),
+                usage: None,
+                task: None,
+                tool_events: Vec::new(),
+            },
+        )?;
+        if let Ok(state) = self.state.load_run(run_id) {
+            let _ = self.refresh_task_progress(task_id, &state);
+        }
+        Ok(())
+    }
+
+    fn wait_for_agent_delay(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        workflow_cancel: &CancelToken,
+        delay: std::time::Duration,
+    ) -> io::Result<bool> {
+        let started = std::time::Instant::now();
+        loop {
+            if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
+                return Ok(true);
+            }
+            let Some(remaining) = delay.checked_sub(started.elapsed()) else {
+                return Ok(false);
+            };
+            thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+        }
+    }
+
+    fn wait_while_paused(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        workflow_cancel: &CancelToken,
+    ) -> io::Result<bool> {
         let mut paused = false;
         while self.state.pause_requested(run_id)? {
-            if self.state.stop_requested(run_id)? {
+            if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
                 return Ok(true);
             }
             let mut state = self.state.load_run(run_id)?;
@@ -958,6 +1108,7 @@ impl WorkflowRunner {
         call: &AgentCall,
         workflow_ipc: &WorkflowIpcContext,
         execution_policy: &WorkflowAgentExecutionPolicy,
+        cancel: &CancelToken,
     ) -> Result<WorkflowChildAgentCallOutput, WorkflowChildAgentCallError> {
         let cwd = self
             .config
@@ -981,7 +1132,6 @@ impl WorkflowRunner {
         let (workflow_child_config, mcp_registry) =
             Self::workflow_child_runtime_parts(&self.config);
         let hooks = HookRunner::new(self.config.hooks.clone());
-        let cancel = CancelToken::new();
         let child_request = ChildAgentRequest {
             prompt: call.prompt.clone(),
             subagent_type: SubagentType::General,
@@ -1003,7 +1153,7 @@ impl WorkflowRunner {
             memory: &memory,
             mcp_registry: &mcp_registry,
             hooks: &hooks,
-            cancel: &cancel,
+            cancel,
             lifecycle: Some(&mut lifecycle),
             executor: self.child_executor,
         });
@@ -1035,6 +1185,7 @@ impl WorkflowRunner {
                             message: error,
                             usage: Some(usage),
                             retryable: false,
+                            cancelled: false,
                             tool_events,
                             task,
                         });
@@ -1049,16 +1200,18 @@ impl WorkflowRunner {
                 })
             }
             _ => {
+                let cancelled = result.status == RunStatus::Cancelled;
                 let mut error = result
                     .error
                     .or(result.final_message)
                     .unwrap_or_else(|| "workflow child agent failed".to_string());
                 append_worktree_outcome(&mut error, worktree.as_ref());
-                let retryable = is_retryable_child_agent_error(&error);
+                let retryable = !cancelled && is_retryable_child_agent_error(&error);
                 Err(WorkflowChildAgentCallError {
                     message: error,
                     usage: Some(usage),
                     retryable,
+                    cancelled,
                     tool_events,
                     task,
                 })
@@ -1717,6 +1870,8 @@ fn child_agent_output(prompt: &str, final_message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::agent_child::ChildAgentResult;
     use crate::cost::CostTracker;
@@ -1812,12 +1967,69 @@ mod tests {
             prompt: "inspect injected runner".to_string(),
             opts: serde_json::json!({}),
         };
+        let cancel = CancelToken::new();
 
         let output = runner
-            .run_child_agent_call(&call, &workflow_ipc, &policy)
+            .run_child_agent_call(&call, &workflow_ipc, &policy, &cancel)
             .expect("injected child executor should satisfy workflow agent call");
 
         assert_eq!(output.message, "injected workflow child result");
+    }
+
+    #[test]
+    fn workflow_execution_gate_normalizes_zero_concurrency() {
+        let gate = Arc::new(WorkflowExecutionGate::new());
+        let permit = gate
+            .begin_agent(1, 0)
+            .expect("zero concurrency should normalize to one worker");
+        let counters = gate.snapshot().expect("gate counters");
+
+        assert_eq!(counters.active_agents, 1);
+        assert_eq!(counters.max_observed_concurrent_agents, 1);
+        drop(permit);
+    }
+
+    #[test]
+    fn workflow_child_agent_observes_run_cancellation_token() {
+        let temp = tempdir().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("workflow-cancelled-child".to_string()),
+            temp.path().join("session"),
+        )
+        .with_child_executor(cancel_aware_workflow_child_executor);
+        let workflow_ipc = WorkflowIpcContext::new();
+        let policy = WorkflowAgentExecutionPolicy {
+            max_agent_retries: 0,
+            max_agent_tokens: None,
+            allowed_tools: None,
+            tool_policy_label: None,
+        };
+        let call = AgentCall {
+            call_id: "call-cancel".to_string(),
+            call_path: "agent-cancel".to_string(),
+            phase: None,
+            prompt: "wait for cancellation".to_string(),
+            opts: serde_json::json!({}),
+        };
+        let cancel = CancelToken::new();
+        let started = Instant::now();
+
+        thread::scope(|scope| {
+            let handle =
+                scope.spawn(|| runner.run_child_agent_call(&call, &workflow_ipc, &policy, &cancel));
+            thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+            let error = handle
+                .join()
+                .expect("child executor thread")
+                .expect_err("cancelled child should not complete successfully");
+            assert!(error.message.contains("cancelled"));
+        });
+
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     fn fake_workflow_child_executor(
@@ -1837,6 +2049,29 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("injected workflow child result".to_string()),
             error: None,
+        })
+    }
+
+    fn cancel_aware_workflow_child_executor(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
+        _cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.cancel.is_cancelled() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !runtime.cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "workflow child did not observe cancellation",
+            ));
+        }
+        Ok(ChildAgentResult {
+            status: RunStatus::Cancelled,
+            final_message: None,
+            error: Some("workflow child cancelled".to_string()),
         })
     }
 

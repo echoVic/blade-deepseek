@@ -3,9 +3,10 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -15,9 +16,14 @@ use serde_json::Value;
 
 use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
 
-const WORKFLOW_STDERR_RETAINED_BYTES: usize =
-    orca_tools::process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM;
-const WORKFLOW_STDERR_READ_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_WORKFLOW_HOST_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_WORKFLOW_HOST_EVENTS: usize = 8_192;
+const MAX_WORKFLOW_HOST_EVENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WORKFLOW_HOST_STDERR_BYTES: usize = 64 * 1024;
+const WORKFLOW_HOST_FRAME_CHANNEL_CAPACITY: usize = 8;
+const DEFAULT_WORKFLOW_HOST_AGENT_WORKERS: usize = 16;
+const WORKFLOW_HOST_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const WORKFLOW_HOST_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -65,35 +71,25 @@ pub struct WorkflowHostIpcPaths {
     pub task_lists_path: PathBuf,
 }
 
-struct WorkflowChild {
-    child: Option<Child>,
+#[derive(Clone, Copy, Debug)]
+struct WorkflowHostRunPolicy {
+    collect_events: bool,
+    max_agent_workers: usize,
 }
 
-impl WorkflowChild {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn child_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("workflow child is available")
-    }
-
-    fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child_mut().wait();
-        if status.is_ok() {
-            self.child.take();
+impl WorkflowHostRunPolicy {
+    fn collecting() -> Self {
+        Self {
+            collect_events: true,
+            max_agent_workers: DEFAULT_WORKFLOW_HOST_AGENT_WORKERS,
         }
-        status
     }
-}
 
-impl Drop for WorkflowChild {
-    fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        orca_tools::process::kill_child_tree(&mut child);
-        let _ = child.wait();
+    fn callback_only(max_agent_workers: usize) -> Self {
+        Self {
+            collect_events: false,
+            max_agent_workers: max_agent_workers.max(1),
+        }
     }
 }
 
@@ -134,6 +130,7 @@ impl WorkflowHost {
             script_path,
             args,
             Some(ipc_paths),
+            WorkflowHostRunPolicy::collecting(),
             |call| {
                 Ok(HostCommand::AgentResult {
                     call_id: call.call_id.clone(),
@@ -145,6 +142,8 @@ impl WorkflowHost {
                 })
             },
             |_| Ok(()),
+            || Ok(false),
+            || {},
         )
     }
 
@@ -178,8 +177,11 @@ impl WorkflowHost {
             script_path,
             args,
             None,
+            WorkflowHostRunPolicy::collecting(),
             on_agent_call,
             on_event,
+            || Ok(false),
+            || {},
         )
     }
 
@@ -198,24 +200,67 @@ impl WorkflowHost {
             script_path,
             args,
             Some(ipc_paths),
+            WorkflowHostRunPolicy::collecting(),
             on_agent_call,
             on_event,
+            || Ok(false),
+            || {},
         )
     }
 
-    fn run_collecting_events_with_agent_and_event_callback_inner<F, E>(
+    pub(crate) fn run_with_agent_event_control_and_ipc_paths<F, E, C, A>(
+        script_path: &Path,
+        args: Value,
+        ipc_paths: &WorkflowHostIpcPaths,
+        max_agent_workers: usize,
+        on_agent_call: F,
+        on_event: E,
+        should_cancel: C,
+        on_abort: A,
+    ) -> io::Result<()>
+    where
+        F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
+        E: FnMut(&HostEvent) -> io::Result<()>,
+        C: Fn() -> io::Result<bool>,
+        A: Fn(),
+    {
+        Self::run_collecting_events_with_agent_and_event_callback_inner(
+            script_path,
+            args,
+            Some(ipc_paths),
+            WorkflowHostRunPolicy::callback_only(max_agent_workers),
+            on_agent_call,
+            on_event,
+            should_cancel,
+            on_abort,
+        )
+        .map(|_| ())
+    }
+
+    fn run_collecting_events_with_agent_and_event_callback_inner<F, E, C, A>(
         script_path: &Path,
         args: Value,
         ipc_paths: Option<&WorkflowHostIpcPaths>,
+        policy: WorkflowHostRunPolicy,
         on_agent_call: F,
         mut on_event: E,
+        should_cancel: C,
+        on_abort: A,
     ) -> io::Result<Vec<HostEvent>>
     where
         F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
         E: FnMut(&HostEvent) -> io::Result<()>,
+        C: Fn() -> io::Result<bool>,
+        A: Fn(),
     {
         let host_path = ensure_host_file()?;
-        let args_json = serde_json::to_string(&args)
+        let _host_file = WorkflowHostFileGuard::new(host_path.clone());
+        let args_json = serialize_bounded_json(
+            &args,
+            MAX_WORKFLOW_HOST_FRAME_BYTES,
+            "workflow host arguments",
+        )?;
+        let args_json = String::from_utf8(args_json)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
         let mut command = Command::new(Self::node_executable());
@@ -230,116 +275,223 @@ impl WorkflowHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
-        {
-            command.process_group(0);
-        }
-        let child = command.spawn()?;
-        let mut child = WorkflowChild::new(child);
+        command.process_group(0);
+
+        let mut child = WorkflowHostChild::new(command.spawn()?);
         let stdin = child
-            .child_mut()
+            .child_mut()?
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("failed to capture workflow host stdin"))?;
         let stdin = Arc::new(Mutex::new(stdin));
-
         let stdout = child
-            .child_mut()
+            .child_mut()?
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("failed to capture workflow host stdout"))?;
         let stderr = child
-            .child_mut()
+            .child_mut()?
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("failed to capture workflow host stderr"))?;
-        let stderr_reader = spawn_stderr_reader(stderr);
-        let reader = BufReader::new(stdout);
+
+        let (frame_tx, frame_rx) = mpsc::sync_channel(WORKFLOW_HOST_FRAME_CHANNEL_CAPACITY);
+        let stdout_handle = spawn_workflow_frame_reader(BufReader::new(stdout), frame_tx);
+        let stderr_handle = spawn_retained_reader(stderr, MAX_WORKFLOW_HOST_STDERR_BYTES, "stderr");
 
         let mut events = Vec::new();
         let mut workflow_failed = None;
         let agent_error = Arc::new(Mutex::new(None));
+        let fatal_worker_error = Arc::new(Mutex::new(None));
+        let abort_workers = Arc::new(AtomicBool::new(false));
         let on_agent_call = &on_agent_call;
-        thread::scope(|scope| -> io::Result<()> {
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
+        let execution_result = thread::scope(|scope| -> io::Result<()> {
+            let worker_count = policy.max_agent_workers.max(1);
+            let call_queue_capacity = worker_count.saturating_mul(2).max(1);
+            let (call_tx, call_rx) = crossbeam_channel::bounded::<AgentCall>(call_queue_capacity);
+            let mut worker_handles = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let receiver = call_rx.clone();
+                let writer = Arc::clone(&stdin);
+                let error_slot = Arc::clone(&agent_error);
+                let fatal_error_slot = Arc::clone(&fatal_worker_error);
+                let abort = Arc::clone(&abort_workers);
+                worker_handles.push(scope.spawn(move || {
+                    run_workflow_agent_worker(
+                        receiver,
+                        writer,
+                        error_slot,
+                        fatal_error_slot,
+                        abort,
+                        on_agent_call,
+                    );
+                }));
+            }
 
-                let event: HostEvent = serde_json::from_str(&line)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if let HostEvent::WorkflowFailed { error } = &event {
-                    workflow_failed = Some(error.clone());
-                }
-                let is_terminal = matches!(
-                    event,
-                    HostEvent::WorkflowCompleted { .. } | HostEvent::WorkflowFailed { .. }
-                );
-                on_event(&event)?;
-                if let HostEvent::AgentCall {
-                    call_id,
-                    call_path,
-                    phase,
-                    prompt,
-                    opts,
-                } = &event
-                {
-                    let call = AgentCall {
-                        call_id: call_id.clone(),
-                        call_path: call_path.clone(),
-                        phase: phase.clone(),
-                        prompt: prompt.clone(),
-                        opts: opts.clone(),
-                    };
-                    let writer = Arc::clone(&stdin);
-                    let error_slot = Arc::clone(&agent_error);
-                    scope.spawn(move || {
-                        let call_id = call.call_id.clone();
-                        let command = match on_agent_call(call) {
-                            Ok(command) => command,
-                            Err(error) => {
-                                record_first_agent_error(&error_slot, error.to_string());
-                                HostCommand::AgentError {
-                                    call_id,
-                                    error: "workflow host failed to answer agent call".to_string(),
-                                }
-                            }
-                        };
+            let run_result = (|| -> io::Result<()> {
+                let mut event_count = 0usize;
+                let mut event_bytes = 0usize;
+                loop {
+                    if should_cancel()? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "workflow host cancelled",
+                        ));
+                    }
+                    if let Some(error) = read_recorded_error(&fatal_worker_error)? {
+                        return Err(io::Error::other(error));
+                    }
 
-                        if let Err(error) = write_host_command(&writer, &command) {
-                            record_first_agent_error(&error_slot, error.to_string());
+                    let frame = match frame_rx.recv_timeout(WORKFLOW_HOST_CONTROL_POLL_INTERVAL) {
+                        Ok(WorkflowHostFrame::Data(frame)) => frame,
+                        Ok(WorkflowHostFrame::Eof) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "workflow host stdout closed before a terminal event",
+                            ));
                         }
-                    });
+                        Ok(WorkflowHostFrame::Error(error)) => return Err(error),
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "workflow host stdout reader disconnected",
+                            ));
+                        }
+                    };
+
+                    if frame.iter().all(u8::is_ascii_whitespace) {
+                        continue;
+                    }
+                    event_count = event_count.saturating_add(1);
+                    event_bytes = event_bytes.saturating_add(frame.len().saturating_add(1));
+                    if event_count > MAX_WORKFLOW_HOST_EVENTS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "workflow host event count exceeded {MAX_WORKFLOW_HOST_EVENTS}"
+                            ),
+                        ));
+                    }
+                    if event_bytes > MAX_WORKFLOW_HOST_EVENT_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "workflow host event bytes exceeded {MAX_WORKFLOW_HOST_EVENT_BYTES}"
+                            ),
+                        ));
+                    }
+
+                    let event: HostEvent = serde_json::from_slice(&frame)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    if let HostEvent::WorkflowFailed { error } = &event {
+                        workflow_failed = Some(error.clone());
+                    }
+                    let is_terminal = matches!(
+                        event,
+                        HostEvent::WorkflowCompleted { .. } | HostEvent::WorkflowFailed { .. }
+                    );
+                    on_event(&event)?;
+                    if let HostEvent::AgentCall {
+                        call_id,
+                        call_path,
+                        phase,
+                        prompt,
+                        opts,
+                    } = &event
+                    {
+                        send_workflow_agent_call(
+                            &call_tx,
+                            AgentCall {
+                                call_id: call_id.clone(),
+                                call_path: call_path.clone(),
+                                phase: phase.clone(),
+                                prompt: prompt.clone(),
+                                opts: opts.clone(),
+                            },
+                            &should_cancel,
+                        )?;
+                    }
+                    if policy.collect_events {
+                        events.push(event);
+                    }
+                    if is_terminal {
+                        on_abort();
+                        abort_workers.store(true, Ordering::Release);
+                        return Ok(());
+                    }
                 }
-                events.push(event);
-                if is_terminal {
-                    break;
+            })();
+
+            if run_result.is_err() {
+                on_abort();
+                abort_workers.store(true, Ordering::Release);
+                let _ = child.terminate_and_wait();
+            }
+            drop(call_tx);
+
+            let mut worker_panic = false;
+            for handle in worker_handles {
+                if handle.join().is_err() {
+                    worker_panic = true;
                 }
             }
-            Ok(())
-        })?;
+            if worker_panic && run_result.is_ok() {
+                on_abort();
+                abort_workers.store(true, Ordering::Release);
+                let _ = child.terminate_and_wait();
+                return Err(io::Error::other("workflow host agent worker panicked"));
+            }
+            if run_result.is_ok()
+                && let Some(error) = read_recorded_error(&fatal_worker_error)?
+            {
+                on_abort();
+                abort_workers.store(true, Ordering::Release);
+                let _ = child.terminate_and_wait();
+                return Err(io::Error::other(error));
+            }
+            run_result
+        });
         drop(stdin);
 
-        if let Some(error) = agent_error
-            .lock()
-            .map_err(|_| io::Error::other("workflow agent error lock poisoned"))?
-            .clone()
-        {
-            return Err(io::Error::other(error));
+        let exit_result = if execution_result.is_ok() {
+            child.wait_for_exit(WORKFLOW_HOST_EXIT_GRACE)
+        } else {
+            child.cached_exit().map(|status| WorkflowHostExit {
+                status,
+                forced: true,
+            })
+        };
+        drop(frame_rx);
+        let stdout_result = join_host_thread(stdout_handle, "stdout frame reader");
+        let stderr_result = join_host_thread(stderr_handle, "stderr reader");
+
+        if let Err(error) = execution_result {
+            return Err(error);
+        }
+        stdout_result?;
+        let stderr = stderr_result?;
+        let exit = exit_result?;
+        if exit.forced {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "workflow host did not exit after its terminal event",
+            ));
         }
 
-        let status = child.wait()?;
-        let stderr = join_stderr_reader(stderr_reader)?;
-        if !status.success() {
+        if let Some(error) = read_recorded_error(&agent_error)? {
+            return Err(io::Error::other(error));
+        }
+        if !exit.status.success() {
             if workflow_failed.is_some() {
                 return Ok(events);
             }
 
             let stderr = format_stderr(stderr);
             let message = if stderr.is_empty() {
-                format!("workflow host exited with status {status}")
+                format!("workflow host exited with status {}", exit.status)
             } else {
-                format!("workflow host exited with status {status}: {stderr}")
+                format!("workflow host exited with status {}: {stderr}", exit.status)
             };
             return Err(io::Error::other(message));
         }
@@ -348,29 +500,322 @@ impl WorkflowHost {
     }
 }
 
-fn spawn_stderr_reader(
-    mut stderr: impl Read + Send + 'static,
-) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
-    thread::spawn(move || {
-        let mut output = RetainedOutput::new(WORKFLOW_STDERR_RETAINED_BYTES);
-        let mut buffer = [0_u8; WORKFLOW_STDERR_READ_CHUNK_BYTES];
+enum WorkflowHostFrame {
+    Data(Vec<u8>),
+    Eof,
+    Error(io::Error),
+}
+
+struct WorkflowHostExit {
+    status: ExitStatus,
+    forced: bool,
+}
+
+struct WorkflowHostFileGuard {
+    path: PathBuf,
+}
+
+impl WorkflowHostFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for WorkflowHostFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct WorkflowHostChild {
+    child: Option<Child>,
+    exit_status: Option<ExitStatus>,
+}
+
+impl WorkflowHostChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            exit_status: None,
+        }
+    }
+
+    fn child_mut(&mut self) -> io::Result<&mut Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("workflow host child already reaped"))
+    }
+
+    fn cached_exit(&self) -> io::Result<ExitStatus> {
+        self.exit_status
+            .ok_or_else(|| io::Error::other("workflow host child has no exit status"))
+    }
+
+    fn terminate_and_wait(&mut self) -> io::Result<ExitStatus> {
+        if let Some(status) = self.exit_status {
+            return Ok(status);
+        }
+        match self.child_mut()?.try_wait() {
+            Ok(Some(status)) => {
+                self.exit_status = Some(status);
+                self.terminate_process_group();
+                return Ok(status);
+            }
+            Ok(None) | Err(_) => {}
+        }
+        self.force_terminate_and_wait()
+    }
+
+    fn force_terminate_and_wait(&mut self) -> io::Result<ExitStatus> {
+        if let Some(status) = self.exit_status {
+            return Ok(status);
+        }
+        let child = self.child_mut()?;
+        orca_tools::process::kill_child_tree(child);
+        let status = child.wait()?;
+        self.exit_status = Some(status);
+        Ok(status)
+    }
+
+    fn terminate_process_group(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            orca_tools::process::kill_child_tree(child);
+        }
+    }
+
+    fn wait_for_exit(&mut self, grace: Duration) -> io::Result<WorkflowHostExit> {
+        if let Some(status) = self.exit_status {
+            return Ok(WorkflowHostExit {
+                status,
+                forced: false,
+            });
+        }
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .unwrap_or_else(Instant::now);
         loop {
-            match stderr.read(&mut buffer) {
-                Ok(0) => return Ok(output.into_snapshot()),
-                Ok(read) => output.append(&buffer[..read]),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+            match self.child_mut()?.try_wait() {
+                Ok(Some(status)) => {
+                    self.exit_status = Some(status);
+                    self.terminate_process_group();
+                    return Ok(WorkflowHostExit {
+                        status,
+                        forced: false,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = self.force_terminate_and_wait();
+                    return Err(error);
+                }
+            }
+            if Instant::now() >= deadline {
+                let status = self.terminate_and_wait()?;
+                return Ok(WorkflowHostExit {
+                    status,
+                    forced: true,
+                });
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for WorkflowHostChild {
+    fn drop(&mut self) {
+        if self.exit_status.is_none() {
+            let _ = self.terminate_and_wait();
+        }
+    }
+}
+
+fn spawn_workflow_frame_reader<R>(
+    mut reader: R,
+    sender: mpsc::SyncSender<WorkflowHostFrame>,
+) -> thread::JoinHandle<io::Result<()>>
+where
+    R: BufRead + Send + 'static,
+{
+    thread::spawn(move || {
+        loop {
+            match read_bounded_workflow_frame(&mut reader, MAX_WORKFLOW_HOST_FRAME_BYTES) {
+                Ok(Some(frame)) => {
+                    if sender.send(WorkflowHostFrame::Data(frame)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {
+                    let _ = sender.send(WorkflowHostFrame::Eof);
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = sender.send(WorkflowHostFrame::Error(error));
+                    return Ok(());
+                }
             }
         }
     })
 }
 
-fn join_stderr_reader(
-    reader: thread::JoinHandle<io::Result<RetainedOutputSnapshot>>,
-) -> io::Result<RetainedOutputSnapshot> {
-    reader
+fn read_bounded_workflow_frame<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::with_capacity(max_bytes.min(8 * 1024));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow host stdout ended with a partial frame",
+            ));
+        }
+
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            let consumed = newline + 1;
+            if frame.len().saturating_add(consumed) > max_bytes {
+                return Err(workflow_frame_too_large(max_bytes));
+            }
+            frame.extend_from_slice(&available[..newline]);
+            reader.consume(consumed);
+            return Ok(Some(frame));
+        }
+
+        if frame.len().saturating_add(available.len()) > max_bytes {
+            return Err(workflow_frame_too_large(max_bytes));
+        }
+        let consumed = available.len();
+        frame.extend_from_slice(available);
+        reader.consume(consumed);
+    }
+}
+
+fn workflow_frame_too_large(max_bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("workflow host frame exceeded {max_bytes} bytes"),
+    )
+}
+
+fn spawn_retained_reader<R>(
+    mut reader: R,
+    retained_bytes: usize,
+    stream: &'static str,
+) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = RetainedOutput::new(retained_bytes);
+        let mut chunk = [0_u8; 8 * 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => return Ok(output.into_snapshot()),
+                Ok(read) => output.append(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("workflow host {stream} read failed: {error}"),
+                    ));
+                }
+            }
+        }
+    })
+}
+
+fn join_host_thread<T>(handle: thread::JoinHandle<io::Result<T>>, label: &str) -> io::Result<T> {
+    handle
         .join()
-        .map_err(|_| io::Error::other("workflow host stderr reader thread panicked"))?
+        .map_err(|_| io::Error::other(format!("workflow host {label} panicked")))?
+}
+
+fn send_workflow_agent_call<C>(
+    sender: &crossbeam_channel::Sender<AgentCall>,
+    mut call: AgentCall,
+    should_cancel: &C,
+) -> io::Result<()>
+where
+    C: Fn() -> io::Result<bool>,
+{
+    loop {
+        match sender.try_send(call) {
+            Ok(()) => return Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                call = returned;
+                if should_cancel()? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "workflow host cancelled",
+                    ));
+                }
+                thread::sleep(WORKFLOW_HOST_CONTROL_POLL_INTERVAL);
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                return Err(io::Error::other(
+                    "workflow host agent worker queue disconnected",
+                ));
+            }
+        }
+    }
+}
+
+fn run_workflow_agent_worker<F>(
+    receiver: crossbeam_channel::Receiver<AgentCall>,
+    writer: Arc<Mutex<impl Write>>,
+    error_slot: Arc<Mutex<Option<String>>>,
+    fatal_error_slot: Arc<Mutex<Option<String>>>,
+    abort: Arc<AtomicBool>,
+    on_agent_call: &F,
+) where
+    F: Fn(AgentCall) -> io::Result<HostCommand> + Send + Sync,
+{
+    loop {
+        let received = receiver.recv();
+        let Ok(call) = received else {
+            return;
+        };
+        if abort.load(Ordering::Acquire) {
+            continue;
+        }
+
+        let call_id = call.call_id.clone();
+        let command =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_agent_call(call))) {
+                Err(_) => {
+                    record_first_agent_error(
+                        &fatal_error_slot,
+                        "workflow host agent callback panicked".to_string(),
+                    );
+                    return;
+                }
+                Ok(Ok(command)) => command,
+                Ok(Err(error)) => {
+                    record_first_agent_error(&error_slot, error.to_string());
+                    HostCommand::AgentError {
+                        call_id,
+                        error: "workflow host failed to answer agent call".to_string(),
+                    }
+                }
+            };
+        if abort.load(Ordering::Acquire) {
+            continue;
+        }
+        if let Err(error) = write_host_command(&writer, &command) {
+            record_first_agent_error(&fatal_error_slot, error.to_string());
+            return;
+        }
+    }
+}
+
+fn read_recorded_error(error_slot: &Arc<Mutex<Option<String>>>) -> io::Result<Option<String>> {
+    error_slot
+        .lock()
+        .map(|error| error.clone())
+        .map_err(|_| io::Error::other("workflow host error lock poisoned"))
 }
 
 fn format_stderr(stderr: RetainedOutputSnapshot) -> String {
@@ -385,14 +830,61 @@ fn format_stderr(stderr: RetainedOutputSnapshot) -> String {
 }
 
 fn write_host_command(writer: &Arc<Mutex<impl Write>>, command: &HostCommand) -> io::Result<()> {
-    let command_json = serde_json::to_string(command)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let command_json = serialize_bounded_json(
+        command,
+        MAX_WORKFLOW_HOST_FRAME_BYTES.saturating_sub(1),
+        "workflow host command frame",
+    )?;
     let mut writer = writer
         .lock()
         .map_err(|_| io::Error::other("workflow host stdin lock poisoned"))?;
-    writer.write_all(command_json.as_bytes())?;
+    writer.write_all(&command_json)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    label: &'static str,
+}
+
+impl BoundedJsonWriter {
+    fn new(max_bytes: usize, label: &'static str) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(8 * 1024)),
+            max_bytes,
+            label,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(buffer.len()) > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} exceeded {} bytes", self.label, self.max_bytes),
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bounded_json<T: Serialize>(
+    value: &T,
+    max_bytes: usize,
+    label: &'static str,
+) -> io::Result<Vec<u8>> {
+    let mut writer = BoundedJsonWriter::new(max_bytes, label);
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(writer.bytes)
 }
 
 fn record_first_agent_error(error_slot: &Arc<Mutex<Option<String>>>, error: String) {
@@ -515,6 +1007,16 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.exists());
         assert!(second.exists());
+        std::fs::remove_file(first).expect("remove first host file");
+        std::fs::remove_file(second).expect("remove second host file");
+    }
+
+    #[test]
+    fn host_emitter_uses_blocking_stdout_writes() {
+        let source = include_str!("host.mjs");
+
+        assert!(source.contains("writeFileSync(1,"));
+        assert!(!source.contains("process.stdout.write"));
     }
 
     #[test]
@@ -686,13 +1188,17 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
 
     #[test]
     fn workflow_stderr_reader_bounds_retained_output() {
-        let observed_bytes = WORKFLOW_STDERR_RETAINED_BYTES + 4096;
+        let observed_bytes = MAX_WORKFLOW_HOST_STDERR_BYTES + 4096;
         let stderr = std::io::Cursor::new(vec![b'x'; observed_bytes]);
 
-        let retained = join_stderr_reader(spawn_stderr_reader(stderr)).expect("read stderr");
+        let retained = join_host_thread(
+            spawn_retained_reader(stderr, MAX_WORKFLOW_HOST_STDERR_BYTES, "stderr"),
+            "stderr reader",
+        )
+        .expect("read stderr");
 
         assert_eq!(retained.observed_bytes, observed_bytes);
-        assert_eq!(retained.bytes.len(), WORKFLOW_STDERR_RETAINED_BYTES);
+        assert_eq!(retained.bytes.len(), MAX_WORKFLOW_HOST_STDERR_BYTES);
         assert_eq!(retained.omitted_bytes, 4096);
         assert!(format_stderr(retained).ends_with("[4096 workflow stderr bytes omitted]"));
     }
@@ -705,6 +1211,194 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         let _ = Command::new("/bin/kill")
             .args(["-KILL", pid.trim()])
             .status();
+    }
+
+    #[test]
+    fn host_control_cancels_silent_workflow_promptly() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("silent.js");
+        std::fs::write(
+            &script,
+            "export const meta = { name: 'silent', description: 'Silent host', phases: [] };\nwhile (true) {}\nexport default 'unreachable';",
+        )
+        .expect("write silent workflow");
+        let started = Instant::now();
+
+        let result = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            &script,
+            serde_json::Value::Null,
+            None,
+            WorkflowHostRunPolicy::callback_only(1),
+            |call| {
+                Ok(HostCommand::AgentResult {
+                    call_id: call.call_id,
+                    result: serde_json::Value::Null,
+                })
+            },
+            |_| Ok(()),
+            || Ok(started.elapsed() >= Duration::from_millis(100)),
+            || {},
+        );
+
+        let error = result.expect_err("silent workflow should be cancelled");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "silent workflow host did not stop promptly"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_kills_child_that_stays_alive_after_terminal_event() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::history::lock_test_env();
+        let previous_node_path = env::var_os("ORCA_NODE_PATH");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let node = temp.path().join("lingering-node");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"workflow_completed\",\"result\":null}'\nsleep 10\n",
+        )
+        .expect("write lingering node");
+        let mut permissions = std::fs::metadata(&node)
+            .expect("lingering node metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&node, permissions).expect("chmod lingering node");
+        let script = temp.path().join("unused.js");
+        std::fs::write(&script, "export default null;").expect("write workflow");
+
+        unsafe {
+            env::set_var("ORCA_NODE_PATH", &node);
+        }
+        let started = Instant::now();
+        let result = WorkflowHost::run_collecting_events(&script, serde_json::Value::Null);
+
+        let error = result.expect_err("lingering host should be killed");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "lingering workflow host exceeded cleanup deadline: {:?}",
+            started.elapsed()
+        );
+
+        unsafe {
+            if let Some(previous) = previous_node_path {
+                env::set_var("ORCA_NODE_PATH", previous);
+            } else {
+                env::remove_var("ORCA_NODE_PATH");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_cleans_pipe_holding_descendants_after_parent_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::history::lock_test_env();
+        let previous_node_path = env::var_os("ORCA_NODE_PATH");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let node = temp.path().join("background-node");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' '{\"type\":\"workflow_completed\",\"result\":null}'\nexit 0\n",
+        )
+        .expect("write background node");
+        let mut permissions = std::fs::metadata(&node)
+            .expect("background node metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&node, permissions).expect("chmod background node");
+        let script = temp.path().join("unused.js");
+        std::fs::write(&script, "export default null;").expect("write workflow");
+
+        unsafe {
+            env::set_var("ORCA_NODE_PATH", &node);
+        }
+        let started = Instant::now();
+        let events = WorkflowHost::run_collecting_events(&script, serde_json::Value::Null)
+            .expect("clean parent exit should complete");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "pipe-holding descendant exceeded cleanup deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            events.last(),
+            Some(HostEvent::WorkflowCompleted { .. })
+        ));
+
+        unsafe {
+            if let Some(previous) = previous_node_path {
+                env::set_var("ORCA_NODE_PATH", previous);
+            } else {
+                env::remove_var("ORCA_NODE_PATH");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_failure_stderr_is_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::history::lock_test_env();
+        let previous_node_path = env::var_os("ORCA_NODE_PATH");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let node = temp.path().join("noisy-node");
+        std::fs::write(
+            &node,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"workflow_completed\",\"result\":null}'\ndd if=/dev/zero bs=2097152 count=1 2>/dev/null | tr '\\000' x >&2\nexit 7\n",
+        )
+        .expect("write noisy node");
+        let mut permissions = std::fs::metadata(&node)
+            .expect("noisy node metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&node, permissions).expect("chmod noisy node");
+        let script = temp.path().join("unused.js");
+        std::fs::write(&script, "export default null;").expect("write workflow");
+
+        unsafe {
+            env::set_var("ORCA_NODE_PATH", &node);
+        }
+        let error = WorkflowHost::run_collecting_events(&script, serde_json::Value::Null)
+            .expect_err("noisy host should fail");
+
+        assert!(error.to_string().len() < 100_000);
+        assert!(error.to_string().contains("bytes omitted"));
+
+        unsafe {
+            if let Some(previous) = previous_node_path {
+                env::set_var("ORCA_NODE_PATH", previous);
+            } else {
+                env::remove_var("ORCA_NODE_PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn host_command_json_is_bounded_before_pipe_write() {
+        let writer = Arc::new(Mutex::new(Vec::new()));
+        let command = HostCommand::AgentResult {
+            call_id: "call-large".to_string(),
+            result: serde_json::Value::String("x".repeat(MAX_WORKFLOW_HOST_FRAME_BYTES * 2)),
+        };
+
+        let error = write_host_command(&writer, &command)
+            .expect_err("oversized host command should fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("command frame"));
+        assert!(writer.lock().expect("writer").is_empty());
     }
 
     #[cfg(unix)]
