@@ -1,4 +1,8 @@
 use std::collections::VecDeque;
+use std::io::{self, Read};
+
+pub const DEFAULT_RETAINED_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const RETAINED_OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Bounded byte retention with a stable prefix and rolling suffix.
 #[derive(Clone, Debug)]
@@ -14,6 +18,7 @@ pub struct RetainedOutputSnapshot {
     pub bytes: Vec<u8>,
     pub observed_bytes: usize,
     pub omitted_bytes: usize,
+    head_bytes: usize,
 }
 
 impl RetainedOutput {
@@ -60,11 +65,13 @@ impl RetainedOutput {
             bytes: self.retained_bytes_vec(),
             observed_bytes: self.observed_bytes(),
             omitted_bytes: self.omitted_bytes(),
+            head_bytes: self.head.len(),
         }
     }
 
     pub fn into_snapshot(self) -> RetainedOutputSnapshot {
         let observed_bytes = self.observed_bytes;
+        let head_bytes = self.head.len();
         let mut bytes = self.head;
         bytes.reserve(self.tail.len());
         bytes.extend(self.tail);
@@ -73,6 +80,7 @@ impl RetainedOutput {
             bytes,
             observed_bytes,
             omitted_bytes,
+            head_bytes,
         }
     }
 
@@ -115,6 +123,35 @@ impl RetainedOutputSnapshot {
     pub fn is_truncated(&self) -> bool {
         self.omitted_bytes > 0
     }
+
+    pub fn rendered_bytes(&self) -> Vec<u8> {
+        if !self.is_truncated() {
+            return self.bytes.clone();
+        }
+        let marker = format!("\n[{} bytes of output omitted]\n", self.omitted_bytes);
+        let split = self.head_bytes.min(self.bytes.len());
+        let mut rendered = Vec::with_capacity(self.bytes.len().saturating_add(marker.len()));
+        rendered.extend_from_slice(&self.bytes[..split]);
+        rendered.extend_from_slice(marker.as_bytes());
+        rendered.extend_from_slice(&self.bytes[split..]);
+        rendered
+    }
+}
+
+pub fn read_to_retained(
+    mut reader: impl Read,
+    max_retained_bytes: usize,
+) -> io::Result<RetainedOutputSnapshot> {
+    let mut output = RetainedOutput::new(max_retained_bytes);
+    let mut buffer = [0_u8; RETAINED_OUTPUT_READ_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(output.into_snapshot()),
+            Ok(read) => output.append(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn head_capacity(max_retained_bytes: usize) -> usize {
@@ -142,6 +179,7 @@ mod tests {
                 bytes: b"hello world".to_vec(),
                 observed_bytes: 11,
                 omitted_bytes: 0,
+                head_bytes: 8,
             }
         );
         assert!(!output.is_truncated());
@@ -176,6 +214,7 @@ mod tests {
                 bytes: b"0123def".to_vec(),
                 observed_bytes: 16,
                 omitted_bytes: 9,
+                head_bytes: 4,
             }
         );
     }
@@ -192,6 +231,7 @@ mod tests {
                 bytes: Vec::new(),
                 observed_bytes: 9,
                 omitted_bytes: 9,
+                head_bytes: 0,
             }
         );
     }
@@ -203,5 +243,16 @@ mod tests {
         output.append(b"abc");
 
         assert_eq!(output.into_snapshot().bytes, b"a");
+    }
+
+    #[test]
+    fn rendered_bytes_insert_omission_marker_between_head_and_tail() {
+        let mut output = RetainedOutput::new(8);
+        output.append(b"HEADmiddleTAIL");
+
+        assert_eq!(
+            String::from_utf8(output.into_snapshot().rendered_bytes()).unwrap(),
+            "HEAD\n[6 bytes of output omitted]\nTAIL"
+        );
     }
 }

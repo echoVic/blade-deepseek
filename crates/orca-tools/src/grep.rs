@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use serde::Deserialize;
@@ -35,14 +36,20 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         );
     }
 
-    let output = Command::new("rg")
+    let mut command = Command::new("rg");
+    command
         .args(["--line-number", "--no-heading", pattern, &search_path])
         .current_dir(cwd)
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::process::prepare_non_interactive_command(&mut command);
+    let output = command.spawn().and_then(|child| {
+        crate::process::wait_for_child_output_with_timeout(child, Duration::from_secs(120))
+    });
 
     match output {
         Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stdout = output.stdout_text();
             let stdout = paginate_output(
                 stdout.lines().map(String::from).collect::<Vec<_>>(),
                 args.offset.unwrap_or(0),
@@ -50,7 +57,11 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
                 DEFAULT_GREP_HEAD_LIMIT,
             );
             let (stdout, truncated) = truncate_output(stdout, max_bytes);
-            ToolResult::completed(request, stdout, truncated)
+            let stdout = crate::process::preserve_ingress_omission_notice(
+                stdout,
+                output.stdout_omitted_bytes,
+            );
+            ToolResult::completed(request, stdout, output.output_was_omitted() || truncated)
         }
         Ok(output) if output.status.code() == Some(1) => ToolResult::completed_kind(
             request,
@@ -59,7 +70,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
             ToolResultKind::NoMatches,
         ),
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = output.stderr_text().trim().to_string();
             ToolResult::failed(request, stderr, output.status.code())
         }
         Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
@@ -209,6 +220,31 @@ mod tests {
             lines[10],
             "[Showing results 251-260 of 300; use offset=260 to continue]"
         );
+    }
+
+    #[test]
+    fn grep_output_is_bounded_at_process_ingress() {
+        let cwd = temp_dir("grep-bounded-ingress");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        let line = format!("needle {}", "x".repeat(2 * 1024 * 1024));
+        fs::write(cwd.join("notes.txt"), line).expect("write large fixture");
+        let request = ToolRequest {
+            id: "grep-1".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: Some("needle".to_string()),
+            raw_arguments: Some(
+                r#"{"pattern":"needle","path":"notes.txt","head_limit":1}"#.to_string(),
+            ),
+        };
+
+        let result = execute(&request, &cwd, 2 * 1024 * 1024);
+        let output = result.output.as_deref().expect("grep output");
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert!(result.truncated);
+        assert!(output.len() <= 1024 * 1024 + 128);
+        assert!(output.contains("bytes of output omitted"));
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {

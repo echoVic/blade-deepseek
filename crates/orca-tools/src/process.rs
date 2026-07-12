@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
+use orca_core::retained_output::{
+    DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
+};
 
-pub const DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM: usize = 1024 * 1024;
-const PROCESS_OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
+pub const DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM: usize = DEFAULT_RETAINED_OUTPUT_BYTES;
 
 pub struct CommandOutput {
     pub stdout: Vec<u8>,
@@ -20,6 +21,47 @@ pub struct CommandOutput {
     pub stderr_omitted_bytes: usize,
     pub status: ExitStatus,
     pub timed_out: bool,
+}
+
+impl CommandOutput {
+    pub fn stdout_text(&self) -> String {
+        render_retained_text(&self.stdout, self.stdout_omitted_bytes)
+    }
+
+    pub fn stderr_text(&self) -> String {
+        render_retained_text(&self.stderr, self.stderr_omitted_bytes)
+    }
+
+    pub fn output_was_omitted(&self) -> bool {
+        self.stdout_omitted_bytes > 0 || self.stderr_omitted_bytes > 0
+    }
+}
+
+fn render_retained_text(bytes: &[u8], omitted_bytes: usize) -> String {
+    if omitted_bytes == 0 {
+        return String::from_utf8_lossy(bytes).to_string();
+    }
+    let split = bytes.len().div_ceil(2);
+    format!(
+        "{}\n[{omitted_bytes} bytes of output omitted]\n{}",
+        String::from_utf8_lossy(&bytes[..split]),
+        String::from_utf8_lossy(&bytes[split..])
+    )
+}
+
+pub fn preserve_ingress_omission_notice(output: String, omitted_bytes: usize) -> String {
+    if omitted_bytes == 0 || output.contains("bytes of output omitted") {
+        return output;
+    }
+    let compacted = "\n[... tool output micro-compacted ...]\n";
+    let notice = format!(
+        "\n[{omitted_bytes} bytes of output omitted at ingress; retained output micro-compacted]\n"
+    );
+    if output.contains(compacted) {
+        output.replacen(compacted, &notice, 1)
+    } else {
+        format!("{output}{notice}")
+    }
 }
 
 pub fn wait_for_child_output_with_timeout(
@@ -48,6 +90,7 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
     should_cancel: impl Fn() -> bool,
     max_retained_bytes_per_stream: usize,
 ) -> io::Result<CommandOutput> {
+    let child_pid = child.id();
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => return child_setup_error(&mut child, "child process has no stdout"),
@@ -65,27 +108,40 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
         .unwrap_or_else(Instant::now);
     let mut timed_out = false;
 
+    let mut status = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Err(error) => {
-                kill_child_tree(&mut child);
-                let _ = child.wait();
-                break Err(error);
-            }
-            Ok(None) => {
-                if should_cancel() {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => status = Some(exit_status),
+                Err(error) => {
                     kill_child_tree(&mut child);
-                    break child.wait();
+                    let _ = child.wait();
+                    break Err(error);
                 }
-                if Instant::now() >= deadline {
-                    timed_out = true;
-                    kill_child_tree(&mut child);
-                    break child.wait();
-                }
-                thread::sleep(Duration::from_millis(50));
+                Ok(None) => {}
             }
         }
+        if status.is_some() && stdout_handle.is_finished() && stderr_handle.is_finished() {
+            break Ok(status.expect("completed child status"));
+        }
+        if should_cancel() {
+            kill_process_group_by_pid(child_pid);
+            if status.is_none() {
+                let _ = child.kill();
+                status = Some(child.wait()?);
+            }
+            break Ok(status.expect("cancelled child status"));
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            kill_process_group_by_pid(child_pid);
+            if status.is_none() {
+                let _ = child.kill();
+                status = Some(child.wait()?);
+            }
+            break Ok(status.expect("timed out child status"));
+        }
+        thread::sleep(Duration::from_millis(50));
     };
 
     let stdout = join_reader(stdout_handle, "stdout");
@@ -145,6 +201,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn inherited_pipe_descendant_cannot_extend_wait_past_deadline() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("(sleep 5) & printf parent-done")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        prepare_non_interactive_command(&mut command);
+        let child = command.spawn().expect("spawn shell with pipe descendant");
+        let start = Instant::now();
+
+        let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
+            child,
+            Duration::from_millis(200),
+            || false,
+            1024,
+        )
+        .expect("bounded wait");
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "reader join exceeded process deadline: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(output.stdout_text(), "parent-done");
+    }
+
+    #[test]
     fn reader_io_failure_is_returned() {
         struct FailingReader;
 
@@ -184,18 +269,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     max_retained_bytes: usize,
 ) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
-    thread::spawn(move || {
-        let mut output = RetainedOutput::new(max_retained_bytes);
-        let mut buffer = [0_u8; PROCESS_OUTPUT_READ_CHUNK_BYTES];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => return Ok(output.into_snapshot()),
-                Ok(read) => output.append(&buffer[..read]),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-    })
+    thread::spawn(move || read_to_retained(&mut reader, max_retained_bytes))
 }
 
 fn join_reader(
@@ -214,11 +288,15 @@ fn child_setup_error<T>(child: &mut Child, message: &str) -> io::Result<T> {
 }
 
 pub fn kill_child_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        kill_process_group(child.id());
-    }
+    kill_process_group_by_pid(child.id());
     let _ = child.kill();
+}
+
+fn kill_process_group_by_pid(pid: u32) {
+    #[cfg(unix)]
+    kill_process_group(pid);
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[cfg(unix)]

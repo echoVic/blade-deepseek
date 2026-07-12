@@ -1249,13 +1249,11 @@ impl AppState {
                         *existing_id = id.clone();
                         *existing_name = name.clone();
                         *existing_status = status.clone();
-                        if existing_output.is_none() || output.is_empty() {
-                            *existing_output = if output.is_empty() {
-                                None
-                            } else {
-                                Some(output.clone())
-                            };
-                        }
+                        *existing_output = if output.is_empty() {
+                            None
+                        } else {
+                            Some(output.clone())
+                        };
                         *existing_diff = diff.clone();
                         *existing_kind = kind.clone();
                     });
@@ -3017,6 +3015,36 @@ mod tests {
         }
         match &state.messages[1] {
             ChatMessage::ToolCall { output, .. } => assert!(output.is_none()),
+            other => panic!("expected tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completed_tool_event_replaces_live_preview_with_canonical_output() {
+        let mut state = state();
+
+        state.update(TuiEvent::ToolRequested {
+            id: "bash-preview".to_string(),
+            name: "bash".to_string(),
+            target: Some("printf output".to_string()),
+        });
+        state.update(TuiEvent::ToolOutputDelta {
+            id: "bash-preview".to_string(),
+            chunk: "live preview".to_string(),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "bash-preview".to_string(),
+            name: "bash".to_string(),
+            status: "completed".to_string(),
+            output: "canonical bounded output".to_string(),
+            diff: None,
+            kind: None,
+        });
+
+        match &state.messages[0] {
+            ChatMessage::ToolCall { output, .. } => {
+                assert_eq!(output.as_deref(), Some("canonical bounded output"));
+            }
             other => panic!("expected tool call, got {other:?}"),
         }
     }

@@ -1,13 +1,16 @@
-use std::io::{self, Read};
+use std::io;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
+
+use crate::retained_output::{
+    DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerificationResult {
@@ -47,16 +50,16 @@ fn run_with_timeout(command: &str, timeout: Duration) -> VerificationResult {
                 } else {
                     output.status.code()
                 },
-                stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                stdout: output.stdout_text().trim().to_string(),
                 stderr: if output.timed_out {
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let stderr = output.stderr_text().trim().to_string();
                     if stderr.is_empty() {
                         format!("verifier timed out after {}s", timeout.as_secs())
                     } else {
                         format!("verifier timed out after {}s: {stderr}", timeout.as_secs())
                     }
                 } else {
-                    String::from_utf8_lossy(&output.stderr).trim().to_string()
+                    output.stderr_text().trim().to_string()
                 },
             },
             Err(error) => VerificationResult {
@@ -78,16 +81,27 @@ fn run_with_timeout(command: &str, timeout: Duration) -> VerificationResult {
 }
 
 struct CommandOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: RetainedOutputSnapshot,
+    stderr: RetainedOutputSnapshot,
     status: ExitStatus,
     timed_out: bool,
+}
+
+impl CommandOutput {
+    fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout.rendered_bytes()).to_string()
+    }
+
+    fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.rendered_bytes()).to_string()
+    }
 }
 
 fn wait_for_child_output_with_timeout(
     mut child: Child,
     timeout: Duration,
 ) -> io::Result<CommandOutput> {
+    let child_pid = child.id();
     let stdout = child
         .stdout
         .take()
@@ -96,71 +110,65 @@ fn wait_for_child_output_with_timeout(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("child process has no stderr"))?;
-
-    let stdout_buf = Arc::new(Mutex::new(Some(Vec::new())));
-    let stderr_buf = Arc::new(Mutex::new(Some(Vec::new())));
-    let stdout_handle = spawn_reader(stdout, Arc::clone(&stdout_buf));
-    let stderr_handle = spawn_reader(stderr, Arc::clone(&stderr_buf));
-
-    let deadline = Instant::now()
+    let stdout_handle =
+        thread::spawn(move || read_to_retained(stdout, DEFAULT_RETAINED_OUTPUT_BYTES));
+    let stderr_handle =
+        thread::spawn(move || read_to_retained(stderr, DEFAULT_RETAINED_OUTPUT_BYTES));
+    let deadline = std::time::Instant::now()
         .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
+        .unwrap_or_else(std::time::Instant::now);
     let mut timed_out = false;
+    let mut status = None;
     let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => {
-                if Instant::now() >= deadline {
-                    timed_out = true;
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => status = Some(exit_status),
+                Ok(None) => {}
+                Err(error) => {
                     kill_child_tree(&mut child);
-                    break child.wait()?;
+                    let _ = child.wait();
+                    break Err(error);
                 }
-                thread::sleep(Duration::from_millis(50));
             }
         }
+        if status.is_some() && stdout_handle.is_finished() && stderr_handle.is_finished() {
+            break Ok(status.expect("completed verifier status"));
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            kill_process_group_by_pid(child_pid);
+            if status.is_none() {
+                let _ = child.kill();
+                status = Some(child.wait()?);
+            }
+            break Ok(status.expect("timed out verifier status"));
+        }
+        thread::sleep(Duration::from_millis(50));
     };
-
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
-
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| io::Error::other("verifier stdout reader panicked"))??;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| io::Error::other("verifier stderr reader panicked"))??;
     Ok(CommandOutput {
-        stdout: take_buffer(stdout_buf),
-        stderr: take_buffer(stderr_buf),
-        status,
+        stdout,
+        stderr,
+        status: status?,
         timed_out,
     })
 }
 
-fn spawn_reader<R: Read + Send + 'static>(
-    mut reader: R,
-    buffer: Arc<Mutex<Option<Vec<u8>>>>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut data = Vec::new();
-        let _ = reader.read_to_end(&mut data);
-        if let Ok(mut slot) = buffer.lock() {
-            *slot = Some(data);
-        }
-    })
-}
-
-fn take_buffer(buffer: Arc<Mutex<Option<Vec<u8>>>>) -> Vec<u8> {
-    match Arc::try_unwrap(buffer) {
-        Ok(mutex) => mutex.into_inner().ok().flatten().unwrap_or_default(),
-        Err(buffer) => buffer
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .unwrap_or_default(),
-    }
-}
-
 fn kill_child_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        kill_process_group(child.id());
-    }
+    kill_process_group_by_pid(child.id());
     let _ = child.kill();
+}
+
+fn kill_process_group_by_pid(pid: u32) {
+    #[cfg(unix)]
+    kill_process_group(pid);
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[cfg(unix)]
@@ -168,16 +176,13 @@ fn kill_process_group(pid: u32) {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
-
-    const SIGTERM: i32 = 15;
-    const SIGKILL: i32 = 9;
     let pgid = -(pid as i32);
     unsafe {
-        let _ = kill(pgid, SIGTERM);
+        let _ = kill(pgid, 15);
     }
     thread::sleep(Duration::from_millis(50));
     unsafe {
-        let _ = kill(pgid, SIGKILL);
+        let _ = kill(pgid, 9);
     }
 }
 
@@ -202,5 +207,33 @@ mod tests {
         assert!(!result.success);
         assert!(result.stderr.contains("timed out"), "{result:?}");
         assert_eq!(result.stdout, "before");
+    }
+
+    #[test]
+    fn verifier_output_is_bounded_at_ingress() {
+        let result = run("printf HEAD; yes x | tr -d '\\n' | head -c 2097144; printf TAIL");
+
+        assert!(result.success, "{}", result.stderr);
+        assert!(result.stdout.len() <= 1024 * 1024 + 128);
+        assert!(result.stdout.starts_with("HEAD"));
+        assert!(result.stdout.ends_with("TAIL"));
+        assert!(result.stdout.contains("omitted"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inherited_pipe_descendant_cannot_extend_verifier_deadline() {
+        let start = Instant::now();
+
+        let result = run_with_timeout("(sleep 5) & printf parent-done", Duration::from_millis(200));
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "verifier reader join exceeded deadline: {:?}",
+            start.elapsed()
+        );
+        assert!(!result.success);
+        assert_eq!(result.stdout, "parent-done");
+        assert!(result.stderr.contains("timed out"), "{result:?}");
     }
 }

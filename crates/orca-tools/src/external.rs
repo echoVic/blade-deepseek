@@ -141,7 +141,7 @@ pub fn execute_external_tool_with_policy_or_cancel(
         if let Err(error) = stdin.write_all(args.as_bytes()) {
             process::kill_child_tree(&mut child);
             let exit_code = child.wait().ok().and_then(|status| status.code());
-            return ToolResult::failed_after_start(
+            return ToolResult::failed(
                 request,
                 format!(
                     "external tool '{}' failed to receive input: {error}",
@@ -167,8 +167,9 @@ pub fn execute_external_tool_with_policy_or_cancel(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let ingress_truncated = output.output_was_omitted();
+    let stdout = output.stdout_text();
+    let stderr = output.stderr_text().trim().to_string();
     if should_cancel() {
         let detail = if stderr.is_empty() {
             stdout.trim().to_string()
@@ -186,8 +187,10 @@ pub fn execute_external_tool_with_policy_or_cancel(
         );
     }
     if output.status.success() && !output.timed_out {
-        let (output, truncated) = truncate_output_with_policy(stdout, output_truncation);
-        return ToolResult::completed(request, output, truncated);
+        let (result_output, truncated) = truncate_output_with_policy(stdout, output_truncation);
+        let result_output =
+            process::preserve_ingress_omission_notice(result_output, output.stdout_omitted_bytes);
+        return ToolResult::completed(request, result_output, ingress_truncated || truncated);
     }
 
     let detail = if stderr.is_empty() {
@@ -195,7 +198,7 @@ pub fn execute_external_tool_with_policy_or_cancel(
     } else {
         stderr
     };
-    ToolResult::failed(
+    let mut result = ToolResult::failed(
         request,
         if output.timed_out {
             if detail.is_empty() {
@@ -227,7 +230,9 @@ pub fn execute_external_tool_with_policy_or_cancel(
         } else {
             output.status.code()
         },
-    )
+    );
+    result.truncated = ingress_truncated;
+    result
 }
 
 fn is_valid_tool_name(name: &str) -> bool {

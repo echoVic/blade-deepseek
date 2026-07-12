@@ -1,8 +1,9 @@
+use orca_core::retained_output::RetainedOutput;
+use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use std::{io::BufRead, io::BufReader};
 
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
@@ -93,12 +94,9 @@ pub fn execute_with_policy_roots_or_cancel(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr)
-        .trim_end()
-        .to_string();
+    let ingress_truncated = output.output_was_omitted();
+    let stdout = output.stdout_text().trim_end().to_string();
+    let stderr = output.stderr_text().trim_end().to_string();
     if should_cancel() {
         let message = if stderr.is_empty() && stdout.is_empty() {
             "shell command cancelled".to_string()
@@ -110,14 +108,21 @@ pub fn execute_with_policy_roots_or_cancel(
             format!("shell command cancelled: {stdout}\n{stderr}")
         };
         let (message, truncated) = truncate_output_with_policy(message, output_truncation);
+        let message = process::preserve_ingress_omission_notice(
+            message,
+            output
+                .stdout_omitted_bytes
+                .saturating_add(output.stderr_omitted_bytes),
+        );
         let mut result = ToolResult::failed(request, message, output.status.code());
-        result.truncated = truncated;
+        result.truncated = ingress_truncated || truncated;
         return result;
     }
     let timed_out = output.timed_out;
     if output.status.success() && !timed_out {
         let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
-        return ToolResult::completed(request, stdout, truncated);
+        let stdout = process::preserve_ingress_omission_notice(stdout, output.stdout_omitted_bytes);
+        return ToolResult::completed(request, stdout, ingress_truncated || truncated);
     }
 
     let message = if timed_out {
@@ -147,6 +152,12 @@ pub fn execute_with_policy_roots_or_cancel(
         format!("{stdout}\n{stderr}")
     };
     let (message, truncated) = truncate_output_with_policy(message, output_truncation);
+    let message = process::preserve_ingress_omission_notice(
+        message,
+        output
+            .stdout_omitted_bytes
+            .saturating_add(output.stderr_omitted_bytes),
+    );
     let mut result = ToolResult::failed(
         request,
         message,
@@ -156,14 +167,18 @@ pub fn execute_with_policy_roots_or_cancel(
             output.status.code()
         },
     );
-    result.truncated = truncated;
+    result.truncated = ingress_truncated || truncated;
     result
 }
 
 enum StreamEvent {
-    Stdout(String),
-    Stderr(String),
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
 }
+
+const STREAM_OUTPUT_CHANNEL_CAPACITY: usize = 8;
+const STREAM_OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
+const STREAM_LIVE_PREVIEW_BYTES: usize = orca_core::tool_types::MAX_TOOL_OUTPUT_BYTES;
 
 pub fn execute_streaming(
     request: &ToolRequest,
@@ -268,29 +283,20 @@ pub fn execute_streaming_command_or_cancel(
             );
         }
     };
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(STREAM_OUTPUT_CHANNEL_CAPACITY);
     let stdout_handle = child.stdout.take().map(|stdout| {
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = tx.send(StreamEvent::Stdout(format!("{line}\n")));
-            }
-        })
+        std::thread::spawn(move || stream_pipe(stdout, tx, StreamEvent::Stdout))
     });
     let stderr_handle = child.stderr.take().map(|stderr| {
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = tx.send(StreamEvent::Stderr(format!("{line}\n")));
-            }
-        })
+        std::thread::spawn(move || stream_pipe(stderr, tx, StreamEvent::Stderr))
     });
     drop(tx);
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+    let mut stdout = RetainedOutput::new(process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM);
+    let mut stderr = RetainedOutput::new(process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM);
+    let mut preview_remaining = STREAM_LIVE_PREVIEW_BYTES;
     let deadline = Instant::now()
         .checked_add(shell_timeout)
         .unwrap_or_else(Instant::now);
@@ -299,12 +305,12 @@ pub fn execute_streaming_command_or_cancel(
     let status = loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(StreamEvent::Stdout(chunk)) => {
-                on_output(&chunk);
-                stdout.push_str(&chunk);
+                emit_live_preview(&chunk, &mut preview_remaining, on_output);
+                stdout.append(&chunk);
             }
             Ok(StreamEvent::Stderr(chunk)) => {
-                on_output(&chunk);
-                stderr.push_str(&chunk);
+                emit_live_preview(&chunk, &mut preview_remaining, on_output);
+                stderr.append(&chunk);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => match child.wait() {
@@ -348,30 +354,40 @@ pub fn execute_streaming_command_or_cancel(
         }
     };
 
-    if let Some(handle) = stdout_handle {
-        let _ = handle.join();
-    }
-    if let Some(handle) = stderr_handle {
-        let _ = handle.join();
-    }
+    let stdout_reader = join_stream_reader(stdout_handle, "stdout");
+    let stderr_reader = join_stream_reader(stderr_handle, "stderr");
     while let Ok(event) = rx.try_recv() {
         match event {
             StreamEvent::Stdout(chunk) => {
-                on_output(&chunk);
-                stdout.push_str(&chunk);
+                emit_live_preview(&chunk, &mut preview_remaining, on_output);
+                stdout.append(&chunk);
             }
             StreamEvent::Stderr(chunk) => {
-                on_output(&chunk);
-                stderr.push_str(&chunk);
+                emit_live_preview(&chunk, &mut preview_remaining, on_output);
+                stderr.append(&chunk);
             }
         }
     }
 
-    let stdout = stdout.trim_end().to_string();
-    let stderr = stderr.trim_end().to_string();
+    if let Err(error) = stdout_reader.and(stderr_reader) {
+        return ToolResult::failed(request, error, status.code());
+    }
+
+    let stdout = stdout.into_snapshot();
+    let stderr = stderr.into_snapshot();
+    let stdout_omitted_bytes = stdout.omitted_bytes;
+    let stderr_omitted_bytes = stderr.omitted_bytes;
+    let ingress_truncated = stdout.is_truncated() || stderr.is_truncated();
+    let stdout = String::from_utf8_lossy(&stdout.rendered_bytes())
+        .trim_end()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&stderr.rendered_bytes())
+        .trim_end()
+        .to_string();
     if status.success() && !timed_out && !cancelled {
         let (stdout, truncated) = truncate_output_with_policy(stdout, output_truncation);
-        ToolResult::completed(request, stdout, truncated)
+        let stdout = process::preserve_ingress_omission_notice(stdout, stdout_omitted_bytes);
+        ToolResult::completed(request, stdout, ingress_truncated || truncated)
     } else {
         let message = if cancelled {
             cancelled_message(&stdout, &stderr)
@@ -385,9 +401,57 @@ pub fn execute_streaming_command_or_cancel(
             format!("{stdout}\n{stderr}")
         };
         let (message, truncated) = truncate_output_with_policy(message, output_truncation);
+        let message = process::preserve_ingress_omission_notice(
+            message,
+            stdout_omitted_bytes.saturating_add(stderr_omitted_bytes),
+        );
         let mut result = ToolResult::failed(request, message, status.code());
-        result.truncated = truncated;
+        result.truncated = ingress_truncated || truncated;
         result
+    }
+}
+
+fn stream_pipe(
+    mut pipe: impl Read,
+    tx: mpsc::SyncSender<StreamEvent>,
+    event: fn(Vec<u8>) -> StreamEvent,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; STREAM_OUTPUT_READ_CHUNK_BYTES];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => {
+                if tx.send(event(buffer[..read].to_vec())).is_err() {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn join_stream_reader(
+    handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stream: &str,
+) -> Result<(), String> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    handle
+        .join()
+        .map_err(|_| format!("{stream} reader thread panicked"))?
+        .map_err(|error| format!("failed to read shell {stream}: {error}"))
+}
+
+fn emit_live_preview(bytes: &[u8], remaining: &mut usize, on_output: &mut dyn FnMut(&str)) {
+    if *remaining == 0 {
+        return;
+    }
+    let admitted = bytes.len().min(*remaining);
+    if admitted > 0 {
+        on_output(&String::from_utf8_lossy(&bytes[..admitted]));
+        *remaining -= admitted;
     }
 }
 
@@ -427,6 +491,25 @@ fn timeout_message(shell_timeout: Duration, stdout: &str, stderr: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_reader_io_failure_is_returned() {
+        let handle = std::thread::spawn(|| Err(std::io::Error::other("reader failed")));
+
+        let error = join_stream_reader(Some(handle), "stdout").unwrap_err();
+
+        assert!(error.contains("failed to read shell stdout"));
+        assert!(error.contains("reader failed"));
+    }
+
+    #[test]
+    fn streaming_reader_panic_is_returned() {
+        let handle = std::thread::spawn(|| -> std::io::Result<()> { panic!("reader panicked") });
+
+        let error = join_stream_reader(Some(handle), "stderr").unwrap_err();
+
+        assert!(error.contains("stderr reader thread panicked"));
+    }
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{ToolName, ToolStatus};
     use std::sync::{
@@ -460,6 +543,42 @@ mod tests {
         let joined = chunks.join("");
         assert!(joined.contains("one\n"), "expected stdout in chunks");
         assert!(joined.contains("two\n"), "expected stdout in chunks");
+    }
+
+    #[test]
+    fn streaming_large_unterminated_output_is_bounded_before_result_truncation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let logical_bytes = process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM * 2;
+        let request = bash_request(&format!(
+            "printf HEAD; yes x | tr -d '\\n' | head -c {}; printf TAIL",
+            logical_bytes - 8
+        ));
+        let mut streamed_bytes = 0usize;
+
+        let result = execute_streaming_with_policy(
+            &request,
+            dir.path(),
+            ToolOutputTruncation::bytes(4096),
+            Duration::from_secs(10),
+            &mut |chunk| streamed_bytes = streamed_bytes.saturating_add(chunk.len()),
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert!(result.truncated);
+        let output = result.output.as_deref().expect("bounded output");
+        assert!(
+            output.starts_with("HEAD"),
+            "missing stable prefix: {output}"
+        );
+        assert!(output.ends_with("TAIL"), "missing rolling suffix: {output}");
+        assert!(
+            output.contains("omitted"),
+            "missing omission marker: {output}"
+        );
+        assert!(
+            streamed_bytes <= process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
+            "live callback admitted {streamed_bytes} bytes"
+        );
     }
 
     #[test]
