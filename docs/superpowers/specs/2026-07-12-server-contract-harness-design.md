@@ -40,29 +40,51 @@ Introduce one test-only `ServerTestClient` boundary that owns:
 
 - the Orca server child process and its isolated `ORCA_HOME`;
 - server stdin;
-- a stdout reader worker;
-- a bounded event channel;
+- nonblocking stdout and stderr reader workers;
+- a bounded line inbox and bounded unmatched-event queue;
+- bounded raw stdout and stderr captures;
 - the recent protocol/noise transcript used for diagnostics;
 - the default event deadline;
 - graceful shutdown and forced process-group cleanup.
 
-The stdout worker is the only blocking reader. Test threads receive parsed
-events with `recv_timeout`, so every protocol wait has a deadline independent
-of whether the child remains alive with stdout open.
+The reader workers continuously drain both pipes. On Unix they use nonblocking
+file descriptors and a cleanup stop token, so a descendant that keeps a pipe
+open cannot make reader joining unbounded. Test threads receive lines with a
+condition-variable deadline, then parse protocol events on the test thread.
+Every wait therefore has a deadline independent of whether the child remains
+alive with stdout open.
 
-`ServerTestClient::wait_for` accepts a typed expectation containing request id,
-event name, and optional event predicate. It returns the matching event or a
-structured test error. While waiting, it must fail immediately when the same
-request reaches a terminal state that makes the expectation impossible.
+Events for another request id remain queued for later expectations. Events for
+the request currently being observed are consumed as progress, while a same
+name event that misses an explicit predicate remains queued, except terminal
+`turn_completed` and `error` events whose predicate mismatch makes the
+expectation impossible. Queue and capture overflow are visible reader failures
+rather than silent event loss or blocked pipe draining.
+
+`ServerTestClient::wait_for_event*` accepts a request id, event name, and an
+optional event predicate. It returns the matching event or a structured test
+error. The explicit `drain_events_until_*` APIs are the only helpers allowed to
+consume the global stream rather than preserve unrelated request ids. While
+waiting, the client fails immediately when the same request reaches a terminal
+state that makes the expectation impossible.
 
 At minimum, these are impossible terminals:
 
-- matching `error` before any different expected event;
+- matching `error` before a different request/response event;
 - matching `turn_completed` before an expected turn-scoped interaction or tool
   event;
-- matching failed/cancelled/indeterminate `tool_completed` before a permission
-  request that execution would have produced;
 - stdout EOF or reader failure.
+
+The runtime also projects recoverable session hooks, turn hooks,
+plan-rendering, memory, and similar warnings as `error` events on the same
+request id. Some can occur before `turn_started`. Therefore an `error` does not
+preclude `turn_completed`; the actual turn terminal remains authoritative. It
+still precludes a different request/response expectation. Likewise, a failed
+tool event alone is not a turn terminal because a multi-tool turn may still
+produce a permission request for a sibling invocation. The harness waits for
+the request-id-scoped `turn_completed` before declaring a later turn
+interaction impossible. This still fails the incident path promptly and
+preserves preceding warning and failed-tool details in the transcript.
 
 The error includes the expectation, terminal reason, child status when known,
 and bounded recent protocol/noise lines.
@@ -74,9 +96,19 @@ use one idempotent path:
 
 1. close server stdin;
 2. wait for a short graceful-exit deadline;
-3. if still alive, signal the owned process group;
-4. wait for the child so it cannot become a zombie;
-5. join the stdout worker after the child closes stdout.
+3. if still alive, send `SIGTERM` to the owned process group and wait for a
+   bounded grace period;
+4. send `SIGKILL` to the process group when needed, kill the direct child as a
+   fallback, and wait so it cannot become a zombie;
+5. wait briefly for pipe EOF, then request both nonblocking readers to stop;
+6. record a bounded stop-observation timeout as a cleanup error, but still join
+   both owned reader threads so no harness worker can detach.
+
+On macOS, signalling a process group whose only remaining member is the
+unreaped zombie leader returns `EPERM`. The cleanup path ignores that one
+kernel-confirmed empty-group case. `EPERM` remains a cleanup failure whenever
+the group still contains another process, so an unkillable descendant cannot
+be reported as successfully reclaimed.
 
 No test failure or panic may leave the direct Orca server child alive. This
 test boundary does not claim to replace the production `ProcessSupervisor`
@@ -93,7 +125,8 @@ calling private server functions.
 ## Migration
 
 1. Add RED unit coverage for deadline diagnostics, impossible-terminal
-   detection, and idempotent child cleanup.
+   detection, unmatched-event preservation, cancellation ordering, and
+   idempotent child cleanup.
 2. Introduce `tests/support/server_test_client.rs` without changing production
    code.
 3. Migrate the two network-permission turn tests that exposed the defect.
@@ -102,6 +135,11 @@ calling private server functions.
    deadline.
 5. Delete `OrcaChild`, direct `BufReader<ChildStdout>` event loops, and the old
    unbounded `read_until_*` helpers once their final caller moves.
+
+The macOS Seatbelt filesystem fixtures must be created outside `/tmp` and
+`$TMPDIR`, because workspace-write profiles intentionally grant those temporary
+roots. Otherwise a worktree under `/private/tmp` can make a deny assertion pass
+through the wrong policy path.
 
 The final state must not retain two long-term event-reading implementations.
 If a raw byte-oriented test genuinely needs direct stdout access, it must use a
@@ -112,8 +150,9 @@ insufficient.
 
 1. Waiting for a missing event fails within the configured deadline and prints
    bounded observed events.
-2. A matching `error`, failed tool terminal, or completed turn fails an
-   impossible expectation immediately rather than waiting for timeout.
+2. A request-level `error` fails a different expectation immediately, but does
+   not preclude `turn_completed`; a completed turn fails an impossible later
+   turn expectation without waiting for timeout.
 3. Dropping a client with an open server process closes, kills if needed, waits,
    and joins without leaving the direct child alive.
 4. The previously hanging network-profile test either observes the expected

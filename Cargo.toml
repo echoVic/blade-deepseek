@@ -68,3 +68,4 @@ similar = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 base64 = { workspace = true }
+libc = "0.2"

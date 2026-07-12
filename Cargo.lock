@@ -141,6 +141,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "libc",
  "orca-approval",
  "orca-core",
  "orca-mcp",

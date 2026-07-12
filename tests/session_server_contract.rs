@@ -1,9 +1,8 @@
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -11,6 +10,11 @@ use base64::engine::general_purpose::STANDARD;
 use orca_runtime::history::SessionStore;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
+
+#[path = "support/server_test_client.rs"]
+mod server_test_client;
+
+use server_test_client::ServerTestClient;
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -56,44 +60,12 @@ impl OrcaCommand {
         self
     }
 
-    fn spawn(&mut self) -> std::io::Result<OrcaChild> {
-        let child = self.command.spawn()?;
-        Ok(OrcaChild {
-            child: Some(child),
-            _home: self.home.take(),
-        })
+    fn spawn(&mut self) -> std::io::Result<ServerTestClient> {
+        ServerTestClient::spawn(&mut self.command, self.home.take())
     }
 
     fn get_envs(&self) -> std::process::CommandEnvs<'_> {
         self.command.get_envs()
-    }
-}
-
-struct OrcaChild {
-    child: Option<Child>,
-    _home: Option<TempDir>,
-}
-
-impl OrcaChild {
-    fn wait_with_output(mut self) -> std::io::Result<Output> {
-        self.child
-            .take()
-            .expect("orca child must be available")
-            .wait_with_output()
-    }
-}
-
-impl Deref for OrcaChild {
-    type Target = Child;
-
-    fn deref(&self) -> &Self::Target {
-        self.child.as_ref().expect("orca child must be available")
-    }
-}
-
-impl DerefMut for OrcaChild {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.child.as_mut().expect("orca child must be available")
     }
 }
 
@@ -138,7 +110,7 @@ fn server_mode_accepts_submit_and_streams_protocol_events() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":1,"op":"submit","prompt":"hello from server"}}"#
@@ -177,7 +149,7 @@ fn server_mode_accepts_turn_start_method_and_streams_protocol_events() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"req-1","method":"turn/start","params":{{"input":[{{"type":"text","text":"hello from turn start"}}]}}}}"#
@@ -215,7 +187,7 @@ fn server_mode_streams_agent_message_item_lifecycle() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"req-1","method":"turn/start","params":{{"input":[{{"type":"text","text":"hello item stream"}}]}}}}"#
@@ -267,7 +239,7 @@ fn server_mode_streams_reasoning_item_lifecycle() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"req-1","method":"turn/start","params":{{"input":[{{"type":"text","text":"hello reasoning item stream"}}]}}}}"#
@@ -335,7 +307,7 @@ fn server_mode_streams_tool_call_item_lifecycle() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"req-1","method":"turn/start","params":{{"input":[{{"type":"text","text":"bash printf hi"}}]}}}}"#
@@ -405,7 +377,7 @@ fn server_mode_streams_file_change_item_lifecycle_for_edit() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"edit-req","method":"turn/start","params":{{"input":[{{"type":"text","text":"edit note.txt :: hello => hi"}}]}}}}"#
@@ -457,7 +429,7 @@ fn server_mode_streams_plan_updated_notification() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"req-1","method":"turn/start","params":{{"input":[{{"type":"text","text":"plan implementing todo support"}}]}}}}"#
@@ -541,7 +513,7 @@ schema = { env = { type = "string", description = "environment" } }
             .expect("spawn orca server");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"req-1","method":"turn/start","params":{{"input":[{{"type":"text","text":"external deploy {{\"env\":\"staging\"}}"}}]}}}}"#
@@ -636,10 +608,9 @@ schema = { env = { type = "string", description = "environment" } }
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -647,14 +618,14 @@ schema = { env = { type = "string", description = "environment" } }
             .expect("write thread/start request");
             stdin.flush().expect("flush thread/start request");
         }
-        let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+        let thread_started = child.expect_event("thread-req", "thread_started");
         let thread_id = thread_started["threadId"]
             .as_str()
             .expect("thread id")
             .to_string();
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"external deploy {{\"env\":\"staging\"}}"}}]}}}}"#,
@@ -663,10 +634,10 @@ schema = { env = { type = "string", description = "environment" } }
             .expect("write failing external turn");
             stdin.flush().expect("flush failing external turn");
         }
-        read_until_event(&mut stdout, "turn-1", "turn_completed");
+        child.expect_event("turn-1", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"items","method":"thread/items/list","params":{{"threadId":"{}","limit":10}}}}"#,
@@ -674,9 +645,9 @@ schema = { env = { type = "string", description = "environment" } }
             )
             .expect("write thread/items/list");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let items = read_until_event(&mut stdout, "items", "thread_items_list");
+        let items = child.expect_event("items", "thread_items_list");
         let item_data = items["data"].as_array().expect("thread items data");
         let external_item = item_data
             .iter()
@@ -720,10 +691,9 @@ fn server_mode_streams_workflow_item_lifecycle() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"workflow-turn","method":"turn/start","params":{{"input":[{{"type":"text","text":"workflow inline"}}]}}}}"#
@@ -732,7 +702,7 @@ fn server_mode_streams_workflow_item_lifecycle() {
         stdin.flush().expect("flush workflow turn");
     }
 
-    let events = read_events_until_workflow_item_completed(&mut stdout, "workflow-turn");
+    let events = read_events_until_workflow_item_completed(&mut child, "workflow-turn");
     let started = events
         .iter()
         .find(|event| event["event"] == "item_started" && event["item"]["type"] == "workflow")
@@ -760,7 +730,7 @@ fn server_mode_streams_workflow_item_lifecycle() {
                 .is_some_and(|result| result.contains("Workflow completed"))
     }));
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(
@@ -781,7 +751,7 @@ fn server_mode_streams_proposed_plan_item_lifecycle() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"req-1","method":"turn/start","params":{{"input":[{{"type":"text","text":"mock_proposed_plan"}}]}}}}"#
@@ -838,7 +808,7 @@ fn server_mode_accepts_thread_start_method_and_returns_thread_event() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -872,7 +842,7 @@ fn server_mode_accepts_idle_turn_control_methods() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt","method":"turn/interrupt","params":{{"turnId":"turn-missing"}}}}"#
@@ -936,10 +906,8 @@ fn server_mode_interrupts_active_thread_turn_before_completion() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -947,11 +915,11 @@ fn server_mode_interrupts_active_thread_turn_before_completion() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-slow","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"slow active turn"}}]}}}}"#,
@@ -960,7 +928,7 @@ fn server_mode_interrupts_active_thread_turn_before_completion() {
         .expect("write slow turn");
         stdin.flush().expect("flush slow turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-slow", "turn_started");
+    let turn_started = child.expect_event("turn-slow", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
@@ -968,7 +936,7 @@ fn server_mode_interrupts_active_thread_turn_before_completion() {
 
     let interrupt_sent_at = Instant::now();
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-active","method":"turn/interrupt","params":{{"turnId":"{}"}}}}"#,
@@ -978,7 +946,7 @@ fn server_mode_interrupts_active_thread_turn_before_completion() {
         stdin.flush().expect("flush turn/interrupt");
     }
 
-    let interrupt = read_until_event(&mut stdout, "interrupt-active", "turn_controlled");
+    let interrupt = child.expect_event("interrupt-active", "turn_controlled");
     assert!(
         interrupt_sent_at.elapsed() < Duration::from_millis(500),
         "interrupt was not handled while turn was active"
@@ -987,8 +955,8 @@ fn server_mode_interrupts_active_thread_turn_before_completion() {
     assert_eq!(interrupt["turnId"], turn_id);
     assert_eq!(interrupt["status"], "interrupted");
 
-    drop(child.stdin.take());
-    let completed = read_until_event(&mut stdout, "turn-slow", "turn_completed");
+    child.close_stdin();
+    let completed = child.expect_event("turn-slow", "turn_completed");
     assert_eq!(completed["status"], "cancelled");
 
     let output = child.wait_with_output().expect("wait for server");
@@ -1016,10 +984,8 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1027,11 +993,11 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-hook","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"cancel hook wait"}}]}}}}"#,
@@ -1040,14 +1006,14 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
         .expect("write hook turn");
         stdin.flush().expect("flush hook turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-hook", "turn_started");
+    let turn_started = child.expect_event("turn-hook", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-hook","method":"turn/interrupt","params":{{"turnId":"{}"}}}}"#,
@@ -1058,16 +1024,16 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
     }
 
     let interrupt_sent_at = Instant::now();
-    let interrupt = read_until_event(&mut stdout, "interrupt-hook", "turn_controlled");
+    let interrupt = child.expect_event("interrupt-hook", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
-    let completed = read_until_event(&mut stdout, "turn-hook", "turn_completed");
+    let completed = child.expect_event("turn-hook", "turn_completed");
     assert!(
         interrupt_sent_at.elapsed() < Duration::from_millis(1200),
         "turn completion waited for the full pre_model hook sleep"
     );
     assert_eq!(completed["status"], "cancelled");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(
@@ -1102,10 +1068,8 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1113,11 +1077,11 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-bash","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"bash printf before; sleep 5; printf after"}}]}}}}"#,
@@ -1126,16 +1090,16 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
         .expect("write bash turn");
         stdin.flush().expect("flush bash turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-bash", "turn_started");
+    let turn_started = child.expect_event("turn-bash", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
         .to_string();
-    let tool_requested = read_until_event(&mut stdout, "turn-bash", "tool_requested");
+    let tool_requested = child.expect_event("turn-bash", "tool_requested");
     assert_eq!(tool_requested["tool"], "bash");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-bash","method":"turn/interrupt","params":{{"turnId":"{}"}}}}"#,
@@ -1146,16 +1110,16 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
     }
 
     let interrupt_sent_at = Instant::now();
-    let interrupt = read_until_event(&mut stdout, "interrupt-bash", "turn_controlled");
+    let interrupt = child.expect_event("interrupt-bash", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
-    let completed = read_until_event(&mut stdout, "turn-bash", "turn_completed");
+    let completed = child.expect_event("turn-bash", "turn_completed");
     assert!(
         interrupt_sent_at.elapsed() < Duration::from_millis(1200),
         "turn completion waited for the full bash sleep"
     );
     assert_eq!(completed["status"], "cancelled");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -1164,7 +1128,7 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
 #[cfg(unix)]
 #[test]
 fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = lock_env();
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     let server = write_slow_mcp_server(workspace.path());
@@ -1192,10 +1156,8 @@ fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1203,11 +1165,11 @@ fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-mcp","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"mcp__slow__wait"}}]}}}}"#,
@@ -1216,16 +1178,16 @@ fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
         .expect("write MCP turn");
         stdin.flush().expect("flush MCP turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-mcp", "turn_started");
+    let turn_started = child.expect_event("turn-mcp", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
         .to_string();
-    let tool_requested = read_until_event(&mut stdout, "turn-mcp", "tool_requested");
+    let tool_requested = child.expect_event("turn-mcp", "tool_requested");
     assert_eq!(tool_requested["tool"], "mcp__slow__wait");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-mcp","method":"turn/interrupt","params":{{"turnId":"{}"}}}}"#,
@@ -1236,16 +1198,16 @@ fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
     }
 
     let interrupt_sent_at = Instant::now();
-    let interrupt = read_until_event(&mut stdout, "interrupt-mcp", "turn_controlled");
+    let interrupt = child.expect_event("interrupt-mcp", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
-    let completed = read_until_event(&mut stdout, "turn-mcp", "turn_completed");
+    let completed = child.expect_event("turn-mcp", "turn_completed");
     assert!(
         interrupt_sent_at.elapsed() < Duration::from_millis(1200),
         "turn completion waited for the full MCP tool sleep"
     );
     assert_eq!(completed["status"], "cancelled");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -1254,7 +1216,7 @@ fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
 #[cfg(unix)]
 #[test]
 fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = lock_env();
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     let server = write_eliciting_mcp_server(workspace.path());
@@ -1282,10 +1244,8 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1293,11 +1253,11 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-mcp-elicit","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"mock_stream_tool_delay_ms 0 mcp__slow__wait"}}]}}}}"#,
@@ -1306,12 +1266,12 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
         .expect("write MCP elicitation turn");
         stdin.flush().expect("flush MCP elicitation turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-mcp-elicit", "turn_started");
+    let turn_started = child.expect_event("turn-mcp-elicit", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
         .to_string();
-    let request = read_until_event(&mut stdout, "turn-mcp-elicit", "mcp_elicitation_request");
+    let request = child.expect_event("turn-mcp-elicit", "mcp_elicitation_request");
     assert_eq!(request["turnId"], turn_id);
     assert!(
         request["requestId"]
@@ -1321,7 +1281,7 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-mcp-elicit","method":"turn/interrupt","params":{{"turnId":"{}"}}}}"#,
@@ -1332,10 +1292,10 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
     }
 
     let interrupt_sent_at = Instant::now();
-    let interrupt =
-        read_until_event_or_matching_error(&mut stdout, "interrupt-mcp-elicit", "turn_controlled");
+    let interrupt = child.expect_event("interrupt-mcp-elicit", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
-    drop(child.stdin.take());
+    let completed = child.expect_event("turn-mcp-elicit", "turn_completed");
+    child.close_stdin();
     let output = wait_for_child_output_with_timeout(child, Duration::from_millis(1200))
         .expect("server should exit after interrupting pending MCP elicitation");
     assert!(
@@ -1343,17 +1303,6 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
         "turn completion waited for the MCP elicitation response"
     );
     assert!(output.stderr.is_empty());
-    let mut remaining_stdout = String::new();
-    stdout
-        .read_to_string(&mut remaining_stdout)
-        .expect("read remaining stdout");
-    let remaining_events = parse_jsonl(remaining_stdout.as_bytes());
-    let completed = remaining_events
-        .iter()
-        .find(|event| event["id"] == "turn-mcp-elicit" && event["event"] == "turn_completed")
-        .unwrap_or_else(|| {
-            panic!("turn should complete after interrupting pending MCP elicitation: {remaining_events:?}")
-        });
     assert_eq!(completed["status"], "cancelled");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -1361,7 +1310,7 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
 #[cfg(unix)]
 #[test]
 fn server_mode_mcp_tool_uses_configured_transport_timeout() {
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = lock_env();
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     let server = write_slow_mcp_server(workspace.path());
@@ -1390,9 +1339,8 @@ fn server_mode_mcp_tool_uses_configured_transport_timeout() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-timeout","method":"thread/start","params":{{}}}}"#
@@ -1400,11 +1348,11 @@ fn server_mode_mcp_tool_uses_configured_transport_timeout() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-timeout", "thread_started");
+    let thread_started = child.expect_event("thread-timeout", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-mcp-timeout","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"mcp__slow__wait"}}]}}}}"#,
@@ -1415,7 +1363,7 @@ fn server_mode_mcp_tool_uses_configured_transport_timeout() {
     }
 
     let started = Instant::now();
-    let events = read_events_until_event(&mut stdout, "turn-mcp-timeout", "turn_completed");
+    let events = child.drain_events_until_event("turn-mcp-timeout", "turn_completed");
     assert!(
         started.elapsed() < Duration::from_millis(4000),
         "MCP timeout path waited too long: {:?}",
@@ -1449,7 +1397,7 @@ fn server_mode_mcp_tool_uses_configured_transport_timeout() {
         "mcp item error did not include transport timeout: {mcp_item_completed}"
     );
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"mcp-items","method":"thread/items/list","params":{{"threadId":"{}","limit":10}}}}"#,
@@ -1458,7 +1406,7 @@ fn server_mode_mcp_tool_uses_configured_transport_timeout() {
         .expect("write thread/items/list");
         stdin.flush().expect("flush thread/items/list");
     }
-    let persisted_items = read_until_event(&mut stdout, "mcp-items", "thread_items_list");
+    let persisted_items = child.expect_event("mcp-items", "thread_items_list");
     let persisted_items_data = persisted_items["data"].as_array().expect("persisted items");
     let persisted_mcp_item = persisted_items_data
         .iter()
@@ -1488,7 +1436,7 @@ fn server_mode_mcp_tool_uses_configured_transport_timeout() {
         serde_json::json!({})
     );
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -1514,10 +1462,8 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1525,11 +1471,11 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-slow","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"resume active turn"}}]}}}}"#,
@@ -1538,14 +1484,14 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
         .expect("write slow turn");
         stdin.flush().expect("flush slow turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-slow", "turn_started");
+    let turn_started = child.expect_event("turn-slow", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-active","method":"turn/interrupt","params":{{"threadId":"{}","turnId":"{}"}}}}"#,
@@ -1561,13 +1507,13 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
         stdin.flush().expect("flush turn controls");
     }
 
-    let interrupt = read_until_event(&mut stdout, "interrupt-active", "turn_controlled");
+    let interrupt = child.expect_event("interrupt-active", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
-    let resume = read_until_event(&mut stdout, "resume-active", "turn_controlled");
+    let resume = child.expect_event("resume-active", "turn_controlled");
     assert_eq!(resume["status"], "resumed");
 
-    drop(child.stdin.take());
-    let completed = read_until_event(&mut stdout, "turn-slow", "turn_completed");
+    child.close_stdin();
+    let completed = child.expect_event("turn-slow", "turn_completed");
     assert_eq!(completed["status"], "success");
 
     let output = child.wait_with_output().expect("wait for server");
@@ -1595,10 +1541,8 @@ fn server_mode_steers_active_thread_turn_as_user_item() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1606,11 +1550,11 @@ fn server_mode_steers_active_thread_turn_as_user_item() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-slow","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"slow steerable turn"}}]}}}}"#,
@@ -1619,14 +1563,14 @@ fn server_mode_steers_active_thread_turn_as_user_item() {
         .expect("write slow turn");
         stdin.flush().expect("flush slow turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-slow", "turn_started");
+    let turn_started = child.expect_event("turn-slow", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"steer-active","method":"turn/steer","params":{{"threadId":"{}","turnId":"{}","input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -1636,14 +1580,14 @@ fn server_mode_steers_active_thread_turn_as_user_item() {
         stdin.flush().expect("flush turn/steer");
     }
 
-    let controlled = read_until_event(&mut stdout, "steer-active", "turn_controlled");
+    let controlled = child.expect_event("steer-active", "turn_controlled");
     assert_eq!(controlled["action"], "steer");
     assert_eq!(controlled["turnId"], turn_id);
     assert_eq!(controlled["status"], "steered");
     assert_eq!(controlled["input"], "mock_history_echo");
 
-    drop(child.stdin.take());
-    let remaining = read_events_until_event(&mut stdout, "turn-slow", "turn_completed");
+    child.close_stdin();
+    let remaining = child.drain_events_until_event("turn-slow", "turn_completed");
     let item_started = remaining
         .iter()
         .find(|event| event["id"] == "steer-active" && event["event"] == "item_started")
@@ -1694,10 +1638,8 @@ fn server_mode_steers_active_thread_turn_with_multi_text_input() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1705,11 +1647,11 @@ fn server_mode_steers_active_thread_turn_with_multi_text_input() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-slow","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"slow steerable turn"}}]}}}}"#,
@@ -1718,14 +1660,14 @@ fn server_mode_steers_active_thread_turn_with_multi_text_input() {
         .expect("write slow turn");
         stdin.flush().expect("flush slow turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-slow", "turn_started");
+    let turn_started = child.expect_event("turn-slow", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"steer-active","method":"turn/steer","params":{{"threadId":"{}","turnId":"{}","input":[{{"type":"text","text":"mock_history_echo"}},{{"type":"text","text":"second steer"}}]}}}}"#,
@@ -1735,12 +1677,12 @@ fn server_mode_steers_active_thread_turn_with_multi_text_input() {
         stdin.flush().expect("flush turn/steer");
     }
 
-    let controlled = read_until_event(&mut stdout, "steer-active", "turn_controlled");
+    let controlled = child.expect_event("steer-active", "turn_controlled");
     assert_eq!(controlled["status"], "steered");
     assert_eq!(controlled["input"], "mock_history_echo\nsecond steer");
 
-    drop(child.stdin.take());
-    let remaining = read_events_until_event(&mut stdout, "turn-slow", "turn_completed");
+    child.close_stdin();
+    let remaining = child.drain_events_until_event("turn-slow", "turn_completed");
     let item_started = remaining
         .iter()
         .find(|event| event["id"] == "steer-active" && event["event"] == "item_started")
@@ -1782,10 +1724,8 @@ fn server_mode_rejects_completed_turn_controls() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1793,11 +1733,11 @@ fn server_mode_rejects_completed_turn_controls() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-done","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"finish quickly"}}]}}}}"#,
@@ -1806,11 +1746,11 @@ fn server_mode_rejects_completed_turn_controls() {
         .expect("write completed turn");
         stdin.flush().expect("flush completed turn");
     }
-    let completed = read_until_event(&mut stdout, "turn-done", "turn_completed");
+    let completed = child.expect_event("turn-done", "turn_completed");
     assert_eq!(completed["status"], "success");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turns-after-done","method":"thread/turns/list","params":{{"threadId":"{}","limit":1}}}}"#,
@@ -1819,14 +1759,14 @@ fn server_mode_rejects_completed_turn_controls() {
         .expect("write turns list");
         stdin.flush().expect("flush turns list");
     }
-    let turns = read_until_event(&mut stdout, "turns-after-done", "thread_turns_list");
+    let turns = child.expect_event("turns-after-done", "thread_turns_list");
     let completed_turn_id = turns["data"][0]["turnId"]
         .as_str()
         .expect("completed turn id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-completed","method":"turn/interrupt","params":{{"turnId":"{}"}}}}"#,
@@ -1842,13 +1782,13 @@ fn server_mode_rejects_completed_turn_controls() {
         stdin.flush().expect("flush completed turn controls");
     }
 
-    drop(child.stdin.take());
-    let interrupt = read_until_event(&mut stdout, "interrupt-completed", "error");
+    child.close_stdin();
+    let interrupt = child.expect_event("interrupt-completed", "error");
     assert_eq!(
         interrupt["message"],
         format!("turn is not active: {completed_turn_id}")
     );
-    let steer = read_until_event(&mut stdout, "steer-completed", "error");
+    let steer = child.expect_event("steer-completed", "error");
     assert_eq!(
         steer["message"],
         format!("turn is not active: {completed_turn_id}")
@@ -1870,10 +1810,8 @@ fn server_mode_active_turn_id_matches_persisted_turn_id() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -1881,11 +1819,11 @@ fn server_mode_active_turn_id_matches_persisted_turn_id() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-one","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"persisted turn id contract"}}]}}}}"#,
@@ -1894,15 +1832,15 @@ fn server_mode_active_turn_id_matches_persisted_turn_id() {
         .expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-one", "turn_started");
+    let turn_started = child.expect_event("turn-one", "turn_started");
     let active_turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("active turn id")
         .to_string();
-    read_until_event(&mut stdout, "turn-one", "turn_completed");
+    child.expect_event("turn-one", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turns","method":"thread/turns/list","params":{{"threadId":"{}","limit":1}}}}"#,
@@ -1910,9 +1848,9 @@ fn server_mode_active_turn_id_matches_persisted_turn_id() {
         )
         .expect("write turns list");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let turns = read_until_event(&mut stdout, "turns", "thread_turns_list");
+    let turns = child.expect_event("turns", "thread_turns_list");
     let persisted_turn_id = turns["data"][0]["turnId"]
         .as_str()
         .expect("persisted turn id");
@@ -1943,10 +1881,8 @@ fn server_mode_rejects_turn_control_thread_mismatch() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-a","method":"thread/start","params":{{}}}}"#
@@ -1959,13 +1895,13 @@ fn server_mode_rejects_turn_control_thread_mismatch() {
         .expect("write thread b start");
         stdin.flush().expect("flush thread starts");
     }
-    let thread_a = read_until_event(&mut stdout, "thread-a", "thread_started");
-    let thread_b = read_until_event(&mut stdout, "thread-b", "thread_started");
+    let thread_a = child.expect_event("thread-a", "thread_started");
+    let thread_b = child.expect_event("thread-b", "thread_started");
     let thread_a_id = thread_a["threadId"].as_str().expect("thread a id");
     let thread_b_id = thread_b["threadId"].as_str().expect("thread b id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-a","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"slow on a"}}]}}}}"#,
@@ -1974,13 +1910,13 @@ fn server_mode_rejects_turn_control_thread_mismatch() {
         .expect("write thread a turn");
         stdin.flush().expect("flush thread a turn");
     }
-    let turn_started = read_until_event(&mut stdout, "turn-a", "turn_started");
+    let turn_started = child.expect_event("turn-a", "turn_started");
     let turn_id = turn_started["task"]["task_id"]
         .as_str()
         .expect("turn task id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"interrupt-mismatch","method":"turn/interrupt","params":{{"threadId":"{}","turnId":"{}"}}}}"#,
@@ -1990,15 +1926,15 @@ fn server_mode_rejects_turn_control_thread_mismatch() {
         stdin.flush().expect("flush mismatched interrupt");
     }
 
-    drop(child.stdin.take());
-    let error = read_until_event(&mut stdout, "interrupt-mismatch", "error");
+    child.close_stdin();
+    let error = child.expect_event("interrupt-mismatch", "error");
     assert_eq!(
         error["message"],
         format!("turn {turn_id} does not belong to thread {thread_b_id}")
     );
 
-    drop(child.stdin.take());
-    let completed = read_until_event(&mut stdout, "turn-a", "turn_completed");
+    child.close_stdin();
+    let completed = child.expect_event("turn-a", "turn_completed");
     assert_eq!(completed["status"], "success");
 
     let output = child.wait_with_output().expect("wait for server");
@@ -2023,10 +1959,8 @@ fn server_mode_controls_runtime_shell_session() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"read line; printf 'server:%s\\n' \"$line\"","description":"interactive server shell"}}}}"#
@@ -2035,7 +1969,7 @@ fn server_mode_controls_runtime_shell_session() {
         stdin.flush().expect("flush shell/start");
     }
 
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
     assert_eq!(started["status"], "running");
     assert_eq!(started["requestedTerminalMode"], "pipe");
@@ -2047,7 +1981,7 @@ fn server_mode_controls_runtime_shell_session() {
     assert!(started["taskId"].as_str().is_some_and(|id| !id.is_empty()));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-write","method":"shell/write","params":{{"shellId":"{}","input":"from-server\n"}}}}"#,
@@ -2056,12 +1990,12 @@ fn server_mode_controls_runtime_shell_session() {
         .expect("write shell/write");
         stdin.flush().expect("flush shell/write");
     }
-    let written = read_until_event(&mut stdout, "shell-write", "shell_updated");
+    let written = child.expect_event("shell-write", "shell_updated");
     assert_eq!(written["shellId"], shell_id);
     assert_eq!(written["status"], "running");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-close","method":"shell/close","params":{{"shellId":"{}"}}}}"#,
@@ -2070,7 +2004,7 @@ fn server_mode_controls_runtime_shell_session() {
         .expect("write shell/close");
         stdin.flush().expect("flush shell/close");
     }
-    let closed = read_until_event(&mut stdout, "shell-close", "shell_updated");
+    let closed = child.expect_event("shell-close", "shell_updated");
     assert_eq!(closed["status"], "stdin_closed");
 
     let mut read_events = Vec::new();
@@ -2078,7 +2012,7 @@ fn server_mode_controls_runtime_shell_session() {
     for attempt in 0.. {
         let request_id = format!("shell-read-{attempt}");
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"{}","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000}}}}"#,
@@ -2087,7 +2021,7 @@ fn server_mode_controls_runtime_shell_session() {
             .expect("write shell/read");
             stdin.flush().expect("flush shell/read");
         }
-        let events = read_events_until_shell_read_response(&mut stdout, &request_id);
+        let events = read_events_until_shell_read_response(&mut child, &request_id);
         let completed = events
             .iter()
             .any(|event| event["event"] == "shell_completed");
@@ -2101,7 +2035,7 @@ fn server_mode_controls_runtime_shell_session() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    drop(child.stdin.take());
+    child.close_stdin();
     assert!(
         read_events
             .iter()
@@ -2148,7 +2082,7 @@ fn server_mode_command_exec_returns_buffered_output() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'legacy-out'; printf 'legacy-err' >&2"],"tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#
@@ -2157,7 +2091,7 @@ fn server_mode_command_exec_returns_buffered_output() {
         stdin.flush().expect("flush command/exec");
     }
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -2197,7 +2131,7 @@ fn server_mode_command_exec_honors_cwd_and_env_overrides() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf '%s|%s|%s|%s' \"$PWD\" \"$ORCA_COMMAND_EXEC_BASE\" \"$ORCA_COMMAND_EXEC_EXTRA\" \"${{ORCA_COMMAND_EXEC_REMOVE-unset}}\""],"cwd":"{}","env":{{"ORCA_COMMAND_EXEC_BASE":"request","ORCA_COMMAND_EXEC_EXTRA":"added","ORCA_COMMAND_EXEC_REMOVE":null}},"tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#,
@@ -2207,7 +2141,7 @@ fn server_mode_command_exec_honors_cwd_and_env_overrides() {
         stdin.flush().expect("flush command/exec");
     }
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -2256,10 +2190,9 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -2267,14 +2200,14 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
             .expect("write thread/start");
             stdin.flush().expect("flush thread/start");
         }
-        let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+        let thread_started = child.expect_event("thread-req", "thread_started");
         let thread_id = thread_started["threadId"]
             .as_str()
             .expect("thread id")
             .to_string();
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"grant","method":"turn/start","params":{{"threadId":"{}","permissionUpdates":[{{"type":"addDirectories","destination":"session","directories":["{}"]}}],"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -2284,10 +2217,10 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
             .expect("write permission grant turn");
             stdin.flush().expect("flush permission grant turn");
         }
-        read_until_event(&mut stdout, "grant", "turn_completed");
+        child.expect_event("grant", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
@@ -2297,8 +2230,8 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
             .expect("write command/exec");
             stdin.flush().expect("flush command/exec");
         }
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
-        drop(child.stdin.take());
+        let completed = child.expect_event("cmd", "command_exec_completed");
+        child.close_stdin();
         assert_eq!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&output_file).expect("allowed output"),
@@ -2338,10 +2271,9 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -2349,14 +2281,14 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-request","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"net","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://api.example.com/ || true"],"timeoutMs":5000}}}}"#,
@@ -2368,11 +2300,8 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
             .expect("flush command/exec permission request");
     }
 
-    let permission_request = read_until_event(
-        &mut stdout,
-        "permission-command-cmd-request",
-        "permission_request",
-    );
+    let permission_request =
+        child.expect_event("permission-command-cmd-request", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
@@ -2384,7 +2313,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":null,"network":{{"enabled":true,"domains":{{"api.example.com":"allow"}}}}}}}}}}"#,
@@ -2393,10 +2322,10 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .expect("write permission/respond");
         stdin.flush().expect("flush permission/respond");
     }
-    read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    child.expect_event("permission-response", "permission_resolved");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -2405,12 +2334,12 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .expect("write thread/read");
         stdin.flush().expect("flush thread/read");
     }
-    let read = read_until_event(&mut stdout, "read", "thread_read");
+    let read = child.expect_event("read", "thread_read");
     assert_eq!(read["networkDomainPermissionCount"], 1);
     assert_eq!(read["networkDomainPermissions"]["api.example.com"], "allow");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
@@ -2418,7 +2347,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .expect("write thread/list");
         stdin.flush().expect("flush thread/list");
     }
-    let list = read_until_event(&mut stdout, "list", "thread_list");
+    let list = child.expect_event("list", "thread_list");
     let listed = list["data"]
         .as_array()
         .expect("thread list data")
@@ -2432,7 +2361,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
@@ -2441,8 +2370,8 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
-    drop(child.stdin.take());
+    let completed = child.expect_event("cmd", "command_exec_completed");
+    child.close_stdin();
     assert!(
         completed["stdout"]
             .as_str()
@@ -2484,10 +2413,9 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -2495,14 +2423,14 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-request","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"requester","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
@@ -2513,11 +2441,8 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
             .flush()
             .expect("flush command/exec permission request");
     }
-    let permission_request = read_until_event(
-        &mut stdout,
-        "permission-command-cmd-request",
-        "permission_request",
-    );
+    let permission_request =
+        child.expect_event("permission-command-cmd-request", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
@@ -2529,7 +2454,7 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":null,"network":{{"enabled":true,"domains":{{"blocked.orca.invalid":"deny"}}}}}}}}}}"#,
@@ -2538,10 +2463,10 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
         .expect("write permission/respond");
         stdin.flush().expect("flush permission/respond");
     }
-    read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    child.expect_event("permission-response", "permission_resolved");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","permissionProfile":"net","command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"timeoutMs":5000}}}}"#,
@@ -2550,8 +2475,8 @@ fn server_mode_session_network_deny_overrides_permission_profile_allow() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-    let error = read_until_event(&mut stdout, "cmd", "error");
-    drop(child.stdin.take());
+    let error = child.expect_event("cmd", "error");
+    child.close_stdin();
     assert_eq!(
         error["message"],
         "command/exec network access to blocked.orca.invalid was denied by configured network policy"
@@ -2568,10 +2493,7 @@ fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
         return;
     }
 
-    let parent = tempfile::Builder::new()
-        .prefix("orca-command-sandbox-")
-        .tempdir_in(std::env::current_dir().expect("current dir"))
-        .expect("sandbox parent");
+    let parent = sandbox_test_parent("orca-command-sandbox-");
     let workspace = parent.path().join("workspace");
     let outside = parent.path().join("outside");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -2593,10 +2515,9 @@ fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"blocked","method":"command/exec","params":{{"command":["sh","-lc",{}]}}}}"#,
@@ -2606,12 +2527,12 @@ fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
         .expect("write sandboxed command/exec");
         stdin.flush().expect("flush sandboxed command/exec");
     }
-    let blocked = read_until_event(&mut stdout, "blocked", "command_exec_completed");
+    let blocked = child.expect_event("blocked", "command_exec_completed");
     assert_ne!(blocked["exitCode"], 0);
     assert!(!blocked_file.exists());
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"allowed","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"dangerFullAccess"}}}}}}"#,
@@ -2623,9 +2544,9 @@ fn server_mode_command_exec_danger_full_access_bypasses_workspace_sandbox() {
             .flush()
             .expect("flush danger full access command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let allowed = read_until_event(&mut stdout, "allowed", "command_exec_completed");
+    let allowed = child.expect_event("allowed", "command_exec_completed");
     assert_eq!(allowed["exitCode"], 0);
     assert_eq!(
         std::fs::read_to_string(&allowed_file).expect("allowed output"),
@@ -2643,10 +2564,7 @@ fn server_mode_command_exec_workspace_write_allows_only_writable_roots() {
         return;
     }
 
-    let parent = tempfile::Builder::new()
-        .prefix("orca-command-workspace-write-")
-        .tempdir_in(std::env::current_dir().expect("current dir"))
-        .expect("sandbox parent");
+    let parent = sandbox_test_parent("orca-command-workspace-write-");
     let workspace = parent.path().join("workspace");
     let allowed_root = parent.path().join("allowed");
     let blocked_root = parent.path().join("blocked");
@@ -2675,10 +2593,9 @@ fn server_mode_command_exec_workspace_write_allows_only_writable_roots() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":["{}"],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}}}}}"#,
@@ -2688,9 +2605,9 @@ fn server_mode_command_exec_workspace_write_allows_only_writable_roots() {
         .expect("write workspaceWrite command/exec");
         stdin.flush().expect("flush workspaceWrite command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_ne!(completed["exitCode"], 0);
     assert_eq!(
         std::fs::read_to_string(&allowed_file).expect("allowed output"),
@@ -2727,10 +2644,9 @@ fn server_mode_command_exec_read_only_blocks_workspace_writes() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"readOnly","networkAccess":false}}}}}}"#,
@@ -2739,9 +2655,9 @@ fn server_mode_command_exec_read_only_blocks_workspace_writes() {
         .expect("write readOnly command/exec");
         stdin.flush().expect("flush readOnly command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_ne!(completed["exitCode"], 0);
     assert!(!workspace_file.exists());
 
@@ -2774,10 +2690,9 @@ fn server_mode_command_exec_permission_profile_read_only_blocks_workspace_writes
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"read-only"}}}}"#,
@@ -2788,9 +2703,9 @@ fn server_mode_command_exec_permission_profile_read_only_blocks_workspace_writes
             .flush()
             .expect("flush read-only permissionProfile command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_ne!(completed["exitCode"], 0);
     assert!(!workspace_file.exists());
 
@@ -2823,10 +2738,9 @@ fn server_mode_command_exec_inherits_thread_active_permission_profile() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -2834,11 +2748,11 @@ fn server_mode_command_exec_inherits_thread_active_permission_profile() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread = read_until_event(&mut stdout, "thread", "thread_started");
+    let thread = child.expect_event("thread", "thread_started");
     let thread_id = thread["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"locked-down","extends":":read-only"}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -2847,10 +2761,10 @@ fn server_mode_command_exec_inherits_thread_active_permission_profile() {
         .expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
-    read_until_event(&mut stdout, "turn", "turn_completed");
+    child.expect_event("turn", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
@@ -2862,9 +2776,9 @@ fn server_mode_command_exec_inherits_thread_active_permission_profile() {
             .flush()
             .expect("flush inherited permissionProfile command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_ne!(completed["exitCode"], 0);
     assert!(!workspace_file.exists());
 
@@ -2905,10 +2819,9 @@ fn server_mode_command_exec_resolves_thread_active_permission_profile_from_confi
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -2916,11 +2829,11 @@ fn server_mode_command_exec_resolves_thread_active_permission_profile_from_confi
             .expect("write thread/start");
             stdin.flush().expect("flush thread/start");
         }
-        let thread = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread = child.expect_event("thread", "thread_started");
         let thread_id = thread["threadId"].as_str().expect("thread id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"locked-down"}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -2929,10 +2842,10 @@ fn server_mode_command_exec_resolves_thread_active_permission_profile_from_confi
             .expect("write turn/start");
             stdin.flush().expect("flush turn/start");
         }
-        read_until_event(&mut stdout, "turn", "turn_completed");
+        child.expect_event("turn", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
@@ -2944,9 +2857,9 @@ fn server_mode_command_exec_resolves_thread_active_permission_profile_from_confi
                 .flush()
                 .expect("flush config-backed permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert!(!workspace_file.exists());
 
@@ -2996,10 +2909,9 @@ fn server_mode_command_exec_uses_configured_permission_profile_filesystem_write_
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -3007,11 +2919,11 @@ fn server_mode_command_exec_uses_configured_permission_profile_filesystem_write_
             .expect("write thread/start");
             stdin.flush().expect("flush thread/start");
         }
-        let thread = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread = child.expect_event("thread", "thread_started");
         let thread_id = thread["threadId"].as_str().expect("thread id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"extra-write"}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -3020,10 +2932,10 @@ fn server_mode_command_exec_uses_configured_permission_profile_filesystem_write_
             .expect("write turn/start");
             stdin.flush().expect("flush turn/start");
         }
-        read_until_event(&mut stdout, "turn", "turn_completed");
+        child.expect_event("turn", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
@@ -3035,9 +2947,9 @@ fn server_mode_command_exec_uses_configured_permission_profile_filesystem_write_
                 .flush()
                 .expect("flush filesystem permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&extra_file).expect("extra output"),
@@ -3090,10 +3002,9 @@ fn server_mode_command_exec_configured_permission_profile_materializes_workspace
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread","method":"thread/start","params":{{"runtimeWorkspaceRoots":["{}"]}}}}"#,
@@ -3102,11 +3013,11 @@ fn server_mode_command_exec_configured_permission_profile_materializes_workspace
             .expect("write thread/start");
             stdin.flush().expect("flush thread/start");
         }
-        let thread = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread = child.expect_event("thread", "thread_started");
         let thread_id = thread["threadId"].as_str().expect("thread id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"docs"}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -3115,10 +3026,10 @@ fn server_mode_command_exec_configured_permission_profile_materializes_workspace
             .expect("write turn/start");
             stdin.flush().expect("flush turn/start");
         }
-        read_until_event(&mut stdout, "turn", "turn_completed");
+        child.expect_event("turn", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
@@ -3130,9 +3041,9 @@ fn server_mode_command_exec_configured_permission_profile_materializes_workspace
                 .flush()
                 .expect("flush workspace roots permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&docs_file).expect("docs output"),
@@ -3187,10 +3098,9 @@ fn server_mode_command_exec_configured_permission_profile_uses_scoped_filesystem
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread","method":"thread/start","params":{{"runtimeWorkspaceRoots":["{}"]}}}}"#,
@@ -3199,11 +3109,11 @@ fn server_mode_command_exec_configured_permission_profile_uses_scoped_filesystem
             .expect("write thread/start");
             stdin.flush().expect("flush thread/start");
         }
-        let thread = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread = child.expect_event("thread", "thread_started");
         let thread_id = thread["threadId"].as_str().expect("thread id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"docs"}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -3212,10 +3122,10 @@ fn server_mode_command_exec_configured_permission_profile_uses_scoped_filesystem
             .expect("write turn/start");
             stdin.flush().expect("flush turn/start");
         }
-        read_until_event(&mut stdout, "turn", "turn_completed");
+        child.expect_event("turn", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
@@ -3227,9 +3137,9 @@ fn server_mode_command_exec_configured_permission_profile_uses_scoped_filesystem
                 .flush()
                 .expect("flush scoped filesystem permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&docs_file).expect("docs output"),
@@ -3285,10 +3195,9 @@ fn server_mode_command_exec_configured_permission_profile_uses_trailing_globstar
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"globstar"}}}}"#,
@@ -3299,9 +3208,9 @@ fn server_mode_command_exec_configured_permission_profile_uses_trailing_globstar
                 .flush()
                 .expect("flush globstar permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&allowed_file).expect("allowed output"),
@@ -3358,10 +3267,9 @@ fn server_mode_command_exec_configured_permission_profile_deny_overrides_write_r
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"mixed"}}}}"#,
@@ -3372,9 +3280,9 @@ fn server_mode_command_exec_configured_permission_profile_deny_overrides_write_r
                 .flush()
                 .expect("flush deny permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&allowed_file).expect("allowed output"),
@@ -3432,10 +3340,9 @@ fn server_mode_command_exec_configured_permission_profile_deny_blocks_reads() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"mixed"}}}}"#,
@@ -3446,9 +3353,9 @@ fn server_mode_command_exec_configured_permission_profile_deny_blocks_reads() {
                 .flush()
                 .expect("flush deny-read permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert!(!leaked_file.exists());
 
@@ -3465,8 +3372,7 @@ fn server_mode_command_exec_configured_permission_profile_enforces_deny_glob_ent
     }
 
     with_orca_home(|home| {
-        let parent =
-            tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("sandbox parent");
+        let parent = sandbox_test_parent("orca-command-deny-read-");
         let workspace = parent.path().join("workspace");
         let allowed = parent.path().join("allowed");
         std::fs::create_dir(&workspace).expect("workspace dir");
@@ -3507,10 +3413,9 @@ fn server_mode_command_exec_configured_permission_profile_enforces_deny_glob_ent
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"globbed"}}}}"#,
@@ -3521,9 +3426,9 @@ fn server_mode_command_exec_configured_permission_profile_enforces_deny_glob_ent
                 .flush()
                 .expect("flush glob permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&output_file).expect("ordinary output"),
@@ -3563,7 +3468,7 @@ fn server_mode_command_exec_configured_permission_profile_materializes_minimal_s
             .expect("spawn orca server");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","true"],"permissionProfile":"minimal"}}}}"#
@@ -3573,7 +3478,7 @@ fn server_mode_command_exec_configured_permission_profile_materializes_minimal_s
                 .flush()
                 .expect("flush minimal permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
         let output = child.wait_with_output().expect("wait for server");
         assert_eq!(output.status.code(), Some(0));
@@ -3616,7 +3521,7 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
             .expect("spawn orca server");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"],"permissionProfile":"net","timeoutMs":5000}}}}"#
@@ -3626,7 +3531,7 @@ fn server_mode_command_exec_configured_permission_profile_enforces_network_domai
                 .flush()
                 .expect("flush network domain permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
         let output = child.wait_with_output().expect("wait for server");
         assert_eq!(output.status.code(), Some(0));
@@ -3668,10 +3573,8 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -3679,11 +3582,11 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             .expect("write thread/start request");
             stdin.flush().expect("flush thread/start request");
         }
-        let thread_started = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread_started = child.expect_event("thread", "thread_started");
         let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"net"}},"input":[{{"type":"text","text":"bash curl --max-time 2 --proxy \"$HTTP_PROXY\" -sS -D - -o /dev/null http://blocked.orca.invalid/ || true"}}]}}}}"#,
@@ -3693,7 +3596,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             stdin.flush().expect("flush bash turn");
         }
 
-        let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+        let permission_request = child.expect_event("turn", "permission_request");
         assert_eq!(permission_request["threadId"], thread_id);
         assert!(
             permission_request["reason"]
@@ -3711,7 +3614,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             .expect("permission request id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"deny","scope":"turn","permissions":{{"fileSystem":null,"network":{{"domains":{{"blocked.orca.invalid":"allow"}}}}}}}}}}"#,
@@ -3720,12 +3623,12 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             .expect("write permission/respond");
             stdin.flush().expect("flush permission/respond");
         }
-        let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+        let resolved = child.expect_event("permission-response", "permission_resolved");
         assert_eq!(resolved["requestId"], request_id);
         assert_eq!(resolved["decision"], "deny");
-        let _completed = read_until_event(&mut stdout, "turn", "turn_completed");
+        let _completed = child.expect_event("turn", "turn_completed");
 
-        drop(child.stdin.take());
+        child.close_stdin();
         let output = child.wait_with_output().expect("wait for server");
         assert_eq!(output.status.code(), Some(0));
         assert!(output.stderr.is_empty());
@@ -3773,10 +3676,8 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -3784,11 +3685,11 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             .expect("write thread/start request");
             stdin.flush().expect("flush thread/start request");
         }
-        let thread_started = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread_started = child.expect_event("thread", "thread_started");
         let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"net"}},"input":[{{"type":"text","text":"bash curl --max-time 2 --proxy \"$HTTP_PROXY\" -sS http://127.0.0.1:{}/"}}]}}}}"#,
@@ -3799,7 +3700,7 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             stdin.flush().expect("flush bash turn");
         }
 
-        let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+        let permission_request = child.expect_event("turn", "permission_request");
         assert_eq!(permission_request["threadId"], thread_id);
         assert_eq!(
             permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
@@ -3810,7 +3711,7 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             .expect("permission request id");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","permissions":{{"fileSystem":null,"network":{{"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#,
@@ -3819,17 +3720,18 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             .expect("write permission/respond");
             stdin.flush().expect("flush permission/respond");
         }
-        let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+        let resolved = child.expect_event("permission-response", "permission_resolved");
         assert_eq!(resolved["requestId"], request_id);
         assert_eq!(resolved["decision"], "allow");
         server.join().expect("server joined");
 
-        let completed = read_until_tool_completed(&mut stdout, "turn", "bash");
+        let completed =
+            child.expect_event_matching("turn", "tool_completed", |event| event["tool"] == "bash");
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["output"], "bash-network-ok");
-        let _turn_completed = read_until_event(&mut stdout, "turn", "turn_completed");
+        let _turn_completed = child.expect_event("turn", "turn_completed");
 
-        drop(child.stdin.take());
+        child.close_stdin();
         let output = child.wait_with_output().expect("wait for server");
         assert_eq!(output.status.code(), Some(0));
         assert!(output.stderr.is_empty());
@@ -3873,10 +3775,9 @@ fn server_mode_command_exec_configured_permission_profile_materializes_tmpdir() 
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"permissionProfile":"tmp"}}}}"#,
@@ -3887,9 +3788,9 @@ fn server_mode_command_exec_configured_permission_profile_materializes_tmpdir() 
                 .flush()
                 .expect("flush tmpdir permissionProfile command/exec");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+        let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert_eq!(
             std::fs::read_to_string(&tmp_file).expect("tmp output"),
@@ -3927,10 +3828,9 @@ fn server_mode_command_exec_sandbox_policy_overrides_thread_active_permission_pr
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -3938,11 +3838,11 @@ fn server_mode_command_exec_sandbox_policy_overrides_thread_active_permission_pr
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread = read_until_event(&mut stdout, "thread", "thread_started");
+    let thread = child.expect_event("thread", "thread_started");
     let thread_id = thread["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"locked-down","extends":":read-only"}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -3951,10 +3851,10 @@ fn server_mode_command_exec_sandbox_policy_overrides_thread_active_permission_pr
         .expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
-    read_until_event(&mut stdout, "turn", "turn_completed");
+    child.expect_event("turn", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}}}}}"#,
@@ -3966,9 +3866,9 @@ fn server_mode_command_exec_sandbox_policy_overrides_thread_active_permission_pr
             .flush()
             .expect("flush explicit sandboxPolicy command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_eq!(completed["exitCode"], 0);
     assert_eq!(
         std::fs::read_to_string(&workspace_file).expect("workspace output"),
@@ -4005,10 +3905,9 @@ fn server_mode_command_exec_external_sandbox_bypasses_workspace_sandbox() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"externalSandbox","networkAccess":"enabled"}}}}}}"#,
@@ -4017,9 +3916,9 @@ fn server_mode_command_exec_external_sandbox_bypasses_workspace_sandbox() {
         .expect("write externalSandbox command/exec");
         stdin.flush().expect("flush externalSandbox command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_eq!(completed["exitCode"], 0);
     assert_eq!(
         std::fs::read_to_string(&outside_file).expect("outside output"),
@@ -4061,10 +3960,9 @@ fn server_mode_command_exec_workspace_write_can_exclude_slash_tmp() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}}}}}}"#,
@@ -4073,9 +3971,9 @@ fn server_mode_command_exec_workspace_write_can_exclude_slash_tmp() {
         .expect("write workspaceWrite command/exec");
         stdin.flush().expect("flush workspaceWrite command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_ne!(completed["exitCode"], 0);
     assert!(!tmp_file.exists());
 
@@ -4114,10 +4012,9 @@ fn server_mode_command_exec_workspace_write_allows_slash_tmp_by_default() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc",{}],"sandboxPolicy":{{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}}}}}"#,
@@ -4126,9 +4023,9 @@ fn server_mode_command_exec_workspace_write_allows_slash_tmp_by_default() {
         .expect("write workspaceWrite command/exec");
         stdin.flush().expect("flush workspaceWrite command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let completed = read_until_event(&mut stdout, "cmd", "command_exec_completed");
+    let completed = child.expect_event("cmd", "command_exec_completed");
     assert_eq!(completed["exitCode"], 0);
     assert_eq!(
         std::fs::read_to_string(&tmp_file).expect("tmp output"),
@@ -4160,7 +4057,7 @@ fn server_mode_command_exec_respects_buffered_output_cap() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'abcdef'; printf 'uvwxyz' >&2"],"outputBytesCap":5}}}}"#
@@ -4169,7 +4066,7 @@ fn server_mode_command_exec_respects_buffered_output_cap() {
         stdin.flush().expect("flush command/exec");
     }
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -4203,7 +4100,7 @@ fn server_mode_command_exec_caps_buffered_output_by_bytes() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'ééé'; printf 'ééé' >&2"],"outputBytesCap":5}}}}"#
@@ -4212,7 +4109,7 @@ fn server_mode_command_exec_caps_buffered_output_by_bytes() {
         stdin.flush().expect("flush command/exec");
     }
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -4290,7 +4187,7 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf done","sh","{started_marker_arg}","{release_marker_arg}"],"processId":"sleep-1","tty":false,"streamStdin":false,"streamStdoutStderr":false}}}}"#
@@ -4298,14 +4195,12 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "sleep-1");
     wait_for_path(&started_marker);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"sleep-1"}}}}"#
@@ -4314,11 +4209,11 @@ fn server_mode_command_exec_with_process_id_can_be_terminated() {
         stdin.flush().expect("flush command/exec/terminate");
     }
 
-    let terminated = read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
+    let terminated = child.expect_event("cmd-kill", "command_exec_terminated");
     assert_eq!(terminated["processId"], "sleep-1");
 
-    drop(child.stdin.take());
-    let events = read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    child.close_stdin();
+    let events = child.drain_events_until_event("cmd", "command_exec_completed");
     let completed = events
         .iter()
         .find(|event| event["event"] == "command_exec_completed")
@@ -4361,7 +4256,7 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf started; : > \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done; printf leaked > \"$3\"","sh","{started_marker_arg}","{release_marker_arg}","{leaked_marker_arg}"],"processId":"eof-cleanup-1","streamStdoutStderr":true}}}}"#
@@ -4369,13 +4264,11 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "eof-cleanup-1");
     wait_for_path(&started_marker);
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output =
         wait_for_child_output_with_timeout(child, Duration::from_secs(3)).expect("server exited");
     assert_eq!(output.status.code(), Some(0));
@@ -4409,7 +4302,7 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-1","method":"command/exec","params":{{"command":["sh","-lc","sleep 30"],"processId":"dup-1"}}}}"#
@@ -4417,13 +4310,11 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
         .expect("write first command/exec");
         stdin.flush().expect("flush first command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd-1", "command_exec_started");
+    let started = child.expect_event("cmd-1", "command_exec_started");
     assert_eq!(started["processId"], "dup-1");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-2","method":"command/exec","params":{{"command":["sh","-lc","printf leaked > \"$1\"","sh","{duplicate_marker_arg}"],"processId":"dup-1"}}}}"#
@@ -4432,7 +4323,7 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
         stdin.flush().expect("flush duplicate command/exec");
     }
 
-    let duplicate = read_next_event_for_id(&mut stdout, "cmd-2");
+    let duplicate = child.expect_next_for_id("cmd-2");
     assert_eq!(duplicate["event"], "error");
     assert_eq!(
         duplicate["message"],
@@ -4440,7 +4331,7 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"dup-1"}}}}"#
@@ -4448,9 +4339,9 @@ fn server_mode_command_exec_rejects_duplicate_active_process_id() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
-    drop(child.stdin.take());
-    read_events_until_event(&mut stdout, "cmd-1", "command_exec_completed");
+    child.expect_event("cmd-kill", "command_exec_terminated");
+    child.close_stdin();
+    child.drain_events_until_event("cmd-1", "command_exec_completed");
     assert!(
         !duplicate_marker.exists(),
         "duplicate command/exec process id should be rejected before spawning a process"
@@ -4487,7 +4378,7 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
 
     let command = "printf listed; touch $1; while test ! -e $2; do sleep 0.05; done; touch $3";
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         let request = serde_json::json!({
             "id": "cmd",
             "method": "command/exec",
@@ -4510,14 +4401,12 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
         writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "listed-1");
     wait_for_path(&started_marker);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-list","method":"command/exec/list","params":{{}}}}"#
@@ -4526,8 +4415,7 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
         stdin.flush().expect("flush command/exec/list");
     }
 
-    let list_events =
-        read_events_until_event_or_error(&mut stdout, "cmd-list", "command_exec_listed");
+    let list_events = child.drain_events_until_event_or_error("cmd-list", "command_exec_listed");
     let listed = list_events
         .iter()
         .find(|event| event["id"] == "cmd-list")
@@ -4571,7 +4459,7 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     std::fs::write(&release_marker, "release").expect("write release marker");
     wait_for_path(&completed_marker);
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-list-after","method":"command/exec/list","params":{{}}}}"#
@@ -4580,7 +4468,7 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
         stdin.flush().expect("flush second command/exec/list");
     }
     let after_release_events =
-        read_events_until_event_or_error(&mut stdout, "cmd-list-after", "command_exec_listed");
+        child.drain_events_until_event_or_error("cmd-list-after", "command_exec_listed");
     assert!(
         after_release_events
             .iter()
@@ -4599,7 +4487,7 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
             .len(),
         0
     );
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -4624,7 +4512,7 @@ fn server_mode_command_exec_write_requires_input_or_close() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","cat"],"processId":"write-empty-1","streamStdin":true}}}}"#
@@ -4632,13 +4520,11 @@ fn server_mode_command_exec_write_requires_input_or_close() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "write-empty-1");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-write","method":"command/exec/write","params":{{"processId":"write-empty-1"}}}}"#
@@ -4647,7 +4533,7 @@ fn server_mode_command_exec_write_requires_input_or_close() {
         stdin.flush().expect("flush command/exec/write");
     }
 
-    let error = read_next_event_for_id(&mut stdout, "cmd-write");
+    let error = child.expect_next_for_id("cmd-write");
     assert_eq!(error["event"], "error");
     assert_eq!(
         error["message"],
@@ -4655,7 +4541,7 @@ fn server_mode_command_exec_write_requires_input_or_close() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"write-empty-1"}}}}"#
@@ -4663,9 +4549,9 @@ fn server_mode_command_exec_write_requires_input_or_close() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
-    drop(child.stdin.take());
-    read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    child.expect_event("cmd-kill", "command_exec_terminated");
+    child.close_stdin();
+    child.drain_events_until_event("cmd", "command_exec_completed");
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
@@ -4691,7 +4577,7 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","cat"],"processId":"resize-zero-1","tty":true,"size":{{"rows":24,"cols":80}}}}}}"#
@@ -4699,13 +4585,11 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "resize-zero-1");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-resize","method":"command/exec/resize","params":{{"processId":"resize-zero-1","size":{{"rows":0,"cols":80}}}}}}"#
@@ -4714,7 +4598,7 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
         stdin.flush().expect("flush command/exec/resize");
     }
 
-    let error = read_next_event_for_id(&mut stdout, "cmd-resize");
+    let error = child.expect_next_for_id("cmd-resize");
     assert_eq!(error["event"], "error");
     assert_eq!(
         error["message"],
@@ -4722,7 +4606,7 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"resize-zero-1"}}}}"#
@@ -4730,9 +4614,9 @@ fn server_mode_command_exec_resize_rejects_zero_dimensions() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
-    drop(child.stdin.take());
-    read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    child.expect_event("cmd-kill", "command_exec_terminated");
+    child.close_stdin();
+    child.drain_events_until_event("cmd", "command_exec_completed");
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
@@ -4758,7 +4642,7 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'out-start\n'; printf 'err-start\n' >&2; IFS= read line; printf 'out:%s\n' \"$line\"; printf 'err:%s\n' \"$line\" >&2"],"processId":"pipe-1","streamStdin":true,"streamStdoutStderr":true}}}}"#
@@ -4766,13 +4650,11 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "pipe-1");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-write","method":"command/exec/write","params":{{"processId":"pipe-1","deltaBase64":"{}","closeStdin":true}}}}"#,
@@ -4782,17 +4664,12 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
         stdin.flush().expect("flush command/exec/write");
     }
 
-    let mut completion_events =
-        read_events_until_event(&mut stdout, "cmd-write", "command_exec_written");
+    let mut completion_events = child.drain_events_until_event("cmd-write", "command_exec_written");
     let write_ack = completion_events
         .last()
         .expect("command_exec_written event");
     assert_eq!(write_ack["processId"], "pipe-1");
-    completion_events.extend(read_events_until_event(
-        &mut stdout,
-        "cmd",
-        "command_exec_completed",
-    ));
+    completion_events.extend(child.drain_events_until_event("cmd", "command_exec_completed"));
     assert_command_exec_delta_seen(&completion_events, "stdout", "out-start\n");
     assert_command_exec_delta_seen(&completion_events, "stderr", "err-start\n");
     assert_command_exec_delta_seen(&completion_events, "stdout", "out:hello\n");
@@ -4805,7 +4682,7 @@ fn server_mode_command_exec_streams_output_and_accepts_write() {
     assert_eq!(completed["stdout"], "");
     assert_eq!(completed["stderr"], "");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -4832,7 +4709,7 @@ fn server_mode_command_exec_read_drains_streaming_output() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'read-out'; printf 'read-err' >&2; sleep 30","sh","{release_marker_arg}"],"processId":"read-1","streamStdoutStderr":true}}}}"#
@@ -4840,14 +4717,12 @@ fn server_mode_command_exec_read_drains_streaming_output() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "read-1");
     std::fs::write(&release_marker, "release").expect("write release marker");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-read","method":"command/exec/read","params":{{"processId":"read-1","timeoutMs":5000}}}}"#
@@ -4856,8 +4731,7 @@ fn server_mode_command_exec_read_drains_streaming_output() {
         stdin.flush().expect("flush command/exec/read");
     }
 
-    let mut read_events =
-        read_events_until_event_or_error(&mut stdout, "cmd-read", "command_exec_read");
+    let mut read_events = child.drain_events_until_event_or_error("cmd-read", "command_exec_read");
     let read_ack = read_events
         .iter()
         .find(|event| event["id"] == "cmd-read" && event["event"] == "command_exec_read")
@@ -4868,7 +4742,7 @@ fn server_mode_command_exec_read_drains_streaming_output() {
         || !command_exec_events_contain(&read_events, "stderr", "read-err")
     {
         read_events.extend(read_command_exec_output_until(
-            &mut stdout,
+            &mut child,
             "read-1",
             |stdout, stderr| stdout.contains("read-out") && stderr.contains("read-err"),
         ));
@@ -4877,7 +4751,7 @@ fn server_mode_command_exec_read_drains_streaming_output() {
     assert_command_exec_delta_seen(&read_events, "stderr", "read-err");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"read-1"}}}}"#
@@ -4885,9 +4759,9 @@ fn server_mode_command_exec_read_drains_streaming_output() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
-    drop(child.stdin.take());
-    read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    child.expect_event("cmd-kill", "command_exec_terminated");
+    child.close_stdin();
+    child.drain_events_until_event("cmd", "command_exec_completed");
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
@@ -4915,7 +4789,7 @@ fn server_mode_command_exec_read_caps_streaming_output() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","while [ ! -e \"$1\" ]; do sleep 0.05; done; printf 'abcdef'; sleep 30","sh","{release_marker_arg}"],"processId":"read-cap-1","streamStdoutStderr":true}}}}"#
@@ -4923,15 +4797,13 @@ fn server_mode_command_exec_read_caps_streaming_output() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "read-cap-1");
     std::thread::sleep(Duration::from_millis(1200));
     std::fs::write(&release_marker, "release").expect("write release marker");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-read","method":"command/exec/read","params":{{"processId":"read-cap-1","timeoutMs":5000,"outputBytesCap":3}}}}"#
@@ -4940,8 +4812,7 @@ fn server_mode_command_exec_read_caps_streaming_output() {
         stdin.flush().expect("flush command/exec/read");
     }
 
-    let mut read_events =
-        read_events_until_event_or_error(&mut stdout, "cmd-read", "command_exec_read");
+    let mut read_events = child.drain_events_until_event_or_error("cmd-read", "command_exec_read");
     let read_ack = read_events
         .iter()
         .find(|event| event["id"] == "cmd-read" && event["event"] == "command_exec_read")
@@ -4950,7 +4821,7 @@ fn server_mode_command_exec_read_caps_streaming_output() {
     assert_eq!(read_ack["status"], "running");
     if !command_exec_events_contain(&read_events, "stdout", "abc") {
         read_events.extend(read_command_exec_output_until(
-            &mut stdout,
+            &mut child,
             "read-cap-1",
             |stdout, _stderr| stdout.contains("abc"),
         ));
@@ -4975,7 +4846,7 @@ fn server_mode_command_exec_read_caps_streaming_output() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"read-cap-1"}}}}"#
@@ -4983,9 +4854,9 @@ fn server_mode_command_exec_read_caps_streaming_output() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    read_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
-    drop(child.stdin.take());
-    read_events_until_event(&mut stdout, "cmd", "command_exec_completed");
+    child.expect_event("cmd-kill", "command_exec_terminated");
+    child.close_stdin();
+    child.drain_events_until_event("cmd", "command_exec_completed");
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
@@ -5013,7 +4884,7 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'abcdefghij'; : > \"$1\"; sleep 30","sh","{started_marker_arg}"],"processId":"stream-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
@@ -5021,14 +4892,12 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "stream-cap-1");
     wait_for_path(&started_marker);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"stream-cap-1"}}}}"#
@@ -5036,13 +4905,9 @@ fn server_mode_command_exec_streaming_respects_output_cap() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    let mut events = read_events_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
-    drop(child.stdin.take());
-    events.extend(read_events_until_event(
-        &mut stdout,
-        "cmd",
-        "command_exec_completed",
-    ));
+    let mut events = child.drain_events_until_event("cmd-kill", "command_exec_terminated");
+    child.close_stdin();
+    events.extend(child.drain_events_until_event("cmd", "command_exec_completed"));
     assert_command_exec_delta_seen(&events, "stdout", "abcde");
     assert_command_exec_output_delta_notification_seen(&events, "stdout", "stream-cap-1");
     assert!(
@@ -5096,7 +4961,7 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["sh","-lc","printf 'ééé'; : > \"$1\"; sleep 30","sh","{started_marker_arg}"],"processId":"stream-byte-cap-1","streamStdoutStderr":true,"outputBytesCap":5}}}}"#
@@ -5104,14 +4969,12 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "stream-byte-cap-1");
     wait_for_path(&started_marker);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-kill","method":"command/exec/terminate","params":{{"processId":"stream-byte-cap-1"}}}}"#
@@ -5119,13 +4982,9 @@ fn server_mode_command_exec_caps_streaming_output_by_bytes() {
         .expect("write command/exec/terminate");
         stdin.flush().expect("flush command/exec/terminate");
     }
-    let mut events = read_events_until_event(&mut stdout, "cmd-kill", "command_exec_terminated");
-    drop(child.stdin.take());
-    events.extend(read_events_until_event(
-        &mut stdout,
-        "cmd",
-        "command_exec_completed",
-    ));
+    let mut events = child.drain_events_until_event("cmd-kill", "command_exec_terminated");
+    child.close_stdin();
+    events.extend(child.drain_events_until_event("cmd", "command_exec_completed"));
     assert_command_exec_delta_seen(&events, "stdout", "éé");
     assert!(
         events.iter().any(|event| {
@@ -5172,7 +5031,7 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{{"command":["python3","-c","import fcntl,termios,struct,sys,pathlib; data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH',0,0,0,0)); rows,cols,_,_=struct.unpack('HHHH', data); print(f'start:{{rows}} {{cols}}', flush=True); pathlib.Path(sys.argv[1]).write_text('started'); sys.stdin.readline(); data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH',0,0,0,0)); rows,cols,_,_=struct.unpack('HHHH', data); print(f'after:{{rows}} {{cols}}', flush=True)","{started_marker_arg}"],"processId":"tty-size-1","tty":true,"size":{{"rows":31,"cols":101}}}}}}"#
@@ -5180,14 +5039,12 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
-    let started = read_until_event(&mut stdout, "cmd", "command_exec_started");
+    let started = child.expect_event("cmd", "command_exec_started");
     assert_eq!(started["processId"], "tty-size-1");
     wait_for_path(&started_marker);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-resize","method":"command/exec/resize","params":{{"processId":"tty-size-1","size":{{"rows":45,"cols":132}}}}}}"#
@@ -5196,7 +5053,7 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
         stdin.flush().expect("flush command/exec/resize");
     }
     let mut completion_events =
-        read_events_until_event(&mut stdout, "cmd-resize", "command_exec_resized");
+        child.drain_events_until_event("cmd-resize", "command_exec_resized");
     let resize_ack = completion_events
         .last()
         .expect("command_exec_resized event");
@@ -5205,7 +5062,7 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
     assert_eq!(resize_ack["cols"], 132);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd-write","method":"command/exec/write","params":{{"processId":"tty-size-1","deltaBase64":"{}","closeStdin":true}}}}"#,
@@ -5215,22 +5072,14 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
         stdin.flush().expect("flush command/exec/write");
     }
 
-    completion_events.extend(read_events_until_event(
-        &mut stdout,
-        "cmd-write",
-        "command_exec_written",
-    ));
+    completion_events.extend(child.drain_events_until_event("cmd-write", "command_exec_written"));
     let write_ack = completion_events
         .iter()
         .rev()
         .find(|event| event["id"] == "cmd-write" && event["event"] == "command_exec_written")
         .expect("command_exec_written event");
     assert_eq!(write_ack["processId"], "tty-size-1");
-    completion_events.extend(read_events_until_event(
-        &mut stdout,
-        "cmd",
-        "command_exec_completed",
-    ));
+    completion_events.extend(child.drain_events_until_event("cmd", "command_exec_completed"));
     assert_command_exec_delta_seen(&completion_events, "stdout", "start:31 101");
     assert_command_exec_delta_seen(&completion_events, "stdout", "after:45 132");
     let completed = completion_events
@@ -5241,7 +5090,7 @@ fn server_mode_command_exec_tty_supports_initial_size_and_resize() {
     assert_eq!(completed["stdout"], "");
     assert_eq!(completed["stderr"], "");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -5258,7 +5107,7 @@ fn server_mode_reports_shell_capabilities() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-caps","method":"shell/capabilities","params":{{}}}}"#
@@ -5318,10 +5167,8 @@ fn server_mode_kills_runtime_shell_session() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf started; sleep 30; printf done","description":"killable server shell"}}}}"#
@@ -5329,13 +5176,13 @@ fn server_mode_kills_runtime_shell_session() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
     assert_eq!(started["requestedTerminalMode"], "pipe");
     assert_eq!(started["effectiveTerminalMode"], "pipe");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-kill","method":"shell/kill","params":{{"shellId":"{}"}}}}"#,
@@ -5344,8 +5191,8 @@ fn server_mode_kills_runtime_shell_session() {
         .expect("write shell/kill");
     }
 
-    drop(child.stdin.take());
-    let killed = read_until_event(&mut stdout, "shell-kill", "shell_completed");
+    child.close_stdin();
+    let killed = child.expect_event("shell-kill", "shell_completed");
     assert_eq!(killed["shellId"], shell_id);
     assert_eq!(killed["status"], "stopped");
     assert!(
@@ -5381,10 +5228,8 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-start","method":"thread/start","params":{{}}}}"#
@@ -5392,11 +5237,11 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread = read_until_event(&mut stdout, "thread-start", "thread_started");
+    let thread = child.expect_event("thread-start", "thread_started");
     let thread_id = thread["threadId"].as_str().expect("thread id").to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"threadId":"{}","command":"printf started; sleep 30; printf done","description":"task-stoppable server shell"}}}}"#,
@@ -5405,12 +5250,12 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
     let task_id = started["taskId"].as_str().expect("task id").to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"task-stop-turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"task_stop {}"}}]}}}}"#,
@@ -5420,7 +5265,7 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
         .expect("write task_stop turn/start");
         stdin.flush().expect("flush task_stop turn/start");
     }
-    let turn_events = read_events_until_event(&mut stdout, "task-stop-turn", "turn_completed");
+    let turn_events = child.drain_events_until_event("task-stop-turn", "turn_completed");
     let task_stop_completed = turn_events
         .iter()
         .find(|event| event["event"] == "tool_completed" && event["tool"] == "task_stop")
@@ -5428,7 +5273,7 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
     assert_eq!(task_stop_completed["status"], "completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000}}}}"#,
@@ -5438,8 +5283,8 @@ fn server_mode_task_stop_reaps_runtime_shell_session() {
         stdin.flush().expect("flush shell/read");
     }
 
-    drop(child.stdin.take());
-    let read_events = read_events_until_event(&mut stdout, "shell-read", "shell_completed");
+    child.close_stdin();
+    let read_events = child.drain_events_until_event("shell-read", "shell_completed");
     assert!(
         read_events
             .iter()
@@ -5482,10 +5327,8 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf ready; sleep 30; printf done","description":"incremental server shell"}}}}"#
@@ -5493,12 +5336,12 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
 
     let read_sent_at = Instant::now();
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000}}}}"#,
@@ -5508,7 +5351,7 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
         stdin.flush().expect("flush shell/read");
     }
 
-    let read_events = read_events_until_event(&mut stdout, "shell-read", "shell_updated");
+    let read_events = child.drain_events_until_event("shell-read", "shell_updated");
     assert!(
         read_sent_at.elapsed() < Duration::from_millis(500),
         "shell/read waited for command completion instead of returning incremental output"
@@ -5533,7 +5376,7 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
     assert_eq!(update["exitCode"], Value::Null);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-kill","method":"shell/kill","params":{{"shellId":"{}"}}}}"#,
@@ -5543,8 +5386,8 @@ fn server_mode_reads_runtime_shell_session_incrementally() {
         stdin.flush().expect("flush shell/kill");
     }
 
-    drop(child.stdin.take());
-    let kill_events = read_events_until_event(&mut stdout, "shell-kill", "shell_completed");
+    child.close_stdin();
+    let kill_events = child.drain_events_until_event("shell-kill", "shell_completed");
     let exited = kill_events
         .iter()
         .find(|event| event["event"] == "shell_exited")
@@ -5587,10 +5430,8 @@ fn server_mode_shell_read_honors_output_byte_cap() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf ready-long-output; sleep 30","description":"capped server shell"}}}}"#
@@ -5598,11 +5439,11 @@ fn server_mode_shell_read_honors_output_byte_cap() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000,"outputBytesCap":5}}}}"#,
@@ -5612,7 +5453,7 @@ fn server_mode_shell_read_honors_output_byte_cap() {
         stdin.flush().expect("flush capped shell/read");
     }
 
-    let read_events = read_events_until_event(&mut stdout, "shell-read", "shell_updated");
+    let read_events = child.drain_events_until_event("shell-read", "shell_updated");
     let output_delta = read_events
         .iter()
         .find(|event| event["event"] == "shell_output_delta")
@@ -5634,7 +5475,7 @@ fn server_mode_shell_read_honors_output_byte_cap() {
     assert_eq!(update["capReached"], true);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-kill","method":"shell/kill","params":{{"shellId":"{}"}}}}"#,
@@ -5644,8 +5485,8 @@ fn server_mode_shell_read_honors_output_byte_cap() {
         stdin.flush().expect("flush shell/kill");
     }
 
-    drop(child.stdin.take());
-    let _ = read_events_until_event(&mut stdout, "shell-kill", "shell_completed");
+    child.close_stdin();
+    let _ = child.drain_events_until_event("shell-kill", "shell_completed");
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -5668,10 +5509,8 @@ fn server_mode_lists_runtime_shell_sessions() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"printf ready; sleep 30","description":"listed server shell"}}}}"#
@@ -5679,12 +5518,12 @@ fn server_mode_lists_runtime_shell_sessions() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
     let task_id = started["taskId"].as_str().expect("task id").to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-list","method":"shell/list","params":{{}}}}"#
@@ -5692,7 +5531,7 @@ fn server_mode_lists_runtime_shell_sessions() {
         .expect("write shell/list");
         stdin.flush().expect("flush shell/list");
     }
-    let listed = read_until_event(&mut stdout, "shell-list", "shell_listed");
+    let listed = child.expect_event("shell-list", "shell_listed");
     assert_eq!(listed["shells"].as_array().expect("shell list").len(), 1);
     let shell = &listed["shells"][0];
     assert_eq!(shell["shellId"], shell_id);
@@ -5703,7 +5542,7 @@ fn server_mode_lists_runtime_shell_sessions() {
     assert_eq!(shell["effectiveTerminalMode"], "pipe");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-kill","method":"shell/kill","params":{{"shellId":"{}"}}}}"#,
@@ -5712,8 +5551,8 @@ fn server_mode_lists_runtime_shell_sessions() {
         .expect("write shell/kill");
         stdin.flush().expect("flush shell/kill");
     }
-    read_until_event(&mut stdout, "shell-kill", "shell_completed");
-    drop(child.stdin.take());
+    child.expect_event("shell-kill", "shell_completed");
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -5736,10 +5575,8 @@ fn server_mode_updates_runtime_shell_session_description() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"sleep 30","description":"old shell label"}}}}"#
@@ -5747,11 +5584,11 @@ fn server_mode_updates_runtime_shell_session_description() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-update","method":"shell/update","params":{{"shellId":"{}","description":"new shell label"}}}}"#,
@@ -5760,13 +5597,13 @@ fn server_mode_updates_runtime_shell_session_description() {
         .expect("write shell/update");
         stdin.flush().expect("flush shell/update");
     }
-    let updated = read_until_event(&mut stdout, "shell-update", "shell_updated");
+    let updated = child.expect_event("shell-update", "shell_updated");
     assert_eq!(updated["shellId"], shell_id);
     assert_eq!(updated["status"], "updated");
     assert_eq!(updated["description"], "new shell label");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-list","method":"shell/list","params":{{}}}}"#
@@ -5774,12 +5611,12 @@ fn server_mode_updates_runtime_shell_session_description() {
         .expect("write shell/list");
         stdin.flush().expect("flush shell/list");
     }
-    let listed = read_until_event(&mut stdout, "shell-list", "shell_listed");
+    let listed = child.expect_event("shell-list", "shell_listed");
     assert_eq!(listed["shells"][0]["shellId"], shell_id);
     assert_eq!(listed["shells"][0]["description"], "new shell label");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-kill","method":"shell/kill","params":{{"shellId":"{}"}}}}"#,
@@ -5788,8 +5625,8 @@ fn server_mode_updates_runtime_shell_session_description() {
         .expect("write shell/kill");
         stdin.flush().expect("flush shell/kill");
     }
-    read_until_event(&mut stdout, "shell-kill", "shell_completed");
-    drop(child.stdin.take());
+    child.expect_event("shell-kill", "shell_completed");
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -5813,10 +5650,8 @@ fn server_mode_starts_runtime_shell_session_with_pty() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"if test -t 0 && test -t 1; then printf tty; else printf pipe; fi","description":"pty server shell","pty":true}}}}"#
@@ -5824,14 +5659,14 @@ fn server_mode_starts_runtime_shell_session_with_pty() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
     assert_eq!(started["requestedTerminalMode"], "pty");
     assert_eq!(started["effectiveTerminalMode"], "pty");
 
     let completed = loop {
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000}}}}"#,
@@ -5840,13 +5675,13 @@ fn server_mode_starts_runtime_shell_session_with_pty() {
             .expect("write shell/read");
             stdin.flush().expect("flush shell/read");
         }
-        let event = read_shell_read_result(&mut stdout, "shell-read");
+        let event = read_shell_read_result(&mut child, "shell-read");
         if event["event"] == "shell_completed" {
             break event;
         }
         assert_eq!(event["event"], "shell_updated");
     };
-    drop(child.stdin.take());
+    child.close_stdin();
     assert_eq!(completed["shellId"], shell_id);
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["exitCode"], 0);
@@ -5878,10 +5713,8 @@ fn server_mode_resizes_runtime_shell_pty_session() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"python3 -c 'import fcntl,termios,struct,sys; sys.stdin.readline(); data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack(\"HHHH\",0,0,0,0)); rows,cols,_,_=struct.unpack(\"HHHH\", data); print(f\"{{rows}} {{cols}}\")'","description":"resizable pty shell","pty":true}}}}"#
@@ -5889,11 +5722,11 @@ fn server_mode_resizes_runtime_shell_pty_session() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-resize","method":"shell/resize","params":{{"shellId":"{}","cols":120,"rows":33}}}}"#,
@@ -5902,7 +5735,7 @@ fn server_mode_resizes_runtime_shell_pty_session() {
         .expect("write shell/resize");
         stdin.flush().expect("flush shell/resize");
     }
-    let resized = read_next_event_for_id(&mut stdout, "shell-resize");
+    let resized = child.expect_next_for_id("shell-resize");
     assert_eq!(resized["event"], "shell_updated");
     assert_eq!(resized["shellId"], shell_id);
     assert_eq!(resized["status"], "resized");
@@ -5910,7 +5743,7 @@ fn server_mode_resizes_runtime_shell_pty_session() {
     assert_eq!(resized["rows"], 33);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-write","method":"shell/write","params":{{"shellId":"{}","input":"\n"}}}}"#,
@@ -5919,11 +5752,11 @@ fn server_mode_resizes_runtime_shell_pty_session() {
         .expect("write shell/write");
         stdin.flush().expect("flush shell/write");
     }
-    let _ = read_until_event(&mut stdout, "shell-write", "shell_updated");
+    let _ = child.expect_event("shell-write", "shell_updated");
 
     let completed = loop {
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000}}}}"#,
@@ -5932,13 +5765,13 @@ fn server_mode_resizes_runtime_shell_pty_session() {
             .expect("write shell/read");
             stdin.flush().expect("flush shell/read");
         }
-        let event = read_shell_read_result(&mut stdout, "shell-read");
+        let event = read_shell_read_result(&mut child, "shell-read");
         if event["event"] == "shell_completed" {
             break event;
         }
         assert_eq!(event["event"], "shell_updated");
     };
-    drop(child.stdin.take());
+    child.close_stdin();
     assert_eq!(completed["shellId"], shell_id);
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["exitCode"], 0);
@@ -5974,10 +5807,8 @@ fn server_mode_starts_runtime_shell_pty_session_with_initial_size() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"python3 -c 'import fcntl,termios,struct,sys; data=fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, struct.pack(\"HHHH\",0,0,0,0)); rows,cols,_,_=struct.unpack(\"HHHH\", data); print(f\"{{rows}} {{cols}}\")'","description":"sized pty shell","terminalMode":"pty","cols":132,"rows":41}}}}"#
@@ -5985,12 +5816,12 @@ fn server_mode_starts_runtime_shell_pty_session_with_initial_size() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
 
     let completed = loop {
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"shell-read","method":"shell/read","params":{{"shellId":"{}","timeoutMs":5000}}}}"#,
@@ -5999,13 +5830,13 @@ fn server_mode_starts_runtime_shell_pty_session_with_initial_size() {
             .expect("write shell/read");
             stdin.flush().expect("flush shell/read");
         }
-        let event = read_shell_read_result(&mut stdout, "shell-read");
+        let event = read_shell_read_result(&mut child, "shell-read");
         if event["event"] == "shell_completed" {
             break event;
         }
         assert_eq!(event["event"], "shell_updated");
     };
-    drop(child.stdin.take());
+    child.close_stdin();
     assert_eq!(completed["shellId"], shell_id);
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["exitCode"], 0);
@@ -6040,10 +5871,8 @@ fn server_mode_rejects_resize_for_pipe_shell_session() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-start","method":"shell/start","params":{{"command":"sleep 30","description":"pipe shell","pty":false}}}}"#
@@ -6051,11 +5880,11 @@ fn server_mode_rejects_resize_for_pipe_shell_session() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    let started = read_until_event(&mut stdout, "shell-start", "shell_started");
+    let started = child.expect_event("shell-start", "shell_started");
     let shell_id = started["shellId"].as_str().expect("shell id").to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-resize","method":"shell/resize","params":{{"shellId":"{}","cols":120,"rows":33}}}}"#,
@@ -6064,7 +5893,7 @@ fn server_mode_rejects_resize_for_pipe_shell_session() {
         .expect("write shell/resize");
         stdin.flush().expect("flush shell/resize");
     }
-    let resized = read_next_event_for_id(&mut stdout, "shell-resize");
+    let resized = child.expect_next_for_id("shell-resize");
     assert_eq!(resized["event"], "error");
     assert!(
         resized["message"]
@@ -6074,7 +5903,7 @@ fn server_mode_rejects_resize_for_pipe_shell_session() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"shell-kill","method":"shell/kill","params":{{"shellId":"{}"}}}}"#,
@@ -6084,8 +5913,8 @@ fn server_mode_rejects_resize_for_pipe_shell_session() {
         stdin.flush().expect("flush shell/kill");
     }
 
-    drop(child.stdin.take());
-    let killed = read_until_event(&mut stdout, "shell-kill", "shell_completed");
+    child.close_stdin();
+    let killed = child.expect_event("shell-kill", "shell_completed");
     assert_eq!(killed["status"], "stopped");
 
     let output = child.wait_with_output().expect("wait for server");
@@ -6102,10 +5931,8 @@ fn server_mode_routes_turn_start_to_started_thread() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6114,11 +5941,7 @@ fn server_mode_routes_turn_start_to_started_thread() {
         stdin.flush().expect("flush thread/start request");
     }
 
-    let mut first_line = String::new();
-    stdout
-        .read_line(&mut first_line)
-        .expect("read thread/start response");
-    let thread_started: Value = serde_json::from_str(first_line.trim()).expect("thread json");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     assert_eq!(thread_started["id"], "thread-req");
     assert_eq!(thread_started["event"], "thread_started");
     let thread_id = thread_started["threadId"]
@@ -6128,7 +5951,7 @@ fn server_mode_routes_turn_start_to_started_thread() {
     assert!(!thread_id.is_empty());
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-req","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"hello bound thread"}}]}}}}"#,
@@ -6137,20 +5960,12 @@ fn server_mode_routes_turn_start_to_started_thread() {
         .expect("write turn/start request");
     }
 
-    drop(child.stdin.take());
-    let mut remaining_stdout = String::new();
-    stdout
-        .read_to_string(&mut remaining_stdout)
-        .expect("read remaining stdout");
+    let turn_events = child.drain_events_until_event("turn-req", "turn_completed");
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
 
-    let turn_events: Vec<Value> = remaining_stdout
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("turn json"))
-        .filter(|event| event["id"] == "turn-req")
-        .collect();
     assert!(
         turn_events
             .iter()
@@ -6172,10 +5987,8 @@ fn server_mode_preserves_thread_conversation_across_turns() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6184,18 +5997,14 @@ fn server_mode_preserves_thread_conversation_across_turns() {
         stdin.flush().expect("flush thread/start request");
     }
 
-    let mut first_line = String::new();
-    stdout
-        .read_line(&mut first_line)
-        .expect("read thread/start response");
-    let thread_started: Value = serde_json::from_str(first_line.trim()).expect("thread json");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"first prompt"}}]}}}}"#,
@@ -6205,10 +6014,10 @@ fn server_mode_preserves_thread_conversation_across_turns() {
         stdin.flush().expect("flush first turn");
     }
 
-    read_until_event(&mut stdout, "turn-1", "turn_completed");
+    child.expect_event("turn-1", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -6217,19 +6026,14 @@ fn server_mode_preserves_thread_conversation_across_turns() {
         .expect("write second turn");
     }
 
-    drop(child.stdin.take());
-    let mut remaining_stdout = String::new();
-    stdout
-        .read_to_string(&mut remaining_stdout)
-        .expect("read remaining stdout");
+    let turn_events = child.drain_events_until_event("turn-2", "turn_completed");
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
 
-    let echoed = remaining_stdout
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("turn json"))
-        .filter(|event| event["id"] == "turn-2")
+    let echoed = turn_events
+        .iter()
         .find_map(|event| {
             (event["event"] == "message_delta")
                 .then(|| event["text"].as_str().map(ToString::to_string))
@@ -6252,10 +6056,8 @@ fn server_mode_updates_thread_metadata_and_reads_title() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6264,14 +6066,14 @@ fn server_mode_updates_thread_metadata_and_reads_title() {
         stdin.flush().expect("flush thread/start request");
     }
 
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"rename","method":"thread/metadata/update","params":{{"threadId":"{}","title":"CLI renamed thread"}}}}"#,
@@ -6281,12 +6083,12 @@ fn server_mode_updates_thread_metadata_and_reads_title() {
         stdin.flush().expect("flush metadata update");
     }
 
-    let renamed = read_until_event(&mut stdout, "rename", "thread_metadata_updated");
+    let renamed = child.expect_event("rename", "thread_metadata_updated");
     assert_eq!(renamed["threadId"], thread_id);
     assert_eq!(renamed["title"], "CLI renamed thread");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -6295,8 +6097,8 @@ fn server_mode_updates_thread_metadata_and_reads_title() {
         .expect("write thread/read request");
     }
 
-    drop(child.stdin.take());
-    let read = read_until_event(&mut stdout, "read", "thread_read");
+    child.close_stdin();
+    let read = child.expect_event("read", "thread_read");
     assert_eq!(read["threadId"], thread_id);
     assert_eq!(read["title"], "CLI renamed thread");
 
@@ -6316,10 +6118,8 @@ fn server_mode_lists_started_thread_from_session_store() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6328,23 +6128,23 @@ fn server_mode_lists_started_thread_from_session_store() {
         stdin.flush().expect("flush thread/start request");
     }
 
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
         )
         .expect("write thread/list");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let listed = read_until_event(&mut stdout, "list", "thread_list");
+    let listed = child.expect_event("list", "thread_list");
     let listed_threads = listed["data"].as_array().expect("thread list data");
     assert!(
         listed_threads
@@ -6374,10 +6174,8 @@ fn server_mode_persists_started_thread_permission_profile() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6385,23 +6183,23 @@ fn server_mode_persists_started_thread_permission_profile() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
         )
         .expect("write thread/list");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let listed = read_until_event(&mut stdout, "list", "thread_list");
+    let listed = child.expect_event("list", "thread_list");
     let listed_threads = listed["data"].as_array().expect("thread list data");
     let thread = listed_threads
         .iter()
@@ -6432,10 +6230,8 @@ fn server_mode_resume_and_fork_inherit_thread_permission_profile() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6443,7 +6239,7 @@ fn server_mode_resume_and_fork_inherit_thread_permission_profile() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let parent_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
@@ -6453,7 +6249,7 @@ fn server_mode_resume_and_fork_inherit_thread_permission_profile() {
         .expect("write current config");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"resume","method":"thread/resume","params":{{"threadId":"{}"}}}}"#,
@@ -6462,7 +6258,7 @@ fn server_mode_resume_and_fork_inherit_thread_permission_profile() {
         .expect("write thread/resume");
         stdin.flush().expect("flush thread/resume");
     }
-    let resumed = read_next_event_for_id(&mut stdout, "resume");
+    let resumed = child.expect_next_for_id("resume");
     assert_eq!(resumed["event"], "thread_started");
     let resumed_id = resumed["threadId"]
         .as_str()
@@ -6470,7 +6266,7 @@ fn server_mode_resume_and_fork_inherit_thread_permission_profile() {
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"fork","method":"thread/fork","params":{{"threadId":"{}"}}}}"#,
@@ -6479,7 +6275,7 @@ fn server_mode_resume_and_fork_inherit_thread_permission_profile() {
         .expect("write thread/fork");
         stdin.flush().expect("flush thread/fork");
     }
-    let forked = read_next_event_for_id(&mut stdout, "fork");
+    let forked = child.expect_next_for_id("fork");
     assert_eq!(forked["event"], "thread_started");
     let forked_id = forked["threadId"]
         .as_str()
@@ -6487,16 +6283,16 @@ fn server_mode_resume_and_fork_inherit_thread_permission_profile() {
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
         )
         .expect("write thread/list");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let listed = read_until_event(&mut stdout, "list", "thread_list");
+    let listed = child.expect_event("list", "thread_list");
     let listed_threads = listed["data"].as_array().expect("thread list data");
     for thread_id in [&resumed_id, &forked_id] {
         let thread = listed_threads
@@ -6529,10 +6325,8 @@ fn server_mode_resume_and_fork_apply_explicit_permission_override() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6540,7 +6334,7 @@ fn server_mode_resume_and_fork_apply_explicit_permission_override() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let parent_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
@@ -6550,7 +6344,7 @@ fn server_mode_resume_and_fork_apply_explicit_permission_override() {
         .expect("write current config");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"resume","method":"thread/resume","params":{{"threadId":"{}","approvalMode":"auto-edit","permissionRules":{{"rules":[{{"tool":"bash","pattern":"cargo test *","decision":"prompt"}}]}}}}}}"#,
@@ -6559,7 +6353,7 @@ fn server_mode_resume_and_fork_apply_explicit_permission_override() {
         .expect("write thread/resume");
         stdin.flush().expect("flush thread/resume");
     }
-    let resumed = read_next_event_for_id(&mut stdout, "resume");
+    let resumed = child.expect_next_for_id("resume");
     assert_eq!(resumed["event"], "thread_started");
     let resumed_id = resumed["threadId"]
         .as_str()
@@ -6567,7 +6361,7 @@ fn server_mode_resume_and_fork_apply_explicit_permission_override() {
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"fork","method":"thread/fork","params":{{"threadId":"{}","approvalMode":"auto-edit","permissionRules":{{"rules":[{{"tool":"bash","pattern":"cargo test *","decision":"prompt"}}]}}}}}}"#,
@@ -6576,7 +6370,7 @@ fn server_mode_resume_and_fork_apply_explicit_permission_override() {
         .expect("write thread/fork");
         stdin.flush().expect("flush thread/fork");
     }
-    let forked = read_next_event_for_id(&mut stdout, "fork");
+    let forked = child.expect_next_for_id("fork");
     assert_eq!(forked["event"], "thread_started");
     let forked_id = forked["threadId"]
         .as_str()
@@ -6584,16 +6378,16 @@ fn server_mode_resume_and_fork_apply_explicit_permission_override() {
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
         )
         .expect("write thread/list");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let listed = read_until_event(&mut stdout, "list", "thread_list");
+    let listed = child.expect_event("list", "thread_list");
     let listed_threads = listed["data"].as_array().expect("thread list data");
     for thread_id in [&resumed_id, &forked_id] {
         let thread = listed_threads
@@ -6626,10 +6420,8 @@ fn server_mode_turn_start_applies_approval_policy_override() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6637,14 +6429,14 @@ fn server_mode_turn_start_applies_approval_policy_override() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","approvalPolicy":"never","permissionRules":{{"rules":[{{"tool":"bash","pattern":"cargo test *","decision":"prompt"}}]}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -6653,19 +6445,19 @@ fn server_mode_turn_start_applies_approval_policy_override() {
         .expect("write turn/start request");
         stdin.flush().expect("flush turn/start request");
     }
-    let _turn_completed = read_until_event(&mut stdout, "turn", "turn_completed");
+    let _turn_completed = child.expect_event("turn", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
         )
         .expect("write thread/list");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
-    let listed = read_until_event(&mut stdout, "list", "thread_list");
+    let listed = child.expect_event("list", "thread_list");
     let listed_threads = listed["data"].as_array().expect("thread list data");
     let thread = listed_threads
         .iter()
@@ -6700,10 +6492,8 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6711,14 +6501,14 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
             .expect("write thread/start request");
             stdin.flush().expect("flush thread/start request");
         }
-        let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+        let thread_started = child.expect_event("thread-req", "thread_started");
         let thread_id = thread_started["threadId"]
             .as_str()
             .expect("thread id")
             .to_string();
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"locked-down","extends":":workspace"}},"permissionUpdates":[{{"type":"setMode","mode":"bypassPermissions","destination":"session"}},{{"type":"removeRules","behavior":"allow","destination":"session","rules":[{{"toolName":"Bash","ruleContent":"cargo *"}}]}},{{"type":"addRules","behavior":"allow","destination":"session","rules":[{{"toolName":"Bash","ruleContent":"cargo test *"}}]}},{{"type":"replaceRules","behavior":"ask","destination":"session","rules":[{{"toolName":"Write","ruleContent":"/workspace/**"}}]}},{{"type":"addDirectories","destination":"session","directories":["{}"]}},{{"type":"removeDirectories","destination":"session","directories":["{}"]}}],"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -6729,10 +6519,10 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
             .expect("write turn/start request");
             stdin.flush().expect("flush turn/start request");
         }
-        let _turn_completed = read_until_event(&mut stdout, "turn", "turn_completed");
+        let _turn_completed = child.expect_event("turn", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
@@ -6740,7 +6530,7 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
             .expect("write thread/list");
         }
 
-        let listed = read_until_event(&mut stdout, "list", "thread_list");
+        let listed = child.expect_event("list", "thread_list");
         let listed_threads = listed["data"].as_array().expect("thread list data");
         let thread = listed_threads
             .iter()
@@ -6761,7 +6551,7 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
         );
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -6769,8 +6559,8 @@ fn server_mode_turn_start_applies_package3_permission_updates() {
             )
             .expect("write thread/read");
         }
-        drop(child.stdin.take());
-        let read = read_until_event(&mut stdout, "read", "thread_read");
+        child.close_stdin();
+        let read = child.expect_event("read", "thread_read");
         assert_eq!(read["activePermissionProfile"]["id"], "locked-down");
         assert_eq!(read["activePermissionProfile"]["extends"], ":workspace");
         assert_eq!(read["additionalWorkingDirectoryCount"], 1);
@@ -6830,10 +6620,8 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6841,14 +6629,14 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
             .expect("write thread/start request");
             stdin.flush().expect("flush thread/start request");
         }
-        let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+        let thread_started = child.expect_event("thread-req", "thread_started");
         let thread_id = thread_started["threadId"]
             .as_str()
             .expect("thread id")
             .to_string();
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn-add","method":"turn/start","params":{{"threadId":"{}","permissionUpdates":[{{"type":"addDirectories","destination":"projectSettings","directories":["{}"]}},{{"type":"addDirectories","destination":"session","directories":["{}"]}}],"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -6859,10 +6647,10 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
             .expect("write add directories turn");
             stdin.flush().expect("flush add directories turn");
         }
-        read_until_event(&mut stdout, "turn-add", "turn_completed");
+        child.expect_event("turn-add", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"read-after-add","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -6871,7 +6659,7 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
             .expect("write thread/read after add");
             stdin.flush().expect("flush thread/read after add");
         }
-        let read_after_add = read_until_event(&mut stdout, "read-after-add", "thread_read");
+        let read_after_add = child.expect_event("read-after-add", "thread_read");
         assert_eq!(read_after_add["additionalWorkingDirectoryCount"], 1);
         assert_eq!(
             read_after_add["additionalWorkingDirectories"][0]["path"],
@@ -6883,7 +6671,7 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
         );
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"turn-remove","method":"turn/start","params":{{"threadId":"{}","permissionUpdates":[{{"type":"removeDirectories","destination":"projectSettings","directories":["{}"]}}],"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -6893,10 +6681,10 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
             .expect("write remove directories turn");
             stdin.flush().expect("flush remove directories turn");
         }
-        read_until_event(&mut stdout, "turn-remove", "turn_completed");
+        child.expect_event("turn-remove", "turn_completed");
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
                 stdin,
                 r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -6904,8 +6692,8 @@ fn server_mode_permission_updates_remove_directories_by_destination() {
             )
             .expect("write thread/read");
         }
-        drop(child.stdin.take());
-        let read = read_until_event(&mut stdout, "read", "thread_read");
+        child.close_stdin();
+        let read = child.expect_event("read", "thread_read");
         assert_eq!(read["additionalWorkingDirectoryCount"], 1);
         assert_eq!(
             read["additionalWorkingDirectories"][0]["path"],
@@ -6961,10 +6749,8 @@ fn server_mode_request_permissions_waits_for_permission_response() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -6972,14 +6758,14 @@ fn server_mode_request_permissions_waits_for_permission_response() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf granted > {}"}}]}}}}"#,
@@ -6991,7 +6777,7 @@ fn server_mode_request_permissions_waits_for_permission_response() {
         stdin.flush().expect("flush turn/start");
     }
 
-    let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+    let permission_request = child.expect_event("turn", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
@@ -7003,7 +6789,7 @@ fn server_mode_request_permissions_waits_for_permission_response() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
@@ -7014,13 +6800,13 @@ fn server_mode_request_permissions_waits_for_permission_response() {
         stdin.flush().expect("flush permission/respond");
     }
 
-    let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    let resolved = child.expect_event("permission-response", "permission_resolved");
     assert_eq!(resolved["requestId"], request_id);
     assert_eq!(resolved["decision"], "allow");
-    let _turn_completed = read_until_event(&mut stdout, "turn", "turn_completed");
+    let _turn_completed = child.expect_event("turn", "turn_completed");
     assert_eq!(std::fs::read_to_string(&output_file).unwrap(), "granted");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -7055,10 +6841,8 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -7066,11 +6850,11 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf granted > {}"}}]}}}}"#,
@@ -7081,14 +6865,14 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
         .expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
-    let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+    let permission_request = child.expect_event("turn", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","strictAutoReview":true,"permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
@@ -7099,9 +6883,9 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
         stdin.flush().expect("flush permission/respond");
     }
 
-    let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    let resolved = child.expect_event("permission-response", "permission_resolved");
     assert_eq!(resolved["strictAutoReview"], true);
-    let events = read_events_until_event(&mut stdout, "turn", "turn_completed");
+    let events = child.drain_events_until_event("turn", "turn_completed");
     assert_eq!(
         events
             .last()
@@ -7122,7 +6906,7 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
     assert_eq!(output["strictAutoReview"], true);
     assert!(!output_file.exists());
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -7157,10 +6941,8 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -7168,11 +6950,11 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf blocked > {}"}}]}}}}"#,
@@ -7183,14 +6965,14 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
         .expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
-    let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+    let permission_request = child.expect_event("turn", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"turn","strictAutoReview":true,"permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
@@ -7201,15 +6983,15 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
         stdin.flush().expect("flush permission/respond");
     }
 
-    let _resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
-    let completed = read_until_event(&mut stdout, "turn", "turn_completed");
+    let _resolved = child.expect_event("permission-response", "permission_resolved");
+    let completed = child.expect_event("turn", "turn_completed");
     assert_eq!(completed["status"], "approval_required");
     assert!(
         !output_file.exists(),
         "strictAutoReview should stop the subsequent bash before execution"
     );
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -7226,10 +7008,8 @@ fn server_mode_lists_and_searches_threads() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -7238,14 +7018,14 @@ fn server_mode_lists_and_searches_threads() {
         stdin.flush().expect("flush thread/start request");
     }
 
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"cli thread search needle"}}]}}}}"#,
@@ -7254,10 +7034,10 @@ fn server_mode_lists_and_searches_threads() {
         .expect("write thread turn");
         stdin.flush().expect("flush thread turn");
     }
-    read_until_event(&mut stdout, "turn", "turn_completed");
+    child.expect_event("turn", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list","method":"thread/list","params":{{"limit":10}}}}"#
@@ -7265,7 +7045,7 @@ fn server_mode_lists_and_searches_threads() {
         .expect("write thread/list");
         stdin.flush().expect("flush thread/list");
     }
-    let listed = read_until_event(&mut stdout, "list", "thread_list");
+    let listed = child.expect_event("list", "thread_list");
     let listed_threads = listed["data"].as_array().expect("thread list data");
     assert!(
         listed_threads.iter().any(|thread| {
@@ -7276,7 +7056,7 @@ fn server_mode_lists_and_searches_threads() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"search","method":"thread/search","params":{{"searchTerm":"needle","limit":10}}}}"#
@@ -7284,7 +7064,7 @@ fn server_mode_lists_and_searches_threads() {
         .expect("write thread/search");
     }
 
-    let searched = read_until_event(&mut stdout, "search", "thread_search");
+    let searched = child.expect_event("search", "thread_search");
     let hits = searched["data"].as_array().expect("thread search data");
     assert!(hits.iter().any(|hit| {
         hit["thread"]["threadId"] == thread_id
@@ -7294,7 +7074,7 @@ fn server_mode_lists_and_searches_threads() {
     }));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turns","method":"thread/turns/list","params":{{"threadId":"{}","limit":10}}}}"#,
@@ -7303,7 +7083,7 @@ fn server_mode_lists_and_searches_threads() {
         .expect("write thread/turns/list");
         stdin.flush().expect("flush thread/turns/list");
     }
-    let turns = read_until_event(&mut stdout, "turns", "thread_turns_list");
+    let turns = child.expect_event("turns", "thread_turns_list");
     let turn_data = turns["data"].as_array().expect("thread turns data");
     assert!(turn_data.iter().any(|turn| {
         turn["threadId"] == thread_id
@@ -7318,7 +7098,7 @@ fn server_mode_lists_and_searches_threads() {
     }));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read-turns","method":"thread/read","params":{{"threadId":"{}","includeTurns":true}}}}"#,
@@ -7327,7 +7107,7 @@ fn server_mode_lists_and_searches_threads() {
         .expect("write thread/read includeTurns");
         stdin.flush().expect("flush thread/read includeTurns");
     }
-    let read_turns = read_until_event(&mut stdout, "read-turns", "thread_read");
+    let read_turns = child.expect_event("read-turns", "thread_read");
     let read_turn_data = read_turns["turns"].as_array().expect("read turns data");
     assert!(read_turn_data.iter().any(|turn| {
         turn["threadId"] == thread_id
@@ -7342,7 +7122,7 @@ fn server_mode_lists_and_searches_threads() {
     }));
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"items","method":"thread/items/list","params":{{"threadId":"{}","limit":10}}}}"#,
@@ -7350,8 +7130,8 @@ fn server_mode_lists_and_searches_threads() {
         )
         .expect("write thread/items/list");
     }
-    drop(child.stdin.take());
-    let items = read_until_event(&mut stdout, "items", "thread_items_list");
+    child.close_stdin();
+    let items = child.expect_event("items", "thread_items_list");
     let item_data = items["data"].as_array().expect("thread items data");
     assert!(item_data.iter().any(|item| {
         item["threadId"] == thread_id
@@ -7396,10 +7176,8 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -7407,14 +7185,14 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
@@ -7425,14 +7203,14 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
         .expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
-    let permission_request = read_until_event(&mut stdout, "turn-1", "permission_request");
+    let permission_request = child.expect_event("turn-1", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"write":["{}"],"read":null}},"network":null}}}}}}"#,
@@ -7442,11 +7220,11 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
         .expect("write session permission/respond");
         stdin.flush().expect("flush session permission/respond");
     }
-    let _resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
-    let _first_completed = read_until_event(&mut stdout, "turn-1", "turn_completed");
+    let _resolved = child.expect_event("permission-response", "permission_resolved");
+    let _first_completed = child.expect_event("turn-1", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
@@ -7457,10 +7235,10 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
         .expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
+    let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -7468,8 +7246,8 @@ fn server_mode_request_permissions_session_scope_persists_directory_grant() {
         )
         .expect("write thread/read");
     }
-    drop(child.stdin.take());
-    let read = read_until_event(&mut stdout, "read", "thread_read");
+    child.close_stdin();
+    let read = child.expect_event("read", "thread_read");
     assert_eq!(read["additionalWorkingDirectoryCount"], 1);
     assert_eq!(
         read["additionalWorkingDirectories"][0]["path"],
@@ -7519,10 +7297,8 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -7530,14 +7306,14 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
@@ -7548,14 +7324,14 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
         .expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
-    let permission_request = read_until_event(&mut stdout, "turn-1", "permission_request");
+    let permission_request = child.expect_event("turn-1", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"read":null,"write":null,"entries":[{{"path":"{}","access":"write"}}]}},"network":null}}}}}}"#,
@@ -7567,12 +7343,12 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
             .flush()
             .expect("flush session permission/respond with entries");
     }
-    let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    let resolved = child.expect_event("permission-response", "permission_resolved");
     assert_eq!(resolved["scope"], "session");
-    let _first_completed = read_until_event(&mut stdout, "turn-1", "turn_completed");
+    let _first_completed = child.expect_event("turn-1", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
@@ -7583,10 +7359,10 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
         .expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
+    let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -7594,8 +7370,8 @@ fn server_mode_request_permissions_session_scope_accepts_file_system_entries() {
         )
         .expect("write thread/read");
     }
-    drop(child.stdin.take());
-    let read = read_until_event(&mut stdout, "read", "thread_read");
+    child.close_stdin();
+    let read = child.expect_event("read", "thread_read");
     assert_eq!(read["additionalWorkingDirectoryCount"], 1);
     assert_eq!(
         read["additionalWorkingDirectories"][0]["path"],
@@ -7639,10 +7415,8 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -7650,14 +7424,14 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
@@ -7668,14 +7442,14 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
         .expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
-    let permission_request = read_until_event(&mut stdout, "turn-1", "permission_request");
+    let permission_request = child.expect_event("turn-1", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"read":null,"write":null,"entries":[{{"path":{{"type":"special","value":{{"kind":"project_roots","subpath":"docs"}}}},"access":"write"}}]}},"network":null}}}}}}"#,
@@ -7686,12 +7460,12 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
             .flush()
             .expect("flush session permission/respond with special entry");
     }
-    let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+    let resolved = child.expect_event("permission-response", "permission_resolved");
     assert_eq!(resolved["scope"], "session");
-    let _first_completed = read_until_event(&mut stdout, "turn-1", "turn_completed");
+    let _first_completed = child.expect_event("turn-1", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
@@ -7702,10 +7476,10 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
         .expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
+    let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -7713,8 +7487,8 @@ fn server_mode_request_permissions_session_scope_accepts_workspace_roots_entries
         )
         .expect("write thread/read");
     }
-    drop(child.stdin.take());
-    let read = read_until_event(&mut stdout, "read", "thread_read");
+    child.close_stdin();
+    let read = child.expect_event("read", "thread_read");
     assert_eq!(read["additionalWorkingDirectoryCount"], 1);
     assert_eq!(
         read["additionalWorkingDirectories"][0]["path"],
@@ -7761,10 +7535,8 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{"runtimeWorkspaceRoots":["{}"]}}}}"#,
@@ -7773,14 +7545,14 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let thread_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","runtimeWorkspaceRoots":["{}"],"input":[{{"type":"text","text":"request_permissions_then_bash {} :: printf first > {}"}}]}}}}"#,
@@ -7792,14 +7564,14 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
         .expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
-    let permission_request = read_until_event(&mut stdout, "turn-1", "permission_request");
+    let permission_request = child.expect_event("turn-1", "permission_request");
     let request_id = permission_request["requestId"]
         .as_str()
         .expect("permission request id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":{{"read":null,"write":null,"entries":[{{"path":{{"type":"special","value":{{"kind":"project_roots","subpath":"docs"}}}},"access":"write"}}]}},"network":null}}}}}}"#,
@@ -7810,11 +7582,11 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
             .flush()
             .expect("flush session permission/respond with special entry");
     }
-    let _resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
-    let _first_completed = read_until_event(&mut stdout, "turn-1", "turn_completed");
+    let _resolved = child.expect_event("permission-response", "permission_resolved");
+    let _first_completed = child.expect_event("turn-1", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         let command = format!("printf ok > {}", second_output.display());
         writeln!(
             stdin,
@@ -7825,10 +7597,10 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
         .expect("write second command/exec");
         stdin.flush().expect("flush second command/exec");
     }
-    let _second_completed = read_until_event(&mut stdout, "cmd-2", "command_exec_completed");
+    let _second_completed = child.expect_event("cmd-2", "command_exec_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{}"}}}}"#,
@@ -7836,8 +7608,8 @@ fn server_mode_turn_start_rebinds_runtime_workspace_roots_for_permission_grants(
         )
         .expect("write thread/read");
     }
-    drop(child.stdin.take());
-    let read = read_until_event(&mut stdout, "read", "thread_read");
+    child.close_stdin();
+    let read = child.expect_event("read", "thread_read");
     assert_eq!(
         read["runtimeWorkspaceRoots"][0],
         new_root.display().to_string()
@@ -7866,10 +7638,8 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orca server");
-
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread-req","method":"thread/start","params":{{}}}}"#
@@ -7877,14 +7647,14 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         .expect("write thread/start request");
         stdin.flush().expect("flush thread/start request");
     }
-    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_started = child.expect_event("thread-req", "thread_started");
     let parent_id = thread_started["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"first prompt"}}]}}}}"#,
@@ -7893,10 +7663,10 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         .expect("write first turn");
         stdin.flush().expect("flush first turn");
     }
-    read_until_event(&mut stdout, "turn-1", "turn_completed");
+    child.expect_event("turn-1", "turn_completed");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"resume","method":"thread/resume","params":{{"threadId":"{}"}}}}"#,
@@ -7905,7 +7675,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         .expect("write thread/resume");
         stdin.flush().expect("flush thread/resume");
     }
-    let resumed = read_next_event_for_id(&mut stdout, "resume");
+    let resumed = child.expect_next_for_id("resume");
     assert_eq!(resumed["event"], "thread_started");
     let resumed_id = resumed["threadId"]
         .as_str()
@@ -7914,7 +7684,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
     assert_eq!(resumed_id, parent_id);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-2","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#,
@@ -7923,7 +7693,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         .expect("write resumed turn");
         stdin.flush().expect("flush resumed turn");
     }
-    let resumed_events = read_events_until_event(&mut stdout, "turn-2", "turn_completed");
+    let resumed_events = child.drain_events_until_event("turn-2", "turn_completed");
     let echoed = resumed_events
         .iter()
         .filter(|event| event["id"] == "turn-2" && event["event"] == "message_delta")
@@ -7935,7 +7705,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"read-resumed","method":"thread/read","params":{{"threadId":"{}","includeMessages":true}}}}"#,
@@ -7944,7 +7714,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         .expect("write resumed thread/read");
         stdin.flush().expect("flush resumed thread/read");
     }
-    let read_resumed = read_until_event(&mut stdout, "read-resumed", "thread_read");
+    let read_resumed = child.expect_event("read-resumed", "thread_read");
     assert!(
         read_resumed["messages"]
             .as_array()
@@ -7956,7 +7726,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
     );
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"fork","method":"thread/fork","params":{{"threadId":"{}"}}}}"#,
@@ -7965,7 +7735,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         .expect("write thread/fork");
         stdin.flush().expect("flush thread/fork");
     }
-    let forked = read_next_event_for_id(&mut stdout, "fork");
+    let forked = child.expect_next_for_id("fork");
     assert_eq!(forked["event"], "thread_started");
     let child_id = forked["threadId"]
         .as_str()
@@ -7974,7 +7744,7 @@ fn server_mode_resumes_and_forks_persisted_threads() {
     assert_ne!(child_id, parent_id);
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"list-children","method":"thread/list","params":{{"parentThreadId":"{}","limit":10}}}}"#,
@@ -7982,8 +7752,8 @@ fn server_mode_resumes_and_forks_persisted_threads() {
         )
         .expect("write child list");
     }
-    drop(child.stdin.take());
-    let children = read_until_event(&mut stdout, "list-children", "thread_list");
+    child.close_stdin();
+    let children = child.expect_event("list-children", "thread_list");
     let child_threads = children["data"].as_array().expect("child threads");
     assert!(child_threads.iter().any(|thread| {
         thread["threadId"] == child_id
@@ -8058,10 +7828,9 @@ fn server_mode_filters_thread_list_by_codex_metadata_fields() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn orca server");
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
             stdin,
             r#"{{"id":"filter-cwd","method":"thread/list","params":{{"cwd":"{}","limit":10,"sortKey":"createdAt","sortDirection":"asc"}}}}"#,
@@ -8070,13 +7839,13 @@ fn server_mode_filters_thread_list_by_codex_metadata_fields() {
         .expect("write cwd filter");
             stdin.flush().expect("flush cwd filter");
         }
-        let filtered_cwd = read_until_event(&mut stdout, "filter-cwd", "thread_list");
+        let filtered_cwd = child.expect_event("filter-cwd", "thread_list");
         let cwd_threads = filtered_cwd["data"].as_array().expect("cwd data");
         assert_eq!(cwd_threads.len(), 1);
         assert_eq!(cwd_threads[0]["threadId"], parent_id);
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
             stdin,
             r#"{{"id":"filter-provider-model","method":"thread/list","params":{{"modelProviders":["openai"],"model":["gpt-5"],"limit":10}}}}"#
@@ -8084,14 +7853,13 @@ fn server_mode_filters_thread_list_by_codex_metadata_fields() {
         .expect("write provider model filter");
             stdin.flush().expect("flush provider model filter");
         }
-        let filtered_provider =
-            read_until_event(&mut stdout, "filter-provider-model", "thread_list");
+        let filtered_provider = child.expect_event("filter-provider-model", "thread_list");
         let provider_threads = filtered_provider["data"].as_array().expect("provider data");
         assert_eq!(provider_threads.len(), 1);
         assert_eq!(provider_threads[0]["threadId"], child_id);
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
             stdin,
             r#"{{"id":"filter-child","method":"thread/list","params":{{"parentThreadId":"{}","limit":10}}}}"#,
@@ -8100,22 +7868,22 @@ fn server_mode_filters_thread_list_by_codex_metadata_fields() {
         .expect("write relation filter");
             stdin.flush().expect("flush relation filter");
         }
-        let filtered_child = read_until_event(&mut stdout, "filter-child", "thread_list");
+        let filtered_child = child.expect_event("filter-child", "thread_list");
         let child_threads = filtered_child["data"].as_array().expect("child data");
         assert_eq!(child_threads.len(), 1);
         assert_eq!(child_threads[0]["threadId"], child_id);
 
         {
-            let stdin = child.stdin.as_mut().expect("server stdin");
+            let stdin = child.stdin_mut();
             writeln!(
             stdin,
             r#"{{"id":"filter-archived","method":"thread/list","params":{{"archived":true,"limit":10}}}}"#
         )
         .expect("write archived filter");
         }
-        drop(child.stdin.take());
+        child.close_stdin();
 
-        let filtered_archived = read_until_event(&mut stdout, "filter-archived", "thread_list");
+        let filtered_archived = child.expect_event("filter-archived", "thread_list");
         let archived_threads = filtered_archived["data"].as_array().expect("archived data");
         assert_eq!(archived_threads.len(), 1);
         assert_eq!(archived_threads[0]["threadId"], archived_id);
@@ -8138,7 +7906,7 @@ fn server_mode_rejects_turn_start_for_unknown_thread() {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn-req","method":"turn/start","params":{{"threadId":"missing-thread","input":[{{"type":"text","text":"hello missing thread"}}]}}}}"#
@@ -8157,54 +7925,6 @@ fn server_mode_rejects_turn_start_for_unknown_thread() {
     assert_eq!(events[0]["message"], "unknown thread: missing-thread");
 }
 
-fn read_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &str) -> Value {
-    loop {
-        let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
-        if event["id"] == id && event["event"] == event_name {
-            return event;
-        }
-        assert!(
-            !(is_thread_query_event(event_name) && event["id"] == id && event["event"] == "error"),
-            "server returned error before {id}/{event_name}: {}",
-            event["message"].as_str().unwrap_or("<missing message>")
-        );
-    }
-}
-
-fn read_until_event_or_matching_error<R: BufRead>(
-    stdout: &mut R,
-    id: &str,
-    event_name: &str,
-) -> Value {
-    loop {
-        let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
-        if event["id"] == id && event["event"] == event_name {
-            return event;
-        }
-        assert!(
-            !(event["id"] == id && event["event"] == "error"),
-            "server returned error before {id}/{event_name}: {}",
-            event["message"].as_str().unwrap_or("<missing message>")
-        );
-    }
-}
-
-fn is_thread_query_event(event_name: &str) -> bool {
-    matches!(
-        event_name,
-        "thread_read" | "thread_list" | "thread_search" | "thread_turns" | "thread_items"
-    )
-}
-
-fn read_until_tool_completed<R: BufRead>(stdout: &mut R, id: &str, tool: &str) -> Value {
-    loop {
-        let event = read_json_event_line(stdout, &format!("{id}/tool_completed"));
-        if event["id"] == id && event["event"] == "tool_completed" && event["tool"] == tool {
-            return event;
-        }
-    }
-}
-
 fn sandbox_seatbelt_available() -> bool {
     Command::new("sandbox-exec")
         .arg("-p")
@@ -8215,25 +7935,23 @@ fn sandbox_seatbelt_available() -> bool {
         .unwrap_or(false)
 }
 
+fn sandbox_test_parent(prefix: &str) -> TempDir {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("HOME is required for macOS Seatbelt contract tests");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(home)
+        .expect("sandbox parent outside temporary allow roots")
+}
+
 fn wait_for_child_output_with_timeout(
-    mut child: OrcaChild,
+    child: ServerTestClient,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("child did not exit within {timeout:?}"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(error.to_string()),
-        }
-    }
+    child
+        .wait_with_output_timeout(timeout)
+        .map_err(|error| error.to_string())
 }
 
 fn wait_for_path(path: &Path) {
@@ -8266,7 +7984,7 @@ fn assert_command_exec_error(params: &str, expected_message: &str) {
         .expect("spawn orca server");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"cmd","method":"command/exec","params":{params}}}"#
@@ -8274,7 +7992,7 @@ fn assert_command_exec_error(params: &str, expected_message: &str) {
         .expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-    drop(child.stdin.take());
+    child.close_stdin();
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
@@ -8296,18 +8014,9 @@ fn assert_command_exec_error(params: &str, expected_message: &str) {
     );
 }
 
-fn read_next_event_for_id<R: BufRead>(stdout: &mut R, id: &str) -> Value {
+fn read_shell_read_result(client: &mut ServerTestClient, id: &str) -> Value {
     loop {
-        let event = read_json_event_line(stdout, &format!("next event for {id}"));
-        if event["id"] == id {
-            return event;
-        }
-    }
-}
-
-fn read_shell_read_result<R: BufRead>(stdout: &mut R, id: &str) -> Value {
-    loop {
-        let event = read_next_event_for_id(stdout, id);
+        let event = client.expect_next_for_id(id);
         match event["event"].as_str() {
             Some("shell_output_delta") => {
                 assert!(event["shellId"].as_str().is_some());
@@ -8330,105 +8039,24 @@ fn read_shell_read_result<R: BufRead>(stdout: &mut R, id: &str) -> Value {
     }
 }
 
-fn read_events_until_event<R: BufRead>(stdout: &mut R, id: &str, event_name: &str) -> Vec<Value> {
-    let mut events = Vec::new();
-    loop {
-        let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
-        let found = event["id"] == id && event["event"] == event_name;
-        events.push(event);
-        if found {
-            return events;
-        }
-    }
-}
-
-fn read_events_until_event_or_error<R: BufRead>(
-    stdout: &mut R,
-    id: &str,
-    event_name: &str,
-) -> Vec<Value> {
-    let mut events = Vec::new();
-    loop {
-        let event = read_json_event_line(stdout, &format!("{id}/{event_name}"));
-        let done = event["id"] == id && (event["event"] == event_name || event["event"] == "error");
-        events.push(event);
-        if done {
-            return events;
-        }
-    }
-}
-
-fn read_events_until_shell_read_response<R: BufRead>(stdout: &mut R, id: &str) -> Vec<Value> {
-    let mut events = Vec::new();
-    loop {
-        let event = read_json_event_line(stdout, &format!("shell/read response for {id}"));
-        let done = event["id"] == id
+fn read_events_until_shell_read_response(client: &mut ServerTestClient, id: &str) -> Vec<Value> {
+    client.drain_events_until_matching(&format!("shell/read response for {id}"), |event| {
+        event["id"] == id
             && matches!(
                 event["event"].as_str(),
                 Some("shell_updated" | "shell_completed" | "error")
-            );
-        events.push(event);
-        if done {
-            return events;
-        }
-    }
+            )
+    })
 }
 
-fn read_json_event_line<R: BufRead>(stdout: &mut R, context: &str) -> Value {
-    loop {
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read server event");
-        assert_ne!(bytes, 0, "server ended before {context}");
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(line) {
-            Ok(event) => return event,
-            Err(_) => continue,
-        }
-    }
-}
-
-#[test]
-fn read_json_event_line_skips_non_protocol_stdout_noise() {
-    let mut input = BufReader::new(
-        b"noise from child process\n\n{\"id\":\"ok\",\"event\":\"done\"}\n".as_slice(),
-    );
-
-    let event = read_json_event_line(&mut input, "test event");
-
-    assert_eq!(event["id"], "ok");
-    assert_eq!(event["event"], "done");
-}
-
-#[test]
-#[should_panic(expected = "server returned error before read/thread_read")]
-fn read_until_event_fails_fast_on_matching_thread_query_error_event() {
-    let mut input = BufReader::new(
-        br#"{"id":"read","event":"error","message":"unknown thread: thread-1"}
-"#
-        .as_slice(),
-    );
-
-    let _ = read_until_event(&mut input, "read", "thread_read");
-}
-
-fn read_command_exec_output_until<R: BufRead>(
-    stdout: &mut R,
+fn read_command_exec_output_until(
+    client: &mut ServerTestClient,
     process_id: &str,
     predicate: impl Fn(&str, &str) -> bool,
 ) -> Vec<Value> {
-    let mut events = Vec::new();
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
-    loop {
-        let mut line = String::new();
-        let bytes = stdout
-            .read_line(&mut line)
-            .expect("read command exec event");
-        assert_ne!(bytes, 0, "server ended before command/exec output");
-        let event: Value = serde_json::from_str(line.trim()).expect("server json");
+    client.drain_events_until_matching("command/exec streaming output", |event| {
         if event["event"] == "command_exec_output_delta" && event["processId"] == process_id {
             let stream = event["stream"].as_str().unwrap_or_default();
             let delta = event["delta"].as_str().unwrap_or_default();
@@ -8437,14 +8065,11 @@ fn read_command_exec_output_until<R: BufRead>(
                 "stderr" => stderr_text.push_str(delta),
                 other => panic!("unexpected command/exec stream {other}: {event}"),
             }
-            events.push(event);
-            if predicate(&stdout_text, &stderr_text) {
-                return events;
-            }
+            predicate(&stdout_text, &stderr_text)
         } else {
-            events.push(event);
+            false
         }
-    }
+    })
 }
 
 fn assert_command_exec_delta_seen(events: &[Value], stream: &str, expected_delta: &str) {
@@ -8482,24 +8107,15 @@ fn assert_command_exec_output_delta_notification_seen(
     );
 }
 
-fn read_events_until_workflow_item_completed<R: BufRead>(stdout: &mut R, id: &str) -> Vec<Value> {
-    let mut events = Vec::new();
-    loop {
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).expect("read server event");
-        assert_ne!(
-            bytes, 0,
-            "server ended before workflow item completion for {id}"
-        );
-        let event: Value = serde_json::from_str(line.trim()).expect("server json");
-        let found = event["id"] == id
+fn read_events_until_workflow_item_completed(
+    client: &mut ServerTestClient,
+    id: &str,
+) -> Vec<Value> {
+    client.drain_events_until_matching(&format!("workflow item completion for {id}"), |event| {
+        event["id"] == id
             && event["event"] == "item_completed"
-            && event["item"]["type"] == "workflow";
-        events.push(event);
-        if found {
-            return events;
-        }
-    }
+            && event["item"]["type"] == "workflow"
+    })
 }
 
 fn has_event(events: &[Value], event: &str) -> bool {
@@ -8514,7 +8130,7 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
 }
 
 fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = lock_env();
     let home = tempdir().expect("temp home");
     let previous = std::env::var_os("ORCA_HOME");
     unsafe {
@@ -8529,6 +8145,12 @@ fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
         }
     }
     result
+}
+
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {
