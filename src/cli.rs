@@ -39,6 +39,7 @@ use crate::runtime::history;
 use crate::tui::app;
 
 const MAX_WORKER_API_KEY_BYTES: u64 = 64 * 1024;
+const MAX_WORKFLOW_LAUNCH_RECORD_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TuiUpdatePreflight {
@@ -497,12 +498,12 @@ struct WorkflowSourceEntry {
     script: String,
 }
 
-#[derive(Debug)]
 struct PersistedWorkflowRun {
     session_id: String,
     state: WorkflowRunState,
     run_dir: PathBuf,
     state_mtime: Option<SystemTime>,
+    legacy_api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -511,8 +512,6 @@ struct WorkflowCliLaunchRecord {
     cwd: String,
     provider: ProviderKind,
     model: Option<String>,
-    #[serde(default, skip_serializing)]
-    api_key: Option<String>,
     base_url: Option<String>,
     input: WorkflowInput,
 }
@@ -1393,7 +1392,7 @@ fn workflow_clone_command(run_id: &str) -> i32 {
 
 fn workflow_restart_command(run_id: &str, restart_phase: Option<String>) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_default();
-    match find_workflow_by_run_id(&cwd, run_id) {
+    match find_workflow_by_run_id_for_restart(&cwd, run_id) {
         Ok(Some(run)) => {
             let record = match read_workflow_cli_launch_record(&run.run_dir) {
                 Ok(record) => record,
@@ -1403,21 +1402,6 @@ fn workflow_restart_command(run_id: &str, restart_phase: Option<String>) -> i32 
                 }
             };
             let launch_cwd = PathBuf::from(&record.cwd);
-            let legacy_api_key = record.api_key.clone();
-            if legacy_api_key.is_some() {
-                let sanitized = WorkflowCliLaunchRecord {
-                    cwd: record.cwd.clone(),
-                    provider: record.provider,
-                    model: record.model.clone(),
-                    api_key: None,
-                    base_url: record.base_url.clone(),
-                    input: record.input.clone(),
-                };
-                if let Err(error) = write_workflow_cli_launch_record(&run.run_dir, &sanitized) {
-                    eprintln!("orca: failed to sanitize workflow launch record: {error}");
-                    return 1;
-                }
-            }
             let mut input = record.input;
             input.resume_from_run_id = Some(run.state.run_id.clone());
             input.restart_phase = restart_phase;
@@ -1426,7 +1410,7 @@ fn workflow_restart_command(run_id: &str, restart_phase: Option<String>) -> i32 
                 run.session_id,
                 record.provider,
                 record.model,
-                legacy_api_key,
+                run.legacy_api_key,
                 record.base_url,
                 &input,
             )
@@ -1489,7 +1473,6 @@ fn run_workflow_worker(args: WorkflowWorkerArgs) -> i32 {
             cwd: args.cwd.display().to_string(),
             provider: args.provider,
             model: args.model,
-            api_key: None,
             base_url: args.base_url,
             input,
         },
@@ -1841,6 +1824,13 @@ fn resolve_workflow_session_id(
 }
 
 fn load_persisted_workflow_runs(cwd: &Path) -> Result<Vec<PersistedWorkflowRun>, String> {
+    load_persisted_workflow_runs_inner(cwd, None)
+}
+
+fn load_persisted_workflow_runs_inner(
+    cwd: &Path,
+    capture_legacy_key_for_run_id: Option<&str>,
+) -> Result<Vec<PersistedWorkflowRun>, String> {
     let root = workflow_session_root(cwd);
     if !root.exists() {
         return Ok(Vec::new());
@@ -1870,11 +1860,16 @@ fn load_persisted_workflow_runs(cwd: &Path) -> Result<Vec<PersistedWorkflowRun>,
             {
                 continue;
             }
+            let migrated_api_key = migrate_legacy_workflow_cli_launch_record(&run_entry.path())?;
             let state_path = run_entry.path().join("state.json");
             if !state_path.exists() {
                 continue;
             }
             let state = read_workflow_state(&state_path)?;
+            let legacy_api_key = capture_legacy_key_for_run_id
+                .is_some_and(|run_id| run_id == state.run_id)
+                .then_some(migrated_api_key)
+                .flatten();
             let state_mtime = fs::metadata(&state_path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok());
@@ -1883,6 +1878,7 @@ fn load_persisted_workflow_runs(cwd: &Path) -> Result<Vec<PersistedWorkflowRun>,
                 state,
                 run_dir: run_entry.path(),
                 state_mtime,
+                legacy_api_key,
             });
         }
     }
@@ -1904,6 +1900,15 @@ fn find_workflow_by_run_id(
     run_id: &str,
 ) -> Result<Option<PersistedWorkflowRun>, String> {
     Ok(load_persisted_workflow_runs(cwd)?
+        .into_iter()
+        .find(|run| run.state.run_id == run_id))
+}
+
+fn find_workflow_by_run_id_for_restart(
+    cwd: &Path,
+    run_id: &str,
+) -> Result<Option<PersistedWorkflowRun>, String> {
+    Ok(load_persisted_workflow_runs_inner(cwd, Some(run_id))?
         .into_iter()
         .find(|run| run.state.run_id == run_id))
 }
@@ -1940,6 +1945,148 @@ fn read_workflow_cli_launch_record(run_dir: &Path) -> Result<WorkflowCliLaunchRe
             path.display()
         )
     })
+}
+
+fn migrate_legacy_workflow_cli_launch_record(run_dir: &Path) -> Result<Option<String>, String> {
+    let path = workflow_cli_launch_record_path(run_dir);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect workflow launch record at {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "workflow launch record at {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_WORKFLOW_LAUNCH_RECORD_BYTES {
+        return Err(format!(
+            "workflow launch record at {} exceeds {} bytes",
+            path.display(),
+            MAX_WORKFLOW_LAUNCH_RECORD_BYTES
+        ));
+    }
+
+    let mut open_options = fs::OpenOptions::new();
+    open_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        open_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = open_options.open(&path).map_err(|error| {
+        format!(
+            "failed to read workflow launch record at {}: {error}",
+            path.display()
+        )
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        format!(
+            "failed to inspect workflow launch record at {}: {error}",
+            path.display()
+        )
+    })?;
+    if !opened_metadata.is_file() {
+        return Err(format!(
+            "workflow launch record at {} is not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.dev() != opened_metadata.dev() || metadata.ino() != opened_metadata.ino() {
+            return Err(format!(
+                "workflow launch record at {} changed while it was opened",
+                path.display()
+            ));
+        }
+    }
+    let mut content =
+        Vec::with_capacity(opened_metadata.len().min(MAX_WORKFLOW_LAUNCH_RECORD_BYTES) as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_WORKFLOW_LAUNCH_RECORD_BYTES + 1)
+        .read_to_end(&mut content)
+        .map_err(|error| {
+            format!(
+                "failed to read workflow launch record at {}: {error}",
+                path.display()
+            )
+        })?;
+    if content.len() as u64 > MAX_WORKFLOW_LAUNCH_RECORD_BYTES {
+        return Err(format!(
+            "workflow launch record at {} exceeds {} bytes",
+            path.display(),
+            MAX_WORKFLOW_LAUNCH_RECORD_BYTES
+        ));
+    }
+    let mut value: Value = serde_json::from_slice(&content).map_err(|error| {
+        format!(
+            "invalid workflow launch record at {}: {error}",
+            path.display()
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        format!(
+            "invalid workflow launch record at {}: expected a JSON object",
+            path.display()
+        )
+    })?;
+    let camel_case_key = object.remove("apiKey");
+    let snake_case_key = object.remove("api_key");
+    if camel_case_key.is_none() && snake_case_key.is_none() {
+        return Ok(None);
+    }
+    let legacy_api_key = camel_case_key
+        .as_ref()
+        .and_then(Value::as_str)
+        .or_else(|| snake_case_key.as_ref().and_then(Value::as_str))
+        .map(ToString::to_string);
+
+    let replacement = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cli-launch.json");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| -> io::Result<()> {
+        use std::fs::OpenOptions;
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        fs::set_permissions(&temp_path, opened_metadata.permissions())?;
+        file.write_all(&replacement)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, &path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "failed to sanitize workflow launch record at {}: {error}",
+            path.display()
+        ));
+    }
+
+    Ok(legacy_api_key)
 }
 
 fn workflow_cli_launch_record_path(run_dir: &Path) -> PathBuf {
@@ -2459,7 +2606,6 @@ mod tests {
             cwd: "/tmp/workspace".to_string(),
             provider: ProviderKind::DeepSeek,
             model: Some("deepseek-chat".to_string()),
-            api_key: Some("orca-secret-sentinel-launch-record".to_string()),
             base_url: None,
             input: workflow_input_for_launch(Path::new("/tmp/workspace"), "workflow", None, None),
         };
@@ -2472,29 +2618,219 @@ mod tests {
         assert!(!json.contains("apiKey"));
         assert!(!persisted.contains("orca-secret-sentinel-launch-record"));
         assert!(!persisted.contains("apiKey"));
-        assert!(
-            read_workflow_cli_launch_record(temp.path())
-                .unwrap()
-                .api_key
-                .is_none()
-        );
+        read_workflow_cli_launch_record(temp.path()).unwrap();
     }
 
     #[test]
-    fn legacy_workflow_launch_record_api_key_can_be_read_for_sanitization() {
+    fn legacy_workflow_launch_record_api_key_is_ignored_by_typed_reader() {
         let record: WorkflowCliLaunchRecord = serde_json::from_value(serde_json::json!({
             "cwd": "/tmp/workspace",
             "provider": "deep-seek",
             "model": null,
             "apiKey": "legacy-secret",
             "baseUrl": null,
-            "input": {
-                "name": "workflow"
-            }
+            "input": { "name": "workflow" }
         }))
         .unwrap();
 
-        assert_eq!(record.api_key.as_deref(), Some("legacy-secret"));
+        assert_eq!(record.cwd, "/tmp/workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workflow_project_access_sanitizes_all_legacy_launch_records_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let runs_root = workflow_session_root(project.path())
+            .join("session-a")
+            .join("workflow-runs");
+        let first = runs_root.join("run-a");
+        let second = runs_root.join("run-b");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(
+            workflow_cli_launch_record_path(&first),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cwd": project.path(),
+                "provider": "deep-seek",
+                "model": null,
+                "apiKey": "legacy-first",
+                "baseUrl": null,
+                "input": { "name": "workflow-a" },
+                "futureField": { "preserved": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            workflow_cli_launch_record_path(&second),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cwd": project.path(),
+                "provider": "deep-seek",
+                "model": null,
+                "api_key": 42,
+                "baseUrl": null,
+                "input": { "name": "workflow-b" },
+                "futureField": "still-present"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            workflow_cli_launch_record_path(&first),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        write_test_workflow_state(&first, "session-a", "run-a", "task-a", project.path());
+        write_test_workflow_state(&second, "session-a", "run-b", "task-b", project.path());
+
+        let runs = load_persisted_workflow_runs(project.path()).unwrap();
+
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| run.legacy_api_key.is_none()));
+        let first_value: Value =
+            serde_json::from_slice(&fs::read(workflow_cli_launch_record_path(&first)).unwrap())
+                .unwrap();
+        let second_value: Value =
+            serde_json::from_slice(&fs::read(workflow_cli_launch_record_path(&second)).unwrap())
+                .unwrap();
+        assert!(first_value.get("apiKey").is_none());
+        assert!(second_value.get("api_key").is_none());
+        assert_eq!(first_value["futureField"]["preserved"], true);
+        assert_eq!(second_value["futureField"], "still-present");
+        assert_eq!(
+            fs::metadata(workflow_cli_launch_record_path(&first))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(fs::read_dir(&first).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn workflow_restart_migration_captures_only_the_target_legacy_key() {
+        let project = tempfile::tempdir().unwrap();
+        let runs_root = workflow_session_root(project.path())
+            .join("session-a")
+            .join("workflow-runs");
+        let first = runs_root.join("run-a");
+        let second = runs_root.join("run-b");
+        for (run_dir, run_id, task_id, key) in [
+            (&first, "run-a", "task-a", "legacy-first"),
+            (&second, "run-b", "task-b", "legacy-second"),
+        ] {
+            fs::create_dir_all(run_dir).unwrap();
+            fs::write(
+                workflow_cli_launch_record_path(run_dir),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "cwd": project.path(),
+                    "provider": "deep-seek",
+                    "model": null,
+                    "apiKey": key,
+                    "baseUrl": null,
+                    "input": { "name": "workflow" }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            write_test_workflow_state(run_dir, "session-a", run_id, task_id, project.path());
+        }
+
+        let runs = load_persisted_workflow_runs_inner(project.path(), Some("run-a")).unwrap();
+
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.state.run_id == "run-a")
+                .and_then(|run| run.legacy_api_key.as_deref()),
+            Some("legacy-first")
+        );
+        assert!(
+            runs.iter()
+                .find(|run| run.state.run_id == "run-b")
+                .and_then(|run| run.legacy_api_key.as_deref())
+                .is_none(),
+            "restart must not aggregate unrelated legacy keys in memory"
+        );
+        for run_dir in [&first, &second] {
+            let value: Value = serde_json::from_slice(
+                &fs::read(workflow_cli_launch_record_path(run_dir)).unwrap(),
+            )
+            .unwrap();
+            assert!(value.get("apiKey").is_none());
+        }
+    }
+
+    #[test]
+    fn workflow_launch_record_migration_rejects_symlinks_and_oversized_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let oversized = temp.path().join("oversized");
+        fs::create_dir_all(&oversized).unwrap();
+        fs::write(
+            workflow_cli_launch_record_path(&oversized),
+            vec![b'x'; MAX_WORKFLOW_LAUNCH_RECORD_BYTES as usize + 1],
+        )
+        .unwrap();
+        let error = migrate_legacy_workflow_cli_launch_record(&oversized).unwrap_err();
+        assert!(error.contains("exceeds"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlinked = temp.path().join("symlinked");
+            let target = temp.path().join("target.json");
+            fs::create_dir_all(&symlinked).unwrap();
+            fs::write(&target, r#"{"apiKey":"must-not-change"}"#).unwrap();
+            symlink(&target, workflow_cli_launch_record_path(&symlinked)).unwrap();
+            let error = migrate_legacy_workflow_cli_launch_record(&symlinked).unwrap_err();
+            assert!(error.contains("not a regular file"));
+            assert_eq!(
+                fs::read_to_string(target).unwrap(),
+                r#"{"apiKey":"must-not-change"}"#
+            );
+        }
+    }
+
+    fn write_test_workflow_state(
+        run_dir: &Path,
+        session_id: &str,
+        run_id: &str,
+        task_id: &str,
+        cwd: &Path,
+    ) {
+        fs::write(
+            run_dir.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runId": run_id,
+                "taskId": task_id,
+                "sessionId": session_id,
+                "cwd": cwd,
+                "workflowName": "workflow",
+                "meta": {
+                    "name": "workflow",
+                    "description": "test workflow",
+                    "phases": []
+                },
+                "scriptDigest": "script-digest",
+                "argsDigest": "args-digest",
+                "status": "completed",
+                "phases": [],
+                "totalAgentCount": 0,
+                "finalSummary": null,
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
