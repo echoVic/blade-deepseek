@@ -38,7 +38,7 @@ esac
   writeExecutable(
     orcaBin,
     `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import readline from "node:readline";
 
 const logPath = ${JSON.stringify(logPath)};
@@ -52,9 +52,31 @@ if (process.env.ORCA_FAKE_BAD_CLI === "1" && args[0] === "exec") {
 }
 
 if (args[0] === "exec") {
-  const text = args.join(" ").includes("ORCA_HISTORY_REPLAY_OK")
-    ? "ORCA_HISTORY_REPLAY_OK"
-    : "ORCA_REAL_E2E_OK";
+  const isHistoryReplay = args.join(" ").includes("ORCA_HISTORY_REPLAY_OK");
+  if (isHistoryReplay) {
+    const historyPath = process.env.ORCA_HOME + "/sessions/2026/07/11/session-2026-07-11T00-00-00-history-replay-e2e.jsonl";
+    const records = readFileSync(historyPath, "utf8")
+      .trim()
+      .split(/\\r?\\n/)
+      .map((line) => JSON.parse(line));
+    const callId = "legacy-missing-tool-call";
+    const hasCall = records.some((record) =>
+      record.type === "conversation.message" &&
+      record.message?.role === "assistant" &&
+      record.message?.tool_calls?.some?.((call) => call.id === callId)
+    );
+    const hasResult = records.some((record) =>
+      record.type === "conversation.message" &&
+      record.message?.role === "tool" &&
+      record.message?.tool_call_id === callId
+    );
+    if (!hasCall || hasResult) {
+      process.stderr.write("history replay fixture must contain one unmatched tool call\\n");
+      process.exit(44);
+    }
+    appendFileSync(logPath, "history-replay-fixture " + callId + " missing-result\\n");
+  }
+  const text = isHistoryReplay ? "ORCA_HISTORY_REPLAY_OK" : "ORCA_REAL_E2E_OK";
   process.stdout.write(JSON.stringify({
     type: "assistant.message.delta",
     payload: { text },
@@ -283,6 +305,30 @@ if (args[0] === "--mode" && args[1] === "server") {
       return;
     }
     if (request.method === "thread/items/list") {
+      if (request.params.threadId === "history-replay-e2e") {
+        process.stdout.write(JSON.stringify({
+          id: request.id,
+          event: "thread_items_list",
+          data: [
+            {
+              threadId: "history-replay-e2e",
+              turnId: "turn-1",
+              itemId: "legacy-missing-tool-call",
+              index: 1,
+              item: {
+                id: "legacy-missing-tool-call",
+                type: "commandExecution",
+                status: "indeterminate",
+                kind: "indeterminate",
+                terminalSource: "compatibility_repair"
+              }
+            }
+          ],
+          nextCursor: null,
+          backwardsCursor: "0"
+        }) + "\\n");
+        return;
+      }
       const descItems = request.params.sortDirection === "desc";
       process.stdout.write(JSON.stringify({
         id: request.id,
@@ -390,6 +436,8 @@ if (args[0] === "--mode" && args[1] === "server") {
     "Provider summary real API e2e verified",
     "CLI real API e2e verified: ORCA_REAL_E2E_OK",
     "History replay real API e2e verified: ORCA_HISTORY_REPLAY_OK",
+    "History replay repair verified: legacy-missing-tool-call status=indeterminate terminalSource=compatibility_repair",
+    "History replay invocation not re-executed: legacy-missing-tool-call",
     "Server real API e2e verified: ORCA_SERVER_REAL_OK",
     "Server thread real API e2e verified: ORCA_SERVER_THREAD_MEMORY_OK_",
     "Server thread/read e2e verified",
@@ -416,7 +464,9 @@ if (args[0] === "--mode" && args[1] === "server") {
     "cargo build --bin orca",
     "cargo run -p orca-provider --example summary_render_realapi",
     "orca exec --output-format jsonl --no-history --mode suggest --max-budget 0.01 Reply with exactly: ORCA_REAL_E2E_OK",
-    "orca exec --output-format jsonl --mode suggest --max-budget 0.01 --resume latest Reply with exactly: ORCA_HISTORY_REPLAY_OK",
+    "orca exec --output-format jsonl --mode full-auto --max-budget 0.01 --resume latest Do not call tools or retry prior work. Reply with exactly: ORCA_HISTORY_REPLAY_OK",
+    "history-replay-fixture legacy-missing-tool-call missing-result",
+    "server-stdin {\"id\":\"history-replay-items\",\"method\":\"thread/items/list\",\"params\":{\"threadId\":\"history-replay-e2e\",\"limit\":20}}",
     "orca --mode server",
     "server-stdin {\"id\":101,\"op\":\"submit\",\"prompt\":\"Reply with exactly: ORCA_SERVER_REAL_OK\"}",
     "server-stdin {\"id\":\"server-thread\",\"method\":\"thread/start\",\"params\":{}}",

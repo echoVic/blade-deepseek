@@ -16,6 +16,7 @@ import path from "node:path";
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const cliSentinel = "ORCA_REAL_E2E_OK";
 const historyReplaySentinel = "ORCA_HISTORY_REPLAY_OK";
+const historyReplayCallId = "legacy-missing-tool-call";
 const serverSentinel = "ORCA_SERVER_REAL_OK";
 const serverThreadSentinel = `ORCA_SERVER_THREAD_MEMORY_OK_${Date.now()}_${process.pid}`;
 const serverThreadReadySentinel = "READY";
@@ -190,6 +191,7 @@ function runHistoryReplay(args) {
     sessionDir,
     "session-2026-07-11T00-00-00-history-replay-e2e.jsonl",
   );
+  const sideEffectPath = path.join(home, "legacy-missing-tool-call-reexecuted");
   mkdirSync(sessionDir, { recursive: true });
   const records = [
     {
@@ -215,8 +217,16 @@ function runHistoryReplay(args) {
       message: {
         role: "assistant",
         content: null,
-        reasoning_content: "synthetic incomplete reasoning",
-        tool_calls: [],
+        reasoning_content: "synthetic incomplete tool invocation",
+        tool_calls: [
+          {
+            id: historyReplayCallId,
+            function_name: "bash",
+            arguments: JSON.stringify({
+              command: `touch ${JSON.stringify(sideEffectPath)}`,
+            }),
+          },
+        ],
         pinned: false,
       },
     },
@@ -234,12 +244,12 @@ function runHistoryReplay(args) {
         "--output-format",
         "jsonl",
         "--mode",
-        "suggest",
+        "full-auto",
         "--max-budget",
         args.maxBudget,
         "--resume",
         "latest",
-        `Reply with exactly: ${historyReplaySentinel}`,
+        `Do not call tools or retry prior work. Reply with exactly: ${historyReplaySentinel}`,
       ],
       {
         env: { ...process.env, ORCA_HOME: home },
@@ -263,7 +273,48 @@ function runHistoryReplay(args) {
       ["payload", "status"],
       "History replay real API e2e",
     );
+    if (existsSync(sideEffectPath)) {
+      throw new Error(
+        `History replay re-executed missing invocation ${historyReplayCallId}: ${sideEffectPath}`,
+      );
+    }
+
+    const inspectRequest = JSON.stringify({
+      id: "history-replay-items",
+      method: "thread/items/list",
+      params: {
+        threadId: "history-replay-e2e",
+        limit: 20,
+      },
+    });
+    const inspectOutput = run(args.orcaBin, ["--mode", "server"], {
+      env: { ...process.env, ORCA_HOME: home },
+      input: `${inspectRequest}\n`,
+      stdio: ["pipe", "pipe", "pipe"],
+      timeoutMs: args.timeoutMs,
+    });
+    const inspectEvents = parseJsonLines(inspectOutput, "history replay thread items");
+    const itemsEvent = inspectEvents.find(
+      (event) => event.id === "history-replay-items" && event.event === "thread_items_list",
+    );
+    const repairedItem = itemsEvent?.data?.find?.(
+      (entry) => entry.item?.id === historyReplayCallId,
+    )?.item;
+    if (
+      repairedItem?.status !== "indeterminate" ||
+      repairedItem?.kind !== "indeterminate" ||
+      repairedItem?.terminalSource !== "compatibility_repair"
+    ) {
+      throw new Error(
+        `History replay did not expose repaired terminal ${historyReplayCallId}: ${inspectOutput}`,
+      );
+    }
+
     console.log(`History replay real API e2e verified: ${historyReplaySentinel}`);
+    console.log(
+      `History replay repair verified: ${historyReplayCallId} status=indeterminate terminalSource=compatibility_repair`,
+    );
+    console.log(`History replay invocation not re-executed: ${historyReplayCallId}`);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
