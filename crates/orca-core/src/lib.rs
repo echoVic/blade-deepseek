@@ -14,6 +14,7 @@ pub mod model;
 pub mod plan_types;
 pub mod proposed_plan;
 pub mod provider_types;
+pub mod retained_output;
 pub mod subagent_config;
 pub mod subagent_types;
 pub mod task_types;
