@@ -635,9 +635,13 @@ fn should_stop_after_tui_tool_result(
     tool_request: &tool_types::ToolRequest,
     result: &tool_types::ToolResult,
 ) -> bool {
-    matches!(result.status, tool_types::ToolStatus::Denied)
-        || (tool_request.name == tool_types::ToolName::RequestUserInput
-            && result.status == tool_types::ToolStatus::Failed)
+    matches!(
+        result.status,
+        tool_types::ToolStatus::Denied
+            | tool_types::ToolStatus::Cancelled
+            | tool_types::ToolStatus::Indeterminate
+    ) || (tool_request.name == tool_types::ToolName::RequestUserInput
+        && result.status == tool_types::ToolStatus::Failed)
 }
 
 /// Everything needed to (re-)run one bash invocation in the TUI with the

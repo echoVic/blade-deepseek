@@ -858,10 +858,18 @@ fn maybe_stop_cancelled_main_session_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
+    pending_tool_requests: &[tool_types::ToolRequest],
 ) -> Option<TuiAgentTurnResult> {
     if !session.task_registry().is_cancelled(task_id) {
         return None;
     }
+    close_unstarted_tool_requests_for_tui(
+        session,
+        event_tx,
+        events,
+        pending_tool_requests,
+        "the main TUI session stopped before sibling dispatch",
+    );
     send_session_completed_for_tui(
         event_tx,
         events,
@@ -870,6 +878,27 @@ fn maybe_stop_cancelled_main_session_for_tui(
     finish_main_session_task_for_tui(session, event_tx, events, task_id, "interrupted");
     session.complete("interrupted");
     Some(TuiAgentTurnResult::new("interrupted"))
+}
+
+fn close_unstarted_tool_requests_for_tui(
+    session: &mut TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    pending_tool_requests: &[tool_types::ToolRequest],
+    reason: &str,
+) {
+    for request in pending_tool_requests {
+        send_tool_requested_for_tui(event_tx, events, request);
+        let result = tool_types::ToolResult::cancelled_before_start(request, reason);
+        send_tool_completed_for_tui(event_tx, events, &result, None);
+        let content = agent_common::format_tool_result_for_model(&result);
+        session
+            .conversation_mut()
+            .add_tool_result_with_terminal(&result, content);
+        if let Some(message) = session.conversation().messages.last().cloned() {
+            session.append_message(&message);
+        }
+    }
 }
 
 pub(crate) fn send_tool_requested_for_tui(
@@ -1694,6 +1723,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     session.hooks(),
                     Some(session.task_registry()),
                 );
+                let mut batch_terminal_status = None;
                 for (should_stop, result, child_cost) in results {
                     if let Some(turn_extension_id) = turn_extension_id.as_deref() {
                         record_tui_goal_tool_finish(session, turn_extension_id, &result);
@@ -1727,30 +1757,42 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
                     }
-                    if let Some(result) = maybe_stop_cancelled_main_session_for_tui(
+                    if should_stop && batch_terminal_status.is_none() {
+                        batch_terminal_status = Some(result.status);
+                    }
+                }
+                if let Some(result) = maybe_stop_cancelled_main_session_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    &tool_requests[batch_end..],
+                ) {
+                    return result;
+                }
+                if let Some(terminal_status) = batch_terminal_status {
+                    close_unstarted_tool_requests_for_tui(
+                        session,
+                        event_tx,
+                        &mut runtime_events,
+                        &tool_requests[batch_end..],
+                        "an earlier subagent ended the TUI tool turn",
+                    );
+                    let status = match terminal_status {
+                        tool_types::ToolStatus::Denied => "approval_required",
+                        tool_types::ToolStatus::Cancelled => "interrupted",
+                        _ => "failed",
+                    };
+                    send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
+                    finish_main_session_task_for_tui(
                         session,
                         event_tx,
                         &mut runtime_events,
                         &main_session_task_id,
-                    ) {
-                        return result;
-                    }
-                    if should_stop {
-                        send_session_completed_for_tui(
-                            event_tx,
-                            &mut runtime_events,
-                            orca_core::event_schema::RunStatus::ApprovalRequired,
-                        );
-                        finish_main_session_task_for_tui(
-                            session,
-                            event_tx,
-                            &mut runtime_events,
-                            &main_session_task_id,
-                            "approval_required",
-                        );
-                        session.complete("approval_required");
-                        return TuiAgentTurnResult::new("approval_required");
-                    }
+                        status,
+                    );
+                    session.complete(status);
+                    return TuiAgentTurnResult::new(status);
                 }
                 index = batch_end;
                 continue;
@@ -1785,14 +1827,15 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     if let Some(message) = session.conversation().messages.last().cloned() {
                         session.append_message(&message);
                     }
-                    if let Some(result) = maybe_stop_cancelled_main_session_for_tui(
-                        session,
-                        event_tx,
-                        &mut runtime_events,
-                        &main_session_task_id,
-                    ) {
-                        return result;
-                    }
+                }
+                if let Some(result) = maybe_stop_cancelled_main_session_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    &tool_requests[batch_end..],
+                ) {
+                    return result;
                 }
                 index = batch_end;
                 continue;
@@ -1881,15 +1924,23 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 event_tx,
                 &mut runtime_events,
                 &main_session_task_id,
+                &tool_requests[index + 1..],
             ) {
                 return result;
             }
 
             if should_stop {
-                let status = if matches!(result.status, tool_types::ToolStatus::Denied) {
-                    "approval_required"
-                } else {
-                    "failed"
+                close_unstarted_tool_requests_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &tool_requests[index + 1..],
+                    "an earlier sibling ended the TUI tool turn",
+                );
+                let status = match result.status {
+                    tool_types::ToolStatus::Denied => "approval_required",
+                    tool_types::ToolStatus::Cancelled => "interrupted",
+                    _ => "failed",
                 };
                 send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
                 finish_main_session_task_for_tui(
@@ -3452,28 +3503,105 @@ mod tests {
         });
 
         let start = Instant::now();
+        let mut observed_events = Vec::new();
         loop {
-            match event_rx
+            let event = event_rx
                 .recv_timeout(Duration::from_secs(2))
-                .expect("TUI event before timeout")
-            {
-                TuiEvent::ToolOutputDelta { chunk, .. } if chunk.contains("before") => {
-                    cancel.cancel();
-                    break;
-                }
-                TuiEvent::SessionCompleted { status } => {
-                    panic!("session completed before streaming output: {status}");
-                }
-                _ => {}
+                .expect("TUI event before timeout");
+            let saw_streaming_output = matches!(&event, TuiEvent::ToolOutputDelta { chunk, .. } if chunk.contains("before"));
+            if let TuiEvent::SessionCompleted { status } = &event {
+                panic!("session completed before streaming output: {status}");
+            }
+            observed_events.push(event);
+            if saw_streaming_output {
+                cancel.cancel();
+                break;
             }
         }
 
         let status = handle.join().expect("turn thread joined");
+        observed_events.extend(event_rx.try_iter());
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "cancelled TUI streaming bash should not wait for shell timeout"
         );
         assert_eq!(status, "interrupted");
+        assert!(observed_events.iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::ToolCompleted { name, status, .. }
+                    if name == "bash" && status == "cancelled"
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_main_session_stop_closes_every_sibling_tool_row() {
+        let config = full_auto_config();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "task stop siblings", None)
+                .expect("session");
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "task_stop_main_session_with_siblings",
+            &event_tx,
+            &action_rx,
+            &cancel,
+            false,
+        );
+
+        assert_eq!(status, "interrupted");
+        let assistant_call_ids = session
+            .conversation()
+            .messages
+            .iter()
+            .flat_map(|message| match message {
+                orca_core::conversation::Message::Assistant { tool_calls, .. } => tool_calls
+                    .iter()
+                    .map(|tool_call| tool_call.id.as_str())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let terminal_ids = session
+            .conversation()
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                orca_core::conversation::Message::Tool { tool_call_id, .. } => {
+                    Some(tool_call_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_call_ids, terminal_ids);
+        assert_eq!(terminal_ids.len(), 4);
+
+        let completed = event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                TuiEvent::ToolCompleted { id, status, .. } => Some((id, status)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 4);
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|(_, status)| status == "cancelled")
+                .count(),
+            2
+        );
+        assert!(
+            completed
+                .iter()
+                .all(|(_, status)| !matches!(status.as_str(), "running" | "receiving"))
+        );
     }
 
     #[test]
@@ -4363,7 +4491,7 @@ mod tests {
         );
 
         responder.join().expect("responder joined");
-        assert_eq!(status, "failed");
+        assert_eq!(status, "interrupted");
     }
 
     #[test]

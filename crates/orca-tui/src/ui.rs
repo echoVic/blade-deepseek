@@ -1333,6 +1333,8 @@ fn append_message_lines(
                 "running" | "receiving" => spinner_frame(tick),
                 "denied" => "✗",
                 "failed" => "✗",
+                "cancelled" => "×",
+                "indeterminate" => "?",
                 _ => "·",
             };
             let color = match status.as_str() {
@@ -1340,10 +1342,16 @@ fn append_message_lines(
                 "completed" => theme.success,
                 "running" | "receiving" => theme.warning,
                 "denied" | "failed" => theme.error,
+                "cancelled" | "indeterminate" => theme.warning,
                 _ => theme.muted,
             };
+            let display_status = match status.as_str() {
+                "cancelled" => "interrupted",
+                "indeterminate" => "state unknown",
+                status => status,
+            };
             let prefix = format!("  {icon} {name}");
-            let status_text = format!(" ({status})");
+            let status_text = format!(" ({display_status})");
             let reserved_width = UnicodeWidthStr::width(prefix.as_str())
                 + UnicodeWidthStr::width(status_text.as_str());
             let target_width =
@@ -3028,6 +3036,43 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("v9.8.7-test"));
+    }
+
+    #[test]
+    fn terminal_tool_rows_render_interrupted_and_state_unknown_labels() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let messages = [
+            ChatMessage::ToolCall {
+                id: "cancelled".to_string(),
+                name: "bash".to_string(),
+                target: None,
+                status: "cancelled".to_string(),
+                output: Some("turn interrupted".to_string()),
+                diff: None,
+                kind: Some("cancelled".to_string()),
+                expanded: false,
+            },
+            ChatMessage::ToolCall {
+                id: "indeterminate".to_string(),
+                name: "deploy".to_string(),
+                target: None,
+                status: "indeterminate".to_string(),
+                output: Some("inspect external state".to_string()),
+                diff: None,
+                kind: Some("indeterminate".to_string()),
+                expanded: false,
+            },
+        ];
+
+        let rendered = build_lines_for_messages(&messages, &theme, 100, 0, false)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(rendered.contains("(interrupted)"));
+        assert!(rendered.contains("(state unknown)"));
+        assert!(!rendered.contains("(completed)"));
     }
 
     fn test_state() -> AppState {

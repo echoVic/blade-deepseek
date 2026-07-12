@@ -79,6 +79,8 @@ pub enum ServerEvent {
         target: Value,
     },
     ToolCompleted {
+        #[serde(rename = "toolCallId", skip_serializing_if = "Value::is_null")]
+        tool_call_id: Value,
         tool: Value,
         status: Value,
         #[serde(skip_serializing_if = "Value::is_null")]
@@ -89,6 +91,8 @@ pub enum ServerEvent {
         exit_code: Value,
         #[serde(skip_serializing_if = "Value::is_null")]
         kind: Value,
+        #[serde(rename = "terminalSource", skip_serializing_if = "Value::is_null")]
+        terminal_source: Value,
     },
     WorkflowStarted {
         #[serde(rename = "taskId")]
@@ -471,12 +475,14 @@ pub fn map_runtime_event_line(line: &str) -> Option<ServerEvent> {
             target: payload["target"].clone(),
         }),
         "tool.call.completed" => Some(ServerEvent::ToolCompleted {
+            tool_call_id: payload["id"].clone(),
             tool: payload["name"].clone(),
             status: payload["status"].clone(),
             output: payload["output"].clone(),
             error: payload["error"].clone(),
             exit_code: payload["exit_code"].clone(),
             kind: payload["kind"].clone(),
+            terminal_source: payload["terminal_source"].clone(),
         }),
         "workflow.started" => Some(ServerEvent::WorkflowStarted {
             task_id: payload["taskId"].clone(),

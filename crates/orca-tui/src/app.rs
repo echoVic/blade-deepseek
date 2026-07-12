@@ -3010,6 +3010,47 @@ mod tests {
             Some(ChatMessage::User(display)) if display.starts_with("[Pasted Content ")
         ));
     }
+
+    #[test]
+    fn repaired_indeterminate_history_tool_renders_state_inspection_warning() {
+        let request = orca_core::tool_types::ToolRequest {
+            id: "legacy-call".to_string(),
+            name: orca_core::tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("deploy".to_string()),
+            raw_arguments: None,
+        };
+        let result = orca_core::tool_types::ToolResult::indeterminate(
+            &request,
+            "legacy tool call has no terminal result",
+        )
+        .with_terminal_source(orca_core::tool_types::ToolTerminalSource::CompatibilityRepair);
+
+        let message = chat_message_from_history(Message::Tool {
+            tool_call_id: request.id,
+            content: "legacy missing result".to_string(),
+            terminal: Some(result.terminal().clone()),
+            pinned: false,
+        })
+        .expect("history tool message");
+
+        let ChatMessage::ToolCall {
+            status,
+            output,
+            kind,
+            ..
+        } = message
+        else {
+            panic!("expected tool row")
+        };
+        assert_eq!(status, "indeterminate");
+        assert_eq!(kind.as_deref(), Some("indeterminate"));
+        assert!(
+            output
+                .as_deref()
+                .is_some_and(|output| output.contains("Inspect external state before retrying"))
+        );
+    }
 }
 
 fn ensure_tui_session(
@@ -3889,16 +3930,42 @@ pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage>
         Message::Tool {
             tool_call_id,
             content,
+            terminal,
             ..
-        } => Some(ChatMessage::ToolCall {
-            id: tool_call_id.clone(),
-            name: format!("tool:{tool_call_id}"),
-            target: None,
-            status: "completed".to_string(),
-            output: Some(content),
-            diff: None,
-            kind: None,
-            expanded: false,
-        }),
+        } => {
+            let status = terminal
+                .as_ref()
+                .map(|terminal| terminal.status.as_str())
+                .unwrap_or("completed")
+                .to_string();
+            let kind = terminal
+                .as_ref()
+                .and_then(|terminal| serde_json::to_value(terminal.kind).ok())
+                .and_then(|value| value.as_str().map(str::to_string));
+            let mut output = content;
+            if output.is_empty()
+                && let Some(error) = terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.error.as_ref())
+            {
+                output = error.clone();
+            }
+            if status == "indeterminate" && !output.contains("Inspect external state") {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str("State is unknown. Inspect external state before retrying.");
+            }
+            Some(ChatMessage::ToolCall {
+                id: tool_call_id.clone(),
+                name: format!("tool:{tool_call_id}"),
+                target: None,
+                status,
+                output: (!output.is_empty()).then_some(output),
+                diff: None,
+                kind,
+                expanded: false,
+            })
+        }
     }
 }

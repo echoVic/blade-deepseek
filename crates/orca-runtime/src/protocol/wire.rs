@@ -2315,12 +2315,14 @@ mod tests {
         let value = legacy_json_event(
             Value::from(7),
             ServerEvent::ToolCompleted {
+                tool_call_id: Value::Null,
                 tool: Value::from("read_file"),
                 status: Value::from("completed"),
                 output: Value::from("ok"),
                 error: Value::Null,
                 exit_code: Value::Null,
                 kind: Value::Null,
+                terminal_source: Value::Null,
             },
         );
 
@@ -2413,6 +2415,21 @@ mod tests {
         assert_eq!(value["exitCode"], 124);
         assert_eq!(value["kind"], "runtime_error");
         assert!(value.get("output").is_none());
+    }
+
+    #[test]
+    fn runtime_tool_completed_mapping_preserves_terminal_identity_and_source() {
+        let mapped = map_runtime_event_line(
+            r#"{"type":"tool.call.completed","payload":{"id":"legacy-call","name":"bash","status":"indeterminate","error":"missing terminal result","kind":"indeterminate","terminal_source":"compatibility_repair"}}"#,
+        )
+        .expect("mapped event");
+        let value = legacy_json_event(Value::from("turn-1"), mapped);
+
+        assert_eq!(value["event"], "tool_completed");
+        assert_eq!(value["toolCallId"], "legacy-call");
+        assert_eq!(value["status"], "indeterminate");
+        assert_eq!(value["kind"], "indeterminate");
+        assert_eq!(value["terminalSource"], "compatibility_repair");
     }
 
     #[test]

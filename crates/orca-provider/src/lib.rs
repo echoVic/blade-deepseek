@@ -600,26 +600,48 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
-    if prompt == "task_stop_main_session"
-        && let Some(task_id) = find_mock_main_session_task_id(conversation)
+    if matches!(
+        prompt,
+        "task_stop_main_session" | "task_stop_main_session_with_siblings"
+    ) && let Some(task_id) = find_mock_main_session_task_id(conversation)
     {
-        let tool_request = ToolRequest {
+        let task_stop = ToolRequest {
             id: "mock-tool-2".to_string(),
             name: ToolName::TaskStop,
             action: ActionKind::Write,
             target: Some(task_id.clone()),
             raw_arguments: Some(serde_json::json!({ "task_id": task_id }).to_string()),
         };
-        let raw_call = RawToolCall {
-            id: tool_request.id.clone(),
-            function_name: tool_request.name.as_str().to_string(),
-            arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
-        };
+        let mut requests = vec![task_stop];
+        if prompt == "task_stop_main_session_with_siblings" {
+            requests.extend(
+                ["first", "second"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| ToolRequest {
+                        id: format!("mock-tool-{}", index + 3),
+                        name: ToolName::Bash,
+                        action: ActionKind::Shell,
+                        target: Some(format!("printf {label}")),
+                        raw_arguments: Some(
+                            serde_json::json!({ "command": format!("printf {label}") }).to_string(),
+                        ),
+                    }),
+            );
+        }
+        let tool_calls = requests
+            .iter()
+            .map(|request| RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            })
+            .collect();
         return ProviderResponse {
-            steps: vec![ProviderStep::ToolCall(tool_request)],
+            steps: requests.into_iter().map(ProviderStep::ToolCall).collect(),
             assistant_content: None,
             assistant_reasoning: None,
-            tool_calls: vec![raw_call],
+            tool_calls,
             usage: None,
         };
     }
@@ -1042,7 +1064,10 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
-    if prompt == "task_stop_main_session" {
+    if matches!(
+        prompt,
+        "task_stop_main_session" | "task_stop_main_session_with_siblings"
+    ) {
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
             name: ToolName::TaskList,

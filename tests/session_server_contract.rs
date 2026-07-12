@@ -1115,12 +1115,42 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
     let interrupt_sent_at = Instant::now();
     let interrupt = child.expect_event("interrupt-bash", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
-    let completed = child.expect_event("turn-bash", "turn_completed");
+    let completion_events = child.drain_events_until_event("turn-bash", "turn_completed");
     assert!(
         interrupt_sent_at.elapsed() < Duration::from_millis(1200),
         "turn completion waited for the full bash sleep"
     );
+    let completed = completion_events.last().expect("turn_completed");
     assert_eq!(completed["status"], "cancelled");
+    let tool_completed = completion_events
+        .iter()
+        .find(|event| event["event"] == "tool_completed" && event["tool"] == "bash")
+        .expect("cancelled bash tool_completed");
+    assert_eq!(tool_completed["toolCallId"], "mock-tool-1");
+    assert_eq!(tool_completed["status"], "cancelled");
+    assert_eq!(tool_completed["kind"], "cancelled");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"bash-items","method":"thread/items/list","params":{{"threadId":"{}","limit":10}}}}"#,
+            thread_id
+        )
+        .expect("write thread/items/list");
+        stdin.flush().expect("flush thread/items/list");
+    }
+    let items = child.expect_event("bash-items", "thread_items_list");
+    let command = items["data"]
+        .as_array()
+        .expect("thread items")
+        .iter()
+        .find(|item| item["item"]["id"] == "mock-tool-1")
+        .expect("cancelled bash thread item");
+    assert_eq!(command["item"]["type"], "commandExecution");
+    assert_eq!(command["item"]["status"], "cancelled");
+    assert_eq!(command["item"]["kind"], "cancelled");
+    assert_eq!(command["item"]["invocationStarted"], "yes");
 
     child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");

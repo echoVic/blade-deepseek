@@ -377,6 +377,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_cancelled_tool_completed_event_keeps_cancelled_status() {
+        let mut events = EventFactory::new("tui-runtime-cancelled".to_string());
+        let request = tool_types::ToolRequest {
+            id: "cancelled-bash".to_string(),
+            name: tool_types::ToolName::Bash,
+            action: orca_core::approval_types::ActionKind::Shell,
+            target: Some("sleep 30".to_string()),
+            raw_arguments: None,
+        };
+        let result = tool_types::ToolResult::cancelled(&request, "turn interrupted", Some(130));
+
+        let tui_event =
+            tui_event_from_runtime_event(&events.tool_call_completed(&result)).expect("tui event");
+
+        assert!(matches!(
+            tui_event,
+            TuiEvent::ToolCompleted { status, kind, .. }
+                if status == "cancelled" && kind.as_deref() == Some("cancelled")
+        ));
+    }
+
+    #[test]
     fn runtime_assistant_delta_events_map_to_tui_streaming_events() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 
