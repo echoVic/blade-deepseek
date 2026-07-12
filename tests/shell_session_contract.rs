@@ -293,6 +293,45 @@ fn shell_session_updates_description_for_list_snapshots() {
     sessions.kill(&handle.id).expect("cleanup shell session");
 }
 
+#[test]
+fn shell_session_terminate_all_preserves_natural_completion() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let tasks = TaskRegistry::new("session-shell".to_string());
+    let mut sessions = RuntimeShellSessionManager::new(tasks.clone());
+    let handle = sessions
+        .spawn(ShellSessionCommand {
+            command: "printf completed".to_string(),
+            cwd: temp.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: Default::default(),
+            description: "naturally completed shell".to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox: ShellSandboxMode::default(),
+        })
+        .expect("spawn shell session");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while sessions
+        .list()
+        .iter()
+        .any(|snapshot| snapshot.id == handle.id && snapshot.status == TaskStatus::Running)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shell did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    sessions.terminate_all();
+
+    let task = tasks.get(&handle.task_id).expect("shell task");
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.result.as_deref(), Some("completed"));
+}
+
 #[cfg(unix)]
 #[test]
 fn shell_session_pty_exposes_terminal_to_child_process() {

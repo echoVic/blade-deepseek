@@ -55,9 +55,15 @@ impl PendingPermissionRequest {
     }
 }
 
+#[derive(Default)]
+struct PendingPermissionState {
+    closed: bool,
+    pending: HashMap<String, PendingPermissionRequest>,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct PendingPermissionManager {
-    pending: Arc<Mutex<HashMap<String, PendingPermissionRequest>>>,
+    state: Arc<Mutex<PendingPermissionState>>,
 }
 
 impl PendingPermissionManager {
@@ -66,14 +72,15 @@ impl PendingPermissionManager {
         request_id: String,
         request: PendingCommandExecPermissionRequest,
     ) -> io::Result<()> {
-        let mut pending = self.pending.lock().map_err(lock_error)?;
-        if pending.contains_key(&request_id) {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Self::ensure_open(&state)?;
+        if state.pending.contains_key(&request_id) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("duplicate pending permission request id: {request_id}"),
             ));
         }
-        pending.insert(
+        state.pending.insert(
             request_id,
             PendingPermissionRequest::CommandExec {
                 request: Box::new(request),
@@ -83,8 +90,15 @@ impl PendingPermissionManager {
     }
 
     pub(super) fn remove(&self, request_id: &str) -> io::Result<Option<PendingPermissionRequest>> {
-        let mut pending = self.pending.lock().map_err(lock_error)?;
-        Ok(pending.remove(request_id))
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Ok(state.pending.remove(request_id))
+    }
+
+    pub(super) fn close(&self) -> io::Result<()> {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        state.closed = true;
+        state.pending.clear();
+        Ok(())
     }
 
     fn insert_runtime(
@@ -92,15 +106,27 @@ impl PendingPermissionManager {
         request_id: String,
         request: PendingPermissionRequest,
     ) -> io::Result<()> {
-        let mut pending = self.pending.lock().map_err(lock_error)?;
-        if pending.contains_key(&request_id) {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Self::ensure_open(&state)?;
+        if state.pending.contains_key(&request_id) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("duplicate pending permission request id: {request_id}"),
             ));
         }
-        pending.insert(request_id, request);
+        state.pending.insert(request_id, request);
         Ok(())
+    }
+
+    fn ensure_open(state: &PendingPermissionState) -> io::Result<()> {
+        if state.closed {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "server permission request manager is closed",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -214,5 +240,40 @@ mod tests {
             .expect("original request still pending");
         assert_eq!(pending.thread_id(), "thread-1");
         assert_eq!(pending.runtime_workspace_roots(), &[PathBuf::from("/repo")]);
+    }
+
+    #[test]
+    fn closing_permission_manager_disconnects_waiters_and_rejects_late_requests() {
+        let manager = PendingPermissionManager::default();
+        let (sender, receiver) = mpsc::channel();
+        manager
+            .insert_runtime(
+                "permission-turn-1-ask".to_string(),
+                PendingPermissionRequest::Runtime {
+                    sender,
+                    thread_id: "thread-1".to_string(),
+                    runtime_workspace_roots: Vec::new(),
+                },
+            )
+            .expect("insert pending request");
+
+        manager.close().expect("close manager");
+
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        let (late_sender, _late_receiver) = mpsc::channel();
+        let error = manager
+            .insert_runtime(
+                "permission-turn-2-ask".to_string(),
+                PendingPermissionRequest::Runtime {
+                    sender: late_sender,
+                    thread_id: "thread-1".to_string(),
+                    runtime_workspace_roots: Vec::new(),
+                },
+            )
+            .expect_err("closed manager must reject late requests");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }

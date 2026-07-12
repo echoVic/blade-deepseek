@@ -4285,6 +4285,72 @@ fn server_mode_command_exec_stops_active_processes_when_input_closes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn server_mode_shell_stops_active_process_group_when_input_closes() {
+    let workspace = tempdir().expect("workspace");
+    let started_marker = workspace.path().join("shell-started");
+    let release_marker = workspace.path().join("shell-release");
+    let leaked_marker = workspace.path().join("shell-still-running");
+    let shell_quote = |path: &Path| {
+        let value = path.to_string_lossy().replace('\'', r#"'"'"'"#);
+        format!("'{value}'")
+    };
+    let command = format!(
+        "printf started > {}; (while [ ! -e {} ]; do sleep 0.05; done; printf leaked > {}) & wait",
+        shell_quote(&started_marker),
+        shell_quote(&release_marker),
+        shell_quote(&leaked_marker),
+    );
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({
+                "id": "shell-start",
+                "method": "shell/start",
+                "params": {
+                    "command": command,
+                    "description": "EOF cleanup server shell",
+                }
+            })
+        )
+        .expect("write shell/start");
+        stdin.flush().expect("flush shell/start");
+    }
+    read_until_event(&mut stdout, "shell-start", "shell_started");
+    wait_for_path(&started_marker);
+
+    drop(child.stdin.take());
+    let output =
+        wait_for_child_output_with_timeout(child, Duration::from_secs(3)).expect("server exited");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    std::fs::write(&release_marker, "release").expect("write release marker");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !leaked_marker.exists(),
+        "active shell process group should be stopped when server input closes"
+    );
+}
+
 #[test]
 fn server_mode_command_exec_rejects_duplicate_active_process_id() {
     let workspace = tempdir().expect("workspace");
@@ -6816,6 +6882,115 @@ fn server_mode_request_permissions_waits_for_permission_response() {
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn server_mode_input_eof_cancels_pending_permission_request() {
+    let workspace = tempdir().expect("workspace");
+    let home = workspace.path().join("home");
+    let extra = workspace.path().join("extra");
+    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::create_dir_all(&extra).expect("create extra");
+    std::fs::write(
+        home.join("config.toml"),
+        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
+    )
+    .expect("write config");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .env("ORCA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
+        )
+        .expect("write thread/start");
+        stdin.flush().expect("flush thread/start");
+    }
+    let thread = read_until_event(&mut stdout, "thread", "thread_started");
+    let thread_id = thread["threadId"].as_str().expect("thread id");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: true"}}]}}}}"#,
+            thread_id,
+            extra.display(),
+        )
+        .expect("write turn/start");
+        stdin.flush().expect("flush turn/start");
+    }
+    read_until_event(&mut stdout, "turn", "permission_request");
+
+    drop(child.stdin.take());
+    let output = wait_for_child_output_with_timeout(child, Duration::from_secs(2))
+        .expect("server exited after permission waiter was cancelled");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn server_mode_input_eof_cancels_pending_user_input_request() {
+    let workspace = tempdir().expect("workspace");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
+        )
+        .expect("write thread/start");
+        stdin.flush().expect("flush thread/start");
+    }
+    let thread = read_until_event(&mut stdout, "thread", "thread_started");
+    let thread_id = thread["threadId"].as_str().expect("thread id");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"ask Continue?"}}]}}}}"#,
+            thread_id,
+        )
+        .expect("write turn/start");
+        stdin.flush().expect("flush turn/start");
+    }
+    read_until_event(&mut stdout, "turn", "user_input_request");
+
+    drop(child.stdin.take());
+    let output = wait_for_child_output_with_timeout(child, Duration::from_secs(2))
+        .expect("server exited after user input waiter was cancelled");
+    assert_eq!(output.status.code(), Some(0));
 }
 
 #[test]

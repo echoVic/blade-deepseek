@@ -28,6 +28,12 @@ impl ServerShellManager {
         self.sessions.as_mut()
     }
 
+    pub(super) fn terminate_all(&mut self) {
+        if let Some(sessions) = self.sessions.as_mut() {
+            sessions.terminate_all();
+        }
+    }
+
     pub(super) fn spawn(
         &mut self,
         cwd: &Path,

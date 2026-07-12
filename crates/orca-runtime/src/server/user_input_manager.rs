@@ -13,9 +13,15 @@ pub(super) struct PendingUserInputRequest {
     pub(super) sender: mpsc::Sender<Option<String>>,
 }
 
+#[derive(Default)]
+struct PendingUserInputState {
+    closed: bool,
+    pending: HashMap<String, PendingUserInputRequest>,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct PendingUserInputManager {
-    pending: Arc<Mutex<HashMap<String, PendingUserInputRequest>>>,
+    state: Arc<Mutex<PendingUserInputState>>,
 }
 
 impl PendingUserInputManager {
@@ -24,20 +30,38 @@ impl PendingUserInputManager {
         request_id: String,
         request: PendingUserInputRequest,
     ) -> io::Result<()> {
-        let mut pending = self.pending.lock().map_err(lock_error)?;
-        if pending.contains_key(&request_id) {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "server user input request manager is closed",
+            ));
+        }
+        if state.pending.contains_key(&request_id) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("duplicate pending user input request id: {request_id}"),
             ));
         }
-        pending.insert(request_id, request);
+        state.pending.insert(request_id, request);
         Ok(())
     }
 
     pub(super) fn remove(&self, request_id: &str) -> io::Result<Option<PendingUserInputRequest>> {
-        let mut pending = self.pending.lock().map_err(lock_error)?;
-        Ok(pending.remove(request_id))
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Ok(state.pending.remove(request_id))
+    }
+
+    pub(super) fn close(&self) -> io::Result<()> {
+        let pending = {
+            let mut state = self.state.lock().map_err(lock_error)?;
+            state.closed = true;
+            std::mem::take(&mut state.pending)
+        };
+        for request in pending.into_values() {
+            let _ = request.sender.send(None);
+        }
+        Ok(())
     }
 }
 
@@ -135,5 +159,36 @@ mod tests {
             first_receiver.recv().expect("first receiver"),
             Some("first".to_string())
         );
+    }
+
+    #[test]
+    fn closing_user_input_manager_cancels_waiters_and_rejects_late_requests() {
+        let manager = PendingUserInputManager::default();
+        let (sender, receiver) = mpsc::channel();
+        manager
+            .insert(
+                "user-input-turn-1-ask".to_string(),
+                PendingUserInputRequest { sender },
+            )
+            .expect("insert pending request");
+
+        manager.close().expect("close manager");
+
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .expect("cancelled response"),
+            None
+        );
+        let (late_sender, _late_receiver) = mpsc::channel();
+        let error = manager
+            .insert(
+                "user-input-turn-2-ask".to_string(),
+                PendingUserInputRequest {
+                    sender: late_sender,
+                },
+            )
+            .expect_err("closed manager must reject late requests");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }

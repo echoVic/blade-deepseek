@@ -71,16 +71,18 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
     let mut line = String::new();
     let mut state = ServerState::default();
     let writer = Arc::new(Mutex::new(writer));
-    while reader.read_line(&mut line)? != 0 {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            handle_line(&config, &mut state, trimmed, Arc::clone(&writer))?;
+    let result = (|| -> io::Result<()> {
+        while reader.read_line(&mut line)? != 0 {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                handle_line(&config, &mut state, trimmed, Arc::clone(&writer))?;
+            }
+            line.clear();
         }
-        line.clear();
-    }
-    state.terminate_active_command_exec_processes();
-    state.join_active_turns();
-    Ok(())
+        Ok(())
+    })();
+    state.shutdown();
+    result
 }
 
 #[derive(Default)]
@@ -95,12 +97,26 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn terminate_active_command_exec_processes(&mut self) {
+    fn shutdown(&mut self) {
+        const ACTIVE_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
         self.command_exec.terminate_all(self.shells.sessions_mut());
+        self.active_turns.cancel_all();
+        let _ = self.pending_permissions.close();
+        let _ = self.pending_user_inputs.close();
+        self.shells.terminate_all();
+        if !self
+            .active_turns
+            .join_all_bounded(&mut self.threads, ACTIVE_TURN_SHUTDOWN_TIMEOUT)
+        {
+            eprintln!(
+                "orca: server shutdown timed out waiting for active turns; cleanup continues in the background"
+            );
+        }
     }
 }
 
 impl ServerState {
+    #[cfg(test)]
     fn join_active_turns(&mut self) {
         self.active_turns.join_all(&mut self.threads);
     }
@@ -2087,7 +2103,7 @@ mod tests {
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
     use tempfile::{TempDir, tempdir};
 
     #[derive(Clone, Default)]
@@ -2108,6 +2124,89 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct ErrorAfterPendingUserInputReader {
+        phase: u8,
+        output: SharedVecWriter,
+    }
+
+    impl Read for ErrorAfterPendingUserInputReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl BufRead for ErrorAfterPendingUserInputReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&[])
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+
+        fn read_line(&mut self, buffer: &mut String) -> io::Result<usize> {
+            match self.phase {
+                0 => {
+                    self.phase = 1;
+                    let line = r#"{"id":"thread","method":"thread/start","params":{}}"#;
+                    buffer.push_str(line);
+                    buffer.push('\n');
+                    Ok(line.len() + 1)
+                }
+                1 => {
+                    let started = wait_for_event(&self.output.0, Duration::from_secs(2), |event| {
+                        event["event"] == "thread_started"
+                    })
+                    .ok_or_else(|| io::Error::other("thread did not start"))?;
+                    let thread_id = started["threadId"]
+                        .as_str()
+                        .ok_or_else(|| io::Error::other("missing thread id"))?;
+                    self.phase = 2;
+                    let line = format!(
+                        r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"ask Continue?"}}]}}}}"#
+                    );
+                    buffer.push_str(&line);
+                    buffer.push('\n');
+                    Ok(line.len() + 1)
+                }
+                _ => {
+                    wait_for_event(&self.output.0, Duration::from_secs(2), |event| {
+                        event["event"] == "user_input_request"
+                    })
+                    .ok_or_else(|| io::Error::other("user input request did not start"))?;
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "injected server input failure",
+                    ))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn server_input_error_releases_pending_user_input_turn() {
+        let temp = tempdir().expect("tempdir");
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let output = SharedVecWriter::default();
+        let reader = ErrorAfterPendingUserInputReader {
+            phase: 0,
+            output: output.clone(),
+        };
+
+        let error = run_with_io(ServerConfig { run_config: config }, reader, output.clone())
+            .expect_err("reader failure should be returned");
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&output.0) > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            Arc::strong_count(&output.0),
+            1,
+            "server input failure must release the active turn writer"
+        );
     }
 
     #[test]

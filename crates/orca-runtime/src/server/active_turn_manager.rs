@@ -83,6 +83,7 @@ impl ActiveTurnManager {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn join_all(&mut self, threads: &mut ServerThreadRuntime) {
         for active in self.running.drain(..) {
             if let Ok((turn_id, _thread_id, thread)) = active.handle.join() {
@@ -91,6 +92,46 @@ impl ActiveTurnManager {
                 threads.put_thread(thread);
             }
         }
+    }
+
+    pub(super) fn cancel_all(&self) {
+        for control in self.controls.values() {
+            control.cancel.cancel();
+        }
+    }
+
+    pub(super) fn join_all_bounded(
+        &mut self,
+        threads: &mut ServerThreadRuntime,
+        timeout: Duration,
+    ) -> bool {
+        const POLL: Duration = Duration::from_millis(10);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        loop {
+            self.reclaim_finished(threads);
+            if self.running.is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                self.handoff_remaining_to_reaper();
+                return false;
+            }
+            thread::sleep(POLL);
+        }
+    }
+
+    fn handoff_remaining_to_reaper(&mut self) {
+        let running = std::mem::take(&mut self.running);
+        let mut controls = std::mem::take(&mut self.controls);
+        drop(thread::spawn(move || {
+            for active in running {
+                if let Ok((turn_id, _thread_id, _thread)) = active.handle.join() {
+                    controls.remove(&turn_id);
+                }
+            }
+        }));
     }
 
     pub(super) fn reclaim_finished(&mut self, threads: &mut ServerThreadRuntime) {

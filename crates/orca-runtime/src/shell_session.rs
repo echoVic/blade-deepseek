@@ -190,6 +190,10 @@ struct ShellSession {
     effective_terminal: ShellTerminalMode,
 }
 
+struct SpawnedShellChild {
+    child: Option<Child>,
+}
+
 enum ShellInput {
     Pipe(Option<ChildStdin>),
     Pty(File),
@@ -276,14 +280,21 @@ impl RuntimeShellSessionManager {
         }
         let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
         let effective_terminal = stdio.effective_terminal();
-        let mut child = process.spawn().inspect_err(|error| {
+        let child = process.spawn().inspect_err(|error| {
             let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
         })?;
-
-        tasks
-            .mark_worker_spawned(&task.id, child.id())
-            .map_err(io::Error::other)?;
-        let (stdin, stdout_reader, stderr_reader) = stdio.finish(&mut child)?;
+        let initialized = initialize_spawned_shell(child, stdio, |pid| {
+            tasks
+                .mark_worker_spawned(&task.id, pid)
+                .map_err(io::Error::other)
+        });
+        let (child, stdin, stdout_reader, stderr_reader) = match initialized {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                let _ = tasks.fail(&task.id, format!("failed to initialize shell: {error}"));
+                return Err(error);
+            }
+        };
         let output_store = self.output_store.clone();
         let stdout_handle = Some(spawn_output_reader(
             stdout_reader,
@@ -548,6 +559,39 @@ impl RuntimeShellSessionManager {
         Ok(output)
     }
 
+    pub fn terminate_all(&mut self) {
+        let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        for id in ids {
+            let _ = self.terminate(&id);
+        }
+    }
+
+    fn terminate(&mut self, id: &str) -> io::Result<ShellSessionOutput> {
+        let mut session = self.take_session(id)?;
+        let tasks = session.tasks.clone();
+        session.stdin.close();
+        let natural_status = session.child.try_wait()?;
+        orca_tools::process::kill_child_tree(&mut session.child);
+        let waited_status = session.child.wait()?;
+        let status = natural_status.unwrap_or(waited_status);
+        let task_status = match natural_status {
+            Some(_) if status.success() => TaskStatus::Completed,
+            Some(_) => TaskStatus::Failed,
+            None => TaskStatus::Stopped,
+        };
+        session.join_readers();
+        let output = session.output(id, task_status, process_exit_code(status));
+        if natural_status.is_some() {
+            Self::record_terminal_output(&tasks, &output)?;
+        } else {
+            tasks
+                .stop(&output.task_id, output.stdout.clone())
+                .map_err(io::Error::other)?;
+        }
+        self.output_store.remove(&output.task_id);
+        Ok(output)
+    }
+
     fn finish_terminal_session(
         &mut self,
         id: &str,
@@ -604,6 +648,12 @@ impl RuntimeShellSessionManager {
     }
 }
 
+impl Drop for RuntimeShellSessionManager {
+    fn drop(&mut self) {
+        self.terminate_all();
+    }
+}
+
 impl ShellSession {
     fn join_readers(&mut self) {
         if let Some(handle) = self.stdout_handle.take() {
@@ -647,6 +697,44 @@ impl ShellSession {
 
     fn output_size(&self) -> usize {
         self.output_store.size(&self.task_id)
+    }
+}
+
+impl Drop for ShellSession {
+    fn drop(&mut self) {
+        self.stdin.close();
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            orca_tools::process::kill_child_tree(&mut self.child);
+            let _ = self.child.wait();
+        }
+        self.join_readers();
+    }
+}
+
+impl SpawnedShellChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child(&self) -> &Child {
+        self.child.as_ref().expect("spawned shell child")
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("spawned shell child")
+    }
+
+    fn into_child(mut self) -> Child {
+        self.child.take().expect("spawned shell child")
+    }
+}
+
+impl Drop for SpawnedShellChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            orca_tools::process::kill_child_tree(child);
+            let _ = child.wait();
+        }
     }
 }
 
@@ -717,6 +805,22 @@ fn configure_shell_stdio(
         }
         ShellTerminalMode::Pty { cols, rows } => configure_pty_stdio(process, cols, rows),
     }
+}
+
+fn initialize_spawned_shell(
+    child: Child,
+    stdio: ShellStdio,
+    register_worker: impl FnOnce(u32) -> io::Result<()>,
+) -> io::Result<(
+    Child,
+    ShellInput,
+    Box<dyn Read + Send>,
+    Option<Box<dyn Read + Send>>,
+)> {
+    let mut child = SpawnedShellChild::new(child);
+    register_worker(child.child().id())?;
+    let (stdin, stdout_reader, stderr_reader) = stdio.finish(child.child_mut())?;
+    Ok((child.into_child(), stdin, stdout_reader, stderr_reader))
 }
 
 fn resolve_terminal_support(
@@ -1045,6 +1149,48 @@ mod tests {
         assert_eq!(
             resolve_terminal_support(ShellTerminalMode::pipe(), false),
             ShellTerminalMode::pipe()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_failure_reaps_spawned_shell_process_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started_marker = temp.path().join("started");
+        let release_marker = temp.path().join("release");
+        let leaked_marker = temp.path().join("leaked");
+        let mut process = std::process::Command::new("sh");
+        process
+            .arg("-c")
+            .arg(
+                "printf started > \"$STARTED\"; (while [ ! -e \"$RELEASE\" ]; do sleep 0.05; done; printf leaked > \"$LEAKED\") & wait",
+            )
+            .env("STARTED", &started_marker)
+            .env("RELEASE", &release_marker)
+            .env("LEAKED", &leaked_marker)
+            .current_dir(temp.path());
+        let stdio = configure_shell_stdio(&mut process, ShellTerminalMode::pipe())
+            .expect("configure shell stdio");
+        let child = process.spawn().expect("spawn shell child");
+
+        let error = match initialize_spawned_shell(child, stdio, |_| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !started_marker.exists() {
+                assert!(Instant::now() < deadline, "shell child did not start");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(io::Error::other("injected registration failure"))
+        }) {
+            Ok(_) => panic!("registration should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "injected registration failure");
+
+        std::fs::write(&release_marker, "release").expect("release descendant");
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !leaked_marker.exists(),
+            "registration failure must reap the spawned process group"
         );
     }
 }
