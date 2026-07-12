@@ -51,9 +51,11 @@ persisted workflow state, and DSL shapes remain unchanged.
 
 ## Target Ownership
 
-One `WorkflowHostSession` owns:
+One lexical `WorkflowHost` run scope, backed by `WorkflowHostChild` and
+`WorkflowHostFileGuard` RAII owners, owns:
 
 - the child Node process and Unix process group;
+- the generated host-module temporary file;
 - the writable protocol stdin;
 - the stdout frame-reader thread and its bounded channel;
 - the stderr retained-output reader;
@@ -70,22 +72,28 @@ The host cancellation predicate checks both the durable stop request and the
 process-local task token. When cancellation is observed, it first cancels the
 shared run token, then terminates the host. Concurrent child agents receive the
 same one-shot run token instead of unrelated tokens created per call.
+Terminal output also cancels queued or unawaited agent work. Such child-agent
+work that was already admitted becomes `cancelled`, not permanently `running`
+or an ordinary failure; queue entries that never started are discarded without
+creating a running record.
 
 ## Resource Policy
 
-- Maximum stdout JSONL frame: 1 MiB, including the terminating newline.
+- Maximum JSONL frame in either direction: 1 MiB, including the terminating
+  newline.
 - Stdout frame channel: synchronous capacity 8.
 - Maximum accepted host events: 8,192 per run.
 - Maximum aggregate accepted event bytes: 64 MiB per run.
 - Retained stderr: 64 KiB head/tail with an exact omission marker.
 - Agent-call workers: the normalized workflow `max_concurrent_agents` value.
-- Agent-call queue: twice the worker count, with a minimum capacity of 1.
+- Agent-call queue: a bounded multi-consumer channel twice the worker count,
+  with a minimum capacity of 1.
 - Cancellation/control polling: at most 50 ms while waiting for host output.
 - Post-terminal child exit grace: 2 seconds, then terminate and wait.
 
-Backpressure is intentional. When the frame or call queue is full, the Node
-host blocks on its pipe instead of allocating an unbounded Rust queue or an
-unbounded number of threads.
+Backpressure is intentional. The Node host writes events synchronously; when
+the frame or call queue is full, it blocks on its pipe instead of allocating an
+unbounded Node/Rust queue or an unbounded number of threads.
 
 There is no total workflow-duration limit in this slice. Long workflows remain
 valid, but they must remain stoppable and resource-bounded.
@@ -112,10 +120,15 @@ host result; `WorkflowRunner` maps a confirmed stop request to the existing
 - stderr omission is diagnostic truncation, not a second failure;
 - callback failure cancels the run token, terminates the host, and returns the
   original callback error;
-- cancellation skips queued agent calls, closes protocol input, terminates the
-  host process group, waits, and returns promptly;
+- cancellation discards queued agent calls, closes protocol input, terminates
+  the host process group, waits, and returns promptly;
+- pause polling and synthetic `minHoldMs` waits observe the same run token;
+- terminal output cancels unawaited admitted calls and closes their persisted
+  agent rows as `cancelled`;
 - terminal host output is authoritative only after the child exits within the
   grace period; a child that emits terminal output and stays alive is killed;
+- a cleanly exited host leader still has its process group terminated before
+  reader joins, so descendants cannot keep inherited pipes alive;
 - pause behavior remains agent-boundary cooperative in this slice; only stop is
   made host-wide.
 
@@ -123,8 +136,10 @@ host result; `WorkflowRunner` maps a confirmed stop request to the existing
 
 1. Add RED tests for bounded lines, frame/event overflow, stderr retention,
    fixed worker admission, silent-host cancellation, and post-terminal cleanup.
-2. Introduce the host session guard and fixed reader/worker channels.
-3. Replace `BufRead::lines`, per-call thread spawning, and `wait_with_output`.
+2. Introduce child/file guards and fixed reader/worker channels in one host run
+   scope.
+3. Replace `BufRead::lines`, per-call thread spawning, and `wait_with_output`;
+   delete the generated host module when the session ends.
 4. Add callback-only production event handling.
 5. Create one run cancellation token in `WorkflowRunner` and pass it through
    every workflow child-agent runtime.
@@ -133,15 +148,21 @@ host result; `WorkflowRunner` maps a confirmed stop request to the existing
 
 ## Acceptance Criteria
 
-1. A frame larger than 1 MiB fails without retaining the complete frame.
+1. A frame larger than 1 MiB in either direction fails without retaining the
+   complete frame.
 2. More than 8,192 events or 64 MiB of accepted event data fails explicitly.
-3. Agent-call execution never creates more worker threads than configured.
+3. Agent-call execution never creates more worker threads than configured, and
+   zero configured concurrency normalizes to one instead of deadlocking.
 4. A silent workflow stops within a bounded interval after `request_stop`.
 5. Active child-agent provider/tool work observes the workflow run token.
 6. Host stderr retains at most 64 KiB plus the omission marker.
-7. Parse, callback, cancellation, post-terminal hang, and nonzero-exit paths
-   leave no workflow Node process or descendant behind.
-8. Existing workflow host/runtime/CLI behavior tests remain green.
+7. Parse, callback, cancellation, post-terminal hang, parent-exit pipe holders,
+   and nonzero-exit paths leave no workflow Node process or descendant behind.
+8. Every normal and error return removes its generated host-module file.
+9. Terminal or stopped child agents do not remain persisted as `running`;
+   admitted work is persisted as `cancelled`, while never-started queue entries
+   create no running record.
+10. Existing workflow host/runtime/CLI behavior tests remain green.
 
 ## Final Deletion Gate
 
@@ -149,4 +170,3 @@ This slice is incomplete while production `WorkflowHost` contains
 `BufRead::lines`, `wait_with_output`, one thread spawn per `agent_call`, an
 unbounded event vector in the production runner, or any early return that can
 skip terminate-and-wait for a live child.
-
