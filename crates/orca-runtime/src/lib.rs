@@ -2834,7 +2834,7 @@ mod tests {
             "run_child_agent_provider_turn(",
             "fold_child_agent_provider_response(",
             "child_agent_tool_requests(",
-            "fold_child_agent_tool_result(",
+            "fold_child_agent_tool_result_and_close_siblings(",
         ] {
             assert!(
                 child_loop_runner_source.contains(marker),
@@ -4148,8 +4148,8 @@ mod tests {
             "session must own tool result model-content formatting"
         );
         assert!(
-            session_source.contains("append_tool_result_message"),
-            "session must own tool result history writing"
+            session_source.contains("writer.append_message(&message)"),
+            "session must persist the same terminal-aware message used by live context"
         );
     }
 

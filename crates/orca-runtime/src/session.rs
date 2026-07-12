@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_core::conversation::{Conversation, RawToolCall, assistant_message_has_payload};
+use orca_core::conversation::{Conversation, Message, RawToolCall, assistant_message_has_payload};
 use orca_core::cost_types::UsageTotals;
 use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
@@ -109,10 +109,19 @@ pub(crate) fn record_tool_result_for_agent(
     emit_deltas: bool,
 ) -> io::Result<String> {
     let result_content = agent_common::format_tool_result_for_model(result);
-    conversation.add_tool_result_with_terminal(result, result_content.clone());
-    if emit_deltas && let Some(writer) = history_writer {
-        writer.append_tool_result_message(result, result_content.clone(), false)?;
-    }
+    let message = Message::Tool {
+        tool_call_id: result.id.clone(),
+        content: result_content.clone(),
+        terminal: Some(result.terminal().clone()),
+        pinned: false,
+    };
+    let history_result = if emit_deltas && let Some(writer) = history_writer {
+        writer.append_message(&message)
+    } else {
+        Ok(())
+    };
+    conversation.messages.push(message);
+    history_result?;
     Ok(result_content)
 }
 

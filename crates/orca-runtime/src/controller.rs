@@ -1479,20 +1479,19 @@ mod tests {
         let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
 
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
-        let result = actor
-            .handle_approval(ToolApprovalGateContext {
-                config: &config,
-                events: &mut events,
-                sink: &mut sink,
-                tool_request: &request,
-                invocation: &invocation,
-                policy: &policy,
-                permission_overlay: &mut permission_overlay,
-                emit_deltas: true,
-            })
-            .unwrap();
+        let execution = actor.handle_approval(ToolApprovalGateContext {
+            config: &config,
+            events: &mut events,
+            sink: &mut sink,
+            tool_request: &request,
+            invocation: &invocation,
+            policy: &policy,
+            permission_overlay: &mut permission_overlay,
+            emit_deltas: true,
+        });
 
-        assert!(result.is_none());
+        assert!(execution.outcome.is_none());
+        assert!(execution.event_error.is_none());
     }
 
     #[test]

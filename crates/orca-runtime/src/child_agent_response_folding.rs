@@ -105,3 +105,35 @@ pub fn fold_child_agent_tool_result(
 
     ChildAgentToolResultFold::Continue
 }
+
+pub fn fold_child_agent_tool_result_and_close_siblings(
+    setup: &mut ChildAgentLoopSetup,
+    tool_request: &ToolRequest,
+    unstarted_siblings: &[&ToolRequest],
+    should_stop: bool,
+    result: ToolResult,
+    child_cost: Option<CostTracker>,
+    child_cost_tracker: &mut CostTracker,
+) -> ChildAgentToolResultFold {
+    let fold = fold_child_agent_tool_result(
+        setup,
+        tool_request,
+        should_stop,
+        result,
+        child_cost,
+        child_cost_tracker,
+    );
+    if matches!(fold, ChildAgentToolResultFold::Stop(_)) {
+        for sibling in unstarted_siblings {
+            let result = ToolResult::cancelled_before_start(
+                sibling,
+                "an earlier sibling ended the child tool turn",
+            );
+            let content = agent_common::format_tool_result_for_model(&result);
+            setup
+                .conversation
+                .add_tool_result_with_terminal(&result, content);
+        }
+    }
+    fold
+}

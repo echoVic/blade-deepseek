@@ -5,7 +5,7 @@ use std::thread;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
-use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::event_schema::{EventEnvelope, EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
 use orca_core::tool_types;
@@ -17,7 +17,7 @@ use crate::agent_child::{
     ChildAgentRuntimeContext, run_child_agent,
 };
 use crate::cost::CostTracker;
-use crate::hooks::{HookContext, HookRunner};
+use crate::hooks::{HookContext, HookRunError, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
 use crate::memory::MemoryBlock;
@@ -90,6 +90,27 @@ struct SubagentExecutionResult {
     worktree: Option<WorktreeOutcome>,
 }
 
+struct SubagentBatchExecution {
+    results: Vec<(RunStatus, tool_types::ToolResult)>,
+    event_error: Option<io::Error>,
+}
+
+fn emit_batch_event<W: io::Write>(
+    sink: &mut EventSink<W>,
+    event: &EventEnvelope,
+    event_error: &mut Option<io::Error>,
+) -> bool {
+    match sink.emit(event) {
+        Ok(()) => true,
+        Err(error) => {
+            if event_error.is_none() {
+                *event_error = Some(error);
+            }
+            false
+        }
+    }
+}
+
 pub(crate) fn should_run_subagent_batch(
     config: &RunConfig,
     tool_request: &tool_types::ToolRequest,
@@ -121,29 +142,37 @@ pub(crate) fn record_subagent_batch_results(
     results: Vec<(RunStatus, tool_types::ToolResult)>,
     emit_deltas: bool,
 ) -> io::Result<SubagentBatchRecordOutcome> {
+    let mut terminal = None;
+    let mut record_error = None;
     for (status, result) in results {
-        record_tool_result_for_agent(
+        if let Err(error) = record_tool_result_for_agent(
             conversation,
             history_writer.as_deref_mut(),
             &result,
             emit_deltas,
-        )?;
-
-        if status == RunStatus::ApprovalRequired {
-            return Ok(SubagentBatchRecordOutcome::Return {
-                status,
-                error: result.error.clone(),
-            });
+        ) && record_error.is_none()
+        {
+            record_error = Some(error);
         }
-        if status == RunStatus::Failed {
-            return Ok(SubagentBatchRecordOutcome::Return {
-                status: RunStatus::Failed,
-                error: result.error.clone(),
-            });
+
+        if terminal.is_none()
+            && matches!(
+                status,
+                RunStatus::ApprovalRequired | RunStatus::Failed | RunStatus::Cancelled
+            )
+        {
+            terminal = Some((status, result.error.clone()));
         }
     }
 
-    Ok(SubagentBatchRecordOutcome::Continue)
+    if let Some(error) = record_error {
+        return Err(error);
+    }
+
+    Ok(match terminal {
+        Some((status, error)) => SubagentBatchRecordOutcome::Return { status, error },
+        None => SubagentBatchRecordOutcome::Continue,
+    })
 }
 
 pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
@@ -180,7 +209,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         cancel,
         workflow_ipc,
     } = runtime;
-    let results = execute_subagent_batch(
+    let execution = execute_subagent_batch(
         config,
         cwd,
         events,
@@ -196,9 +225,19 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         cancel,
         workflow_ipc,
         child_executor,
-    )?;
+    );
 
-    match record_subagent_batch_results(conversation, history_writer, results, emit_deltas)? {
+    let record_outcome = record_subagent_batch_results(
+        conversation,
+        history_writer,
+        execution.results,
+        emit_deltas,
+    )?;
+    if let Some(error) = execution.event_error {
+        return Err(error);
+    }
+
+    match record_outcome {
         SubagentBatchRecordOutcome::Continue => Ok(ToolTurnOutcome::Continue),
         SubagentBatchRecordOutcome::Return { status, error } => {
             Ok(ToolTurnOutcome::Return { status, error })
@@ -215,7 +254,7 @@ fn is_batchable_subagent_request(tool_request: &tool_types::ToolRequest) -> bool
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_subagent_batch(
+fn execute_subagent_batch(
     config: &RunConfig,
     cwd: &Path,
     events: &mut EventFactory,
@@ -231,184 +270,320 @@ pub(crate) fn execute_subagent_batch(
     cancel: &CancelToken,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
-) -> io::Result<Vec<(RunStatus, tool_types::ToolResult)>> {
-    let mut handles = Vec::new();
+) -> SubagentBatchExecution {
     let mut results: Vec<Option<(RunStatus, tool_types::ToolResult)>> =
         vec![None; tool_requests.len()];
+    let mut event_error = None;
 
-    for (idx, tool_request) in tool_requests.iter().enumerate() {
-        let invocation = prepare_tool_invocation_with_external(
-            tool_request,
-            subagent_depth,
-            config.subagents.max_depth,
-            mcp_registry,
-            &[],
-        );
-        if emit_deltas {
-            sink.emit(&events.tool_call_requested(tool_request))?;
-        }
-        if let Err(error) = validate_tool_invocation_with_external(&invocation, mcp_registry, &[]) {
-            let result = error.into_result();
-            if emit_deltas {
-                sink.emit(&events.tool_call_completed(&result))?;
-            }
-            results[idx] = Some((RunStatus::Failed, result));
-            continue;
-        }
-        let pre_tool_outcome = match hooks.run(
-            HookEvent::PreToolUse,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: Some(tool_request),
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let result = tool_types::ToolResult::failed(
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+
+        for (idx, tool_request) in tool_requests.iter().enumerate() {
+            if event_error.is_some() {
+                let result = tool_types::ToolResult::failed_before_start(
                     tool_request,
-                    format!("pre_tool_use hook blocked tool: {error}"),
+                    "subagent dispatch stopped after event delivery failed",
                     None,
                 );
                 if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
+                    emit_batch_event(
+                        sink,
+                        &events.tool_call_requested(tool_request),
+                        &mut event_error,
+                    );
+                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
                 }
                 results[idx] = Some((RunStatus::Failed, result));
                 continue;
             }
-        };
-        let invocation = match apply_pre_tool_outcome_with_external(
-            invocation,
-            &pre_tool_outcome,
-            mcp_registry,
-            &[],
-        ) {
-            Ok(invocation) => invocation,
-            Err(error) => {
+            if emit_deltas {
+                let requested = events.tool_call_requested(tool_request);
+                if !emit_batch_event(sink, &requested, &mut event_error) {
+                    let result = tool_types::ToolResult::failed_before_start(
+                        tool_request,
+                        "subagent dispatch stopped because the requested event could not be delivered",
+                        None,
+                    );
+                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    results[idx] = Some((RunStatus::Failed, result));
+                    continue;
+                }
+            }
+            if cancel.is_cancelled() {
+                let result = tool_types::ToolResult::cancelled_before_start(
+                    tool_request,
+                    "the subagent batch was cancelled before dispatch",
+                );
+                if emit_deltas {
+                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                }
+                results[idx] = Some((RunStatus::Cancelled, result));
+                continue;
+            }
+
+            let invocation = prepare_tool_invocation_with_external(
+                tool_request,
+                subagent_depth,
+                config.subagents.max_depth,
+                mcp_registry,
+                &[],
+            );
+            if let Err(error) =
+                validate_tool_invocation_with_external(&invocation, mcp_registry, &[])
+            {
                 let result = error.into_result();
                 if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
+                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
                 }
                 results[idx] = Some((RunStatus::Failed, result));
                 continue;
             }
-        };
 
-        let request = subagent::create_subagent_request(&invocation.effective);
-        let mut subagent_lifecycle =
-            RuntimeSessionLifecycle::new(format!("subagent-{}", tool_request.id));
-        let subagent_task = subagent_lifecycle
-            .start_task(RuntimeTaskKind::Subagent)
-            .clone();
-        if emit_deltas {
-            let event = subagent_task
-                .attach_to_event(events.subagent_started(&tool_request.id, &request.description));
-            sink.emit(&event)?;
-        }
-
-        let child_request = ChildAgentRequest {
-            prompt: request.prompt.clone(),
-            subagent_type: request.subagent_type,
-            model: request.model.clone(),
-            depth: subagent_depth + 1,
-            emit_deltas: false,
-            allowed_tools: None,
-            tool_policy_label: None,
-            workflow_ipc: workflow_ipc.cloned(),
-        };
-        let child_tool_request = invocation.effective;
-        let child_config = config.clone();
-        let child_cwd = cwd.to_path_buf();
-        let child_instructions = instructions.clone();
-        let child_memory = memory.clone();
-        let child_mcp_registry = mcp_registry.clone();
-        let child_hooks = hooks.clone();
-        let child_cancel = cancel.clone();
-        handles.push((
-            idx,
-            thread::spawn(move || {
-                let mut child_events =
-                    EventFactory::new(format!("subagent-{}", child_tool_request.id));
-                let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
-                let mut child_runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
-                    cwd: &child_cwd,
-                    events: &mut child_events,
-                    sink: &mut child_sink,
-                    instructions: &child_instructions,
-                    memory: &child_memory,
-                    mcp_registry: &child_mcp_registry,
-                    hooks: &child_hooks,
-                    cancel: &child_cancel,
-                    lifecycle: Some(&mut subagent_lifecycle),
-                    executor: child_executor,
-                });
-                let (child, child_cost_tracker) =
-                    run_child_agent(&child_config, &child_request, &mut child_runtime);
-                subagent_lifecycle.finish_task(child.status);
-
-                SubagentExecutionResult {
-                    tool_request: child_tool_request,
-                    description: request.description,
-                    task: subagent_lifecycle
-                        .active_task()
-                        .cloned()
-                        .unwrap_or(subagent_task),
-                    schema: request.schema,
-                    child,
-                    cost_tracker: child_cost_tracker,
-                    worktree: None,
-                }
-            }),
-        ));
-    }
-
-    for (idx, handle) in handles {
-        let execution = match handle.join() {
-            Ok(execution) => execution,
-            Err(_) => {
-                let tool_request = &tool_requests[idx];
-                let result =
-                    tool_types::ToolResult::failed(tool_request, "subagent thread panicked", None);
-                if emit_deltas {
-                    sink.emit(&events.tool_call_completed(&result))?;
-                }
-                results[idx] = Some((RunStatus::Failed, result));
-                continue;
-            }
-        };
-
-        cost_tracker.merge(&execution.cost_tracker);
-
-        let (status, result) =
-            subagent_execution_to_tool_result(events, sink, &execution, emit_deltas)?;
-        if emit_deltas {
-            sink.emit(&events.tool_call_completed(&result))?;
-            if let Err(error) = hooks.run(
-                HookEvent::PostToolUse,
+            let pre_tool_outcome = match hooks.run_with_cancel_result(
+                HookEvent::PreToolUse,
                 HookContext {
                     cwd: &cwd.display().to_string(),
                     session_status: None,
-                    tool_request: Some(&execution.tool_request),
-                    tool_result: Some(&result),
+                    tool_request: Some(tool_request),
+                    tool_result: None,
                     before_messages: None,
                     after_messages: None,
                     usage: None,
                 },
+                cancel,
             ) {
-                sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
-            }
-        }
-        results[idx] = Some((status, result));
-    }
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let (status, result) = match error {
+                        HookRunError::Cancelled(_) => (
+                            RunStatus::Cancelled,
+                            tool_types::ToolResult::cancelled_before_start(
+                                tool_request,
+                                "the pre-tool hook was cancelled",
+                            ),
+                        ),
+                        HookRunError::Failed(error) => (
+                            RunStatus::Failed,
+                            tool_types::ToolResult::failed_before_start(
+                                tool_request,
+                                format!("pre_tool_use hook blocked tool: {error}"),
+                                None,
+                            ),
+                        ),
+                    };
+                    if emit_deltas {
+                        emit_batch_event(
+                            sink,
+                            &events.tool_call_completed(&result),
+                            &mut event_error,
+                        );
+                    }
+                    results[idx] = Some((status, result));
+                    continue;
+                }
+            };
+            let invocation = match apply_pre_tool_outcome_with_external(
+                invocation,
+                &pre_tool_outcome,
+                mcp_registry,
+                &[],
+            ) {
+                Ok(invocation) => invocation,
+                Err(error) => {
+                    let result = error.into_result();
+                    if emit_deltas {
+                        emit_batch_event(
+                            sink,
+                            &events.tool_call_completed(&result),
+                            &mut event_error,
+                        );
+                    }
+                    results[idx] = Some((RunStatus::Failed, result));
+                    continue;
+                }
+            };
 
-    Ok(results
-        .into_iter()
-        .map(|result| result.expect("each subagent batch item has a result"))
-        .collect())
+            if cancel.is_cancelled() {
+                let result = tool_types::ToolResult::cancelled_before_start(
+                    tool_request,
+                    "the subagent batch was cancelled before dispatch",
+                );
+                if emit_deltas {
+                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                }
+                results[idx] = Some((RunStatus::Cancelled, result));
+                continue;
+            }
+
+            let request = subagent::create_subagent_request(&invocation.effective);
+            let mut subagent_lifecycle =
+                RuntimeSessionLifecycle::new(format!("subagent-{}", tool_request.id));
+            let subagent_task = subagent_lifecycle
+                .start_task(RuntimeTaskKind::Subagent)
+                .clone();
+            if emit_deltas {
+                let event = subagent_task.attach_to_event(
+                    events.subagent_started(&tool_request.id, &request.description),
+                );
+                if !emit_batch_event(sink, &event, &mut event_error) {
+                    let error = "subagent dispatch stopped because its started event could not be delivered";
+                    let failed_task = subagent_task.with_status(RuntimeTaskStatus::Failed);
+                    emit_batch_event(
+                        sink,
+                        &failed_task.attach_to_event(events.subagent_completed(
+                            &tool_request.id,
+                            &request.description,
+                            RunStatus::Failed,
+                            None,
+                            Some(error),
+                        )),
+                        &mut event_error,
+                    );
+                    let result =
+                        tool_types::ToolResult::failed_before_start(tool_request, error, None);
+                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    results[idx] = Some((RunStatus::Failed, result));
+                    continue;
+                }
+            }
+
+            let child_request = ChildAgentRequest {
+                prompt: request.prompt.clone(),
+                subagent_type: request.subagent_type,
+                model: request.model.clone(),
+                depth: subagent_depth + 1,
+                emit_deltas: false,
+                allowed_tools: None,
+                tool_policy_label: None,
+                workflow_ipc: workflow_ipc.cloned(),
+            };
+            let child_tool_request = invocation.effective;
+            let child_config = config.clone();
+            let child_cwd = cwd.to_path_buf();
+            let child_instructions = instructions.clone();
+            let child_memory = memory.clone();
+            let child_mcp_registry = mcp_registry.clone();
+            let child_hooks = hooks.clone();
+            let child_cancel = cancel.clone();
+            let panic_task = subagent_task.clone();
+            let panic_description = request.description.clone();
+            handles.push((
+                idx,
+                panic_task,
+                panic_description,
+                scope.spawn(move || {
+                    let mut child_events =
+                        EventFactory::new(format!("subagent-{}", child_tool_request.id));
+                    let mut child_sink = EventSink::new(io::sink(), child_config.output_format);
+                    let mut child_runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
+                        cwd: &child_cwd,
+                        events: &mut child_events,
+                        sink: &mut child_sink,
+                        instructions: &child_instructions,
+                        memory: &child_memory,
+                        mcp_registry: &child_mcp_registry,
+                        hooks: &child_hooks,
+                        cancel: &child_cancel,
+                        lifecycle: Some(&mut subagent_lifecycle),
+                        executor: child_executor,
+                    });
+                    let (child, child_cost_tracker) =
+                        run_child_agent(&child_config, &child_request, &mut child_runtime);
+                    subagent_lifecycle.finish_task(child.status);
+
+                    SubagentExecutionResult {
+                        tool_request: child_tool_request,
+                        description: request.description,
+                        task: subagent_lifecycle
+                            .active_task()
+                            .cloned()
+                            .unwrap_or(subagent_task),
+                        schema: request.schema,
+                        child,
+                        cost_tracker: child_cost_tracker,
+                        worktree: None,
+                    }
+                }),
+            ));
+        }
+
+        for (idx, panic_task, panic_description, handle) in handles {
+            let execution = match handle.join() {
+                Ok(execution) => execution,
+                Err(_) => {
+                    let tool_request = &tool_requests[idx];
+                    let error = "Subagent worker panicked after execution started; its side effects and final output are indeterminate. Inspect external state before retrying.";
+                    let result =
+                        tool_types::ToolResult::indeterminate_after_start(tool_request, error);
+                    if emit_deltas {
+                        let failed_task = panic_task.with_status(RuntimeTaskStatus::Failed);
+                        emit_batch_event(
+                            sink,
+                            &failed_task.attach_to_event(events.subagent_completed(
+                                &tool_request.id,
+                                &panic_description,
+                                RunStatus::Failed,
+                                None,
+                                Some(error),
+                            )),
+                            &mut event_error,
+                        );
+                        emit_batch_event(
+                            sink,
+                            &events.tool_call_completed(&result),
+                            &mut event_error,
+                        );
+                    }
+                    results[idx] = Some((RunStatus::Failed, result));
+                    continue;
+                }
+            };
+
+            cost_tracker.merge(&execution.cost_tracker);
+
+            let (status, result) =
+                match subagent_execution_to_tool_result(events, sink, &execution, emit_deltas) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if event_error.is_none() {
+                            event_error = Some(error);
+                        }
+                        subagent_execution_to_tool_result(events, sink, &execution, false)
+                            .expect("subagent result folding without events cannot fail")
+                    }
+                };
+            if emit_deltas {
+                emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                if let Err(error) = hooks.run(
+                    HookEvent::PostToolUse,
+                    HookContext {
+                        cwd: &cwd.display().to_string(),
+                        session_status: None,
+                        tool_request: Some(&execution.tool_request),
+                        tool_result: Some(&result),
+                        before_messages: None,
+                        after_messages: None,
+                        usage: None,
+                    },
+                ) {
+                    emit_batch_event(
+                        sink,
+                        &events.error(&format!("post_tool_use hook failed: {error}")),
+                        &mut event_error,
+                    );
+                }
+            }
+            results[idx] = Some((status, result));
+        }
+    });
+
+    SubagentBatchExecution {
+        results: results
+            .into_iter()
+            .map(|result| result.expect("each subagent batch item has a result"))
+            .collect(),
+        event_error,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,12 +727,38 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         .finish_task(child.status)
         .cloned()
         .unwrap_or_else(|| subagent_task.clone());
-    let worktree = worktree_guard
-        .map(WorktreeGuard::finish)
-        .transpose()
-        .map_err(io::Error::other)?;
-
     cost_tracker.merge(&child_cost_tracker);
+    let worktree = match worktree_guard.map(WorktreeGuard::finish).transpose() {
+        Ok(worktree) => worktree,
+        Err(cleanup_error) => {
+            let mut error = format!(
+                "failed to finish subagent worktree after child status {:?}: {cleanup_error}",
+                child.status
+            );
+            if let Some(child_error) = child.error.as_deref() {
+                error.push_str(&format!("\n\nChild error: {child_error}"));
+            }
+            let failed_task = subagent_lifecycle
+                .finish_task(RunStatus::Failed)
+                .cloned()
+                .unwrap_or_else(|| completed_task.clone());
+            if emit_deltas {
+                let event = failed_task.attach_to_event(events.subagent_completed(
+                    &tool_request.id,
+                    &description,
+                    RunStatus::Failed,
+                    child.final_message.as_deref(),
+                    Some(&error),
+                ));
+                sink.emit(&event)?;
+            }
+            return Ok(tool_types::ToolResult::failed_after_start(
+                tool_request,
+                format!("Subagent status: Failed\n\n{error}"),
+                None,
+            ));
+        }
+    };
 
     match child.status {
         RunStatus::Success => {
@@ -603,6 +804,27 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                 tool_request,
                 format!("Subagent status: success\n\n{output}"),
                 false,
+            ))
+        }
+        RunStatus::Cancelled => {
+            let mut error = child
+                .error
+                .unwrap_or_else(|| "subagent ended with status Cancelled".to_string());
+            append_worktree_outcome(&mut error, worktree.as_ref());
+            if emit_deltas {
+                let event = completed_task.attach_to_event(events.subagent_completed(
+                    &tool_request.id,
+                    &description,
+                    RunStatus::Cancelled,
+                    child.final_message.as_deref(),
+                    Some(&error),
+                ));
+                sink.emit(&event)?;
+            }
+            Ok(tool_types::ToolResult::cancelled(
+                tool_request,
+                format!("Subagent status: Cancelled\n\n{error}"),
+                None,
             ))
         }
         status => {
@@ -700,6 +922,32 @@ fn subagent_execution_to_tool_result(
                 ),
             ))
         }
+        RunStatus::Cancelled => {
+            let mut error = execution
+                .child
+                .error
+                .clone()
+                .unwrap_or_else(|| "subagent ended with status Cancelled".to_string());
+            append_worktree_outcome(&mut error, execution.worktree.as_ref());
+            if emit_deltas {
+                let event = execution.task.attach_to_event(events.subagent_completed(
+                    &execution.tool_request.id,
+                    &execution.description,
+                    RunStatus::Cancelled,
+                    execution.child.final_message.as_deref(),
+                    Some(&error),
+                ));
+                sink.emit(&event)?;
+            }
+            Ok((
+                RunStatus::Cancelled,
+                tool_types::ToolResult::cancelled(
+                    &execution.tool_request,
+                    format!("Subagent status: Cancelled\n\n{error}"),
+                    None,
+                ),
+            ))
+        }
         status => {
             let mut error = execution
                 .child
@@ -764,6 +1012,8 @@ fn subagent_output_value(output: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::cost::CostTracker;
@@ -776,6 +1026,7 @@ mod tests {
     use orca_core::config::{OutputFormat, ProviderKind, RunConfig};
     use orca_core::event_schema::{EventFactory, RunStatus};
     use orca_core::event_sink::EventSink;
+    use orca_core::hook_types::{HookConfig, HookEvent};
     use orca_core::model::ModelSelection;
     use orca_core::provider_types::Usage;
     use orca_core::subagent_config::SubagentConfig;
@@ -916,6 +1167,118 @@ mod tests {
     }
 
     #[test]
+    fn record_subagent_batch_results_records_executed_suffix_before_returning_first_failure() {
+        let first_request = subagent_request("first");
+        let failed_request = subagent_request("failed");
+        let third_request = subagent_request("third");
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let outcome = super::record_subagent_batch_results(
+            &mut conversation,
+            None,
+            vec![
+                (
+                    RunStatus::Success,
+                    tool_types::ToolResult::completed(
+                        &first_request,
+                        "first completed".to_string(),
+                        false,
+                    ),
+                ),
+                (
+                    RunStatus::Failed,
+                    tool_types::ToolResult::failed(&failed_request, "child failed", None),
+                ),
+                (
+                    RunStatus::Success,
+                    tool_types::ToolResult::completed(
+                        &third_request,
+                        "third completed".to_string(),
+                        false,
+                    ),
+                ),
+            ],
+            false,
+        )
+        .expect("record complete subagent batch");
+
+        assert!(matches!(
+            outcome,
+            super::SubagentBatchRecordOutcome::Return {
+                status: RunStatus::Failed,
+                error: Some(ref error),
+            } if error == "child failed"
+        ));
+        assert_eq!(conversation.messages.len(), 3);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| match message {
+                    orca_core::conversation::Message::Tool { tool_call_id, .. } => {
+                        tool_call_id.as_str()
+                    }
+                    _ => panic!("expected tool result"),
+                })
+                .collect::<Vec<_>>(),
+            vec!["first", "failed", "third"]
+        );
+    }
+
+    #[test]
+    fn record_subagent_batch_results_keeps_live_terminals_after_history_failure() {
+        let history = tempfile::tempdir().expect("history tempdir");
+        let history_path = history.path().join("session.jsonl");
+        std::fs::write(&history_path, "").expect("create history file");
+        let mut writer =
+            crate::thread_store::SessionWriter::append_to_existing(history_path.clone())
+                .expect("open existing history");
+        std::fs::remove_file(&history_path).expect("remove history file");
+        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        let first = subagent_request("first");
+        let second = subagent_request("second");
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let error = match super::record_subagent_batch_results(
+            &mut conversation,
+            Some(&mut writer),
+            vec![
+                (
+                    RunStatus::Success,
+                    tool_types::ToolResult::completed(&first, "first completed".to_string(), false),
+                ),
+                (
+                    RunStatus::Success,
+                    tool_types::ToolResult::completed(
+                        &second,
+                        "second completed".to_string(),
+                        false,
+                    ),
+                ),
+            ],
+            true,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("history append must fail"),
+        };
+
+        assert!(error.raw_os_error().is_some());
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| match message {
+                    orca_core::conversation::Message::Tool { tool_call_id, .. } => {
+                        tool_call_id.as_str()
+                    }
+                    _ => panic!("expected tool result"),
+                })
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
     fn run_subagent_batch_tool_turn_executes_and_records_results() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
@@ -995,6 +1358,470 @@ mod tests {
         _child_cost_tracker: &mut CostTracker,
     ) -> io::Result<ChildAgentResult> {
         panic!("budget-rejected async subagent must not start a child executor")
+    }
+
+    fn cancelled_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        Ok(ChildAgentResult {
+            status: RunStatus::Cancelled,
+            final_message: None,
+            error: Some("child turn cancelled".to_string()),
+        })
+    }
+
+    fn cancelling_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        let marker = runtime
+            .cwd
+            .join(format!("{}.started", request.prompt.replace(' ', "-")));
+        std::fs::write(marker, "started\n")?;
+        runtime.cancel.cancel();
+        Ok(ChildAgentResult {
+            status: RunStatus::Cancelled,
+            final_message: None,
+            error: Some("child cancelled parent batch".to_string()),
+        })
+    }
+
+    fn delayed_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        std::thread::sleep(Duration::from_millis(250));
+        std::fs::write(runtime.cwd.join("delayed-child-finished"), "finished\n")?;
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("finished".to_string()),
+            error: None,
+        })
+    }
+
+    fn panic_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        panic!("child worker panic")
+    }
+
+    #[derive(Default)]
+    struct FailThirdFlush {
+        flushes: usize,
+    }
+
+    impl io::Write for FailThirdFlush {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.flushes == 3 {
+                return Err(io::Error::other("event consumer disconnected"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn subagent_batch_cancellation_stops_blocked_hook_and_unstarted_sibling() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let mut events = EventFactory::new("subagent-batch-hook-cancel".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let requests = vec![subagent_request("first"), subagent_request("second")];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: r#"if [ "$ORCA_TOOL_TARGET" = "inspect second" ]; then sleep 5; fi"#
+                .to_string(),
+            tool: Some("subagent".to_string()),
+        }]);
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let mut conversation = orca_core::conversation::Conversation::new();
+        let started = Instant::now();
+
+        let outcome =
+            super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
+                request: super::RuntimeSubagentBatchToolTurnRequest {
+                    config: &config,
+                    cwd: cwd.path(),
+                    tool_requests: &requests,
+                    subagent_depth: 0,
+                    emit_deltas: false,
+                },
+                io: super::RuntimeSubagentBatchToolTurnIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: None,
+                    cost_tracker: &mut cost_tracker,
+                },
+                services: super::RuntimeSubagentBatchToolTurnServices {
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &mcp_registry,
+                    hooks: &hooks,
+                },
+                runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    cancel: &cancel,
+                    workflow_ipc: None,
+                },
+                child_executor: cancelling_child_executor::<std::io::Sink>,
+            })
+            .expect("cancel subagent batch");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert!(cwd.path().join("inspect-first.started").exists());
+        assert!(!cwd.path().join("inspect-second.started").exists());
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(matches!(
+            &conversation.messages[1],
+            orca_core::conversation::Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == tool_types::ToolStatus::Cancelled
+                && terminal.started == tool_types::ToolInvocationStarted::No
+        ));
+    }
+
+    #[test]
+    fn subagent_batch_joins_started_worker_before_event_io_error_returns() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let mut events = EventFactory::new("subagent-batch-event-error".to_string());
+        let mut sink = EventSink::new(FailThirdFlush::default(), OutputFormat::Text);
+        let requests = vec![subagent_request("first"), subagent_request("second")];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let mut conversation = orca_core::conversation::Conversation::new();
+        let started = Instant::now();
+
+        let error =
+            match super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
+                request: super::RuntimeSubagentBatchToolTurnRequest {
+                    config: &config,
+                    cwd: cwd.path(),
+                    tool_requests: &requests,
+                    subagent_depth: 0,
+                    emit_deltas: true,
+                },
+                io: super::RuntimeSubagentBatchToolTurnIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: None,
+                    cost_tracker: &mut cost_tracker,
+                },
+                services: super::RuntimeSubagentBatchToolTurnServices {
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &mcp_registry,
+                    hooks: &hooks,
+                },
+                runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    cancel: &cancel,
+                    workflow_ipc: None,
+                },
+                child_executor: delayed_child_executor::<std::io::Sink>,
+            }) {
+                Err(error) => error,
+                Ok(_) => panic!("third event flush should fail after recording terminals"),
+            };
+
+        assert!(error.to_string().contains("event consumer disconnected"));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(cwd.path().join("delayed-child-finished").exists());
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(matches!(
+            &conversation.messages[0],
+            orca_core::conversation::Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == tool_types::ToolStatus::Completed
+        ));
+        assert!(matches!(
+            &conversation.messages[1],
+            orca_core::conversation::Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == tool_types::ToolStatus::Failed
+                && terminal.started == tool_types::ToolInvocationStarted::No
+        ));
+    }
+
+    #[test]
+    fn subagent_batch_panic_is_indeterminate_and_closes_lifecycle_event() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let mut events = EventFactory::new("subagent-batch-panic".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let requests = vec![subagent_request("panic")];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let outcome =
+            super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
+                request: super::RuntimeSubagentBatchToolTurnRequest {
+                    config: &config,
+                    cwd: cwd.path(),
+                    tool_requests: &requests,
+                    subagent_depth: 0,
+                    emit_deltas: true,
+                },
+                io: super::RuntimeSubagentBatchToolTurnIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: None,
+                    cost_tracker: &mut cost_tracker,
+                },
+                services: super::RuntimeSubagentBatchToolTurnServices {
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &mcp_registry,
+                    hooks: &hooks,
+                },
+                runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    cancel: &cancel,
+                    workflow_ipc: None,
+                },
+                child_executor: panic_child_executor::<std::io::Sink>,
+            })
+            .expect("panic must become a terminal result");
+
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Failed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &conversation.messages[0],
+            orca_core::conversation::Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == tool_types::ToolStatus::Indeterminate
+                && terminal.started == tool_types::ToolInvocationStarted::Yes
+        ));
+        let emitted = String::from_utf8(sink.writer_mut().clone()).expect("jsonl events");
+        let parsed = emitted
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(parsed.iter().any(|event| {
+            event["type"] == "subagent.completed"
+                && event["payload"]["status"] == "failed"
+                && event["payload"]["task"]["status"] == "failed"
+        }));
+        assert!(parsed.iter().any(|event| {
+            event["type"] == "tool.call.completed" && event["payload"]["status"] == "indeterminate"
+        }));
+    }
+
+    fn remove_worktree_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        std::fs::remove_dir_all(runtime.cwd).expect("remove child worktree");
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("child completed before cleanup".to_string()),
+            error: None,
+        })
+    }
+
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn isolated_subagent_cleanup_failure_returns_started_terminal() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["config", "user.email", "orca@example.test"]);
+        run_git(repo.path(), &["config", "user.name", "Orca Test"]);
+        std::fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("write fixture");
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        run_git(repo.path(), &["commit", "-m", "seed"]);
+
+        let config = config(SubagentConfig::default());
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "cleanup failure",
+                    "prompt": "cleanup failure",
+                    "isolation": "worktree"
+                })
+                .to_string(),
+            ),
+            ..subagent_request("cleanup-failure")
+        };
+        let mut events = EventFactory::new("subagent-cleanup-failure".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-cleanup-failure".to_string());
+
+        let result = super::execute_subagent_tool(
+            &config,
+            repo.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            true,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            remove_worktree_child_executor::<Vec<u8>>,
+        )
+        .expect("cleanup failure must return a tool terminal");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(
+            result.terminal().started,
+            tool_types::ToolInvocationStarted::Yes
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed to finish subagent worktree"))
+        );
+        let emitted = String::from_utf8(sink.writer_mut().clone()).expect("jsonl events");
+        assert!(emitted.lines().any(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["type"] == "subagent.completed" && event["payload"]["status"] == "failed"
+        }));
+    }
+
+    #[test]
+    fn subagent_batch_preserves_cancelled_child_terminals() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let mut events = EventFactory::new("subagent-batch-cancelled".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let requests = vec![
+            subagent_request("cancelled-1"),
+            subagent_request("cancelled-2"),
+        ];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let outcome =
+            super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
+                request: super::RuntimeSubagentBatchToolTurnRequest {
+                    config: &config,
+                    cwd: cwd.path(),
+                    tool_requests: &requests,
+                    subagent_depth: 0,
+                    emit_deltas: true,
+                },
+                io: super::RuntimeSubagentBatchToolTurnIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: None,
+                    cost_tracker: &mut cost_tracker,
+                },
+                services: super::RuntimeSubagentBatchToolTurnServices {
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &mcp_registry,
+                    hooks: &hooks,
+                },
+                runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    cancel: &cancel,
+                    workflow_ipc: None,
+                },
+                child_executor: cancelled_child_executor::<std::io::Sink>,
+            })
+            .expect("run cancelled subagent batch");
+
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(conversation.messages.len(), 2);
+        for message in &conversation.messages {
+            assert!(matches!(
+                message,
+                orca_core::conversation::Message::Tool {
+                    terminal: Some(terminal),
+                    ..
+                } if terminal.status == tool_types::ToolStatus::Cancelled
+                    && terminal.started == tool_types::ToolInvocationStarted::Yes
+            ));
+        }
     }
 
     #[test]
@@ -1106,5 +1933,51 @@ mod tests {
         );
         assert!(task_registry.list().is_empty());
         assert_eq!(cost_tracker.totals(), Default::default());
+    }
+
+    #[test]
+    fn sync_subagent_preserves_cancelled_child_terminal() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("subagent-cancelled".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = subagent_request("cancelled");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-cancelled".to_string());
+
+        let result = super::execute_subagent_tool(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            true,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            cancelled_child_executor::<Vec<u8>>,
+        )
+        .expect("cancelled subagent tool");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Cancelled);
+        assert_eq!(
+            result.terminal().started,
+            tool_types::ToolInvocationStarted::Yes
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Subagent status: Cancelled\n\nchild turn cancelled")
+        );
     }
 }

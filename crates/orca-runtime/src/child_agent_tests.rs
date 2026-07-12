@@ -20,9 +20,10 @@ use orca_core::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
 use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::subagent_types::SubagentType;
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 
+use crate::child_agent_response_folding::fold_child_agent_tool_result_and_close_siblings;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
@@ -1151,6 +1152,94 @@ fn fold_child_agent_tool_result_preserves_cancelled_child_result() {
             assert_eq!(result.error.as_deref(), Some("turn interrupted"));
         }
         ChildAgentToolResultFold::Continue => panic!("should_stop should stop child execution"),
+    }
+}
+
+#[test]
+fn stopping_child_tool_result_closes_three_call_sibling_boundary() {
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    let mut setup = prepare_child_agent_loop(
+        &runtime_config,
+        &request,
+        std::env::temp_dir().as_path(),
+        &instructions,
+        &memory,
+    );
+    let tool_requests = ["tool-1", "tool-2", "tool-3"]
+        .into_iter()
+        .map(|id| ToolRequest {
+            id: id.to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some(format!("echo {id}")),
+            raw_arguments: None,
+        })
+        .collect::<Vec<_>>();
+    let raw_calls = tool_requests
+        .iter()
+        .map(|request| RawToolCall {
+            id: request.id.clone(),
+            function_name: request.name.as_str().to_string(),
+            arguments: request.raw_arguments.clone().unwrap_or_default(),
+        })
+        .collect();
+    setup
+        .conversation
+        .add_assistant(Some("run tools".to_string()), None, raw_calls);
+    let mut tracker = CostTracker::new(None);
+    let result = ToolResult::cancelled(&tool_requests[0], "turn interrupted", Some(130));
+
+    let fold = fold_child_agent_tool_result_and_close_siblings(
+        &mut setup,
+        &tool_requests[0],
+        &tool_requests[1..].iter().collect::<Vec<_>>(),
+        true,
+        result,
+        None,
+        &mut tracker,
+    );
+
+    assert!(matches!(
+        fold,
+        ChildAgentToolResultFold::Stop(ChildAgentResult {
+            status: RunStatus::Cancelled,
+            ..
+        })
+    ));
+    let terminal_messages = setup
+        .conversation
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } => Some((tool_call_id.as_str(), terminal)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_messages.len(), 3);
+    for (index, (tool_call_id, terminal)) in terminal_messages.iter().enumerate() {
+        assert_eq!(*tool_call_id, tool_requests[index].id);
+        assert_eq!(terminal.status, ToolStatus::Cancelled);
+        assert_eq!(
+            terminal.started,
+            if index == 0 {
+                ToolInvocationStarted::Yes
+            } else {
+                ToolInvocationStarted::No
+            }
+        );
     }
 }
 

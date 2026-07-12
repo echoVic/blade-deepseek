@@ -27,7 +27,7 @@ use crate::extension::{
     RuntimeExtensionStores,
 };
 use crate::goals::install_goal_tool_lifecycle;
-use crate::hooks::{HookContext, HookOutcome, HookRunner};
+use crate::hooks::{HookContext, HookOutcome, HookRunError, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
@@ -479,20 +479,21 @@ impl<'a> RuntimeTaskActor<'a> {
             usage: None,
         };
         let result = if let Some(cancel) = cancel {
-            hooks.run_with_cancel(HookEvent::PreToolUse, context, cancel)
+            hooks.run_with_cancel_result(HookEvent::PreToolUse, context, cancel)
         } else {
-            hooks.run(HookEvent::PreToolUse, context)
+            hooks
+                .run(HookEvent::PreToolUse, context)
+                .map_err(HookRunError::Failed)
         };
-        result.map_err(|error| {
-            if cancel.is_some_and(CancelToken::is_cancelled) {
+        result.map_err(|error| match error {
+            HookRunError::Cancelled(_) => {
                 ToolResult::cancelled_before_start(request, "the pre-tool hook was cancelled")
-            } else {
-                ToolResult::failed(
-                    request,
-                    format!("pre_tool_use hook blocked tool: {error}"),
-                    None,
-                )
             }
+            HookRunError::Failed(error) => ToolResult::failed_before_start(
+                request,
+                format!("pre_tool_use hook blocked tool: {error}"),
+                None,
+            ),
         })
     }
 

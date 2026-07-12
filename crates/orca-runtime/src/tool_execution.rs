@@ -69,8 +69,44 @@ pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
     pub(crate) emit_deltas: bool,
 }
 
+struct PreToolHookExecution {
+    outcome: Result<ToolInvocation, (RunStatus, tool_types::ToolResult)>,
+    event_error: Option<io::Error>,
+}
+
+#[derive(Default)]
+pub(crate) struct ApprovalGateExecution {
+    pub(crate) outcome: Option<(RunStatus, tool_types::ToolResult)>,
+    pub(crate) event_error: Option<io::Error>,
+}
+
 pub(crate) struct ToolExecutionActor {
     runtime: RuntimeToolActorContext,
+}
+
+pub(crate) struct ToolExecutionCompletion {
+    pub(crate) status: RunStatus,
+    pub(crate) result: tool_types::ToolResult,
+    pub(crate) event_error: Option<io::Error>,
+}
+
+impl ToolExecutionCompletion {
+    fn from_pair((status, result): (RunStatus, tool_types::ToolResult)) -> Self {
+        Self {
+            status,
+            result,
+            event_error: None,
+        }
+    }
+
+    fn from_pair_with_event_error(
+        pair: (RunStatus, tool_types::ToolResult),
+        event_error: Option<io::Error>,
+    ) -> Self {
+        let mut completion = Self::from_pair(pair);
+        completion.event_error = event_error;
+        completion
+    }
 }
 
 pub(crate) fn policy_for_tool_execution(config: &RunConfig) -> ApprovalPolicy {
@@ -258,9 +294,9 @@ pub(crate) fn execute_tool_with_approval<W: io::Write>(
     context: ToolExecutionContext<'_>,
     child_executor: ChildAgentExecutor<W>,
     workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
-) -> io::Result<(RunStatus, tool_types::ToolResult)> {
+) -> io::Result<ToolExecutionCompletion> {
     let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_TOOL_MAX_TURNS);
-    actor.execute(
+    actor.execute_with_event_error(
         config,
         events,
         sink,
@@ -306,6 +342,7 @@ impl ToolExecutionActor {
             .run_post_tool_hook_with_cancel(hooks, cwd, request, result, cancel)
     }
 
+    #[cfg(test)]
     pub(crate) fn execute<W: io::Write>(
         &mut self,
         config: &RunConfig,
@@ -316,6 +353,31 @@ impl ToolExecutionActor {
         child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
     ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
+        let completion = self.execute_with_event_error(
+            config,
+            events,
+            sink,
+            tool_request,
+            context,
+            child_executor,
+            workflow_child_executor,
+        )?;
+        match completion.event_error {
+            Some(error) => Err(error),
+            None => Ok((completion.status, completion.result)),
+        }
+    }
+
+    fn execute_with_event_error<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        tool_request: &tool_types::ToolRequest,
+        context: ToolExecutionContext<'_>,
+        child_executor: ChildAgentExecutor<W>,
+        workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    ) -> io::Result<ToolExecutionCompletion> {
         let ToolExecutionContext {
             cwd,
             subagent_depth,
@@ -350,17 +412,25 @@ impl ToolExecutionActor {
         let invocation =
             prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
         if let Err(error) = validate_tool_invocation(&invocation, mcp_registry, config) {
-            if emit_deltas {
-                emit_tool_call_requested(events, sink, tool_request)?;
-            }
             let result = error.into_result();
+            let mut event_error = None;
             if emit_deltas {
-                emit_tool_call_completed(events, sink, tool_request, &result)?;
+                retain_first_io_error(
+                    &mut event_error,
+                    emit_tool_call_requested(events, sink, tool_request),
+                );
+                retain_first_io_error(
+                    &mut event_error,
+                    emit_tool_call_completed(events, sink, tool_request, &result),
+                );
             }
-            return Ok((RunStatus::Failed, result));
+            return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                (RunStatus::Failed, result),
+                event_error,
+            ));
         }
 
-        if let Some(outcome) = self.handle_approval(ToolApprovalGateContext {
+        let approval_execution = self.handle_approval(ToolApprovalGateContext {
             config,
             events,
             sink,
@@ -369,15 +439,68 @@ impl ToolExecutionActor {
             policy,
             permission_overlay,
             emit_deltas,
-        })? {
-            return Ok(outcome);
+        });
+        match (approval_execution.outcome, approval_execution.event_error) {
+            (Some(outcome), event_error) => {
+                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                    outcome,
+                    event_error,
+                ));
+            }
+            (None, Some(error)) => {
+                let result = tool_types::ToolResult::failed_before_start(
+                    tool_request,
+                    format!(
+                        "tool dispatch stopped because approval event delivery failed: {error}"
+                    ),
+                    None,
+                );
+                let mut event_error = Some(error);
+                if emit_deltas {
+                    retain_first_io_error(
+                        &mut event_error,
+                        emit_tool_call_requested(events, sink, tool_request),
+                    );
+                    retain_first_io_error(
+                        &mut event_error,
+                        emit_tool_call_completed(events, sink, tool_request, &result),
+                    );
+                }
+                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                    (RunStatus::Failed, result),
+                    event_error,
+                ));
+            }
+            (None, None) => {}
         }
 
         if emit_deltas {
-            emit_tool_call_requested(events, sink, tool_request)?;
+            let mut event_error = None;
+            retain_first_io_error(
+                &mut event_error,
+                emit_tool_call_requested(events, sink, tool_request),
+            );
+            if event_error.is_some() {
+                let result = tool_types::ToolResult::failed_before_start(
+                    tool_request,
+                    format!(
+                        "tool dispatch stopped because its requested event could not be delivered: {}",
+                        event_error.as_ref().expect("requested event error")
+                    ),
+                    None,
+                );
+                retain_first_io_error(
+                    &mut event_error,
+                    emit_tool_call_completed(events, sink, tool_request, &result),
+                );
+                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                    (RunStatus::Failed, result),
+                    event_error,
+                ));
+            }
         }
         let cwd_display = cwd.display().to_string();
-        let invocation = match self.apply_pre_tool_hook(
+        let hook_execution = self.apply_pre_tool_hook(
             config,
             events,
             sink,
@@ -388,9 +511,15 @@ impl ToolExecutionActor {
             mcp_registry,
             emit_deltas,
             Some(cancel),
-        )? {
+        );
+        let invocation = match hook_execution.outcome {
             Ok(invocation) => invocation,
-            Err(outcome) => return Ok(outcome),
+            Err(outcome) => {
+                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                    outcome,
+                    hook_execution.event_error,
+                ));
+            }
         };
         let execution_request = &invocation.effective;
         if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
@@ -401,8 +530,8 @@ impl ToolExecutionActor {
                 call_id: &execution_request.id,
             });
         }
-        let result =
-            match RuntimeToolRouter::new(&mut self.runtime).dispatch(RuntimeToolInvocationContext {
+        let result = match RuntimeToolRouter::new(&mut self.runtime).dispatch(
+            RuntimeToolInvocationContext {
                 config,
                 cwd,
                 events,
@@ -426,23 +555,16 @@ impl ToolExecutionActor {
                 extension_stores,
                 child_executor,
                 workflow_child_executor,
-            }) {
-                Ok(result) => result,
-                Err(error) => {
-                    if let (Some(registry), Some(extension_stores)) =
-                        (extension_registry, extension_stores)
-                    {
-                        registry.on_tool_finish(ToolFinishInput {
-                            thread_store: extension_stores.thread_store(),
-                            turn_store: extension_stores.turn_store(),
-                            tool_name: execution_request.name.as_str(),
-                            call_id: &execution_request.id,
-                            outcome: ToolCallOutcome::Aborted,
-                        });
-                    }
-                    return Err(error);
-                }
-            };
+            },
+        ) {
+            Ok(result) => result,
+            Err(error) => tool_types::ToolResult::indeterminate(
+                execution_request,
+                format!(
+                    "Tool invocation outcome is indeterminate after an execution I/O error: {error}. Inspect external state before retrying."
+                ),
+            ),
+        };
         if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
             registry.on_tool_finish(ToolFinishInput {
                 thread_store: extension_stores.thread_store(),
@@ -452,7 +574,7 @@ impl ToolExecutionActor {
                 outcome: tool_call_outcome_for_result(&result),
             });
         }
-        self.finish_tool_result(
+        Ok(self.finish_tool_result(
             events,
             sink,
             execution_request,
@@ -461,13 +583,13 @@ impl ToolExecutionActor {
             &cwd_display,
             emit_deltas,
             Some(cancel),
-        )
+        ))
     }
 
     pub(crate) fn handle_approval<W: io::Write>(
         &mut self,
         context: ToolApprovalGateContext<'_, W>,
-    ) -> io::Result<Option<(RunStatus, tool_types::ToolResult)>> {
+    ) -> ApprovalGateExecution {
         let ToolApprovalGateContext {
             config,
             events,
@@ -480,7 +602,7 @@ impl ToolExecutionActor {
         } = context;
 
         if tool_request.name == tool_types::ToolName::RequestPermissions {
-            return Ok(None);
+            return ApprovalGateExecution::default();
         }
 
         if let Some(approval) = approval_request_for_invocation(invocation)
@@ -488,52 +610,140 @@ impl ToolExecutionActor {
         {
             let approval_decision = RuntimeToolApprovalPolicy::new(policy, permission_overlay)
                 .resolve(approval.clone(), tool_request);
+            let mut event_error = None;
             if emit_deltas {
-                sink.emit(&events.approval_requested(&approval))?;
+                retain_first_io_error(
+                    &mut event_error,
+                    sink.emit(&events.approval_requested(&approval)),
+                );
             }
 
             match approval_decision {
                 RuntimeApprovalDecision::Allowed(resolution) => {
                     if emit_deltas {
-                        sink.emit(&events.approval_resolved(&resolution))?;
+                        retain_first_io_error(
+                            &mut event_error,
+                            sink.emit(&events.approval_resolved(&resolution)),
+                        );
+                    }
+                    if event_error.is_some() {
+                        return failed_approval_gate_before_start(
+                            events,
+                            sink,
+                            tool_request,
+                            emit_deltas,
+                            event_error,
+                            "tool dispatch stopped because approval events could not be delivered",
+                        );
                     }
                 }
                 RuntimeApprovalDecision::Ask(approval) => {
+                    if event_error.is_some() {
+                        return failed_approval_gate_before_start(
+                            events,
+                            sink,
+                            tool_request,
+                            emit_deltas,
+                            event_error,
+                            "tool dispatch stopped before interactive approval because the request event could not be delivered",
+                        );
+                    }
                     let handler = RuntimeConfigApprovalHandler::new(config);
-                    let final_resolution = self.runtime.resolve_interactive_tool_approval(
+                    let final_resolution = match self.runtime.resolve_interactive_tool_approval(
                         &handler,
                         &approval,
                         tool_request,
-                    )?;
+                    ) {
+                        Ok(resolution) => resolution,
+                        Err(error) => {
+                            return failed_approval_gate_before_start(
+                                events,
+                                sink,
+                                tool_request,
+                                emit_deltas,
+                                event_error,
+                                &format!(
+                                    "interactive approval failed before tool dispatch: {error}"
+                                ),
+                            );
+                        }
+                    };
                     if emit_deltas {
-                        sink.emit(&events.approval_resolved(&final_resolution))?;
+                        retain_first_io_error(
+                            &mut event_error,
+                            sink.emit(&events.approval_resolved(&final_resolution)),
+                        );
                     }
-                    if final_resolution.decision == ApprovalDecision::Deny {
-                        if emit_deltas {
-                            emit_tool_call_requested(events, sink, tool_request)?;
+                    match final_resolution.decision {
+                        ApprovalDecision::Deny => {
+                            let result = tool_types::ToolResult::denied(
+                                tool_request,
+                                final_resolution.reason,
+                            );
+                            return finish_approval_gate_terminal(
+                                events,
+                                sink,
+                                tool_request,
+                                emit_deltas,
+                                event_error,
+                                RunStatus::ApprovalRequired,
+                                result,
+                            );
                         }
-                        let result =
-                            tool_types::ToolResult::denied(tool_request, final_resolution.reason);
-                        if emit_deltas {
-                            emit_tool_call_completed(events, sink, tool_request, &result)?;
+                        ApprovalDecision::Allow if event_error.is_none() => {}
+                        ApprovalDecision::Allow => {
+                            return failed_approval_gate_before_start(
+                                events,
+                                sink,
+                                tool_request,
+                                emit_deltas,
+                                event_error,
+                                "tool dispatch stopped because the approval resolution event could not be delivered",
+                            );
                         }
-                        return Ok(Some((RunStatus::ApprovalRequired, result)));
+                        ApprovalDecision::Ask => {
+                            return failed_approval_gate_before_start(
+                                events,
+                                sink,
+                                tool_request,
+                                emit_deltas,
+                                event_error,
+                                "interactive approval did not resolve before tool dispatch",
+                            );
+                        }
                     }
                 }
                 RuntimeApprovalDecision::Denied { resolution, result } => {
                     if emit_deltas {
-                        sink.emit(&events.approval_resolved(&resolution))?;
-                        emit_tool_call_requested(events, sink, tool_request)?;
+                        retain_first_io_error(
+                            &mut event_error,
+                            sink.emit(&events.approval_resolved(&resolution)),
+                        );
                     }
-                    if emit_deltas {
-                        emit_tool_call_completed(events, sink, tool_request, &result)?;
-                    }
-                    return Ok(Some((RunStatus::ApprovalRequired, result)));
+                    return finish_approval_gate_terminal(
+                        events,
+                        sink,
+                        tool_request,
+                        emit_deltas,
+                        event_error,
+                        RunStatus::ApprovalRequired,
+                        result,
+                    );
                 }
-                RuntimeApprovalDecision::NotRequired => {}
+                RuntimeApprovalDecision::NotRequired if event_error.is_none() => {}
+                RuntimeApprovalDecision::NotRequired => {
+                    return failed_approval_gate_before_start(
+                        events,
+                        sink,
+                        tool_request,
+                        emit_deltas,
+                        event_error,
+                        "tool dispatch stopped because approval events could not be delivered",
+                    );
+                }
             }
         }
-        Ok(None)
+        ApprovalGateExecution::default()
     }
 
     fn apply_pre_tool_hook(
@@ -548,26 +758,42 @@ impl ToolExecutionActor {
         mcp_registry: &McpRegistry,
         emit_deltas: bool,
         cancel: Option<&CancelToken>,
-    ) -> io::Result<Result<ToolInvocation, (RunStatus, tool_types::ToolResult)>> {
+    ) -> PreToolHookExecution {
+        let mut event_error = None;
         let pre_tool_outcome =
             match self.run_pre_tool_hook(hooks, cwd_display, tool_request, cancel) {
                 Ok(outcome) => outcome,
                 Err(result) => {
                     if emit_deltas {
-                        emit_tool_call_completed(events, sink, tool_request, &result)?;
+                        retain_first_io_error(
+                            &mut event_error,
+                            emit_tool_call_completed(events, sink, tool_request, &result),
+                        );
                     }
                     let status = run_status_from_tool_status(result.status);
-                    return Ok(Err((status, result)));
+                    return PreToolHookExecution {
+                        outcome: Err((status, result)),
+                        event_error,
+                    };
                 }
             };
         match apply_pre_tool_outcome(invocation, &pre_tool_outcome, mcp_registry, config) {
-            Ok(invocation) => Ok(Ok(invocation)),
+            Ok(invocation) => PreToolHookExecution {
+                outcome: Ok(invocation),
+                event_error,
+            },
             Err(error) => {
                 let result = error.into_result();
                 if emit_deltas {
-                    emit_tool_call_completed(events, sink, tool_request, &result)?;
+                    retain_first_io_error(
+                        &mut event_error,
+                        emit_tool_call_completed(events, sink, tool_request, &result),
+                    );
                 }
-                Ok(Err((RunStatus::Failed, result)))
+                PreToolHookExecution {
+                    outcome: Err((RunStatus::Failed, result)),
+                    event_error,
+                }
             }
         }
     }
@@ -582,29 +808,94 @@ impl ToolExecutionActor {
         cwd_display: &str,
         emit_deltas: bool,
         cancel: Option<&CancelToken>,
-    ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
+    ) -> ToolExecutionCompletion {
+        let mut event_error = None;
         if emit_deltas {
-            emit_tool_call_completed(events, sink, execution_request, result)?;
+            retain_first_io_error(
+                &mut event_error,
+                emit_tool_call_completed(events, sink, execution_request, result),
+            );
             if execution_request.name == tool_types::ToolName::UpdatePlan
                 && result.status == tool_types::ToolStatus::Completed
             {
                 match orca_tools::update_plan::parse_args(execution_request) {
-                    Ok(update) => sink.emit(&events.plan_updated(&update))?,
-                    Err(error) => {
-                        sink.emit(&events.error(&format!("failed to render plan update: {error}")))?
-                    }
+                    Ok(update) => retain_first_io_error(
+                        &mut event_error,
+                        sink.emit(&events.plan_updated(&update)),
+                    ),
+                    Err(error) => retain_first_io_error(
+                        &mut event_error,
+                        sink.emit(&events.error(&format!("failed to render plan update: {error}"))),
+                    ),
                 }
             }
             if let Some(warning) =
                 self.run_post_tool_hook(hooks, cwd_display, execution_request, result, cancel)
             {
-                sink.emit(&events.error(&warning))?;
+                retain_first_io_error(&mut event_error, sink.emit(&events.error(&warning)));
             }
         }
 
         let status = run_status_from_tool_status(result.status);
 
-        Ok((status, result.clone()))
+        ToolExecutionCompletion {
+            status,
+            result: result.clone(),
+            event_error,
+        }
+    }
+}
+
+fn failed_approval_gate_before_start<W: io::Write>(
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    tool_request: &tool_types::ToolRequest,
+    emit_deltas: bool,
+    event_error: Option<io::Error>,
+    reason: &str,
+) -> ApprovalGateExecution {
+    let result = tool_types::ToolResult::failed_before_start(tool_request, reason, None);
+    finish_approval_gate_terminal(
+        events,
+        sink,
+        tool_request,
+        emit_deltas,
+        event_error,
+        RunStatus::Failed,
+        result,
+    )
+}
+
+fn finish_approval_gate_terminal<W: io::Write>(
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    tool_request: &tool_types::ToolRequest,
+    emit_deltas: bool,
+    mut event_error: Option<io::Error>,
+    status: RunStatus,
+    result: tool_types::ToolResult,
+) -> ApprovalGateExecution {
+    if emit_deltas {
+        retain_first_io_error(
+            &mut event_error,
+            emit_tool_call_requested(events, sink, tool_request),
+        );
+        retain_first_io_error(
+            &mut event_error,
+            emit_tool_call_completed(events, sink, tool_request, &result),
+        );
+    }
+    ApprovalGateExecution {
+        outcome: Some((status, result)),
+        event_error,
+    }
+}
+
+fn retain_first_io_error(slot: &mut Option<io::Error>, result: io::Result<()>) {
+    if let Err(error) = result
+        && slot.is_none()
+    {
+        *slot = Some(error);
     }
 }
 
@@ -730,6 +1021,38 @@ mod tests {
         panic!("read_file tool execution must not execute child agents")
     }
 
+    #[derive(Default)]
+    struct FailSecondFlush {
+        flushes: usize,
+    }
+
+    impl io::Write for FailSecondFlush {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.flushes == 2 {
+                return Err(io::Error::other("approval event consumer disconnected"));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailFirstFlush;
+
+    impl io::Write for FailFirstFlush {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("approval event consumer disconnected"))
+        }
+    }
+
     #[test]
     fn policy_for_tool_execution_preserves_config_permission_rules() {
         let config = config_with_permission_rules(PermissionRules {
@@ -766,19 +1089,18 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
 
         let cancelled = ToolResult::cancelled(&request, "turn interrupted", Some(130));
-        let (status, _) = actor
-            .finish_tool_result(
-                &mut events,
-                &mut sink,
-                &request,
-                &cancelled,
-                &hooks,
-                ".",
-                false,
-                None,
-            )
-            .unwrap();
-        assert_eq!(status, RunStatus::Cancelled);
+        let completion = actor.finish_tool_result(
+            &mut events,
+            &mut sink,
+            &request,
+            &cancelled,
+            &hooks,
+            ".",
+            false,
+            None,
+        );
+        assert_eq!(completion.status, RunStatus::Cancelled);
+        assert!(completion.event_error.is_none());
         assert_eq!(
             tool_call_outcome_for_result(&cancelled),
             crate::extension::ToolCallOutcome::Cancelled {
@@ -787,19 +1109,18 @@ mod tests {
         );
 
         let indeterminate = ToolResult::indeterminate(&request, "missing terminal result");
-        let (status, _) = actor
-            .finish_tool_result(
-                &mut events,
-                &mut sink,
-                &request,
-                &indeterminate,
-                &hooks,
-                ".",
-                false,
-                None,
-            )
-            .unwrap();
-        assert_eq!(status, RunStatus::Failed);
+        let completion = actor.finish_tool_result(
+            &mut events,
+            &mut sink,
+            &request,
+            &indeterminate,
+            &hooks,
+            ".",
+            false,
+            None,
+        );
+        assert_eq!(completion.status, RunStatus::Failed);
+        assert!(completion.event_error.is_none());
         assert_eq!(
             tool_call_outcome_for_result(&indeterminate),
             crate::extension::ToolCallOutcome::Indeterminate {
@@ -832,22 +1153,21 @@ mod tests {
         let mut events = EventFactory::new("cancelled-pre-tool-hook".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
 
-        let result = actor
-            .apply_pre_tool_hook(
-                &config,
-                &mut events,
-                &mut sink,
-                &request,
-                invocation,
-                &hooks,
-                ".",
-                &mcp_registry,
-                false,
-                Some(&cancel),
-            )
-            .unwrap();
+        let execution = actor.apply_pre_tool_hook(
+            &config,
+            &mut events,
+            &mut sink,
+            &request,
+            invocation,
+            &hooks,
+            ".",
+            &mcp_registry,
+            false,
+            Some(&cancel),
+        );
+        assert!(execution.event_error.is_none());
 
-        let Err((status, result)) = result else {
+        let Err((status, result)) = execution.outcome else {
             panic!("cancelled pre-tool hook must stop before tool execution");
         };
         assert_eq!(status, RunStatus::Cancelled);
@@ -884,21 +1204,143 @@ mod tests {
         overlay.set_preapproved_tool_call_id(Some("shell-1".to_string()));
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
 
-        let result = actor
-            .handle_approval(ToolApprovalGateContext {
-                config: &config,
-                events: &mut events,
-                sink: &mut sink,
-                tool_request: &request,
-                invocation: &invocation,
-                policy: &policy,
-                permission_overlay: &mut overlay,
-                emit_deltas: true,
-            })
-            .expect("approval gate");
+        let execution = actor.handle_approval(ToolApprovalGateContext {
+            config: &config,
+            events: &mut events,
+            sink: &mut sink,
+            tool_request: &request,
+            invocation: &invocation,
+            policy: &policy,
+            permission_overlay: &mut overlay,
+            emit_deltas: true,
+        });
 
-        assert!(result.is_none());
+        assert!(execution.outcome.is_none());
+        assert!(execution.event_error.is_none());
         assert!(!overlay.consume_preapproved_tool_call_id("shell-1"));
+    }
+
+    #[test]
+    fn denied_approval_preserves_terminal_after_resolved_event_io_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_permission_rules(PermissionRules {
+            rules: vec![PermissionRule::new("bash", "rm *", Decision::Deny)],
+        });
+        config.approval_mode = ApprovalMode::FullAuto;
+        let request = ToolRequest {
+            id: "denied-shell".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("rm scratch.txt".to_string()),
+            raw_arguments: Some(r#"{"command":"rm scratch.txt"}"#.to_string()),
+        };
+        let policy = policy_for_tool_execution(&config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new("denied-approval-event-error".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+        let mut events = EventFactory::new("denied-approval-event-error".to_string());
+        let mut sink = EventSink::new(FailSecondFlush::default(), OutputFormat::Text);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+
+        let completion = actor
+            .execute_with_event_error(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                ToolExecutionContext::new(cwd.path(), 0, true, &policy)
+                    .with_services(&instructions, &memory, &registry, &hooks)
+                    .with_runtime(
+                        &mut cost_tracker,
+                        &cancel,
+                        &task_registry,
+                        &mut background_workflows,
+                        None,
+                    )
+                    .with_permission_overlay(&mut permission_overlay),
+                unused_child_executor,
+                unused_child_executor,
+            )
+            .expect("known approval denial must survive event I/O failure");
+
+        assert_eq!(completion.status, RunStatus::ApprovalRequired);
+        assert_eq!(completion.result.status, ToolStatus::Denied);
+        assert_eq!(
+            completion.result.terminal().started,
+            orca_core::tool_types::ToolInvocationStarted::No
+        );
+        assert!(
+            completion
+                .event_error
+                .as_ref()
+                .is_some_and(|error| error.to_string().contains("consumer disconnected"))
+        );
+    }
+
+    #[test]
+    fn approval_event_io_error_stops_dispatch_with_failed_before_start_terminal() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let marker = cwd.path().join("must-not-exist");
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let request = ToolRequest {
+            id: "allowed-shell".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some(format!("touch {}", marker.display())),
+            raw_arguments: Some(
+                serde_json::json!({ "command": format!("touch {}", marker.display()) }).to_string(),
+            ),
+        };
+        let policy = policy_for_tool_execution(&config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new("allowed-approval-event-error".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+        let mut events = EventFactory::new("allowed-approval-event-error".to_string());
+        let mut sink = EventSink::new(FailFirstFlush, OutputFormat::Text);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+
+        let completion = actor
+            .execute_with_event_error(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                ToolExecutionContext::new(cwd.path(), 0, true, &policy)
+                    .with_services(&instructions, &memory, &registry, &hooks)
+                    .with_runtime(
+                        &mut cost_tracker,
+                        &cancel,
+                        &task_registry,
+                        &mut background_workflows,
+                        None,
+                    )
+                    .with_permission_overlay(&mut permission_overlay),
+                unused_child_executor,
+                unused_child_executor,
+            )
+            .expect("pre-dispatch event I/O failure must produce a tool terminal");
+
+        assert_eq!(completion.status, RunStatus::Failed);
+        assert_eq!(completion.result.status, ToolStatus::Failed);
+        assert_eq!(
+            completion.result.terminal().started,
+            orca_core::tool_types::ToolInvocationStarted::No
+        );
+        assert!(completion.event_error.is_some());
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -1069,5 +1511,72 @@ mod tests {
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.output.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn tool_execution_maps_interaction_io_error_to_indeterminate_terminal() {
+        struct ErrorHandler;
+
+        impl RuntimeUserInputHandler for ErrorHandler {
+            fn request_user_input(
+                &self,
+                _request: &RuntimeUserInputRequest,
+            ) -> io::Result<Option<String>> {
+                Err(io::Error::other("interaction channel closed"))
+            }
+        }
+
+        let config = config_with_permission_rules(PermissionRules::default());
+        let mut actor = ToolExecutionActor::new("tool-user-input-error", 128);
+        let mut events = EventFactory::new("tool-user-input-error".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let cwd = std::env::current_dir().expect("cwd");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new_for_cwd("tool-user-input-error".to_string(), &cwd);
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+        let request = ToolRequest {
+            id: "ask-error".to_string(),
+            name: ToolName::RequestUserInput,
+            action: ActionKind::Read,
+            target: Some("Continue?".to_string()),
+            raw_arguments: Some(r#"{"question":"Continue?"}"#.to_string()),
+        };
+
+        let (status, result) = actor
+            .execute(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                ToolExecutionContext::new(&cwd, 0, true, &policy_for_tool_execution(&config))
+                    .with_services(&instructions, &memory, &mcp_registry, &hooks)
+                    .with_runtime(
+                        &mut cost_tracker,
+                        &cancel,
+                        &task_registry,
+                        &mut background_workflows,
+                        None,
+                    )
+                    .with_permission_overlay(&mut permission_overlay)
+                    .with_user_input_handler(Some(&ErrorHandler)),
+                unused_child_executor,
+                unused_child_executor,
+            )
+            .expect("interaction I/O error must still produce a tool terminal");
+
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Indeterminate);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("interaction channel closed"))
+        );
     }
 }

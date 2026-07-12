@@ -808,6 +808,31 @@ impl ToolResult {
     }
 
     pub fn failed(request: &ToolRequest, error: impl Into<String>, exit_code: Option<i32>) -> Self {
+        Self::failed_with_started(request, error, exit_code, ToolInvocationStarted::Unknown)
+    }
+
+    pub fn failed_after_start(
+        request: &ToolRequest,
+        error: impl Into<String>,
+        exit_code: Option<i32>,
+    ) -> Self {
+        Self::failed_with_started(request, error, exit_code, ToolInvocationStarted::Yes)
+    }
+
+    pub fn failed_before_start(
+        request: &ToolRequest,
+        error: impl Into<String>,
+        exit_code: Option<i32>,
+    ) -> Self {
+        Self::failed_with_started(request, error, exit_code, ToolInvocationStarted::No)
+    }
+
+    fn failed_with_started(
+        request: &ToolRequest,
+        error: impl Into<String>,
+        exit_code: Option<i32>,
+        started: ToolInvocationStarted,
+    ) -> Self {
         Self {
             id: request.id.clone(),
             name: request.name.clone(),
@@ -819,7 +844,7 @@ impl ToolResult {
                 false,
                 ToolResultKind::RuntimeError,
                 ToolTerminalSource::Observed,
-                ToolInvocationStarted::Unknown,
+                started,
             ),
             file_change_preview: None,
         }
@@ -905,6 +930,18 @@ impl ToolResult {
     }
 
     pub fn indeterminate(request: &ToolRequest, reason: impl Into<String>) -> Self {
+        Self::indeterminate_with_started(request, reason, ToolInvocationStarted::Unknown)
+    }
+
+    pub fn indeterminate_after_start(request: &ToolRequest, reason: impl Into<String>) -> Self {
+        Self::indeterminate_with_started(request, reason, ToolInvocationStarted::Yes)
+    }
+
+    fn indeterminate_with_started(
+        request: &ToolRequest,
+        reason: impl Into<String>,
+        started: ToolInvocationStarted,
+    ) -> Self {
         Self {
             id: request.id.clone(),
             name: request.name.clone(),
@@ -916,7 +953,7 @@ impl ToolResult {
                 false,
                 ToolResultKind::Indeterminate,
                 ToolTerminalSource::Observed,
-                ToolInvocationStarted::Unknown,
+                started,
             ),
             file_change_preview: None,
         }
@@ -1182,6 +1219,13 @@ mod tests {
         );
         assert_eq!(ToolStatus::Cancelled.as_str(), "cancelled");
         assert_eq!(ToolStatus::Indeterminate.as_str(), "indeterminate");
+
+        let failed_after_start = ToolResult::failed_after_start(&request, "cleanup failed", None);
+        assert_eq!(failed_after_start.status, ToolStatus::Failed);
+        assert_eq!(
+            failed_after_start.terminal().started,
+            ToolInvocationStarted::Yes
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::tool_types::ToolRequest;
+use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::agent_child::ChildAgentExecutor;
@@ -15,7 +15,9 @@ use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{RuntimePermissionRequestHandler, RuntimeUserInputHandler};
+use crate::lifecycle::{
+    RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeUserInputHandler,
+};
 use crate::memory::MemoryBlock;
 #[cfg(test)]
 use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
@@ -24,6 +26,7 @@ use crate::runtime_readonly_tool_turn::{
     RuntimeReadonlyToolTurnServices, run_readonly_tool_turn,
 };
 use crate::runtime_tool_scheduler::{RuntimeToolDispatch, RuntimeToolDispatchScheduler};
+use crate::session::record_tool_result_for_agent;
 use crate::step_context::{
     RuntimeSamplingRequestState, RuntimeStepContext, RuntimeToolResultRecordOutcome,
 };
@@ -80,6 +83,11 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
     pub(crate) interactions: RuntimeNormalToolTurnInteractions<'a>,
     pub(crate) extensions: Option<RuntimeExtensionContext<'a>>,
     pub(crate) executors: RuntimeNormalToolTurnExecutors<W>,
+}
+
+pub(crate) struct RuntimeNormalToolTurnExecution {
+    outcome: ToolTurnOutcome,
+    event_error: Option<io::Error>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
@@ -205,20 +213,58 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let user_input_handler = capabilities.user_input_handler;
     let mcp_elicitation_handler = capabilities.mcp_elicitation_handler;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
+        if cancel.is_cancelled() {
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                "the tool turn was cancelled before dispatch",
+            )?;
+            return Ok(ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                error: Some("tool turn cancelled".to_string()),
+            });
+        }
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,
             tool_policy,
             mcp_registry,
             &config.external_tools,
         ) {
-            if emit_deltas {
-                sink.emit(&events.tool_call_requested(tool_request))?;
-                sink.emit(&events.tool_call_completed(&result))?;
-            }
-            return Ok(ToolTurnOutcome::Return {
+            record_tool_result_for_agent(
+                conversation,
+                history_writer.as_deref_mut(),
+                &result,
+                emit_deltas,
+            )?;
+            sampling_state.advance_tool_cursor_one(tool_requests.len());
+            let event_error = if emit_deltas {
+                emit_tool_terminal_events(events, sink, tool_request, &result).err()
+            } else {
+                None
+            };
+            let outcome = ToolTurnOutcome::Return {
                 status: RunStatus::Failed,
                 error: Some(result.error.clone().unwrap_or_default()),
-            });
+            };
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                "an earlier sibling was rejected by tool policy",
+            )?;
+            if let Some(error) = event_error {
+                return Err(error);
+            }
+            return Ok(outcome);
         }
 
         let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
@@ -228,7 +274,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         };
 
         if let RuntimeToolDispatch::SubagentBatch(dispatch_window) = dispatch {
-            match run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext {
+            let outcome = run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext {
                 request: RuntimeSubagentBatchToolTurnRequest {
                     config,
                     cwd,
@@ -254,22 +300,47 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     workflow_ipc,
                 },
                 child_executor: batch_child_executor,
-            })? {
-                ToolTurnOutcome::Continue => {}
-                ToolTurnOutcome::Return { status, error } => {
-                    return Ok(ToolTurnOutcome::Return { status, error });
-                }
-            }
+            });
             sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    close_unstarted_tool_requests(
+                        sampling_state,
+                        tool_requests,
+                        events,
+                        sink,
+                        conversation,
+                        history_writer.as_deref_mut(),
+                        emit_deltas,
+                        "an earlier subagent batch ended after an event I/O error",
+                    )?;
+                    return Err(error);
+                }
+            };
+            if matches!(outcome, ToolTurnOutcome::Return { .. }) {
+                close_unstarted_tool_requests(
+                    sampling_state,
+                    tool_requests,
+                    events,
+                    sink,
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    emit_deltas,
+                    "an earlier sibling ended the tool turn",
+                )?;
+                return Ok(outcome);
+            }
             continue;
         }
 
         if let RuntimeToolDispatch::ReadonlyBatch(dispatch_window) = dispatch {
-            match run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
+            let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 request: RuntimeReadonlyToolTurnRequest {
                     cwd,
                     tool_requests: dispatch_window.tool_requests(),
                     emit_deltas,
+                    cancel,
                     output_truncation: config.tools.output_truncation,
                 },
                 io: RuntimeReadonlyToolTurnIo {
@@ -282,13 +353,37 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     mcp_registry,
                     hooks,
                 },
-            })? {
-                ToolTurnOutcome::Continue => {}
-                ToolTurnOutcome::Return { status, error } => {
-                    return Ok(ToolTurnOutcome::Return { status, error });
-                }
-            }
+            });
             sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    close_unstarted_tool_requests(
+                        sampling_state,
+                        tool_requests,
+                        events,
+                        sink,
+                        conversation,
+                        history_writer.as_deref_mut(),
+                        emit_deltas,
+                        "an earlier read-only batch completed before an event I/O error",
+                    )?;
+                    return Err(error);
+                }
+            };
+            if matches!(outcome, ToolTurnOutcome::Return { .. }) {
+                close_unstarted_tool_requests(
+                    sampling_state,
+                    tool_requests,
+                    events,
+                    sink,
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    emit_deltas,
+                    "an earlier sibling ended the tool turn",
+                )?;
+                return Ok(outcome);
+            }
             continue;
         }
 
@@ -296,7 +391,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             unreachable!("batch dispatches are handled before normal tool dispatch");
         };
 
-        match run_normal_tool_turn(RuntimeNormalToolTurnContext {
+        let execution = run_normal_tool_turn(RuntimeNormalToolTurnContext {
             sampling_state,
             request: RuntimeNormalToolTurnRequest {
                 config,
@@ -335,21 +430,176 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 child_executor,
                 workflow_child_executor,
             },
-        })? {
-            ToolTurnOutcome::Continue => {}
-            ToolTurnOutcome::Return { status, error } => {
-                return Ok(ToolTurnOutcome::Return { status, error });
+        });
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                if conversation_has_tool_result(conversation, &tool_request.id) {
+                    sampling_state.advance_tool_cursor_one(tool_requests.len());
+                    close_unstarted_tool_requests(
+                        sampling_state,
+                        tool_requests,
+                        events,
+                        sink,
+                        conversation,
+                        history_writer.as_deref_mut(),
+                        emit_deltas,
+                        "an earlier tool result was recorded before persistence failed",
+                    )?;
+                    return Err(error);
+                }
+                let end_index = sampling_state
+                    .tool_cursor_position()
+                    .saturating_add(1)
+                    .min(tool_requests.len());
+                record_indeterminate_tool_requests_until(
+                    sampling_state,
+                    tool_requests,
+                    end_index,
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    emit_deltas,
+                    &format!(
+                        "Tool invocation outcome is indeterminate after runtime I/O error: {error}. Inspect external state before retrying."
+                    ),
+                )?;
+                close_unstarted_tool_requests(
+                    sampling_state,
+                    tool_requests,
+                    events,
+                    sink,
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    emit_deltas,
+                    "an earlier tool invocation ended after a runtime I/O error",
+                )?;
+                return Err(error);
             }
-        }
+        };
         sampling_state.advance_tool_cursor_one(tool_requests.len());
+        if let Some(error) = execution.event_error {
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                "an earlier tool invocation completed before an event I/O error",
+            )?;
+            return Err(error);
+        }
+        let outcome = execution.outcome;
+        if matches!(outcome, ToolTurnOutcome::Return { .. }) {
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                "an earlier sibling ended the tool turn",
+            )?;
+            return Ok(outcome);
+        }
     }
 
     Ok(ToolTurnOutcome::Continue)
 }
 
+fn close_unstarted_tool_requests<W: io::Write>(
+    sampling_state: &mut RuntimeSamplingRequestState,
+    tool_requests: &[ToolRequest],
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    conversation: &mut Conversation,
+    mut history_writer: Option<&mut SessionWriter>,
+    emit_deltas: bool,
+    reason: &str,
+) -> io::Result<()> {
+    let mut first_error = None;
+    while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
+        let result = ToolResult::cancelled_before_start(tool_request, reason);
+        if let Err(error) = record_tool_result_for_agent(
+            conversation,
+            history_writer.as_deref_mut(),
+            &result,
+            emit_deltas,
+        ) && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        sampling_state.advance_tool_cursor_one(tool_requests.len());
+        if emit_deltas
+            && let Err(error) = emit_tool_terminal_events(events, sink, tool_request, &result)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn conversation_has_tool_result(conversation: &Conversation, tool_call_id: &str) -> bool {
+    conversation.messages.iter().rev().any(|message| {
+        matches!(
+            message,
+            orca_core::conversation::Message::Tool {
+                tool_call_id: recorded_id,
+                ..
+            } if recorded_id == tool_call_id
+        )
+    })
+}
+
+fn record_indeterminate_tool_requests_until(
+    sampling_state: &mut RuntimeSamplingRequestState,
+    tool_requests: &[ToolRequest],
+    end_index: usize,
+    conversation: &mut Conversation,
+    mut history_writer: Option<&mut SessionWriter>,
+    emit_deltas: bool,
+    reason: &str,
+) -> io::Result<()> {
+    while sampling_state.tool_cursor_position() < end_index {
+        let Some(tool_request) = sampling_state.current_tool_request(tool_requests) else {
+            break;
+        };
+        let result = ToolResult::indeterminate(tool_request, reason);
+        record_tool_result_for_agent(
+            conversation,
+            history_writer.as_deref_mut(),
+            &result,
+            emit_deltas,
+        )?;
+        sampling_state.advance_tool_cursor_one(tool_requests.len());
+    }
+    Ok(())
+}
+
+fn emit_tool_terminal_events<W: io::Write>(
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    request: &ToolRequest,
+    result: &ToolResult,
+) -> io::Result<()> {
+    let requested = sink.emit(&RuntimeTaskActor::tool_call_requested_event_for(
+        events, request,
+    ));
+    let completed = sink.emit(&RuntimeTaskActor::tool_call_completed_event_for(
+        events, request, result,
+    ));
+    requested.and(completed)
+}
+
 pub(crate) fn run_normal_tool_turn<W: io::Write>(
     context: RuntimeNormalToolTurnContext<'_, W>,
-) -> io::Result<ToolTurnOutcome> {
+) -> io::Result<RuntimeNormalToolTurnExecution> {
     let RuntimeNormalToolTurnContext {
         sampling_state,
         request,
@@ -397,9 +647,26 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         mcp_elicitation_handler,
     } = interactions;
     if let Some(error) = subagent_budget_exhaustion_error(config, tool_request, cost_tracker) {
-        return Ok(ToolTurnOutcome::Return {
-            status: RunStatus::BudgetExhausted,
-            error: Some(error),
+        let result = ToolResult::failed_before_start(tool_request, error.clone(), None);
+        let event_error = if emit_deltas {
+            emit_tool_terminal_events(events, sink, tool_request, &result).err()
+        } else {
+            None
+        };
+        sampling_state.record_normal_tool_result(
+            conversation,
+            history_writer.as_deref_mut(),
+            tool_request,
+            &result,
+            RunStatus::BudgetExhausted,
+            emit_deltas,
+        )?;
+        return Ok(RuntimeNormalToolTurnExecution {
+            outcome: ToolTurnOutcome::Return {
+                status: RunStatus::BudgetExhausted,
+                error: Some(error),
+            },
+            event_error,
         });
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
@@ -419,7 +686,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         execution_context =
             execution_context.with_extensions(extensions.registry(), extensions.stores());
     }
-    let (status, result) = execute_tool_with_approval(
+    let execution = execute_tool_with_approval(
         config,
         events,
         sink,
@@ -429,43 +696,61 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         workflow_child_executor,
     )?;
 
-    if let Some(error) = subagent_budget_exhaustion_error(config, tool_request, cost_tracker) {
-        let totals = cost_tracker.totals();
-        if emit_deltas {
-            sink.emit(&events.usage_updated(totals))?;
-            if let Some(writer) = history_writer.as_deref_mut() {
-                writer.append_usage(totals)?;
-            }
-        }
+    let budget_exhaustion = subagent_budget_exhaustion_error(config, tool_request, cost_tracker);
+    let mut event_error = execution.event_error;
+    if budget_exhaustion.is_some() {
         sampling_state.record_normal_tool_result(
             conversation,
             history_writer.as_deref_mut(),
             tool_request,
-            &result,
-            status,
+            &execution.result,
+            execution.status,
             emit_deltas,
         )?;
-        return Ok(ToolTurnOutcome::Return {
-            status: RunStatus::BudgetExhausted,
-            error: Some(error),
-        });
+        let totals = cost_tracker.totals();
+        if emit_deltas {
+            if let Err(error) = sink.emit(&events.usage_updated(totals))
+                && event_error.is_none()
+            {
+                event_error = Some(error);
+            }
+            if let Some(writer) = history_writer.as_deref_mut()
+                && let Err(error) = writer.append_usage(totals)
+                && event_error.is_none()
+            {
+                event_error = Some(error);
+            }
+        }
     }
 
-    sampling_state
-        .record_normal_tool_result(
-            conversation,
-            history_writer.as_deref_mut(),
-            tool_request,
-            &result,
-            status,
-            emit_deltas,
-        )
-        .map(ToolTurnOutcome::from_record_outcome)
+    let outcome = if let Some(error) = budget_exhaustion {
+        ToolTurnOutcome::Return {
+            status: RunStatus::BudgetExhausted,
+            error: Some(error),
+        }
+    } else {
+        sampling_state
+            .record_normal_tool_result(
+                conversation,
+                history_writer.as_deref_mut(),
+                tool_request,
+                &execution.result,
+                execution.status,
+                emit_deltas,
+            )
+            .map(ToolTurnOutcome::from_record_outcome)?
+    };
+    Ok(RuntimeNormalToolTurnExecution {
+        outcome,
+        event_error,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io;
+    use std::time::{Duration, Instant};
 
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::{ActionKind, ApprovalMode};
@@ -477,10 +762,13 @@ mod tests {
     use orca_core::event_schema::{EventFactory, RunStatus};
     use orca_core::event_sink::EventSink;
     use orca_core::external_config::ExternalToolConfig;
+    use orca_core::hook_types::{HookConfig, HookEvent};
     use orca_core::model::ModelSelection;
     use orca_core::provider_types::Usage;
     use orca_core::subagent_config::SubagentConfig;
-    use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+    use orca_core::tool_types::{
+        ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolStatus,
+    };
     use serde_json::json;
 
     use super::*;
@@ -572,6 +860,58 @@ mod tests {
             final_message: Some("first child completed".to_string()),
             error: None,
         })
+    }
+
+    fn delayed_batch_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("child finished".to_string()),
+            error: None,
+        })
+    }
+
+    #[derive(Default)]
+    struct FailThirdFlush {
+        flushes: usize,
+    }
+
+    impl io::Write for FailThirdFlush {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.flushes == 3 {
+                return Err(io::Error::other("event consumer disconnected"));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailSecondFlush {
+        flushes: usize,
+    }
+
+    impl io::Write for FailSecondFlush {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.flushes == 2 {
+                return Err(io::Error::other("tool event consumer disconnected"));
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -741,6 +1081,89 @@ mod tests {
     }
 
     #[test]
+    fn sampling_request_state_records_cancelled_normal_tool_result_as_terminal() {
+        let mut conversation = Conversation::new();
+        let sampling_state = RuntimeSamplingRequestState::new();
+        let request = request(
+            ToolName::RequestUserInput,
+            ActionKind::Read,
+            Some("Continue?"),
+            Some(r#"{"question":"Continue?"}"#),
+        );
+        let result = ToolResult::cancelled(&request, "user input cancelled", None);
+
+        let outcome = sampling_state
+            .record_normal_tool_result(
+                &mut conversation,
+                None,
+                &request,
+                &result,
+                RunStatus::Cancelled,
+                false,
+            )
+            .expect("record cancelled result");
+
+        match outcome {
+            RuntimeToolResultRecordOutcome::Return { status, error } => {
+                assert_eq!(status, RunStatus::Cancelled);
+                assert_eq!(error.as_deref(), Some("user input cancelled"));
+            }
+            RuntimeToolResultRecordOutcome::Continue => {
+                panic!("cancelled result must end the tool turn")
+            }
+        }
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } if tool_call_id == "tool-1"
+                && terminal.status == ToolStatus::Cancelled
+                && terminal.started == ToolInvocationStarted::Yes
+        ));
+    }
+
+    #[test]
+    fn sampling_request_state_returns_for_indeterminate_normal_tool_result() {
+        let mut conversation = Conversation::new();
+        let sampling_state = RuntimeSamplingRequestState::new();
+        let request = request(
+            ToolName::RequestUserInput,
+            ActionKind::Read,
+            Some("Continue?"),
+            Some(r#"{"question":"Continue?"}"#),
+        );
+        let result = ToolResult::indeterminate(&request, "interaction channel closed");
+
+        let outcome = sampling_state
+            .record_normal_tool_result(
+                &mut conversation,
+                None,
+                &request,
+                &result,
+                RunStatus::Failed,
+                false,
+            )
+            .expect("record indeterminate result");
+
+        assert!(matches!(
+            outcome,
+            RuntimeToolResultRecordOutcome::Return {
+                status: RunStatus::Failed,
+                error: Some(ref error),
+            } if error == "interaction channel closed"
+        ));
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Indeterminate
+        ));
+    }
+
+    #[test]
     fn record_readonly_batch_results_records_each_tool_message_in_order() {
         let mut conversation = Conversation::new();
         let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
@@ -765,6 +1188,50 @@ mod tests {
         );
         assert!(
             matches!(&conversation.messages[1], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-2")
+        );
+    }
+
+    #[test]
+    fn record_readonly_batch_results_keeps_live_terminals_after_history_failure() {
+        let history = tempfile::tempdir().expect("history tempdir");
+        let history_path = history.path().join("session.jsonl");
+        std::fs::write(&history_path, "").expect("create history file");
+        let mut writer =
+            SessionWriter::append_to_existing(history_path.clone()).expect("open existing history");
+        std::fs::remove_file(&history_path).expect("remove history file");
+        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        let mut conversation = Conversation::new();
+        let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
+        let second = ToolRequest {
+            id: "tool-2".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("two.txt".to_string()),
+            raw_arguments: None,
+        };
+
+        let error = record_readonly_batch_results(
+            &mut conversation,
+            Some(&mut writer),
+            vec![
+                ToolResult::completed(&first, "one".to_string(), false),
+                ToolResult::completed(&second, "two".to_string(), false),
+            ],
+            true,
+        )
+        .expect_err("history append must fail");
+
+        assert!(error.raw_os_error().is_some());
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| match message {
+                    Message::Tool { tool_call_id, .. } => tool_call_id.as_str(),
+                    _ => panic!("expected tool result"),
+                })
+                .collect::<Vec<_>>(),
+            ["tool-1", "tool-2"]
         );
     }
 
@@ -837,7 +1304,8 @@ mod tests {
         })
         .expect("run normal tool turn");
 
-        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        assert!(matches!(outcome.outcome, ToolTurnOutcome::Continue));
+        assert!(outcome.event_error.is_none());
         assert_eq!(conversation.messages.len(), 1);
         assert!(
             matches!(&conversation.messages[0], Message::Tool { tool_call_id, content, .. }
@@ -875,6 +1343,7 @@ mod tests {
                 cwd: cwd.path(),
                 tool_requests: &requests,
                 emit_deltas: false,
+                cancel: &CancelToken::new(),
                 output_truncation: ToolConfig::default().output_truncation,
             },
             io: RuntimeReadonlyToolTurnIo {
@@ -913,14 +1382,225 @@ mod tests {
     }
 
     #[test]
-    fn run_tool_turns_returns_failed_for_disallowed_child_tool() {
+    fn run_readonly_tool_turn_returns_cancelled_after_closing_batch() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("one.txt"), "one\n").expect("write file");
+        std::fs::write(cwd.path().join("two.txt"), "two\n").expect("write file");
+        let requests = ["one.txt", "two.txt"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| ToolRequest {
+                id: format!("tool-{}", index + 1),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some(path.to_string()),
+                raw_arguments: Some(json!({ "path": path }).to_string()),
+            })
+            .collect::<Vec<_>>();
+        let mut events = EventFactory::new("readonly-tool-turn-cancelled".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
+            request: RuntimeReadonlyToolTurnRequest {
+                cwd: cwd.path(),
+                tool_requests: &requests,
+                emit_deltas: false,
+                cancel: &cancel,
+                output_truncation: ToolConfig::default().output_truncation,
+            },
+            io: RuntimeReadonlyToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+            },
+            services: RuntimeReadonlyToolTurnServices {
+                mcp_registry: &registry,
+                hooks: &hooks,
+            },
+        })
+        .expect("run cancelled readonly tool turn");
+
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(conversation.messages.len(), 2);
+        for message in &conversation.messages {
+            assert!(matches!(
+                message,
+                Message::Tool {
+                    terminal: Some(terminal),
+                    ..
+                } if terminal.status == ToolStatus::Cancelled
+                    && terminal.started == ToolInvocationStarted::No
+            ));
+        }
+    }
+
+    #[test]
+    fn run_readonly_tool_turn_records_pre_hook_failures_without_panicking() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let requests = ["one.txt", "two.txt"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| ToolRequest {
+                id: format!("tool-{}", index + 1),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some(path.to_string()),
+                raw_arguments: Some(json!({ "path": path }).to_string()),
+            })
+            .collect::<Vec<_>>();
+        let mut events = EventFactory::new("readonly-tool-turn-hook-failure".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: "printf blocked >&2; exit 7".to_string(),
+            tool: Some("read_file".to_string()),
+        }]);
+        let cancel = CancelToken::new();
+
+        let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
+            request: RuntimeReadonlyToolTurnRequest {
+                cwd: cwd.path(),
+                tool_requests: &requests,
+                emit_deltas: false,
+                cancel: &cancel,
+                output_truncation: ToolConfig::default().output_truncation,
+            },
+            io: RuntimeReadonlyToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+            },
+            services: RuntimeReadonlyToolTurnServices {
+                mcp_registry: &registry,
+                hooks: &hooks,
+            },
+        })
+        .expect("run readonly hook failures");
+
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        assert_eq!(conversation.messages.len(), 2);
+        for message in &conversation.messages {
+            assert!(matches!(
+                message,
+                Message::Tool {
+                    terminal: Some(terminal),
+                    ..
+                } if terminal.status == ToolStatus::Failed
+                    && terminal.started == ToolInvocationStarted::No
+            ));
+        }
+    }
+
+    #[test]
+    fn run_readonly_tool_turn_cancels_blocked_pre_hook_before_tool_start() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let requests = vec![request(
+            ToolName::ReadFile,
+            ActionKind::Read,
+            Some("one.txt"),
+            Some(json!({ "path": "one.txt" }).to_string().as_str()),
+        )];
+        let mut events = EventFactory::new("readonly-tool-turn-hook-cancelled".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: "sleep 5".to_string(),
+            tool: Some("read_file".to_string()),
+        }]);
+        let cancel = CancelToken::new();
+        let cancel_from_thread = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel_from_thread.cancel();
+        });
+        let started = Instant::now();
+
+        let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
+            request: RuntimeReadonlyToolTurnRequest {
+                cwd: cwd.path(),
+                tool_requests: &requests,
+                emit_deltas: false,
+                cancel: &cancel,
+                output_truncation: ToolConfig::default().output_truncation,
+            },
+            io: RuntimeReadonlyToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+            },
+            services: RuntimeReadonlyToolTurnServices {
+                mcp_registry: &registry,
+                hooks: &hooks,
+            },
+        })
+        .expect("cancel blocked readonly pre-hook");
+        canceller.join().expect("join canceller");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled pre-hook took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Cancelled
+                && terminal.started == ToolInvocationStarted::No
+        ));
+    }
+
+    #[test]
+    fn run_tool_turns_records_policy_failure_and_closes_unstarted_siblings() {
         let cwd = tempfile::tempdir().expect("cwd");
         let config = config_with_external(Vec::new());
         let mut events = EventFactory::new("tool-turns-disallowed".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
         let allowed = vec!["read_file".to_string()];
-        let request = request(ToolName::Subagent, ActionKind::Agent, Some("audit"), None);
+        let requests = vec![
+            request(ToolName::Subagent, ActionKind::Agent, Some("audit"), None),
+            ToolRequest {
+                id: "tool-2".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf should-not-run".to_string()),
+                raw_arguments: Some(r#"{"command":"printf should-not-run"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "tool-3".to_string(),
+                name: ToolName::WriteFile,
+                action: ActionKind::Write,
+                target: Some("never.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"never.txt","content":"never"}"#.to_string()),
+            },
+        ];
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let mcp_registry = McpRegistry::default();
@@ -961,7 +1641,7 @@ mod tests {
                 cost_tracker: &mut cost_tracker,
                 background_workflows: &mut background_workflows,
             },
-            tool_requests: &[request],
+            tool_requests: &requests,
             executors: RuntimeToolTurnsExecutors {
                 child_executor: unused_child_executor::<Vec<u8>>,
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
@@ -980,7 +1660,826 @@ mod tests {
             }
             ToolTurnOutcome::Continue => panic!("disallowed child tool should end the turn"),
         }
-        assert!(conversation.messages.is_empty());
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert_eq!(conversation.messages.len(), 3);
+        for (index, expected_id) in ["tool-1", "tool-2", "tool-3"].iter().enumerate() {
+            let Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } = &conversation.messages[index]
+            else {
+                panic!("expected terminal-aware tool message at {index}")
+            };
+            assert_eq!(tool_call_id, expected_id);
+            assert_eq!(terminal.started, ToolInvocationStarted::No);
+            assert_eq!(
+                terminal.status,
+                if index == 0 {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Cancelled
+                }
+            );
+        }
+
+        let emitted = String::from_utf8(sink.writer_mut().clone()).expect("jsonl events");
+        let events = emitted
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for id in ["tool-1", "tool-2", "tool-3"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event["type"] == "tool.call.requested" && event["payload"]["id"] == id
+                    })
+                    .count(),
+                1,
+                "missing or duplicate requested event for {id}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event["type"] == "tool.call.completed" && event["payload"]["id"] == id
+                    })
+                    .count(),
+                1,
+                "missing or duplicate completed event for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_tool_turns_closes_requests_after_subagent_batch_event_io_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.output_format = OutputFormat::Text;
+        config.subagents.max_parallel = 2;
+        let mut events = EventFactory::new("tool-turn-batch-event-error".to_string());
+        let mut sink = EventSink::new(FailThirdFlush::default(), OutputFormat::Text);
+        let mut conversation = Conversation::new();
+        let requests = ["one", "two", "three"]
+            .into_iter()
+            .map(|id| ToolRequest {
+                id: id.to_string(),
+                name: ToolName::Subagent,
+                action: ActionKind::Agent,
+                target: Some(format!("inspect {id}")),
+                raw_arguments: Some(
+                    json!({
+                        "description": format!("inspect {id}"),
+                        "prompt": format!("inspect {id}")
+                    })
+                    .to_string(),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-batch-event-error".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = match run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<FailThirdFlush>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: delayed_batch_child_executor::<io::Sink>,
+            },
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("event I/O error must remain visible to the caller"),
+        };
+
+        assert!(error.to_string().contains("event consumer disconnected"));
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert_eq!(conversation.messages.len(), 3);
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Completed
+        ));
+        assert!(matches!(
+            &conversation.messages[1],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Failed
+                && terminal.started == ToolInvocationStarted::No
+        ));
+        assert!(matches!(
+            &conversation.messages[2],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Cancelled
+                && terminal.started == ToolInvocationStarted::No
+        ));
+    }
+
+    #[test]
+    fn run_tool_turns_preserves_known_current_result_after_event_io_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("one.txt"), "one\n").expect("write fixture");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.output_format = OutputFormat::Text;
+        config.tools.max_read_parallel = 1;
+        let mut events = EventFactory::new("tool-turn-normal-event-error".to_string());
+        let mut sink = EventSink::new(FailSecondFlush::default(), OutputFormat::Text);
+        let mut conversation = Conversation::new();
+        let requests = vec![
+            ToolRequest {
+                id: "read-one".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("one.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"one.txt"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "never-run".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf never".to_string()),
+                raw_arguments: Some(r#"{"command":"printf never"}"#.to_string()),
+            },
+        ];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-normal-event-error".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = match run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<FailSecondFlush>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("event I/O error must remain visible to the caller"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("tool event consumer disconnected")
+        );
+        assert_eq!(sampling_state.tool_cursor_position(), 2);
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Completed
+        ));
+        assert!(matches!(
+            &conversation.messages[1],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Cancelled
+                && terminal.started == ToolInvocationStarted::No
+        ));
+    }
+
+    #[test]
+    fn run_tool_turns_preserves_invalid_input_after_pre_dispatch_event_io_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.output_format = OutputFormat::Text;
+        config.tools.max_read_parallel = 1;
+        let mut events = EventFactory::new("tool-turn-invalid-event-error".to_string());
+        let mut sink = EventSink::new(FailSecondFlush::default(), OutputFormat::Text);
+        let mut conversation = Conversation::new();
+        let requests = vec![
+            ToolRequest {
+                id: "invalid-read".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(r#"{}"#.to_string()),
+            },
+            ToolRequest {
+                id: "never-run".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf never".to_string()),
+                raw_arguments: Some(r#"{"command":"printf never"}"#.to_string()),
+            },
+        ];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-invalid-event-error".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = match run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<FailSecondFlush>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("event I/O error must remain visible to the caller"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("tool event consumer disconnected")
+        );
+        assert_eq!(sampling_state.tool_cursor_position(), 2);
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Failed
+                && terminal.started == ToolInvocationStarted::No
+        ));
+        assert!(matches!(
+            &conversation.messages[1],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Cancelled
+                && terminal.started == ToolInvocationStarted::No
+        ));
+    }
+
+    #[test]
+    fn run_tool_turns_preserves_readonly_batch_results_after_event_io_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("one.txt"), "one\n").expect("write first fixture");
+        std::fs::write(cwd.path().join("two.txt"), "two\n").expect("write second fixture");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.output_format = OutputFormat::Text;
+        config.tools.max_read_parallel = 2;
+        let mut events = EventFactory::new("tool-turn-readonly-event-error".to_string());
+        let mut sink = EventSink::new(FailThirdFlush::default(), OutputFormat::Text);
+        let mut conversation = Conversation::new();
+        let requests = vec![
+            ToolRequest {
+                id: "read-one".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("one.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"one.txt"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "read-two".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("two.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"two.txt"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "never-run".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf never".to_string()),
+                raw_arguments: Some(r#"{"command":"printf never"}"#.to_string()),
+            },
+        ];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-readonly-event-error".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = match run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<FailThirdFlush>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("event I/O error must remain visible to the caller"),
+        };
+
+        assert!(error.to_string().contains("event consumer disconnected"));
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert_eq!(conversation.messages.len(), 3);
+        for message in &conversation.messages[..2] {
+            assert!(matches!(
+                message,
+                Message::Tool {
+                    terminal: Some(terminal),
+                    ..
+                } if terminal.status == ToolStatus::Completed
+            ));
+        }
+        assert!(matches!(
+            &conversation.messages[2],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Cancelled
+                && terminal.started == ToolInvocationStarted::No
+        ));
+    }
+
+    #[test]
+    fn run_tool_turns_closes_readonly_batch_and_sibling_after_history_failure() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("one.txt"), "one\n").expect("write first fixture");
+        std::fs::write(cwd.path().join("two.txt"), "two\n").expect("write second fixture");
+        let history = tempfile::tempdir().expect("history tempdir");
+        let history_path = history.path().join("session.jsonl");
+        std::fs::write(&history_path, "").expect("create history file");
+        let mut history_writer =
+            SessionWriter::append_to_existing(history_path.clone()).expect("open existing history");
+        std::fs::remove_file(&history_path).expect("remove history file");
+        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.tools.max_read_parallel = 2;
+        let requests = vec![
+            ToolRequest {
+                id: "read-one".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("one.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"one.txt"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "read-two".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("two.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"two.txt"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "never-run".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf never".to_string()),
+                raw_arguments: Some(r#"{"command":"printf never"}"#.to_string()),
+            },
+        ];
+        let mut events = EventFactory::new("tool-turn-history-error".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-history-error".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = match run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: Some(&mut history_writer),
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<Vec<u8>>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("history append failure must remain visible"),
+        };
+
+        assert!(error.raw_os_error().is_some());
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| match message {
+                    Message::Tool {
+                        tool_call_id,
+                        terminal: Some(terminal),
+                        ..
+                    } => (tool_call_id.as_str(), terminal.status),
+                    _ => panic!("expected terminal-aware tool result"),
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("read-one", ToolStatus::Completed),
+                ("read-two", ToolStatus::Completed),
+                ("never-run", ToolStatus::Cancelled),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_turn_closes_unstarted_siblings_on_cancel() {
+        struct CancelHandler {
+            calls: Cell<usize>,
+        }
+
+        impl RuntimeUserInputHandler for CancelHandler {
+            fn request_user_input(
+                &self,
+                _request: &crate::lifecycle::RuntimeUserInputRequest,
+            ) -> io::Result<Option<String>> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(None)
+            }
+        }
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut events = EventFactory::new("tool-turn-cancel-siblings".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let requests = ["tool-1", "tool-2", "tool-3"]
+            .into_iter()
+            .map(|id| ToolRequest {
+                id: id.to_string(),
+                name: ToolName::RequestUserInput,
+                action: ActionKind::Read,
+                target: Some("Continue?".to_string()),
+                raw_arguments: Some(r#"{"question":"Continue?"}"#.to_string()),
+            })
+            .collect::<Vec<_>>();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-cancel-siblings".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let handler = CancelHandler {
+            calls: Cell::new(0),
+        };
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::new(None, None),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            Some(&handler),
+            None,
+        );
+
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<Vec<u8>>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        })
+        .expect("run cancelled tool turn");
+
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(
+            handler.calls.get(),
+            1,
+            "unstarted siblings must not execute"
+        );
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert_eq!(conversation.messages.len(), 3);
+        for (index, message) in conversation.messages.iter().enumerate() {
+            let Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } = message
+            else {
+                panic!("expected terminal-aware tool message at {index}")
+            };
+            assert_eq!(tool_call_id, &requests[index].id);
+            assert_eq!(terminal.status, ToolStatus::Cancelled);
+            assert_eq!(
+                terminal.started,
+                if index == 0 {
+                    ToolInvocationStarted::Yes
+                } else {
+                    ToolInvocationStarted::No
+                }
+            );
+        }
+        assert_one_terminal_event_pair_per_call(&mut sink, &requests);
+    }
+
+    #[test]
+    fn tool_turn_closes_all_pending_calls_when_cancelled_before_dispatch() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut events = EventFactory::new("tool-turn-pre-cancel".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let requests = ["tool-1", "tool-2", "tool-3"]
+            .into_iter()
+            .map(|id| ToolRequest {
+                id: id.to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("sleep 5".to_string()),
+                raw_arguments: Some(r#"{"command":"sleep 5"}"#.to_string()),
+            })
+            .collect::<Vec<_>>();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let task_registry = TaskRegistry::new("tool-turn-pre-cancel".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::new(None, None),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: unused_child_executor::<Vec<u8>>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        })
+        .expect("run pre-cancelled tool turn");
+
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(sampling_state.tool_cursor_position(), 3);
+        assert_eq!(conversation.messages.len(), 3);
+        for message in &conversation.messages {
+            assert!(matches!(
+                message,
+                Message::Tool {
+                    terminal: Some(terminal),
+                    ..
+                } if terminal.status == ToolStatus::Cancelled
+                    && terminal.started == ToolInvocationStarted::No
+            ));
+        }
+        assert_one_terminal_event_pair_per_call(&mut sink, &requests);
+        assert!(task_registry.list().is_empty(), "no shell task may start");
+    }
+
+    fn assert_one_terminal_event_pair_per_call(
+        sink: &mut EventSink<Vec<u8>>,
+        requests: &[ToolRequest],
+    ) {
+        let emitted = String::from_utf8(sink.writer_mut().clone()).expect("jsonl events");
+        let events = emitted
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for request in requests {
+            for event_type in ["tool.call.requested", "tool.call.completed"] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event["type"] == event_type && event["payload"]["id"] == request.id
+                        })
+                        .count(),
+                    1,
+                    "expected one {event_type} event for {}",
+                    request.id
+                );
+            }
+        }
     }
 
     #[test]
@@ -1071,15 +2570,35 @@ mod tests {
         }
         assert_eq!(cost_tracker.totals().input_tokens, 10_000_000);
         assert!(cost_tracker.totals().estimated_cost_usd > 1.0);
+        assert_eq!(conversation.messages.len(), 2);
         assert!(matches!(
-            conversation.messages.as_slice(),
-            [Message::Tool { tool_call_id, .. }] if tool_call_id == "child-1"
+            &conversation.messages[0],
+            Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } if tool_call_id == "child-1"
+                && terminal.status == ToolStatus::Completed
+                && terminal.started == ToolInvocationStarted::Yes
+        ));
+        assert!(matches!(
+            &conversation.messages[1],
+            Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } if tool_call_id == "child-2"
+                && terminal.status == ToolStatus::Cancelled
+                && terminal.started == ToolInvocationStarted::No
         ));
         let output = String::from_utf8(sink.writer_mut().clone()).expect("jsonl is utf8");
         assert_eq!(output.matches("\"type\":\"usage.updated\"").count(), 1);
+        assert_one_terminal_event_pair_per_call(&mut sink, &requests);
 
+        let mut admission_state = RuntimeSamplingRequestState::new();
+        let mut admission_conversation = Conversation::new();
         let admission_outcome = run_normal_tool_turn(RuntimeNormalToolTurnContext {
-            sampling_state: &mut sampling_state,
+            sampling_state: &mut admission_state,
             request: RuntimeNormalToolTurnRequest {
                 config: &config,
                 cwd: cwd.path(),
@@ -1091,7 +2610,7 @@ mod tests {
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
                 sink: &mut sink,
-                conversation: &mut conversation,
+                conversation: &mut admission_conversation,
                 history_writer: None,
                 cost_tracker: &mut cost_tracker,
                 background_workflows: &mut background_workflows,
@@ -1121,11 +2640,22 @@ mod tests {
         .expect("reject already exhausted child admission");
 
         assert!(matches!(
-            admission_outcome,
+            admission_outcome.outcome,
             ToolTurnOutcome::Return {
                 status: RunStatus::BudgetExhausted,
                 ..
             }
+        ));
+        assert!(admission_outcome.event_error.is_none());
+        assert!(matches!(
+            admission_conversation.messages.as_slice(),
+            [Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            }] if tool_call_id == "child-2"
+                && terminal.status == ToolStatus::Failed
+                && terminal.started == ToolInvocationStarted::No
         ));
     }
 

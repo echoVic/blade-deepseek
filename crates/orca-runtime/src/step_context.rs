@@ -98,7 +98,6 @@ impl RuntimeSamplingRequestState {
         tool_requests.get(self.tool_cursor_index)
     }
 
-    #[cfg(test)]
     pub(crate) fn tool_cursor_position(&self) -> usize {
         self.tool_cursor_index
     }
@@ -154,7 +153,9 @@ impl RuntimeSamplingRequestState {
         );
         record_tool_result_for_agent(conversation, history_writer, result, emit_deltas)?;
 
-        if status == RunStatus::ApprovalRequired {
+        if matches!(status, RunStatus::ApprovalRequired | RunStatus::Cancelled)
+            || result.status == orca_core::tool_types::ToolStatus::Indeterminate
+        {
             return Ok(RuntimeToolResultRecordOutcome::Return {
                 status,
                 error: result.error.clone(),

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -16,6 +17,26 @@ pub struct HookRunner {
 pub struct HookOutcome {
     pub modified_target: Option<String>,
     pub injected_context: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HookRunError {
+    Cancelled(String),
+    Failed(String),
+}
+
+impl fmt::Display for HookRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled(message) | Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for HookRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -44,7 +65,17 @@ impl HookRunner {
         context: HookContext<'_>,
         cancel: &CancelToken,
     ) -> Result<HookOutcome, String> {
-        self.run_with_timeout_or_cancel(event, context, Duration::from_secs(30), || {
+        self.run_with_cancel_result(event, context, cancel)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn run_with_cancel_result(
+        &self,
+        event: HookEvent,
+        context: HookContext<'_>,
+        cancel: &CancelToken,
+    ) -> Result<HookOutcome, HookRunError> {
+        self.run_with_timeout_or_cancel_result(event, context, Duration::from_secs(30), || {
             cancel.is_cancelled()
         })
     }
@@ -65,6 +96,17 @@ impl HookRunner {
         timeout: Duration,
         should_cancel: impl Fn() -> bool,
     ) -> Result<HookOutcome, String> {
+        self.run_with_timeout_or_cancel_result(event, context, timeout, should_cancel)
+            .map_err(|error| error.to_string())
+    }
+
+    fn run_with_timeout_or_cancel_result(
+        &self,
+        event: HookEvent,
+        context: HookContext<'_>,
+        timeout: Duration,
+        should_cancel: impl Fn() -> bool,
+    ) -> Result<HookOutcome, HookRunError> {
         let mut outcome = HookOutcome::default();
         for hook in self.matching_hooks(event, context.tool_request) {
             let mut command = Command::new("sh");
@@ -138,17 +180,22 @@ impl HookRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             orca_tools::process::prepare_non_interactive_command(&mut command);
-            let child = command
-                .spawn()
-                .map_err(|error| format!("hook '{}' failed to start: {error}", hook.command))?;
+            let child = command.spawn().map_err(|error| {
+                HookRunError::Failed(format!("hook '{}' failed to start: {error}", hook.command))
+            })?;
             let output = orca_tools::process::wait_for_child_output_with_timeout_or_cancel(
                 child,
                 timeout,
                 &should_cancel,
             )
-            .map_err(|error| format!("hook '{}' failed: {error}", hook.command))?;
+            .map_err(|error| {
+                HookRunError::Failed(format!("hook '{}' failed: {error}", hook.command))
+            })?;
             if output.termination == orca_tools::process::CommandTermination::Cancelled {
-                return Err(format!("hook '{}' cancelled", hook.command));
+                return Err(HookRunError::Cancelled(format!(
+                    "hook '{}' cancelled",
+                    hook.command
+                )));
             }
 
             if output.timed_out {
@@ -166,7 +213,7 @@ impl HookRunner {
                     (true, false) => stderr,
                     (false, false) => format!("{stdout}\n{stderr}"),
                 };
-                return Err(if detail.is_empty() {
+                return Err(HookRunError::Failed(if detail.is_empty() {
                     format!(
                         "hook '{}' timed out after {}s",
                         hook.command,
@@ -178,7 +225,7 @@ impl HookRunner {
                         hook.command,
                         timeout.as_secs()
                     )
-                });
+                }));
             }
 
             if !output.status.success() {
@@ -191,20 +238,20 @@ impl HookRunner {
                         .trim()
                         .to_string();
                 let detail = if stderr.is_empty() { stdout } else { stderr };
-                return Err(if detail.is_empty() {
+                return Err(HookRunError::Failed(if detail.is_empty() {
                     format!("hook '{}' exited with {}", hook.command, output.status)
                 } else {
                     format!(
                         "hook '{}' exited with {}: {detail}",
                         hook.command, output.status
                     )
-                });
+                }));
             }
 
             let stdout = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(65536)])
                 .trim()
                 .to_string();
-            apply_hook_stdout(&stdout, &mut outcome)?;
+            apply_hook_stdout(&stdout, &mut outcome).map_err(HookRunError::Failed)?;
         }
 
         Ok(outcome)
@@ -352,6 +399,42 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("blocked"));
+    }
+
+    #[test]
+    fn typed_hook_failure_is_not_relabelled_by_late_cancellation() {
+        let runner = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: "echo blocked >&2; exit 7".to_string(),
+            tool: Some("bash".to_string()),
+        }]);
+        let request = ToolRequest {
+            id: "tool-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: None,
+        };
+        let cancel = CancelToken::new();
+
+        let error = runner
+            .run_with_cancel_result(
+                HookEvent::PreToolUse,
+                HookContext {
+                    cwd: ".",
+                    session_status: None,
+                    tool_request: Some(&request),
+                    tool_result: None,
+                    before_messages: None,
+                    after_messages: None,
+                    usage: None,
+                },
+                &cancel,
+            )
+            .expect_err("hook should fail");
+        cancel.cancel();
+
+        assert!(matches!(error, HookRunError::Failed(message) if message.contains("blocked")));
     }
 
     #[test]

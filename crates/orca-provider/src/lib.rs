@@ -792,6 +792,31 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    if prompt.trim() == "subagent batch terminal_boundary" {
+        let mut first = parse_mock_prompt("subagent schema_fail").expect("schema fail request");
+        first.id = "mock-tool-1".to_string();
+        let mut second = parse_mock_prompt("subagent schema_ok").expect("schema ok request");
+        second.id = "mock-tool-2".to_string();
+        let mut third = parse_mock_prompt("subagent schema_ok").expect("schema ok request");
+        third.id = "mock-tool-3".to_string();
+        let requests = vec![first, second, third];
+        let tool_calls = requests
+            .iter()
+            .map(|request| RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            })
+            .collect();
+        return ProviderResponse {
+            steps: requests.into_iter().map(ProviderStep::ToolCall).collect(),
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls,
+            usage: None,
+        };
+    }
+
     if let Some(rest) = prompt.trim().strip_prefix("request_permissions_then_bash ")
         && let Some((root, command)) = rest.split_once(" :: ")
     {

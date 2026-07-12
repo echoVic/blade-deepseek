@@ -19,7 +19,7 @@ use crate::child_agent_provider_turn::{
 use crate::child_agent_response_folding::{
     ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
     ChildAgentToolResultFold, child_agent_tool_requests, fold_child_agent_provider_response,
-    fold_child_agent_tool_result,
+    fold_child_agent_tool_result_and_close_siblings,
 };
 use crate::child_agent_types::{
     ChildAgentActivity, ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult,
@@ -118,15 +118,17 @@ where
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
 
-        for tool_request in child_agent_tool_requests(&response) {
+        let tool_requests = child_agent_tool_requests(&response);
+        for (index, tool_request) in tool_requests.iter().enumerate() {
             let tool_context = ChildAgentToolContext {
                 policy: &setup.policy,
                 mcp_registry: &setup.mcp_registry,
             };
             let tool_execution = execute_tool(&tool_context, &child_cancel, tool_request);
-            let tool_fold = fold_child_agent_tool_result(
+            let tool_fold = fold_child_agent_tool_result_and_close_siblings(
                 &mut setup,
                 tool_request,
+                &tool_requests[index + 1..],
                 tool_execution.should_stop,
                 tool_execution.result,
                 tool_execution.child_cost,
@@ -241,7 +243,8 @@ where
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
 
-        for tool_request in child_agent_tool_requests(&response) {
+        let tool_requests = child_agent_tool_requests(&response);
+        for (index, tool_request) in tool_requests.iter().enumerate() {
             let tool_context = ChildAgentToolContext {
                 policy: &setup.policy,
                 mcp_registry: &setup.mcp_registry,
@@ -260,9 +263,10 @@ where
                     status: run_status_from_tool_status(tool_execution.result.status),
                 });
             }
-            let tool_fold = fold_child_agent_tool_result(
+            let tool_fold = fold_child_agent_tool_result_and_close_siblings(
                 &mut setup,
                 tool_request,
+                &tool_requests[index + 1..],
                 tool_execution.should_stop,
                 tool_execution.result,
                 tool_execution.child_cost,
