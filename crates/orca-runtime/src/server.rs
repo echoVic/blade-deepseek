@@ -1644,27 +1644,24 @@ fn run_thread_turns_list<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let store = SessionStore::new();
-    let page = match store.list_thread_turns(thread_id, cursor, limit, sort_direction, items_view) {
-        Ok(page) => page,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match state.threads.list_thread_turns(
-                thread_id,
-                cursor,
-                limit,
-                sort_direction,
-                items_view,
-            ) {
-                Some(page) => page,
-                None => {
-                    return protocol::write_server_event(
-                        writer,
-                        &id,
-                        ServerEvent::error(format!("unknown thread: {thread_id}")),
-                    );
-                }
+    let page = if let Some(page) =
+        state
+            .threads
+            .list_thread_turns(thread_id, cursor, limit, sort_direction, items_view)
+    {
+        page
+    } else {
+        match store.list_thread_turns(thread_id, cursor, limit, sort_direction, items_view) {
+            Ok(page) => page,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return protocol::write_server_event(
+                    writer,
+                    &id,
+                    ServerEvent::error(format!("unknown thread: {thread_id}")),
+                );
             }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
 
     protocol::write_server_event(
@@ -1694,24 +1691,24 @@ fn run_thread_items_list<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let store = SessionStore::new();
-    let page = match store.list_thread_items(thread_id, turn_id, cursor, limit, sort_direction) {
-        Ok(page) => page,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match state
-                .threads
-                .list_thread_items(thread_id, turn_id, cursor, limit, sort_direction)
-            {
-                Some(page) => page,
-                None => {
-                    return protocol::write_server_event(
-                        writer,
-                        &id,
-                        ServerEvent::error(format!("unknown thread: {thread_id}")),
-                    );
-                }
+    let page = if let Some(page) =
+        state
+            .threads
+            .list_thread_items(thread_id, turn_id, cursor, limit, sort_direction)
+    {
+        page
+    } else {
+        match store.list_thread_items(thread_id, turn_id, cursor, limit, sort_direction) {
+            Ok(page) => page,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return protocol::write_server_event(
+                    writer,
+                    &id,
+                    ServerEvent::error(format!("unknown thread: {thread_id}")),
+                );
             }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
 
     protocol::write_server_event(
@@ -1924,93 +1921,62 @@ fn run_thread_read<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let store = SessionStore::new();
-    if let Ok(thread) = store.read_thread(thread_id, include_messages, include_turns) {
-        return protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::ThreadRead {
-                thread_id: Value::from(thread.thread_id),
-                title: Value::from(thread.title),
-                cwd: Value::from(thread.cwd),
-                runtime_workspace_roots: runtime_workspace_roots_to_json(
-                    thread.runtime_workspace_roots,
-                ),
-                active_permission_profile: active_permission_profile_to_json(
-                    thread.active_permission_profile,
-                ),
-                additional_working_directory_count: Value::from(
-                    thread.additional_working_directories.len() as u64,
-                ),
-                additional_working_directories: additional_working_directories_to_json(
-                    thread.additional_working_directories,
-                ),
-                network_domain_permission_count: Value::from(
-                    thread.network_domain_permissions.len() as u64,
-                ),
-                network_domain_permissions: network_domain_permissions_to_json(
-                    thread.network_domain_permissions,
-                ),
-                message_count: Value::from(thread.message_count as u64),
-                messages: Value::from(thread.messages),
-                turns: Value::from(
-                    thread
-                        .turns
-                        .into_iter()
-                        .map(thread_turn_to_json)
-                        .collect::<Vec<_>>(),
-                ),
-            },
-        );
-    }
-
-    match state
-        .threads
-        .read_thread(thread_id, include_messages, include_turns)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown thread"))
+    let thread = if let Some(thread) =
+        state
+            .threads
+            .read_thread(thread_id, include_messages, include_turns)
     {
-        Ok(thread) => protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::ThreadRead {
-                thread_id: Value::from(thread.thread_id),
-                title: Value::from(thread.title),
-                cwd: Value::from(thread.cwd),
-                runtime_workspace_roots: runtime_workspace_roots_to_json(
-                    thread.runtime_workspace_roots,
-                ),
-                active_permission_profile: active_permission_profile_to_json(
-                    thread.active_permission_profile,
-                ),
-                additional_working_directory_count: Value::from(
-                    thread.additional_working_directories.len() as u64,
-                ),
-                additional_working_directories: additional_working_directories_to_json(
-                    thread.additional_working_directories,
-                ),
-                network_domain_permission_count: Value::from(
-                    thread.network_domain_permissions.len() as u64,
-                ),
-                network_domain_permissions: network_domain_permissions_to_json(
-                    thread.network_domain_permissions,
-                ),
-                message_count: Value::from(thread.message_count as u64),
-                messages: Value::from(thread.messages),
-                turns: Value::from(
-                    thread
-                        .turns
-                        .into_iter()
-                        .map(thread_turn_to_json)
-                        .collect::<Vec<_>>(),
-                ),
-            },
-        ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::error(format!("unknown thread: {thread_id}")),
-        ),
-        Err(error) => Err(error),
-    }
+        thread
+    } else {
+        match store.read_thread(thread_id, include_messages, include_turns) {
+            Ok(thread) => thread,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return protocol::write_server_event(
+                    writer,
+                    &id,
+                    ServerEvent::error(format!("unknown thread: {thread_id}")),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    protocol::write_server_event(
+        writer,
+        &id,
+        ServerEvent::ThreadRead {
+            thread_id: Value::from(thread.thread_id),
+            title: Value::from(thread.title),
+            cwd: Value::from(thread.cwd),
+            runtime_workspace_roots: runtime_workspace_roots_to_json(
+                thread.runtime_workspace_roots,
+            ),
+            active_permission_profile: active_permission_profile_to_json(
+                thread.active_permission_profile,
+            ),
+            additional_working_directory_count: Value::from(
+                thread.additional_working_directories.len() as u64,
+            ),
+            additional_working_directories: additional_working_directories_to_json(
+                thread.additional_working_directories,
+            ),
+            network_domain_permission_count: Value::from(
+                thread.network_domain_permissions.len() as u64
+            ),
+            network_domain_permissions: network_domain_permissions_to_json(
+                thread.network_domain_permissions,
+            ),
+            message_count: Value::from(thread.message_count as u64),
+            messages: Value::from(thread.messages),
+            turns: Value::from(
+                thread
+                    .turns
+                    .into_iter()
+                    .map(thread_turn_to_json)
+                    .collect::<Vec<_>>(),
+            ),
+        },
+    )
 }
 
 fn run_thread_metadata_update<W: Write>(
@@ -5316,6 +5282,144 @@ enabled = true
                     }) && items.iter().any(|item| item["role"] == "assistant")
                 })
             }));
+        });
+    }
+
+    #[test]
+    fn thread_projections_prefer_the_live_owner_over_persisted_records() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                &mut output,
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&output)
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+
+            let expected_read = state
+                .threads
+                .read_thread(&thread_id, true, false)
+                .expect("live read projection");
+            let expected_turns = state
+                .threads
+                .list_thread_turns(
+                    &thread_id,
+                    None,
+                    10,
+                    SortDirection::Asc,
+                    TurnItemsView::Full,
+                )
+                .expect("live turns projection");
+            let expected_items = state
+                .threads
+                .list_thread_items(&thread_id, None, None, 10, SortDirection::Asc)
+                .expect("live items projection");
+
+            let transcript = SessionStore::new()
+                .load_session(&thread_id)
+                .expect("load live transcript path");
+            let mut persisted = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript.path)
+                .expect("open persisted transcript");
+            writeln!(
+                persisted,
+                "{}",
+                serde_json::json!({
+                    "type": "conversation.message",
+                    "message": {
+                        "role": "user",
+                        "content": "disk-only stale message",
+                        "pinned": false
+                    }
+                })
+            )
+            .expect("append stale user record");
+            writeln!(
+                persisted,
+                "{}",
+                serde_json::json!({
+                    "type": "conversation.message",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": null,
+                        "tool_calls": [{
+                            "id": "disk-only-call",
+                            "function_name": "bash",
+                            "arguments": "{\"command\":\"printf stale\"}"
+                        }],
+                        "pinned": false
+                    }
+                })
+            )
+            .expect("append stale assistant record");
+            persisted.flush().expect("flush stale records");
+
+            let requests = [
+                format!(
+                    r#"{{"id":"read","method":"thread/read","params":{{"threadId":"{thread_id}","includeMessages":true}}}}"#
+                ),
+                format!(
+                    r#"{{"id":"turns","method":"thread/turns/list","params":{{"threadId":"{thread_id}","limit":10}}}}"#
+                ),
+                format!(
+                    r#"{{"id":"items","method":"thread/items/list","params":{{"threadId":"{thread_id}","limit":10}}}}"#
+                ),
+            ];
+            let mut projection_output = Vec::new();
+            for request in requests {
+                handle_line_for_test(&server_config, &mut state, &request, &mut projection_output)
+                    .expect("project live thread");
+            }
+
+            let events = parse_jsonl(&projection_output);
+            let read = events
+                .iter()
+                .find(|event| event["event"] == "thread_read")
+                .expect("thread_read event");
+            assert_eq!(read["messageCount"], expected_read.message_count);
+            assert_eq!(read["messages"], serde_json::json!(expected_read.messages));
+            let turns = events
+                .iter()
+                .find(|event| event["event"] == "thread_turns_list")
+                .expect("thread_turns_list event");
+            assert_eq!(
+                turns["data"],
+                serde_json::json!(
+                    expected_turns
+                        .data
+                        .into_iter()
+                        .map(thread_turn_to_json)
+                        .collect::<Vec<_>>()
+                )
+            );
+            let items = events
+                .iter()
+                .find(|event| event["event"] == "thread_items_list")
+                .expect("thread_items_list event");
+            assert_eq!(
+                items["data"],
+                serde_json::json!(
+                    expected_items
+                        .data
+                        .into_iter()
+                        .map(thread_item_to_json)
+                        .collect::<Vec<_>>()
+                )
+            );
         });
     }
 

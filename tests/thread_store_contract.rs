@@ -1172,6 +1172,71 @@ fn session_store_round_trips_tool_terminal_metadata() {
 }
 
 #[test]
+fn session_store_repairs_missing_tool_terminal_for_recovered_projections() {
+    with_orca_home(|home| {
+        let store = SessionStore::new();
+        let mut thread = store
+            .create_live_thread(home, "mock", None, "recover missing terminal")
+            .expect("create live thread");
+        let thread_id = thread.thread_id().to_string();
+        thread
+            .append_items(&[
+                Message::user("run legacy command".to_string()),
+                Message::Assistant {
+                    content: None,
+                    reasoning_content: Some("legacy incomplete invocation".to_string()),
+                    tool_calls: vec![RawToolCall {
+                        id: "legacy-missing-call".to_string(),
+                        function_name: "bash".to_string(),
+                        arguments: r#"{"command":"deploy production"}"#.to_string(),
+                    }],
+                    pinned: false,
+                },
+                Message::user("continue after recovery".to_string()),
+            ])
+            .expect("append incomplete legacy turn");
+        thread
+            .complete("success")
+            .expect("complete recovered thread");
+
+        let transcript = store.load_session(&thread_id).expect("load raw transcript");
+        let original = std::fs::read(&transcript.path).expect("read source JSONL");
+        let projection = store
+            .read_thread(&thread_id, true, true)
+            .expect("read recovered projection");
+        let items = store
+            .list_thread_items(&thread_id, None, None, 20, SortDirection::Asc)
+            .expect("list recovered items");
+
+        let repaired_message = projection
+            .messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("synthetic repaired tool message");
+        assert_eq!(repaired_message["toolCallId"], "legacy-missing-call");
+        assert!(
+            repaired_message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(MISSING_TOOL_TERMINAL_ERROR))
+        );
+
+        let repaired_item = items
+            .data
+            .iter()
+            .find(|item| item.item["id"] == "legacy-missing-call")
+            .expect("repaired command item");
+        assert_eq!(repaired_item.item["status"], "indeterminate");
+        assert_eq!(repaired_item.item["kind"], "indeterminate");
+        assert_eq!(repaired_item.item["terminalSource"], "compatibility_repair");
+        assert_eq!(
+            std::fs::read(&transcript.path).expect("reread source JSONL"),
+            original,
+            "projection repair must not rewrite the source JSONL"
+        );
+    });
+}
+
+#[test]
 fn session_store_projects_file_edit_calls_as_file_change_thread_items() {
     with_orca_home(|home| {
         let store = SessionStore::new();

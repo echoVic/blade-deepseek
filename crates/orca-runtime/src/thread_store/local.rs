@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
+use orca_core::conversation::{Message, normalize_tool_boundaries};
 use orca_core::tool_types::truncate_output;
 
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
@@ -191,6 +192,9 @@ pub(crate) fn load_thread_records(
             format!("session '{thread_id}' is missing metadata"),
         )
     })?;
+    let mut recovered_messages = messages.into_iter().map(Message::from).collect::<Vec<_>>();
+    normalize_tool_boundaries(&mut recovered_messages);
+    let messages = recovered_messages.iter().map(StoredMessage::from).collect();
     Ok((meta, messages))
 }
 
