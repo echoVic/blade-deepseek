@@ -52,64 +52,79 @@ admission, one run token, callback-only production events, bounded stderr, and
 RAII process/file cleanup. Terminal output cancels unawaited agents, and parent
 exit cannot leave pipe-holding descendants behind.
 
-### Current next slice: P0.1c completion
+### P0.1c Bounded one-shot command adapters
 
-The resource-lifecycle branch migrated grep and several shared process callers,
-but the P0.1c deletion gate is not complete: Git status, worktree Git, and
-thread-search ripgrep still use `Command::output`, while grep paginates a
-retained head/tail sample. Finish these adapters before beginning P0.1d. Split
-P0.1d afterward into tool-facing file admission (`read_file`, edit, TUI diff)
-and runtime-owned inputs (instructions, skills, workflow scripts/state).
+Git status, worktree Git, grep, and ripgrep thread search now apply memory
+admission while bytes arrive. A shared bounded-line collector owns drain,
+deadline, process-group retirement, wait, and reader joins. Grep retains only
+the requested page; thread search parses bounded JSON frames online; Git paths
+retain bounded diagnostics. The named production `.output()` paths are deleted.
+
+### Current next slice: P0.1d-a tool-facing file admission
+
+Start with user-triggered file reads and transforms: `read_file`, edit, and TUI
+diff. They have the clearest direct memory-risk boundary and can establish the
+shared metadata preflight plus bounded range reader before repository-controlled
+runtime inputs adopt stricter typed limits in P0.1d-b.
 
 ## Ranked Work
 
-### 1. P0.1c Bounded one-shot command adapters
+### 1. P0.1c Bounded one-shot command adapters (completed)
 
 **Risk:** High. **Effort:** Medium. **Depends on:** P0.1.
 
-Current production paths still call `.output()` and truncate only after the
-child exits:
+The completed slice removed post-exit collection from:
 
 - `crates/orca-tools/src/grep.rs`;
 - `crates/orca-tools/src/git.rs`;
 - `crates/orca-runtime/src/thread_store/local.rs`;
 - `crates/orca-runtime/src/worktree.rs`.
 
-Introduce a streaming command adapter with separate bounded stdout/stderr
-consumers. Grep/thread search need a line-page collector that counts/drains the
-stream while retaining only the requested page; `head_limit=0` must not restore
-an unlimited allocation path. Every adapter owns timeout/cancel, process-group
-termination, wait, UTF-8 boundary handling, and an explicit omission/result
-shape.
+The shared adapter drains bounded stdout lines and stderr concurrently, retires
+the process group, waits, joins readers, and reports omission. Grep pagination
+counts the full stream while retaining one bounded page; `head_limit=0` cannot
+restore unlimited retention.
 
 **Deletion gate:** no production `.output()` remains in these modules, and a
-multi-gigabyte logical stream keeps process RSS bounded in regression tests.
+large newline-free logical stream does not cause proportional retained memory
+in regression tests.
 
-### 2. P0.1d Bounded file admission
+### 2. P0.1d-a Tool-facing bounded file admission
 
 **Risk:** High. **Effort:** Medium. **Depends on:** shared bounded readers.
 
-Several paths apply output limits only after loading an entire file:
+User-triggered tool/UI paths apply output limits only after loading an entire
+file:
 
 - `crates/orca-tools/src/read_file.rs` calls `read_to_string` before line-range
   selection and output truncation;
 - `crates/orca-tools/src/edit.rs` and `crates/orca-tui/src/diff.rs` materialize
-  complete before/after contents, with the diff path retaining both copies;
-- repository-controlled skills, instructions, memory, workflow scripts, and
-  persisted JSONL/state readers have no common byte-admission policy.
+  complete before/after contents, with the diff path retaining both copies.
 
 Port Package 3's bounded range/tail reader semantics into a shared Orca file
 reader. `read_file` should stream only the requested line page under both a byte
 and line ceiling. Whole-file transforms such as edit/diff must preflight file
 metadata, reject unsupported sizes before allocation, and re-check bytes read
-to handle file growth races. Define smaller caps for config/script inputs and
-typed `too_large` outcomes instead of silently returning partial syntax.
+to handle file growth races.
 
 **Deletion gate:** tool/UI paths do not truncate after a full-file read; a
-sparse or multi-gigabyte file cannot cause proportional RSS; config, skill,
-workflow, and persisted-state loaders have explicit admission ceilings.
+sparse or multi-gigabyte file cannot cause proportional RSS.
 
-### 3. P0.2 MCP transport session owners
+### 3. P0.1d-b Runtime-owned bounded file inputs
+
+**Risk:** High. **Effort:** Medium/High. **Depends on:** P0.1d-a shared readers.
+
+Repository-controlled instructions, skills, memory, workflow scripts/state,
+and persisted JSONL currently lack one typed admission policy. Apply smaller
+domain-specific ceilings before parsing, distinguish `too_large` from malformed
+content, and never parse silently truncated syntax. Persisted logs need bounded
+frame iteration rather than whole-file materialization.
+
+**Deletion gate:** every config, instruction, skill, workflow, memory, and
+persisted-state loader declares its byte/frame ceiling and returns a typed
+oversize result before proportional allocation.
+
+### 4. P0.2 MCP transport session owners
 
 **Risk:** Critical. **Effort:** High. **Depends on:** shared bounded-frame helper
 from P0.1b.
@@ -136,7 +151,7 @@ Create a common `McpTransportSession` contract, first implemented by
 detached reader remains in stdio; cancellation leaves no SSE request thread
 running; no MCP response body is collected without a byte ceiling.
 
-### 4. P0.3 Server transport framing and backpressure
+### 5. P0.3 Server transport framing and backpressure
 
 **Risk:** High. **Effort:** Medium/High. **Depends on:** bounded-frame helper.
 
@@ -157,7 +172,7 @@ Split transport from request processing:
 direct shared-writer mutex in worker threads, and overload/EOF tests prove
 bounded shutdown.
 
-### 5. P0.4 HTTP and provider response budgets
+### 6. P0.4 HTTP and provider response budgets
 
 **Risk:** High. **Effort:** Medium. **Depends on:** none after frame utilities.
 
@@ -178,7 +193,7 @@ distinguish protocol-limit failures from retryable transport failures.
 sized body; oversized body, newline-free SSE, and tool-argument flood tests stay
 within configured memory and return typed terminal errors.
 
-### 6. P0.5 Runtime event admission and projection
+### 7. P0.5 Runtime event admission and projection
 
 **Risk:** High. **Effort:** Medium/High. **Depends on:** provider delta policy.
 
@@ -203,7 +218,7 @@ before deserialization and expose queue saturation in diagnostics.
 JSONL partial frame grows without a ceiling, and stress tests with a stalled
 renderer keep queue memory bounded without losing terminal/control events.
 
-### 7. P1 Shared operation host crate
+### 8. P1 Shared operation host crate
 
 **Risk:** Architectural. **Effort:** High. **Depends on:** P0.1c, P0.1d, and
 P0.2-P0.5 proving the required primitives.
@@ -222,7 +237,7 @@ Keep tool policy, MCP protocol, workflow state, and UI projection above this
 crate. The abstraction is ready only when it deletes duplicate lifecycle code,
 not merely wraps it.
 
-### 8. P1 Task supervisor and cancellation tree
+### 9. P1 Task supervisor and cancellation tree
 
 **Risk:** Architectural. **Effort:** High. **Depends on:** shared operation host.
 
@@ -233,7 +248,7 @@ agent exit must terminate its owned background operations, matching Package 3's
 agent cleanup registry; global shutdown should resemble Codex's bounded thread
 shutdown instead of joining indefinitely.
 
-### 9. P2 Quota-managed output spool
+### 10. P2 Quota-managed output spool
 
 **Risk:** Medium. **Effort:** Medium. **Depends on:** shared operation host.
 
@@ -243,7 +258,7 @@ disk-growth watchdog. Retained memory remains the default. Do not add an
 unbounded spool: Package 3's historical 768 GB output incident is the boundary
 condition to design against.
 
-### 10. P2 Pre-main process hardening
+### 11. P2 Pre-main process hardening
 
 **Risk:** Security hardening. **Effort:** Low/Medium. **Depends on:** stable
 packaging/startup boundary.
@@ -255,8 +270,8 @@ separate from sandbox policy and make unsupported-platform behavior explicit.
 
 ## Execution Order
 
-1. Finish one-shot command adapters and bounded local-file admission to remove
-   cheap remaining heap hazards.
+1. Complete tool-facing bounded file admission, then apply typed limits to
+   runtime-owned file inputs.
 2. Rebuild both MCP transports, then server transport, around bounded frames and
    explicit owners.
 3. Bound HTTP/provider frames and aggregate response state, then close the
