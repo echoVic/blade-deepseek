@@ -1497,7 +1497,9 @@ impl Tool for BuiltinTool {
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
             BuiltinExecutor::ReadFile => {
-                read_file::execute(request, ctx.cwd, ctx.max_output_bytes())
+                read_file::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
             }
             BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
                 list_files::execute(request, ctx.cwd, ctx.max_output_bytes())
@@ -1512,7 +1514,9 @@ impl Tool for BuiltinTool {
                 ctx.shell_timeout,
                 || ctx.is_cancelled(),
             ),
-            BuiltinExecutor::Edit => edit::execute(request, ctx.cwd),
+            BuiltinExecutor::Edit => {
+                edit::execute_or_cancel(request, ctx.cwd, || ctx.is_cancelled())
+            }
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
             BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes()),
             BuiltinExecutor::WebSearch => web_search::execute(request, ctx.max_output_bytes()),

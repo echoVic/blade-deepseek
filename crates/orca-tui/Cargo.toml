@@ -20,7 +20,6 @@ crossterm = { workspace = true }
 tui-textarea = { workspace = true }
 pulldown-cmark = { workspace = true }
 unicode-width = { workspace = true }
-similar = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

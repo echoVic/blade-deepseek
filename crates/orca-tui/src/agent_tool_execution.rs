@@ -324,7 +324,6 @@ fn execute_tool_for_tui_inner(
             tool_request_with_hook_outcome(tool_request, &pre_tool_outcome)
         };
         let execution_request = &effective_tool_request;
-        let before = diff::capture_before(execution_request, cwd);
         // Match the runtime path (tool_router.rs): configured extra working
         // directories plus roots granted during this turn.
         let additional_roots = config
@@ -589,7 +588,7 @@ fn execute_tool_for_tui_inner(
             )
         };
         if matches!(result.status, tool_types::ToolStatus::Completed) {
-            rendered_diff = before.and_then(diff::render_after);
+            rendered_diff = diff::render(&result);
         }
         (result, None)
     };

@@ -2476,6 +2476,7 @@ mod tests {
             exit_code: Some(0),
             truncated: false,
             kind: tool_types::ToolResultKind::Success,
+            file_change_preview: None,
         };
 
         record_tui_goal_tool_finish(&session, "turn-1", &result);

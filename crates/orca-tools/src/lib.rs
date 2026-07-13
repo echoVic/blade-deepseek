@@ -9,6 +9,7 @@ use orca_mcp::{McpElicitationHandler, McpRegistry};
 pub mod bash;
 pub mod edit;
 pub mod external;
+pub mod file_admission;
 pub mod git;
 pub mod glob;
 pub mod grep;

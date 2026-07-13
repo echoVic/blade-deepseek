@@ -15,6 +15,7 @@ globset = { workspace = true }
 walkdir = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }
+similar = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

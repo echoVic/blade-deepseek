@@ -124,6 +124,10 @@ impl RetainedOutputSnapshot {
         self.omitted_bytes > 0
     }
 
+    pub fn retained_head_bytes(&self) -> usize {
+        self.head_bytes
+    }
+
     pub fn rendered_bytes(&self) -> Vec<u8> {
         if !self.is_truncated() {
             return self.bytes.clone();

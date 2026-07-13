@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::approval_types::ActionKind;
 
@@ -509,6 +510,18 @@ impl ToolStatus {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileChangePreview {
+    UnifiedDiff {
+        text: String,
+        truncated: bool,
+    },
+    Omitted {
+        path: String,
+        max_input_bytes: usize,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResult {
     pub id: String,
@@ -523,6 +536,8 @@ pub struct ToolResult {
         skip_serializing_if = "ToolResultKind::is_success"
     )]
     pub kind: ToolResultKind,
+    #[serde(skip)]
+    pub file_change_preview: Option<Arc<FileChangePreview>>,
 }
 
 impl ToolResult {
@@ -536,6 +551,7 @@ impl ToolResult {
             exit_code: Some(0),
             truncated,
             kind: ToolResultKind::Success,
+            file_change_preview: None,
         }
     }
 
@@ -554,6 +570,7 @@ impl ToolResult {
             exit_code: Some(0),
             truncated,
             kind,
+            file_change_preview: None,
         }
     }
 
@@ -567,6 +584,7 @@ impl ToolResult {
             exit_code,
             truncated: false,
             kind: ToolResultKind::RuntimeError,
+            file_change_preview: None,
         }
     }
 
@@ -580,6 +598,7 @@ impl ToolResult {
             exit_code: None,
             truncated: false,
             kind: ToolResultKind::InvalidInput,
+            file_change_preview: None,
         }
     }
 
@@ -593,7 +612,13 @@ impl ToolResult {
             exit_code: None,
             truncated: false,
             kind: ToolResultKind::PermissionDenied,
+            file_change_preview: None,
         }
+    }
+
+    pub fn with_file_change_preview(mut self, preview: FileChangePreview) -> Self {
+        self.file_change_preview = Some(Arc::new(preview));
+        self
     }
 }
 
@@ -729,6 +754,27 @@ mod tests {
             serde_json::from_str::<ToolName>("\"read_file\"").unwrap(),
             name
         );
+    }
+
+    #[test]
+    fn file_change_preview_is_internal_and_not_serialized() {
+        let request = ToolRequest {
+            id: "edit-1".to_string(),
+            name: ToolName::Edit,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: None,
+        };
+        let result = ToolResult::completed(&request, "edited file.txt".to_string(), false)
+            .with_file_change_preview(FileChangePreview::UnifiedDiff {
+                text: "--- a/file.txt\n+++ b/file.txt".to_string(),
+                truncated: false,
+            });
+
+        let value = serde_json::to_value(&result).expect("serialize tool result");
+        assert!(value.get("file_change_preview").is_none());
+        let restored: ToolResult = serde_json::from_value(value).expect("deserialize tool result");
+        assert!(restored.file_change_preview.is_none());
     }
 
     #[test]

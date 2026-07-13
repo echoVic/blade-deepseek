@@ -3,9 +3,20 @@ use std::path::Path;
 
 use orca_core::tool_types::{ToolRequest, ToolResult};
 
+use crate::file_admission::{
+    MAX_EDIT_FILE_BYTES, build_file_change_preview, read_text_file_with_limit,
+};
 use crate::resolve_workspace_path;
 
 pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
+    execute_or_cancel(request, cwd, || false)
+}
+
+pub fn execute_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let (path_str, old, new) = match parse_edit_args(request) {
         Ok(args) => args,
         Err(error) => return ToolResult::failed(request, error, None),
@@ -23,7 +34,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         return ToolResult::failed(request, "edit old text cannot be empty", None);
     }
 
-    let contents = match fs::read_to_string(&path) {
+    let contents = match read_text_file_with_limit(&path, MAX_EDIT_FILE_BYTES, &should_cancel) {
         Ok(contents) => contents,
         Err(error) => {
             return ToolResult::failed(
@@ -42,8 +53,30 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         return ToolResult::failed(request, "edit old text matched multiple locations", None);
     }
 
+    let updated_bytes = contents
+        .len()
+        .saturating_sub(old.len())
+        .saturating_add(new.len());
+    if updated_bytes > MAX_EDIT_FILE_BYTES {
+        return ToolResult::failed(
+            request,
+            format!(
+                "edited file would be too large ({updated_bytes} bytes; maximum {MAX_EDIT_FILE_BYTES} bytes)"
+            ),
+            None,
+        );
+    }
     let updated = contents.replacen(&*old, &new, 1);
-    if let Err(error) = fs::write(&path, updated) {
+    if should_cancel() {
+        return ToolResult::failed(request, "file edit cancelled", None);
+    }
+    let relative_path = path
+        .strip_prefix(cwd)
+        .unwrap_or(&path)
+        .display()
+        .to_string();
+    let preview = build_file_change_preview(&relative_path, Some(&contents), Some(&updated));
+    if let Err(error) = fs::write(&path, &updated) {
         return ToolResult::failed(
             request,
             format!("failed to write {}: {error}", path.display()),
@@ -51,14 +84,8 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
         );
     }
 
-    ToolResult::completed(
-        request,
-        format!(
-            "edited {}",
-            path.strip_prefix(cwd).unwrap_or(&path).display()
-        ),
-        false,
-    )
+    ToolResult::completed(request, format!("edited {relative_path}"), false)
+        .with_file_change_preview(preview)
 }
 
 fn parse_edit_args(request: &ToolRequest) -> Result<(String, String, String), String> {
@@ -111,7 +138,7 @@ fn is_inside_workspace(cwd: &Path, path: &Path) -> bool {
 mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
-    use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
+    use orca_core::tool_types::{FileChangePreview, ToolName, ToolRequest, ToolStatus};
     use std::fs;
 
     fn make_request(target: Option<&str>, raw_arguments: Option<&str>) -> ToolRequest {
@@ -248,5 +275,56 @@ mod tests {
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(fs::read_to_string(&file).unwrap(), "new content\n");
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_before_exact_match_scan() {
+        const EXPECTED_EDIT_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+
+        let dir = temp_dir("oversized");
+        let file = dir.join("large.txt");
+        let handle = fs::File::create(&file).expect("create sparse fixture");
+        handle
+            .set_len(EXPECTED_EDIT_LIMIT_BYTES + 1)
+            .expect("size sparse fixture");
+        let raw = r#"{"path":"large.txt","old_text":"missing","new_text":"replacement"}"#;
+        let req = make_request(None, Some(raw));
+
+        let result = execute(&req, &dir);
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("too large")),
+            "unexpected error: {:?}",
+            result.error
+        );
+        assert_eq!(
+            fs::metadata(file)
+                .expect("oversized fixture metadata")
+                .len(),
+            EXPECTED_EDIT_LIMIT_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn successful_edit_emits_committed_file_change_preview() {
+        let dir = temp_dir("preview");
+        let file = dir.join("preview.txt");
+        fs::write(&file, "old\nsame\n").expect("write preview fixture");
+        let raw = r#"{"path":"preview.txt","old_text":"old","new_text":"new"}"#;
+        let req = make_request(None, Some(raw));
+
+        let result = execute(&req, &dir);
+
+        let preview = result.file_change_preview.expect("successful edit preview");
+        let FileChangePreview::UnifiedDiff { text, truncated } = preview.as_ref() else {
+            panic!("small edit should render a unified diff");
+        };
+        assert!(!*truncated);
+        assert!(text.contains("-old"));
+        assert!(text.contains("+new"));
     }
 }
