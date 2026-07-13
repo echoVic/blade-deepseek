@@ -22,6 +22,8 @@ sha2 = { workspace = true }
 base64 = { workspace = true }
 globset = { workspace = true }
 walkdir = { workspace = true }
+ignore = { workspace = true }
+nucleo-matcher = { workspace = true }
 
 [dev-dependencies]
 orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }

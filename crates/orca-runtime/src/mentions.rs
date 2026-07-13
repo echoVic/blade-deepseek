@@ -1,9 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 const MAX_MENTION_BYTES: usize = 32 * 1024;
 const MAX_FUZZY_MENTION_CANDIDATES: usize = 8;
-const MAX_FUZZY_MENTION_VISITS: usize = 2000;
+const MAX_INDEX_FILES: usize = 100_000;
+const INDEX_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
 
 pub fn expand_file_mentions(input: &str, cwd: &Path) -> Result<String, String> {
     let mentions = find_mentions(input);
@@ -61,7 +68,13 @@ pub fn complete_file_mention(input: &str, cwd: &Path) -> Option<String> {
     let replacement = if matches.len() == 1 {
         matches[0].clone()
     } else {
-        common_prefix(&matches)?
+        let common = common_prefix(&matches)?;
+        // Fuzzy matches need not share the typed prefix; only complete when
+        // the common prefix actually extends what the user typed.
+        if !common.starts_with(prefix) {
+            return None;
+        }
+        common
     };
     if replacement == prefix {
         return None;
@@ -207,9 +220,13 @@ fn current_mention_prefix(input: &str) -> Option<(usize, &str)> {
 }
 
 fn mention_matches(cwd: &Path, prefix: &str) -> Vec<String> {
-    let exact_matches = prefix_mention_matches(cwd, prefix);
-    if !exact_matches.is_empty() || prefix.contains('/') || prefix.is_empty() {
-        return exact_matches;
+    if prefix.trim().is_empty() {
+        return prefix_mention_matches(cwd, prefix);
+    }
+    // A trailing slash means the user is drilling into a directory: list its
+    // contents directly instead of fuzzy-ranking the whole workspace.
+    if prefix.ends_with('/') && resolve_mention_dir(cwd, prefix.trim_end_matches('/')).is_ok() {
+        return prefix_mention_matches(cwd, prefix);
     }
     fuzzy_mention_matches(cwd, prefix)
 }
@@ -260,101 +277,196 @@ fn prefix_mention_matches(cwd: &Path, prefix: &str) -> Vec<String> {
     matches
 }
 
+struct CachedIndex {
+    paths: Vec<String>,
+    built_at: Instant,
+    git_index_path: Option<PathBuf>,
+    git_index_mtime: Option<SystemTime>,
+}
+
+fn index_cache() -> &'static Mutex<HashMap<PathBuf, CachedIndex>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mention_index_paths(cwd: &Path) -> Vec<String> {
+    let Ok(cwd) = cwd.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok(mut cache) = index_cache().lock() else {
+        return Vec::new();
+    };
+    if let Some(cached) = cache.get(&cwd)
+        && !index_is_stale(cached)
+    {
+        return cached.paths.clone();
+    }
+    let paths = build_index(&cwd);
+    let git_index_path = find_git_index(&cwd);
+    let git_index_mtime = git_index_path.as_deref().and_then(file_mtime);
+    let cached = CachedIndex {
+        paths: paths.clone(),
+        built_at: Instant::now(),
+        git_index_path,
+        git_index_mtime,
+    };
+    cache.insert(cwd, cached);
+    paths
+}
+
+fn index_is_stale(cached: &CachedIndex) -> bool {
+    // A changed .git/index (commit, add, checkout, ...) invalidates
+    // immediately; otherwise refresh on a timer to pick up untracked files,
+    // which never touch the git index.
+    if let Some(path) = &cached.git_index_path
+        && file_mtime(path) != cached.git_index_mtime
+    {
+        return true;
+    }
+    cached.built_at.elapsed() >= INDEX_REFRESH_THROTTLE
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|meta| meta.modified()).ok()
+}
+
+fn find_git_index(cwd: &Path) -> Option<PathBuf> {
+    for dir in cwd.ancestors() {
+        let git = dir.join(".git");
+        if git.is_dir() {
+            return Some(git.join("index"));
+        }
+        // .git as a file (worktree/submodule): fall back to the time-based
+        // refresh only.
+        if git.is_file() {
+            return None;
+        }
+    }
+    None
+}
+
+fn build_index(cwd: &Path) -> Vec<String> {
+    let files = git_ls_files(cwd).unwrap_or_else(|| walk_files(cwd));
+    with_parent_dirs(files)
+}
+
+fn git_ls_files(cwd: &Path) -> Option<Vec<String>> {
+    let tracked = run_git_ls_files(cwd, &["ls-files", "--recurse-submodules"])?;
+    let untracked =
+        run_git_ls_files(cwd, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+    let mut files = tracked;
+    let mut seen = files
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for file in untracked {
+        if seen.insert(file.clone()) {
+            files.push(file);
+        }
+    }
+    files.truncate(MAX_INDEX_FILES);
+    Some(files)
+}
+
+fn run_git_ls_files(cwd: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .arg("-c")
+        .arg("core.quotepath=false")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(
+        stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| line.to_string())
+            .collect(),
+    )
+}
+
+fn walk_files(cwd: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let walker = ignore::WalkBuilder::new(cwd)
+        .follow_links(false)
+        .require_git(false)
+        .git_global(false)
+        .build();
+    for entry in walker.flatten() {
+        if files.len() >= MAX_INDEX_FILES {
+            break;
+        }
+        if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(cwd) else {
+            continue;
+        };
+        let Some(relative) = relative.to_str() else {
+            continue;
+        };
+        files.push(relative.replace('\\', "/"));
+    }
+    files
+}
+
+fn with_parent_dirs(files: Vec<String>) -> Vec<String> {
+    let mut dirs = std::collections::BTreeSet::new();
+    for file in &files {
+        for (index, ch) in file.char_indices() {
+            if ch == '/' {
+                dirs.insert(file[..index + 1].to_string());
+            }
+        }
+    }
+    let mut paths = files;
+    paths.extend(dirs);
+    paths
+}
+
 fn fuzzy_mention_matches(cwd: &Path, query: &str) -> Vec<String> {
     let query = query.trim();
     if query.is_empty() {
         return Vec::new();
     }
-    let Ok(cwd) = cwd.canonicalize() else {
-        return Vec::new();
-    };
+    let paths = mention_index_paths(cwd);
+    let mut matcher = Matcher::new({
+        let mut config = Config::DEFAULT;
+        config.set_match_paths();
+        config
+    });
+    let atom = Atom::new(
+        query,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
+    let mut buf = Vec::new();
     let mut scored = Vec::new();
-    collect_fuzzy_mention_matches(&cwd, &cwd, query, &mut scored, &mut 0);
+    for path in &paths {
+        let haystack = Utf32Str::new(path, &mut buf);
+        if let Some(score) = atom.score(haystack, &mut matcher) {
+            scored.push((score, path));
+        }
+    }
     scored.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.ends_with('/').cmp(&right.1.ends_with('/')))
             .then_with(|| left.1.len().cmp(&right.1.len()))
-            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.1.cmp(right.1))
     });
     scored
         .into_iter()
         .take(MAX_FUZZY_MENTION_CANDIDATES)
-        .map(|(_, candidate)| candidate)
+        .map(|(_, candidate)| candidate.clone())
         .collect()
-}
-
-fn collect_fuzzy_mention_matches(
-    root: &Path,
-    dir: &Path,
-    query: &str,
-    scored: &mut Vec<(usize, String)>,
-    visited: &mut usize,
-) {
-    if *visited >= MAX_FUZZY_MENTION_VISITS {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries = entries.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        if *visited >= MAX_FUZZY_MENTION_VISITS {
-            return;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        *visited += 1;
-        let path = entry.path();
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let candidate = relative.to_string_lossy().replace('\\', "/");
-        let candidate = if path.is_dir() {
-            format!("{candidate}/")
-        } else {
-            candidate
-        };
-        if let Some(score) = fuzzy_score(&candidate, query) {
-            scored.push((score, candidate));
-        }
-        if path.is_dir() {
-            collect_fuzzy_mention_matches(root, &path, query, scored, visited);
-        }
-    }
-}
-
-fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
-    let candidate_lower = candidate.to_lowercase();
-    let query_lower = query.to_lowercase();
-    if candidate_lower.contains(&query_lower) {
-        return candidate_lower.find(&query_lower);
-    }
-    subsequence_score(&candidate_lower, &query_lower)
-}
-
-fn subsequence_score(candidate: &str, query: &str) -> Option<usize> {
-    let mut score = 0;
-    let mut last_match = 0;
-    let mut chars = candidate.char_indices();
-    for query_char in query.chars() {
-        let mut matched = None;
-        for (index, candidate_char) in chars.by_ref() {
-            if candidate_char == query_char {
-                matched = Some(index);
-                break;
-            }
-        }
-        let index = matched?;
-        score += index.saturating_sub(last_match);
-        last_match = index + query_char.len_utf8();
-    }
-    Some(score)
 }
 
 fn resolve_mention_dir(cwd: &Path, mention: &str) -> Result<PathBuf, String> {
@@ -707,5 +819,70 @@ mod tests {
                 .iter()
                 .any(|candidate| { candidate == "src/runtime/config/mod.rs" })
         );
+    }
+
+    #[test]
+    fn fuzzy_skips_gitignored_paths_and_tolerates_typos() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+        let src = dir.path().join("src/content/blog/AI");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("orca-deepseek-empty-turn-recovery-retrospective.mdx"),
+            "post",
+        )
+        .unwrap();
+        let dist = dir
+            .path()
+            .join("dist/client/blog/ai/orca-deepseek-cache-optimization");
+        fs::create_dir_all(&dist).unwrap();
+        fs::write(dist.join("index.html"), "built").unwrap();
+
+        // "deepeek" (missing the "s") still matches as a subsequence.
+        let candidates = list_mention_candidates("@orca-deepeek-em", dir.path());
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.ends_with("orca-deepseek-empty-turn-recovery-retrospective.mdx")
+        }));
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.starts_with("dist/"))
+        );
+    }
+
+    #[test]
+    fn fuzzy_matches_deep_paths_even_when_cwd_has_prefix_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main-notes.txt"), "top level").unwrap();
+        let nested = dir.path().join("src/app");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("main.rs"), "fn main() {}").unwrap();
+
+        let candidates = list_mention_candidates("@main", dir.path());
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "src/app/main.rs")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "main-notes.txt")
+        );
+    }
+
+    #[test]
+    fn trailing_slash_lists_directory_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("alpha.rs"), "a").unwrap();
+        fs::write(nested.join("beta.rs"), "b").unwrap();
+
+        let candidates = list_mention_candidates("@src/", dir.path());
+
+        assert_eq!(candidates, vec!["src/alpha.rs", "src/beta.rs"]);
     }
 }
