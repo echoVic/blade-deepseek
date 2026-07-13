@@ -2,12 +2,14 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
+use orca_core::tool_types::truncate_output;
 
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
@@ -299,6 +301,64 @@ pub struct SearchHit {
     pub line: String,
 }
 
+const THREAD_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
+const THREAD_SEARCH_MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
+const THREAD_SEARCH_MAX_SNIPPET_BYTES: usize = 8 * 1024;
+const THREAD_SEARCH_MAX_PROCESS_HITS: usize = 4_096;
+
+struct RipgrepSearchMatch {
+    path: PathBuf,
+    archived: bool,
+    line_number: usize,
+    line: String,
+}
+
+struct RipgrepSearchCollector {
+    archive_root: PathBuf,
+    matches: Vec<RipgrepSearchMatch>,
+}
+
+impl RipgrepSearchCollector {
+    fn new() -> Self {
+        Self {
+            archive_root: archive_dir(),
+            matches: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, line: orca_tools::process::BoundedLine<'_>) {
+        if line.omitted_bytes > 0 || self.matches.len() >= THREAD_SEARCH_MAX_PROCESS_HITS {
+            return;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line.bytes) else {
+            return;
+        };
+        if value["type"].as_str() != Some("match") {
+            return;
+        }
+        let Some(path_text) = value["data"]["path"]["text"].as_str() else {
+            return;
+        };
+        let Some(line_number) = value["data"]["line_number"].as_u64() else {
+            return;
+        };
+        let Some(line_text) = value["data"]["lines"]["text"].as_str() else {
+            return;
+        };
+        let path = PathBuf::from(path_text);
+        let (line, _) = truncate_output(
+            line_text.trim_end_matches('\n').to_string(),
+            THREAD_SEARCH_MAX_SNIPPET_BYTES,
+        );
+        self.matches.push(RipgrepSearchMatch {
+            archived: path.starts_with(&self.archive_root),
+            path,
+            line_number: line_number as usize,
+            line,
+        });
+    }
+}
+
 fn search_roots_with_ripgrep(
     query: &str,
     include_archived: bool,
@@ -315,47 +375,53 @@ fn search_roots_with_ripgrep(
         return Ok(true);
     }
 
-    let output = match Command::new("rg")
+    let mut command = Command::new("rg");
+    command
         .arg("--json")
         .arg("--fixed-strings")
         .arg("--glob")
         .arg("*.jsonl")
         .arg(query)
         .args(&roots)
-        .output()
-    {
-        Ok(output) => output,
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    orca_tools::process::prepare_non_interactive_command(&mut command);
+    let child = match command.spawn() {
+        Ok(child) => child,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
+    let output = orca_tools::process::wait_for_child_stdout_lines_with_timeout(
+        child,
+        THREAD_SEARCH_TIMEOUT,
+        THREAD_SEARCH_MAX_JSON_LINE_BYTES,
+        RipgrepSearchCollector::new(),
+        |collector, line| {
+            collector.push(line);
+            Ok(())
+        },
+    )?;
+
+    if output.timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "thread search timed out after {}s",
+                THREAD_SEARCH_TIMEOUT.as_secs()
+            ),
+        ));
+    }
 
     if !output.status.success() && output.status.code() != Some(1) {
         return Ok(false);
     }
 
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value["type"].as_str() != Some("match") {
-            continue;
-        }
-        let Some(path_text) = value["data"]["path"]["text"].as_str() else {
-            continue;
-        };
-        let Some(line_number) = value["data"]["line_number"].as_u64() else {
-            continue;
-        };
-        let Some(line_text) = value["data"]["lines"]["text"].as_str() else {
-            continue;
-        };
-        let path = PathBuf::from(path_text);
-        let archived = path.starts_with(archive_dir());
+    for matched in output.value.matches {
         push_search_hit(
-            &path,
-            archived,
-            line_number as usize,
-            line_text.trim_end_matches('\n').to_string(),
+            &matched.path,
+            matched.archived,
+            matched.line_number,
+            matched.line,
             hits,
         );
     }
@@ -877,4 +943,63 @@ pub(crate) fn sort_thread_search_hits(hits: &mut [StoredThreadSearchHit], sort_k
             .cmp(&a.thread.updated_at)
             .then_with(|| b.thread.created_at.cmp(&a.thread.created_at)),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn match_line(path: &Path, line_text: &str, line_number: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "type": "match",
+            "data": {
+                "path": { "text": path.display().to_string() },
+                "line_number": line_number,
+                "lines": { "text": line_text },
+            }
+        }))
+        .expect("match json")
+    }
+
+    #[test]
+    fn ripgrep_search_collector_bounds_snippets_and_hit_count() {
+        let path = sessions_dir().join("thread.jsonl");
+        let mut collector = RipgrepSearchCollector::new();
+        let large = match_line(&path, &format!("needle {}", "x".repeat(32 * 1024)), 1);
+        collector.push(orca_tools::process::BoundedLine {
+            bytes: &large,
+            observed_bytes: large.len(),
+            omitted_bytes: 0,
+        });
+
+        assert_eq!(collector.matches.len(), 1);
+        assert!(collector.matches[0].line.len() <= THREAD_SEARCH_MAX_SNIPPET_BYTES);
+        assert!(
+            collector.matches[0]
+                .line
+                .contains("tool output micro-compacted")
+        );
+
+        let small = match_line(&path, "needle", 2);
+        for _ in 0..THREAD_SEARCH_MAX_PROCESS_HITS {
+            collector.push(orca_tools::process::BoundedLine {
+                bytes: &small,
+                observed_bytes: small.len(),
+                omitted_bytes: 0,
+            });
+        }
+        assert_eq!(collector.matches.len(), THREAD_SEARCH_MAX_PROCESS_HITS);
+    }
+
+    #[test]
+    fn ripgrep_search_collector_rejects_truncated_json_frames() {
+        let mut collector = RipgrepSearchCollector::new();
+        collector.push(orca_tools::process::BoundedLine {
+            bytes: br#"{"type":"match""#,
+            observed_bytes: THREAD_SEARCH_MAX_JSON_LINE_BYTES + 1,
+            omitted_bytes: 1,
+        });
+
+        assert!(collector.matches.is_empty());
+    }
 }

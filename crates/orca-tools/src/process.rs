@@ -29,11 +29,41 @@ pub struct CommandOutput {
     pub timed_out: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BoundedLine<'a> {
+    pub bytes: &'a [u8],
+    pub observed_bytes: usize,
+    pub omitted_bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct LineCommandOutput<T> {
+    pub value: T,
+    pub stdout_observed_bytes: usize,
+    pub stdout_omitted_bytes: usize,
+    pub oversized_lines: usize,
+    pub stderr: Vec<u8>,
+    pub stderr_observed_bytes: usize,
+    pub stderr_omitted_bytes: usize,
+    pub status: ExitStatus,
+    pub timed_out: bool,
+}
+
 impl CommandOutput {
     pub fn stdout_text(&self) -> String {
         render_retained_text(&self.stdout, self.stdout_omitted_bytes)
     }
 
+    pub fn stderr_text(&self) -> String {
+        render_retained_text(&self.stderr, self.stderr_omitted_bytes)
+    }
+
+    pub fn output_was_omitted(&self) -> bool {
+        self.stdout_omitted_bytes > 0 || self.stderr_omitted_bytes > 0
+    }
+}
+
+impl<T> LineCommandOutput<T> {
     pub fn stderr_text(&self) -> String {
         render_retained_text(&self.stderr, self.stderr_omitted_bytes)
     }
@@ -125,61 +155,19 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
         Arc::clone(&reader_stop),
     );
 
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
-    let mut timed_out = false;
-
-    let mut status = None;
-    let status = loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit_status)) => {
-                    status = Some(exit_status);
-                    // Retire the process-group lease immediately after observing the
-                    // leader exit. This closes ordinary inherited-pipe descendants
-                    // without retaining a stale numeric PID until the deadline.
-                    kill_process_group_by_pid(child_pid);
-                    reader_stop.store(true, Ordering::Release);
-                }
-                Err(error) => {
-                    kill_child_tree(&mut child);
-                    let _ = child.wait();
-                    break Err(error);
-                }
-                Ok(None) => {}
-            }
-        }
-        if let Some(exit_status) = status
-            && stdout_handle.is_finished()
-            && stderr_handle.is_finished()
-        {
-            break Ok(exit_status);
-        }
-        if should_cancel() {
-            if status.is_none() {
-                kill_child_tree(&mut child);
-                status = Some(child.wait()?);
-            }
-            reader_stop.store(true, Ordering::Release);
-            break Ok(status.expect("cancelled child status"));
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            if status.is_none() {
-                kill_child_tree(&mut child);
-                status = Some(child.wait()?);
-            }
-            reader_stop.store(true, Ordering::Release);
-            break Ok(status.expect("timed out child status"));
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
+    let status = wait_for_child_and_readers(
+        &mut child,
+        child_pid,
+        timeout,
+        should_cancel,
+        || stdout_handle.is_finished() && stderr_handle.is_finished(),
+        reader_stop.as_ref(),
+    );
 
     reader_stop.store(true, Ordering::Release);
     let stdout = join_reader(stdout_handle, "stdout");
     let stderr = join_reader(stderr_handle, "stderr");
-    let status = status?;
+    let (status, timed_out) = status?;
     let stdout = stdout?;
     let stderr = stderr?;
 
@@ -193,6 +181,275 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
         status,
         timed_out,
     })
+}
+
+pub fn wait_for_child_stdout_lines_with_timeout<T, F>(
+    child: Child,
+    timeout: Duration,
+    max_line_bytes: usize,
+    initial: T,
+    on_line: F,
+) -> io::Result<LineCommandOutput<T>>
+where
+    T: Send + 'static,
+    F: FnMut(&mut T, BoundedLine<'_>) -> io::Result<()> + Send + 'static,
+{
+    wait_for_child_stdout_lines_with_timeout_or_cancel(
+        child,
+        timeout,
+        max_line_bytes,
+        DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
+        initial,
+        || false,
+        on_line,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn wait_for_child_stdout_lines_with_timeout_or_cancel<T, F>(
+    mut child: Child,
+    timeout: Duration,
+    max_line_bytes: usize,
+    max_retained_stderr_bytes: usize,
+    initial: T,
+    should_cancel: impl Fn() -> bool,
+    on_line: F,
+) -> io::Result<LineCommandOutput<T>>
+where
+    T: Send + 'static,
+    F: FnMut(&mut T, BoundedLine<'_>) -> io::Result<()> + Send + 'static,
+{
+    let child_pid = child.id();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => return child_setup_error(&mut child, "child process has no stdout"),
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => return child_setup_error(&mut child, "child process has no stderr"),
+    };
+
+    #[cfg(unix)]
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        kill_child_tree(&mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let stdout_handle = spawn_bounded_line_reader(
+        stdout,
+        max_line_bytes,
+        initial,
+        on_line,
+        Arc::clone(&reader_stop),
+    );
+    let stderr_handle =
+        spawn_stoppable_reader(stderr, max_retained_stderr_bytes, Arc::clone(&reader_stop));
+    let status = wait_for_child_and_readers(
+        &mut child,
+        child_pid,
+        timeout,
+        should_cancel,
+        || stdout_handle.is_finished() && stderr_handle.is_finished(),
+        reader_stop.as_ref(),
+    );
+
+    reader_stop.store(true, Ordering::Release);
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| io::Error::other("stdout line reader thread panicked"));
+    let stderr = join_reader(stderr_handle, "stderr");
+    let (status, timed_out) = status?;
+    let stdout = stdout??;
+    let stderr = stderr?;
+
+    Ok(LineCommandOutput {
+        value: stdout.value,
+        stdout_observed_bytes: stdout.observed_bytes,
+        stdout_omitted_bytes: stdout.omitted_bytes,
+        oversized_lines: stdout.oversized_lines,
+        stderr: stderr.bytes,
+        stderr_observed_bytes: stderr.observed_bytes,
+        stderr_omitted_bytes: stderr.omitted_bytes,
+        status,
+        timed_out,
+    })
+}
+
+fn wait_for_child_and_readers(
+    child: &mut Child,
+    child_pid: u32,
+    timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+    readers_finished: impl Fn() -> bool,
+    reader_stop: &AtomicBool,
+) -> io::Result<(ExitStatus, bool)> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let mut status = None;
+
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    status = Some(exit_status);
+                    // Retire the process-group lease while the PID still identifies
+                    // this operation, then release readers held by escaped descendants.
+                    kill_process_group_by_pid(child_pid);
+                    reader_stop.store(true, Ordering::Release);
+                }
+                Err(error) => {
+                    kill_child_tree(child);
+                    let _ = child.wait();
+                    reader_stop.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                Ok(None) => {}
+            }
+        }
+        if let Some(exit_status) = status
+            && readers_finished()
+        {
+            return Ok((exit_status, false));
+        }
+        if should_cancel() {
+            if status.is_none() {
+                kill_child_tree(child);
+                status = Some(child.wait()?);
+            }
+            reader_stop.store(true, Ordering::Release);
+            return Ok((status.expect("cancelled child status"), false));
+        }
+        if Instant::now() >= deadline {
+            if status.is_none() {
+                kill_child_tree(child);
+                status = Some(child.wait()?);
+            }
+            reader_stop.store(true, Ordering::Release);
+            return Ok((status.expect("timed out child status"), true));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+struct BoundedLineRead<T> {
+    value: T,
+    observed_bytes: usize,
+    omitted_bytes: usize,
+    oversized_lines: usize,
+}
+
+fn spawn_bounded_line_reader<R, T, F>(
+    reader: R,
+    max_line_bytes: usize,
+    mut value: T,
+    mut on_line: F,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<BoundedLineRead<T>>>
+where
+    R: Read + Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&mut T, BoundedLine<'_>) -> io::Result<()> + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = StoppableReader { reader, stop };
+        let mut buffer = [0_u8; orca_core::retained_output::RETAINED_OUTPUT_READ_CHUNK_BYTES];
+        let mut line = Vec::with_capacity(max_line_bytes.min(buffer.len()));
+        let mut line_observed_bytes = 0usize;
+        let mut observed_bytes = 0usize;
+        let mut omitted_bytes = 0usize;
+        let mut oversized_lines = 0usize;
+        let mut first_handler_error = None;
+
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            observed_bytes = observed_bytes.saturating_add(read);
+            for &byte in &buffer[..read] {
+                if byte == b'\n' {
+                    finish_bounded_line(
+                        &mut value,
+                        &mut on_line,
+                        &mut line,
+                        line_observed_bytes,
+                        &mut omitted_bytes,
+                        &mut oversized_lines,
+                        &mut first_handler_error,
+                    );
+                    line_observed_bytes = 0;
+                    continue;
+                }
+                line_observed_bytes = line_observed_bytes.saturating_add(1);
+                if line.len() < max_line_bytes {
+                    line.push(byte);
+                }
+            }
+        }
+
+        if line_observed_bytes > 0 {
+            finish_bounded_line(
+                &mut value,
+                &mut on_line,
+                &mut line,
+                line_observed_bytes,
+                &mut omitted_bytes,
+                &mut oversized_lines,
+                &mut first_handler_error,
+            );
+        }
+
+        if let Some(error) = first_handler_error {
+            return Err(error);
+        }
+        Ok(BoundedLineRead {
+            value,
+            observed_bytes,
+            omitted_bytes,
+            oversized_lines,
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_bounded_line<T, F>(
+    value: &mut T,
+    on_line: &mut F,
+    line: &mut Vec<u8>,
+    line_observed_bytes: usize,
+    omitted_bytes: &mut usize,
+    oversized_lines: &mut usize,
+    first_handler_error: &mut Option<io::Error>,
+) where
+    F: FnMut(&mut T, BoundedLine<'_>) -> io::Result<()>,
+{
+    let retained_bytes = line.len();
+    let line_omitted_bytes = line_observed_bytes.saturating_sub(retained_bytes);
+    *omitted_bytes = omitted_bytes.saturating_add(line_omitted_bytes);
+    if line_omitted_bytes > 0 {
+        *oversized_lines = oversized_lines.saturating_add(1);
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    if first_handler_error.is_none()
+        && let Err(error) = on_line(
+            value,
+            BoundedLine {
+                bytes: line,
+                observed_bytes: line_observed_bytes,
+                omitted_bytes: line_omitted_bytes,
+            },
+        )
+    {
+        *first_handler_error = Some(error);
+    }
+    line.clear();
 }
 
 #[cfg(test)]
@@ -231,6 +488,71 @@ mod tests {
         assert!(output.stdout.ends_with(b"TAIL"));
         assert_eq!(output.stderr_observed_bytes, 0);
         assert_eq!(output.stderr_omitted_bytes, 0);
+    }
+
+    #[test]
+    fn bounded_line_reader_caps_newline_free_stdout() {
+        let logical_bytes = 256 * 1024;
+        let retained_bytes = 4096;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("yes x | tr -d '\\n' | head -c {logical_bytes}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        prepare_non_interactive_command(&mut command);
+        let child = command.spawn().expect("spawn noisy child");
+
+        let output = wait_for_child_stdout_lines_with_timeout(
+            child,
+            Duration::from_secs(5),
+            retained_bytes,
+            Vec::new(),
+            |lines, line| {
+                lines.push((line.bytes.to_vec(), line.observed_bytes, line.omitted_bytes));
+                Ok(())
+            },
+        )
+        .expect("collect bounded line");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout_observed_bytes, logical_bytes);
+        assert_eq!(output.stdout_omitted_bytes, logical_bytes - retained_bytes);
+        assert_eq!(output.oversized_lines, 1);
+        assert_eq!(output.value.len(), 1);
+        assert_eq!(output.value[0].0.len(), retained_bytes);
+        assert_eq!(output.value[0].1, logical_bytes);
+        assert_eq!(output.value[0].2, logical_bytes - retained_bytes);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_line_collector_error_still_drains_and_reaps() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("(sleep 5) & printf 'first\\nsecond\\n'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        prepare_non_interactive_command(&mut command);
+        let child = command.spawn().expect("spawn child");
+        let started = Instant::now();
+
+        let error = wait_for_child_stdout_lines_with_timeout(
+            child,
+            Duration::from_millis(200),
+            1024,
+            (),
+            |_, _| Err(io::Error::other("collector rejected line")),
+        )
+        .expect_err("collector error should be returned");
+
+        assert!(error.to_string().contains("collector rejected line"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "collector failure exceeded process deadline: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

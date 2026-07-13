@@ -6,6 +6,9 @@ use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_ou
 use serde::Deserialize;
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
+const MAX_GREP_HEAD_LIMIT: usize = 1_000;
+const MIN_GREP_LINE_BYTES: usize = 8 * 1024;
+const MAX_GREP_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Default, Deserialize)]
 struct GrepArgs {
@@ -43,25 +46,49 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::process::prepare_non_interactive_command(&mut command);
+    let offset = args.offset.unwrap_or(0);
+    let limit = normalized_head_limit(args.head_limit);
+    let collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
+    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
     let output = command.spawn().and_then(|child| {
-        crate::process::wait_for_child_output_with_timeout(child, Duration::from_secs(120))
+        crate::process::wait_for_child_stdout_lines_with_timeout(
+            child,
+            Duration::from_secs(120),
+            max_line_bytes,
+            collector,
+            |collector, line| {
+                collector.push(line);
+                Ok(())
+            },
+        )
     });
 
     match output {
-        Ok(output) if output.status.success() => {
-            let stdout = output.stdout_text();
-            let stdout = paginate_output(
-                stdout.lines().map(String::from).collect::<Vec<_>>(),
-                args.offset.unwrap_or(0),
-                args.head_limit,
-                DEFAULT_GREP_HEAD_LIMIT,
-            );
+        Ok(output) if output.status.success() && !output.timed_out => {
+            let ingress_truncated = output.output_was_omitted();
+            let (stdout, page_truncated) = output.value.render();
             let (stdout, truncated) = truncate_output(stdout, max_bytes);
             let stdout = crate::process::preserve_ingress_omission_notice(
                 stdout,
                 output.stdout_omitted_bytes,
             );
-            ToolResult::completed(request, stdout, output.output_was_omitted() || truncated)
+            ToolResult::completed(
+                request,
+                stdout,
+                ingress_truncated || page_truncated || truncated,
+            )
+        }
+        Ok(output) if output.timed_out => {
+            let stderr = output.stderr_text().trim().to_string();
+            ToolResult::failed(
+                request,
+                if stderr.is_empty() {
+                    "rg timed out after 120s".to_string()
+                } else {
+                    format!("rg timed out after 120s: {stderr}")
+                },
+                output.status.code(),
+            )
         }
         Ok(output) if output.status.code() == Some(1) => ToolResult::completed_kind(
             request,
@@ -85,46 +112,93 @@ fn parse_args(request: &ToolRequest) -> GrepArgs {
         .unwrap_or_default()
 }
 
-fn paginate_output(
-    lines: Vec<String>,
-    offset: usize,
-    head_limit: Option<usize>,
-    default_limit: usize,
-) -> String {
-    if head_limit == Some(0) {
-        return lines.get(offset..).unwrap_or_default().to_vec().join("\n");
+fn normalized_head_limit(head_limit: Option<usize>) -> usize {
+    match head_limit {
+        None | Some(0) => DEFAULT_GREP_HEAD_LIMIT,
+        Some(limit) => limit.min(MAX_GREP_HEAD_LIMIT),
     }
+}
 
-    let total = lines.len();
-    let limit = head_limit.unwrap_or(default_limit);
-    let page = lines
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-    let next_offset = (total.saturating_sub(offset) > limit).then_some(offset + limit);
+struct GrepPageCollector {
+    offset: usize,
+    limit: usize,
+    total_lines: usize,
+    retained_bytes: usize,
+    retained_budget: usize,
+    lines: Vec<String>,
+    selection_truncated: bool,
+}
 
-    let mut output = page.join("\n");
-    if let Some(next_offset) = next_offset {
-        let notice = if offset == 0 {
-            format!("[Showing first {limit} results; use offset={next_offset} to continue]")
-        } else {
-            let end = next_offset.min(total);
-            format!(
-                "[Showing results {}-{} of {total}; use offset={next_offset} to continue]",
-                offset + 1,
-                end
-            )
-        };
-        if output.is_empty() {
-            output = notice;
-        } else {
-            output.push('\n');
-            output.push_str(&notice);
+impl GrepPageCollector {
+    fn new(offset: usize, limit: usize, retained_budget: usize) -> Self {
+        Self {
+            offset,
+            limit,
+            total_lines: 0,
+            retained_bytes: 0,
+            retained_budget,
+            lines: Vec::with_capacity(limit.min(DEFAULT_GREP_HEAD_LIMIT)),
+            selection_truncated: false,
         }
     }
-    output
+
+    fn push(&mut self, line: crate::process::BoundedLine<'_>) {
+        let index = self.total_lines;
+        self.total_lines = self.total_lines.saturating_add(1);
+        if index < self.offset || self.lines.len() >= self.limit {
+            return;
+        }
+
+        let separator_bytes = usize::from(!self.lines.is_empty());
+        let remaining = self
+            .retained_budget
+            .saturating_sub(self.retained_bytes.saturating_add(separator_bytes));
+        if remaining == 0 {
+            self.selection_truncated = true;
+            return;
+        }
+
+        let mut text = String::from_utf8_lossy(line.bytes).to_string();
+        if line.omitted_bytes > 0 {
+            text = crate::process::preserve_ingress_omission_notice(text, line.omitted_bytes);
+        }
+        let (text, truncated) = truncate_output(text, remaining);
+        self.selection_truncated |= truncated || line.omitted_bytes > 0;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(separator_bytes)
+            .saturating_add(text.len());
+        self.lines.push(text);
+    }
+
+    fn render(self) -> (String, bool) {
+        let next_offset = (self.total_lines.saturating_sub(self.offset) > self.limit)
+            .then_some(self.offset.saturating_add(self.limit));
+
+        let mut output = self.lines.join("\n");
+        if let Some(next_offset) = next_offset {
+            let notice = if self.offset == 0 {
+                format!(
+                    "[Showing first {} results; use offset={next_offset} to continue]",
+                    self.limit
+                )
+            } else {
+                let end = next_offset.min(self.total_lines);
+                format!(
+                    "[Showing results {}-{end} of {}; use offset={next_offset} to continue]",
+                    self.offset + 1,
+                    self.total_lines
+                )
+            };
+            if output.is_empty() {
+                output = notice;
+            } else {
+                output.push('\n');
+                output.push_str(&notice);
+            }
+        }
+        (output, self.selection_truncated)
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +293,84 @@ mod tests {
         assert_eq!(
             lines[10],
             "[Showing results 251-260 of 300; use offset=260 to continue]"
+        );
+    }
+
+    #[test]
+    fn grep_zero_head_limit_uses_default_page() {
+        let cwd = temp_dir("grep-zero-limit");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        let contents = (0..300)
+            .map(|index| format!("needle {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(cwd.join("notes.txt"), contents).expect("write fixture");
+        let request = ToolRequest {
+            id: "grep-zero-limit".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: Some("needle".to_string()),
+            raw_arguments: Some(
+                r#"{"pattern":"needle","path":"notes.txt","head_limit":0}"#.to_string(),
+            ),
+        };
+
+        let result = execute(&request, &cwd, 100_000);
+        let lines = result
+            .output
+            .as_deref()
+            .expect("grep output")
+            .lines()
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), DEFAULT_GREP_HEAD_LIMIT + 1);
+        assert!(lines[DEFAULT_GREP_HEAD_LIMIT - 1].contains("needle 249"));
+        assert_eq!(
+            lines[DEFAULT_GREP_HEAD_LIMIT],
+            "[Showing first 250 results; use offset=250 to continue]"
+        );
+    }
+
+    #[test]
+    fn grep_head_limit_is_clamped_to_safety_ceiling() {
+        assert_eq!(normalized_head_limit(Some(usize::MAX)), MAX_GREP_HEAD_LIMIT);
+    }
+
+    #[test]
+    fn grep_paginates_the_complete_stream_before_retention() {
+        let cwd = temp_dir("grep-complete-stream-page");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        let padding = "x".repeat(4096);
+        let contents = (0..500)
+            .map(|index| format!("needle {index:03} {padding}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(cwd.join("notes.txt"), contents).expect("write fixture");
+        let request = ToolRequest {
+            id: "grep-middle-page".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: Some("needle".to_string()),
+            raw_arguments: Some(
+                r#"{"pattern":"needle","path":"notes.txt","offset":240,"head_limit":5}"#
+                    .to_string(),
+            ),
+        };
+
+        let result = execute(&request, &cwd, 100_000);
+        let lines = result
+            .output
+            .as_deref()
+            .expect("grep output")
+            .lines()
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].contains("needle 240"), "first line: {}", lines[0]);
+        assert!(lines[4].contains("needle 244"), "last line: {}", lines[4]);
+        assert_eq!(
+            lines[5],
+            "[Showing results 241-245 of 500; use offset=245 to continue]"
         );
     }
 

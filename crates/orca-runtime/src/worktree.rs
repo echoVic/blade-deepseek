@@ -1,7 +1,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKTREE_GIT_RETAINED_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeOutcome {
@@ -58,30 +62,86 @@ impl WorktreeGuard {
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> io::Result<String> {
-    let output = Command::new("git").current_dir(cwd).args(args).output()?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let output = run_git(cwd, args)?;
+    if output.status.success() && !output.timed_out {
+        Ok(output.stdout_text())
     } else {
         Err(git_error(args, &output))
     }
 }
 
 fn git_status(cwd: &Path, args: &[&str]) -> io::Result<()> {
-    let output = Command::new("git").current_dir(cwd).args(args).output()?;
-    if output.status.success() {
+    let output = run_git(cwd, args)?;
+    if output.status.success() && !output.timed_out {
         Ok(())
     } else {
         Err(git_error(args, &output))
     }
 }
 
-fn git_error(args: &[&str], output: &std::process::Output) -> io::Error {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+fn run_git(cwd: &Path, args: &[&str]) -> io::Result<orca_tools::process::CommandOutput> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    orca_tools::process::prepare_non_interactive_command(&mut command);
+    let child = command.spawn()?;
+    orca_tools::process::wait_for_child_output_with_timeout_or_cancel_and_limit(
+        child,
+        WORKTREE_GIT_TIMEOUT,
+        || false,
+        WORKTREE_GIT_RETAINED_BYTES,
+    )
+}
+
+fn git_error(args: &[&str], output: &orca_tools::process::CommandOutput) -> io::Error {
+    let stderr = output.stderr_text();
+    let stdout = output.stdout_text();
+    let reason = if output.timed_out {
+        format!("timed out after {}s", WORKTREE_GIT_TIMEOUT.as_secs())
+    } else {
+        format!("exited with {}", output.status)
+    };
     io::Error::other(format!(
-        "git {} failed: {}{}",
+        "git {} {reason}: {}{}",
         args.join(" "),
         stdout.trim(),
         stderr.trim()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worktree_git_output_is_bounded_at_ingress() {
+        let repo = tempfile::tempdir().expect("repo");
+        let init = Command::new("git")
+            .arg("init")
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+        assert!(init.success());
+
+        let output = run_git(
+            repo.path(),
+            &[
+                "-c",
+                "alias.noisy=!yes x | tr -d '\\n' | head -c 262144",
+                "noisy",
+            ],
+        )
+        .expect("run noisy git alias");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout_observed_bytes, 262_144);
+        assert_eq!(output.stdout.len(), WORKTREE_GIT_RETAINED_BYTES);
+        assert_eq!(
+            output.stdout_omitted_bytes,
+            262_144 - WORKTREE_GIT_RETAINED_BYTES
+        );
+    }
 }
