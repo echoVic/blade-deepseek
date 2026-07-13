@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.21":
+        "DeepSeek turns that end without visible content or a tool call now receive one bounded semantic recovery request instead of an identical replay. The request-local correction preserves valid tool-call reasoning and tool results, never persists the incomplete response, avoids replaying recovery reasoning already shown in the TUI, and preserves usage reported by both attempts. Foreground budgeted requests use serialized admission and later-turn preflight, while detached completions persist priced usage and redacted diagnostics through the task-correlated background_task.provider_response record without overwriting global session completion. Resume accounting now uses session.usage_baseline, and Goal tokens count input plus output without adding cache hits twice. The release also updates the tag-driven GitHub Actions pipeline to current v5 artifact, checkout, and Node setup actions.",
       "v0.2.20":
         "The TUI now keeps long sessions compact across the full interaction loop. Large pastes stay collapsed in the composer and transcript while the complete prompt reaches the model; Goal objectives and notices, task-plan steps, and tool targets use display-width-aware ellipses; long approval content cannot push decisions away; slash and file menus follow the selected row; and the responsive footer preserves permission mode and context before optional metadata. Permission modes now use blue, violet, red, and teal semantic accents.",
       "v0.2.19":
@@ -494,6 +496,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.21":
+        "DeepSeek turn 如果结束时既没有可见正文也没有工具调用，Orca 现在会发起一次有上限、会改变请求语义的恢复请求，而不是原样重放。临时纠正指令会保留已经有效的 tool-call reasoning 与 tool result，不会把不完整响应写入历史，也不会在 TUI 重复展示已经出现过的 recovery reasoning，并保留两次请求上报的 usage。启用预算时，前台请求会串行准入并在后续 turn 开始前预检；detached completion 则通过任务关联的 background_task.provider_response 持久化定价后的 usage 与脱敏诊断，不会覆盖全局 session completion。恢复会话使用 session.usage_baseline 延续累计核算，Goal token 只计算 input 加 output，不再重复加入 cache hit。本次发布同时把 tag 驱动的 GitHub Actions 流程升级到 v5 的 checkout、artifact 与 Node setup actions。",
       "v0.2.20":
         "TUI 现在会在完整交互链路中控制长内容占用。大段粘贴在输入框和 transcript 中保持折叠，但提交给模型的正文不变；Goal 目标与状态、Task Plan 步骤和工具 target 会按终端显示宽度省略；长审批内容不会再把决策选项挤出；Slash 与文件菜单会跟随当前选择滚动；响应式底栏优先保留权限模式和 context。权限模式分别使用蓝、紫、红、青绿语义色。",
       "v0.2.19":

@@ -75,6 +75,7 @@ pub struct SessionTranscript {
     pub usage: Option<UsageTotals>,
     pub plan: Option<(Option<String>, Vec<PlanItem>)>,
     pub completion_status: Option<String>,
+    pub completion_error: Option<String>,
     pub path: PathBuf,
 }
 
@@ -89,6 +90,18 @@ pub(crate) enum SessionRecord {
     Completed {
         status: String,
         completed_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    #[serde(rename = "background_task.provider_response")]
+    BackgroundTaskProviderResponse {
+        task_id: String,
+        status: String,
+        completed_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<UsageTotals>,
     },
     #[serde(rename = "context.collapsed")]
     ContextCollapsed(CompactionRecord),
@@ -96,6 +109,8 @@ pub(crate) enum SessionRecord {
     ContextSummary(ContextSummaryRecord),
     #[serde(rename = "session.usage")]
     Usage(UsageTotals),
+    #[serde(rename = "session.usage_baseline")]
+    UsageBaseline(UsageTotals),
     #[serde(rename = "plan.state")]
     PlanState {
         explanation: Option<String>,

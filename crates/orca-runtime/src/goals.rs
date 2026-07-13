@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crate::extension::{
     ExtensionData, ExtensionRegistryBuilder, ToolCallOutcome, ToolFinishInput,
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const GOALS_DB_FILENAME: &str = "goals_1.json";
+static GOAL_DB_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct GoalStore {
@@ -169,6 +170,7 @@ impl GoalStore {
         source_session_id: &str,
         resumed_session_id: &str,
     ) -> io::Result<Option<ThreadGoal>> {
+        let _guard = goal_db_mutation_lock();
         let mut db = self.load()?;
         let Some(source) = db.goals.get(source_session_id).cloned() else {
             return Ok(None);
@@ -205,6 +207,7 @@ impl GoalStore {
         status: ThreadGoalStatus,
         token_budget: Option<i64>,
     ) -> io::Result<ThreadGoal> {
+        let _guard = goal_db_mutation_lock();
         validate_thread_goal_objective(objective).map_err(invalid_input)?;
         let mut db = self.load()?;
         let now = now_timestamp();
@@ -228,6 +231,7 @@ impl GoalStore {
         session_id: &str,
         update: GoalUpdate,
     ) -> io::Result<Option<ThreadGoal>> {
+        let _guard = goal_db_mutation_lock();
         let mut db = self.load()?;
         let Some(goal) = db.goals.get_mut(session_id) else {
             return Ok(None);
@@ -252,6 +256,7 @@ impl GoalStore {
     }
 
     pub fn clear(&mut self, session_id: &str) -> io::Result<bool> {
+        let _guard = goal_db_mutation_lock();
         let mut db = self.load()?;
         let removed = db.goals.remove(session_id).is_some();
         if removed {
@@ -266,6 +271,7 @@ impl GoalStore {
         tokens_delta: i64,
         elapsed_delta: i64,
     ) -> io::Result<Option<ThreadGoal>> {
+        let _guard = goal_db_mutation_lock();
         let mut db = self.load()?;
         let Some(goal) = db.goals.get_mut(session_id) else {
             return Ok(None);
@@ -302,6 +308,13 @@ impl GoalStore {
         fs::rename(tmp, &self.path)?;
         Ok(())
     }
+}
+
+fn goal_db_mutation_lock() -> std::sync::MutexGuard<'static, ()> {
+    GOAL_DB_MUTATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 pub fn goals_db_path() -> PathBuf {
@@ -611,6 +624,45 @@ mod tests {
         assert_eq!(replaced.token_budget, Some(60_000));
         assert_eq!(replaced.tokens_used, 0);
         assert_eq!(replaced.time_used_seconds, 0);
+    }
+
+    #[test]
+    fn concurrent_usage_deltas_are_not_lost() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("goals_1.json");
+        let mut store = GoalStore::with_path(path.clone());
+        store
+            .replace(
+                "session-1",
+                "concurrent usage",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut store = GoalStore::with_path(path);
+                barrier.wait();
+                for _ in 0..25 {
+                    store
+                        .account_usage("session-1", 7, 1)
+                        .unwrap()
+                        .expect("goal exists");
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let goal = store.get("session-1").unwrap().unwrap();
+        assert_eq!(goal.tokens_used, 8 * 25 * 7);
+        assert_eq!(goal.time_used_seconds, 8 * 25);
     }
 
     #[test]

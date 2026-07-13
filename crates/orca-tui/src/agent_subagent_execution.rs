@@ -30,6 +30,17 @@ use crate::agent_runner::{
 use crate::agent_tool_execution::execute_tool_for_tui;
 use crate::types::{TuiEvent, UserAction};
 
+pub(crate) fn config_for_remaining_subagent_budget(
+    config: &RunConfig,
+    parent_usage: UsageTotals,
+) -> RunConfig {
+    let mut child_config = config.clone();
+    if let Some(max_budget) = config.max_budget_usd {
+        child_config.max_budget_usd = Some((max_budget - parent_usage.estimated_cost_usd).max(0.0));
+    }
+    child_config
+}
+
 fn send_subagent_task_status_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
@@ -49,6 +60,7 @@ pub(crate) fn should_run_subagent_batch(
     tool_request.name == tool_types::ToolName::Subagent
         && subagent_depth < config.subagents.max_depth
         && config.subagents.max_parallel > 1
+        && config.max_budget_usd.is_none()
         && subagent::create_subagent_request(tool_request).mode == SubagentMode::Sync
 }
 
@@ -283,6 +295,22 @@ pub(crate) fn execute_subagent_for_tui(
     }
 
     if request.mode == SubagentMode::Async {
+        if config.max_budget_usd.is_some() {
+            let error = "async subagents are unavailable while max_budget_usd is active; use sync mode so usage can be admitted and reconciled in the parent turn";
+            send_subagent_completed_for_tui(
+                event_tx,
+                &mut events,
+                &tool_request.id,
+                &description,
+                RunStatus::Failed,
+                None,
+                Some(error),
+            );
+            return (
+                tool_types::ToolResult::failed(tool_request, error, None),
+                CostTracker::new(None),
+            );
+        }
         let Some(task_registry) = task_registry else {
             return (
                 tool_types::ToolResult::failed(
@@ -354,7 +382,7 @@ pub(crate) fn execute_subagent_for_tui(
             &mut events,
             &tool_request.id,
             &description,
-            RunStatus::Failed,
+            child.status,
             child.final_message.as_deref(),
             Some(&error),
         );
@@ -573,7 +601,7 @@ fn child_result_to_tui_tool_result(
             &mut events,
             &tool_request.id,
             description,
-            RunStatus::Failed,
+            child.status,
             child.final_message.as_deref(),
             Some(&error),
         );
@@ -636,6 +664,17 @@ fn run_child_agent_for_tui_observed(
     hooks: &HookRunner,
     observer: Option<&ChildAgentActivityObserver<'_>>,
 ) -> (ChildAgentResult, CostTracker) {
+    let current_child_usage = std::cell::Cell::new(UsageTotals::default());
+    let current_child_usage_ref = &current_child_usage;
+    let current_child_usage_for_tools = &current_child_usage;
+    let tracking_observer = ChildAgentActivityObserver::new(move |activity| {
+        if let ChildAgentActivity::Usage(usage) = activity {
+            current_child_usage_ref.set(*usage);
+        }
+        if let Some(observer) = observer {
+            observer.emit(activity.clone());
+        }
+    });
     run_child_agent_prompt_with_tool_executor_observed(
         config,
         ChildAgentPromptContext {
@@ -648,15 +687,23 @@ fn run_child_agent_for_tui_observed(
             memory,
             hooks,
         },
-        observer,
+        Some(&tracking_observer),
         {
             // Permission grants persist across the child agent's tool calls,
             // mirroring the per-turn overlay in the main TUI loop.
             let permission_overlay =
                 std::cell::RefCell::new(orca_runtime::lifecycle::TurnPermissionOverlay::default());
             move |config, request, tool_context, child_cancel, tool_request| {
+                let budget_config =
+                    (tool_request.name == tool_types::ToolName::Subagent).then(|| {
+                        config_for_remaining_subagent_budget(
+                            config,
+                            current_child_usage_for_tools.get(),
+                        )
+                    });
+                let tool_config = budget_config.as_ref().unwrap_or(config);
                 let (should_stop, result, child_cost) = execute_tool_for_tui(
-                    config,
+                    tool_config,
                     cwd,
                     tool_request,
                     event_tx,

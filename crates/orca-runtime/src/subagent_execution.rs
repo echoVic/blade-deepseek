@@ -98,6 +98,7 @@ pub(crate) fn should_run_subagent_batch(
     tool_request.name == tool_types::ToolName::Subagent
         && subagent_depth < config.subagents.max_depth
         && config.subagents.max_parallel > 1
+        && config.max_budget_usd.is_none()
         && is_batchable_subagent_request(tool_request)
 }
 
@@ -463,6 +464,25 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         return Ok(tool_types::ToolResult::failed(tool_request, error, None));
     }
 
+    if request.mode == SubagentMode::Async && config.max_budget_usd.is_some() {
+        let error = "async subagents are unavailable while max_budget_usd is active; use sync mode so usage can be admitted and reconciled in the parent turn";
+        let failed_task = subagent_lifecycle
+            .finish_task(RunStatus::Failed)
+            .cloned()
+            .unwrap_or_else(|| subagent_task.clone());
+        if emit_deltas {
+            let event = failed_task.attach_to_event(events.subagent_completed(
+                &tool_request.id,
+                &description,
+                RunStatus::Failed,
+                None,
+                Some(error),
+            ));
+            sink.emit(&event)?;
+        }
+        return Ok(tool_types::ToolResult::failed(tool_request, error, None));
+    }
+
     if request.mode == SubagentMode::Async {
         return Ok(launch_async_subagent(AsyncSubagentLaunchContext {
             config,
@@ -525,7 +545,8 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         lifecycle: Some(&mut subagent_lifecycle),
         executor: child_executor,
     });
-    let (child, child_cost_tracker) = run_child_agent(config, &child_request, &mut runtime);
+    let child_config = config_for_remaining_subagent_budget(config, cost_tracker);
+    let (child, child_cost_tracker) = run_child_agent(&child_config, &child_request, &mut runtime);
     drop(runtime);
     let completed_task = subagent_lifecycle
         .finish_task(child.status)
@@ -606,6 +627,18 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
             ))
         }
     }
+}
+
+fn config_for_remaining_subagent_budget(
+    config: &RunConfig,
+    cost_tracker: &CostTracker,
+) -> RunConfig {
+    let mut child_config = config.clone();
+    if let Some(max_budget) = config.max_budget_usd {
+        child_config.max_budget_usd =
+            Some((max_budget - cost_tracker.totals().estimated_cost_usd).max(0.0));
+    }
+    child_config
 }
 
 fn subagent_execution_to_tool_result(
@@ -744,6 +777,7 @@ mod tests {
     use orca_core::event_schema::{EventFactory, RunStatus};
     use orca_core::event_sink::EventSink;
     use orca_core::model::ModelSelection;
+    use orca_core::provider_types::Usage;
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::tool_types;
     use orca_mcp::McpRegistry;
@@ -822,6 +856,37 @@ mod tests {
 
         assert!(super::should_run_subagent_batch(&config, &requests[0], 0));
         assert_eq!(super::collect_subagent_batch(&config, &requests, 0), 1);
+    }
+
+    #[test]
+    fn budget_mode_disables_parallel_subagent_batching() {
+        let subagents = SubagentConfig {
+            max_parallel: 3,
+            ..SubagentConfig::default()
+        };
+        let mut config = config(subagents);
+        config.max_budget_usd = Some(1.0);
+        let requests = [subagent_request("a"), subagent_request("b")];
+
+        assert!(!super::should_run_subagent_batch(&config, &requests[0], 0));
+    }
+
+    #[test]
+    fn sync_subagent_receives_only_remaining_aggregate_budget() {
+        let mut config = config(SubagentConfig::default());
+        config.max_budget_usd = Some(0.5);
+        let mut cost_tracker = CostTracker::new(None);
+        cost_tracker.add_usage(Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_tokens: 0,
+        });
+
+        let child_config = super::config_for_remaining_subagent_budget(&config, &cost_tracker);
+
+        let remaining = child_config.max_budget_usd.expect("remaining budget");
+        assert!((remaining - 0.36).abs() < 1e-12);
+        assert_eq!(config.max_budget_usd, Some(0.5));
     }
 
     #[test]
@@ -923,6 +988,15 @@ mod tests {
         })
     }
 
+    fn unexpected_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        panic!("budget-rejected async subagent must not start a child executor")
+    }
+
     #[test]
     fn sync_subagent_uses_injected_child_executor() {
         let cwd = tempfile::tempdir().expect("temp cwd");
@@ -975,5 +1049,62 @@ mod tests {
                 .unwrap_or_default()
                 .contains("injected child result")
         );
+    }
+
+    #[test]
+    fn budget_mode_rejects_async_subagent_before_task_launch() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut config = config(SubagentConfig::default());
+        config.max_budget_usd = Some(1.0);
+        let mut events = EventFactory::new("subagent-budget-async".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "inspect later",
+                    "prompt": "inspect later",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+            ..subagent_request("budget-async")
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-budget-async".to_string());
+
+        let result = super::execute_subagent_tool(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            true,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            unexpected_child_executor::<Vec<u8>>,
+        )
+        .expect("budget-rejected subagent tool");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("max_budget_usd is active"))
+        );
+        assert!(task_registry.list().is_empty());
+        assert_eq!(cost_tracker.totals(), Default::default());
     }
 }

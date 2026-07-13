@@ -865,7 +865,18 @@ mod tests {
     fn automatic_compaction_completes_after_persistence_and_post_hook() {
         let temp = tempfile::tempdir().expect("tempdir");
         let history_path = temp.path().join("session.jsonl");
-        fs::write(&history_path, "").expect("seed history file");
+        let meta = crate::history::create_meta(temp.path(), "mock", None, "compaction order");
+        let mut meta_record = serde_json::to_value(meta)
+            .expect("serialize history metadata")
+            .as_object()
+            .cloned()
+            .expect("history metadata object");
+        meta_record.insert("type".to_string(), serde_json::json!("session.meta"));
+        fs::write(
+            &history_path,
+            format!("{}\n", serde_json::Value::Object(meta_record)),
+        )
+        .expect("seed history file");
         let completed_marker = temp.path().join("completed.marker");
         let hook_command = format!("test ! -e '{}'", completed_marker.display());
         let hooks = HookRunner::new(vec![HookConfig {

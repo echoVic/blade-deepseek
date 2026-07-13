@@ -140,6 +140,24 @@ impl ToolTurnOutcome {
     }
 }
 
+fn subagent_budget_exhaustion_error(
+    config: &RunConfig,
+    tool_request: &ToolRequest,
+    cost_tracker: &CostTracker,
+) -> Option<String> {
+    if tool_request.name != orca_core::tool_types::ToolName::Subagent {
+        return None;
+    }
+    let max_budget = config.max_budget_usd?;
+    let totals = cost_tracker.totals();
+    (totals.estimated_cost_usd > max_budget).then(|| {
+        format!(
+            "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
+            totals.estimated_cost_usd, max_budget
+        )
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn terminal_tool_turn(status: RunStatus, error: Option<String>) -> ToolTurnOutcome {
     ToolTurnOutcome::from_terminal(status, error)
@@ -358,7 +376,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         events,
         sink,
         conversation,
-        history_writer,
+        mut history_writer,
         cost_tracker,
         background_workflows,
     } = io;
@@ -378,6 +396,12 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         user_input_handler,
         mcp_elicitation_handler,
     } = interactions;
+    if let Some(error) = subagent_budget_exhaustion_error(config, tool_request, cost_tracker) {
+        return Ok(ToolTurnOutcome::Return {
+            status: RunStatus::BudgetExhausted,
+            error: Some(error),
+        });
+    }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
@@ -405,10 +429,32 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         workflow_child_executor,
     )?;
 
+    if let Some(error) = subagent_budget_exhaustion_error(config, tool_request, cost_tracker) {
+        let totals = cost_tracker.totals();
+        if emit_deltas {
+            sink.emit(&events.usage_updated(totals))?;
+            if let Some(writer) = history_writer.as_deref_mut() {
+                writer.append_usage(totals)?;
+            }
+        }
+        sampling_state.record_normal_tool_result(
+            conversation,
+            history_writer.as_deref_mut(),
+            tool_request,
+            &result,
+            status,
+            emit_deltas,
+        )?;
+        return Ok(ToolTurnOutcome::Return {
+            status: RunStatus::BudgetExhausted,
+            error: Some(error),
+        });
+    }
+
     sampling_state
         .record_normal_tool_result(
             conversation,
-            history_writer,
+            history_writer.as_deref_mut(),
             tool_request,
             &result,
             status,
@@ -432,6 +478,7 @@ mod tests {
     use orca_core::event_sink::EventSink;
     use orca_core::external_config::ExternalToolConfig;
     use orca_core::model::ModelSelection;
+    use orca_core::provider_types::Usage;
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
     use serde_json::json;
@@ -506,6 +553,25 @@ mod tests {
         _child_cost_tracker: &mut CostTracker,
     ) -> io::Result<ChildAgentResult> {
         panic!("read_file turn must not execute child agents")
+    }
+
+    fn budget_crossing_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        assert_eq!(request.prompt, "first child");
+        child_cost_tracker.add_usage(Usage {
+            input_tokens: 10_000_000,
+            output_tokens: 0,
+            cache_tokens: 0,
+        });
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("first child completed".to_string()),
+            error: None,
+        })
     }
 
     #[test]
@@ -915,6 +981,152 @@ mod tests {
             ToolTurnOutcome::Continue => panic!("disallowed child tool should end the turn"),
         }
         assert!(conversation.messages.is_empty());
+    }
+
+    #[test]
+    fn sequential_subagents_stop_after_first_child_crosses_budget() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.max_budget_usd = Some(1.0);
+        let subagent_request = |id: &str, prompt: &str| ToolRequest {
+            id: id.to_string(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: Some(prompt.to_string()),
+            raw_arguments: Some(
+                json!({
+                    "description": prompt,
+                    "prompt": prompt
+                })
+                .to_string(),
+            ),
+        };
+        let requests = [
+            subagent_request("child-1", "first child"),
+            subagent_request("child-2", "second child"),
+        ];
+        let mut events = EventFactory::new("sequential-subagent-budget".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("sequential-subagent-budget".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            executors: RuntimeToolTurnsExecutors {
+                child_executor: budget_crossing_child_executor::<Vec<u8>>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        })
+        .expect("run sequential subagent turns");
+
+        match outcome {
+            ToolTurnOutcome::Return { status, error } => {
+                assert_eq!(status, RunStatus::BudgetExhausted);
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("budget exhausted"))
+                );
+            }
+            ToolTurnOutcome::Continue => panic!("budget crossing must stop the tool turn"),
+        }
+        assert_eq!(cost_tracker.totals().input_tokens, 10_000_000);
+        assert!(cost_tracker.totals().estimated_cost_usd > 1.0);
+        assert!(matches!(
+            conversation.messages.as_slice(),
+            [Message::Tool { tool_call_id, .. }] if tool_call_id == "child-1"
+        ));
+        let output = String::from_utf8(sink.writer_mut().clone()).expect("jsonl is utf8");
+        assert_eq!(output.matches("\"type\":\"usage.updated\"").count(), 1);
+
+        let admission_outcome = run_normal_tool_turn(RuntimeNormalToolTurnContext {
+            sampling_state: &mut sampling_state,
+            request: RuntimeNormalToolTurnRequest {
+                config: &config,
+                cwd: cwd.path(),
+                tool_request: &requests[1],
+                subagent_depth: 0,
+                emit_deltas: false,
+                policy: &policy,
+            },
+            io: RuntimeNormalToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            services: RuntimeNormalToolTurnServices {
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &mcp_registry,
+                hooks: &hooks,
+            },
+            runtime: RuntimeNormalToolTurnRuntime {
+                cancel: &cancel,
+                task_registry: &task_registry,
+                workflow_ipc: None,
+            },
+            interactions: RuntimeNormalToolTurnInteractions {
+                permission_handler: None,
+                user_input_handler: None,
+                mcp_elicitation_handler: None,
+            },
+            extensions: None,
+            executors: RuntimeNormalToolTurnExecutors {
+                child_executor: unused_child_executor::<Vec<u8>>,
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+            },
+        })
+        .expect("reject already exhausted child admission");
+
+        assert!(matches!(
+            admission_outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::BudgetExhausted,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -735,6 +735,7 @@ mod tests {
             usage: None,
             plan: None,
             completion_status: None,
+            completion_error: None,
             path: cwd.join("bad-tool-boundary.jsonl"),
         };
 
@@ -773,6 +774,7 @@ mod tests {
             usage: None,
             plan: None,
             completion_status: None,
+            completion_error: None,
             path: cwd.join("reasoning-only.jsonl"),
         };
 
@@ -793,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn load_session_preserves_latest_completion_status() {
+    fn load_session_preserves_latest_completion_status_and_redacted_error() {
         let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
@@ -803,11 +805,18 @@ mod tests {
 
         let result = (|| {
             let cwd = std::env::current_dir()?;
-            let mut writer = SessionWriter::start(&cwd, "mock", None, "interrupted turn")?;
-            writer.complete("interrupted")?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "failed turn")?;
+            writer.complete_with_error(
+                "failed",
+                Some("DeepSeek provider error: api_key=super-secret"),
+            )?;
             let transcript = load_session("latest")?;
 
-            assert_eq!(transcript.completion_status.as_deref(), Some("interrupted"));
+            assert_eq!(transcript.completion_status.as_deref(), Some("failed"));
+            assert_eq!(
+                transcript.completion_error.as_deref(),
+                Some("DeepSeek provider error: api_key=<redacted>")
+            );
             Ok::<(), io::Error>(())
         })();
 
@@ -818,7 +827,7 @@ mod tests {
                 std::env::remove_var(ORCA_HOME_ENV);
             }
         }
-        result.expect("completion status restored from history");
+        result.expect("completion status and error restored from history");
     }
 
     #[test]

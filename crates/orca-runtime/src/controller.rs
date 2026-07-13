@@ -587,6 +587,7 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
             AgentToolPolicyContext::unrestricted(),
         )?;
         let status = result.status;
+        let completion_error = result.error;
         lifecycle.finish_task(status);
         observe_background_workflows(
             request.options().wait_for_background_workflows,
@@ -595,7 +596,7 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
             &mut background_workflows,
         )?;
         let status = run_verifier_if_needed(status, config.verifier.as_deref(), events, &mut sink)?;
-        session.complete(status.as_str());
+        session.complete_with_error(status.as_str(), completion_error.as_deref());
         if request.emit_session_completed() {
             sink.emit(&events.session_completed(status))?;
         }
@@ -645,6 +646,7 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         AgentToolPolicyContext::unrestricted(),
     )?;
     let status = result.status;
+    let completion_error = result.error;
     lifecycle.finish_task(status);
     observe_background_workflows(
         request.options().wait_for_background_workflows,
@@ -658,7 +660,7 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         &mut execution.events,
         &mut execution.sink,
     )?;
-    session.complete(status.as_str());
+    session.complete_with_error(status.as_str(), completion_error.as_deref());
     if request.emit_session_completed() {
         execution
             .sink
@@ -851,6 +853,68 @@ mod tests {
             desktop_notifications: false,
             auto_memory: false,
         }
+    }
+
+    fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("temp ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        let result = f(home.path());
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        result
+    }
+
+    fn assert_controller_failure_persists_error(use_event_factory: bool) {
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.history_mode = HistoryMode::Record;
+            config.output_format = OutputFormat::Jsonl;
+            let mut thread = RuntimeThread::start(&config, "provider failure").expect("thread");
+            let thread_id = thread.thread_id().to_string();
+            let request = ThreadTurnRequest::new("mock_provider_error");
+            let mut output = Vec::new();
+
+            let status = if use_event_factory {
+                let mut events = EventFactory::new(thread_id.clone());
+                thread.run_request_with_event_factory(&config, &request, &mut output, &mut events)
+            } else {
+                thread.run_request(&config, &request, &mut output)
+            }
+            .expect("provider failure completes the turn");
+
+            assert_eq!(status, RunStatus::Failed);
+            assert_eq!(
+                thread.session().completion_error(),
+                Some("mock provider error: api_key=super-secret")
+            );
+            let transcript =
+                crate::history::load_session(&thread_id).expect("failed session transcript");
+            assert_eq!(
+                transcript.completion_error.as_deref(),
+                Some("mock provider error: api_key=<redacted>")
+            );
+            let persisted = std::fs::read_to_string(&transcript.path).expect("session JSONL");
+            assert!(!persisted.contains("super-secret"));
+        });
+    }
+
+    #[test]
+    fn controller_default_path_persists_redacted_provider_error() {
+        assert_controller_failure_persists_error(false);
+    }
+
+    #[test]
+    fn controller_event_factory_path_persists_redacted_provider_error() {
+        assert_controller_failure_persists_error(true);
     }
 
     fn subagent_request(id: &str) -> tool_types::ToolRequest {

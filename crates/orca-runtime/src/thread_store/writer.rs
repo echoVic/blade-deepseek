@@ -134,18 +134,50 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     let mut messages = Vec::new();
     let mut compactions = Vec::new();
     let mut summaries = Vec::new();
-    let mut usage = None;
+    let mut usage_baseline = UsageTotals::default();
+    let mut foreground_usage = None;
+    let mut background_usage = UsageTotals::default();
+    let mut has_usage_baseline = false;
+    let mut has_background_usage = false;
     let mut last_plan: Option<(Option<String>, Vec<PlanItem>)> = None;
     let mut completion_status = None;
+    let mut completion_error = None;
 
     for record in records {
         match record {
             SessionRecord::Meta(m) => meta = Some(m),
             SessionRecord::Message { message } => messages.push(message.into()),
-            SessionRecord::Completed { status, .. } => completion_status = Some(status),
+            SessionRecord::Completed { status, error, .. } => {
+                completion_status = Some(status);
+                completion_error = error;
+            }
+            SessionRecord::BackgroundTaskProviderResponse {
+                usage: Some(record),
+                ..
+            } => {
+                background_usage.input_tokens = background_usage
+                    .input_tokens
+                    .saturating_add(record.input_tokens);
+                background_usage.output_tokens = background_usage
+                    .output_tokens
+                    .saturating_add(record.output_tokens);
+                background_usage.cache_tokens = background_usage
+                    .cache_tokens
+                    .saturating_add(record.cache_tokens);
+                background_usage.estimated_cost_usd += record.estimated_cost_usd;
+                has_background_usage = true;
+            }
+            SessionRecord::BackgroundTaskProviderResponse { usage: None, .. } => {}
             SessionRecord::ContextCollapsed(record) => compactions.push(record),
             SessionRecord::ContextSummary(record) => summaries.push(record),
-            SessionRecord::Usage(record) => usage = Some(record),
+            SessionRecord::Usage(record) => foreground_usage = Some(record),
+            SessionRecord::UsageBaseline(record) => {
+                usage_baseline = record;
+                foreground_usage = None;
+                background_usage = UsageTotals::default();
+                has_usage_baseline = true;
+                has_background_usage = false;
+            }
             SessionRecord::PlanState { explanation, plan } => {
                 let all_done = !plan.is_empty()
                     && plan.iter().all(|item| item.status == PlanStatus::Completed);
@@ -164,6 +196,12 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
             format!("missing session metadata in {}", path.display()),
         )
     })?;
+    let has_foreground_usage = foreground_usage.is_some();
+    let mut aggregate_usage = usage_baseline;
+    add_usage_totals(&mut aggregate_usage, foreground_usage.unwrap_or_default());
+    add_usage_totals(&mut aggregate_usage, background_usage);
+    let usage = (has_usage_baseline || has_foreground_usage || has_background_usage)
+        .then_some(aggregate_usage);
 
     Ok(SessionTranscript {
         meta,
@@ -173,6 +211,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         usage,
         plan: last_plan,
         completion_status,
+        completion_error,
         path: path.to_path_buf(),
     })
 }
@@ -192,7 +231,24 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
             }
         }
         SessionRecord::Message { message } => redact_stored_message(message),
-        SessionRecord::Completed { status, .. } => redact_string_in_place(status),
+        SessionRecord::Completed { status, error, .. } => {
+            redact_string_in_place(status);
+            if let Some(error) = error {
+                redact_string_in_place(error);
+            }
+        }
+        SessionRecord::BackgroundTaskProviderResponse {
+            task_id,
+            status,
+            error,
+            ..
+        } => {
+            redact_string_in_place(task_id);
+            redact_string_in_place(status);
+            if let Some(error) = error {
+                redact_string_in_place(error);
+            }
+        }
         SessionRecord::ContextCollapsed(_) => {}
         SessionRecord::ContextSummary(record) => {
             redact_string_in_place(&mut record.summary);
@@ -205,7 +261,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
                 }
             }
         }
-        SessionRecord::Usage(_) => {}
+        SessionRecord::Usage(_) | SessionRecord::UsageBaseline(_) => {}
         SessionRecord::PlanState { explanation, plan } => {
             if let Some(explanation) = explanation {
                 redact_string_in_place(explanation);
@@ -216,6 +272,13 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         }
     }
     redacted
+}
+
+fn add_usage_totals(totals: &mut UsageTotals, usage: UsageTotals) {
+    totals.input_tokens = totals.input_tokens.saturating_add(usage.input_tokens);
+    totals.output_tokens = totals.output_tokens.saturating_add(usage.output_tokens);
+    totals.cache_tokens = totals.cache_tokens.saturating_add(usage.cache_tokens);
+    totals.estimated_cost_usd += usage.estimated_cost_usd;
 }
 
 fn redact_stored_message(message: &mut StoredMessage) {
@@ -246,7 +309,7 @@ fn redact_string_in_place(value: &mut String) {
     *value = redact_sensitive_text(value);
 }
 
-fn redact_sensitive_text(value: &str) -> String {
+pub(crate) fn redact_sensitive_text(value: &str) -> String {
     redact_standalone_secret_tokens(&redact_keyed_secret_values(value))
 }
 
@@ -514,6 +577,7 @@ impl SessionWriter {
         // make the whole transcript undecodable, so a compressed session must
         // be restored to plaintext before it can be continued.
         let path = restore_plaintext_transcript(path)?;
+        append_usage_baseline(&path)?;
         Ok(Self { path })
     }
 
@@ -549,11 +613,35 @@ impl SessionWriter {
     }
 
     pub fn complete(&mut self, status: &str) -> io::Result<()> {
+        self.complete_with_error(status, None)
+    }
+
+    pub fn complete_with_error(&mut self, status: &str, error: Option<&str>) -> io::Result<()> {
         write_record(
             &self.path,
             &SessionRecord::Completed {
                 status: status.to_string(),
                 completed_at: Utc::now(),
+                error: error.map(str::to_string),
+            },
+        )
+    }
+
+    pub fn append_background_task_provider_response(
+        &mut self,
+        task_id: &str,
+        status: &str,
+        error: Option<&str>,
+        usage: Option<UsageTotals>,
+    ) -> io::Result<()> {
+        write_record(
+            &self.path,
+            &SessionRecord::BackgroundTaskProviderResponse {
+                task_id: task_id.to_string(),
+                status: status.to_string(),
+                completed_at: Utc::now(),
+                error: error.map(str::to_string),
+                usage,
             },
         )
     }
@@ -620,5 +708,165 @@ impl SessionWriter {
         plan: Vec<PlanItem>,
     ) -> io::Result<()> {
         write_record(&self.path, &SessionRecord::PlanState { explanation, plan })
+    }
+}
+
+fn append_usage_baseline(path: &Path) -> io::Result<()> {
+    let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+    lock_file(&file)?;
+    let result = (|| {
+        let Some(usage) = read_transcript(path)?.usage else {
+            return Ok(());
+        };
+        write_record_line(&mut file, &SessionRecord::UsageBaseline(usage))?;
+        file.flush()
+    })();
+    let unlock_result = unlock_file(&file);
+    result.and(unlock_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_core::approval_rules::PermissionRules;
+
+    fn usage(input_tokens: u64, output_tokens: u64, cache_tokens: u64, cost: f64) -> UsageTotals {
+        UsageTotals {
+            input_tokens,
+            output_tokens,
+            cache_tokens,
+            estimated_cost_usd: cost,
+        }
+    }
+
+    fn assert_usage(actual: UsageTotals, expected: UsageTotals) {
+        assert_eq!(actual.input_tokens, expected.input_tokens);
+        assert_eq!(actual.output_tokens, expected.output_tokens);
+        assert_eq!(actual.cache_tokens, expected.cache_tokens);
+        assert!(
+            (actual.estimated_cost_usd - expected.estimated_cost_usd).abs() < 1e-12,
+            "expected cost {}, got {}",
+            expected.estimated_cost_usd,
+            actual.estimated_cost_usd
+        );
+    }
+
+    fn new_transcript() -> (tempfile::TempDir, PathBuf, SessionWriter) {
+        let directory = tempfile::tempdir().expect("temporary transcript directory");
+        let path = directory.path().join("resume-usage.jsonl");
+        let meta = SessionMeta {
+            schema_version: 1,
+            session_id: "resume-usage".to_string(),
+            cwd: directory.path().display().to_string(),
+            provider: "mock".to_string(),
+            model: None,
+            title: "resume usage".to_string(),
+            created_at: Utc::now(),
+            parent_id: None,
+            forked: false,
+            approval_mode: None,
+            active_permission_profile: None,
+            runtime_workspace_roots: Vec::new(),
+            permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
+            network_domain_permissions: Default::default(),
+        };
+        write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");
+        let writer = SessionWriter { path: path.clone() };
+        (directory, path, writer)
+    }
+
+    fn aggregate_usage(path: &Path) -> UsageTotals {
+        read_transcript(path)
+            .expect("read transcript")
+            .usage
+            .expect("aggregate usage")
+    }
+
+    fn seed_foreground_and_background(writer: &mut SessionWriter) {
+        writer
+            .append_usage(usage(100, 20, 40, 0.10))
+            .expect("write initial foreground usage");
+        writer
+            .append_background_task_provider_response(
+                "background-1",
+                "success",
+                None,
+                Some(usage(30, 10, 15, 0.05)),
+            )
+            .expect("write background usage");
+    }
+
+    #[test]
+    fn legacy_transcript_without_baseline_keeps_background_usage() {
+        let (_directory, path, mut writer) = new_transcript();
+        seed_foreground_and_background(&mut writer);
+        writer
+            .append_usage(usage(140, 25, 50, 0.13))
+            .expect("update foreground snapshot");
+
+        assert_usage(aggregate_usage(&path), usage(170, 35, 65, 0.18));
+    }
+
+    #[test]
+    fn usage_baseline_accumulates_later_background_delta() {
+        let (_directory, path, mut initial) = new_transcript();
+        seed_foreground_and_background(&mut initial);
+
+        let mut resumed = SessionWriter::append_to_existing(path.clone()).expect("resume writer");
+        resumed
+            .append_background_task_provider_response(
+                "background-2",
+                "success",
+                None,
+                Some(usage(20, 5, 8, 0.03)),
+            )
+            .expect("write resumed background usage");
+
+        assert_usage(aggregate_usage(&path), usage(150, 35, 63, 0.18));
+    }
+
+    #[test]
+    fn usage_baseline_uses_latest_resumed_foreground_snapshot() {
+        let (_directory, path, mut initial) = new_transcript();
+        seed_foreground_and_background(&mut initial);
+
+        let mut resumed = SessionWriter::append_to_existing(path.clone()).expect("resume writer");
+        resumed
+            .append_usage(usage(50, 8, 20, 0.04))
+            .expect("write resumed foreground usage");
+        resumed
+            .append_usage(usage(80, 12, 30, 0.07))
+            .expect("update resumed foreground snapshot");
+
+        assert_usage(aggregate_usage(&path), usage(210, 42, 85, 0.22));
+    }
+
+    #[test]
+    fn multiple_resumes_roll_forward_each_aggregate_baseline_once() {
+        let (_directory, path, mut initial) = new_transcript();
+        seed_foreground_and_background(&mut initial);
+
+        let mut first_resume =
+            SessionWriter::append_to_existing(path.clone()).expect("first resume writer");
+        first_resume
+            .append_usage(usage(80, 12, 30, 0.07))
+            .expect("write first resumed foreground usage");
+
+        let mut second_resume =
+            SessionWriter::append_to_existing(path.clone()).expect("second resume writer");
+        second_resume
+            .append_usage(usage(20, 4, 7, 0.02))
+            .expect("write second resumed foreground usage");
+
+        assert_usage(aggregate_usage(&path), usage(230, 46, 92, 0.24));
+        assert_eq!(
+            read_records(&path)
+                .expect("read records")
+                .iter()
+                .filter(|record| matches!(record, SessionRecord::UsageBaseline(_)))
+                .count(),
+            2
+        );
     }
 }

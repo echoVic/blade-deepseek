@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EVENT_SCHEMA_VERSION, EventEnvelope, EventFactory, EventType};
 use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
@@ -26,13 +27,15 @@ use orca_runtime::controller::ThreadTurnRequest;
 use orca_runtime::hooks::{HookContext, conversation_with_hook_context};
 use orca_runtime::memory;
 use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
+use orca_runtime::tasks::MainSessionTerminalUpdate;
 
 use crate::agent_subagent_execution::{
-    collect_subagent_batch, execute_subagent_batch_for_tui, should_run_subagent_batch,
+    collect_subagent_batch, config_for_remaining_subagent_budget, execute_subagent_batch_for_tui,
+    should_run_subagent_batch,
 };
 use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_for_tui};
 use crate::agent_workflow_execution::execute_workflow_for_tui;
-use crate::bridge::TuiConversationSession;
+use crate::bridge::{TuiBudgetAdmission, TuiConversationSession, TuiUsageLedger};
 use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::types::{PendingWorkflowNotification, TuiEvent, UserAction};
 
@@ -303,6 +306,95 @@ fn provider_response_status(response: &ProviderResponse) -> &'static str {
     }
 }
 
+fn provider_response_error(response: &ProviderResponse) -> Option<String> {
+    response.steps.iter().find_map(|step| match step {
+        ProviderStep::Error(error) => Some(error.clone()),
+        _ => None,
+    })
+}
+
+fn provider_response_usage_totals(
+    response: &ProviderResponse,
+    model: Option<&str>,
+) -> Option<orca_core::cost_types::UsageTotals> {
+    let usage = response.usage.filter(|usage| !usage.is_empty())?;
+    let mut tracker = orca_runtime::cost::CostTracker::new(model);
+    Some(tracker.add_usage(usage))
+}
+
+fn usage_budget_error(
+    totals: orca_core::cost_types::UsageTotals,
+    max_budget_usd: Option<f64>,
+) -> Option<String> {
+    let max_budget = max_budget_usd?;
+    (totals.estimated_cost_usd > max_budget).then(|| {
+        format!(
+            "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
+            totals.estimated_cost_usd, max_budget
+        )
+    })
+}
+
+fn persist_merged_usage(
+    session: &mut TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    usage: orca_core::cost_types::UsageTotals,
+) -> orca_core::cost_types::UsageTotals {
+    let totals = session.record_external_usage(usage);
+    send_runtime_event_as_tui(event_tx, events.usage_updated(totals));
+    let foreground_totals = session.runtime_session().usage_totals();
+    if let Some(writer) = session.writer_mut() {
+        let _ = writer.append_usage(foreground_totals);
+    }
+    totals
+}
+
+fn finish_budget_exhausted_after_usage(
+    session: &mut TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    task_id: &str,
+    totals: orca_core::cost_types::UsageTotals,
+    max_budget_usd: Option<f64>,
+) -> Option<TuiAgentTurnResult> {
+    let error = usage_budget_error(totals, max_budget_usd)?;
+    send_error_for_tui(event_tx, events, &error);
+    send_session_completed_for_tui(
+        event_tx,
+        events,
+        orca_core::event_schema::RunStatus::BudgetExhausted,
+    );
+    finish_main_session_task_with_error_for_tui(
+        session,
+        event_tx,
+        events,
+        task_id,
+        "budget_exhausted",
+        Some(&error),
+    );
+    session.complete_with_error("budget_exhausted", &error);
+    Some(TuiAgentTurnResult::new("budget_exhausted"))
+}
+
+fn usage_totals_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens),
+        estimated_cost_usd: (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0),
+    }
+}
+
+fn add_usage_totals(base: UsageTotals, delta: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: base.input_tokens.saturating_add(delta.input_tokens),
+        output_tokens: base.output_tokens.saturating_add(delta.output_tokens),
+        cache_tokens: base.cache_tokens.saturating_add(delta.cache_tokens),
+        estimated_cost_usd: base.estimated_cost_usd + delta.estimated_cost_usd,
+    }
+}
+
 fn provider_response_pending_tool_call(
     response: &ProviderResponse,
 ) -> Option<PendingToolCallSummary> {
@@ -336,17 +428,50 @@ fn provider_response_pending_tool_call(
         })
 }
 
-fn spawn_background_provider_completion(
-    provider_rx: Receiver<ProviderStreamEvent>,
+struct BackgroundProviderCompletionContext {
     task_registry: orca_runtime::tasks::TaskRegistry,
+    history_writer: Option<orca_runtime::history::SessionWriter>,
+    model: Option<String>,
+    usage_ledger: TuiUsageLedger,
+    budget_admission: Option<TuiBudgetAdmission>,
+    max_budget_usd: Option<f64>,
     event_tx: Sender<TuiEvent>,
     run_id: String,
     task_id: String,
+    completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TuiBackgroundTurnCompletion {
+    pub(crate) usage: Option<UsageTotals>,
+}
+
+pub(crate) type TuiBackgroundTurnCompletionHandler =
+    Box<dyn FnOnce(TuiBackgroundTurnCompletion) + Send>;
+
+fn spawn_background_provider_completion(
+    provider_rx: Receiver<ProviderStreamEvent>,
+    context: BackgroundProviderCompletionContext,
 ) {
+    let BackgroundProviderCompletionContext {
+        task_registry,
+        mut history_writer,
+        model,
+        usage_ledger,
+        budget_admission: _budget_admission,
+        max_budget_usd,
+        event_tx,
+        run_id,
+        task_id,
+        completion_handler,
+    } = context;
     thread::spawn(move || {
         let mut status = "failed";
         let mut pending_tool_call = None;
         let mut pending_provider_response = None;
+        let mut failure_error = None;
+        let mut usage = None;
+        let mut usage_totals = None;
         let mut buffered_steps = Vec::new();
         let mut events = EventFactory::new(run_id);
         while let Ok(event) = provider_rx.recv() {
@@ -365,6 +490,16 @@ fn spawn_background_provider_completion(
                 }
                 ProviderStreamEvent::Done(response) => {
                     status = provider_response_status(&response);
+                    failure_error = provider_response_error(&response);
+                    usage = provider_response_usage_totals(&response, model.as_deref());
+                    if let Some(usage) = usage {
+                        let totals = usage_ledger.add(usage);
+                        usage_totals = Some(totals);
+                        if let Some(error) = usage_budget_error(totals, max_budget_usd) {
+                            status = "budget_exhausted";
+                            failure_error = Some(error);
+                        }
+                    }
                     pending_tool_call = provider_response_pending_tool_call(&response);
                     if status == "approval_required" {
                         pending_provider_response = Some(response);
@@ -375,38 +510,55 @@ fn spawn_background_provider_completion(
         }
         let pending_tool_name = pending_tool_call
             .as_ref()
-            .map(|pending_tool_call| pending_tool_call.name.as_str());
-        let foregrounded = background_task_is_foregrounded(&task_registry, &task_id);
+            .map(|pending_tool_call| pending_tool_call.name.clone());
+        let failure_message = failure_error.clone().unwrap_or_else(|| status.to_string());
 
-        let result = match status {
-            "success" => task_registry.complete(&task_id, status.to_string()),
-            "approval_required" => match pending_provider_response {
-                Some(response) => task_registry.approval_required_for_pending_provider_response(
-                    &task_id,
-                    status.to_string(),
-                    response,
-                ),
-                None => task_registry.approval_required_for_pending_tool(
-                    &task_id,
-                    status.to_string(),
-                    pending_tool_call.clone(),
-                ),
+        if let Some(totals) = usage_totals {
+            send_runtime_event_as_tui(&event_tx, events.usage_updated(totals));
+        }
+
+        let terminal_update = match status {
+            "success" => MainSessionTerminalUpdate::Completed {
+                result: status.to_string(),
             },
-            _ => task_registry.fail(&task_id, status.to_string()),
+            "approval_required" => MainSessionTerminalUpdate::ApprovalRequired {
+                summary: status.to_string(),
+                pending_tool_call,
+                pending_provider_response,
+            },
+            _ => MainSessionTerminalUpdate::Failed {
+                error: failure_message.clone(),
+            },
         };
-        if result.is_ok() {
+        let result =
+            task_registry.apply_main_session_terminal_update(&task_id, terminal_update, usage);
+        if let Some(writer) = &mut history_writer {
+            let error = failure_error.as_deref();
+            if let Err(error) =
+                writer.append_background_task_provider_response(&task_id, status, error, usage)
+            {
+                eprintln!("orca: warning: background provider history write failed: {error}");
+            }
+        }
+        if let Some(completion_handler) = completion_handler {
+            completion_handler(TuiBackgroundTurnCompletion { usage });
+        }
+        if let Ok(transition) = result {
             if let Some(updated_task) = task_summary_for_tui(&task_registry, &task_id) {
                 send_task_status_updated_for_tui(&event_tx, &mut events, &updated_task);
             }
-        }
-        if foregrounded {
-            forward_foregrounded_background_steps(&event_tx, &mut events, &mut buffered_steps);
-            send_session_completed_status_for_tui(&event_tx, &mut events, status);
-        } else {
-            let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
-                status,
-                pending_tool_name,
-            )));
+            if transition.is_backgrounded {
+                let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
+                    status,
+                    pending_tool_name.as_deref(),
+                )));
+            } else {
+                forward_foregrounded_background_steps(&event_tx, &mut events, &mut buffered_steps);
+                if let Some(error) = failure_error.as_deref() {
+                    send_error_for_tui(&event_tx, &mut events, error);
+                }
+                send_session_completed_status_for_tui(&event_tx, &mut events, status);
+            }
         }
     });
 }
@@ -498,6 +650,12 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
     let task_id = continuation.task_id();
+    let task_usage_before = session
+        .task_registry()
+        .get(task_id)
+        .and_then(|task| task.usage)
+        .unwrap_or_default();
+    let runtime_usage_before = session.runtime_usage_totals();
     let runtime_continuation =
         match orca_runtime::background_turn::take_approved_background_turn_continuation(
             session.task_registry(),
@@ -540,24 +698,40 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     ) {
         Ok(status) => status,
         Err(error) => {
-            send_error_for_tui(event_tx, &mut runtime_events, &error.to_string());
+            let error = error.to_string();
+            let task_usage = add_usage_totals(
+                task_usage_before,
+                usage_totals_delta(runtime_usage_before, session.runtime_usage_totals()),
+            );
+            send_error_for_tui(event_tx, &mut runtime_events, &error);
             send_session_completed_for_tui(
                 event_tx,
                 &mut runtime_events,
                 orca_core::event_schema::RunStatus::Failed,
             );
-            finish_main_session_task_for_tui(
+            finish_main_session_task_with_error_and_usage_for_tui(
                 session,
                 event_tx,
                 &mut runtime_events,
                 task_id,
                 "failed",
+                Some(&error),
+                Some(task_usage),
             );
-            session.complete("failed");
+            session.complete_with_error("failed", &error);
             return TuiAgentTurnResult::new("failed");
         }
     };
     let status = status.as_str();
+    let task_usage = add_usage_totals(
+        task_usage_before,
+        usage_totals_delta(runtime_usage_before, session.runtime_usage_totals()),
+    );
+    send_runtime_event_as_tui(
+        event_tx,
+        runtime_events.usage_updated(session.usage_totals()),
+    );
+    let completion_error = session.completion_error().map(str::to_string);
 
     if status == "success"
         && let Some(notification) =
@@ -568,14 +742,15 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             &mut runtime_events,
             orca_core::event_schema::RunStatus::Success,
         );
-        finish_main_session_task_for_tui(
+        finish_main_session_task_with_error_and_usage_for_tui(
             session,
             event_tx,
             &mut runtime_events,
             task_id,
             "success",
+            None,
+            Some(task_usage),
         );
-        session.complete("success");
         return TuiAgentTurnResult::with_continuation(
             "success",
             TuiAgentTurnContinuation::WorkflowNotification(notification),
@@ -583,8 +758,27 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     }
 
     send_session_completed_status_for_tui(event_tx, &mut runtime_events, status);
-    finish_main_session_task_for_tui(session, event_tx, &mut runtime_events, task_id, status);
-    session.complete(status);
+    if let Some(error) = completion_error.as_deref() {
+        finish_main_session_task_with_error_and_usage_for_tui(
+            session,
+            event_tx,
+            &mut runtime_events,
+            task_id,
+            status,
+            Some(error),
+            Some(task_usage),
+        );
+    } else {
+        finish_main_session_task_with_error_and_usage_for_tui(
+            session,
+            event_tx,
+            &mut runtime_events,
+            task_id,
+            status,
+            None,
+            Some(task_usage),
+        );
+    }
     TuiAgentTurnResult::new(status)
 }
 
@@ -595,7 +789,38 @@ fn finish_main_session_task_for_tui(
     task_id: &str,
     status: &str,
 ) {
-    let usage = Some(session.usage_totals());
+    finish_main_session_task_with_error_for_tui(session, event_tx, events, task_id, status, None);
+}
+
+fn finish_main_session_task_with_error_for_tui(
+    session: &mut TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    task_id: &str,
+    status: &str,
+    error: Option<&str>,
+) {
+    let usage = session.usage_totals();
+    finish_main_session_task_with_error_and_usage_for_tui(
+        session,
+        event_tx,
+        events,
+        task_id,
+        status,
+        error,
+        Some(usage),
+    );
+}
+
+fn finish_main_session_task_with_error_and_usage_for_tui(
+    session: &mut TuiConversationSession,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    task_id: &str,
+    status: &str,
+    error: Option<&str>,
+    usage: Option<UsageTotals>,
+) {
     let result = match status {
         "success" => {
             session
@@ -603,9 +828,11 @@ fn finish_main_session_task_for_tui(
                 .complete_with_usage(task_id, status.to_string(), usage)
         }
         "interrupted" | "cancelled" => session.task_registry().stop(task_id, status.to_string()),
-        _ => session
-            .task_registry()
-            .fail_with_usage(task_id, status.to_string(), usage),
+        _ => session.task_registry().fail_with_usage(
+            task_id,
+            error.unwrap_or(status).to_string(),
+            usage,
+        ),
     };
     if result.is_ok() {
         if let Some(finished_task) = task_summary_for_tui(session.task_registry(), task_id) {
@@ -857,6 +1084,7 @@ pub fn run_agent_for_tui(
         None,
         true,
         None,
+        None,
     )
     .status
 }
@@ -873,6 +1101,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     task_description: Option<&str>,
     backtrack_target: bool,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
+    background_completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
 ) -> TuiAgentTurnResult {
     let cwd = config
         .cwd
@@ -902,18 +1131,6 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     let policy = ApprovalPolicy::new(config.approval_mode)
         .with_permission_rules(config.permission_rules.clone());
     let mut permission_overlay = orca_runtime::lifecycle::TurnPermissionOverlay::default();
-    session.replace_skill_context(agent_common::explicit_skill_context(&cwd, prompt));
-    if backtrack_target {
-        session.conversation_mut().add_user(prompt.to_string());
-    } else {
-        session
-            .conversation_mut()
-            .add_user_pinned(prompt.to_string());
-    }
-    if let Some(message) = session.conversation().messages.last().cloned() {
-        session.append_message(&message);
-    }
-
     let mut turn: u32 = 0;
     let mut tui_compaction = orca_runtime::TuiAgentTurnCompactionState::new();
     let mut runtime_events = EventFactory::new(
@@ -929,6 +1146,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         task_description.unwrap_or(prompt),
     );
     let mut main_session_backgrounded = false;
+    let mut background_completion_handler = background_completion_handler;
+    let mut provider_budget_admission = None;
     poll_background_current_turn_for_tui(
         session,
         event_tx,
@@ -938,6 +1157,35 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         &main_session_task_id,
         &mut main_session_backgrounded,
     );
+    if let Some(error) = usage_budget_error(session.usage_totals(), config.max_budget_usd) {
+        send_error_for_tui(event_tx, &mut runtime_events, &error);
+        send_session_completed_for_tui(
+            event_tx,
+            &mut runtime_events,
+            orca_core::event_schema::RunStatus::BudgetExhausted,
+        );
+        finish_main_session_task_with_error_for_tui(
+            session,
+            event_tx,
+            &mut runtime_events,
+            &main_session_task_id,
+            "budget_exhausted",
+            Some(&error),
+        );
+        session.complete_with_error("budget_exhausted", &error);
+        return TuiAgentTurnResult::new("budget_exhausted");
+    }
+    session.replace_skill_context(agent_common::explicit_skill_context(&cwd, prompt));
+    if backtrack_target {
+        session.conversation_mut().add_user(prompt.to_string());
+    } else {
+        session
+            .conversation_mut()
+            .add_user_pinned(prompt.to_string());
+    }
+    if let Some(message) = session.conversation().messages.last().cloned() {
+        session.append_message(&message);
+    }
 
     loop {
         turn += 1;
@@ -1046,19 +1294,65 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     &mut runtime_events,
                     orca_core::event_schema::RunStatus::Failed,
                 );
-                finish_main_session_task_for_tui(
+                finish_main_session_task_with_error_for_tui(
                     session,
                     event_tx,
                     &mut runtime_events,
                     &main_session_task_id,
                     "failed",
+                    Some(&error),
                 );
-                session.complete("failed");
+                session.complete_with_error("failed", &error);
                 return TuiAgentTurnResult::new("failed");
             }
         };
         let model_conversation =
             conversation_with_hook_context(session.conversation(), &pre_model_outcome);
+
+        if provider_budget_admission.is_none() {
+            provider_budget_admission = match session
+                .usage_ledger()
+                .admit_budgeted_request(config.max_budget_usd, cancel)
+            {
+                Ok(admission) => Some(admission),
+                Err(crate::bridge::TuiBudgetAdmissionError::BudgetExhausted(totals)) => {
+                    let error = usage_budget_error(totals, config.max_budget_usd)
+                        .unwrap_or_else(|| "budget exhausted".to_string());
+                    send_error_for_tui(event_tx, &mut runtime_events, &error);
+                    send_session_completed_for_tui(
+                        event_tx,
+                        &mut runtime_events,
+                        orca_core::event_schema::RunStatus::BudgetExhausted,
+                    );
+                    finish_main_session_task_with_error_for_tui(
+                        session,
+                        event_tx,
+                        &mut runtime_events,
+                        &main_session_task_id,
+                        "budget_exhausted",
+                        Some(&error),
+                    );
+                    session.complete_with_error("budget_exhausted", &error);
+                    return TuiAgentTurnResult::new("budget_exhausted");
+                }
+                Err(crate::bridge::TuiBudgetAdmissionError::Cancelled) => {
+                    send_session_completed_for_tui(
+                        event_tx,
+                        &mut runtime_events,
+                        orca_core::event_schema::RunStatus::Cancelled,
+                    );
+                    finish_main_session_task_for_tui(
+                        session,
+                        event_tx,
+                        &mut runtime_events,
+                        &main_session_task_id,
+                        "cancelled",
+                    );
+                    session.complete("cancelled");
+                    return TuiAgentTurnResult::new("cancelled");
+                }
+            };
+        }
 
         let mut emitted_message_delta = false;
         let mut stream_events = EventFactory::new(runtime_events.run_id().to_string());
@@ -1153,12 +1447,22 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             }
 
             if main_session_backgrounded {
+                let history_writer = session.writer_mut().map(|writer| writer.clone());
+                let usage_ledger = session.usage_ledger();
                 spawn_background_provider_completion(
                     provider_rx,
-                    session.task_registry().clone(),
-                    event_tx.clone(),
-                    runtime_events.run_id().to_string(),
-                    main_session_task_id.clone(),
+                    BackgroundProviderCompletionContext {
+                        task_registry: session.task_registry().clone(),
+                        history_writer,
+                        model: Some(route_decision.actual_model.clone()),
+                        usage_ledger,
+                        budget_admission: provider_budget_admission.take(),
+                        max_budget_usd: config.max_budget_usd,
+                        event_tx: event_tx.clone(),
+                        run_id: runtime_events.run_id().to_string(),
+                        task_id: main_session_task_id.clone(),
+                        completion_handler: background_completion_handler.take(),
+                    },
                 );
                 return TuiAgentTurnResult::new("backgrounded");
             }
@@ -1186,38 +1490,32 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         if let Some(usage) = response.usage
             && !usage.is_empty()
         {
-            let totals = session.cost_tracker_mut().add_usage(usage);
+            let totals = session.record_provider_usage(usage);
             send_runtime_event_as_tui(event_tx, runtime_events.usage_updated(totals));
+            let history_totals = session.runtime_session().usage_totals();
             if let Some(writer) = session.writer_mut() {
-                let _ = writer.append_usage(totals);
+                let _ = writer.append_usage(history_totals);
             }
-            if let Some(max_budget) = config.max_budget_usd
-                && totals.estimated_cost_usd > max_budget
-            {
-                send_error_for_tui(
-                    event_tx,
-                    &mut runtime_events,
-                    &format!(
-                        "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
-                        totals.estimated_cost_usd, max_budget
-                    ),
-                );
+            if let Some(error) = usage_budget_error(totals, config.max_budget_usd) {
+                send_error_for_tui(event_tx, &mut runtime_events, &error);
                 send_session_completed_for_tui(
                     event_tx,
                     &mut runtime_events,
                     orca_core::event_schema::RunStatus::BudgetExhausted,
                 );
-                finish_main_session_task_for_tui(
+                finish_main_session_task_with_error_for_tui(
                     session,
                     event_tx,
                     &mut runtime_events,
                     &main_session_task_id,
                     "budget_exhausted",
+                    Some(&error),
                 );
-                session.complete("budget_exhausted");
+                session.complete_with_error("budget_exhausted", &error);
                 return TuiAgentTurnResult::new("budget_exhausted");
             }
         }
+        provider_budget_admission = None;
 
         if cancel.is_cancelled() {
             send_session_completed_for_tui(
@@ -1264,14 +1562,15 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     &mut runtime_events,
                     orca_core::event_schema::RunStatus::Failed,
                 );
-                finish_main_session_task_for_tui(
+                finish_main_session_task_with_error_for_tui(
                     session,
                     event_tx,
                     &mut runtime_events,
                     &main_session_task_id,
                     "failed",
+                    Some(&error),
                 );
-                session.complete("failed");
+                session.complete_with_error("failed", &error);
                 return TuiAgentTurnResult::new("failed");
             }
             Err(error) => {
@@ -1399,7 +1698,28 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     if let Some(turn_extension_id) = turn_extension_id.as_deref() {
                         record_tui_goal_tool_finish(session, turn_extension_id, &result);
                     }
-                    session.cost_tracker_mut().merge(&child_cost);
+                    let child_usage = child_cost.totals();
+                    if child_usage.total_tokens() > 0
+                        || child_usage.cache_tokens > 0
+                        || child_usage.estimated_cost_usd > 0.0
+                    {
+                        let totals = persist_merged_usage(
+                            session,
+                            event_tx,
+                            &mut runtime_events,
+                            child_usage,
+                        );
+                        if let Some(result) = finish_budget_exhausted_after_usage(
+                            session,
+                            event_tx,
+                            &mut runtime_events,
+                            &main_session_task_id,
+                            totals,
+                            config.max_budget_usd,
+                        ) {
+                            return result;
+                        }
+                    }
                     let result_content = agent_common::format_tool_result_for_model(&result);
                     session
                         .conversation_mut()
@@ -1479,8 +1799,11 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             }
 
             let tool_request = &tool_requests[index];
+            let child_budget_config = (tool_request.name == tool_types::ToolName::Subagent)
+                .then(|| config_for_remaining_subagent_budget(config, session.usage_totals()));
+            let tool_config = child_budget_config.as_ref().unwrap_or(config);
             let (should_stop, result, child_cost) = execute_tool_for_tui(
-                config,
+                tool_config,
                 &cwd,
                 tool_request,
                 event_tx,
@@ -1501,7 +1824,31 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             );
 
             if let Some(c) = child_cost {
-                session.cost_tracker_mut().merge(&c);
+                let child_usage = c.totals();
+                if child_usage.total_tokens() > 0
+                    || child_usage.cache_tokens > 0
+                    || child_usage.estimated_cost_usd > 0.0
+                {
+                    let totals =
+                        persist_merged_usage(session, event_tx, &mut runtime_events, child_usage);
+                    if let Some(turn_result) = finish_budget_exhausted_after_usage(
+                        session,
+                        event_tx,
+                        &mut runtime_events,
+                        &main_session_task_id,
+                        totals,
+                        config.max_budget_usd,
+                    ) {
+                        let result_content = agent_common::format_tool_result_for_model(&result);
+                        session
+                            .conversation_mut()
+                            .add_tool_result(tool_request.id.clone(), result_content);
+                        if let Some(message) = session.conversation().messages.last().cloned() {
+                            session.append_message(&message);
+                        }
+                        return turn_result;
+                    }
+                }
             }
 
             if let Some(turn_extension_id) = turn_extension_id.as_deref() {
@@ -1610,8 +1957,9 @@ fn record_tui_goal_tool_finish(
 mod tests {
     use super::*;
     use crate::agent_subagent_execution::{
-        collect_subagent_batch, execute_subagent_batch_for_tui, execute_subagent_for_tui,
-        execute_subagent_status_for_tui, run_child_agent_for_tui_silent, should_run_subagent_batch,
+        collect_subagent_batch, config_for_remaining_subagent_budget,
+        execute_subagent_batch_for_tui, execute_subagent_for_tui, execute_subagent_status_for_tui,
+        run_child_agent_for_tui_silent, should_run_subagent_batch,
     };
     use crate::agent_tool_execution::{canonical_action_for_tool, execute_tool_for_tui};
     use orca_runtime::hooks::HookRunner;
@@ -1629,6 +1977,24 @@ mod tests {
     use orca_core::model::ModelSelection;
     use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
     use orca_runtime::workflow::host::WorkflowHost;
+
+    fn with_isolated_orca_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().expect("temp ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        let result = f(home.path());
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        result
+    }
 
     fn config() -> RunConfig {
         RunConfig {
@@ -1692,6 +2058,359 @@ mod tests {
             approval_mode: ApprovalMode::FullAuto,
             ..config()
         }
+    }
+
+    #[test]
+    fn tui_surface_error_preserves_redacted_failure_diagnostics() {
+        with_isolated_orca_home(|home| {
+            let mut config = config();
+            config.history_mode = HistoryMode::Record;
+            let mut session =
+                TuiConversationSession::new_with_preloaded(&config, "provider failure", None)
+                    .expect("session");
+            let session_id = session.session_id().expect("session id").to_string();
+            let (event_tx, event_rx) = mpsc::channel();
+            let (_action_tx, action_rx) = mpsc::channel();
+            let cancel = CancelToken::new();
+            let error = "mock provider error: api_key=super-secret";
+
+            let status = run_agent_for_tui(
+                &config,
+                &mut session,
+                "mock_provider_error",
+                &event_tx,
+                &action_rx,
+                &cancel,
+                false,
+            );
+
+            assert_eq!(status, "failed");
+            assert!(
+                event_rx
+                    .try_iter()
+                    .any(|event| matches!(event, TuiEvent::Error(message) if message == error))
+            );
+            let task = session
+                .task_registry()
+                .list()
+                .into_iter()
+                .find(|task| task.task_type == TaskType::MainSession)
+                .expect("main session task");
+            assert_eq!(task.status, TaskStatus::Failed);
+            assert_eq!(task.error.as_deref(), Some(error));
+
+            let transcript =
+                orca_runtime::history::load_session("latest").expect("failed session transcript");
+            assert_eq!(
+                transcript.completion_error.as_deref(),
+                Some("mock provider error: api_key=<redacted>")
+            );
+            let tasks_path = home
+                .join("task-sessions")
+                .join(session_id)
+                .join("tasks.json");
+            let persisted_tasks = std::fs::read_to_string(tasks_path).expect("persisted tasks");
+            assert!(!persisted_tasks.contains("super-secret"));
+            assert!(persisted_tasks.contains("api_key=<redacted>"));
+        });
+    }
+
+    #[test]
+    fn background_provider_failure_preserves_error() {
+        with_isolated_orca_home(|home| {
+            let mut config = config();
+            config.history_mode = HistoryMode::Record;
+            let mut session =
+                TuiConversationSession::new_with_preloaded(&config, "background failure", None)
+                    .expect("session");
+            let session_id = session.session_id().expect("session id").to_string();
+            let registry = session.task_registry().clone();
+            let history_writer = session.writer_mut().map(|writer| writer.clone());
+            let task = registry.create_main_session("Provider failure".to_string());
+            registry.mark_running(&task.id).unwrap();
+            registry.mark_backgrounded(&task.id).unwrap();
+            let (event_tx, event_rx) = mpsc::channel();
+            let (provider_tx, provider_rx) = mpsc::channel();
+            let error = "DeepSeek provider error: api_key=super-secret";
+
+            spawn_background_provider_completion(
+                provider_rx,
+                BackgroundProviderCompletionContext {
+                    task_registry: registry.clone(),
+                    history_writer,
+                    model: Some(orca_core::model::FLASH_MODEL.to_string()),
+                    usage_ledger: TuiUsageLedger::default(),
+                    budget_admission: None,
+                    max_budget_usd: None,
+                    event_tx,
+                    run_id: session_id.clone(),
+                    task_id: task.id.clone(),
+                    completion_handler: None,
+                },
+            );
+            session.complete("success");
+            provider_tx
+                .send(ProviderStreamEvent::Done(ProviderResponse {
+                    steps: vec![ProviderStep::Error(error.to_string())],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(orca_core::provider_types::Usage {
+                        input_tokens: 120,
+                        output_tokens: 30,
+                        cache_tokens: 10,
+                    }),
+                }))
+                .unwrap();
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    event
+                        if task_update_matches(&event, |task| {
+                            task.status == TaskStatus::Failed
+                        }) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            let record = registry.get(&task.id).unwrap();
+            assert_eq!(record.error.as_deref(), Some(error));
+            let usage = record.usage.expect("background failure usage");
+            assert_eq!(usage.input_tokens, 120);
+            assert_eq!(usage.output_tokens, 30);
+            assert_eq!(usage.cache_tokens, 10);
+            assert!(usage.estimated_cost_usd > 0.0);
+            let transcript =
+                orca_runtime::history::load_session(&session_id).expect("background transcript");
+            assert_eq!(transcript.completion_status.as_deref(), Some("success"));
+            assert_eq!(transcript.completion_error, None);
+            let transcript_usage = transcript.usage.expect("background transcript usage");
+            assert_eq!(transcript_usage.input_tokens, 120);
+            assert_eq!(transcript_usage.output_tokens, 30);
+            assert_eq!(transcript_usage.cache_tokens, 10);
+            assert!(transcript_usage.estimated_cost_usd > 0.0);
+            let persisted_session =
+                std::fs::read_to_string(&transcript.path).expect("persisted session");
+            assert_eq!(
+                persisted_session
+                    .lines()
+                    .filter(|line| line.contains("\"type\":\"session.completed\""))
+                    .count(),
+                1
+            );
+            let background_record = persisted_session
+                .lines()
+                .find(|line| line.contains("\"type\":\"background_task.provider_response\""))
+                .expect("task-correlated background provider response");
+            assert!(background_record.contains("DeepSeek provider error: api_key=<redacted>"));
+            assert!(!background_record.contains("super-secret"));
+            assert!(background_record.contains("\"input_tokens\":120"));
+            let tasks_path = home
+                .join("task-sessions")
+                .join(session_id)
+                .join("tasks.json");
+            let persisted_tasks = std::fs::read_to_string(tasks_path).expect("persisted tasks");
+            assert!(!persisted_tasks.contains("super-secret"));
+            assert!(persisted_tasks.contains("api_key=<redacted>"));
+        });
+    }
+
+    #[test]
+    fn approved_background_failure_preserves_controller_error() {
+        with_isolated_orca_home(|_| {
+            let mut config = config();
+            config.history_mode = HistoryMode::Record;
+            let mut session =
+                TuiConversationSession::new_with_preloaded(&config, "approved failure", None)
+                    .expect("session");
+            let session_id = session.session_id().expect("session id").to_string();
+            session
+                .conversation_mut()
+                .add_user("mock_provider_error".to_string());
+            let user_message = session
+                .conversation()
+                .messages
+                .last()
+                .cloned()
+                .expect("user message");
+            session.append_message(&user_message);
+
+            let registry = session.task_registry().clone();
+            let task = registry.create_main_session("Provider failure".to_string());
+            registry.mark_running(&task.id).unwrap();
+            registry.mark_backgrounded(&task.id).unwrap();
+            let tool_request = tool_types::ToolRequest {
+                id: "mock-tool-1".to_string(),
+                name: tool_types::ToolName::TaskList,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            };
+            let raw_tool_call = orca_core::conversation::RawToolCall {
+                id: tool_request.id.clone(),
+                function_name: tool_request.name.as_str().to_string(),
+                arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+            };
+            registry
+                .approval_required_for_pending_provider_response(
+                    &task.id,
+                    "approval_required".to_string(),
+                    ProviderResponse {
+                        steps: vec![ProviderStep::ToolCall(tool_request)],
+                        assistant_content: Some("I need task state.".to_string()),
+                        assistant_reasoning: Some("Inspect tasks.".to_string()),
+                        tool_calls: vec![raw_tool_call],
+                        usage: None,
+                    },
+                )
+                .unwrap();
+            registry
+                .submit_pending_tool_approval_response(&task.id, true)
+                .unwrap();
+
+            let (event_tx, _event_rx) = mpsc::channel();
+            let (_action_tx, action_rx) = mpsc::channel();
+            let pending_actions = RefCell::new(VecDeque::new());
+            let result = continue_approved_background_turn_for_tui(
+                &config,
+                &mut session,
+                &TuiBackgroundTurnContinuationRequest::new(task.id.clone()),
+                &event_tx,
+                &action_rx,
+                &pending_actions,
+                &CancelToken::new(),
+                None,
+            );
+
+            assert_eq!(result.status, "failed");
+            assert_eq!(
+                registry.get(&task.id).unwrap().error.as_deref(),
+                Some("mock provider error: api_key=super-secret")
+            );
+            let transcript =
+                orca_runtime::history::load_session(&session_id).expect("continued transcript");
+            assert_eq!(
+                transcript.completion_error.as_deref(),
+                Some("mock provider error: api_key=<redacted>")
+            );
+            let persisted =
+                std::fs::read_to_string(&transcript.path).expect("continued session JSONL");
+            assert_eq!(
+                persisted
+                    .lines()
+                    .filter(|line| line.contains("\"type\":\"session.completed\""))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn approved_background_continuation_adds_task_local_usage_exactly_once() {
+        with_isolated_orca_home(|_| {
+            let mut config = full_auto_config();
+            config.history_mode = HistoryMode::Record;
+            let mut session = TuiConversationSession::new_with_preloaded(
+                &config,
+                "approved task-local usage",
+                None,
+            )
+            .expect("session");
+            session.record_external_usage(UsageTotals {
+                input_tokens: 10_000,
+                output_tokens: 1_000,
+                cache_tokens: 8_000,
+                estimated_cost_usd: 1.0,
+            });
+
+            let registry = session.task_registry().clone();
+            let task = registry.create_main_session("Usage child".to_string());
+            registry.mark_running(&task.id).unwrap();
+            registry.mark_backgrounded(&task.id).unwrap();
+            let initial_task_usage = UsageTotals {
+                input_tokens: 40,
+                output_tokens: 10,
+                cache_tokens: 30,
+                estimated_cost_usd: 0.01,
+            };
+            session.usage_ledger().add(initial_task_usage);
+            let tool_request = tool_types::ToolRequest {
+                id: "usage-child-1".to_string(),
+                name: tool_types::ToolName::Subagent,
+                action: orca_core::approval_types::ActionKind::Agent,
+                target: Some("usage child".to_string()),
+                raw_arguments: Some(
+                    serde_json::json!({
+                        "description": "usage child",
+                        "prompt": "mock_usage"
+                    })
+                    .to_string(),
+                ),
+            };
+            let raw_tool_call = orca_core::conversation::RawToolCall {
+                id: tool_request.id.clone(),
+                function_name: tool_request.name.as_str().to_string(),
+                arguments: tool_request.raw_arguments.clone().unwrap(),
+            };
+            registry
+                .approval_required_for_pending_provider_response_with_usage(
+                    &task.id,
+                    "approval_required".to_string(),
+                    ProviderResponse {
+                        steps: vec![ProviderStep::ToolCall(tool_request)],
+                        assistant_content: None,
+                        assistant_reasoning: Some("Delegate usage work.".to_string()),
+                        tool_calls: vec![raw_tool_call],
+                        usage: None,
+                    },
+                    Some(initial_task_usage),
+                )
+                .unwrap();
+            registry
+                .submit_pending_tool_approval_response(&task.id, true)
+                .unwrap();
+
+            let (event_tx, _event_rx) = mpsc::channel();
+            let (_action_tx, action_rx) = mpsc::channel();
+            let pending_actions = RefCell::new(VecDeque::new());
+            let request = TuiBackgroundTurnContinuationRequest::new(task.id.clone());
+            let result = continue_approved_background_turn_for_tui(
+                &config,
+                &mut session,
+                &request,
+                &event_tx,
+                &action_rx,
+                &pending_actions,
+                &CancelToken::new(),
+                None,
+            );
+
+            assert_eq!(result.status, "success");
+            let task_usage = registry
+                .get(&task.id)
+                .and_then(|task| task.usage)
+                .expect("continued task usage");
+            assert_eq!(task_usage.input_tokens, 160);
+            assert_eq!(task_usage.output_tokens, 40);
+            assert_eq!(task_usage.cache_tokens, 40);
+            assert_ne!(task_usage, session.usage_totals());
+
+            let duplicate = continue_approved_background_turn_for_tui(
+                &config,
+                &mut session,
+                &request,
+                &event_tx,
+                &action_rx,
+                &pending_actions,
+                &CancelToken::new(),
+                None,
+            );
+            assert_eq!(duplicate.status, "failed");
+            assert_eq!(registry.get(&task.id).unwrap().usage, Some(task_usage));
+        });
     }
 
     fn task_update_matches(
@@ -1843,6 +2562,7 @@ mod tests {
             usage: None,
             plan: None,
             completion_status: None,
+            completion_error: None,
             path: transcript_path,
         };
 
@@ -2503,6 +3223,7 @@ mod tests {
             None,
             true,
             Some(&pending_notifications),
+            None,
         );
 
         assert_eq!(result.status, "success");
@@ -2551,6 +3272,7 @@ mod tests {
             None,
             true,
             Some(&pending_notifications),
+            None,
         );
 
         assert_eq!(result.status, "success");
@@ -2791,10 +3513,18 @@ mod tests {
         };
         spawn_background_provider_completion(
             provider_rx,
-            registry.clone(),
-            event_tx,
-            "run-background-response".to_string(),
-            task.id.clone(),
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: Some(orca_core::model::FLASH_MODEL.to_string()),
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-response".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
         );
         provider_tx
             .send(ProviderStreamEvent::Done(ProviderResponse {
@@ -2802,7 +3532,11 @@ mod tests {
                 assistant_content: Some("I need task_list.".to_string()),
                 assistant_reasoning: Some("Need task state.".to_string()),
                 tool_calls: Vec::new(),
-                usage: None,
+                usage: Some(orca_core::provider_types::Usage {
+                    input_tokens: 80,
+                    output_tokens: 20,
+                    cache_tokens: 5,
+                }),
             }))
             .unwrap();
 
@@ -2839,6 +3573,14 @@ mod tests {
             Some("mock-tool-1")
         );
         assert_eq!(continuation.response.steps.len(), 1);
+        let usage = registry
+            .get(&task.id)
+            .and_then(|record| record.usage)
+            .expect("approval-required response usage");
+        assert_eq!(usage.input_tokens, 80);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_tokens, 5);
+        assert!(usage.estimated_cost_usd > 0.0);
     }
 
     #[test]
@@ -2852,10 +3594,18 @@ mod tests {
         let (provider_tx, provider_rx) = mpsc::channel();
         spawn_background_provider_completion(
             provider_rx,
-            registry.clone(),
-            event_tx,
-            "run-background-foreground".to_string(),
-            task.id.clone(),
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: None,
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-foreground".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
         );
         provider_tx
             .send(ProviderStreamEvent::Step(ProviderStep::MessageDelta(
@@ -2880,7 +3630,11 @@ mod tests {
                 assistant_content: Some("now visible".to_string()),
                 assistant_reasoning: None,
                 tool_calls: Vec::new(),
-                usage: None,
+                usage: Some(orca_core::provider_types::Usage {
+                    input_tokens: 60,
+                    output_tokens: 15,
+                    cache_tokens: 4,
+                }),
             }))
             .unwrap();
         let completed_status = loop {
@@ -2890,6 +3644,382 @@ mod tests {
             }
         };
         assert_eq!(completed_status, "success");
+        let usage = registry
+            .get(&task.id)
+            .and_then(|record| record.usage)
+            .expect("successful background response usage");
+        assert_eq!(usage.input_tokens, 60);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.cache_tokens, 4);
+        assert!(usage.estimated_cost_usd > 0.0);
+    }
+
+    #[test]
+    fn foregrounded_background_provider_failure_emits_error_before_completion() {
+        let registry = TaskRegistry::new("session-background-failure".to_string());
+        let task = registry.create_main_session("Provider failure".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (provider_tx, provider_rx) = mpsc::channel();
+        spawn_background_provider_completion(
+            provider_rx,
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: None,
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-failure".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
+        );
+        registry.mark_foregrounded(&task.id).unwrap();
+        let provider_error = "DeepSeek provider error: empty assistant response";
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: vec![ProviderStep::Error(provider_error.to_string())],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            }))
+            .unwrap();
+
+        let mut observed_error = false;
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                TuiEvent::Error(message) => {
+                    assert_eq!(message, provider_error);
+                    observed_error = true;
+                }
+                TuiEvent::SessionCompleted { status } => {
+                    assert_eq!(status, "failed");
+                    assert!(
+                        observed_error,
+                        "provider error must be emitted before session completion"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn background_provider_invokes_completion_handler_exactly_once() {
+        let registry = TaskRegistry::new("session-background-goal-usage".to_string());
+        let task = registry.create_main_session("Goal response".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (provider_tx, provider_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        spawn_background_provider_completion(
+            provider_rx,
+            BackgroundProviderCompletionContext {
+                task_registry: registry,
+                history_writer: None,
+                model: Some(orca_core::model::FLASH_MODEL.to_string()),
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-goal-usage".to_string(),
+                task_id: task.id,
+                completion_handler: Some(Box::new(move |completion| {
+                    completion_tx.send(completion).unwrap();
+                })),
+            },
+        );
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("done".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: Some(orca_core::provider_types::Usage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    cache_tokens: 10,
+                }),
+            }))
+            .unwrap();
+
+        let completion = completion_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("background completion callback");
+        let usage = completion.usage.expect("background completion usage");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cache_tokens, 10);
+        assert!(usage.estimated_cost_usd > 0.0);
+        assert!(matches!(
+            completion_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn background_provider_usage_enforces_shared_budget() {
+        let registry = TaskRegistry::new("session-background-budget".to_string());
+        let task = registry.create_main_session("Budgeted response".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        let usage_ledger = TuiUsageLedger::default();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (provider_tx, provider_rx) = mpsc::channel();
+        spawn_background_provider_completion(
+            provider_rx,
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: Some(orca_core::model::FLASH_MODEL.to_string()),
+                usage_ledger: usage_ledger.clone(),
+                budget_admission: None,
+                max_budget_usd: Some(0.0),
+                event_tx,
+                run_id: "run-background-budget".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
+        );
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("done".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: Some(orca_core::provider_types::Usage {
+                    input_tokens: 100,
+                    output_tokens: 25,
+                    cache_tokens: 8,
+                }),
+            }))
+            .unwrap();
+
+        let mut emitted_totals = None;
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                TuiEvent::UsageUpdated(totals) => emitted_totals = Some(totals),
+                event
+                    if task_update_matches(&event, |task| {
+                        task.status == TaskStatus::Failed
+                            && task
+                                .error
+                                .as_deref()
+                                .is_some_and(|error| error.contains("budget exhausted"))
+                    }) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let totals = emitted_totals.expect("background usage event");
+        assert_eq!(totals, usage_ledger.totals());
+        assert_eq!(totals.input_tokens, 100);
+        assert_eq!(totals.output_tokens, 25);
+        assert_eq!(totals.cache_tokens, 8);
+        assert!(totals.estimated_cost_usd > 0.0);
+        let task_usage = registry
+            .get(&task.id)
+            .and_then(|record| record.usage)
+            .expect("budget-exhausted task usage");
+        assert_eq!(task_usage.input_tokens, 100);
+        assert_eq!(task_usage.output_tokens, 25);
+        assert_eq!(task_usage.cache_tokens, 8);
+    }
+
+    #[test]
+    fn sync_subagent_usage_is_persisted_emitted_and_budget_checked_immediately() {
+        with_isolated_orca_home(|_| {
+            let mut config = full_auto_config();
+            config.history_mode = HistoryMode::Record;
+            config.max_budget_usd = Some(0.0);
+            let mut session =
+                TuiConversationSession::new_with_preloaded(&config, "budgeted child", None)
+                    .expect("session");
+            let session_id = session.session_id().expect("session id").to_string();
+            let (event_tx, event_rx) = mpsc::channel();
+            let (_action_tx, action_rx) = mpsc::channel();
+
+            let status = run_agent_for_tui(
+                &config,
+                &mut session,
+                "subagent schema_ok",
+                &event_tx,
+                &action_rx,
+                &CancelToken::new(),
+                false,
+            );
+
+            assert_eq!(status, "budget_exhausted");
+            let totals = session.usage_totals();
+            assert_eq!(totals.input_tokens, 120);
+            assert_eq!(totals.output_tokens, 30);
+            assert_eq!(totals.cache_tokens, 10);
+            assert!(totals.estimated_cost_usd > 0.0);
+
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                events.iter().any(
+                    |event| matches!(event, TuiEvent::UsageUpdated(usage) if *usage == totals)
+                )
+            );
+            assert!(events.iter().any(
+                |event| matches!(event, TuiEvent::Error(error) if error.contains("budget exhausted"))
+            ));
+            assert!(events.iter().any(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SubagentCompleted { status, error, .. }
+                        if status == "budget_exhausted"
+                            && error
+                                .as_deref()
+                                .is_some_and(|error| error.contains("budget exhausted"))
+                )
+            }));
+            assert!(events.iter().any(|event| {
+                matches!(event, TuiEvent::SessionCompleted { status } if status == "budget_exhausted")
+            }));
+
+            let transcript =
+                orca_runtime::history::load_session(&session_id).expect("parent transcript");
+            assert_eq!(transcript.usage, Some(totals));
+            let persisted = std::fs::read_to_string(&transcript.path).expect("session JSONL");
+            let usage_record = persisted
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .rfind(|record| record["type"] == "session.usage")
+                .expect("immediate parent session usage record");
+            assert_eq!(usage_record["input_tokens"], 120);
+            assert_eq!(usage_record["output_tokens"], 30);
+            assert_eq!(usage_record["cache_tokens"], 10);
+            let assistant_index = transcript
+                .messages
+                .iter()
+                .position(|message| matches!(message, orca_core::conversation::Message::Assistant { tool_calls, .. } if tool_calls.len() == 1))
+                .expect("persisted assistant subagent call");
+            let tool_call_id = match &transcript.messages[assistant_index] {
+                orca_core::conversation::Message::Assistant { tool_calls, .. } => &tool_calls[0].id,
+                _ => unreachable!(),
+            };
+            assert!(matches!(
+                transcript.messages.get(assistant_index + 1),
+                Some(orca_core::conversation::Message::Tool { tool_call_id: persisted_id, .. })
+                    if persisted_id == tool_call_id
+            ));
+            assert!(
+                !session.conversation().messages.iter().any(|message| {
+                    message
+                        .content_str()
+                        .is_some_and(|content| content == "Mock completed after tool execution.")
+                }),
+                "budget enforcement must stop before another parent provider request"
+            );
+        });
+    }
+
+    #[test]
+    fn tui_sync_subagent_enforces_parent_remaining_budget_inside_child() {
+        let mut config = full_auto_config();
+        config.max_budget_usd = Some(0.25);
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "budgeted child", None)
+                .expect("session");
+        session.usage_ledger().add(UsageTotals {
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_tokens: 8,
+            estimated_cost_usd: 0.25,
+        });
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "subagent schema_ok",
+            &event_tx,
+            &action_rx,
+            &CancelToken::new(),
+            false,
+        );
+
+        assert_eq!(status, "budget_exhausted");
+        assert!(event_rx.try_iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::SubagentCompleted { status, error, .. }
+                    if status == "budget_exhausted"
+                        && error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("limit $0.000000"))
+            )
+        }));
+    }
+
+    #[test]
+    fn tui_rejects_next_turn_after_background_budget_exhaustion() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.cwd = Some(temp.path().to_path_buf());
+        config.max_budget_usd = Some(0.5);
+        let mut session =
+            TuiConversationSession::new_with_preloaded(&config, "budgeted turn", None).unwrap();
+        session
+            .usage_ledger()
+            .add(orca_core::cost_types::UsageTotals {
+                input_tokens: 100,
+                output_tokens: 25,
+                cache_tokens: 8,
+                estimated_cost_usd: 0.75,
+            });
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+
+        let status = run_agent_for_tui(
+            &config,
+            &mut session,
+            "must not call provider",
+            &event_tx,
+            &action_rx,
+            &CancelToken::new(),
+            false,
+        );
+
+        assert_eq!(status, "budget_exhausted");
+        assert!(
+            !session
+                .conversation()
+                .messages
+                .iter()
+                .any(|message| message.content_str() == Some("must not call provider")),
+            "a budget-rejected prompt must not enter resumable conversation history"
+        );
+        assert!(event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::Error(error) if error.contains("budget exhausted"))
+        ));
+        let task = session
+            .task_registry()
+            .list()
+            .into_iter()
+            .find(|task| task.task_type == TaskType::MainSession)
+            .expect("budget-exhausted main task");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(
+            task.error
+                .as_deref()
+                .is_some_and(|error| error.contains("budget exhausted"))
+        );
     }
 
     #[test]
@@ -2903,10 +4033,18 @@ mod tests {
         let (provider_tx, provider_rx) = mpsc::channel();
         spawn_background_provider_completion(
             provider_rx,
-            registry.clone(),
-            event_tx,
-            "run-background-replay".to_string(),
-            task.id.clone(),
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: None,
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-replay".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
         );
         provider_tx
             .send(ProviderStreamEvent::Step(ProviderStep::MessageDelta(
@@ -3138,6 +4276,7 @@ mod tests {
             false,
             Some("Workflow notification notification-1"),
             false,
+            None,
             None,
         );
 
@@ -3559,6 +4698,107 @@ mod tests {
         assert_eq!(collect_subagent_batch(&config, &requests, 0), 0);
         assert!(should_run_subagent_batch(&config, &requests[1], 0));
         assert_eq!(collect_subagent_batch(&config, &requests, 1), 2);
+    }
+
+    #[test]
+    fn tui_budget_mode_disables_parallel_subagent_batching() {
+        let mut config = full_auto_config();
+        config.max_budget_usd = Some(1.0);
+        let request = tool_types::ToolRequest {
+            id: "subagent-sync-budgeted".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("sync child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "sync child",
+                    "prompt": "simple audit"
+                })
+                .to_string(),
+            ),
+        };
+
+        assert!(!should_run_subagent_batch(&config, &request, 0));
+    }
+
+    #[test]
+    fn tui_sync_subagent_receives_only_parent_remaining_aggregate_budget() {
+        let mut config = full_auto_config();
+        config.max_budget_usd = Some(0.5);
+        let parent_usage = UsageTotals {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_tokens: 2,
+            estimated_cost_usd: 0.3,
+        };
+
+        let child_config = config_for_remaining_subagent_budget(&config, parent_usage);
+
+        let remaining = child_config.max_budget_usd.expect("remaining budget");
+        assert!((remaining - 0.2).abs() < 1e-12);
+        assert_eq!(config.max_budget_usd, Some(0.5));
+    }
+
+    #[test]
+    fn tui_budget_mode_rejects_async_subagent_before_task_launch() {
+        let mut config = full_auto_config();
+        config.max_budget_usd = Some(1.0);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let pending_actions = RefCell::new(VecDeque::new());
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let registry = TaskRegistry::new("session-budgeted-async".to_string());
+        let request = tool_types::ToolRequest {
+            id: "subagent-async-budgeted".to_string(),
+            name: tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some("async child".to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "async child",
+                    "prompt": "mock_usage",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+        };
+
+        let (result, cost) = execute_subagent_for_tui(
+            &config,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &request,
+            &event_tx,
+            &action_rx,
+            &pending_actions,
+            None,
+            0,
+            &instructions,
+            &memory,
+            &hooks,
+            Some(&registry),
+        );
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("max_budget_usd is active"))
+        );
+        assert_eq!(cost.totals(), UsageTotals::default());
+        assert!(registry.list().is_empty());
+        assert!(event_rx.try_iter().any(|event| {
+            matches!(
+                event,
+                TuiEvent::SubagentCompleted { status, error, .. }
+                    if status == "failed"
+                        && error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("max_budget_usd is active"))
+            )
+        }));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord, RuntimeUsageTotals,
 };
+use crate::thread_store::redact_sensitive_text;
 
 #[derive(Clone, Debug)]
 pub struct TaskRegistry {
@@ -34,6 +35,26 @@ pub struct TaskHandle {
     pub id: String,
     pub task_type: TaskType,
     pub workflow_run_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum MainSessionTerminalUpdate {
+    Completed {
+        result: String,
+    },
+    Failed {
+        error: String,
+    },
+    ApprovalRequired {
+        summary: String,
+        pending_tool_call: Option<PendingToolCallSummary>,
+        pending_provider_response: Option<ProviderResponse>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskTerminalTransition {
+    pub is_backgrounded: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -598,6 +619,79 @@ impl TaskRegistry {
         })
     }
 
+    pub fn apply_main_session_terminal_update(
+        &self,
+        id: &str,
+        update: MainSessionTerminalUpdate,
+        usage: Option<UsageTotals>,
+    ) -> Result<TaskTerminalTransition, String> {
+        self.with_tasks(|tasks| {
+            let record = tasks
+                .get_mut(id)
+                .ok_or_else(|| format!("task '{id}' not found"))?;
+            if record.task_type != TaskType::MainSession {
+                return Err(
+                    "apply_main_session_terminal_update requires a main session task".to_string(),
+                );
+            }
+            if is_terminal(record.status) {
+                return Err(task_state_error(
+                    "apply_main_session_terminal_update",
+                    record.status,
+                ));
+            }
+
+            let transition = TaskTerminalTransition {
+                is_backgrounded: record.is_backgrounded,
+            };
+            match update {
+                MainSessionTerminalUpdate::Completed { result } => {
+                    record.status = TaskStatus::Completed;
+                    record.result = Some(result);
+                    record.error = None;
+                    record.tool = None;
+                    record.pending_tool_call = None;
+                    record.pending_tool_approval_response = None;
+                    record.pending_provider_response = None;
+                }
+                MainSessionTerminalUpdate::Failed { error } => {
+                    record.status = TaskStatus::Failed;
+                    record.result = None;
+                    record.error = Some(error);
+                    record.tool = None;
+                    record.pending_tool_call = None;
+                    record.pending_tool_approval_response = None;
+                    record.pending_provider_response = None;
+                }
+                MainSessionTerminalUpdate::ApprovalRequired {
+                    summary,
+                    pending_tool_call,
+                    pending_provider_response,
+                } => {
+                    record.status = TaskStatus::ApprovalRequired;
+                    record.result = Some(summary);
+                    record.error = None;
+                    record.tool = pending_tool_call
+                        .as_ref()
+                        .map(|pending_tool_call| pending_tool_call.name.clone());
+                    record.pending_tool_call = pending_tool_call;
+                    record.pending_tool_approval_response = None;
+                    record.pending_provider_response = pending_provider_response;
+                }
+            }
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.usage = usage;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+            self.persist_current_session(tasks)?;
+            Ok(transition)
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())?
+    }
+
     pub fn mark_worker_spawned(&self, id: &str, pid: u32) -> Result<(), String> {
         self.update_task(id, |record| {
             if is_terminal(record.status) {
@@ -697,6 +791,16 @@ impl TaskRegistry {
         summary: String,
         response: ProviderResponse,
     ) -> Result<(), String> {
+        self.approval_required_for_pending_provider_response_with_usage(id, summary, response, None)
+    }
+
+    pub fn approval_required_for_pending_provider_response_with_usage(
+        &self,
+        id: &str,
+        summary: String,
+        response: ProviderResponse,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), String> {
         let pending_tool_call = pending_tool_call_from_provider_response(&response);
         let tool = pending_tool_call
             .as_ref()
@@ -707,6 +811,7 @@ impl TaskRegistry {
             tool,
             pending_tool_call,
             Some(response),
+            usage,
         )
     }
 
@@ -723,6 +828,7 @@ impl TaskRegistry {
             tool,
             pending_tool_call,
             None,
+            None,
         )
     }
 
@@ -733,6 +839,7 @@ impl TaskRegistry {
         tool: Option<String>,
         pending_tool_call: Option<PendingToolCallSummary>,
         pending_provider_response: Option<ProviderResponse>,
+        usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::ApprovalRequired;
@@ -746,6 +853,7 @@ impl TaskRegistry {
             record.pending_tool_call = pending_tool_call;
             record.pending_tool_approval_response = None;
             record.pending_provider_response = pending_provider_response;
+            record.usage = usage;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
             Ok(())
@@ -1207,7 +1315,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             subagent_turn: record.subagent_turn,
             last_activity_at_ms: record.last_activity_at_ms,
             result: record.result.clone(),
-            error: record.error.clone(),
+            error: record.error.as_deref().map(redact_sensitive_text),
             worker_pid: record.worker_pid,
             command: record.command.clone(),
         }
@@ -1488,12 +1596,6 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
 mod tests {
     use super::*;
 
-    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn recover_test_lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     #[test]
     fn persistent_registry_recovers_interrupted_subagent_task_by_id() {
         let temp = tempfile::tempdir().unwrap();
@@ -1547,7 +1649,7 @@ mod tests {
 
     #[test]
     fn cwd_constructor_migrates_legacy_project_task_sessions_to_orca_home() {
-        let _guard = recover_test_lock(&TEST_ENV_LOCK);
+        let _guard = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
@@ -2342,6 +2444,72 @@ mod tests {
         assert_eq!(record.status, TaskStatus::Running);
         assert!(!record.is_backgrounded);
         assert!(record.last_activity_at_ms.is_some());
+    }
+
+    #[test]
+    fn main_session_terminal_update_reports_background_state_and_rejects_late_foreground() {
+        let registry = TaskRegistry::new("session-terminal-background".to_string());
+        let task = registry.create_main_session("long prompt".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+
+        let transition = registry
+            .apply_main_session_terminal_update(
+                &task.id,
+                MainSessionTerminalUpdate::Completed {
+                    result: "done".to_string(),
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(transition.is_backgrounded);
+        let error = registry.mark_foregrounded(&task.id).unwrap_err();
+        assert!(error.contains("Completed"));
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, TaskStatus::Completed);
+        assert!(record.is_backgrounded);
+    }
+
+    #[test]
+    fn foreground_and_terminal_update_observe_one_atomic_order() {
+        for iteration in 0..64 {
+            let registry = TaskRegistry::new(format!("session-terminal-race-{iteration}"));
+            let task = registry.create_main_session("long prompt".to_string());
+            registry.mark_running(&task.id).unwrap();
+            registry.mark_backgrounded(&task.id).unwrap();
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let foreground_registry = registry.clone();
+            let foreground_task_id = task.id.clone();
+            let foreground_barrier = barrier.clone();
+            let foreground = std::thread::spawn(move || {
+                foreground_barrier.wait();
+                foreground_registry.mark_foregrounded(&foreground_task_id)
+            });
+
+            barrier.wait();
+            let transition = registry
+                .apply_main_session_terminal_update(
+                    &task.id,
+                    MainSessionTerminalUpdate::Completed {
+                        result: "done".to_string(),
+                    },
+                    None,
+                )
+                .unwrap();
+            let foreground_result = foreground.join().unwrap();
+
+            assert_eq!(
+                foreground_result.is_ok(),
+                !transition.is_backgrounded,
+                "foreground result and terminal snapshot diverged on iteration {iteration}"
+            );
+            assert_eq!(
+                registry.get(&task.id).unwrap().status,
+                TaskStatus::Completed
+            );
+        }
     }
 
     #[test]

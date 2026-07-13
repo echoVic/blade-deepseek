@@ -3,12 +3,43 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-12
-Current baseline: v0.2.20 makes the TUI resilient to long interactive content:
-large pastes remain compact before and after submission, Goal and plan surfaces
-truncate by display width, approval decisions stay visible, candidate menus
-follow selection, tool headers preserve status, and the footer degrades by
-information priority with permission-mode semantic colors. Earlier v0.2.19 lets process managers inside the macOS workspace-write
+Last updated: 2026-07-13
+Current baseline: v0.2.21 gives a DeepSeek turn that ends without visible
+content or a tool call one bounded semantic recovery request. A request-local
+instruction changes the retry without mutating conversation history, preserves
+the preceding valid tool-call/tool-result boundary, and keeps reasoning-only
+responses invalid. Streaming recovery suppresses reasoning already shown by the
+failed attempt while continuing to emit recovered content and tool progress.
+Reported usage from both attempts is combined. Foreground and detached TUI turns
+no longer lose usage reported by the failed recovery attempt, while controller
+paths retain their runtime-owned accounting. Foreground TUI provider requests
+use serialized admission while `max_budget_usd` is active, and later turns fail
+preflight before their prompt enters conversation history once completed usage
+is over budget. Synchronous child-agent usage is emitted and persisted
+immediately; budget mode disables parallel batches and rejects asynchronous
+children so their usage is reconciled before the parent turn proceeds. Each
+synchronous child receives only the aggregate budget remaining in its parent,
+and crossing that limit prevents later children in the same provider turn.
+Detached provider completions remain task-scoped: priced usage and redacted
+errors are persisted as `background_task.provider_response`, without writing a
+global `session.completed` record. A `session.usage_baseline` starts a new
+accounting epoch on resume, preserving earlier foreground snapshots and
+detached deltas without loss or double counting.
+Foreground and background TUI failures and controller-backed CLI/server turns
+keep the real diagnostic in task and session state; optional
+`session.completed.error`, detached `background_task.provider_response`, and
+persisted task errors use the existing secret redactor before disk writes.
+Goal usage now counts input plus output tokens rather than adding cache hits a
+second time. Detached completions and approved continuations apply exact usage
+deltas, while synchronized Goal-store mutations prevent concurrent updates from
+overwriting each other. Historical cache-inflated Goal values are not migrated
+automatically.
+Earlier v0.2.20 makes the TUI
+resilient to long interactive content: large pastes remain compact before and
+after submission, Goal and plan surfaces truncate by display width, approval
+decisions stay visible, candidate menus follow selection, tool headers preserve
+status, and the footer degrades by information priority with permission-mode
+semantic colors. Earlier v0.2.19 lets process managers inside the macOS workspace-write
 and read-only Seatbelt profiles signal their own child workers. This restores
 Vitest, Tinypool, Jest, and similar worker-pool cleanup after failures and
 shutdown without granting authority over unrelated or same-sandbox processes.

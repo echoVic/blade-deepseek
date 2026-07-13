@@ -29,7 +29,10 @@ pub enum ChildAgentProviderErrorDecision {
 
 pub enum ChildAgentProviderTurn {
     Response(ProviderResponse),
-    Fail(ChildAgentResult),
+    Fail {
+        result: ChildAgentResult,
+        usage: Option<orca_core::provider_types::Usage>,
+    },
 }
 
 pub fn route_child_agent_model(
@@ -70,11 +73,14 @@ pub fn run_child_agent_provider_turn(
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
-            return ChildAgentProviderTurn::Fail(ChildAgentResult {
-                status: RunStatus::Failed,
-                final_message: None,
-                error: Some(format!("pre_model_call hook failed: {error}")),
-            });
+            return ChildAgentProviderTurn::Fail {
+                result: ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some(format!("pre_model_call hook failed: {error}")),
+                },
+                usage: None,
+            };
         }
     };
     let model_conversation =
@@ -100,11 +106,14 @@ pub fn run_child_agent_provider_turn(
             usage: response.usage.as_ref(),
         },
     ) {
-        return ChildAgentProviderTurn::Fail(ChildAgentResult {
-            status: RunStatus::Failed,
-            final_message: None,
-            error: Some(format!("post_model_call hook failed: {error}")),
-        });
+        return ChildAgentProviderTurn::Fail {
+            result: ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(format!("post_model_call hook failed: {error}")),
+            },
+            usage: response.usage,
+        };
     }
 
     ChildAgentProviderTurn::Response(response)
@@ -133,11 +142,14 @@ pub fn run_child_agent_provider_turn_observed(
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
-            return ChildAgentProviderTurn::Fail(ChildAgentResult {
-                status: RunStatus::Failed,
-                final_message: None,
-                error: Some(format!("pre_model_call hook failed: {error}")),
-            });
+            return ChildAgentProviderTurn::Fail {
+                result: ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some(format!("pre_model_call hook failed: {error}")),
+                },
+                usage: None,
+            };
         }
     };
     let model_conversation =
@@ -167,11 +179,14 @@ pub fn run_child_agent_provider_turn_observed(
             usage: response.usage.as_ref(),
         },
     ) {
-        return ChildAgentProviderTurn::Fail(ChildAgentResult {
-            status: RunStatus::Failed,
-            final_message: None,
-            error: Some(format!("post_model_call hook failed: {error}")),
-        });
+        return ChildAgentProviderTurn::Fail {
+            result: ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(format!("post_model_call hook failed: {error}")),
+            },
+            usage: response.usage,
+        };
     }
 
     ChildAgentProviderTurn::Response(response)

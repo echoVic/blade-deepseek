@@ -38,6 +38,7 @@ pub struct InteractiveSession {
     conversation: Conversation,
     writer: Option<SessionWriter>,
     session_id: Option<String>,
+    completion_error: Option<String>,
     instructions: ProjectInstructions,
     cost_tracker: CostTracker,
     mcp_registry: McpRegistry,
@@ -360,6 +361,7 @@ impl InteractiveSession {
             conversation,
             writer,
             session_id,
+            completion_error: None,
             instructions,
             cost_tracker: CostTracker::new(None),
             mcp_registry,
@@ -401,6 +403,7 @@ impl InteractiveSession {
             conversation,
             writer,
             session_id: Some(session_id.clone()),
+            completion_error: None,
             instructions,
             cost_tracker: CostTracker::new(None),
             mcp_registry,
@@ -424,6 +427,10 @@ impl InteractiveSession {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    pub fn completion_error(&self) -> Option<&str> {
+        self.completion_error.as_deref()
     }
 
     pub fn store(&self) -> &SessionStore {
@@ -497,8 +504,13 @@ impl InteractiveSession {
     }
 
     pub fn complete(&mut self, status: &str) {
+        self.complete_with_error(status, None);
+    }
+
+    pub fn complete_with_error(&mut self, status: &str, error: Option<&str>) {
+        self.completion_error = error.map(str::to_string);
         if let Some(writer) = &mut self.writer
-            && let Err(error) = writer.complete(status)
+            && let Err(error) = writer.complete_with_error(status, error)
         {
             eprintln!("orca: warning: history completion write failed: {error}");
         }

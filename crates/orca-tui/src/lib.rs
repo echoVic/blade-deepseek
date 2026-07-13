@@ -45,6 +45,19 @@ mod workflow_panel_actions;
 pub use app::run_tui;
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn lock_process_env() -> MutexGuard<'static, ()> {
+        PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn runtime_event_projection_is_owned_by_dedicated_module() {

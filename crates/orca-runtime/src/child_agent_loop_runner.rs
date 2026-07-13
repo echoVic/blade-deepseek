@@ -4,11 +4,12 @@ use std::path::Path;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::RunStatus;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::tool_types::{ToolRequest, ToolStatus};
 
 use crate::child_agent_entrypoints::run_child_agent_with_executor;
 use crate::child_agent_loop_setup::{
-    ChildAgentTurnBudget, advance_child_agent_turn, prepare_child_agent_loop,
+    ChildAgentLoopSetup, ChildAgentTurnBudget, advance_child_agent_turn, prepare_child_agent_loop,
 };
 use crate::child_agent_provider_turn::{
     ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
@@ -73,23 +74,45 @@ where
             &child_cancel,
         ) {
             ChildAgentProviderTurn::Response(response) => response,
-            ChildAgentProviderTurn::Fail(result) => return Ok(result),
+            ChildAgentProviderTurn::Fail { result, usage } => {
+                record_child_provider_usage(usage, context.child_cost_tracker, None);
+                if let Some(result) =
+                    child_agent_budget_exhausted_result(config, context.child_cost_tracker)
+                {
+                    return Ok(result);
+                }
+                return Ok(result);
+            }
         };
 
-        match handle_child_agent_provider_error(
+        let provider_error_decision = handle_child_agent_provider_error_with_usage(
             config,
             &mut setup,
             context.cwd,
             context.hooks,
             &response,
-        )? {
+            context.child_cost_tracker,
+            None,
+        )?;
+        if let Some(result) =
+            child_agent_budget_exhausted_result(config, context.child_cost_tracker)
+        {
+            return Ok(result);
+        }
+        match provider_error_decision {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
             Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
             None => {}
         }
 
-        match fold_child_agent_provider_response(&mut setup, &response, context.child_cost_tracker)
+        let provider_fold =
+            fold_child_agent_provider_response(&mut setup, &response, context.child_cost_tracker);
+        if let Some(result) =
+            child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
+            return Ok(result);
+        }
+        match provider_fold {
             ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
@@ -100,14 +123,20 @@ where
                 mcp_registry: &setup.mcp_registry,
             };
             let tool_execution = execute_tool(&tool_context, &child_cancel, tool_request);
-            match fold_child_agent_tool_result(
+            let tool_fold = fold_child_agent_tool_result(
                 &mut setup,
                 tool_request,
                 tool_execution.should_stop,
                 tool_execution.result,
                 tool_execution.child_cost,
                 context.child_cost_tracker,
-            ) {
+            );
+            if let Some(result) =
+                child_agent_budget_exhausted_result(config, context.child_cost_tracker)
+            {
+                return Ok(result);
+            }
+            match tool_fold {
                 ChildAgentToolResultFold::Continue => {}
                 ChildAgentToolResultFold::Stop(result) => return Ok(result),
             }
@@ -157,16 +186,32 @@ where
             observer,
         ) {
             ChildAgentProviderTurn::Response(response) => response,
-            ChildAgentProviderTurn::Fail(result) => return Ok(result),
+            ChildAgentProviderTurn::Fail { result, usage } => {
+                record_child_provider_usage(usage, context.child_cost_tracker, observer);
+                if let Some(result) =
+                    child_agent_budget_exhausted_result(config, context.child_cost_tracker)
+                {
+                    return Ok(result);
+                }
+                return Ok(result);
+            }
         };
 
-        match handle_child_agent_provider_error(
+        let provider_error_decision = handle_child_agent_provider_error_with_usage(
             config,
             &mut setup,
             context.cwd,
             context.hooks,
             &response,
-        )? {
+            context.child_cost_tracker,
+            observer,
+        )?;
+        if let Some(result) =
+            child_agent_budget_exhausted_result(config, context.child_cost_tracker)
+        {
+            return Ok(result);
+        }
+        match provider_error_decision {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
             Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
             None => {}
@@ -184,6 +229,11 @@ where
                     context.child_cost_tracker.totals(),
                 ));
             }
+        }
+        if let Some(result) =
+            child_agent_budget_exhausted_result(config, context.child_cost_tracker)
+        {
+            return Ok(result);
         }
         match provider_fold {
             ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
@@ -209,17 +259,14 @@ where
                     status: run_status_from_tool_status(tool_execution.result.status),
                 });
             }
-            match fold_child_agent_tool_result(
+            let tool_fold = fold_child_agent_tool_result(
                 &mut setup,
                 tool_request,
                 tool_execution.should_stop,
                 tool_execution.result,
                 tool_execution.child_cost,
                 context.child_cost_tracker,
-            ) {
-                ChildAgentToolResultFold::Continue => {}
-                ChildAgentToolResultFold::Stop(result) => return Ok(result),
-            }
+            );
             if had_child_cost {
                 if let Some(observer) = observer {
                     observer.emit(ChildAgentActivity::Usage(
@@ -227,8 +274,67 @@ where
                     ));
                 }
             }
+            if let Some(result) =
+                child_agent_budget_exhausted_result(config, context.child_cost_tracker)
+            {
+                return Ok(result);
+            }
+            match tool_fold {
+                ChildAgentToolResultFold::Continue => {}
+                ChildAgentToolResultFold::Stop(result) => return Ok(result),
+            }
         }
     }
+}
+
+pub(crate) fn handle_child_agent_provider_error_with_usage(
+    config: &RunConfig,
+    setup: &mut ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+    response: &ProviderResponse,
+    child_cost_tracker: &mut CostTracker,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
+) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
+    let has_provider_error = response
+        .steps
+        .iter()
+        .any(|step| matches!(step, ProviderStep::Error(_)));
+    if has_provider_error {
+        record_child_provider_usage(response.usage, child_cost_tracker, observer);
+    }
+
+    handle_child_agent_provider_error(config, setup, cwd, hooks, response)
+}
+
+fn record_child_provider_usage(
+    usage: Option<orca_core::provider_types::Usage>,
+    child_cost_tracker: &mut CostTracker,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
+) {
+    let Some(usage) = usage.filter(|usage| !usage.is_empty()) else {
+        return;
+    };
+    child_cost_tracker.add_usage(usage);
+    if let Some(observer) = observer {
+        observer.emit(ChildAgentActivity::Usage(child_cost_tracker.totals()));
+    }
+}
+
+pub(crate) fn child_agent_budget_exhausted_result(
+    config: &RunConfig,
+    child_cost_tracker: &CostTracker,
+) -> Option<ChildAgentResult> {
+    let max_budget = config.max_budget_usd?;
+    let totals = child_cost_tracker.totals();
+    (totals.estimated_cost_usd > max_budget).then(|| ChildAgentResult {
+        status: RunStatus::BudgetExhausted,
+        final_message: None,
+        error: Some(format!(
+            "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
+            totals.estimated_cost_usd, max_budget
+        )),
+    })
 }
 
 fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {

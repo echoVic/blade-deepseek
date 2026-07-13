@@ -349,8 +349,34 @@ impl RuntimeProviderTurnStep {
             input.cancel,
             &mut |step| emit_provider_delta(step, emit_deltas, events, sink),
         );
+
+        let mut usage_error = None;
+        if let Some(usage) = response.usage
+            && !usage.is_empty()
+        {
+            let totals = match input
+                .actor
+                .record_usage(usage, cost_tracker, input.max_budget_usd)
+            {
+                Ok(totals) => totals,
+                Err(error) => {
+                    usage_error = Some(error);
+                    cost_tracker.totals()
+                }
+            };
+            if emit_deltas {
+                sink.emit(&events.usage_updated(totals))?;
+                if let Some(writer) = history_writer.as_deref_mut() {
+                    writer.append_usage(totals)?;
+                }
+            }
+        }
+
         if input.cancel.is_cancelled() {
             return cancelled_provider_turn(emit_deltas, events, sink);
+        }
+        if let Some(error) = usage_error {
+            return Ok(RuntimeProviderTurnOutput::terminal(error));
         }
 
         if let Some(warning) = input.actor.run_post_model_hook_with_cancel(
@@ -364,25 +390,6 @@ impl RuntimeProviderTurnStep {
         }
         if input.cancel.is_cancelled() {
             return cancelled_provider_turn(emit_deltas, events, sink);
-        }
-
-        if let Some(usage) = response.usage
-            && !usage.is_empty()
-        {
-            match input
-                .actor
-                .record_usage(usage, cost_tracker, input.max_budget_usd)
-            {
-                Ok(totals) => {
-                    if emit_deltas {
-                        sink.emit(&events.usage_updated(totals))?;
-                        if let Some(writer) = history_writer.as_deref_mut() {
-                            writer.append_usage(totals)?;
-                        }
-                    }
-                }
-                Err(error) => return Ok(RuntimeProviderTurnOutput::terminal(error)),
-            }
         }
 
         Ok(RuntimeProviderTurnOutput::response(response))
@@ -885,6 +892,67 @@ mod tests {
         assert!(output.contains("\"id\":\"call_1\""));
         assert!(output.contains("\"name\":\"write_file\""));
         assert!(output.contains("\"arguments_bytes\":12345"));
+    }
+
+    #[test]
+    fn cancelled_provider_turn_preserves_completed_usage() {
+        let mut lifecycle =
+            crate::lifecycle::RuntimeSessionLifecycle::new("provider-cancelled-usage".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_usage_then_cancel".to_string());
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::FLASH_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let hooks = HookRunner::default();
+        let cancel = CancelToken::new();
+        let mut cost_tracker = CostTracker::new(Some(orca_core::model::FLASH_MODEL));
+        let mut events = EventFactory::new("provider-cancelled-usage".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        let response = RuntimeProviderTurnStep::new()
+            .run(RuntimeProviderTurnInput {
+                actor: &mut actor,
+                provider: ProviderKind::Mock,
+                runtime_system_messages: &[],
+                provider_config: &provider_config,
+                turn_context: RuntimeTurnContext::new(
+                    Path::new("."),
+                    "mock_usage_then_cancel",
+                    0,
+                    true,
+                    &SubagentType::General,
+                ),
+                hooks: &hooks,
+                cancel: &cancel,
+                max_budget_usd: None,
+                io: RuntimeProviderTurnIo {
+                    conversation: &mut conversation,
+                    cost_tracker: &mut cost_tracker,
+                    events: &mut events,
+                    sink: &mut sink,
+                    history_writer: None,
+                },
+            })
+            .expect("provider turn");
+
+        let error = response.terminal_error.expect("cancelled turn");
+        assert_eq!(error.status, RunStatus::Cancelled);
+        assert_eq!(cost_tracker.totals().input_tokens, 120);
+        assert_eq!(cost_tracker.totals().output_tokens, 30);
+        assert_eq!(cost_tracker.totals().cache_tokens, 10);
+        drop(sink);
+        let output = String::from_utf8(output).expect("jsonl is utf8");
+        assert_eq!(output.matches("\"type\":\"usage.updated\"").count(), 1);
+        assert!(output.contains("\"type\":\"error\""));
+        assert!(output.contains("turn cancelled"));
     }
 
     #[test]

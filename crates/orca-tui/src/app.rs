@@ -395,8 +395,6 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn test_config(history_mode: HistoryMode) -> RunConfig {
         RunConfig {
             app_version: "0.0.0-test".to_string(),
@@ -748,9 +746,12 @@ mod tests {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
                 session_id.to_string(),
             ))));
-            let mut transcript = transcript(session_id);
-            transcript.path = home.join("resume-background-approval.jsonl");
-            std::fs::write(&transcript.path, "").unwrap();
+            let fixture = transcript(session_id);
+            let mut writer = history::SessionWriter::start_from_meta(fixture.meta)
+                .expect("create resumable approval transcript");
+            writer.complete("approval_required").unwrap();
+            let transcript =
+                history::load_session(session_id).expect("load resumable approval transcript");
             let preloaded = Arc::new(Mutex::new(Some(transcript)));
             let (event_tx, event_rx) = mpsc::channel();
             let (action_tx, action_rx) = mpsc::channel();
@@ -978,12 +979,13 @@ mod tests {
             usage: None,
             plan: None,
             completion_status: None,
+            completion_error: None,
             path: std::path::PathBuf::from("/tmp/resumed-goal.jsonl"),
         }
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_support::lock_process_env();
         let home = tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe {
@@ -998,6 +1000,76 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn incident_goal_usage_counts_cache_as_input_subset() {
+        let incident_usage = orca_core::cost_types::UsageTotals {
+            input_tokens: 49_909_209,
+            output_tokens: 191_567,
+            cache_tokens: 47_879_040,
+            estimated_cost_usd: 3.156_464_565,
+        };
+
+        assert_eq!(goal_tokens_for_usage(incident_usage), 50_100_776);
+        assert_eq!(
+            goal_token_delta(
+                orca_core::cost_types::UsageTotals::default(),
+                incident_usage,
+            ),
+            50_100_776
+        );
+        assert_ne!(
+            goal_tokens_for_usage(incident_usage),
+            97_979_816,
+            "cache hits are already included in input_tokens"
+        );
+    }
+
+    #[test]
+    fn background_goal_completion_accounts_usage_exactly_once() {
+        with_orca_home(|_| {
+            let session_id = "background-goal-usage";
+            orca_runtime::goals::GoalStore::load_default()
+                .replace(
+                    session_id,
+                    "account detached provider usage",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+            let (event_tx, event_rx) = mpsc::channel();
+            let (foreground_token_tx, foreground_token_rx) = mpsc::sync_channel(1);
+            let handler = background_goal_completion_handler(
+                session_id.to_string(),
+                Instant::now(),
+                event_tx,
+                foreground_token_rx,
+            );
+            foreground_token_tx.send(200).unwrap();
+
+            handler(bridge::TuiBackgroundTurnCompletion {
+                usage: Some(orca_core::cost_types::UsageTotals {
+                    input_tokens: 49_909_209,
+                    output_tokens: 191_567,
+                    cache_tokens: 47_879_040,
+                    estimated_cost_usd: 3.156_464_565,
+                }),
+            });
+
+            let goal = orca_runtime::goals::GoalStore::load_default()
+                .get(session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(goal.tokens_used, 50_100_976);
+            assert_eq!(
+                event_rx
+                    .try_iter()
+                    .filter(|event| matches!(event, TuiEvent::GoalStatus(Some(_))))
+                    .count(),
+                1
+            );
+        });
     }
 
     fn test_pending_workflow_notifications() -> bridge::PendingWorkflowNotifications {
@@ -1311,7 +1383,7 @@ mod tests {
 
     #[test]
     fn preloaded_goal_resume_projects_elapsed_before_first_turn_started() {
-        with_orca_home(|home| {
+        with_orca_home(|_| {
             let session_id = "resume-goal-timer-session";
             let mut goal_store = orca_runtime::goals::GoalStore::load_default();
             goal_store
@@ -1331,9 +1403,11 @@ mod tests {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
                 session_id.to_string(),
             ))));
-            let mut restored = transcript(session_id);
-            restored.path = home.join("resume-goal-timer.jsonl");
-            std::fs::write(&restored.path, "").unwrap();
+            let fixture = transcript(session_id);
+            history::SessionWriter::start_from_meta(fixture.meta)
+                .expect("create resumable goal transcript");
+            let restored =
+                history::load_session(session_id).expect("load resumable goal transcript");
             let preloaded = Arc::new(Mutex::new(Some(restored)));
             let (event_tx, event_rx) = mpsc::channel();
             let (action_tx, action_rx) = mpsc::channel();
@@ -3051,6 +3125,61 @@ fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     )
 }
 
+fn goal_tokens_for_usage(usage: orca_core::cost_types::UsageTotals) -> i64 {
+    usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .min(i64::MAX as u64) as i64
+}
+
+fn goal_token_delta(
+    before: orca_core::cost_types::UsageTotals,
+    after: orca_core::cost_types::UsageTotals,
+) -> i64 {
+    after
+        .input_tokens
+        .saturating_sub(before.input_tokens)
+        .saturating_add(after.output_tokens.saturating_sub(before.output_tokens))
+        .min(i64::MAX as u64) as i64
+}
+
+fn account_goal_usage_for_tui(
+    session_id: &str,
+    token_delta: i64,
+    elapsed_delta: i64,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) {
+    if token_delta <= 0 && elapsed_delta <= 0 {
+        return;
+    }
+    if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().account_usage(
+        session_id,
+        token_delta,
+        elapsed_delta,
+    ) {
+        let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
+    }
+}
+
+fn background_goal_completion_handler(
+    session_id: String,
+    started_at: Instant,
+    event_tx: mpsc::Sender<TuiEvent>,
+    foreground_token_rx: mpsc::Receiver<i64>,
+) -> bridge::TuiBackgroundTurnCompletionHandler {
+    Box::new(move |completion: bridge::TuiBackgroundTurnCompletion| {
+        let foreground_token_delta = foreground_token_rx.recv().unwrap_or_default();
+        let token_delta = foreground_token_delta.saturating_add(
+            completion
+                .usage
+                .map(goal_tokens_for_usage)
+                .unwrap_or_default(),
+        );
+        let elapsed_delta = started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
+        account_goal_usage_for_tui(&session_id, token_delta, elapsed_delta, &event_tx);
+    })
+}
+
 fn run_goal_turns_for_tui(
     config: &RunConfig,
     session: &mut bridge::TuiConversationSession,
@@ -3080,8 +3209,15 @@ fn run_goal_turns_for_tui(
             );
             let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
         }
-        let before_usage = session.usage_totals();
+        let before_usage = session.runtime_usage_totals();
         let started_at = std::time::Instant::now();
+        let (foreground_token_tx, foreground_token_rx) = mpsc::sync_channel(1);
+        let background_completion_handler = background_goal_completion_handler(
+            session_id.clone(),
+            started_at,
+            event_tx.clone(),
+            foreground_token_rx,
+        );
         let prompt = submitted_turn.prompt().to_string();
         let turn_result = bridge::run_agent_for_tui_with_notification_queue(
             config,
@@ -3095,31 +3231,15 @@ fn run_goal_turns_for_tui(
             submitted_turn.task_label(),
             submitted_turn.is_backtrack_target(),
             Some(pending_workflow_notifications),
+            Some(background_completion_handler),
         );
         let status = turn_result.status;
-        let after_usage = session.usage_totals();
-        let token_delta = after_usage
-            .input_tokens
-            .saturating_sub(before_usage.input_tokens)
-            .saturating_add(
-                after_usage
-                    .output_tokens
-                    .saturating_sub(before_usage.output_tokens),
-            )
-            .saturating_add(
-                after_usage
-                    .cache_tokens
-                    .saturating_sub(before_usage.cache_tokens),
-            ) as i64;
-        let elapsed_delta = started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
-        if token_delta > 0 || elapsed_delta > 0 {
-            if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().account_usage(
-                &session_id,
-                token_delta,
-                elapsed_delta,
-            ) {
-                let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
-            }
+        let token_delta = goal_token_delta(before_usage, session.runtime_usage_totals());
+        if status == "backgrounded" {
+            let _ = foreground_token_tx.send(token_delta);
+        } else {
+            let elapsed_delta = started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
+            account_goal_usage_for_tui(&session_id, token_delta, elapsed_delta, event_tx);
         }
         if status != "success" {
             if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
@@ -3519,6 +3639,9 @@ fn agent_loop_thread(
                     && let Some(session) = session.as_mut()
                 {
                     let cfg = config.lock().unwrap().clone();
+                    let goal_session_id = session.session_id().map(str::to_string);
+                    let before_usage = session.runtime_usage_totals();
+                    let started_at = Instant::now();
                     let result = bridge::continue_approved_background_turn_for_tui(
                         &cfg,
                         session,
@@ -3529,6 +3652,18 @@ fn agent_loop_thread(
                         &cancel,
                         Some(&pending_workflow_notifications),
                     );
+                    if let Some(goal_session_id) = goal_session_id {
+                        let token_delta =
+                            goal_token_delta(before_usage, session.runtime_usage_totals());
+                        let elapsed_delta =
+                            started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
+                        account_goal_usage_for_tui(
+                            &goal_session_id,
+                            token_delta,
+                            elapsed_delta,
+                            &event_tx,
+                        );
+                    }
                     if let Some(continuation) = result.continuation {
                         match continuation {
                             bridge::TuiAgentTurnContinuation::WorkflowNotification(

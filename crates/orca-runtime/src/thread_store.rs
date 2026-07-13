@@ -28,6 +28,7 @@ pub use types::{
     TurnItemsView,
 };
 pub use writer::SessionWriter;
+pub(crate) use writer::redact_sensitive_text;
 
 pub(crate) fn resume_conversation(
     transcript: &SessionTranscript,

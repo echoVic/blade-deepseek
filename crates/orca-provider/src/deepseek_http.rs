@@ -21,6 +21,41 @@ const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
 const STREAM_INTEGRITY_RETRIES: usize = 1;
 const EMPTY_RESPONSE_ERROR: &str = "response did not contain content or tool calls";
+const EMPTY_RESPONSE_RECOVERY_PROMPT: &str = "Continue the current turn. The previous response ended without visible assistant content or tool calls. Return a user-facing answer in content, or call an available tool. Do not return reasoning only.";
+
+#[derive(Debug, Eq, PartialEq)]
+struct DeepSeekRequestError {
+    message: String,
+    usage: Option<Usage>,
+}
+
+impl DeepSeekRequestError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            usage: None,
+        }
+    }
+
+    fn with_usage(message: impl Into<String>, usage: Option<Usage>) -> Self {
+        Self {
+            message: message.into(),
+            usage,
+        }
+    }
+}
+
+impl From<String> for DeepSeekRequestError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl std::fmt::Display for DeepSeekRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
 
 /// DeepSeek strict function calling (Beta) is only served on the /beta endpoint.
 fn is_strict_capable_endpoint(base_url: &str) -> bool {
@@ -107,6 +142,35 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+}
+
+fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
+    if let Some(last) = request.messages.last_mut()
+        && last.role == "user"
+        && let Some(content) = &mut last.content
+    {
+        content.push_str("\n\n");
+        content.push_str(EMPTY_RESPONSE_RECOVERY_PROMPT);
+        return;
+    }
+
+    request.messages.push(ApiMessage {
+        role: "user".to_string(),
+        content: Some(EMPTY_RESPONSE_RECOVERY_PROMPT.to_string()),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+    });
+}
+
+fn merge_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let total = total.get_or_insert_with(Usage::default);
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.cache_tokens = total.cache_tokens.saturating_add(usage.cache_tokens);
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +274,7 @@ pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderRes
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls: Vec::new(),
-            usage: None,
+            usage: error.usage,
         },
     }
 }
@@ -231,7 +295,7 @@ pub async fn call_streaming_async(
                 assistant_content: None,
                 assistant_reasoning: None,
                 tool_calls: Vec::new(),
-                usage: None,
+                usage: error.usage,
             }
         }
     }
@@ -242,7 +306,7 @@ async fn request_chat_streaming(
     config: &ProviderConfig,
     cancel: &CancelToken,
     on_step: &mut impl FnMut(&ProviderStep),
-) -> Result<ProviderResponse, String> {
+) -> Result<ProviderResponse, DeepSeekRequestError> {
     let api_key = config.api_key.as_deref().ok_or_else(|| {
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
     })?;
@@ -276,6 +340,8 @@ async fn request_chat_streaming(
 
     let mut empty_response_retries = 0;
     let mut stream_integrity_retries = 0;
+    let mut suppress_retry_reasoning = false;
+    let mut accumulated_usage = None;
     loop {
         let response = match crate::http_client::execute_streaming_with_retry(
             &streaming_client,
@@ -294,13 +360,17 @@ async fn request_chat_streaming(
                     |client| client.post(&url).bearer_auth(api_key).json(&request),
                     cancel,
                 )
-                .await?
+                .await
+                .map_err(|error| DeepSeekRequestError::with_usage(error, accumulated_usage))?
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(DeepSeekRequestError::with_usage(error, accumulated_usage));
+            }
         };
 
         let mut steps = Vec::new();
         let mut emitted_step = false;
+        let mut emitted_reasoning = false;
 
         let stream_result = match crate::streaming::parse_sse_response(
             response,
@@ -308,8 +378,14 @@ async fn request_chat_streaming(
             crate::http_client::streaming_idle_read_timeout(),
             |delta| {
                 let step = provider_step_from_stream_event(delta);
-                emitted_step = true;
-                on_step(&step);
+                let is_reasoning_delta = matches!(&step, ProviderStep::ReasoningDelta(_));
+                if is_reasoning_delta {
+                    emitted_reasoning = true;
+                }
+                if !(suppress_retry_reasoning && is_reasoning_delta) {
+                    emitted_step = true;
+                    on_step(&step);
+                }
                 if stream_step_belongs_in_response_steps(&step) {
                     steps.push(step);
                 }
@@ -326,15 +402,25 @@ async fn request_chat_streaming(
                 stream_integrity_retries += 1;
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(DeepSeekRequestError::with_usage(error, accumulated_usage));
+            }
         };
+
+        merge_usage(&mut accumulated_usage, stream_result.usage);
 
         match stream_result.finish_reason.as_deref() {
             Some("length") => {
-                return Err(length_finish_reason_error());
+                return Err(DeepSeekRequestError::with_usage(
+                    length_finish_reason_error(),
+                    accumulated_usage,
+                ));
             }
             Some("content_filter") => {
-                return Err("Response blocked by content filter".to_string());
+                return Err(DeepSeekRequestError::with_usage(
+                    "Response blocked by content filter",
+                    accumulated_usage,
+                ));
             }
             _ => {}
         }
@@ -394,9 +480,14 @@ async fn request_chat_streaming(
         {
             if empty_response_retries < EMPTY_RESPONSE_RETRIES {
                 empty_response_retries += 1;
+                suppress_retry_reasoning = emitted_reasoning;
+                add_empty_response_recovery_instruction(&mut request);
                 continue;
             }
-            return Err(EMPTY_RESPONSE_ERROR.to_string());
+            return Err(DeepSeekRequestError::with_usage(
+                EMPTY_RESPONSE_ERROR,
+                accumulated_usage,
+            ));
         }
 
         return Ok(ProviderResponse {
@@ -404,7 +495,7 @@ async fn request_chat_streaming(
             assistant_content,
             assistant_reasoning,
             tool_calls: raw_calls_for_history,
-            usage: stream_result.usage,
+            usage: accumulated_usage,
         });
     }
 }
@@ -425,7 +516,7 @@ fn stream_step_belongs_in_response_steps(step: &ProviderStep) -> bool {
 fn request_chat(
     conversation: &Conversation,
     config: &ProviderConfig,
-) -> Result<ProviderResponse, String> {
+) -> Result<ProviderResponse, DeepSeekRequestError> {
     let api_key = config.api_key.as_deref().ok_or_else(|| {
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
     })?;
@@ -454,6 +545,7 @@ fn request_chat(
         reasoning_effort: Some(config.reasoning_effort),
     };
 
+    let mut accumulated_usage = None;
     for empty_attempt in 0..=EMPTY_RESPONSE_RETRIES {
         let response = match crate::http_client::execute_with_retry(|client| {
             client.post(&url).bearer_auth(api_key).json(&request)
@@ -465,20 +557,31 @@ fn request_chat(
                 request.tools = Some(tools.clone());
                 crate::http_client::execute_with_retry(|client| {
                     client.post(&url).bearer_auth(api_key).json(&request)
-                })?
+                })
+                .map_err(|error| DeepSeekRequestError::with_usage(error, accumulated_usage))?
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(DeepSeekRequestError::with_usage(error, accumulated_usage));
+            }
         };
-        let response = response
-            .json::<ChatResponse>()
-            .map_err(|error| format!("invalid response: {error}"))?;
+        let response = response.json::<ChatResponse>().map_err(|error| {
+            DeepSeekRequestError::with_usage(
+                format!("invalid response: {error}"),
+                accumulated_usage,
+            )
+        })?;
 
         let usage = response.usage.map(Usage::from);
+        merge_usage(&mut accumulated_usage, usage);
         let Some(choice) = response.choices.into_iter().next() else {
             if empty_attempt < EMPTY_RESPONSE_RETRIES {
+                add_empty_response_recovery_instruction(&mut request);
                 continue;
             }
-            return Err("response did not contain choices".to_string());
+            return Err(DeepSeekRequestError::with_usage(
+                "response did not contain choices",
+                accumulated_usage,
+            ));
         };
 
         let message = choice.message;
@@ -488,10 +591,16 @@ fn request_chat(
 
         match finish_reason.as_str() {
             "length" => {
-                return Err(length_finish_reason_error());
+                return Err(DeepSeekRequestError::with_usage(
+                    length_finish_reason_error(),
+                    accumulated_usage,
+                ));
             }
             "content_filter" => {
-                return Err("Response blocked by content filter".to_string());
+                return Err(DeepSeekRequestError::with_usage(
+                    "Response blocked by content filter",
+                    accumulated_usage,
+                ));
             }
             "stop" | "tool_calls" | "" => {}
             other => {
@@ -547,9 +656,13 @@ fn request_chat(
                 .any(|step| matches!(step, ProviderStep::Error(_)))
         {
             if empty_attempt < EMPTY_RESPONSE_RETRIES {
+                add_empty_response_recovery_instruction(&mut request);
                 continue;
             }
-            return Err(EMPTY_RESPONSE_ERROR.to_string());
+            return Err(DeepSeekRequestError::with_usage(
+                EMPTY_RESPONSE_ERROR,
+                accumulated_usage,
+            ));
         }
 
         return Ok(ProviderResponse {
@@ -557,11 +670,14 @@ fn request_chat(
             assistant_content,
             assistant_reasoning,
             tool_calls: raw_calls_for_history,
-            usage,
+            usage: accumulated_usage,
         });
     }
 
-    Err(EMPTY_RESPONSE_ERROR.to_string())
+    Err(DeepSeekRequestError::with_usage(
+        EMPTY_RESPONSE_ERROR,
+        accumulated_usage,
+    ))
 }
 
 fn length_finish_reason_error() -> String {
@@ -842,16 +958,15 @@ mod tests {
         }
     }
 
-    fn spawn_two_response_server(
-        first: &'static str,
-        second: &'static str,
+    fn spawn_response_sequence_server(
+        responses: Vec<&'static str>,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&bodies);
         std::thread::spawn(move || {
-            for response in [first, second] {
+            for response in responses {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let body = read_http_request_body(&mut stream);
                 captured.lock().expect("lock captured bodies").push(body);
@@ -864,6 +979,33 @@ mod tests {
             }
         });
         (base_url, bodies)
+    }
+
+    fn spawn_two_response_server(
+        first: &'static str,
+        second: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        spawn_response_sequence_server(vec![first, second])
+    }
+
+    fn incident_plan_boundary_conversation() -> Conversation {
+        let mut conversation = Conversation::new();
+        conversation.add_user("finish the migration".to_string());
+        conversation.add_assistant(
+            None,
+            Some("The migration is complete; update the plan and report.".to_string()),
+            vec![RawToolCall {
+                id: "call_update_plan".to_string(),
+                function_name: "update_plan".to_string(),
+                arguments: r#"{"plan":[{"step":"migrate tools","status":"completed"}]}"#
+                    .to_string(),
+            }],
+        );
+        conversation.add_tool_result(
+            "call_update_plan".to_string(),
+            "Plan updated (1 item). [x] migrate tools".to_string(),
+        );
+        conversation
     }
 
     fn spawn_two_streaming_response_server(
@@ -1514,8 +1656,8 @@ mod tests {
     #[test]
     fn request_chat_retries_once_after_empty_response() {
         let (base_url, bodies) = spawn_two_response_server(
-            r#"{"choices":[]}"#,
-            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"prompt_cache_hit_tokens":7}}"#,
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":13,"completion_tokens":5,"prompt_cache_hit_tokens":9}}"#,
         );
         let mut conversation = Conversation::new();
         conversation.add_user("hello".to_string());
@@ -1532,18 +1674,40 @@ mod tests {
         let response = request_chat(&conversation, &config).expect("retry succeeds");
 
         assert_eq!(response.assistant_content.as_deref(), Some("ok"));
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 24,
+                output_tokens: 8,
+                cache_tokens: 16,
+            })
+        );
         let bodies = bodies.lock().expect("lock captured bodies");
         assert_eq!(bodies.len(), 2);
-        for body in bodies.iter() {
-            let json: Value = serde_json::from_str(body).expect("request json");
-            assert_eq!(json["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
-        }
+        let first: Value = serde_json::from_str(&bodies[0]).expect("first request json");
+        let retry: Value = serde_json::from_str(&bodies[1]).expect("retry request json");
+        assert_eq!(first["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
+        assert_eq!(retry["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
+        assert_eq!(
+            first["messages"].as_array().expect("first messages").len(),
+            1
+        );
+        assert_eq!(
+            retry["messages"].as_array().expect("retry messages").len(),
+            1
+        );
+        assert_eq!(
+            retry["messages"][0]["content"],
+            format!("hello\n\n{EMPTY_RESPONSE_RECOVERY_PROMPT}")
+        );
+        assert_eq!(conversation.messages.len(), 1);
     }
 
     #[test]
     fn non_streaming_reasoning_only_response_is_rejected() {
-        let reasoning_only = r#"{"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"stop"}]}"#;
-        let (base_url, bodies) = spawn_two_response_server(reasoning_only, reasoning_only);
+        let reasoning_only = r#"{"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"prompt_cache_hit_tokens":5}}"#;
+        let (base_url, bodies) =
+            spawn_response_sequence_server(vec![reasoning_only; EMPTY_RESPONSE_RETRIES + 1]);
         let mut conversation = Conversation::new();
         conversation.add_user("hello".to_string());
         let config = ProviderConfig {
@@ -1558,7 +1722,57 @@ mod tests {
 
         let error = request_chat(&conversation, &config).expect_err("reasoning-only is invalid");
 
-        assert_eq!(error, EMPTY_RESPONSE_ERROR);
+        assert_eq!(error.message, EMPTY_RESPONSE_ERROR);
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input_tokens: 14,
+                output_tokens: 4,
+                cache_tokens: 10,
+            })
+        );
+        assert_eq!(
+            bodies.lock().expect("lock captured bodies").len(),
+            EMPTY_RESPONSE_RETRIES + 1
+        );
+    }
+
+    #[test]
+    fn non_streaming_facade_preserves_usage_when_recovery_also_fails() {
+        let first = r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"prompt_cache_hit_tokens":2}}"#;
+        let second = r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"prompt_cache_hit_tokens":4}}"#;
+        let (base_url, bodies) = spawn_two_response_server(first, second);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let response = crate::call(
+            orca_core::config::ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+        );
+
+        assert!(matches!(
+            response.steps.as_slice(),
+            [ProviderStep::Error(message)]
+                if message == "DeepSeek provider error: response did not contain choices"
+        ));
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 8,
+                output_tokens: 3,
+                cache_tokens: 6,
+            })
+        );
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
     }
 
@@ -1607,6 +1821,7 @@ mod tests {
     async fn streaming_reasoning_only_response_is_rejected() {
         let reasoning_only = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\n\
                               data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"prompt_cache_hit_tokens\":7}}\n\n\
                               data: [DONE]\n\n";
         let (base_url, bodies) = spawn_two_streaming_response_server(reasoning_only);
         let mut conversation = Conversation::new();
@@ -1626,8 +1841,153 @@ mod tests {
             .await
             .expect_err("reasoning-only is invalid");
 
-        assert_eq!(error, EMPTY_RESPONSE_ERROR);
+        assert_eq!(error.message, EMPTY_RESPONSE_ERROR);
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input_tokens: 22,
+                output_tokens: 6,
+                cache_tokens: 14,
+            })
+        );
+        assert_eq!(
+            bodies.lock().expect("lock captured bodies").len(),
+            EMPTY_RESPONSE_RETRIES + 1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_facade_preserves_usage_when_recovery_also_fails() {
+        let first = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":4,\"prompt_cache_hit_tokens\":8}}\n\n\
+                     data: [DONE]\n\n";
+        let second = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":5,\"prompt_cache_hit_tokens\":9}}\n\n\
+                      data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![first, second]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut emitted = Vec::new();
+
+        let response = crate::call_streaming_async(
+            orca_core::config::ProviderKind::DeepSeek,
+            &conversation,
+            &config,
+            &cancel,
+            |step| emitted.push(step.clone()),
+        )
+        .await;
+
+        assert!(matches!(
+            response.steps.as_slice(),
+            [ProviderStep::Error(message)]
+                if message == "DeepSeek provider error: response did not contain content or tool calls"
+        ));
+        assert!(matches!(
+            emitted.as_slice(),
+            [ProviderStep::Error(message)]
+                if message == "DeepSeek provider error: response did not contain content or tool calls"
+        ));
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 30,
+                output_tokens: 9,
+                cache_tokens: 17,
+            })
+        );
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_empty_response_retry_adds_recovery_instruction() {
+        let reasoning_only = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first attempt thinking\"},\"finish_reason\":null}]}\n\n\
+                              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":4,\"prompt_cache_hit_tokens\":12}}\n\n\
+                              data: [DONE]\n\n";
+        let recovered = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"retry thinking\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":6,\"prompt_cache_hit_tokens\":14}}\n\n\
+                         data: [DONE]\n\n";
+        let (base_url, bodies) =
+            spawn_streaming_response_sequence_server(vec![reasoning_only, recovered]);
+        let conversation = incident_plan_boundary_conversation();
+        let original_messages = serde_json::to_value(conversation_to_api_messages(&conversation))
+            .expect("serialize original messages");
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-v4-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut emitted = Vec::new();
+
+        let response = request_chat_streaming(&conversation, &config, &cancel, &mut |step| {
+            emitted.push(step.clone())
+        })
+        .await
+        .expect("recovery response succeeds");
+
+        assert_eq!(response.assistant_content.as_deref(), Some("recovered"));
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 36,
+                output_tokens: 10,
+                cache_tokens: 26,
+            })
+        );
+        assert!(emitted.iter().any(
+            |step| matches!(step, ProviderStep::ReasoningDelta(text) if text == "first attempt thinking")
+        ));
+        assert!(!emitted.iter().any(
+            |step| matches!(step, ProviderStep::ReasoningDelta(text) if text == "retry thinking")
+        ));
+        assert!(
+            emitted.iter().any(
+                |step| matches!(step, ProviderStep::MessageDelta(text) if text == "recovered")
+            )
+        );
+        let bodies = bodies.lock().expect("lock captured bodies");
+        assert_eq!(bodies.len(), 2);
+        let first: Value = serde_json::from_str(&bodies[0]).expect("first request json");
+        let retry: Value = serde_json::from_str(&bodies[1]).expect("retry request json");
+        assert_eq!(
+            first["messages"].as_array().expect("first messages").len(),
+            3
+        );
+        assert_eq!(
+            retry["messages"].as_array().expect("retry messages").len(),
+            4
+        );
+        assert_eq!(
+            first["messages"][1]["reasoning_content"],
+            "The migration is complete; update the plan and report."
+        );
+        assert_eq!(retry["messages"][2]["role"], "tool");
+        assert!(!bodies[1].contains("first attempt thinking"));
+        assert_eq!(
+            retry["messages"][3]["content"],
+            EMPTY_RESPONSE_RECOVERY_PROMPT
+        );
+        assert_eq!(
+            serde_json::to_value(conversation_to_api_messages(&conversation))
+                .expect("serialize unchanged messages"),
+            original_messages
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1767,7 +2127,8 @@ mod tests {
         .await
         .expect_err("a visible partial response must not be replayed transparently");
 
-        assert_eq!(error, "stream ended before terminal marker");
+        assert_eq!(error.message, "stream ended before terminal marker");
+        assert_eq!(error.usage, None);
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
         assert_eq!(deltas, vec!["partial"]);
     }
@@ -2025,7 +2386,9 @@ mod tests {
 
         canceller.join().expect("stalled stream canceller");
         server.join().expect("stalled stream server");
-        assert_eq!(result.unwrap_err(), "cancelled");
+        let error = result.unwrap_err();
+        assert_eq!(error.message, "cancelled");
+        assert_eq!(error.usage, None);
         assert!(
             elapsed < Duration::from_millis(500),
             "cancelled stream returned after {elapsed:?}"

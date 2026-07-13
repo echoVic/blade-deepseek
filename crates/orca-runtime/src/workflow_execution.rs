@@ -587,6 +587,7 @@ export const meta = {
 
     #[test]
     fn workflow_tool_reports_immediate_startup_failure() {
+        let _guard = crate::history::lock_test_env();
         if !WorkflowHost::node_available() {
             return;
         }
@@ -629,6 +630,7 @@ export const meta = {
 
     #[test]
     fn workflow_draft_action_run_reports_immediate_startup_failure() {
+        let _guard = crate::history::lock_test_env();
         if !WorkflowHost::node_available() {
             return;
         }

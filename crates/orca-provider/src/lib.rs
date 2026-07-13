@@ -236,6 +236,12 @@ pub async fn call_streaming_async(
             for step in &response.steps {
                 on_step(step);
             }
+            if conversation
+                .last_user_message()
+                .is_some_and(|prompt| prompt.trim() == "mock_usage_then_cancel")
+            {
+                cancel.cancel();
+            }
             response
         }
         ProviderKind::DeepSeekFixture => {
@@ -381,6 +387,18 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         .iter()
         .any(|m| matches!(m, Message::Tool { .. }));
     let prompt = conversation.last_user_message().unwrap_or("");
+
+    if prompt.trim() == "mock_provider_error" {
+        return ProviderResponse {
+            steps: vec![ProviderStep::Error(
+                "mock provider error: api_key=super-secret".to_string(),
+            )],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
 
     if prompt.trim() == "bad_plan_then_fix" && has_tool_results {
         let has_fixed_plan = conversation.messages.iter().any(|m| match m {
@@ -661,7 +679,7 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
-    if prompt.trim() == "mock_usage" {
+    if matches!(prompt.trim(), "mock_usage" | "mock_usage_then_cancel") {
         let reasoning = "Mock runtime is preserving the DeepSeek reasoning channel.";
         let message = "Mock runtime completed with usage accounting.";
         return ProviderResponse {

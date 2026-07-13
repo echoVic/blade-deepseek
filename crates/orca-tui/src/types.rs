@@ -1499,7 +1499,11 @@ impl AppState {
                 self.push_message(ChatMessage::System(msg));
             }
             TuiEvent::UsageUpdated(usage) => {
-                self.usage = usage;
+                self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
+                self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
+                self.usage.cache_tokens = self.usage.cache_tokens.max(usage.cache_tokens);
+                self.usage.estimated_cost_usd =
+                    self.usage.estimated_cost_usd.max(usage.estimated_cost_usd);
             }
             TuiEvent::ContextUpdated {
                 used_tokens,
@@ -2916,6 +2920,28 @@ mod tests {
             state.accepts_mouse_scroll_at(completed_at + std::time::Duration::from_millis(900)),
             "manual mouse scrolling should work again after the completion grace period"
         );
+    }
+
+    #[test]
+    fn usage_updates_merge_monotonically_across_out_of_order_events() {
+        let mut state = state();
+        state.update(TuiEvent::UsageUpdated(UsageTotals {
+            input_tokens: 300,
+            output_tokens: 80,
+            cache_tokens: 40,
+            estimated_cost_usd: 0.003,
+        }));
+        state.update(TuiEvent::UsageUpdated(UsageTotals {
+            input_tokens: 200,
+            output_tokens: 120,
+            cache_tokens: 20,
+            estimated_cost_usd: 0.002,
+        }));
+
+        assert_eq!(state.usage.input_tokens, 300);
+        assert_eq!(state.usage.output_tokens, 120);
+        assert_eq!(state.usage.cache_tokens, 40);
+        assert_eq!(state.usage.estimated_cost_usd, 0.003);
     }
 
     #[test]

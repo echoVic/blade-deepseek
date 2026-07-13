@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io;
 use std::io::Cursor;
 
@@ -272,7 +273,7 @@ fn run_child_agent_provider_turn_applies_model_hooks_around_provider_call() {
 #[test]
 fn run_child_agent_provider_turn_returns_child_failure_for_model_hook_errors() {
     let request = ChildAgentRequest::new(
-        "inspect repo".to_string(),
+        "mock_usage".to_string(),
         SubagentType::General,
         None,
         2,
@@ -311,7 +312,8 @@ fn run_child_agent_provider_turn_returns_child_failure_for_model_hook_errors() {
     );
 
     match pre_turn {
-        ChildAgentProviderTurn::Fail(result) => {
+        ChildAgentProviderTurn::Fail { result, usage } => {
+            assert!(usage.is_none());
             assert_eq!(result.status, RunStatus::Failed);
             assert!(
                 result
@@ -340,7 +342,15 @@ fn run_child_agent_provider_turn_returns_child_failure_for_model_hook_errors() {
     );
 
     match post_turn {
-        ChildAgentProviderTurn::Fail(result) => {
+        ChildAgentProviderTurn::Fail { result, usage } => {
+            assert_eq!(
+                usage,
+                Some(Usage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    cache_tokens: 10,
+                })
+            );
             assert_eq!(result.status, RunStatus::Failed);
             assert!(
                 result
@@ -538,6 +548,128 @@ fn handle_child_agent_provider_error_retries_prompt_too_long_once() {
 }
 
 #[test]
+fn child_agent_provider_error_records_usage_before_failure() {
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    let mut setup = prepare_child_agent_loop(
+        &runtime_config,
+        &request,
+        std::env::temp_dir().as_path(),
+        &instructions,
+        &memory,
+    );
+    let response = ProviderResponse {
+        steps: vec![ProviderStep::Error("quota exhausted".to_string())],
+        assistant_content: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        usage: Some(Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_tokens: 10,
+        }),
+    };
+    let mut tracker = CostTracker::new(None);
+
+    let decision = crate::child_agent_loop_runner::handle_child_agent_provider_error_with_usage(
+        &runtime_config,
+        &mut setup,
+        std::env::temp_dir().as_path(),
+        &HookRunner::default(),
+        &response,
+        &mut tracker,
+        None,
+    )
+    .expect("provider-error handling should not fail")
+    .expect("provider error should produce a decision");
+
+    assert!(matches!(
+        decision,
+        ChildAgentProviderErrorDecision::Fail(ChildAgentResult {
+            status: RunStatus::Failed,
+            ..
+        })
+    ));
+    let totals = tracker.totals();
+    assert_eq!(totals.input_tokens, 120);
+    assert_eq!(totals.output_tokens, 30);
+    assert_eq!(totals.cache_tokens, 10);
+}
+
+#[test]
+fn observed_child_agent_provider_error_emits_cumulative_usage() {
+    let request = ChildAgentRequest::new(
+        "inspect repo".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    let mut setup = prepare_child_agent_loop(
+        &runtime_config,
+        &request,
+        std::env::temp_dir().as_path(),
+        &instructions,
+        &memory,
+    );
+    let response = ProviderResponse {
+        steps: vec![ProviderStep::Error("quota exhausted".to_string())],
+        assistant_content: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        usage: Some(Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_tokens: 10,
+        }),
+    };
+    let mut tracker = CostTracker::new(None);
+    tracker.add_usage(Usage {
+        input_tokens: 5,
+        output_tokens: 2,
+        cache_tokens: 1,
+    });
+    let activities = RefCell::new(Vec::new());
+    let observer = ChildAgentActivityObserver::new(|activity| {
+        activities.borrow_mut().push(activity.clone());
+    });
+
+    let decision = crate::child_agent_loop_runner::handle_child_agent_provider_error_with_usage(
+        &runtime_config,
+        &mut setup,
+        std::env::temp_dir().as_path(),
+        &HookRunner::default(),
+        &response,
+        &mut tracker,
+        Some(&observer),
+    )
+    .expect("provider-error handling should not fail")
+    .expect("provider error should produce a decision");
+
+    assert!(matches!(decision, ChildAgentProviderErrorDecision::Fail(_)));
+    drop(observer);
+    assert_eq!(
+        activities.into_inner(),
+        vec![ChildAgentActivity::Usage(tracker.totals())]
+    );
+    let totals = tracker.totals();
+    assert_eq!(totals.input_tokens, 125);
+    assert_eq!(totals.output_tokens, 32);
+    assert_eq!(totals.cache_tokens, 11);
+}
+
+#[test]
 fn fold_child_agent_provider_response_records_usage_and_terminal_assistant() {
     let request = ChildAgentRequest::new(
         "inspect repo".to_string(),
@@ -569,6 +701,17 @@ fn fold_child_agent_provider_response_records_usage_and_terminal_assistant() {
     };
     let mut tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
 
+    let decision = crate::child_agent_loop_runner::handle_child_agent_provider_error_with_usage(
+        &runtime_config,
+        &mut setup,
+        std::env::temp_dir().as_path(),
+        &HookRunner::default(),
+        &response,
+        &mut tracker,
+        None,
+    )
+    .expect("provider-error handling should not fail");
+    assert!(decision.is_none());
     let fold = fold_child_agent_provider_response(&mut setup, &response, &mut tracker);
 
     match fold {
@@ -580,7 +723,10 @@ fn fold_child_agent_provider_response_records_usage_and_terminal_assistant() {
             panic!("terminal response should complete child run")
         }
     }
-    assert!(tracker.totals().total_tokens() > 0);
+    let totals = tracker.totals();
+    assert_eq!(totals.input_tokens, 120);
+    assert_eq!(totals.output_tokens, 30);
+    assert_eq!(totals.cache_tokens, 10);
     assert!(matches!(
         setup.conversation.messages.last(),
         Some(Message::Assistant {
@@ -720,6 +866,64 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
         Some("Mock completed after tool execution.")
     );
     assert_eq!(tool_count, 1);
+}
+
+#[test]
+fn observed_child_agent_stops_at_local_budget_after_emitting_exact_usage() {
+    let request = ChildAgentRequest::new(
+        "mock_usage".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let mut runtime_config = config(None);
+    runtime_config.max_budget_usd = Some(0.0);
+    let mut tracker = CostTracker::new(None);
+    let activities = RefCell::new(Vec::new());
+    let observer = ChildAgentActivityObserver::new(|activity| {
+        activities.borrow_mut().push(activity.clone());
+    });
+
+    let result = run_child_agent_loop_with_tool_executor_observed(
+        &runtime_config,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+        },
+        Some(&observer),
+        |_setup, _cancel, _tool_request| {
+            panic!("budget-exhausted child must not execute provider-requested tools")
+        },
+    )
+    .expect("child loop should report budget exhaustion");
+
+    assert_eq!(result.status, RunStatus::BudgetExhausted);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("budget exhausted"))
+    );
+    let totals = tracker.totals();
+    assert_eq!(totals.input_tokens, 120);
+    assert_eq!(totals.output_tokens, 30);
+    assert_eq!(totals.cache_tokens, 10);
+    let usage_events = activities
+        .borrow()
+        .iter()
+        .filter_map(|activity| match activity {
+            ChildAgentActivity::Usage(usage) => Some(*usage),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(usage_events, vec![totals]);
 }
 
 #[test]

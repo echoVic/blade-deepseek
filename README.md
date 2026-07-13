@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.20 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.21 sh
 ```
 
 ### GitHub Releases
@@ -76,6 +76,10 @@ content sent to the model:
   terminals, then adds token, cost, and shortcut metadata as space permits.
 - Permission modes use semantic colors: `suggest` blue, `auto-edit` violet,
   `full-auto` red, and `plan` teal.
+- If DeepSeek ends a turn without visible content or a tool call, Orca performs
+  one bounded corrective retry without persisting the incomplete response or
+  repeating already displayed reasoning. Terminal provider failures retain a
+  redacted diagnostic in session and task history for later analysis.
 
 ## Configuration
 

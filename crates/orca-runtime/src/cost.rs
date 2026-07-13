@@ -35,10 +35,29 @@ impl CostTracker {
     }
 
     pub fn merge(&mut self, other: &CostTracker) {
-        self.totals.input_tokens += other.totals.input_tokens;
-        self.totals.output_tokens += other.totals.output_tokens;
-        self.totals.cache_tokens += other.totals.cache_tokens;
+        self.totals.input_tokens = self
+            .totals
+            .input_tokens
+            .saturating_add(other.totals.input_tokens);
+        self.totals.output_tokens = self
+            .totals
+            .output_tokens
+            .saturating_add(other.totals.output_tokens);
+        self.totals.cache_tokens = self
+            .totals
+            .cache_tokens
+            .saturating_add(other.totals.cache_tokens);
         self.totals.estimated_cost_usd += other.totals.estimated_cost_usd;
+    }
+
+    pub fn merge_totals(&mut self, usage: UsageTotals) {
+        self.totals.input_tokens = self.totals.input_tokens.saturating_add(usage.input_tokens);
+        self.totals.output_tokens = self
+            .totals
+            .output_tokens
+            .saturating_add(usage.output_tokens);
+        self.totals.cache_tokens = self.totals.cache_tokens.saturating_add(usage.cache_tokens);
+        self.totals.estimated_cost_usd += usage.estimated_cost_usd;
     }
 
     pub fn totals(&self) -> UsageTotals {
