@@ -1087,6 +1087,30 @@ mod tests {
         }
     }
 
+    fn history_writer_that_fails_on_append(
+        label: &str,
+    ) -> (tempfile::TempDir, crate::thread_store::SessionWriter) {
+        let history = tempfile::tempdir().expect("history tempdir");
+        let history_path = history.path().join("session.jsonl");
+        let meta = crate::history::create_meta(history.path(), "mock", None, label);
+        let mut meta_record = serde_json::to_value(meta)
+            .expect("serialize history metadata")
+            .as_object()
+            .cloned()
+            .expect("history metadata object");
+        meta_record.insert("type".to_string(), serde_json::json!("session.meta"));
+        std::fs::write(
+            &history_path,
+            format!("{}\n", serde_json::Value::Object(meta_record)),
+        )
+        .expect("seed history file");
+        let writer = crate::thread_store::SessionWriter::append_to_existing(history_path.clone())
+            .expect("open existing history");
+        std::fs::remove_file(&history_path).expect("remove history file");
+        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        (history, writer)
+    }
+
     #[test]
     fn batch_plan_stops_at_async_request_boundary() {
         let mut subagents = SubagentConfig::default();
@@ -1227,14 +1251,8 @@ mod tests {
 
     #[test]
     fn record_subagent_batch_results_keeps_live_terminals_after_history_failure() {
-        let history = tempfile::tempdir().expect("history tempdir");
-        let history_path = history.path().join("session.jsonl");
-        std::fs::write(&history_path, "").expect("create history file");
-        let mut writer =
-            crate::thread_store::SessionWriter::append_to_existing(history_path.clone())
-                .expect("open existing history");
-        std::fs::remove_file(&history_path).expect("remove history file");
-        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        let (_history, mut writer) =
+            history_writer_that_fails_on_append("subagent batch history failure");
         let first = subagent_request("first");
         let second = subagent_request("second");
         let mut conversation = orca_core::conversation::Conversation::new();

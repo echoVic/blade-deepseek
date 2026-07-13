@@ -807,6 +807,28 @@ mod tests {
         }
     }
 
+    fn history_writer_that_fails_on_append(label: &str) -> (tempfile::TempDir, SessionWriter) {
+        let history = tempfile::tempdir().expect("history tempdir");
+        let history_path = history.path().join("session.jsonl");
+        let meta = crate::history::create_meta(history.path(), "mock", None, label);
+        let mut meta_record = serde_json::to_value(meta)
+            .expect("serialize history metadata")
+            .as_object()
+            .cloned()
+            .expect("history metadata object");
+        meta_record.insert("type".to_string(), json!("session.meta"));
+        std::fs::write(
+            &history_path,
+            format!("{}\n", serde_json::Value::Object(meta_record)),
+        )
+        .expect("seed history file");
+        let writer =
+            SessionWriter::append_to_existing(history_path.clone()).expect("open existing history");
+        std::fs::remove_file(&history_path).expect("remove history file");
+        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        (history, writer)
+    }
+
     fn unused_child_executor<W: io::Write>(
         _config: &RunConfig,
         _request: &ChildAgentRequest,
@@ -1166,13 +1188,8 @@ mod tests {
 
     #[test]
     fn record_readonly_batch_results_keeps_live_terminals_after_history_failure() {
-        let history = tempfile::tempdir().expect("history tempdir");
-        let history_path = history.path().join("session.jsonl");
-        std::fs::write(&history_path, "").expect("create history file");
-        let mut writer =
-            SessionWriter::append_to_existing(history_path.clone()).expect("open existing history");
-        std::fs::remove_file(&history_path).expect("remove history file");
-        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        let (_history, mut writer) =
+            history_writer_that_fails_on_append("readonly batch history failure");
         let mut conversation = Conversation::new();
         let first = request(ToolName::ReadFile, ActionKind::Read, Some("one.txt"), None);
         let second = ToolRequest {
@@ -2107,13 +2124,8 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         std::fs::write(cwd.path().join("one.txt"), "one\n").expect("write first fixture");
         std::fs::write(cwd.path().join("two.txt"), "two\n").expect("write second fixture");
-        let history = tempfile::tempdir().expect("history tempdir");
-        let history_path = history.path().join("session.jsonl");
-        std::fs::write(&history_path, "").expect("create history file");
-        let mut history_writer =
-            SessionWriter::append_to_existing(history_path.clone()).expect("open existing history");
-        std::fs::remove_file(&history_path).expect("remove history file");
-        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        let (_history, mut history_writer) =
+            history_writer_that_fails_on_append("readonly sibling history failure");
         let mut config = config_with_external(Vec::new());
         config.approval_mode = ApprovalMode::FullAuto;
         config.tools.max_read_parallel = 2;
