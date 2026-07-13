@@ -1,0 +1,71 @@
+Cargo.lock
+  s_b8a5b8329f561f::t_77f2d78684c4b0 1208-1217,1221,1280-1289,1368,1610-1629
+Cargo.toml
+  s_b8a5b8329f561f::t_3384913e00ef83 20-21
+crates/orca-file-search/Cargo.toml
+  s_b8a5b8329f561f::t_c971232b527bb5 1-12
+crates/orca-file-search/examples/million_path_bench.rs
+  s_b8a5b8329f561f::t_2c7f4b69e3ee78 1-227
+crates/orca-file-search/src/browse.rs
+  s_b8a5b8329f561f::t_dacff68ace4ed0 1-235
+crates/orca-file-search/src/discovery.rs
+  s_b8a5b8329f561f::t_438dd81b46a485 1-128
+crates/orca-file-search/src/eligibility.rs
+  s_b8a5b8329f561f::t_3ed48889ae8e3c 1-115
+crates/orca-file-search/src/freshness.rs
+  s_b8a5b8329f561f::t_16ddf6d6ef9b76 1-84
+crates/orca-file-search/src/lib.rs
+  s_b8a5b8329f561f::t_02c36ac0284337 1-13
+crates/orca-file-search/src/session.rs
+  s_b8a5b8329f561f::t_bc18760980e942 1-567
+crates/orca-file-search/src/types.rs
+  s_b8a5b8329f561f::t_0f58a4f3d2999d 1-101
+crates/orca-file-search/tests/session.rs
+  s_b8a5b8329f561f::t_920de3657d4496 1-336
+crates/orca-runtime/src/mentions.rs
+  s_b8a5b8329f561f::t_508aaa77c0d8d0 53-72,75-139,141-142,147,151-152,158-166,169-171,174-179,182-183,193-195,197-202,204-208,497-498,505-509,572-577,579-580,582-594,598-600,602,604-605,609-619,621-624,626-627,631-634,637-638,642-646,651-653,655-656
+crates/orca-tui/Cargo.toml
+  s_b8a5b8329f561f::t_9020d6b94297ab 16
+crates/orca-tui/src/app.rs
+  s_b8a5b8329f561f::t_b1d6f8370fdffb 27-29,36,87-91,304-319,325-333,349
+crates/orca-tui/src/composer_input_actions.rs
+  s_b8a5b8329f561f::t_10e863b578f90a 7-10,69-91
+crates/orca-tui/src/composer_textarea.rs
+  s_b8a5b8329f561f::t_dde1d5da6e35e0 18-26,35-54,68-83,298-314
+crates/orca-tui/src/idle_key_actions.rs
+  s_b8a5b8329f561f::t_4a034b88f29992 4,50-52
+crates/orca-tui/src/lib.rs
+  s_b8a5b8329f561f::t_3f4ebea6bb3801 25,691-698
+crates/orca-tui/src/mention_menu_actions.rs
+  s_b8a5b8329f561f::t_cf8a5e383cecc0 6-8,23-24,28-30,32,37-40,43-53,59-63,72-80
+crates/orca-tui/src/mention_search_manager.rs
+  s_b8a5b8329f561f::t_52611c36b19c44 1-555
+crates/orca-tui/src/types.rs
+  s_b8a5b8329f561f::t_49917cb90002ad 12,217-219,495-518,565,651,1527
+crates/orca-tui/src/ui.rs
+  s_b8a5b8329f561f::t_2ffcf95dfeb0e1 17,88,2232-2233,2235,2240-2241,2245-2250,2258,2263-2264,2269,2276-2288,2291-2296,2308-2327,3342-3351,3362-3450
+docs/architecture/adr/0001-streaming-mention-file-search.md
+  s_b8a5b8329f561f::t_f3745134e88c09 1-325
+docs/architecture/mention-search-glossary.md
+  s_b8a5b8329f561f::t_f54baca62a3798 1-120
+docs/superpowers/plans/2026-07-13-streaming-mention-file-search.md
+  s_b8a5b8329f561f::t_e5e8a6585f69dd 1-360
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a74ef2c85103dbdf1f54c1c186112e77ca5d0f54",
+  "prompts": {},
+  "sessions": {
+    "s_b8a5b8329f561f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5a1f-e7c9-79d0-9450-3ac002f96b8a",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
