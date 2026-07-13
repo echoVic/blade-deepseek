@@ -24,13 +24,16 @@ use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
-use crate::composer_textarea::{make_setup_textarea, make_textarea};
+use crate::composer_textarea::{
+    make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
+};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::input_event_actions::{
     BatchedInputEvent, coalesce_input_events, handle_mouse_event, handle_paste_event,
     handle_scroll_lines,
 };
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
+use crate::mention_search_manager::MentionSearchManager;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
@@ -81,6 +84,11 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
     let (action_tx, action_rx) = mpsc::channel::<UserAction>();
+    let mention_root = config
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut mention_search = MentionSearchManager::new(mention_root, event_tx.clone());
     let pending_workflow_notifications: bridge::PendingWorkflowNotifications =
         bridge::PendingWorkflowNotifications::new();
 
@@ -293,20 +301,36 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     },
                     IterationEvent::Runtime(tui_event) => {
-                        handle_runtime_event(
-                            tui_event,
-                            &mut state,
-                            &action_tx,
-                            &pending_workflow_notifications,
-                            &mut textarea,
-                            &mut vim_state,
-                            &theme,
-                        );
+                        if let TuiEvent::MentionSearchDirty { generation } = tui_event {
+                            let text = textarea_text(&textarea);
+                            let cursor = textarea_cursor_byte_index(&textarea);
+                            mention_search
+                                .consume_dirty_at_cursor(generation, &text, cursor, &mut state);
+                        } else {
+                            handle_runtime_event(
+                                tui_event,
+                                &mut state,
+                                &action_tx,
+                                &pending_workflow_notifications,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                            );
+                        }
                     }
                 }
                 Ok(None)
             },
         )?;
+        let mention_enabled = MentionSearchManager::is_enabled(&state);
+        let mention_root = config
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        mention_search.set_root(mention_root, &mut state);
+        let text = textarea_text(&textarea);
+        let cursor = textarea_cursor_byte_index(&textarea);
+        mention_search.sync_at_cursor(&text, cursor, mention_enabled, &mut state, Instant::now());
         if let Some(code) = iteration.exit_code {
             exit_code = code;
             break 'main;
@@ -322,6 +346,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     // Leave the cursor on a fresh line below the final frame so the shell prompt returns cleanly.
     drop(terminal);
     terminal_cleanup.finish();
+    mention_search.shutdown();
 
     Ok(exit_code)
 }

@@ -16,6 +16,15 @@ pub(crate) fn make_textarea_with_text<'a>(
     vim_state: &VimState,
     theme: &Theme,
 ) -> TextArea<'a> {
+    make_textarea_with_text_at_cursor(text, text.len(), vim_state, theme)
+}
+
+pub(crate) fn make_textarea_with_text_at_cursor<'a>(
+    text: &str,
+    cursor: usize,
+    vim_state: &VimState,
+    theme: &Theme,
+) -> TextArea<'a> {
     let lines: Vec<String> = if text.is_empty() {
         vec![String::new()]
     } else {
@@ -23,8 +32,26 @@ pub(crate) fn make_textarea_with_text<'a>(
     };
     let mut textarea = TextArea::from(lines);
     configure_textarea(&mut textarea, vim_state, theme);
-    textarea.move_cursor(CursorMove::Bottom);
-    textarea.move_cursor(CursorMove::End);
+    let cursor = cursor.min(text.len());
+    let cursor = if text.is_char_boundary(cursor) {
+        cursor
+    } else {
+        (0..cursor)
+            .rev()
+            .find(|index| text.is_char_boundary(*index))
+            .unwrap_or(0)
+    };
+    let before_cursor = &text[..cursor];
+    let row = before_cursor.bytes().filter(|byte| *byte == b'\n').count();
+    let column = before_cursor
+        .rsplit_once('\n')
+        .map_or(before_cursor, |(_, line)| line)
+        .chars()
+        .count();
+    textarea.move_cursor(CursorMove::Jump(
+        row.min(u16::MAX as usize) as u16,
+        column.min(u16::MAX as usize) as u16,
+    ));
     textarea
 }
 
@@ -36,6 +63,22 @@ fn configure_textarea(textarea: &mut TextArea, vim_state: &VimState, theme: &The
 
 pub(crate) fn textarea_text(textarea: &TextArea) -> String {
     textarea.lines().join("\n")
+}
+
+pub(crate) fn textarea_cursor_byte_index(textarea: &TextArea) -> usize {
+    let (row, column) = textarea.cursor();
+    let mut cursor = 0usize;
+    for (index, line) in textarea.lines().iter().enumerate() {
+        if index == row {
+            cursor += line
+                .char_indices()
+                .nth(column)
+                .map_or(line.len(), |(offset, _)| offset);
+            return cursor;
+        }
+        cursor += line.len() + 1;
+    }
+    cursor
 }
 
 pub(crate) fn insert_pasted_text(textarea: &mut TextArea, pasted: &str) -> bool {
@@ -250,6 +293,23 @@ mod tests {
         assert_eq!(
             expand_pending_pastes(visible, &pending),
             format!("{first} / second")
+        );
+    }
+
+    #[test]
+    fn cursor_byte_index_tracks_unicode_and_multiple_lines() {
+        let mut textarea = make_textarea_with_text_at_cursor(
+            "first\n你好吗 @src",
+            "first\n你好".len(),
+            &VimState::new(false),
+            &Theme::named(ThemeName::Dark),
+        );
+
+        assert_eq!(textarea_cursor_byte_index(&textarea), "first\n你好".len());
+        textarea.move_cursor(CursorMove::End);
+        assert_eq!(
+            textarea_cursor_byte_index(&textarea),
+            "first\n你好吗 @src".len()
         );
     }
 }

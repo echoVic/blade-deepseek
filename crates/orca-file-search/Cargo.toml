@@ -1,0 +1,12 @@
+[package]
+name = "orca-file-search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-channel = { workspace = true }
+ignore = { workspace = true }
+nucleo = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

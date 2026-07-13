@@ -22,6 +22,7 @@ mod idle_submit_actions;
 mod input_event_actions;
 mod key_event_actions;
 mod mention_menu_actions;
+mod mention_search_manager;
 mod running_actions;
 mod runtime_event_actions;
 mod runtime_event_projection;
@@ -683,12 +684,16 @@ mod tests {
             std::fs::read_to_string(format!("{manifest_dir}/src/mention_menu_actions.rs"))
                 .expect("mention_menu_actions module should exist");
         assert!(
-            mention_menu_actions.contains("pub(crate) fn update_mention_candidates"),
-            "mention_menu_actions should own mention candidate refresh"
-        );
-        assert!(
             mention_menu_actions.contains("pub(crate) fn handle_mention_menu_key"),
             "mention_menu_actions should own mention menu key handling"
+        );
+
+        let mention_search_manager =
+            std::fs::read_to_string(format!("{manifest_dir}/src/mention_search_manager.rs"))
+                .expect("mention_search_manager module should exist");
+        assert!(
+            mention_search_manager.contains("pub(crate) fn sync_at_cursor"),
+            "mention_search_manager should own mention candidate refresh"
         );
 
         let app = std::fs::read_to_string(format!("{manifest_dir}/src/app.rs"))

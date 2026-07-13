@@ -13,6 +13,7 @@ orca-tools = { path = "../orca-tools" }
 orca-provider = { path = "../orca-provider" }
 orca-approval = { path = "../orca-approval" }
 orca-runtime = { path = "../orca-runtime" }
+orca-file-search = { path = "../orca-file-search" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ratatui = { workspace = true, features = ["scrolling-regions", "unstable-rendered-line-info"] }

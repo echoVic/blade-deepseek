@@ -14,6 +14,7 @@ use orca_core::task_types::{
     BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
+use orca_file_search::SearchPhase;
 use orca_runtime::history::SessionSummary;
 
 use crate::display_text::{compact_long_text, truncate_to_display_width};
@@ -84,7 +85,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_slash_menu(frame, chunks[4], state, theme);
     }
 
-    if !state.mention_candidates.is_empty() && state.slash_menu.is_none() {
+    if state.mention.phase.is_some() && state.slash_menu.is_none() {
         render_mention_candidates(frame, chunks[4], state, theme);
     }
 
@@ -2228,19 +2229,25 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
 }
 
 fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
-    let candidates = &state.mention_candidates;
-    if candidates.is_empty() {
+    let candidates = &state.mention.candidates;
+    let Some(phase) = &state.mention.phase else {
         return;
-    }
+    };
 
     let visible_count = candidates.len().min(12);
     let max_start = candidates.len().saturating_sub(visible_count);
     let start = state
-        .mention_selected
+        .mention
+        .selected
         .saturating_sub(visible_count.saturating_sub(1))
         .min(max_start);
     let end = (start + visible_count).min(candidates.len());
-    let item_count = visible_count as u16;
+    let status = mention_status_text(
+        phase,
+        state.mention.progress.scanned_paths,
+        candidates.is_empty(),
+    );
+    let item_count = visible_count as u16 + u16::from(status.is_some());
     let height = item_count + 2;
     let width = input_area.width;
     let y = input_area.y.saturating_sub(height);
@@ -2248,27 +2255,45 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
 
     frame.render_widget(Clear, popup_area);
 
-    let lines: Vec<Line> = candidates
+    let mut lines: Vec<Line> = candidates
         .iter()
         .enumerate()
         .skip(start)
         .take(end.saturating_sub(start))
-        .map(|(i, c)| {
-            let prefix = if i == state.mention_selected {
+        .map(|(i, candidate)| {
+            let prefix = if i == state.mention.selected {
                 "▸ "
             } else {
                 "  "
             };
-            let style = if i == state.mention_selected {
+            let style = if i == state.mention.selected {
                 Style::default()
                     .fg(theme.border)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text)
             };
-            Line::from(Span::styled(format!("{prefix}@{c}"), style))
+            let mut spans = vec![Span::styled(format!("{prefix}@"), style)];
+            for (index, ch) in candidate.path.chars().enumerate() {
+                let matched = candidate.indices.binary_search(&(index as u32)).is_ok();
+                let char_style = if matched {
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                };
+                spans.push(Span::styled(ch.to_string(), char_style));
+            }
+            Line::from(spans)
         })
         .collect();
+    if let Some((text, color)) = status {
+        lines.push(Line::from(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(color),
+        )));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2278,6 +2303,26 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+}
+
+fn mention_status_text(
+    phase: &SearchPhase,
+    scanned_paths: usize,
+    candidates_empty: bool,
+) -> Option<(String, Color)> {
+    match phase {
+        SearchPhase::Searching => Some(("Searching files…".to_string(), Color::DarkGray)),
+        SearchPhase::Scanning => {
+            Some((format!("Scanning… {scanned_paths} paths"), Color::DarkGray))
+        }
+        SearchPhase::Refreshing => Some(("Refreshing…".to_string(), Color::DarkGray)),
+        SearchPhase::Complete if candidates_empty => {
+            Some(("No matches".to_string(), Color::DarkGray))
+        }
+        SearchPhase::Complete => None,
+        SearchPhase::Incomplete { .. } => Some(("Search incomplete".to_string(), Color::Red)),
+        SearchPhase::Stopping => Some(("Stopping search…".to_string(), Color::DarkGray)),
+    }
 }
 
 fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -3294,8 +3339,16 @@ mod tests {
         assert!(!rendered.contains("/command-00"));
 
         state.slash_menu = None;
-        state.mention_candidates = (0..20).map(|index| format!("file-{index:02}.rs")).collect();
-        state.mention_selected = 19;
+        state.mention.candidates = (0..20)
+            .map(|index| orca_file_search::SearchMatch {
+                path: format!("file-{index:02}.rs"),
+                kind: orca_file_search::MatchKind::File,
+                score: 1,
+                indices: Vec::new(),
+            })
+            .collect();
+        state.mention.selected = 19;
+        state.mention.phase = Some(orca_file_search::SearchPhase::Complete);
         terminal
             .draw(|frame| {
                 render_mention_candidates(frame, Rect::new(0, 18, 70, 1), &state, &theme);
@@ -3304,6 +3357,95 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("▸ @file-19.rs"));
         assert!(!rendered.contains("@file-00.rs"));
+    }
+
+    #[test]
+    fn mention_popup_reports_every_streaming_phase() {
+        assert_eq!(
+            mention_status_text(&SearchPhase::Searching, 0, true),
+            Some(("Searching files…".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Scanning, 42, false),
+            Some(("Scanning… 42 paths".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Refreshing, 42, false),
+            Some(("Refreshing…".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Complete, 42, true),
+            Some(("No matches".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(
+                &SearchPhase::Incomplete {
+                    message: "walk failed".to_string(),
+                },
+                42,
+                false,
+            ),
+            Some(("Search incomplete".to_string(), Color::Red))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Stopping, 42, false),
+            Some(("Stopping search…".to_string(), Color::DarkGray))
+        );
+        assert_eq!(mention_status_text(&SearchPhase::Complete, 42, false), None);
+    }
+
+    #[test]
+    fn mention_popup_highlights_unicode_character_indices() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.mention.candidates = vec![orca_file_search::SearchMatch {
+            path: "src/你好.rs".to_string(),
+            kind: orca_file_search::MatchKind::File,
+            score: 1,
+            indices: vec![4],
+        }];
+        state.mention.phase = Some(SearchPhase::Complete);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                render_mention_candidates(frame, Rect::new(0, 5, 20, 1), &state, &theme);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let highlighted = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "你")
+            .unwrap();
+        assert_eq!(highlighted.style().fg, Some(theme.warning));
+    }
+
+    #[test]
+    fn mention_popup_renders_in_a_narrow_terminal() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.mention.candidates = vec![orca_file_search::SearchMatch {
+            path: "src/a-very-long-file-name.rs".to_string(),
+            kind: orca_file_search::MatchKind::File,
+            score: 1,
+            indices: Vec::new(),
+        }];
+        state.mention.phase = Some(SearchPhase::Scanning);
+        state.mention.progress.scanned_paths = 10;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 5))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                render_mention_candidates(frame, Rect::new(0, 4, 12, 1), &state, &theme);
+            })
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Files"));
     }
 
     #[test]

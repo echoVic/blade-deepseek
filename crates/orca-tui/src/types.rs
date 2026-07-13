@@ -9,6 +9,7 @@ use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 use orca_core::task_types::BackgroundTaskSummary;
+use orca_file_search::{SearchMatch, SearchPhase, SearchProgress, SessionGeneration};
 use orca_runtime::history::SessionSummary;
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
@@ -213,6 +214,9 @@ pub enum TuiEvent {
         requested_schema_json: Option<String>,
     },
     Notice(String),
+    MentionSearchDirty {
+        generation: SessionGeneration,
+    },
     Error(String),
     UsageUpdated(UsageTotals),
     ContextUpdated {
@@ -488,6 +492,30 @@ pub struct SubMenu {
     pub context: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MentionPopupState {
+    pub candidates: Vec<SearchMatch>,
+    pub selected: usize,
+    pub selected_path: Option<String>,
+    pub manual_selection: bool,
+    pub phase: Option<SearchPhase>,
+    pub progress: SearchProgress,
+    pub pending_query: Option<String>,
+    pub dismissed_query: Option<String>,
+}
+
+impl MentionPopupState {
+    pub(crate) fn clear_projection(&mut self) {
+        self.candidates.clear();
+        self.selected = 0;
+        self.selected_path = None;
+        self.manual_selection = false;
+        self.phase = None;
+        self.progress = SearchProgress::default();
+        self.pending_query = None;
+    }
+}
+
 pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) message_revisions: Vec<u64>,
@@ -534,8 +562,7 @@ pub struct AppState {
     pub context_used_tokens: usize,
     pub context_limit_tokens: usize,
     pub slash_menu: Option<SlashMenu>,
-    pub mention_candidates: Vec<String>,
-    pub mention_selected: usize,
+    pub mention: MentionPopupState,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
     proposed_plan_parser: ProposedPlanStreamParser,
     /// The most recent update_plan call failed, so `current_plan` may be
@@ -621,8 +648,7 @@ impl AppState {
             context_used_tokens: 0,
             context_limit_tokens: 0,
             slash_menu: None,
-            mention_candidates: Vec::new(),
-            mention_selected: 0,
+            mention: MentionPopupState::default(),
             current_plan: None,
             proposed_plan_parser: ProposedPlanStreamParser::default(),
             plan_update_failed: false,
@@ -1498,6 +1524,7 @@ impl AppState {
             TuiEvent::Notice(msg) => {
                 self.push_message(ChatMessage::System(msg));
             }
+            TuiEvent::MentionSearchDirty { .. } => {}
             TuiEvent::UsageUpdated(usage) => {
                 self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
                 self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
