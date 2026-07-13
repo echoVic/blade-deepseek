@@ -4347,9 +4347,8 @@ fn server_mode_shell_stops_active_process_group_when_input_closes() {
         .spawn()
         .expect("spawn orca server");
 
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             "{}",
@@ -4365,10 +4364,10 @@ fn server_mode_shell_stops_active_process_group_when_input_closes() {
         .expect("write shell/start");
         stdin.flush().expect("flush shell/start");
     }
-    read_until_event(&mut stdout, "shell-start", "shell_started");
+    child.expect_event("shell-start", "shell_started");
     wait_for_path(&started_marker);
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output =
         wait_for_child_output_with_timeout(child, Duration::from_secs(3)).expect("server exited");
     assert_eq!(output.status.code(), Some(0));
@@ -6942,9 +6941,8 @@ fn server_mode_input_eof_cancels_pending_permission_request() {
         .spawn()
         .expect("spawn orca server");
 
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -6952,11 +6950,11 @@ fn server_mode_input_eof_cancels_pending_permission_request() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread = read_until_event(&mut stdout, "thread", "thread_started");
+    let thread = child.expect_event("thread", "thread_started");
     let thread_id = thread["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"request_permissions_then_bash {} :: true"}}]}}}}"#,
@@ -6966,9 +6964,9 @@ fn server_mode_input_eof_cancels_pending_permission_request() {
         .expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
-    read_until_event(&mut stdout, "turn", "permission_request");
+    child.expect_event("turn", "permission_request");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = wait_for_child_output_with_timeout(child, Duration::from_secs(2))
         .expect("server exited after permission waiter was cancelled");
     assert_eq!(output.status.code(), Some(0));
@@ -6992,9 +6990,8 @@ fn server_mode_input_eof_cancels_pending_user_input_request() {
         .spawn()
         .expect("spawn orca server");
 
-    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
@@ -7002,11 +6999,11 @@ fn server_mode_input_eof_cancels_pending_user_input_request() {
         .expect("write thread/start");
         stdin.flush().expect("flush thread/start");
     }
-    let thread = read_until_event(&mut stdout, "thread", "thread_started");
+    let thread = child.expect_event("thread", "thread_started");
     let thread_id = thread["threadId"].as_str().expect("thread id");
 
     {
-        let stdin = child.stdin.as_mut().expect("server stdin");
+        let stdin = child.stdin_mut();
         writeln!(
             stdin,
             r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"ask Continue?"}}]}}}}"#,
@@ -7015,9 +7012,9 @@ fn server_mode_input_eof_cancels_pending_user_input_request() {
         .expect("write turn/start");
         stdin.flush().expect("flush turn/start");
     }
-    read_until_event(&mut stdout, "turn", "user_input_request");
+    child.expect_event("turn", "user_input_request");
 
-    drop(child.stdin.take());
+    child.close_stdin();
     let output = wait_for_child_output_with_timeout(child, Duration::from_secs(2))
         .expect("server exited after user input waiter was cancelled");
     assert_eq!(output.status.code(), Some(0));
