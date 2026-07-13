@@ -118,6 +118,31 @@ unrelated processes or other processes that merely share the sandbox. Orca
 also starts non-interactive shell commands in their own process group so
 timeouts and explicit cancellation can clean up the command tree.
 
+## Resource Ownership
+
+Goal mode does not keep a separate in-memory copy of every subprocess output.
+It uses the same runtime tool paths as ordinary turns. The planned v0.2.22
+resource-governance release is intended to make the ownership contract across
+those shared paths explicit:
+
+- captured stdout and stderr are bounded at process ingress
+- streamed shell output uses bounded retained storage
+- external tools, verifier commands, MCP servers, workflows, async subagents,
+  and server shells keep an owner responsible for terminal cleanup
+- timeout, cancellation, setup failure, stdin EOF, and server shutdown either
+  wait for owned children or transfer them to an explicit reaper
+
+The target Unix behavior uses process groups so cleanup reaches descendants.
+On non-Unix platforms, the draft guarantees only direct-child kill and wait;
+complete descendant-tree parity remains follow-up work. These guarantees are
+v0.2.22 draft scope and are not part of the published v0.2.21 contract.
+
+The v0.2.18 memory incident was traced to sandboxed Vitest/Tinypool workers that
+could not be signaled and survived their parent. v0.2.19 fixed that direct
+Seatbelt policy defect. See
+[`docs/reports/2026-07-12-goal-resource-incident.md`](reports/2026-07-12-goal-resource-incident.md)
+for the evidence and the separate planned v0.2.22 defense-in-depth scope.
+
 ## Implementation Notes
 
 - Shared types live in `crates/orca-core/src/goal_types.rs`.
