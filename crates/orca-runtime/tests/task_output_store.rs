@@ -6,7 +6,7 @@ use orca_runtime::{
     tasks::TaskRegistry,
 };
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn task_output_store_reads_delta_and_tail_without_splitting_utf8() {
@@ -167,7 +167,7 @@ fn shell_session_writes_process_output_to_task_output_store() {
 
     let handle = manager
         .spawn(ShellSessionCommand {
-            command: "printf stdout; printf stderr >&2; sleep 0.2".to_string(),
+            command: "printf stdout; printf stderr >&2; read -r _ || true".to_string(),
             cwd: cwd.path().to_path_buf(),
             additional_readable_directories: Vec::new(),
             additional_working_directories: Vec::new(),
@@ -180,9 +180,20 @@ fn shell_session_writes_process_output_to_task_output_store() {
         })
         .expect("spawn shell");
 
-    let running_output = manager
-        .read(&handle.id, Duration::from_secs(1))
-        .expect("read running shell");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let running_output = loop {
+        let output = manager
+            .read(&handle.id, Duration::from_millis(50))
+            .expect("read running shell");
+        if output.stdout == "stdout" && output.stderr == "stderr" {
+            break output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both shell readers did not publish output"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(running_output.stdout, "stdout");
     assert_eq!(running_output.stderr, "stderr");
 
@@ -193,6 +204,9 @@ fn shell_session_writes_process_output_to_task_output_store() {
     assert_eq!(stored.stdout, "stdout");
     assert_eq!(stored.stderr, "stderr");
 
+    manager
+        .write_stdin(&handle.id, "\n")
+        .expect("release running shell");
     let final_output = manager
         .wait(&handle.id, Duration::from_secs(2))
         .expect("wait for shell");
