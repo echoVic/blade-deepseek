@@ -301,22 +301,7 @@ fn wait_for_child_and_readers(
 
     loop {
         if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit_status)) => {
-                    status = Some(exit_status);
-                    // Retire the process-group lease while the PID still identifies
-                    // this operation, then release readers held by escaped descendants.
-                    kill_process_group_by_pid(child_pid);
-                    reader_stop.store(true, Ordering::Release);
-                }
-                Err(error) => {
-                    kill_child_tree(child);
-                    let _ = child.wait();
-                    reader_stop.store(true, Ordering::Release);
-                    return Err(error);
-                }
-                Ok(None) => {}
-            }
+            status = try_observe_child_exit(child, child_pid, reader_stop)?;
         }
         if let Some(exit_status) = status
             && readers_finished()
@@ -324,10 +309,13 @@ fn wait_for_child_and_readers(
             return Ok((exit_status, CommandTermination::Exited));
         }
         if should_cancel() {
-            let termination = if status.is_none() {
-                CommandTermination::Cancelled
-            } else {
+            if status.is_none() {
+                status = try_observe_child_exit(child, child_pid, reader_stop)?;
+            }
+            let termination = if status.is_some() {
                 CommandTermination::Exited
+            } else {
+                CommandTermination::Cancelled
             };
             if status.is_none() {
                 kill_child_tree(child);
@@ -337,10 +325,13 @@ fn wait_for_child_and_readers(
             return Ok((status.expect("cancelled child status"), termination));
         }
         if Instant::now() >= deadline {
-            let termination = if status.is_none() {
-                CommandTermination::TimedOut
-            } else {
+            if status.is_none() {
+                status = try_observe_child_exit(child, child_pid, reader_stop)?;
+            }
+            let termination = if status.is_some() {
                 CommandTermination::Exited
+            } else {
+                CommandTermination::TimedOut
             };
             if status.is_none() {
                 kill_child_tree(child);
@@ -350,6 +341,29 @@ fn wait_for_child_and_readers(
             return Ok((status.expect("timed out child status"), termination));
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn try_observe_child_exit(
+    child: &mut Child,
+    child_pid: u32,
+    reader_stop: &AtomicBool,
+) -> io::Result<Option<ExitStatus>> {
+    match child.try_wait() {
+        Ok(Some(exit_status)) => {
+            // Retire the process-group lease while the PID still identifies
+            // this operation, then release readers held by escaped descendants.
+            kill_process_group_by_pid(child_pid);
+            reader_stop.store(true, Ordering::Release);
+            Ok(Some(exit_status))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            kill_child_tree(child);
+            let _ = child.wait();
+            reader_stop.store(true, Ordering::Release);
+            Err(error)
+        }
     }
 }
 

@@ -752,14 +752,14 @@ mod tests {
             "escaped streaming reader exceeded deadline: {:?}",
             started.elapsed()
         );
-        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Completed);
         assert!(
             result
-                .error
+                .output
                 .as_deref()
-                .unwrap_or_default()
-                .contains("shell command timed out")
+                .is_some_and(|output| output.contains("parent-done"))
         );
+        assert!(result.error.is_none());
     }
 
     #[test]
