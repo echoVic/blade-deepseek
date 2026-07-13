@@ -234,12 +234,15 @@ impl WorkflowExecutionGate {
             .counters
             .lock()
             .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
-        if counters.total_agents >= max_agents_per_run {
-            return Err(io::Error::other(format!(
-                "maximum workflow agent count {max_agents_per_run} exceeded"
-            )));
-        }
-        while counters.active_agents >= max_concurrent_agents {
+        loop {
+            if counters.total_agents >= max_agents_per_run {
+                return Err(io::Error::other(format!(
+                    "maximum workflow agent count {max_agents_per_run} exceeded"
+                )));
+            }
+            if counters.active_agents < max_concurrent_agents {
+                break;
+            }
             counters = self
                 .condvar
                 .wait(counters)
@@ -1987,6 +1990,38 @@ mod tests {
         assert_eq!(counters.active_agents, 1);
         assert_eq!(counters.max_observed_concurrent_agents, 1);
         drop(permit);
+    }
+
+    #[test]
+    fn workflow_execution_gate_rechecks_total_limit_after_waiting() {
+        let gate = Arc::new(WorkflowExecutionGate::new());
+        let first = gate
+            .begin_agent(2, 1)
+            .expect("first workflow agent should acquire the only active slot");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                let gate = Arc::clone(&gate);
+                let result_tx = result_tx.clone();
+                scope.spawn(move || {
+                    let result = gate.begin_agent(2, 1);
+                    let acquired = result.is_ok();
+                    result_tx.send(acquired).expect("send gate result");
+                    thread::sleep(Duration::from_millis(25));
+                    drop(result);
+                });
+            }
+
+            thread::sleep(Duration::from_millis(25));
+            drop(first);
+        });
+        drop(result_tx);
+
+        let results = result_rx.into_iter().collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|acquired| **acquired).count(), 1);
+        assert_eq!(results.iter().filter(|acquired| !**acquired).count(), 1);
+        assert_eq!(gate.snapshot().expect("gate counters").total_agents, 2);
     }
 
     #[test]

@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::mpsc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -737,24 +740,52 @@ impl SseTransport {
             return Err("MCP tool call cancelled".to_string());
         }
         let id = self.next_request_id()?;
-        let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let headers = self.headers.clone();
         let method = method.to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result =
-                request_sse_with_client(client, endpoint, headers, id, method, params, timeout);
+        let worker = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("failed to start MCP SSE request runtime: {error}"))
+                .and_then(|runtime| {
+                    runtime.block_on(request_sse_with_async_client(
+                        reqwest::Client::new(),
+                        endpoint,
+                        headers,
+                        id,
+                        method,
+                        params,
+                        timeout,
+                        worker_cancel,
+                    ))
+                });
             let _ = sender.send(result);
         });
         loop {
             if should_cancel() {
+                cancel.store(true, Ordering::Release);
+                let _ = receiver.recv();
+                worker
+                    .join()
+                    .map_err(|_| "MCP SSE worker panicked during cancellation".to_string())?;
                 return Err("MCP tool call cancelled".to_string());
             }
             match receiver.recv_timeout(Duration::from_millis(25)) {
-                Ok(result) => return result,
+                Ok(result) => {
+                    worker
+                        .join()
+                        .map_err(|_| "MCP SSE worker panicked before returning".to_string())?;
+                    return result;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    worker
+                        .join()
+                        .map_err(|_| "MCP SSE worker panicked before returning".to_string())?;
                     return Err("MCP SSE worker stopped before returning".to_string());
                 }
             }
@@ -770,6 +801,98 @@ impl SseTransport {
         *next_id += 1;
         Ok(id)
     }
+}
+
+async fn request_sse_with_async_client(
+    client: reqwest::Client,
+    endpoint: String,
+    headers: HashMap<String, String>,
+    id: u64,
+    method: String,
+    params: Value,
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+) -> Result<Value, String> {
+    let mut builder = client.post(&endpoint);
+    for (key, value) in &headers {
+        builder = builder.header(key, value);
+    }
+    let request = builder
+        .timeout(timeout)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))
+        .send();
+    tokio::pin!(request);
+    let response = loop {
+        tokio::select! {
+            result = &mut request => {
+                break result.map_err(|error| {
+                    if error.is_timeout() {
+                        format!(
+                            "MCP SSE request '{method}' timed out after {}",
+                            format_duration(timeout)
+                        )
+                    } else {
+                        format!("MCP SSE request '{method}' failed: {error}")
+                    }
+                })?;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("MCP tool call cancelled".to_string());
+                }
+            }
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("MCP SSE request '{method}' failed with {status}"));
+    }
+    let text = read_bounded_async_sse_response(response, &cancel).await?;
+    let response = parse_sse_or_json_response(&text)
+        .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("MCP SSE request '{method}' failed: {error}"));
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("MCP SSE request '{method}' missing result"))
+}
+
+async fn read_bounded_async_sse_response(
+    mut response: reqwest::Response,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let mut bytes = Vec::with_capacity(MAX_SSE_RESPONSE_BYTES.min(8 * 1024));
+    loop {
+        let chunk = tokio::select! {
+            result = response.chunk() => result
+                .map_err(|error| format!("failed to read MCP SSE response: {error}"))?,
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("MCP tool call cancelled".to_string());
+                }
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if bytes.len().saturating_add(chunk.len()) > MAX_SSE_RESPONSE_BYTES {
+            return Err(format!(
+                "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))
 }
 
 fn request_sse_with_client(
@@ -1559,6 +1682,72 @@ done
         assert!(
             handler.requests.lock().unwrap().is_empty(),
             "SSE transport does not support elicitation/create routing"
+        );
+    }
+
+    #[test]
+    fn sse_handler_cancel_closes_peer_before_returning() {
+        let (peer_closed_tx, peer_closed_rx) = mpsc::channel();
+        let server = OneShotSseServer::start(move |stream| {
+            let _ = read_http_request(stream);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("set peer-close timeout");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut byte = [0_u8; 1];
+            loop {
+                match stream.read(&mut byte) {
+                    Ok(0) => {
+                        let _ = peer_closed_tx.send(true);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => {
+                        let _ = peer_closed_tx.send(true);
+                        return;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    let _ = peer_closed_tx.send(false);
+                    return;
+                }
+            }
+        });
+        let transport = SseTransport::new(&McpServerConfig {
+            name: "cancel_peer_sse".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(server.url()),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(5000),
+            tool_timeout_ms: Some(5000),
+        })
+        .expect("connect cancellable SSE MCP");
+        let started = Instant::now();
+
+        let error = transport
+            .call_tool_with_elicitation_handler_or_cancel(
+                "wait",
+                Value::Object(Default::default()),
+                None,
+                &|| started.elapsed() >= Duration::from_millis(100),
+            )
+            .expect_err("SSE tool call should be cancelled");
+
+        assert_eq!(error, "MCP tool call cancelled");
+        assert!(
+            peer_closed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("server should observe cancellation peer close"),
+            "cancelled SSE request remained connected after the call returned"
         );
     }
 

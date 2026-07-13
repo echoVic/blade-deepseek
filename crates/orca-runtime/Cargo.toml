@@ -23,6 +23,7 @@ base64 = { workspace = true }
 globset = { workspace = true }
 walkdir = { workspace = true }
 crossbeam-channel = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }

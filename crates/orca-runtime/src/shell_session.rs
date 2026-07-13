@@ -4,6 +4,10 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ExitStatus, Stdio};
 use std::str;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -186,6 +190,7 @@ struct ShellSession {
     output_store: TaskOutputStore,
     stdout_handle: Option<thread::JoinHandle<()>>,
     stderr_handle: Option<thread::JoinHandle<()>>,
+    reader_stop: Arc<AtomicBool>,
     requested_terminal: ShellTerminalMode,
     effective_terminal: ShellTerminalMode,
 }
@@ -296,11 +301,13 @@ impl RuntimeShellSessionManager {
             }
         };
         let output_store = self.output_store.clone();
+        let reader_stop = Arc::new(AtomicBool::new(false));
         let stdout_handle = Some(spawn_output_reader(
             stdout_reader,
             output_store.clone(),
             task.id.clone(),
             ShellOutputStream::Stdout,
+            Arc::clone(&reader_stop),
         ));
         let stderr_handle = stderr_reader.map(|reader| {
             spawn_output_reader(
@@ -308,6 +315,7 @@ impl RuntimeShellSessionManager {
                 output_store.clone(),
                 task.id.clone(),
                 ShellOutputStream::Stderr,
+                Arc::clone(&reader_stop),
             )
         });
         let id = format!("shell-{}", Uuid::new_v4());
@@ -323,6 +331,7 @@ impl RuntimeShellSessionManager {
                 output_store,
                 stdout_handle,
                 stderr_handle,
+                reader_stop,
                 requested_terminal,
                 effective_terminal,
             },
@@ -656,6 +665,9 @@ impl Drop for RuntimeShellSessionManager {
 
 impl ShellSession {
     fn join_readers(&mut self) {
+        orca_tools::process::kill_child_tree(&mut self.child);
+        let _ = self.child.wait();
+        self.reader_stop.store(true, Ordering::Release);
         if let Some(handle) = self.stdout_handle.take() {
             let _ = handle.join();
         }
@@ -703,10 +715,6 @@ impl ShellSession {
 impl Drop for ShellSession {
     fn drop(&mut self) {
         self.stdin.close();
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            orca_tools::process::kill_child_tree(&mut self.child);
-            let _ = self.child.wait();
-        }
         self.join_readers();
     }
 }
@@ -920,14 +928,20 @@ impl ShellStdio {
                     .stdout
                     .take()
                     .ok_or_else(|| io::Error::other("child process has no stdout"))?;
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|stderr| Box::new(stderr) as Box<dyn Read + Send>);
+                let stderr = child.stderr.take();
+                #[cfg(unix)]
+                {
+                    set_nonblocking(&stdout)?;
+                    if let Some(stderr) = stderr.as_ref() {
+                        set_nonblocking(stderr)?;
+                    }
+                }
+                let stderr = stderr.map(|stderr| Box::new(stderr) as Box<dyn Read + Send>);
                 Ok((ShellInput::Pipe(stdin), Box::new(stdout), stderr))
             }
             #[cfg(unix)]
             Self::Pty { master, .. } => {
+                set_nonblocking(&master)?;
                 let reader = master.try_clone()?;
                 Ok((ShellInput::Pty(master), Box::new(reader), None))
             }
@@ -1009,6 +1023,7 @@ fn spawn_output_reader<R: Read + Send + 'static>(
     output_store: TaskOutputStore,
     task_id: String,
     stream: ShellOutputStream,
+    stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
@@ -1020,11 +1035,31 @@ fn spawn_output_reader<R: Read + Send + 'static>(
                     pending.extend_from_slice(&buffer[..n]);
                     drain_valid_utf8_output(&output_store, &task_id, stream, &mut pending);
                 }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
         flush_lossy_output(&output_store, &task_id, stream, &mut pending);
     })
+}
+
+#[cfg(unix)]
+fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
+    let fd = reader.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn wait_for_output_or_exit(
@@ -1192,5 +1227,61 @@ mod tests {
             !leaked_marker.exists(),
             "registration failure must reap the spawned process group"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_session_descendant_cannot_block_terminal_shell_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let helper = std::env::current_exe().expect("resolve test executable");
+        let mut env = BTreeMap::new();
+        env.insert(
+            "ORCA_SHELL_ESCAPE_HELPER".to_string(),
+            Some(helper.display().to_string()),
+        );
+        env.insert(
+            "ORCA_SHELL_ESCAPE_HOLDER".to_string(),
+            Some("1".to_string()),
+        );
+        let tasks = TaskRegistry::new("escaped-shell-session".to_string());
+        let mut sessions = RuntimeShellSessionManager::new(tasks);
+        let handle = sessions
+            .spawn(ShellSessionCommand {
+                command: "\"$ORCA_SHELL_ESCAPE_HELPER\" --exact shell_session::tests::escaped_shell_pipe_holder_helper --nocapture & printf parent-done".to_string(),
+                cwd: temp.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env,
+                description: "escaped shell pipe holder".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            })
+            .expect("spawn escaped shell fixture");
+        let started = Instant::now();
+
+        let output = sessions
+            .wait(&handle.id, Duration::from_millis(200))
+            .expect("terminal shell read should remain bounded");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "terminal shell reader join exceeded timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(output.stdout.contains("parent-done"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_shell_pipe_holder_helper() {
+        if std::env::var_os("ORCA_SHELL_ESCAPE_HOLDER").is_none() {
+            return;
+        }
+        unsafe {
+            libc::setsid();
+        }
+        thread::sleep(Duration::from_secs(5));
     }
 }

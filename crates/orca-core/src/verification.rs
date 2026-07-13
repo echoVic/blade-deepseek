@@ -1,8 +1,14 @@
-use std::io;
+use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -102,18 +108,23 @@ fn wait_for_child_output_with_timeout(
     timeout: Duration,
 ) -> io::Result<CommandOutput> {
     let child_pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("child process has no stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("child process has no stderr"))?;
-    let stdout_handle =
-        thread::spawn(move || read_to_retained(stdout, DEFAULT_RETAINED_OUTPUT_BYTES));
-    let stderr_handle =
-        thread::spawn(move || read_to_retained(stderr, DEFAULT_RETAINED_OUTPUT_BYTES));
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => return child_setup_error(&mut child, "child process has no stdout"),
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => return child_setup_error(&mut child, "child process has no stderr"),
+    };
+    #[cfg(unix)]
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        kill_child_tree(&mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let stdout_handle = spawn_stoppable_reader(stdout, Arc::clone(&reader_stop));
+    let stderr_handle = spawn_stoppable_reader(stderr, Arc::clone(&reader_stop));
     let deadline = std::time::Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(std::time::Instant::now);
@@ -122,7 +133,20 @@ fn wait_for_child_output_with_timeout(
     let status = loop {
         if status.is_none() {
             match child.try_wait() {
-                Ok(Some(exit_status)) => status = Some(exit_status),
+                Ok(Some(exit_status)) => {
+                    status = Some(exit_status);
+                    let drain_deadline = std::time::Instant::now() + Duration::from_millis(20);
+                    while (!stdout_handle.is_finished() || !stderr_handle.is_finished())
+                        && std::time::Instant::now() < drain_deadline
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    if !stdout_handle.is_finished() || !stderr_handle.is_finished() {
+                        timed_out = true;
+                    }
+                    kill_process_group_by_pid(child_pid);
+                    reader_stop.store(true, Ordering::Release);
+                }
                 Ok(None) => {}
                 Err(error) => {
                     kill_child_tree(&mut child);
@@ -139,15 +163,16 @@ fn wait_for_child_output_with_timeout(
         }
         if std::time::Instant::now() >= deadline {
             timed_out = true;
-            kill_process_group_by_pid(child_pid);
             if status.is_none() {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 status = Some(child.wait()?);
             }
+            reader_stop.store(true, Ordering::Release);
             break Ok(status.expect("timed out verifier status"));
         }
         thread::sleep(Duration::from_millis(50));
     };
+    reader_stop.store(true, Ordering::Release);
     let stdout = stdout_handle
         .join()
         .map_err(|_| io::Error::other("verifier stdout reader panicked"))??;
@@ -160,6 +185,57 @@ fn wait_for_child_output_with_timeout(
         status: status?,
         timed_out,
     })
+}
+
+fn spawn_stoppable_reader<R: Read + Send + 'static>(
+    reader: R,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
+    thread::spawn(move || {
+        let mut reader = StoppableReader { reader, stop };
+        read_to_retained(&mut reader, DEFAULT_RETAINED_OUTPUT_BYTES)
+    })
+}
+
+struct StoppableReader<R> {
+    reader: R,
+    stop: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for StoppableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.reader.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self.stop.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
+    let fd = reader.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn child_setup_error<T>(child: &mut Child, message: &str) -> io::Result<T> {
+    kill_child_tree(child);
+    let _ = child.wait();
+    Err(io::Error::other(message))
 }
 
 fn kill_child_tree(child: &mut Child) {
@@ -180,8 +256,9 @@ fn kill_process_group(pid: u32) {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     let pgid = -(pid as i32);
-    unsafe {
-        let _ = kill(pgid, 15);
+    let terminated = unsafe { kill(pgid, 15) } == 0;
+    if !terminated {
+        return;
     }
     thread::sleep(Duration::from_millis(50));
     unsafe {
@@ -236,7 +313,40 @@ mod tests {
             start.elapsed()
         );
         assert!(!result.success);
-        assert_eq!(result.stdout, "parent-done");
+        assert!(result.stdout.contains("parent-done"), "{result:?}");
         assert!(result.stderr.contains("timed out"), "{result:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_session_descendant_cannot_extend_verifier_deadline() {
+        let helper = std::env::current_exe().expect("resolve test executable");
+        let command = format!(
+            "ORCA_VERIFIER_ESCAPE_HOLDER=1 {helper:?} --exact verification::tests::escaped_verifier_pipe_holder_helper --nocapture & printf parent-done"
+        );
+        let start = Instant::now();
+
+        let result = run_with_timeout(&command, Duration::from_millis(200));
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "escaped verifier reader join exceeded deadline: {:?}",
+            start.elapsed()
+        );
+        assert!(!result.success);
+        assert!(result.stdout.contains("parent-done"), "{result:?}");
+        assert!(result.stderr.contains("timed out"), "{result:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_verifier_pipe_holder_helper() {
+        if std::env::var_os("ORCA_VERIFIER_ESCAPE_HOLDER").is_none() {
+            return;
+        }
+        unsafe {
+            libc::setsid();
+        }
+        thread::sleep(Duration::from_secs(5));
     }
 }

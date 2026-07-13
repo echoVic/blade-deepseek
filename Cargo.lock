@@ -1226,6 +1226,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -1241,6 +1242,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1270,6 +1272,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs",
  "globset",
+ "libc",
  "orca-approval",
  "orca-core",
  "orca-mcp",
@@ -1294,6 +1297,7 @@ dependencies = [
  "chrono",
  "dirs",
  "globset",
+ "libc",
  "orca-core",
  "orca-mcp",
  "reqwest",

@@ -2,7 +2,11 @@ use orca_core::retained_output::RetainedOutput;
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 
 use orca_core::tool_types::{
@@ -283,14 +287,33 @@ pub fn execute_streaming_command_or_cancel(
             );
         }
     };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    #[cfg(unix)]
+    if let Err(error) = stdout
+        .as_ref()
+        .map_or(Ok(()), process::set_nonblocking)
+        .and_then(|()| stderr.as_ref().map_or(Ok(()), process::set_nonblocking))
+    {
+        process::kill_child_tree(&mut child);
+        let _ = child.wait();
+        return ToolResult::failed(
+            request,
+            format!("failed to configure shell output readers: {error}"),
+            None,
+        );
+    }
+    let reader_stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::sync_channel(STREAM_OUTPUT_CHANNEL_CAPACITY);
-    let stdout_handle = child.stdout.take().map(|stdout| {
+    let stdout_handle = stdout.map(|stdout| {
         let tx = tx.clone();
-        std::thread::spawn(move || stream_pipe(stdout, tx, StreamEvent::Stdout))
+        let stop = Arc::clone(&reader_stop);
+        std::thread::spawn(move || stream_pipe(stdout, tx, StreamEvent::Stdout, stop))
     });
-    let stderr_handle = child.stderr.take().map(|stderr| {
+    let stderr_handle = stderr.map(|stderr| {
         let tx = tx.clone();
-        std::thread::spawn(move || stream_pipe(stderr, tx, StreamEvent::Stderr))
+        let stop = Arc::clone(&reader_stop);
+        std::thread::spawn(move || stream_pipe(stderr, tx, StreamEvent::Stderr, stop))
     });
     drop(tx);
 
@@ -313,47 +336,29 @@ pub fn execute_streaming_command_or_cancel(
                 stderr.append(&chunk);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => match child.wait() {
-                Ok(status) => break status,
-                Err(error) => {
-                    return ToolResult::failed(
-                        request,
-                        format!("failed to wait for shell command: {error}"),
-                        None,
-                    );
-                }
-            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break child
+                    .wait()
+                    .map_err(|error| format!("failed to wait for shell command: {error}"));
+            }
         }
         if should_cancel() {
             cancelled = true;
             process::kill_child_tree(&mut child);
-            match child.wait() {
-                Ok(status) => break status,
-                Err(error) => {
-                    return ToolResult::failed(
-                        request,
-                        format!("failed to wait for shell command: {error}"),
-                        None,
-                    );
-                }
-            }
+            break child
+                .wait()
+                .map_err(|error| format!("failed to wait for shell command: {error}"));
         }
         if Instant::now() >= deadline {
             timed_out = true;
             process::kill_child_tree(&mut child);
-            match child.wait() {
-                Ok(status) => break status,
-                Err(error) => {
-                    return ToolResult::failed(
-                        request,
-                        format!("failed to wait for shell command: {error}"),
-                        None,
-                    );
-                }
-            }
+            break child
+                .wait()
+                .map_err(|error| format!("failed to wait for shell command: {error}"));
         }
     };
 
+    reader_stop.store(true, Ordering::Release);
     while let Ok(event) = rx.recv() {
         match event {
             StreamEvent::Stdout(chunk) => {
@@ -368,6 +373,10 @@ pub fn execute_streaming_command_or_cancel(
     }
     let stdout_reader = join_stream_reader(stdout_handle, "stdout");
     let stderr_reader = join_stream_reader(stderr_handle, "stderr");
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
 
     if let Err(error) = stdout_reader.and(stderr_reader) {
         return ToolResult::failed(request, error, status.code());
@@ -415,6 +424,7 @@ fn stream_pipe(
     mut pipe: impl Read,
     tx: mpsc::SyncSender<StreamEvent>,
     event: fn(Vec<u8>) -> StreamEvent,
+    stop: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let mut buffer = [0_u8; STREAM_OUTPUT_READ_CHUNK_BYTES];
     loop {
@@ -424,6 +434,12 @@ fn stream_pipe(
                 if tx.send(event(buffer[..read].to_vec())).is_err() {
                     return Ok(());
                 }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -491,6 +507,8 @@ fn timeout_message(shell_timeout: Duration, stdout: &str, stderr: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn streaming_reader_io_failure_is_returned() {
@@ -672,6 +690,58 @@ mod tests {
             "unexpected error: {:?}",
             result.error
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_session_descendant_cannot_deadlock_stream_shutdown() {
+        let helper = std::env::current_exe().expect("resolve test executable");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "\"$ORCA_BASH_ESCAPE_HELPER\" --exact bash::tests::escaped_stream_pipe_holder_helper --nocapture & printf parent-done",
+            )
+            .env("ORCA_BASH_ESCAPE_HELPER", helper)
+            .env("ORCA_BASH_ESCAPE_HOLDER", "1")
+            .process_group(0);
+        let request = bash_request("escaped pipe holder");
+        let started = Instant::now();
+
+        let result = execute_streaming_command_or_cancel(
+            &request,
+            command,
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_millis(200),
+            &mut |_| {},
+            || false,
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "escaped streaming reader exceeded deadline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shell command timed out")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_stream_pipe_holder_helper() {
+        if std::env::var_os("ORCA_BASH_ESCAPE_HOLDER").is_none() {
+            return;
+        }
+        unsafe {
+            libc::setsid();
+        }
+        std::thread::sleep(Duration::from_secs(5));
     }
 
     #[test]

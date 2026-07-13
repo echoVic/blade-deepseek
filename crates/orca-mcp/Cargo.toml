@@ -10,6 +10,7 @@ test-utils = []
 orca-core = { path = "../orca-core" }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

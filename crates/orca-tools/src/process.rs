@@ -1,8 +1,14 @@
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -100,8 +106,24 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
         None => return child_setup_error(&mut child, "child process has no stderr"),
     };
 
-    let stdout_handle = spawn_reader(stdout, max_retained_bytes_per_stream);
-    let stderr_handle = spawn_reader(stderr, max_retained_bytes_per_stream);
+    #[cfg(unix)]
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        kill_child_tree(&mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let stdout_handle = spawn_stoppable_reader(
+        stdout,
+        max_retained_bytes_per_stream,
+        Arc::clone(&reader_stop),
+    );
+    let stderr_handle = spawn_stoppable_reader(
+        stderr,
+        max_retained_bytes_per_stream,
+        Arc::clone(&reader_stop),
+    );
 
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -112,7 +134,14 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
     let status = loop {
         if status.is_none() {
             match child.try_wait() {
-                Ok(Some(exit_status)) => status = Some(exit_status),
+                Ok(Some(exit_status)) => {
+                    status = Some(exit_status);
+                    // Retire the process-group lease immediately after observing the
+                    // leader exit. This closes ordinary inherited-pipe descendants
+                    // without retaining a stale numeric PID until the deadline.
+                    kill_process_group_by_pid(child_pid);
+                    reader_stop.store(true, Ordering::Release);
+                }
                 Err(error) => {
                     kill_child_tree(&mut child);
                     let _ = child.wait();
@@ -128,25 +157,26 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
             break Ok(exit_status);
         }
         if should_cancel() {
-            kill_process_group_by_pid(child_pid);
             if status.is_none() {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 status = Some(child.wait()?);
             }
+            reader_stop.store(true, Ordering::Release);
             break Ok(status.expect("cancelled child status"));
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            kill_process_group_by_pid(child_pid);
             if status.is_none() {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 status = Some(child.wait()?);
             }
+            reader_stop.store(true, Ordering::Release);
             break Ok(status.expect("timed out child status"));
         }
         thread::sleep(Duration::from_millis(50));
     };
 
+    reader_stop.store(true, Ordering::Release);
     let stdout = join_reader(stdout_handle, "stdout");
     let stderr = join_reader(stderr_handle, "stderr");
     let status = status?;
@@ -233,6 +263,54 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn escaped_session_descendant_cannot_extend_wait_past_deadline() {
+        let helper = std::env::current_exe().expect("resolve test executable");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "\"$ORCA_PROCESS_ESCAPE_HELPER\" --exact process::tests::escaped_pipe_holder_helper --nocapture & printf parent-done",
+            )
+            .env("ORCA_PROCESS_ESCAPE_HELPER", helper)
+            .env("ORCA_PROCESS_ESCAPE_HOLDER", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        prepare_non_interactive_command(&mut command);
+        let child = command
+            .spawn()
+            .expect("spawn shell with escaped pipe descendant");
+        let start = Instant::now();
+
+        let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
+            child,
+            Duration::from_millis(200),
+            || false,
+            1024,
+        )
+        .expect("bounded escaped-session wait");
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "escaped reader join exceeded process deadline: {:?}",
+            start.elapsed()
+        );
+        assert!(output.stdout_text().contains("parent-done"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_pipe_holder_helper() {
+        if std::env::var_os("ORCA_PROCESS_ESCAPE_HOLDER").is_none() {
+            return;
+        }
+        unsafe {
+            libc::setsid();
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+
+    #[test]
     fn reader_io_failure_is_returned() {
         struct FailingReader;
 
@@ -268,11 +346,58 @@ pub fn prepare_non_interactive_command(command: &mut Command) {
     }
 }
 
+#[cfg(test)]
 fn spawn_reader<R: Read + Send + 'static>(
-    mut reader: R,
+    reader: R,
     max_retained_bytes: usize,
 ) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
-    thread::spawn(move || read_to_retained(&mut reader, max_retained_bytes))
+    spawn_stoppable_reader(reader, max_retained_bytes, Arc::new(AtomicBool::new(false)))
+}
+
+fn spawn_stoppable_reader<R: Read + Send + 'static>(
+    reader: R,
+    max_retained_bytes: usize,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<RetainedOutputSnapshot>> {
+    thread::spawn(move || {
+        let mut reader = StoppableReader { reader, stop };
+        read_to_retained(&mut reader, max_retained_bytes)
+    })
+}
+
+struct StoppableReader<R> {
+    reader: R,
+    stop: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for StoppableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.reader.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self.stop.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
+    let fd = reader.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn join_reader(
@@ -311,8 +436,9 @@ fn kill_process_group(pid: u32) {
     const SIGTERM: i32 = 15;
     const SIGKILL: i32 = 9;
     let pgid = -(pid as i32);
-    unsafe {
-        let _ = kill(pgid, SIGTERM);
+    let terminated = unsafe { kill(pgid, SIGTERM) } == 0;
+    if !terminated {
+        return;
     }
     thread::sleep(Duration::from_millis(50));
     unsafe {
