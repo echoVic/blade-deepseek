@@ -52,6 +52,15 @@ admission, one run token, callback-only production events, bounded stderr, and
 RAII process/file cleanup. Terminal output cancels unawaited agents, and parent
 exit cannot leave pipe-holding descendants behind.
 
+### Current next slice: P0.1c completion
+
+The resource-lifecycle branch migrated grep and several shared process callers,
+but the P0.1c deletion gate is not complete: Git status, worktree Git, and
+thread-search ripgrep still use `Command::output`, while grep paginates a
+retained head/tail sample. Finish these adapters before beginning P0.1d. Split
+P0.1d afterward into tool-facing file admission (`read_file`, edit, TUI diff)
+and runtime-owned inputs (instructions, skills, workflow scripts/state).
+
 ## Ranked Work
 
 ### 1. P0.1c Bounded one-shot command adapters
