@@ -1,0 +1,35 @@
+Cargo.toml
+  s_3c67cb57e0b71e::t_c1c73184f4244a 35
+docs/production-roadmap.md
+  s_3c67cb57e0b71e::t_69aad6cc632866 6-20,428-429,434,444,944-947
+docs/releases/v0.2.22.md
+  s_3c67cb57e0b71e::t_d3078a6e09df9b 1-85
+npm/orca/package.json
+  s_3c67cb57e0b71e::t_3000686a0faf46 3
+site/index.html
+  s_3c67cb57e0b71e::t_f86521e690ad72 74
+site/public/sitemap.xml
+  s_3c67cb57e0b71e::t_1a09e910525f86 5,11,17,23,29,35
+site/src/changelog/Changelog.tsx
+  s_3c67cb57e0b71e::t_84f20dff898872 79-80,501-502
+site/src/shared.ts
+  s_3c67cb57e0b71e::t_f1ce3d54512fb5 7,10-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4fda52ffff1bfe11542dec7246ef018c33fb740e",
+  "prompts": {},
+  "sessions": {
+    "s_3c67cb57e0b71e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a7ac860-2ddf-4e3f-aa6d-90bc290a7d36",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
