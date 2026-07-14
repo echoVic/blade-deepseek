@@ -1,0 +1,103 @@
+README.md
+  s_b8a5b8329f561f::t_2c73c57107b452 79-82,190-192
+crates/orca-file-search/Cargo.toml
+  s_b8a5b8329f561f::t_804acb2b1a5e85 8
+crates/orca-file-search/src/browse.rs
+  s_b8a5b8329f561f::t_3f8efc51e283dc 9-10,17-18,20,24-31,35-41,43-77,79-80,85-88,92,108,112-115,127-128,131-133,136,154,156,189,206,235-243,274-282
+crates/orca-file-search/src/discovery.rs
+  s_b8a5b8329f561f::t_2742712970e747 11,30,32-33,40-82,85-93,119-123
+crates/orca-file-search/src/eligibility.rs
+  s_b8a5b8329f561f::t_5f53496686132c 3-5,11,16-20,55-92,132,141,158
+crates/orca-file-search/src/session.rs
+  s_b8a5b8329f561f::t_5bcf17f6fe31f3 16,37-39,58-60,70-84,90,95-100,109-110,114,118-122,139,148-150,170,172-173,182,216-218,245,254-256,385-391,432-437,470-475,478,486,502-505,527,550,555-575
+crates/orca-file-search/src/types.rs
+  s_b8a5b8329f561f::t_1f3afdc45009a6 1-2,41-42,79-80,92
+crates/orca-file-search/tests/session.rs
+  s_b8a5b8329f561f::t_3cfff0f4b91693 2,107-279
+crates/orca-mcp/src/client.rs
+  s_b8a5b8329f561f::t_ca2ebbb03b2d77 272-273
+crates/orca-runtime/Cargo.toml
+  s_b8a5b8329f561f::t_eb7e9364a42023 8,25
+crates/orca-runtime/src/mentions.rs
+  s_3c67cb57e0b71e::t_0cca83347800fd 4-8,11-623,630-688,691,697-730,732-818,820,822-848,850-860,862-895,910-911,1013-1014,1057-1058,1074-1087,1110-1119,1138-1142,1189,1194,1536-1807
+crates/orca-runtime/src/protocol/events.rs
+  s_b8a5b8329f561f::t_5aef7ed270ffa9 49-114,496-550
+crates/orca-runtime/src/protocol/turn.rs
+  s_b8a5b8329f561f::t_690baa4b70bce2 2-7,10-99
+crates/orca-runtime/src/protocol/wire.rs
+  s_b8a5b8329f561f::t_cb6d521b47d5de 25,40-45,185-212,338-353,366-368,371-384,435-543,1098-1099,1103-1104,1107-1119,1594-1704
+crates/orca-runtime/src/server.rs
+  s_b8a5b8329f561f::t_81ba9a67f19794 11,13,44,46,86,100-101,108-112,1807-1819,1844-1858,2090-2095,2097-2113
+crates/orca-runtime/src/server/fuzzy_file_search_manager.rs
+  s_b8a5b8329f561f::t_c329d4fec85825 1-397
+crates/orca-runtime/src/server/mention_search_manager.rs
+  s_b8a5b8329f561f::t_edfbe59a5e2514 1-408
+crates/orca-runtime/src/server/processors/fuzzy_file_search.rs
+  s_b8a5b8329f561f::t_69d9917295b24a 1-93
+crates/orca-runtime/src/server/processors/mention_search.rs
+  s_b8a5b8329f561f::t_b33573507a8fd9 1-104
+crates/orca-runtime/src/server/processors/mod.rs
+  s_b8a5b8329f561f::t_3fd116b1f43a4c 2,4
+crates/orca-runtime/src/server/processors/submit.rs
+  s_b8a5b8329f561f::t_56c58a1167250d 12,27
+crates/orca-runtime/src/server/router.rs
+  s_b8a5b8329f561f::t_e321f717330fd0 9-10,60-77,120
+crates/orca-runtime/src/server_runtime.rs
+  s_b8a5b8329f561f::t_55ad8ec8d0f500 460-467
+crates/orca-runtime/src/session.rs
+  s_b8a5b8329f561f::t_83a68ca39fd6fb 251-260
+crates/orca-runtime/src/thread.rs
+  s_b8a5b8329f561f::t_2e350cc8ce9fe4 7,38-52
+crates/orca-tui/src/app.rs
+  s_b8a5b8329f561f::t_8193ad0030ed30 4,88-90,188,191-193,200,236-238,309-310,315-319,330,336,339,361-376,1042,1050-1053,2206-2209,3056-3057,3067-3116,3125,3130,3134,3411,3421-3446,3483,3487,3572,3582-3596,3601-3619,3641,3649-3669,3689-3704,3719,3728-3742,3908-3915,4009,4018
+crates/orca-tui/src/bridge.rs
+  s_b8a5b8329f561f::t_ecefd5c1816e91 186-205
+crates/orca-tui/src/composer_input_actions.rs
+  s_b8a5b8329f561f::t_3bd1928501df8f 74
+crates/orca-tui/src/idle_submit_actions.rs
+  s_b8a5b8329f561f::t_94b423f43ad0f6 26-30,39,57-61,64
+crates/orca-tui/src/mention_menu_actions.rs
+  s_b8a5b8329f561f::t_c2b40b635100a6 40,45,53-59,82,86-180
+crates/orca-tui/src/mention_search_manager.rs
+  s_b8a5b8329f561f::t_8511bf3823ee8c 3,10,22-26,37-43,61,63-76,78-84,97,99-104,107-108,119-152,250,258-262,270,295,300-338,374-383,417,420,422-429,432,437,444,448,457-478,488,498-499,518,533-540,584,589,600,608,620,628,645-647,649,658,666,723-783
+crates/orca-tui/src/submitted_turn.rs
+  s_b8a5b8329f561f::t_dc723763cc0780 6-9,42-52,67,80-85,87-89,98,109-112
+crates/orca-tui/src/types.rs
+  s_b8a5b8329f561f::t_1bebdd368f0caa 12,14,221-223,253-256,505,507,519,574,661,1537
+crates/orca-tui/src/ui.rs
+  s_b8a5b8329f561f::t_3d82d977660f7c 2277,2288-2291,2305,3347-3356,3410-3418,3442-3450,3463
+docs/architecture/adr/0001-streaming-mention-file-search.md
+  s_b8a5b8329f561f::t_3e4ee9fc51e2cc 8-13
+docs/architecture/adr/0002-unified-atomic-mention-system.md
+  s_b8a5b8329f561f::t_0ebbc5b0c0446e 1-202
+docs/architecture/mention-search-glossary.md
+  s_b8a5b8329f561f::t_e2425b9ff89a8f 3-5,7,9-17,35-62,100-102,106,112-120,147-149
+docs/harness-contract.md
+  s_b8a5b8329f561f::t_6cdffc605eccda 28-30,49-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c57ac185ad4d2fd9a9009212aaf545641e30e1df",
+  "prompts": {},
+  "sessions": {
+    "s_3c67cb57e0b71e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a7ac860-2ddf-4e3f-aa6d-90bc290a7d36",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    },
+    "s_b8a5b8329f561f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5a1f-e7c9-79d0-9450-3ac002f96b8a",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
