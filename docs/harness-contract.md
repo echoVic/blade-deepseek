@@ -25,7 +25,9 @@ Options:
 orca --mode=server
 ```
 
-Server mode reads one JSON object per line from stdin and writes one JSON object per line to stdout. The initial supported operation is `submit`:
+Server mode reads one JSON object per line from stdin and writes one JSON object per line to
+stdout. It retains the legacy one-shot `submit` operation and also exposes stateful thread, turn,
+shell, command, permission, file-search, and Mention-search methods. The legacy shape is:
 
 ```json
 {"id":1,"op":"submit","prompt":"fix the bug in main.rs"}
@@ -44,7 +46,77 @@ The response stream preserves the request `id` and emits compact protocol events
 
 Unsupported operations and malformed requests emit an `error` event. Server mode exits when stdin closes.
 
-Requests are processed serially — the next `submit` is not read until the current one completes. Events are streamed as they occur (not batched).
+Legacy unbound `submit` runs as a one-shot request. Thread-bound turns and search sessions may keep
+running while the server accepts later control/update lines. Events are streamed as they occur and
+preserve the request id that owns the stream.
+
+### Streaming file search
+
+The Codex-compatible file-only search protocol accepts multiple explicit roots:
+
+```json
+{"id":"files-start","method":"fuzzyFileSearch/sessionStart","params":{"sessionId":"files-1","roots":["/workspace/frontend","/workspace/backend"],"exclude":["target/**"],"respectGitignore":true,"resultLimit":24}}
+{"id":"files-update","method":"fuzzyFileSearch/sessionUpdate","params":{"sessionId":"files-1","query":"src/main"}}
+{"id":"files-stop","method":"fuzzyFileSearch/sessionStop","params":{"sessionId":"files-1"}}
+```
+
+`fuzzyFileSearch/sessionUpdated` notifications stream `files` with canonical `root`, relative
+`path`, file/directory `matchType`, score, matched character indices, phase, and scan progress.
+Equal relative paths from different roots remain separate results. If roots overlap, the same
+filesystem path may appear once per owning root traversal; clients should treat `id`/`root + path`
+as identity rather than deduplicating on the relative path alone.
+
+### Unified Mention search
+
+Unified search is bound to a live thread so discovery uses that thread's workspace roots and MCP
+registry:
+
+```json
+{"id":"thread","method":"thread/start","params":{"runtimeWorkspaceRoots":["/workspace/frontend","/workspace/backend"]}}
+{"id":"mentions-start","method":"mention/search/start","params":{"sessionId":"mentions-1","threadId":"thread-id-from-response","resultLimit":12}}
+{"id":"mentions-update","method":"mention/search/update","params":{"sessionId":"mentions-1","query":"review"}}
+{"id":"mentions-stop","method":"mention/search/stop","params":{"sessionId":"mentions-1"}}
+```
+
+`mention/search/updated` notifications merge file, Skill, Plugin, MCP Resource, and MCP Resource
+Template candidates. Every candidate includes `id`, `kind`, `display`, `description`, score,
+highlight indices, and a typed `target`. The candidate id is opaque and derived from the complete
+typed target; clients must preserve it for selection anchors and must not reconstruct it from
+display text. Catalog discovery errors are returned in `errors` without discarding healthy
+candidates.
+
+### Atomic Mention input
+
+Clients submit the exact selected target instead of sending only display text:
+
+```json
+{
+  "id": "turn",
+  "method": "turn/start",
+  "params": {
+    "threadId": "thread-id-from-response",
+    "input": [
+      {"type":"text","text":"compare "},
+      {
+        "type":"mention",
+        "name":"same.txt",
+        "target":{
+          "type":"file",
+          "root":"/workspace/backend",
+          "path":"same.txt",
+          "kind":"file"
+        }
+      }
+    ]
+  }
+}
+```
+
+Supported targets are `file`, `skill`, `plugin`, `resource`, and `resource_template`. The visible
+prompt remains natural (`compare @same.txt`), while the runtime revalidates and expands the bound
+target before it enters model history. Bound MCP Resources are read through the same thread
+registry used during discovery. Unbound legacy `@file` prompts and explicit `$skill` prompts remain
+supported.
 
 ## Event Envelope
 

@@ -71,7 +71,7 @@ pub(crate) fn apply_composer_key_input(
             .mention
             .candidates
             .iter()
-            .map(|candidate| candidate.path.clone())
+            .map(|candidate| candidate.display.clone())
             .collect::<Vec<_>>();
         let token_is_current =
             mentions::mention_token_at_cursor(&text, cursor).is_some_and(|token| {

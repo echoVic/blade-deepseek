@@ -183,6 +183,26 @@ impl TuiConversationSession {
         })
     }
 
+    pub fn new_with_preloaded_and_mcp_registry(
+        config: &RunConfig,
+        prompt_for_title: &str,
+        preloaded: Option<history::SessionTranscript>,
+        mcp_registry: McpRegistry,
+    ) -> std::io::Result<Self> {
+        let usage_baseline = preloaded_usage_baseline(&config.history_mode, preloaded.as_ref());
+        let runtime = RuntimeThread::start_with_preloaded_and_mcp_registry(
+            config,
+            prompt_for_title,
+            preloaded,
+            mcp_registry,
+        )?;
+        Ok(Self {
+            runtime,
+            pending_interactions: RuntimePendingInteractionStore::default(),
+            usage_ledger: TuiUsageLedger::from_totals(usage_baseline),
+        })
+    }
+
     pub fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
         self.runtime.session()
     }

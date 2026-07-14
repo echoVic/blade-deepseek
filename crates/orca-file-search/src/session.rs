@@ -13,7 +13,7 @@ use nucleo::{Config, Matcher, Nucleo};
 
 use crate::browse::BrowseScan;
 use crate::discovery::{DiscoveryControl, spawn_synthetic_discovery, spawn_workspace_discovery};
-use crate::eligibility::Candidate;
+use crate::eligibility::{Candidate, ExcludeMatcher};
 use crate::freshness::RootFingerprint;
 use crate::types::{
     MatchKind, RESULT_LIMIT, SearchMatch, SearchMode, SearchPhase, SearchProgress, SearchSnapshot,
@@ -34,6 +34,9 @@ pub struct SearchSessionOptions {
     generation: SessionGeneration,
     walk_threads: NonZeroUsize,
     match_threads: NonZeroUsize,
+    result_limit: usize,
+    exclude: Vec<String>,
+    respect_gitignore: bool,
     notify: Notify,
 }
 
@@ -52,6 +55,9 @@ impl SearchSessionOptions {
             generation,
             walk_threads,
             match_threads,
+            result_limit: RESULT_LIMIT,
+            exclude: Vec::new(),
+            respect_gitignore: true,
             notify: Arc::new(notify),
         }
     }
@@ -61,18 +67,37 @@ impl SearchSessionOptions {
         self.match_threads = NonZeroUsize::new(match_threads.get().min(MAX_MATCH_THREADS)).unwrap();
         self
     }
+
+    pub fn with_result_limit(mut self, result_limit: usize) -> Self {
+        self.result_limit = result_limit.clamp(1, 100);
+        self
+    }
+
+    pub fn with_excludes(mut self, excludes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.exclude = excludes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_respect_gitignore(mut self, respect_gitignore: bool) -> Self {
+        self.respect_gitignore = respect_gitignore;
+        self
+    }
 }
 
 pub struct SearchSession {
     shared: Arc<Shared>,
     handles: Vec<JoinHandle<()>>,
-    fingerprint: RootFingerprint,
+    fingerprints: Vec<RootFingerprint>,
 }
 
 impl SearchSession {
     pub fn start(root: &Path, options: SearchSessionOptions) -> Result<Self, String> {
-        let fingerprint = RootFingerprint::capture(root)?;
-        Self::start_inner(fingerprint, options, None)
+        Self::start_roots(&[root.to_path_buf()], options)
+    }
+
+    pub fn start_roots(roots: &[PathBuf], options: SearchSessionOptions) -> Result<Self, String> {
+        let fingerprints = capture_roots(roots)?;
+        Self::start_inner(fingerprints, options, None)
     }
 
     #[doc(hidden)]
@@ -81,15 +106,20 @@ impl SearchSession {
         options: SearchSessionOptions,
         paths: Vec<String>,
     ) -> Result<Self, String> {
-        let fingerprint = RootFingerprint::capture(root)?;
-        Self::start_inner(fingerprint, options, Some(paths))
+        let fingerprints = capture_roots(&[root.to_path_buf()])?;
+        Self::start_inner(fingerprints, options, Some(paths))
     }
 
     fn start_inner(
-        fingerprint: RootFingerprint,
+        fingerprints: Vec<RootFingerprint>,
         options: SearchSessionOptions,
         synthetic_paths: Option<Vec<String>>,
     ) -> Result<Self, String> {
+        let roots = fingerprints
+            .iter()
+            .map(|fingerprint| fingerprint.canonical_root.clone())
+            .collect::<Vec<_>>();
+        let exclude = ExcludeMatcher::compile(&options.exclude)?;
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let notify_tx = wake_tx.clone();
         let mut nucleo = Nucleo::new(
@@ -106,7 +136,7 @@ impl SearchSession {
         nucleo.sort_results(false);
         let injector = nucleo.injector();
         let shared = Arc::new(Shared {
-            root: fingerprint.canonical_root.clone(),
+            roots: roots.clone(),
             generation: AtomicU64::new(options.generation.0),
             query: LatestQuery::new(options.generation),
             snapshots: SnapshotSlot::new(options.notify),
@@ -115,6 +145,9 @@ impl SearchSession {
             walk_complete: Arc::new(AtomicBool::new(false)),
             error_count: Arc::new(AtomicUsize::new(0)),
             wake_tx: wake_tx.clone(),
+            result_limit: options.result_limit,
+            exclude: exclude.clone(),
+            respect_gitignore: options.respect_gitignore,
         });
 
         let matcher_shared = shared.clone();
@@ -134,8 +167,10 @@ impl SearchSession {
             spawn_synthetic_discovery(paths, injector, discovery_control)
         } else {
             spawn_workspace_discovery(
-                fingerprint.canonical_root.clone(),
+                roots,
                 options.walk_threads.get(),
+                options.respect_gitignore,
+                exclude,
                 injector,
                 discovery_control,
             )
@@ -144,7 +179,7 @@ impl SearchSession {
         Ok(Self {
             shared,
             handles: vec![matcher_handle, discovery_handle],
-            fingerprint,
+            fingerprints,
         })
     }
 
@@ -178,7 +213,9 @@ impl SearchSession {
     }
 
     pub fn tracked_state_changed(&self) -> bool {
-        self.fingerprint.tracked_state_changed()
+        self.fingerprints
+            .iter()
+            .any(RootFingerprint::tracked_state_changed)
     }
 
     pub fn cancel(&self) {
@@ -205,7 +242,7 @@ impl Drop for SearchSession {
 }
 
 struct Shared {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     generation: AtomicU64,
     query: LatestQuery,
     snapshots: SnapshotSlot,
@@ -214,6 +251,9 @@ struct Shared {
     walk_complete: Arc<AtomicBool>,
     error_count: Arc<AtomicUsize>,
     wake_tx: Sender<()>,
+    result_limit: usize,
+    exclude: ExcludeMatcher,
+    respect_gitignore: bool,
 }
 
 impl Shared {
@@ -342,7 +382,13 @@ fn matcher_worker(shared: Arc<Shared>, wake_rx: Receiver<()>, mut nucleo: Nucleo
                         last_fuzzy_query.clone_from(query);
                     }
                     SearchMode::Browse { directory } => {
-                        match BrowseScan::start(&shared.root, directory) {
+                        match BrowseScan::start(
+                            &shared.roots,
+                            directory,
+                            shared.result_limit,
+                            shared.respect_gitignore,
+                            shared.exclude.clone(),
+                        ) {
                             Ok(scan) => browse_scan = Some(scan),
                             Err(error) => browse_error = Some(error),
                         }
@@ -383,7 +429,12 @@ fn matcher_worker(shared: Arc<Shared>, wake_rx: Receiver<()>, mut nucleo: Nucleo
                 SearchMode::Fuzzy { .. } if force_publish && status.running && !status.changed => {
                     Vec::new()
                 }
-                SearchMode::Fuzzy { .. } => fuzzy_matches(&nucleo, &mut index_matcher),
+                SearchMode::Fuzzy { .. } => fuzzy_matches(
+                    &nucleo,
+                    &mut index_matcher,
+                    &shared.roots,
+                    shared.result_limit,
+                ),
                 SearchMode::Browse { .. } => browse_scan
                     .as_ref()
                     .map_or_else(Vec::new, |scan| scan.matches().to_vec()),
@@ -416,10 +467,15 @@ fn matcher_worker(shared: Arc<Shared>, wake_rx: Receiver<()>, mut nucleo: Nucleo
     }
 }
 
-fn fuzzy_matches(nucleo: &Nucleo<Candidate>, index_matcher: &mut Matcher) -> Vec<SearchMatch> {
+fn fuzzy_matches(
+    nucleo: &Nucleo<Candidate>,
+    index_matcher: &mut Matcher,
+    roots: &[PathBuf],
+    result_limit: usize,
+) -> Vec<SearchMatch> {
     let snapshot = nucleo.snapshot();
     let column_pattern = snapshot.pattern().column_pattern(0);
-    let mut best = BinaryHeap::with_capacity(RESULT_LIMIT + 1);
+    let mut best = BinaryHeap::with_capacity(result_limit + 1);
     for (matched, item) in snapshot.matches().iter().zip(snapshot.matched_items(..)) {
         let ranked = RankedCandidate {
             score: matched.score,
@@ -427,7 +483,7 @@ fn fuzzy_matches(nucleo: &Nucleo<Candidate>, index_matcher: &mut Matcher) -> Vec
             candidate: item.data,
             haystack: &item.matcher_columns[0],
         };
-        if best.len() < RESULT_LIMIT {
+        if best.len() < result_limit {
             best.push(ranked);
         } else if best.peek().is_some_and(|worst| ranked < *worst) {
             best.pop();
@@ -443,6 +499,10 @@ fn fuzzy_matches(nucleo: &Nucleo<Candidate>, index_matcher: &mut Matcher) -> Vec
             indices.sort_unstable();
             indices.dedup();
             SearchMatch {
+                root: roots
+                    .get(ranked.candidate.root_index)
+                    .cloned()
+                    .unwrap_or_default(),
                 path: ranked.candidate.path.clone(),
                 kind: ranked.candidate.kind,
                 score: ranked.score,
@@ -464,6 +524,7 @@ impl PartialEq for RankedCandidate<'_> {
         self.score == other.score
             && self.index == other.index
             && self.candidate.kind == other.candidate.kind
+            && self.candidate.root_index == other.candidate.root_index
             && self.candidate.path == other.candidate.path
     }
 }
@@ -486,8 +547,30 @@ impl Ord for RankedCandidate<'_> {
             })
             .then_with(|| self.candidate.path.len().cmp(&other.candidate.path.len()))
             .then_with(|| self.candidate.path.cmp(&other.candidate.path))
+            .then_with(|| self.candidate.root_index.cmp(&other.candidate.root_index))
             .then_with(|| self.index.cmp(&other.index))
     }
+}
+
+fn capture_roots(roots: &[PathBuf]) -> Result<Vec<RootFingerprint>, String> {
+    if roots.is_empty() {
+        return Err("file search requires at least one root".to_string());
+    }
+    let mut fingerprints = Vec::new();
+    for root in roots {
+        let fingerprint = RootFingerprint::capture(root)?;
+        if fingerprints
+            .iter()
+            .any(|existing: &RootFingerprint| existing.canonical_root == fingerprint.canonical_root)
+        {
+            continue;
+        }
+        fingerprints.push(fingerprint);
+    }
+    if fingerprints.is_empty() {
+        return Err("file search requires at least one distinct root".to_string());
+    }
+    Ok(fingerprints)
 }
 
 fn match_kind_order(kind: MatchKind) -> u8 {

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 crossbeam-channel = { workspace = true }
+globset = { workspace = true }
 ignore = { workspace = true }
 nucleo = { workspace = true }
 

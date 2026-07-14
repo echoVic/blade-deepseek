@@ -1,15 +1,23 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::types::MatchKind;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Candidate {
+    pub root_index: usize,
     pub path: String,
     pub kind: MatchKind,
 }
 
-pub(crate) fn candidate_from_path(root: &Path, path: &Path) -> Option<Candidate> {
+pub(crate) fn candidate_from_path(
+    root_index: usize,
+    root: &Path,
+    path: &Path,
+) -> Option<Candidate> {
     if path == root {
         return None;
     }
@@ -44,7 +52,44 @@ pub(crate) fn candidate_from_path(root: &Path, path: &Path) -> Option<Candidate>
     if kind == MatchKind::Directory {
         path.push('/');
     }
-    Some(Candidate { path, kind })
+    Some(Candidate {
+        root_index,
+        path,
+        kind,
+    })
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ExcludeMatcher {
+    set: Option<Arc<GlobSet>>,
+}
+
+impl ExcludeMatcher {
+    pub(crate) fn compile(patterns: &[String]) -> Result<Self, String> {
+        if patterns.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            builder
+                .add(Glob::new(pattern).map_err(|error| {
+                    format!("invalid file-search exclude '{pattern}': {error}")
+                })?);
+        }
+        let set = builder
+            .build()
+            .map_err(|error| format!("failed to build file-search excludes: {error}"))?;
+        Ok(Self {
+            set: Some(Arc::new(set)),
+        })
+    }
+
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        self.set.as_ref().is_some_and(|set| {
+            let normalized = path.trim_end_matches('/');
+            set.is_match(normalized) || set.is_match(path)
+        })
+    }
 }
 
 pub(crate) fn canonical_root(root: &Path) -> Result<PathBuf, String> {
@@ -84,7 +129,7 @@ mod tests {
         fs::create_dir(&git).unwrap();
         fs::write(git.join("index"), "index").unwrap();
 
-        assert!(candidate_from_path(dir.path(), &git.join("index")).is_none());
+        assert!(candidate_from_path(0, dir.path(), &git.join("index")).is_none());
     }
 
     #[test]
@@ -93,7 +138,7 @@ mod tests {
         let nested = root.path().join("src");
         fs::create_dir(&nested).unwrap();
 
-        let candidate = candidate_from_path(root.path(), &nested).unwrap();
+        let candidate = candidate_from_path(0, root.path(), &nested).unwrap();
 
         assert_eq!(candidate.path, "src/");
     }
@@ -110,6 +155,6 @@ mod tests {
         let link = root.path().join("secret-link.txt");
         symlink(target, &link).unwrap();
 
-        assert!(candidate_from_path(root.path(), &link).is_none());
+        assert!(candidate_from_path(0, root.path(), &link).is_none());
     }
 }

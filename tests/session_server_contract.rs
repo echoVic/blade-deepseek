@@ -3,13 +3,14 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use orca_runtime::history::SessionStore;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -74,12 +75,98 @@ struct OrcaChild {
     _home: Option<TempDir>,
 }
 
+const SERVER_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct TimedEventReader {
+    events: mpsc::Receiver<Result<Value, String>>,
+}
+
+impl TimedEventReader {
+    fn new(stdout: ChildStdout) -> Self {
+        let (tx, events) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let event = serde_json::from_str(line.trim_end()).map_err(|error| {
+                            format!("invalid server event: {error}; line={line:?}")
+                        });
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(format!("read server event: {error}")));
+                        break;
+                    }
+                }
+            }
+        });
+        Self { events }
+    }
+
+    fn until_event(&self, id: &str, event_name: &str) -> Value {
+        let deadline = Instant::now() + SERVER_EVENT_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = match self.events.recv_timeout(remaining) {
+                Ok(Ok(event)) => event,
+                Ok(Err(error)) => panic!("{id}/{event_name}: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("timed out after {SERVER_EVENT_TIMEOUT:?} waiting for {id}/{event_name}")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("server stdout closed before {id}/{event_name}")
+                }
+            };
+            if event["id"] == id && event["event"] == event_name {
+                return event;
+            }
+        }
+    }
+
+    fn until_tool_completed(&self, id: &str, tool: &str) -> Value {
+        let deadline = Instant::now() + SERVER_EVENT_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = match self.events.recv_timeout(remaining) {
+                Ok(Ok(event)) => event,
+                Ok(Err(error)) => panic!("{id}/tool_completed: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "timed out after {SERVER_EVENT_TIMEOUT:?} waiting for {id}/tool_completed"
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("server stdout closed before {id}/tool_completed")
+                }
+            };
+            if event["id"] == id && event["event"] == "tool_completed" && event["tool"] == tool {
+                return event;
+            }
+        }
+    }
+}
+
 impl OrcaChild {
     fn wait_with_output(mut self) -> std::io::Result<Output> {
         self.child
             .take()
             .expect("orca child must be available")
             .wait_with_output()
+    }
+}
+
+impl Drop for OrcaChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
     }
 }
 
@@ -202,6 +289,436 @@ fn server_mode_accepts_turn_start_method_and_streams_protocol_events() {
         .find(|event| event["event"] == "turn_completed")
         .expect("turn_completed event");
     assert_eq!(completed["status"], "success");
+}
+
+#[test]
+fn server_mode_streams_multi_root_fuzzy_file_search_sessions() {
+    let first = tempdir().expect("first root");
+    let second = tempdir().expect("second root");
+    std::fs::create_dir_all(first.path().join("src")).expect("first src");
+    std::fs::create_dir_all(second.path().join("src")).expect("second src");
+    std::fs::write(first.path().join("src/main.rs"), "first").expect("first file");
+    std::fs::write(second.path().join("src/main.rs"), "second").expect("second file");
+
+    let mut child = orca_command()
+        .args(["--mode", "server", "--provider", "mock"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+    let mut stdin = child.stdin.take().expect("server stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "search-start",
+            "method": "fuzzyFileSearch/sessionStart",
+            "params": {
+                "sessionId": "files-1",
+                "roots": [first.path(), second.path()],
+                "resultLimit": 32,
+            }
+        })
+    )
+    .expect("write search start");
+    stdin.flush().expect("flush search start");
+    let started = read_json_event_line(&mut stdout, "file search started");
+    assert_eq!(started["event"], "fuzzy_file_search_session_started");
+    assert_eq!(started["sessionId"], "files-1");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "search-update",
+            "method": "fuzzyFileSearch/sessionUpdate",
+            "params": {"sessionId": "files-1", "query": "main"}
+        })
+    )
+    .expect("write search update");
+    stdin.flush().expect("flush search update");
+
+    let accepted = read_json_event_line(&mut stdout, "file search update accepted");
+    assert_eq!(
+        accepted["event"],
+        "fuzzy_file_search_session_update_accepted"
+    );
+    let final_update = loop {
+        let event = read_json_event_line(&mut stdout, "file search streamed update");
+        if event["event"] == "fuzzy_file_search_session_updated"
+            && event["query"] == "main"
+            && event["phase"] == "complete"
+        {
+            break event;
+        }
+    };
+    assert_eq!(final_update["method"], "fuzzyFileSearch/sessionUpdated");
+    let files = final_update["files"].as_array().expect("files");
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| file["path"] == "src/main.rs")
+            .count(),
+        2
+    );
+    let first_root = first.path().canonicalize().expect("canonical first root");
+    let second_root = second.path().canonicalize().expect("canonical second root");
+    assert!(
+        files
+            .iter()
+            .any(|file| { file["root"].as_str() == Some(first_root.to_string_lossy().as_ref()) })
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| { file["root"].as_str() == Some(second_root.to_string_lossy().as_ref()) })
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "search-stop",
+            "method": "fuzzyFileSearch/sessionStop",
+            "params": {"sessionId": "files-1"}
+        })
+    )
+    .expect("write search stop");
+    stdin.flush().expect("flush search stop");
+    let stopped = loop {
+        let event = read_json_event_line(&mut stdout, "file search stopped");
+        if event["event"] == "fuzzy_file_search_session_stopped" {
+            break event;
+        }
+    };
+    assert_eq!(stopped["event"], "fuzzy_file_search_session_stopped");
+    assert_eq!(stopped["sessionId"], "files-1");
+
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn server_mode_streams_unified_file_skill_and_plugin_mention_candidates() {
+    let workspace = tempdir().expect("workspace");
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname='mention-server-test'\nversion='0.1.0'\n",
+    )
+    .expect("workspace manifest");
+    std::fs::write(workspace.path().join("review.md"), "review file").expect("review file");
+    let skill_dir = workspace.path().join(".orca/skills/review");
+    std::fs::create_dir_all(&skill_dir).expect("skill directory");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: Review\ndescription: Review changes safely\n---\n\nReview the diff.\n",
+    )
+    .expect("skill manifest");
+    let plugin_dir = workspace.path().join(".orca/plugins/review/.codex-plugin");
+    std::fs::create_dir_all(&plugin_dir).expect("plugin directory");
+    std::fs::write(
+        plugin_dir.join("plugin.json"),
+        r#"{"name":"review-plugin","description":"Review plugin","interface":{"displayName":"review"}}"#,
+    )
+    .expect("plugin manifest");
+
+    let mut child = orca_command()
+        .args(["--mode", "server", "--provider", "mock"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+    let mut stdin = child.stdin.take().expect("server stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "thread-start",
+            "method": "thread/start",
+            "params": {"runtimeWorkspaceRoots": [workspace.path()]}
+        })
+    )
+    .expect("write thread start");
+    stdin.flush().expect("flush thread start");
+    let thread_started = read_until_event(&mut stdout, "thread-start", "thread_started");
+    let thread_id = thread_started["threadId"].as_str().expect("thread id");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "mention-start",
+            "method": "mention/search/start",
+            "params": {
+                "sessionId": "mentions-1",
+                "threadId": thread_id,
+                "resultLimit": 32
+            }
+        })
+    )
+    .expect("write mention search start");
+    stdin.flush().expect("flush mention search start");
+    let started = read_until_event(
+        &mut stdout,
+        "mention-start",
+        "mention_search_session_started",
+    );
+    assert_eq!(started["sessionId"], "mentions-1");
+    assert_eq!(started["threadId"], thread_id);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "mention-update",
+            "method": "mention/search/update",
+            "params": {"sessionId": "mentions-1", "query": "review"}
+        })
+    )
+    .expect("write mention search update");
+    stdin.flush().expect("flush mention search update");
+    let accepted = read_until_event(
+        &mut stdout,
+        "mention-update",
+        "mention_search_session_update_accepted",
+    );
+    assert_eq!(accepted["query"], "review");
+
+    let completed = loop {
+        let event = read_json_event_line(&mut stdout, "mention search streamed update");
+        if event["event"] == "mention_search_session_updated"
+            && event["query"] == "review"
+            && event["phase"] == "complete"
+        {
+            break event;
+        }
+    };
+    assert_eq!(completed["method"], "mention/search/updated");
+    let candidates = completed["candidates"].as_array().expect("candidates");
+    for kind in ["file", "skill", "plugin"] {
+        assert!(
+            candidates.iter().any(|candidate| candidate["kind"] == kind),
+            "missing {kind} candidate: {candidates:?}"
+        );
+    }
+    let review_ids = candidates
+        .iter()
+        .filter(|candidate| candidate["display"] == "review" || candidate["display"] == "review.md")
+        .filter_map(|candidate| candidate["id"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        review_ids.len(),
+        3,
+        "candidate identities must remain atomic"
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "mention-stop",
+            "method": "mention/search/stop",
+            "params": {"sessionId": "mentions-1"}
+        })
+    )
+    .expect("write mention search stop");
+    stdin.flush().expect("flush mention search stop");
+    let stopped = read_until_event(
+        &mut stdout,
+        "mention-stop",
+        "mention_search_session_stopped",
+    );
+    assert_eq!(stopped["sessionId"], "mentions-1");
+
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn server_mode_unified_mention_discovers_and_expands_mcp_resource() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let workspace = tempdir().expect("workspace");
+    let home = workspace.path().join("home");
+    let server = write_resource_mcp_server(workspace.path());
+    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "[[mcp_servers]]\nname = \"resources\"\ntransport = \"stdio\"\ncommand = \"{}\"\n",
+            server.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+        ])
+        .env("ORCA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+    let mut stdin = child.stdin.take().expect("server stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "thread-start",
+            "method": "thread/start",
+            "params": {"runtimeWorkspaceRoots": [workspace.path()]}
+        })
+    )
+    .expect("write thread start");
+    stdin.flush().expect("flush thread start");
+    let thread_started = read_until_event(&mut stdout, "thread-start", "thread_started");
+    let thread_id = thread_started["threadId"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "mention-start",
+            "method": "mention/search/start",
+            "params": {
+                "sessionId": "mentions-mcp",
+                "threadId": thread_id,
+                "resultLimit": 12
+            }
+        })
+    )
+    .expect("write mention start");
+    stdin.flush().expect("flush mention start");
+    read_until_event(
+        &mut stdout,
+        "mention-start",
+        "mention_search_session_started",
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "mention-update",
+            "method": "mention/search/update",
+            "params": {"sessionId": "mentions-mcp", "query": "memo"}
+        })
+    )
+    .expect("write mention update");
+    stdin.flush().expect("flush mention update");
+    read_until_event(
+        &mut stdout,
+        "mention-update",
+        "mention_search_session_update_accepted",
+    );
+
+    let resource_target = loop {
+        let event = read_json_event_line(&mut stdout, "MCP mention result");
+        if event["event"] != "mention_search_session_updated" || event["query"] != "memo" {
+            continue;
+        }
+        if let Some(target) = event["candidates"]
+            .as_array()
+            .and_then(|candidates| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate["kind"] == "resource")
+            })
+            .map(|candidate| candidate["target"].clone())
+        {
+            break target;
+        }
+    };
+    assert_eq!(resource_target["type"], "resource");
+    assert_eq!(resource_target["server"], "resources");
+    assert_eq!(resource_target["uri"], "memo://orca/one");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "mention-stop",
+            "method": "mention/search/stop",
+            "params": {"sessionId": "mentions-mcp"}
+        })
+    )
+    .expect("write mention stop");
+    stdin.flush().expect("flush mention stop");
+    read_until_event(
+        &mut stdout,
+        "mention-stop",
+        "mention_search_session_stopped",
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "turn-1",
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [
+                    {"type": "text", "text": "inspect "},
+                    {"type": "mention", "name": "memo one", "target": resource_target}
+                ]
+            }
+        })
+    )
+    .expect("write resource mention turn");
+    stdin.flush().expect("flush resource mention turn");
+    read_until_event(&mut stdout, "turn-1", "turn_completed");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "id": "turn-2",
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "mock_history_echo"}]
+            }
+        })
+    )
+    .expect("write history echo turn");
+    stdin.flush().expect("flush history echo turn");
+    let events = read_events_until_event(&mut stdout, "turn-2", "turn_completed");
+    let echoed = events
+        .iter()
+        .filter(|event| event["event"] == "message_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect::<String>();
+    assert!(
+        echoed.contains("resource body from shared registry"),
+        "resource content should enter model history: {echoed}"
+    );
+
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -3669,7 +4186,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             .spawn()
             .expect("spawn orca server");
 
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+        let stdout = TimedEventReader::new(child.stdout.take().expect("server stdout"));
         {
             let stdin = child.stdin.as_mut().expect("server stdin");
             writeln!(
@@ -3679,7 +4196,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             .expect("write thread/start request");
             stdin.flush().expect("flush thread/start request");
         }
-        let thread_started = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread_started = stdout.until_event("thread", "thread_started");
         let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
         {
@@ -3693,7 +4210,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             stdin.flush().expect("flush bash turn");
         }
 
-        let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+        let permission_request = stdout.until_event("turn", "permission_request");
         assert_eq!(permission_request["threadId"], thread_id);
         assert!(
             permission_request["reason"]
@@ -3720,10 +4237,10 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
             .expect("write permission/respond");
             stdin.flush().expect("flush permission/respond");
         }
-        let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+        let resolved = stdout.until_event("permission-response", "permission_resolved");
         assert_eq!(resolved["requestId"], request_id);
         assert_eq!(resolved["decision"], "deny");
-        let _completed = read_until_event(&mut stdout, "turn", "turn_completed");
+        let _completed = stdout.until_event("turn", "turn_completed");
 
         drop(child.stdin.take());
         let output = child.wait_with_output().expect("wait for server");
@@ -3774,7 +4291,7 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             .spawn()
             .expect("spawn orca server");
 
-        let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+        let stdout = TimedEventReader::new(child.stdout.take().expect("server stdout"));
         {
             let stdin = child.stdin.as_mut().expect("server stdin");
             writeln!(
@@ -3784,7 +4301,7 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             .expect("write thread/start request");
             stdin.flush().expect("flush thread/start request");
         }
-        let thread_started = read_until_event(&mut stdout, "thread", "thread_started");
+        let thread_started = stdout.until_event("thread", "thread_started");
         let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
         {
@@ -3799,7 +4316,7 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             stdin.flush().expect("flush bash turn");
         }
 
-        let permission_request = read_until_event(&mut stdout, "turn", "permission_request");
+        let permission_request = stdout.until_event("turn", "permission_request");
         assert_eq!(permission_request["threadId"], thread_id);
         assert_eq!(
             permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
@@ -3819,15 +4336,15 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             .expect("write permission/respond");
             stdin.flush().expect("flush permission/respond");
         }
-        let resolved = read_until_event(&mut stdout, "permission-response", "permission_resolved");
+        let resolved = stdout.until_event("permission-response", "permission_resolved");
         assert_eq!(resolved["requestId"], request_id);
         assert_eq!(resolved["decision"], "allow");
         server.join().expect("server joined");
 
-        let completed = read_until_tool_completed(&mut stdout, "turn", "bash");
+        let completed = stdout.until_tool_completed("turn", "bash");
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["output"], "bash-network-ok");
-        let _turn_completed = read_until_event(&mut stdout, "turn", "turn_completed");
+        let _turn_completed = stdout.until_event("turn", "turn_completed");
 
         drop(child.stdin.take());
         let output = child.wait_with_output().expect("wait for server");
@@ -6244,6 +6761,116 @@ fn server_mode_preserves_thread_conversation_across_turns() {
 }
 
 #[test]
+fn server_mode_atomic_file_mention_uses_the_bound_workspace_root() {
+    let first = tempdir().expect("first root");
+    let second = tempdir().expect("second root");
+    std::fs::write(first.path().join("same.txt"), "content-from-first-root").expect("first file");
+    std::fs::write(second.path().join("same.txt"), "content-from-second-root")
+        .expect("second file");
+    let second_root = second.path().canonicalize().expect("canonical second root");
+
+    let mut child = orca_command()
+        .args(["--mode", "server", "--provider", "mock"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+    let mut stdout = BufReader::new(child.stdout.take().expect("server stdout"));
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "thread-req",
+                "method": "thread/start",
+                "params": {
+                    "runtimeWorkspaceRoots": [first.path(), second.path()]
+                }
+            })
+        )
+        .expect("write thread/start request");
+        stdin.flush().expect("flush thread/start request");
+    }
+    let thread_started = read_until_event(&mut stdout, "thread-req", "thread_started");
+    let thread_id = thread_started["threadId"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "turn-1",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [
+                        {"type": "text", "text": "inspect "},
+                        {
+                            "type": "mention",
+                            "name": "same.txt",
+                            "target": {
+                                "type": "file",
+                                "root": second_root,
+                                "path": "same.txt",
+                                "kind": "file"
+                            }
+                        }
+                    ]
+                }
+            })
+        )
+        .expect("write atomic mention turn");
+        stdin.flush().expect("flush atomic mention turn");
+    }
+    read_until_event(&mut stdout, "turn-1", "turn_completed");
+
+    {
+        let stdin = child.stdin.as_mut().expect("server stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "turn-2",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "mock_history_echo"}]
+                }
+            })
+        )
+        .expect("write history echo turn");
+        stdin.flush().expect("flush history echo turn");
+    }
+    let events = read_events_until_event(&mut stdout, "turn-2", "turn_completed");
+    let echoed = events
+        .iter()
+        .filter(|event| event["event"] == "message_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect::<String>();
+
+    assert!(
+        echoed.contains("content-from-second-root"),
+        "bound second-root file should enter model history: {echoed}"
+    );
+    assert!(
+        !echoed.contains("content-from-first-root"),
+        "same relative path from first root must not be expanded: {echoed}"
+    );
+
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn server_mode_updates_thread_metadata_and_reads_title() {
     let mut child = orca_command()
         .args(["--mode", "server", "--provider", "mock"])
@@ -8196,15 +8823,6 @@ fn is_thread_query_event(event_name: &str) -> bool {
     )
 }
 
-fn read_until_tool_completed<R: BufRead>(stdout: &mut R, id: &str, tool: &str) -> Value {
-    loop {
-        let event = read_json_event_line(stdout, &format!("{id}/tool_completed"));
-        if event["id"] == id && event["event"] == "tool_completed" && event["tool"] == tool {
-            return event;
-        }
-    }
-}
-
 fn sandbox_seatbelt_available() -> bool {
     Command::new("sandbox-exec")
         .arg("-p")
@@ -8573,6 +9191,45 @@ done
 "#,
     )
     .expect("write MCP fixture");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&server).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).expect("chmod MCP fixture");
+    }
+    server
+}
+
+#[cfg(unix)]
+fn write_resource_mcp_server(dir: &std::path::Path) -> std::path::PathBuf {
+    let server = dir.join("resource_mcp_server.sh");
+    std::fs::write(
+        &server,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"resources","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"resources":[{"uri":"memo://orca/one","name":"memo one","description":"A test memo","mimeType":"text/plain"}]}}\n'
+      ;;
+    *'"method":"resources/templates/list"'*)
+      printf '{"jsonrpc":"2.0","id":4,"result":{"resourceTemplates":[]}}\n'
+      ;;
+    *'"method":"resources/read"'*)
+      printf '{"jsonrpc":"2.0","id":5,"result":{"contents":[{"uri":"memo://orca/one","mimeType":"text/plain","text":"resource body from shared registry"}]}}\n'
+      ;;
+  esac
+done
+"#,
+    )
+    .expect("write resource MCP fixture");
     {
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = std::fs::metadata(&server).expect("metadata").permissions();

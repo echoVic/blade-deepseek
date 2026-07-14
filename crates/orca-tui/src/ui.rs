@@ -2274,7 +2274,7 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
                 Style::default().fg(theme.text)
             };
             let mut spans = vec![Span::styled(format!("{prefix}@"), style)];
-            for (index, ch) in candidate.path.chars().enumerate() {
+            for (index, ch) in candidate.display.chars().enumerate() {
                 let matched = candidate.indices.binary_search(&(index as u32)).is_ok();
                 let char_style = if matched {
                     Style::default()
@@ -2285,6 +2285,10 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
                 };
                 spans.push(Span::styled(ch.to_string(), char_style));
             }
+            spans.push(Span::styled(
+                format!("  [{}] {}", candidate.kind.label(), candidate.description),
+                Style::default().fg(theme.muted),
+            ));
             Line::from(spans)
         })
         .collect();
@@ -2298,7 +2302,7 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Files ")
+        .title(" Mentions ")
         .border_style(Style::default().fg(theme.border));
 
     let paragraph = Paragraph::new(lines).block(block);
@@ -3340,11 +3344,16 @@ mod tests {
 
         state.slash_menu = None;
         state.mention.candidates = (0..20)
-            .map(|index| orca_file_search::SearchMatch {
-                path: format!("file-{index:02}.rs"),
-                kind: orca_file_search::MatchKind::File,
-                score: 1,
-                indices: Vec::new(),
+            .map(|index| {
+                orca_runtime::mentions::MentionCandidate::from_file_match(
+                    &orca_file_search::SearchMatch {
+                        root: std::path::PathBuf::from("/workspace"),
+                        path: format!("file-{index:02}.rs"),
+                        kind: orca_file_search::MatchKind::File,
+                        score: 1,
+                        indices: Vec::new(),
+                    },
+                )
             })
             .collect();
         state.mention.selected = 19;
@@ -3398,12 +3407,15 @@ mod tests {
     fn mention_popup_highlights_unicode_character_indices() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut state = test_state();
-        state.mention.candidates = vec![orca_file_search::SearchMatch {
-            path: "src/你好.rs".to_string(),
-            kind: orca_file_search::MatchKind::File,
-            score: 1,
-            indices: vec![4],
-        }];
+        state.mention.candidates = vec![orca_runtime::mentions::MentionCandidate::from_file_match(
+            &orca_file_search::SearchMatch {
+                root: std::path::PathBuf::from("/workspace"),
+                path: "src/你好.rs".to_string(),
+                kind: orca_file_search::MatchKind::File,
+                score: 1,
+                indices: vec![4],
+            },
+        )];
         state.mention.phase = Some(SearchPhase::Complete);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
             .expect("test backend");
@@ -3427,12 +3439,15 @@ mod tests {
     fn mention_popup_renders_in_a_narrow_terminal() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut state = test_state();
-        state.mention.candidates = vec![orca_file_search::SearchMatch {
-            path: "src/a-very-long-file-name.rs".to_string(),
-            kind: orca_file_search::MatchKind::File,
-            score: 1,
-            indices: Vec::new(),
-        }];
+        state.mention.candidates = vec![orca_runtime::mentions::MentionCandidate::from_file_match(
+            &orca_file_search::SearchMatch {
+                root: std::path::PathBuf::from("/workspace"),
+                path: "src/a-very-long-file-name.rs".to_string(),
+                kind: orca_file_search::MatchKind::File,
+                score: 1,
+                indices: Vec::new(),
+            },
+        )];
         state.mention.phase = Some(SearchPhase::Scanning);
         state.mention.progress.scanned_paths = 10;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 5))
@@ -3445,7 +3460,7 @@ mod tests {
             .expect("draw");
 
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("Files"));
+        assert!(rendered.contains("Mentions"));
     }
 
     #[test]

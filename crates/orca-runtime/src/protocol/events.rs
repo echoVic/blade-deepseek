@@ -46,6 +46,72 @@ impl Serialize for ServerEventEnvelope {
             object.insert("event".to_string(), Value::from(event_name.clone()));
             object.remove("eventName");
         }
+        match &self.event {
+            ServerEvent::FuzzyFileSearchSessionUpdated {
+                session_id,
+                query,
+                files,
+                phase,
+                progress,
+            } => {
+                object.insert(
+                    "method".to_string(),
+                    Value::from("fuzzyFileSearch/sessionUpdated"),
+                );
+                object.insert(
+                    "params".to_string(),
+                    json!({
+                        "sessionId": session_id,
+                        "query": query,
+                        "files": files,
+                        "phase": phase,
+                        "progress": progress,
+                    }),
+                );
+            }
+            ServerEvent::FuzzyFileSearchSessionCompleted { session_id, query } => {
+                object.insert(
+                    "method".to_string(),
+                    Value::from("fuzzyFileSearch/sessionCompleted"),
+                );
+                object.insert(
+                    "params".to_string(),
+                    json!({"sessionId": session_id, "query": query}),
+                );
+            }
+            ServerEvent::MentionSearchSessionUpdated {
+                session_id,
+                query,
+                candidates,
+                phase,
+                progress,
+                errors,
+            } => {
+                object.insert("method".to_string(), Value::from("mention/search/updated"));
+                object.insert(
+                    "params".to_string(),
+                    json!({
+                        "sessionId": session_id,
+                        "query": query,
+                        "candidates": candidates,
+                        "phase": phase,
+                        "progress": progress,
+                        "errors": errors,
+                    }),
+                );
+            }
+            ServerEvent::MentionSearchSessionCompleted { session_id, query } => {
+                object.insert(
+                    "method".to_string(),
+                    Value::from("mention/search/completed"),
+                );
+                object.insert(
+                    "params".to_string(),
+                    json!({"sessionId": session_id, "query": query}),
+                );
+            }
+            _ => {}
+        }
         let mut map = serializer.serialize_map(Some(object.len()))?;
         for (key, value) in object {
             map.serialize_entry(key, value)?;
@@ -426,6 +492,61 @@ pub enum ServerEvent {
         exit_code: Value,
         stdout: Value,
         stderr: Value,
+    },
+    FuzzyFileSearchSessionStarted {
+        #[serde(rename = "sessionId")]
+        session_id: Value,
+    },
+    FuzzyFileSearchSessionUpdateAccepted {
+        #[serde(rename = "sessionId")]
+        session_id: Value,
+        query: Value,
+    },
+    FuzzyFileSearchSessionUpdated {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        query: String,
+        files: Value,
+        phase: Value,
+        progress: Value,
+    },
+    FuzzyFileSearchSessionCompleted {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        query: String,
+    },
+    FuzzyFileSearchSessionStopped {
+        #[serde(rename = "sessionId")]
+        session_id: Value,
+    },
+    MentionSearchSessionStarted {
+        #[serde(rename = "sessionId")]
+        session_id: Value,
+        #[serde(rename = "threadId")]
+        thread_id: Value,
+    },
+    MentionSearchSessionUpdateAccepted {
+        #[serde(rename = "sessionId")]
+        session_id: Value,
+        query: Value,
+    },
+    MentionSearchSessionUpdated {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        query: String,
+        candidates: Value,
+        phase: Value,
+        progress: Value,
+        errors: Value,
+    },
+    MentionSearchSessionCompleted {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        query: String,
+    },
+    MentionSearchSessionStopped {
+        #[serde(rename = "sessionId")]
+        session_id: Value,
     },
     Error {
         message: String,

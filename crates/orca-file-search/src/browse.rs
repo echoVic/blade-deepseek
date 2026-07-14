@@ -6,61 +6,90 @@ use std::time::{Duration, Instant};
 use ignore::WalkBuilder;
 
 use crate::discovery::not_vcs_metadata;
-use crate::eligibility::candidate_from_path;
-use crate::types::{MatchKind, RESULT_LIMIT, SearchMatch};
+use crate::eligibility::{ExcludeMatcher, candidate_from_path};
+use crate::types::{MatchKind, SearchMatch};
 
 const BROWSE_BATCH_SIZE: usize = 256;
 const BROWSE_BATCH_BUDGET: Duration = Duration::from_millis(5);
 
 pub(crate) struct BrowseScan {
-    root: PathBuf,
     directory: String,
-    search_dir: PathBuf,
-    walker: ignore::Walk,
+    roots: Vec<BrowseRoot>,
+    active_root: usize,
     matches: Vec<SearchMatch>,
+    result_limit: usize,
     case_sensitive: bool,
     complete: bool,
     error_count: usize,
+    exclude: ExcludeMatcher,
+}
+
+struct BrowseRoot {
+    root_index: usize,
+    root: PathBuf,
+    search_dir: PathBuf,
+    walker: ignore::Walk,
 }
 
 impl BrowseScan {
-    pub(crate) fn start(root: &Path, directory: &str) -> Result<Self, String> {
-        let root = root.canonicalize().map_err(|error| {
-            format!("failed to resolve search root {}: {error}", root.display())
-        })?;
+    pub(crate) fn start(
+        roots: &[PathBuf],
+        directory: &str,
+        result_limit: usize,
+        respect_gitignore: bool,
+        exclude: ExcludeMatcher,
+    ) -> Result<Self, String> {
         let directory = directory.trim_end_matches('/');
-        let requested_dir = if directory.is_empty() {
-            root.clone()
-        } else {
-            root.join(directory)
-        };
-        let search_dir = requested_dir
-            .canonicalize()
-            .map_err(|error| format!("failed to browse @{directory}: {error}"))?;
-        if !search_dir.starts_with(&root) {
-            return Err(format!("@{directory} is outside the workspace"));
-        }
-        if !search_dir.is_dir() {
-            return Err(format!("@{directory} is not a directory"));
-        }
+        let mut browse_roots = Vec::new();
+        for (root_index, root) in roots.iter().enumerate() {
+            let requested_dir = if directory.is_empty() {
+                root.clone()
+            } else {
+                root.join(directory)
+            };
+            let Ok(search_dir) = requested_dir.canonicalize() else {
+                continue;
+            };
+            if !search_dir.starts_with(root) || !search_dir.is_dir() {
+                continue;
+            }
 
-        let mut builder = WalkBuilder::new(&search_dir);
-        builder
-            .max_depth(Some(1))
-            .hidden(false)
-            .follow_links(false)
-            .require_git(true)
-            .filter_entry(not_vcs_metadata);
+            let mut builder = WalkBuilder::new(&search_dir);
+            builder
+                .max_depth(Some(1))
+                .hidden(false)
+                .follow_links(false)
+                .require_git(true)
+                .filter_entry(not_vcs_metadata);
+            if !respect_gitignore {
+                builder
+                    .git_ignore(false)
+                    .git_global(false)
+                    .git_exclude(false)
+                    .ignore(false)
+                    .parents(false);
+            }
+            browse_roots.push(BrowseRoot {
+                root_index,
+                root: root.clone(),
+                search_dir,
+                walker: builder.build(),
+            });
+        }
+        if browse_roots.is_empty() {
+            return Err(format!("failed to browse @{directory} in any search root"));
+        }
 
         Ok(Self {
-            root,
             directory: directory.to_string(),
-            search_dir,
-            walker: builder.build(),
-            matches: Vec::with_capacity(RESULT_LIMIT),
+            roots: browse_roots,
+            active_root: 0,
+            matches: Vec::with_capacity(result_limit),
+            result_limit,
             case_sensitive: directory.chars().any(char::is_uppercase),
             complete: false,
             error_count: 0,
+            exclude,
         })
     }
 
@@ -76,9 +105,13 @@ impl BrowseScan {
                 self.complete = true;
                 break;
             }
-            let Some(entry) = self.walker.next() else {
+            let Some(root) = self.roots.get_mut(self.active_root) else {
                 self.complete = true;
                 break;
+            };
+            let Some(entry) = root.walker.next() else {
+                self.active_root += 1;
+                continue;
             };
             processed += 1;
             let entry = match entry {
@@ -91,12 +124,16 @@ impl BrowseScan {
             if entry.depth() == 0 {
                 continue;
             }
-            let Some(candidate) = candidate_from_path(&self.root, entry.path()) else {
+            let Some(candidate) = candidate_from_path(root.root_index, &root.root, entry.path())
+            else {
                 continue;
             };
+            if self.exclude.matches(&candidate.path) {
+                continue;
+            }
             let Some(child) = entry
                 .path()
-                .strip_prefix(&self.search_dir)
+                .strip_prefix(&root.search_dir)
                 .ok()
                 .and_then(Path::to_str)
             else {
@@ -114,7 +151,9 @@ impl BrowseScan {
             if candidate.kind == MatchKind::Directory {
                 path.push('/');
             }
+            let match_root = root.root.clone();
             self.insert(SearchMatch {
+                root: match_root,
                 path,
                 kind: candidate.kind,
                 score: 0,
@@ -147,7 +186,7 @@ impl BrowseScan {
             .binary_search_by(|existing| browse_order(existing, &candidate, self.case_sensitive))
             .unwrap_or_else(|index| index);
         self.matches.insert(index, candidate);
-        self.matches.truncate(RESULT_LIMIT);
+        self.matches.truncate(self.result_limit);
     }
 }
 
@@ -164,6 +203,7 @@ fn browse_order(left: &SearchMatch, right: &SearchMatch, case_sensitive: bool) -
                     .then_with(|| left.path.cmp(&right.path))
             }
         })
+        .then_with(|| left.root.cmp(&right.root))
 }
 
 fn match_kind_order(kind: MatchKind) -> u8 {
@@ -192,7 +232,15 @@ mod tests {
         fs::write(root.path().join("alpha.rs"), "alpha").unwrap();
         fs::create_dir(root.path().join("zeta")).unwrap();
 
-        let mut scan = BrowseScan::start(root.path(), "").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+        let mut scan = BrowseScan::start(
+            &roots,
+            "",
+            crate::types::RESULT_LIMIT,
+            true,
+            crate::eligibility::ExcludeMatcher::default(),
+        )
+        .unwrap();
         while !scan.is_complete() {
             scan.advance(&AtomicBool::new(false));
         }
@@ -223,7 +271,15 @@ mod tests {
             fs::write(root.path().join(format!("file-{index:04}.rs")), "file").unwrap();
         }
 
-        let mut scan = BrowseScan::start(root.path(), "").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+        let mut scan = BrowseScan::start(
+            &roots,
+            "",
+            crate::types::RESULT_LIMIT,
+            true,
+            crate::eligibility::ExcludeMatcher::default(),
+        )
+        .unwrap();
         while !scan.is_complete() {
             scan.advance(&AtomicBool::new(false));
             assert!(scan.matches().len() <= crate::types::RESULT_LIMIT);

@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -99,6 +100,179 @@ fn browse_mode_lists_direct_children_while_catalog_builds() {
             .matches
             .iter()
             .all(|candidate| candidate.path != "src/nested/deep.rs")
+    );
+    session.join();
+}
+
+#[test]
+fn multi_root_session_streams_matches_with_stable_root_identity() {
+    let first = tempdir().unwrap();
+    let second = tempdir().unwrap();
+    fs::create_dir_all(first.path().join("src")).unwrap();
+    fs::create_dir_all(second.path().join("src")).unwrap();
+    fs::write(first.path().join("src/main.rs"), "first").unwrap();
+    fs::write(second.path().join("src/main.rs"), "second").unwrap();
+    fs::write(second.path().join("src/worker.rs"), "worker").unwrap();
+
+    let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+    let (notify_tx, notify_rx) = mpsc::channel();
+    let mut session = SearchSession::start_roots(
+        &roots,
+        SearchSessionOptions::new(SessionGeneration(20), move |generation| {
+            let _ = notify_tx.send(generation);
+        })
+        .with_result_limit(32),
+    )
+    .unwrap();
+    session.update(SearchMode::fuzzy("main"));
+
+    let snapshot = wait_for_snapshot(&session, &notify_rx, |snapshot| {
+        matches!(snapshot.phase, SearchPhase::Complete)
+    });
+    let mut main_roots = snapshot
+        .matches
+        .iter()
+        .filter(|candidate| candidate.path == "src/main.rs")
+        .map(|candidate| candidate.root.clone())
+        .collect::<Vec<_>>();
+    main_roots.sort();
+
+    let mut expected = roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap())
+        .collect::<Vec<PathBuf>>();
+    expected.sort();
+    assert_eq!(main_roots, expected);
+    session.join();
+}
+
+#[test]
+fn overlapping_roots_preserve_each_traversal_identity() {
+    let workspace = tempdir().unwrap();
+    let nested = workspace.path().join("pkg");
+    fs::create_dir_all(nested.join("src")).unwrap();
+    fs::write(nested.join("src/main.rs"), "nested").unwrap();
+
+    let roots = vec![workspace.path().to_path_buf(), nested.clone()];
+    let (notify_tx, notify_rx) = mpsc::channel();
+    let mut session = SearchSession::start_roots(
+        &roots,
+        SearchSessionOptions::new(SessionGeneration(23), move |generation| {
+            let _ = notify_tx.send(generation);
+        })
+        .with_result_limit(32),
+    )
+    .unwrap();
+    session.update(SearchMode::fuzzy("main"));
+
+    let snapshot = wait_for_snapshot(&session, &notify_rx, |snapshot| {
+        matches!(snapshot.phase, SearchPhase::Complete)
+    });
+    let mut identities = snapshot
+        .matches
+        .iter()
+        .filter(|candidate| candidate.path.ends_with("src/main.rs"))
+        .map(|candidate| (candidate.root.clone(), candidate.path.clone()))
+        .collect::<Vec<_>>();
+    identities.sort();
+
+    let mut expected = vec![
+        (
+            workspace.path().canonicalize().unwrap(),
+            "pkg/src/main.rs".to_string(),
+        ),
+        (nested.canonicalize().unwrap(), "src/main.rs".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(identities, expected);
+    session.join();
+}
+
+#[test]
+fn multi_root_browse_lists_direct_children_from_each_root() {
+    let first = tempdir().unwrap();
+    let second = tempdir().unwrap();
+    fs::create_dir_all(first.path().join("src/alpha")).unwrap();
+    fs::create_dir_all(second.path().join("src/beta")).unwrap();
+    fs::write(first.path().join("src/first.rs"), "first").unwrap();
+    fs::write(second.path().join("src/second.rs"), "second").unwrap();
+
+    let roots = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+    let (notify_tx, notify_rx) = mpsc::channel();
+    let mut session = SearchSession::start_roots(
+        &roots,
+        SearchSessionOptions::new(SessionGeneration(21), move |generation| {
+            let _ = notify_tx.send(generation);
+        })
+        .with_result_limit(32),
+    )
+    .unwrap();
+    session.update(SearchMode::browse("src/"));
+
+    let snapshot = wait_for_snapshot(&session, &notify_rx, |snapshot| {
+        snapshot.mode == SearchMode::browse("src/")
+            && matches!(snapshot.phase, SearchPhase::Complete)
+    });
+
+    assert!(snapshot.matches.iter().any(|candidate| {
+        candidate.root == first.path().canonicalize().unwrap() && candidate.path == "src/first.rs"
+    }));
+    assert!(snapshot.matches.iter().any(|candidate| {
+        candidate.root == second.path().canonicalize().unwrap() && candidate.path == "src/second.rs"
+    }));
+    assert!(
+        snapshot
+            .matches
+            .iter()
+            .all(|candidate| !candidate.path.ends_with("/first.rs/"))
+    );
+    session.join();
+}
+
+#[test]
+fn search_options_apply_excludes_and_can_disable_gitignore() {
+    let root = tempdir().unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::write(root.path().join(".gitignore"), "ignored.rs\n").unwrap();
+    fs::create_dir(root.path().join("generated")).unwrap();
+    fs::write(root.path().join("ignored.rs"), "ignored").unwrap();
+    fs::write(root.path().join("generated/skip.rs"), "skip").unwrap();
+    fs::write(root.path().join("keep.rs"), "keep").unwrap();
+
+    let (notify_tx, notify_rx) = mpsc::channel();
+    let mut session = SearchSession::start(
+        root.path(),
+        SearchSessionOptions::new(SessionGeneration(22), move |generation| {
+            let _ = notify_tx.send(generation);
+        })
+        .with_result_limit(32)
+        .with_excludes(["generated/**"])
+        .with_respect_gitignore(false),
+    )
+    .unwrap();
+    session.update(SearchMode::fuzzy("rs"));
+
+    let snapshot = wait_for_snapshot(&session, &notify_rx, |snapshot| {
+        matches!(snapshot.phase, SearchPhase::Complete)
+    });
+
+    assert!(
+        snapshot
+            .matches
+            .iter()
+            .any(|candidate| candidate.path == "ignored.rs")
+    );
+    assert!(
+        snapshot
+            .matches
+            .iter()
+            .any(|candidate| candidate.path == "keep.rs")
+    );
+    assert!(
+        snapshot
+            .matches
+            .iter()
+            .all(|candidate| candidate.path != "generated/skip.rs")
     );
     session.join();
 }

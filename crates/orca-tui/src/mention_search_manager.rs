@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use orca_file_search::{
     SearchMode, SearchPhase, SearchSession, SearchSessionOptions, SearchSnapshot, SessionGeneration,
 };
 use orca_runtime::mentions::{self, MentionToken};
+use orca_runtime::mentions::{MentionCandidate, MentionCatalog};
 
 use crate::types::{AppState, AppStatus, TuiEvent};
 
@@ -15,6 +17,11 @@ const WARM_IDLE: Duration = Duration::from_secs(30);
 struct TokenIdentity {
     start: usize,
     quoted: bool,
+}
+
+struct CatalogDiscoveryResult {
+    generation: u64,
+    catalog: MentionCatalog,
 }
 
 impl From<&MentionToken> for TokenIdentity {
@@ -27,7 +34,13 @@ impl From<&MentionToken> for TokenIdentity {
 }
 
 pub(crate) struct MentionSearchManager {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+    catalog: MentionCatalog,
+    catalog_registry: Option<orca_mcp::McpRegistry>,
+    catalog_generation: u64,
+    catalog_result_tx: mpsc::Sender<CatalogDiscoveryResult>,
+    catalog_result_rx: mpsc::Receiver<CatalogDiscoveryResult>,
+    catalog_workers: Vec<JoinHandle<()>>,
     event_tx: mpsc::Sender<TuiEvent>,
     next_generation: u64,
     session: Option<SearchSession>,
@@ -45,9 +58,30 @@ impl MentionSearchManager {
             && state.slash_menu.is_none()
     }
 
+    #[cfg(test)]
     pub(crate) fn new(root: PathBuf, event_tx: mpsc::Sender<TuiEvent>) -> Self {
+        Self::new_roots(vec![root], event_tx)
+    }
+
+    pub(crate) fn new_roots(roots: Vec<PathBuf>, event_tx: mpsc::Sender<TuiEvent>) -> Self {
+        Self::new_roots_with_catalog(roots, event_tx, MentionCatalog::default(), None)
+    }
+
+    fn new_roots_with_catalog(
+        roots: Vec<PathBuf>,
+        event_tx: mpsc::Sender<TuiEvent>,
+        catalog: MentionCatalog,
+        catalog_registry: Option<orca_mcp::McpRegistry>,
+    ) -> Self {
+        let (catalog_result_tx, catalog_result_rx) = mpsc::channel();
         Self {
-            root,
+            roots: normalize_roots(roots),
+            catalog,
+            catalog_registry,
+            catalog_generation: 0,
+            catalog_result_tx,
+            catalog_result_rx,
+            catalog_workers: Vec::new(),
             event_tx,
             next_generation: 0,
             session: None,
@@ -60,12 +94,18 @@ impl MentionSearchManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_root(&mut self, root: PathBuf, state: &mut AppState) {
-        let root = root.canonicalize().unwrap_or(root);
-        if self.root == root {
+        self.set_roots(vec![root], state);
+    }
+
+    pub(crate) fn set_roots(&mut self, roots: Vec<PathBuf>, state: &mut AppState) {
+        let roots = normalize_roots(roots);
+        if self.roots == roots {
             return;
         }
-        self.root = root;
+        self.roots = roots;
+        self.refresh_catalog_async();
         self.warm_deadline = None;
         self.active_token = None;
         self.active_generation = None;
@@ -74,6 +114,40 @@ impl MentionSearchManager {
         state.mention.dismissed_query = None;
         state.mention.clear_projection();
         self.begin_stop();
+    }
+
+    pub(crate) fn install_registry(&mut self, registry: orca_mcp::McpRegistry) {
+        self.catalog_registry = Some(registry);
+        self.refresh_catalog_async();
+    }
+
+    pub(crate) fn consume_catalog_dirty(&mut self, event_generation: u64, state: &mut AppState) {
+        self.reap_catalog_workers();
+        if event_generation != self.catalog_generation {
+            return;
+        }
+        let mut latest = None;
+        while let Ok(result) = self.catalog_result_rx.try_recv() {
+            if result.generation == self.catalog_generation {
+                latest = Some(result.catalog);
+            }
+        }
+        let Some(catalog) = latest else {
+            return;
+        };
+        self.catalog = catalog;
+
+        if self.active_token.is_some() {
+            let generation = self.advance_generation();
+            self.active_generation = Some(generation);
+            if let Some(session) = &self.session {
+                session.set_generation(generation);
+                if let Some(query) = &self.active_query {
+                    session.update(search_mode(query));
+                }
+            }
+            state.mention.phase = Some(SearchPhase::Searching);
+        }
     }
 
     #[cfg(test)]
@@ -173,7 +247,7 @@ impl MentionSearchManager {
 
     pub(crate) fn consume_dirty_at_cursor(
         &mut self,
-        _event_generation: SessionGeneration,
+        event_generation: SessionGeneration,
         text: &str,
         cursor: usize,
         state: &mut AppState,
@@ -181,6 +255,11 @@ impl MentionSearchManager {
         let Some(session) = &self.session else {
             return;
         };
+        if session.generation() != event_generation
+            || self.active_generation != Some(event_generation)
+        {
+            return;
+        }
         let Some(snapshot) = session.take_latest_snapshot() else {
             return;
         };
@@ -188,6 +267,7 @@ impl MentionSearchManager {
     }
 
     pub(crate) fn poll(&mut self, now: Instant) {
+        self.reap_catalog_workers();
         if self.warm_deadline.is_some_and(|deadline| now >= deadline) {
             self.warm_deadline = None;
             self.begin_stop();
@@ -212,9 +292,48 @@ impl MentionSearchManager {
         let options = SearchSessionOptions::new(generation, move |generation| {
             let _ = event_tx.send(TuiEvent::MentionSearchDirty { generation });
         });
-        self.session = Some(SearchSession::start(&self.root, options)?);
+        self.session = Some(SearchSession::start_roots(&self.roots, options)?);
         self.refreshing = false;
         Ok(())
+    }
+
+    fn refresh_catalog_async(&mut self) {
+        let Some(registry) = self.catalog_registry.clone() else {
+            return;
+        };
+        self.catalog_generation = self.catalog_generation.wrapping_add(1);
+        let generation = self.catalog_generation;
+        let roots = self.roots.clone();
+        let result_tx = self.catalog_result_tx.clone();
+        let event_tx = self.event_tx.clone();
+        let worker = std::thread::Builder::new()
+            .name("orca-mention-catalog".to_string())
+            .spawn(move || {
+                let catalog = MentionCatalog::discover(&roots, &registry);
+                if result_tx
+                    .send(CatalogDiscoveryResult {
+                        generation,
+                        catalog,
+                    })
+                    .is_ok()
+                {
+                    let _ = event_tx.send(TuiEvent::MentionCatalogDirty { generation });
+                }
+            })
+            .expect("mention catalog worker should start");
+        self.catalog_workers.push(worker);
+    }
+
+    fn reap_catalog_workers(&mut self) {
+        let mut pending = Vec::with_capacity(self.catalog_workers.len());
+        for worker in self.catalog_workers.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                pending.push(worker);
+            }
+        }
+        self.catalog_workers = pending;
     }
 
     fn deactivate(&mut self, state: &mut AppState, now: Instant) {
@@ -252,6 +371,16 @@ impl MentionSearchManager {
                     session.join();
                 });
         }
+        if !self.catalog_workers.is_empty() {
+            let workers = std::mem::take(&mut self.catalog_workers);
+            let _ = std::thread::Builder::new()
+                .name("orca-mention-catalog-reaper".to_string())
+                .spawn(move || {
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                });
+        }
     }
 
     #[cfg(test)]
@@ -285,37 +414,66 @@ impl MentionSearchManager {
         }
 
         let previous_index = state.mention.selected;
-        let anchored_path = state
+        let anchored_candidate = state
             .mention
             .manual_selection
-            .then(|| state.mention.selected_path.clone())
+            .then(|| state.mention.selected_identity.clone())
             .flatten();
-        state.mention.candidates = snapshot.matches;
+        let files = snapshot
+            .matches
+            .iter()
+            .map(MentionCandidate::from_file_match)
+            .collect::<Vec<_>>();
+        let static_candidates = self.catalog.search(&token.query, 12);
+        state.mention.candidates =
+            mentions::merge_candidates(&token.query, static_candidates, files, 12);
         state.mention.phase = Some(snapshot.phase);
         state.mention.progress = snapshot.progress;
-        if let Some(path) = anchored_path {
+        if let Some(id) = anchored_candidate {
             state.mention.selected = state
                 .mention
                 .candidates
                 .iter()
-                .position(|candidate| candidate.path == path)
+                .position(|candidate| candidate.id == id)
                 .unwrap_or_else(|| {
                     previous_index.min(state.mention.candidates.len().saturating_sub(1))
                 });
         } else {
             state.mention.selected = 0;
         }
-        state.mention.selected_path = state
+        state.mention.selected_identity = state
             .mention
             .candidates
             .get(state.mention.selected)
-            .map(|candidate| candidate.path.clone());
+            .map(|candidate| candidate.id.clone());
     }
 
     fn advance_generation(&mut self) -> SessionGeneration {
         self.next_generation = self.next_generation.wrapping_add(1);
         SessionGeneration(self.next_generation)
     }
+}
+
+fn search_mode(query: &str) -> SearchMode {
+    if query.is_empty() || query.ends_with('/') {
+        SearchMode::browse(query)
+    } else {
+        SearchMode::fuzzy(query)
+    }
+}
+
+fn normalize_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut normalized = Vec::new();
+    for root in roots {
+        let root = root.canonicalize().unwrap_or(root);
+        if !normalized.contains(&root) {
+            normalized.push(root);
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push(std::env::current_dir().unwrap_or_default());
+    }
+    normalized
 }
 
 impl Drop for MentionSearchManager {
@@ -327,6 +485,7 @@ impl Drop for MentionSearchManager {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -336,8 +495,8 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{MentionSearchManager, TokenIdentity};
-    use crate::types::AppState;
+    use super::{MentionCandidate, MentionSearchManager, TokenIdentity};
+    use crate::types::{AppState, TuiEvent};
 
     fn state() -> AppState {
         let (action_tx, _action_rx) = mpsc::channel();
@@ -356,6 +515,7 @@ mod tests {
             matches: paths
                 .iter()
                 .map(|path| SearchMatch {
+                    root: PathBuf::from("/workspace"),
                     path: (*path).to_string(),
                     kind: MatchKind::File,
                     score: 1,
@@ -368,6 +528,14 @@ mod tests {
                 walk_complete: false,
             },
         }
+    }
+
+    fn file_candidates(paths: &[&str]) -> Vec<MentionCandidate> {
+        snapshot(SessionGeneration(0), "", paths)
+            .matches
+            .iter()
+            .map(MentionCandidate::from_file_match)
+            .collect()
     }
 
     #[test]
@@ -413,12 +581,12 @@ mod tests {
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@main", true, &mut state, Instant::now());
-        state.mention.candidates = snapshot(SessionGeneration(0), "main", &["sentinel.rs"]).matches;
+        state.mention.candidates = file_candidates(&["sentinel.rs"]);
 
         let current = manager.session.as_ref().unwrap().generation();
         manager.consume_dirty(SessionGeneration(current.0 + 1), "@main", &mut state);
 
-        assert_eq!(state.mention.candidates[0].path, "sentinel.rs");
+        assert_eq!(state.mention.candidates[0].display, "sentinel.rs");
     }
 
     #[test]
@@ -429,7 +597,7 @@ mod tests {
         let mut state = state();
         manager.sync("@main", true, &mut state, Instant::now());
         let generation = manager.session.as_ref().unwrap().generation();
-        state.mention.candidates = snapshot(generation, "main", &["sentinel.rs"]).matches;
+        state.mention.candidates = file_candidates(&["sentinel.rs"]);
 
         manager.apply_snapshot(
             snapshot(generation, "main", &["new.rs"]),
@@ -437,7 +605,7 @@ mod tests {
             &mut state,
         );
 
-        assert_eq!(state.mention.candidates[0].path, "sentinel.rs");
+        assert_eq!(state.mention.candidates[0].display, "sentinel.rs");
     }
 
     #[test]
@@ -449,7 +617,7 @@ mod tests {
         manager.sync("@main", true, &mut state, Instant::now());
         let generation = manager.session.as_ref().unwrap().generation();
         state.mention.pending_query = Some("older".to_string());
-        state.mention.candidates = snapshot(generation, "main", &["sentinel.rs"]).matches;
+        state.mention.candidates = file_candidates(&["sentinel.rs"]);
 
         manager.apply_snapshot(
             snapshot(generation, "main", &["new.rs"]),
@@ -457,7 +625,7 @@ mod tests {
             &mut state,
         );
 
-        assert_eq!(state.mention.candidates[0].path, "sentinel.rs");
+        assert_eq!(state.mention.candidates[0].display, "sentinel.rs");
     }
 
     #[test]
@@ -474,9 +642,11 @@ mod tests {
         });
         manager.active_query = Some("m".to_string());
         state.mention.pending_query = Some("m".to_string());
-        state.mention.candidates = snapshot(generation, "m", &["a.rs", "b.rs", "c.rs"]).matches;
+        state.mention.candidates = file_candidates(&["a.rs", "b.rs", "c.rs"]);
+        let a_identity = state.mention.candidates[0].id.clone();
+        let b_identity = state.mention.candidates[1].id.clone();
         state.mention.selected = 1;
-        state.mention.selected_path = Some("b.rs".to_string());
+        state.mention.selected_identity = Some(state.mention.candidates[1].id.clone());
         state.mention.manual_selection = true;
 
         manager.apply_snapshot(
@@ -485,7 +655,7 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.mention.selected, 2);
-        assert_eq!(state.mention.selected_path.as_deref(), Some("b.rs"));
+        assert_eq!(state.mention.selected_identity, Some(b_identity));
 
         manager.apply_snapshot(
             snapshot(generation, "m", &["c.rs", "a.rs"]),
@@ -493,7 +663,7 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.mention.selected, 1);
-        assert_eq!(state.mention.selected_path.as_deref(), Some("a.rs"));
+        assert_eq!(state.mention.selected_identity, Some(a_identity));
     }
 
     #[test]
@@ -550,6 +720,66 @@ mod tests {
         manager.sync("@main", true, &mut state, Instant::now());
         let second_generation = manager.session.as_ref().unwrap().generation();
         assert_ne!(first_generation, second_generation);
-        assert_eq!(manager.root, second.path().canonicalize().unwrap());
+        assert_eq!(manager.roots, vec![second.path().canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn manager_preserves_all_runtime_workspace_roots() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel();
+
+        let manager = MentionSearchManager::new_roots(
+            vec![first.path().to_path_buf(), second.path().to_path_buf()],
+            event_tx,
+        );
+
+        assert_eq!(
+            manager.roots,
+            vec![
+                first.path().canonicalize().unwrap(),
+                second.path().canonicalize().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_install_discovers_catalog_in_background_and_requeries_active_token() {
+        let root = tempdir().unwrap();
+        let plugin_dir = root.path().join(".orca/plugins/github/.codex-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name":"github","description":"GitHub workflows","interface":{"displayName":"GitHub"}}"#,
+        )
+        .unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
+        let mut state = state();
+        manager.sync("@git", true, &mut state, Instant::now());
+        let initial_generation = manager.session.as_ref().unwrap().generation();
+
+        manager.install_registry(orca_mcp::McpRegistry::default());
+        let catalog_generation = loop {
+            match event_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                TuiEvent::MentionCatalogDirty { generation } => break generation,
+                TuiEvent::MentionSearchDirty { .. } => {}
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+        manager.consume_catalog_dirty(catalog_generation, &mut state);
+
+        assert!(
+            manager
+                .catalog
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.display == "GitHub")
+        );
+        assert_ne!(
+            manager.session.as_ref().unwrap().generation(),
+            initial_generation
+        );
+        manager.shutdown();
     }
 }

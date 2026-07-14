@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SessionGeneration(pub u64);
 
@@ -36,6 +38,8 @@ pub enum MatchKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchMatch {
+    /// Canonical search root that owns `path`.
+    pub root: PathBuf,
     pub path: String,
     pub kind: MatchKind,
     pub score: u32,
@@ -72,6 +76,8 @@ pub const RESULT_LIMIT: usize = 12;
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
         MatchKind, SearchMatch, SearchMode, SearchPhase, SearchProgress, SearchSnapshot,
         SessionGeneration,
@@ -83,6 +89,7 @@ mod tests {
             generation: SessionGeneration(7),
             mode: SearchMode::fuzzy("SrcM"),
             matches: vec![SearchMatch {
+                root: PathBuf::from("/workspace"),
                 path: "src/main.rs".to_string(),
                 kind: MatchKind::File,
                 score: 42,

@@ -76,6 +76,10 @@ content sent to the model:
   terminals, then adds token, cost, and shortcut metadata as space permits.
 - Permission modes use semantic colors: `suggest` blue, `auto-edit` violet,
   `full-auto` red, and `plan` teal.
+- `@` opens one unified Mention menu for streaming multi-root files, Skills,
+  Plugins, and MCP Resources. The visible token stays editable while Orca keeps
+  a hidden atomic target binding, so equal names from different roots or
+  providers expand to the object the user actually selected.
 - If DeepSeek ends a turn without visible content or a tool call, Orca performs
   one bounded corrective retry without persisting the incomplete response or
   repeating already displayed reasoning. Terminal provider failures retain a
@@ -183,7 +187,9 @@ Options:
 - top-level `--resume <session|latest>` — Open a saved conversation in TUI mode
 - top-level `--fork <session|latest>` — Fork a saved conversation in TUI mode
 - top-level `--session-picker` — Choose a saved conversation before entering TUI mode
-- top-level `--mode=server` — Read JSONL `submit` requests from stdin and emit protocol events to stdout
+- top-level `--mode=server` — Run the JSONL app-server, including thread/turn
+  methods, multi-root `fuzzyFileSearch/*`, unified `mention/search/*`, and
+  atomic structured Mention input; see [the harness contract](docs/harness-contract.md)
 
 ## Workflows
 

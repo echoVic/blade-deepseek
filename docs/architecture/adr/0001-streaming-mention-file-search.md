@@ -5,6 +5,12 @@
 Accepted on 2026-07-13 after design grilling against the local Claude Code and Codex reference
 implementations.
 
+Extended on 2026-07-14 by
+[ADR-0002](0002-unified-atomic-mention-system.md), which adds canonical multi-root identity,
+file-only and unified app-server sessions, files/Skills/Plugins/MCP Resources candidate merging,
+and atomic submission bindings. This ADR remains authoritative for the underlying file-search
+performance and lifecycle contract.
+
 ## Context
 
 Orca currently resolves non-empty fuzzy `@` queries synchronously in

@@ -3,7 +3,10 @@ use orca_runtime::mentions;
 use crate::types::PendingWorkflowNotification;
 
 enum SubmittedTurnKind {
-    User(String),
+    User {
+        prompt: String,
+        bindings: mentions::MentionBindings,
+    },
     WorkflowNotification(PendingWorkflowNotification),
 }
 
@@ -36,7 +39,17 @@ pub(crate) struct SubmittedTurn {
 impl SubmittedTurn {
     pub(crate) fn user(prompt: String) -> Self {
         Self {
-            kind: SubmittedTurnKind::User(prompt),
+            kind: SubmittedTurnKind::User {
+                bindings: mentions::MentionBindings::new(&prompt),
+                prompt,
+            },
+            presentation: SubmittedTurnPresentation::user(),
+        }
+    }
+
+    pub(crate) fn user_with_mentions(prompt: String, bindings: mentions::MentionBindings) -> Self {
+        Self {
+            kind: SubmittedTurnKind::User { prompt, bindings },
             presentation: SubmittedTurnPresentation::user(),
         }
     }
@@ -51,7 +64,7 @@ impl SubmittedTurn {
 
     pub(crate) fn prompt(&self) -> &str {
         match &self.kind {
-            SubmittedTurnKind::User(prompt) => prompt,
+            SubmittedTurnKind::User { prompt, .. } => prompt,
             SubmittedTurnKind::WorkflowNotification(notification) => &notification.prompt,
         }
     }
@@ -64,9 +77,16 @@ impl SubmittedTurn {
         self.presentation.backtrack_target
     }
 
-    pub(crate) fn prompt_for_model(&self, cwd: &std::path::Path) -> Result<String, String> {
+    pub(crate) fn prompt_for_model(
+        &self,
+        cwd: &std::path::Path,
+        workspace_roots: &[std::path::PathBuf],
+        mcp_registry: &orca_mcp::McpRegistry,
+    ) -> Result<String, String> {
         match &self.kind {
-            SubmittedTurnKind::User(prompt) => mentions::expand_file_mentions(prompt, cwd),
+            SubmittedTurnKind::User { prompt, bindings } => {
+                mentions::expand_mentions(prompt, bindings, cwd, workspace_roots, mcp_registry)
+            }
             SubmittedTurnKind::WorkflowNotification(notification) => {
                 Ok(notification.prompt.clone())
             }
@@ -75,7 +95,7 @@ impl SubmittedTurn {
 
     pub(crate) fn title_seed(&self, model_prompt: &str) -> String {
         match &self.kind {
-            SubmittedTurnKind::User(_) => model_prompt.to_string(),
+            SubmittedTurnKind::User { .. } => model_prompt.to_string(),
             SubmittedTurnKind::WorkflowNotification(_) => self
                 .presentation
                 .task_label
@@ -86,7 +106,10 @@ impl SubmittedTurn {
 
     pub(crate) fn with_model_prompt(mut self, prompt: String) -> Self {
         self.kind = match self.kind {
-            SubmittedTurnKind::User(_) => SubmittedTurnKind::User(prompt),
+            SubmittedTurnKind::User { .. } => SubmittedTurnKind::User {
+                bindings: mentions::MentionBindings::new(&prompt),
+                prompt,
+            },
             SubmittedTurnKind::WorkflowNotification(mut notification) => {
                 notification.prompt = prompt;
                 SubmittedTurnKind::WorkflowNotification(notification)
