@@ -24,6 +24,9 @@ use crate::transcript_view::viewport_paragraph;
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
+    // Recomputed by render_live_messages when the pill is actually shown;
+    // cleared here so panel switches never leave a stale click target behind.
+    state.jump_to_bottom_area = None;
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
         return;
@@ -403,6 +406,7 @@ pub(crate) fn render_live_messages(
     let width = area.width.max(1) as usize;
     let visible_height = area.height as usize;
     state.reconcile_message_tracking();
+    state.transcript_area = Some(area);
 
     if state.messages.is_empty() {
         let lines = build_welcome_lines(state, theme);
@@ -417,6 +421,7 @@ pub(crate) fn render_live_messages(
         state.total_lines = total;
         state.visible_height = visible_height;
         state.scroll_offset = scroll;
+        state.viewport_base_row = scroll;
         frame.render_widget(
             paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             area,
@@ -454,8 +459,54 @@ pub(crate) fn render_live_messages(
     state.total_lines = viewport.total_height;
     state.visible_height = visible_height;
     state.scroll_offset = viewport.scroll_offset;
+    state.viewport_base_row = viewport.base_row;
 
-    frame.render_widget(viewport_paragraph(viewport.lines), area);
+    // Overlay the mouse selection on the materialized rows; the render cache
+    // itself stays selection-agnostic so highlighting never invalidates it.
+    let lines = match state.selection {
+        Some(selection) => viewport
+            .lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                match selection.cols_on_row(viewport.base_row + index) {
+                    Some((col_start, col_end)) => crate::selection::apply_selection_to_line(
+                        line,
+                        col_start,
+                        col_end,
+                        theme.selection_bg,
+                    ),
+                    None => line,
+                }
+            })
+            .collect(),
+        None => viewport.lines,
+    };
+
+    frame.render_widget(viewport_paragraph(lines), area);
+
+    // Floating "jump to bottom" pill, shown while the user has scrolled away
+    // from the tail (auto-follow disarmed). Clicking it re-arms follow.
+    if !state.auto_scroll && viewport.total_height > visible_height && area.height > 0 {
+        let label = " Jump to bottom (click) ↓ ";
+        let pill_width = UnicodeWidthStr::width(label) as u16;
+        if area.width >= pill_width {
+            let pill = Rect {
+                x: area.x + (area.width - pill_width) / 2,
+                y: area.y + area.height - 1,
+                width: pill_width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    label,
+                    Style::default().bg(theme.selection_bg).fg(theme.text),
+                )),
+                pill,
+            );
+            state.jump_to_bottom_area = Some(pill);
+        }
+    }
 }
 
 fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1982,13 +2033,18 @@ fn push_hard_wrapped_segment(
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // The live status dot + elapsed time moved to the activity line above the composer
     // (see `render_activity`); this bottom line is now purely persistent metadata.
-    let line = status_line(state, theme, area.width as usize);
+    let line = status_line(state, theme, area.width as usize, std::time::Instant::now());
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 }
 
-fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+fn status_line(
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+    now: std::time::Instant,
+) -> Line<'static> {
     let mode_prefix = " | mode: ";
     let mode_value = state.approval_mode.as_str();
     let mode_width = UnicodeWidthStr::width(mode_prefix) + UnicodeWidthStr::width(mode_value);
@@ -2021,10 +2077,6 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         Style::default().fg(theme.muted),
     ));
     optional.push(Span::styled(
-        " | shift+drag to copy",
-        Style::default().fg(theme.muted),
-    ));
-    optional.push(Span::styled(
         " | F1/ctrl+k shortcuts",
         Style::default().fg(theme.muted),
     ));
@@ -2034,6 +2086,18 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         if used + span_width <= width {
             used += span_width;
             spans.push(span);
+        }
+    }
+
+    // Transient right-aligned "copied N chars to clipboard" feedback, shown
+    // for a few seconds after a mouse selection lands on the clipboard.
+    if let Some(chars) = state.copy_notice_at(now) {
+        let notice = format!("copied {chars} chars to clipboard");
+        let notice_width = UnicodeWidthStr::width(notice.as_str());
+        // Separate it from the metadata by at least two columns.
+        if used + notice_width + 2 <= width {
+            spans.push(Span::raw(" ".repeat(width - used - notice_width)));
+            spans.push(Span::styled(notice, Style::default().fg(theme.approval)));
         }
     }
     Line::from(spans)
@@ -3732,17 +3796,82 @@ mod tests {
         state.context_used_tokens = 250;
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let narrow = status_line(&state, &theme, 70).to_string();
+        let narrow = status_line(&state, &theme, 70, std::time::Instant::now()).to_string();
         assert!(narrow.contains("mode: suggest"));
         assert!(narrow.contains("context: 75%"));
         assert!(!narrow.contains("cost:"));
         assert!(!narrow.contains("shortcuts"));
 
-        let wide = status_line(&state, &theme, 180).to_string();
+        let wide = status_line(&state, &theme, 180, std::time::Instant::now()).to_string();
         assert!(wide.contains("tokens:"));
         assert!(wide.contains("cost:"));
-        assert!(wide.contains("shift+drag"));
+        // Drag-to-copy is native now; the old shift+drag hint is gone.
+        assert!(!wide.contains("shift+drag"));
         assert!(wide.contains("shortcuts"));
+    }
+
+    #[test]
+    fn jump_pill_appears_when_scrolled_up_and_leaves_with_follow() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        for index in 0..80 {
+            state
+                .messages
+                .push(ChatMessage::System(format!("line {index}")));
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+        let mut draw = |state: &mut AppState| {
+            terminal
+                .draw(|frame| render(frame, state, &textarea, &theme))
+                .expect("draw");
+            format!("{:?}", terminal.backend().buffer())
+        };
+
+        // Following the tail: no pill.
+        let following = draw(&mut state);
+        assert!(!following.contains("Jump to bottom"));
+        assert_eq!(state.jump_to_bottom_area, None);
+
+        // Scrolled up: the pill appears and registers its click target.
+        state.scroll_up(10);
+        let scrolled = draw(&mut state);
+        assert!(scrolled.contains("Jump to bottom (click) ↓"));
+        assert!(state.jump_to_bottom_area.is_some());
+
+        // Back at the bottom: gone again.
+        state.scroll_to_bottom();
+        let back = draw(&mut state);
+        assert!(!back.contains("Jump to bottom"));
+        assert_eq!(state.jump_to_bottom_area, None);
+    }
+
+    #[test]
+    fn copy_notice_shows_right_aligned_and_expires() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let staged_at = std::time::Instant::now();
+        state.stage_clipboard_copy("hello".to_string(), staged_at);
+        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello"));
+
+        // Fresh: the notice is appended, padded to the right edge.
+        let line = status_line(&state, &theme, 120, staged_at);
+        let text = line.to_string();
+        assert!(text.contains("copied 5 chars to clipboard"));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()),
+            120,
+            "notice must be padded flush to the right edge"
+        );
+
+        // Too narrow to fit: silently omitted, metadata untouched.
+        let narrow = status_line(&state, &theme, 40, staged_at).to_string();
+        assert!(!narrow.contains("copied"));
+
+        // Expired: gone again.
+        let later = staged_at + crate::types::AppState::COPY_NOTICE_TTL;
+        assert!(!status_line(&state, &theme, 120, later).to_string().contains("copied"));
     }
 
     #[test]

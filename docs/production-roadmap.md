@@ -4,7 +4,18 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-14
-Current baseline: v0.2.22 replaces the synchronous TUI-only `@file` index with
+Current baseline: v0.2.23 gives the TUI native-feeling mouse text
+interaction. Left-drag selects transcript text with a theme-aware,
+foreground-preserving highlight; release copies through OSC 52 (plus
+`pbcopy` on macOS) with a transient status-line notice. Selections anchor in
+content space so streaming and scrolling never shift them; extraction
+restores whitespace dropped at soft wraps while keeping hard-split words
+unbroken, and counts display width for CJK. Double-click selects and copies
+the word under the cursor, dragging onto the first/last transcript row keeps
+auto-scrolling from the animation tick while the pointer sits still, and a
+floating `Jump to bottom` pill re-arms auto-follow on click.
+
+Earlier v0.2.22 replaces the synchronous TUI-only `@file` index with
 an owned streaming `orca-file-search` subsystem. It supports canonical
 multi-root browse/fuzzy search, exclude and Git-ignore controls, million-path
 bounded latency/memory gates, Codex-compatible app-server `fuzzyFileSearch/*`
@@ -438,7 +449,7 @@ working baseline used to prioritize the next patch releases.
 | Persistent goals | `/goal` with persisted state, cumulative active-Goal timing, metadata-preserving atomic resume, plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented; runtime orchestration still open |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
 | Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper now keep long-lived agent state behind `RuntimeThread` instead of directly assembling session/lifecycle/executor pieces; workflow runs, sync/async subagent boundaries, workflow child agents, and shell tool calls also carry task metadata; tool approval/hooks/normal fallback now share a runtime tool actor context, while workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; server stdio decoding now delegates operation dispatch through a focused router boundary, with synchronous thread query/metadata, turn-control, shell session, command/exec compatibility, permission response, user-input response, and submit-family dispatch moved into focused processor modules; command/exec active process state and pending server user-input state now live in focused server manager modules; runtime-special tool classification and small executors now live in `runtime_special.rs`; approved background provider-response continuations now convert into typed `RuntimeTurnContinuation` values, and the runtime consumes the single preapproved tool-call id exactly once through the turn permission overlay | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; deeper TUI loop delegation still open |
-| TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, per-turn timers plus cumulative active-Goal timing, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
+| TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, per-turn timers plus cumulative active-Goal timing, clearer approval dialogs, and mouse text selection with OSC 52 clipboard copy, double-click word copy, edge auto-scroll, and a jump-to-bottom control | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary; resume normalization drops legacy reasoning-only assistant turns before provider replay | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
 | Skills | Markdown discovery, `list_skills`/`read_skill`, explicit `$skill` injection, and atomic unified Mention candidates across runtime workspace roots | Codex skills and plugin-provided skill bundles | Implemented for discovery/injection; plugin tool bundles remain open |

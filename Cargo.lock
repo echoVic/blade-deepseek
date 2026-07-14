@@ -134,7 +134,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "blade-deepseek"
-version = "0.2.22"
+version = "0.2.23"
 dependencies = [
  "base64",
  "chrono",
@@ -1364,6 +1364,7 @@ dependencies = [
 name = "orca-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "crossterm",
  "orca-approval",

@@ -25,6 +25,7 @@ use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
+use crate::clipboard;
 use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
 };
@@ -236,9 +237,21 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         if let Ok(registry) = mention_registry_rx.try_recv() {
             mention_search.install_registry(registry);
         }
-        let animation_active = state.status == AppStatus::Running;
+        // The copy notice and edge-drag auto-scroll count as animation so the
+        // idle loop keeps drawing frames: the notice until it expires (expiry
+        // clears it while THIS iteration still counts as animating, so
+        // `did_animate` marks the frame dirty and the final redraw removes it
+        // from the screen), and the edge drag so scrolling continues while the
+        // pointer sits still on the transcript's first/last row.
+        let animation_active = state.status == AppStatus::Running
+            || state.copy_notice.is_some()
+            || state.drag_edge_scroll.is_some();
+        if state.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
+            state.copy_notice = None;
+        }
         if animation_active && scheduler.animation_due(now) {
             state.advance_tick();
+            state.apply_drag_edge_scroll();
             scheduler.did_animate(now);
         }
 
@@ -341,6 +354,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         if let Some(code) = iteration.exit_code {
             exit_code = code;
             break 'main;
+        }
+        // A finished drag staged its text here; write it out via OSC 52 (plus
+        // pbcopy on macOS). The escape sequence is invisible to the UI, so no
+        // redraw coordination is needed.
+        if let Some(text) = state.pending_clipboard_copy.take() {
+            clipboard::copy_to_clipboard(&text);
         }
         if let Some(draw_at) = iteration.draw_at {
             terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;

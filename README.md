@@ -72,6 +72,12 @@ content sent to the model:
   shortened by terminal display width with a visible ellipsis.
 - Approval dialogs keep the decision options visible when commands or previews
   are long, and slash/file candidate menus scroll with the current selection.
+- Drag over the transcript to select text with a theme-aware highlight;
+  releasing the button copies it to the system clipboard via OSC 52 (with
+  `pbcopy` fallback on macOS) and shows a `copied N chars` notice. Double-click
+  copies the word under the cursor, dragging past the first/last row
+  auto-scrolls to grow the selection, and a `Jump to bottom` pill re-arms
+  auto-follow after scrolling up.
 - The status line preserves permission mode and context pressure first on narrow
   terminals, then adds token, cost, and shortcut metadata as space permits.
 - Permission modes use semantic colors: `suggest` blue, `auto-edit` violet,

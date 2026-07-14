@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span, StyledGrapheme};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
+use crate::selection::{SelectionPos, TranscriptSelection, slice_row_by_columns};
 use crate::theme::Theme;
 use crate::types::ChatMessage;
 
@@ -25,6 +26,11 @@ struct StyleRun {
 struct CompactWrappedLine {
     text: String,
     row_boundaries: Vec<usize>,
+    /// Whitespace the word-wrapper dropped at each row boundary
+    /// (`wrap_gaps[i]` sits between row `i` and row `i + 1`). Rendering never
+    /// shows it, but clipboard extraction re-inserts it so soft-wrapped prose
+    /// copies as "foo bar", not "foobar".
+    wrap_gaps: Vec<String>,
     style_runs: Vec<StyleRun>,
     alignment: Option<Alignment>,
 }
@@ -34,8 +40,15 @@ impl CompactWrappedLine {
         Self {
             text: String::new(),
             row_boundaries: vec![0],
+            wrap_gaps: Vec::new(),
             style_runs: Vec::new(),
             alignment,
+        }
+    }
+
+    fn note_gap(&mut self, symbol: &str) {
+        if let Some(last) = self.wrap_gaps.last_mut() {
+            last.push_str(symbol);
         }
     }
 
@@ -54,6 +67,7 @@ impl CompactWrappedLine {
             self.text.push_str(grapheme.symbol);
         }
         self.row_boundaries.push(self.text.len());
+        self.wrap_gaps.push(String::new());
     }
 
     fn row_count(&self) -> usize {
@@ -160,10 +174,13 @@ fn wrap_line_ratatui_compatible(line: &Line<'_>, width: u16) -> CompactWrappedLi
                 }
                 whitespace_width = whitespace_width.saturating_sub(grapheme_width);
                 remaining_width = remaining_width.saturating_sub(grapheme_width);
-                pending_whitespace.pop_front();
+                if let Some(dropped) = pending_whitespace.pop_front() {
+                    wrapped.note_gap(dropped.symbol);
+                }
             }
 
             if is_whitespace && pending_whitespace.is_empty() {
+                wrapped.note_gap(grapheme.symbol);
                 non_whitespace_previous = false;
                 continue;
             }
@@ -326,6 +343,9 @@ pub(crate) struct TranscriptViewport {
     pub lines: Vec<Line<'static>>,
     pub total_height: usize,
     pub scroll_offset: usize,
+    /// Absolute visual row (cache space) of the first rendered line; anchors
+    /// screen coordinates to content space for mouse selection.
+    pub base_row: usize,
     #[cfg(test)]
     pub first_message: usize,
     #[cfg(test)]
@@ -555,6 +575,7 @@ impl TranscriptRenderCache {
             return TranscriptViewport {
                 total_height,
                 scroll_offset,
+                base_row: base_height.saturating_add(scroll_offset),
                 #[cfg(test)]
                 first_message: live_start,
                 #[cfg(test)]
@@ -634,6 +655,7 @@ impl TranscriptRenderCache {
             lines,
             total_height,
             scroll_offset,
+            base_row: absolute_scroll,
             #[cfg(test)]
             first_message,
             #[cfg(test)]
@@ -641,6 +663,161 @@ impl TranscriptRenderCache {
             #[cfg(test)]
             rendered_message_count: last_message.saturating_sub(first_message),
         }
+    }
+
+    /// Resolve an absolute visual row to its message, wrapped line, and row
+    /// index within that line. `None` past the end of the transcript.
+    fn locate_row(&self, row: usize) -> Option<(usize, usize, usize)> {
+        let message_count = self.entries.len();
+        let total_rows = self.cumulative_heights.last().copied().unwrap_or_default();
+        if message_count == 0 || row >= total_rows {
+            return None;
+        }
+        let message_index = self.cumulative_heights[..message_count]
+            .partition_point(|height| *height <= row)
+            .saturating_sub(1);
+        let cached = self.entries.get(message_index).and_then(Option::as_ref)?;
+        let relative = row - self.cumulative_heights[message_index];
+        let line_count = cached.wrapped_lines.len();
+        if line_count == 0 || relative >= cached.visual_height {
+            return None;
+        }
+        let line_index = cached.line_cumulative_heights[..line_count]
+            .partition_point(|height| *height <= relative)
+            .saturating_sub(1);
+        let row_within = relative - cached.line_cumulative_heights[line_index];
+        if row_within >= cached.wrapped_lines[line_index].row_count() {
+            return None;
+        }
+        Some((message_index, line_index, row_within))
+    }
+
+    fn row_text(&self, message_index: usize, line_index: usize, row_within: usize) -> &str {
+        let Some(cached) = self.entries.get(message_index).and_then(Option::as_ref) else {
+            return "";
+        };
+        let Some(wrapped) = cached.wrapped_lines.get(line_index) else {
+            return "";
+        };
+        &wrapped.text[wrapped.row_boundaries[row_within]..wrapped.row_boundaries[row_within + 1]]
+    }
+
+    /// The word under `pos`, as a settled (non-dragging) selection: a run of
+    /// characters of the same class (alphanumeric/underscore, punctuation, or
+    /// whitespace) within the clicked visual row. `None` when the click lands
+    /// past the end of the row or transcript.
+    pub fn word_selection_at(&self, pos: SelectionPos) -> Option<TranscriptSelection> {
+        use unicode_width::UnicodeWidthChar;
+
+        #[derive(PartialEq)]
+        enum CharClass {
+            Whitespace,
+            Word,
+            Punctuation,
+        }
+        fn classify(ch: char) -> CharClass {
+            if ch.is_whitespace() {
+                CharClass::Whitespace
+            } else if ch.is_alphanumeric() || ch == '_' {
+                CharClass::Word
+            } else {
+                CharClass::Punctuation
+            }
+        }
+
+        let (message_index, line_index, row_within) = self.locate_row(pos.row)?;
+        let text = self.row_text(message_index, line_index, row_within);
+
+        // (leading display column, char) pairs for the row.
+        let mut cells: Vec<(usize, char)> = Vec::new();
+        let mut col = 0usize;
+        for ch in text.chars() {
+            cells.push((col, ch));
+            col += ch.width().unwrap_or(0);
+        }
+        let clicked = cells.iter().rposition(|(leading, ch)| {
+            *leading <= pos.col && pos.col < leading + ch.width().unwrap_or(0).max(1)
+        })?;
+        let class = classify(cells[clicked].1);
+
+        let mut first = clicked;
+        while first > 0 && classify(cells[first - 1].1) == class {
+            first -= 1;
+        }
+        let mut last = clicked;
+        while last + 1 < cells.len() && classify(cells[last + 1].1) == class {
+            last += 1;
+        }
+
+        Some(TranscriptSelection {
+            anchor: crate::selection::SelectionPos {
+                row: pos.row,
+                col: cells[first].0,
+            },
+            head: crate::selection::SelectionPos {
+                row: pos.row,
+                col: cells[last].0,
+            },
+            dragging: false,
+        })
+    }
+
+    /// Extract the selected text for clipboard copy.
+    ///
+    /// Rows that belong to the same logical (wrapped) line are joined with the
+    /// whitespace the word-wrapper dropped at that boundary (`wrap_gaps`), so
+    /// soft-wrapped prose reads naturally while a hard-split long word (URL)
+    /// stays unbroken. Hard line breaks emit `\n` with trailing whitespace
+    /// trimmed, matching what terminals do on copy.
+    pub fn extract_text(&self, selection: &TranscriptSelection) -> String {
+        let (start, end) = selection.normalized();
+        let message_count = self.entries.len();
+        let total_rows = self.cumulative_heights.last().copied().unwrap_or_default();
+        if message_count == 0 || total_rows == 0 || start.row >= total_rows {
+            return String::new();
+        }
+
+        let mut out = String::new();
+        let mut current_line = String::new();
+        let mut previous: Option<(usize, usize, usize)> = None;
+        for row in start.row..=end.row.min(total_rows - 1) {
+            let Some((message_index, line_index, row_within)) = self.locate_row(row) else {
+                continue;
+            };
+
+            if let Some((prev_message, prev_line, prev_row)) = previous {
+                let soft_wrap = prev_message == message_index
+                    && prev_line == line_index
+                    && prev_row + 1 == row_within;
+                if soft_wrap {
+                    let gap = self.entries[message_index]
+                        .as_ref()
+                        .and_then(|cached| cached.wrapped_lines.get(line_index))
+                        .and_then(|wrapped| wrapped.wrap_gaps.get(prev_row));
+                    if let Some(gap) = gap {
+                        current_line.push_str(gap);
+                    }
+                } else {
+                    let settled = current_line.trim_end().len();
+                    current_line.truncate(settled);
+                    out.push_str(&current_line);
+                    out.push('\n');
+                    current_line.clear();
+                }
+            }
+
+            let (col_start, col_end) = selection.cols_on_row(row).unwrap_or((0, None));
+            current_line.push_str(slice_row_by_columns(
+                self.row_text(message_index, line_index, row_within),
+                col_start,
+                col_end,
+            ));
+            previous = Some((message_index, line_index, row_within));
+        }
+        let settled = current_line.trim_end().len();
+        current_line.truncate(settled);
+        out.push_str(&current_line);
+        out
     }
 
     fn rebuild_cumulative_heights(&mut self) {
@@ -708,6 +885,7 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::{TranscriptRenderCache, viewport_paragraph, wrap_line_ratatui_compatible};
+    use crate::selection::{SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
     use crate::types::ChatMessage;
     use crate::ui::build_lines_for_messages;
@@ -784,6 +962,160 @@ mod tests {
         viewport_paragraph(viewport.lines).render(actual.area, &mut actual);
 
         assert_eq!(actual, expected);
+    }
+
+    /// Build a cache whose message `i` renders exactly `lines_per_message[i]`.
+    fn extraction_cache(
+        lines_per_message: &[Vec<Line<'static>>],
+        width: usize,
+    ) -> TranscriptRenderCache {
+        let messages: Vec<ChatMessage> = (0..lines_per_message.len())
+            .map(|index| ChatMessage::System(index.to_string()))
+            .collect();
+        let revisions: Vec<u64> = (1..=messages.len() as u64).collect();
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+        cache.prepare(
+            &messages,
+            &revisions,
+            width,
+            &theme,
+            0,
+            false,
+            |message, _, _, _, _| {
+                let ChatMessage::System(index) = message else {
+                    unreachable!()
+                };
+                lines_per_message[index.parse::<usize>().unwrap()].clone()
+            },
+        );
+        cache
+    }
+
+    fn selection(
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> TranscriptSelection {
+        TranscriptSelection {
+            anchor: SelectionPos {
+                row: anchor.0,
+                col: anchor.1,
+            },
+            head: SelectionPos {
+                row: head.0,
+                col: head.1,
+            },
+            dragging: false,
+        }
+    }
+
+    #[test]
+    fn extract_restores_the_space_dropped_at_a_soft_wrap() {
+        let cache = extraction_cache(&[vec![Line::from("foo bar baz")]], 5);
+        assert_eq!(
+            cache.extract_text(&selection((0, 0), (99, 99))),
+            "foo bar baz"
+        );
+    }
+
+    #[test]
+    fn extract_does_not_invent_a_gap_inside_a_hard_split_long_word() {
+        let cache = extraction_cache(&[vec![Line::from("abcdefghij")]], 4);
+        assert_eq!(
+            cache.extract_text(&selection((0, 0), (99, 99))),
+            "abcdefghij"
+        );
+    }
+
+    #[test]
+    fn extract_emits_newlines_at_hard_line_and_message_boundaries() {
+        let cache = extraction_cache(
+            &[
+                vec![Line::from("alpha")],
+                vec![Line::from("beta"), Line::from("gamma")],
+            ],
+            20,
+        );
+        assert_eq!(
+            cache.extract_text(&selection((0, 0), (99, 99))),
+            "alpha\nbeta\ngamma"
+        );
+    }
+
+    #[test]
+    fn extract_respects_column_ranges_on_a_single_row() {
+        let cache = extraction_cache(&[vec![Line::from("hello world")]], 20);
+        assert_eq!(cache.extract_text(&selection((0, 6), (0, 10))), "world");
+        // Backwards drag selects the same range.
+        assert_eq!(cache.extract_text(&selection((0, 10), (0, 6))), "world");
+    }
+
+    #[test]
+    fn extract_counts_display_columns_for_wide_characters() {
+        // 你=cols 0-1, 好=2-3, 世=4-5, 界=6-7.
+        let cache = extraction_cache(&[vec![Line::from("你好世界")]], 20);
+        assert_eq!(cache.extract_text(&selection((0, 2), (0, 4))), "好世");
+    }
+
+    #[test]
+    fn extract_selects_one_cell_for_same_point_and_nothing_out_of_range() {
+        let cache = extraction_cache(&[vec![Line::from("alpha")]], 20);
+        // Same-cell endpoints still cover one character ('h' at col 3)...
+        assert_eq!(cache.extract_text(&selection((0, 3), (0, 3))), "h");
+        // ...but rows past the transcript extract nothing.
+        assert_eq!(cache.extract_text(&selection((7, 0), (9, 5))), "");
+    }
+
+    #[test]
+    fn viewport_base_row_tracks_scroll_position() {
+        let cache = extraction_cache(
+            &[vec![
+                Line::from("one"),
+                Line::from("two"),
+                Line::from("three"),
+                Line::from("four"),
+            ]],
+            20,
+        );
+        assert_eq!(cache.viewport(0, 0, 2).base_row, 0);
+        assert_eq!(cache.viewport(0, 2, 2).base_row, 2);
+        assert_eq!(cache.viewport(0, usize::MAX, 2).base_row, 2);
+    }
+
+    #[test]
+    fn word_selection_expands_over_same_class_runs() {
+        let cache = extraction_cache(&[vec![Line::from("hello world(x)")]], 40);
+        // Click inside "world" (cols 6-10).
+        let sel = cache
+            .word_selection_at(SelectionPos { row: 0, col: 8 })
+            .unwrap();
+        assert_eq!(cache.extract_text(&sel), "world");
+        // Click on the parenthesis selects just the punctuation run.
+        let sel = cache
+            .word_selection_at(SelectionPos { row: 0, col: 11 })
+            .unwrap();
+        assert_eq!(cache.extract_text(&sel), "(");
+        // CJK characters are alphanumeric and select as a run.
+        let cache = extraction_cache(&[vec![Line::from("你好 世界")]], 40);
+        let sel = cache
+            .word_selection_at(SelectionPos { row: 0, col: 1 })
+            .unwrap();
+        assert_eq!(cache.extract_text(&sel), "你好");
+    }
+
+    #[test]
+    fn word_selection_past_the_row_end_is_none() {
+        let cache = extraction_cache(&[vec![Line::from("hi")]], 40);
+        assert!(
+            cache
+                .word_selection_at(SelectionPos { row: 0, col: 10 })
+                .is_none()
+        );
+        assert!(
+            cache
+                .word_selection_at(SelectionPos { row: 5, col: 0 })
+                .is_none()
+        );
     }
 
     fn prepare_with_counters(
