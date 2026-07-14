@@ -1,0 +1,53 @@
+LICENSE
+  s_8feb0ebbd2e920::t_9925b49fe3e31b 1-21
+README.md
+  s_8feb0ebbd2e920::t_cb769d3def0cf0 75-80
+crates/orca-tui/Cargo.toml
+  s_8feb0ebbd2e920::t_b27be3c21b7586 17
+crates/orca-tui/src/app.rs
+  s_8feb0ebbd2e920::t_5c05bf202021bc 28,240-251,254,358-363
+crates/orca-tui/src/clipboard.rs
+  s_8feb0ebbd2e920::t_26272b6c131d15 1-38
+crates/orca-tui/src/input_event_actions.rs
+  s_8feb0ebbd2e920::t_4579311a743650 3,10,96-192,194,201-207,209-211,222-549
+crates/orca-tui/src/lib.rs
+  s_8feb0ebbd2e920::t_c2fb11b375f1a5 13,28
+crates/orca-tui/src/selection.rs
+  s_8feb0ebbd2e920::t_6a39affe84dcf0 1-396
+crates/orca-tui/src/theme.rs
+  s_8feb0ebbd2e920::t_9a3c81eed7fac0 18-19,39-40,54,68-69,83-84
+crates/orca-tui/src/transcript_view.rs
+  s_8feb0ebbd2e920::t_fa38bfe9fb6be8 13,29-33,43,49-54,70,177-179,183,346-348,578,658,668-822,888,967-1120
+crates/orca-tui/src/types.rs
+  s_8feb0ebbd2e920::t_f95ffd0002492c 586-605,691-698,702-770
+crates/orca-tui/src/ui.rs
+  s_8feb0ebbd2e920::t_e0ec4dc81725b6 27-29,409,424,462,464-509,2036,2042-2047,2091-2102,3799,3805,3808-3809,3813-3876
+docs/production-roadmap.md
+  s_8feb0ebbd2e920::t_468ecdbcd289a7 7-18,452
+docs/releases/v0.2.23.md
+  s_8feb0ebbd2e920::t_db3999933a2cef 1-70
+site/index.html
+  s_8feb0ebbd2e920::t_1c5b87f3da9892 74
+site/src/changelog/Changelog.tsx
+  s_8feb0ebbd2e920::t_43227099615811 79-80,503-504
+site/src/shared.ts
+  s_8feb0ebbd2e920::t_4895d989f69909 7,10-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ff348b31ab806946312ddec27c3c77d8f787bb5f",
+  "prompts": {},
+  "sessions": {
+    "s_8feb0ebbd2e920": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "640e3045-5ffb-4c51-93a5-720a39c179d6",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
