@@ -4,6 +4,7 @@ use std::sync::Arc;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_mcp::McpRegistry;
 
 use crate::controller::{ControllerRunOptions, ThreadTurnExecutor, ThreadTurnRequest};
 use crate::extension::ExtensionData;
@@ -31,6 +32,21 @@ impl RuntimeThread {
         preloaded: Option<SessionTranscript>,
     ) -> io::Result<Self> {
         let session = InteractiveSession::new_with_preloaded(config, &title.into(), preloaded)?;
+        Ok(Self::from_session(session))
+    }
+
+    pub fn start_with_preloaded_and_mcp_registry(
+        config: &RunConfig,
+        title: impl Into<String>,
+        preloaded: Option<SessionTranscript>,
+        mcp_registry: McpRegistry,
+    ) -> io::Result<Self> {
+        let session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            config,
+            &title.into(),
+            preloaded,
+            mcp_registry,
+        )?;
         Ok(Self::from_session(session))
     }
 

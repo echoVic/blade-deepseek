@@ -134,7 +134,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "blade-deepseek"
-version = "0.2.21"
+version = "0.2.23"
 dependencies = [
  "base64",
  "chrono",
@@ -337,6 +337,16 @@ version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
 dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+dependencies = [
+ "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
@@ -975,6 +985,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2adf14691c72bcfc1058740436a35bdd3ae9c07d1a941ef00b749e9ea16aefa7"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1181,6 +1207,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleo"
+version = "0.5.0"
+source = "git+https://github.com/helix-editor/nucleo.git?rev=8c16d47cdfa9607d3e44df5f81c635c6f43c65ee#8c16d47cdfa9607d3e44df5f81c635c6f43c65ee"
+dependencies = [
+ "nucleo-matcher",
+ "parking_lot",
+ "rayon",
+]
+
+[[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "git+https://github.com/helix-editor/nucleo.git?rev=8c16d47cdfa9607d3e44df5f81c635c6f43c65ee#8c16d47cdfa9607d3e44df5f81c635c6f43c65ee"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1235,6 +1280,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orca-file-search"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "globset",
+ "ignore",
+ "nucleo",
+ "tempfile",
+]
+
+[[package]]
 name = "orca-mcp"
 version = "0.1.0"
 dependencies = [
@@ -1273,8 +1329,10 @@ dependencies = [
  "dirs",
  "globset",
  "libc",
+ "nucleo",
  "orca-approval",
  "orca-core",
+ "orca-file-search",
  "orca-mcp",
  "orca-provider",
  "orca-tools",
@@ -1313,10 +1371,12 @@ dependencies = [
 name = "orca-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "crossterm",
  "orca-approval",
  "orca-core",
+ "orca-file-search",
  "orca-mcp",
  "orca-provider",
  "orca-runtime",
@@ -1555,6 +1615,26 @@ dependencies = [
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
 ]
 
 [[package]]

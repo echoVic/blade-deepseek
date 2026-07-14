@@ -8,7 +8,9 @@ use std::time::Duration;
 mod active_turn_manager;
 mod command_exec_manager;
 mod command_exec_sandbox;
+mod fuzzy_file_search_manager;
 mod mcp_elicitation_manager;
+mod mention_search_manager;
 mod permission_manager;
 mod router;
 mod shell_manager;
@@ -41,7 +43,9 @@ use command_exec_manager::{
 };
 pub use command_exec_sandbox::{CommandExecSandbox, bash_sandbox_for_cwd};
 use command_exec_sandbox::{command_exec_sandbox_mode, materialize_workspace_roots_paths};
+use fuzzy_file_search_manager::FuzzyFileSearchManager;
 use mcp_elicitation_manager::{PendingMcpElicitationManager, ServerMcpElicitationRequestHandler};
+use mention_search_manager::MentionSearchManager;
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use permission_manager::{
     PendingCommandExecPermissionRequest, PendingPermissionManager, PendingPermissionRequest,
@@ -99,6 +103,8 @@ struct ServerState {
     pending_permissions: PendingPermissionManager,
     pending_user_inputs: PendingUserInputManager,
     pending_mcp_elicitations: PendingMcpElicitationManager,
+    fuzzy_file_searches: FuzzyFileSearchManager,
+    mention_searches: MentionSearchManager,
 }
 
 impl ServerState {
@@ -109,6 +115,7 @@ impl ServerState {
         let _ = self.pending_permissions.close();
         let _ = self.pending_user_inputs.close();
         self.shells.terminate_all();
+        self.terminate_searches();
         if self
             .active_turns
             .wait_all_bounded(&mut self.threads, GRACEFUL_TURN_SHUTDOWN_TIMEOUT)
@@ -123,6 +130,11 @@ impl ServerState {
             return self.active_turns.handoff_remaining_to_reaper();
         }
         None
+    }
+
+    fn terminate_searches(&mut self) {
+        self.fuzzy_file_searches.stop_all();
+        self.mention_searches.stop_all();
     }
 }
 
@@ -1816,13 +1828,19 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
     writer: Arc<Mutex<W>>,
 ) -> io::Result<()> {
     let run_config = thread_run_config(&config.run_config);
-    let ClientOp::Submit {
-        thread_id: Some(thread_id),
-        prompt,
-        permissions,
-    } = op
-    else {
-        return Ok(());
+    let (thread_id, mut prompt, bindings, permissions) = match op {
+        ClientOp::Submit {
+            thread_id: Some(thread_id),
+            prompt,
+            permissions,
+        } => (thread_id, prompt, None, permissions),
+        ClientOp::SubmitWithMentions {
+            thread_id: Some(thread_id),
+            prompt,
+            bindings,
+            permissions,
+        } => (thread_id, prompt, Some(bindings), permissions),
+        _ => return Ok(()),
     };
 
     state.reclaim_finished_thread(&thread_id);
@@ -1847,6 +1865,21 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
         .runtime_workspace_roots
         .clone()
         .unwrap_or_else(|| thread_state.runtime_workspace_roots().to_vec());
+    if let Some(bindings) = bindings {
+        match crate::mentions::expand_mentions(
+            &prompt,
+            &bindings,
+            std::path::Path::new(thread_state.cwd()),
+            &runtime_workspace_roots,
+            thread_state.mcp_registry(),
+        ) {
+            Ok(expanded) => prompt = expanded,
+            Err(error) => {
+                state.threads.put_thread(thread_state);
+                return write_locked_event(&writer, &id, ServerEvent::error(error));
+            }
+        }
+    }
     state.active_turns.insert_control(
         active_turn_id.clone(),
         ActiveTurnControl::new(thread_id.clone(), cancel.clone(), steer_handle.clone()),
@@ -2047,9 +2080,30 @@ fn run_submit<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let mut run_config = config.run_config.clone();
-    let ClientOp::Submit { prompt, .. } = op else {
-        return Ok(());
+    let (mut prompt, bindings) = match op {
+        ClientOp::Submit { prompt, .. } => (prompt, None),
+        ClientOp::SubmitWithMentions {
+            prompt, bindings, ..
+        } => (prompt, Some(bindings)),
+        _ => return Ok(()),
     };
+    if let Some(bindings) = bindings {
+        let cwd = server_cwd(&run_config)?;
+        let roots = run_config
+            .runtime_workspace_roots
+            .clone()
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_else(|| vec![cwd.clone()]);
+        let mcp_registry = orca_mcp::initialize_registry(&run_config.mcp_servers);
+        prompt =
+            match crate::mentions::expand_mentions(&prompt, &bindings, &cwd, &roots, &mcp_registry)
+            {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    return protocol::write_server_event(writer, &id, ServerEvent::error(error));
+                }
+            };
+    }
     run_config.prompt = prompt;
     // Defensive: force JSONL output and disable history regardless of config file settings.
     run_config.output_format = OutputFormat::Jsonl;

@@ -22,7 +22,7 @@ use super::thread::{
     parse_items_view, parse_sort_direction_asc_default, parse_sort_direction_desc_default,
     parse_thread_list_filters, parse_thread_sort_key,
 };
-use super::turn::prompt_from_turn_start_params;
+use super::turn::{prompt_from_turn_start_params, turn_start_input_from_params};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Submission {
@@ -35,6 +35,12 @@ pub enum ClientOp {
     Submit {
         thread_id: Option<String>,
         prompt: String,
+        permissions: PermissionProfileOverride,
+    },
+    SubmitWithMentions {
+        thread_id: Option<String>,
+        prompt: String,
+        bindings: crate::mentions::MentionBindings,
         permissions: PermissionProfileOverride,
     },
     ThreadStart {
@@ -176,6 +182,34 @@ pub enum ClientOp {
     CommandExecTerminate {
         process_id: String,
     },
+    FuzzyFileSearchSessionStart {
+        session_id: String,
+        roots: Vec<PathBuf>,
+        exclude: Vec<String>,
+        respect_gitignore: bool,
+        result_limit: usize,
+    },
+    FuzzyFileSearchSessionUpdate {
+        session_id: String,
+        query: String,
+    },
+    FuzzyFileSearchSessionStop {
+        session_id: String,
+    },
+    MentionSearchSessionStart {
+        session_id: String,
+        thread_id: String,
+        exclude: Vec<String>,
+        respect_gitignore: bool,
+        result_limit: usize,
+    },
+    MentionSearchSessionUpdate {
+        session_id: String,
+        query: String,
+    },
+    MentionSearchSessionStop {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -301,6 +335,22 @@ pub(super) struct WireParams {
     permission_updates: Vec<WirePermissionUpdate>,
     #[serde(rename = "runtimeWorkspaceRoots", default)]
     runtime_workspace_roots: Option<Vec<PathBuf>>,
+    #[serde(rename = "sessionId", default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    roots: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(rename = "respectGitignore", default = "default_true")]
+    respect_gitignore: bool,
+    #[serde(rename = "resultLimit", default)]
+    result_limit: Option<usize>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -313,11 +363,25 @@ pub(super) enum CwdOrModelFilter {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub(super) enum WireUserInput {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     Image {},
     LocalImage {},
-    Skill {},
-    Mention {},
+    Skill {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        path: Option<PathBuf>,
+    },
+    Mention {
+        name: String,
+        target: crate::mentions::MentionTarget,
+        #[serde(default)]
+        start: Option<usize>,
+        #[serde(default)]
+        end: Option<usize>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +432,115 @@ impl Submission {
                     },
                 })
             }
+            (_, Some("fuzzyFileSearch/sessionStart")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::FuzzyFileSearchSessionStart {
+                    session_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.session_id.clone())
+                        .unwrap_or_default(),
+                    roots: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.roots.clone())
+                        .map(normalize_runtime_workspace_roots)
+                        .unwrap_or_default(),
+                    exclude: wire
+                        .params
+                        .as_ref()
+                        .map(|params| params.exclude.clone())
+                        .unwrap_or_default(),
+                    respect_gitignore: wire
+                        .params
+                        .as_ref()
+                        .is_none_or(|params| params.respect_gitignore),
+                    result_limit: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.result_limit)
+                        .unwrap_or(12),
+                },
+            }),
+            (_, Some("fuzzyFileSearch/sessionUpdate")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::FuzzyFileSearchSessionUpdate {
+                    session_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.session_id.clone())
+                        .unwrap_or_default(),
+                    query: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.query.clone())
+                        .unwrap_or_default(),
+                },
+            }),
+            (_, Some("fuzzyFileSearch/sessionStop")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::FuzzyFileSearchSessionStop {
+                    session_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.session_id.clone())
+                        .unwrap_or_default(),
+                },
+            }),
+            (_, Some("mention/search/start")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::MentionSearchSessionStart {
+                    session_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.session_id.clone())
+                        .unwrap_or_default(),
+                    thread_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.thread_id.clone())
+                        .unwrap_or_default(),
+                    exclude: wire
+                        .params
+                        .as_ref()
+                        .map(|params| params.exclude.clone())
+                        .unwrap_or_default(),
+                    respect_gitignore: wire
+                        .params
+                        .as_ref()
+                        .is_none_or(|params| params.respect_gitignore),
+                    result_limit: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.result_limit)
+                        .unwrap_or(12),
+                },
+            }),
+            (_, Some("mention/search/update")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::MentionSearchSessionUpdate {
+                    session_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.session_id.clone())
+                        .unwrap_or_default(),
+                    query: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.query.clone())
+                        .unwrap_or_default(),
+                },
+            }),
+            (_, Some("mention/search/stop")) => Ok(Self {
+                id: wire.id,
+                op: ClientOp::MentionSearchSessionStop {
+                    session_id: wire
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.session_id.clone())
+                        .unwrap_or_default(),
+                },
+            }),
             (_, Some("thread/resume")) => {
                 let thread_id = wire
                     .params
@@ -922,20 +1095,28 @@ impl Submission {
                 },
             }),
             (_, Some("turn/start")) => {
-                let permissions = wire
-                    .params
+                let params = wire.params;
+                let permissions = params
                     .as_ref()
                     .map(permission_profile_override)
                     .unwrap_or_default();
+                let thread_id = params.as_ref().and_then(|params| params.thread_id.clone());
+                let input = turn_start_input_from_params(params);
                 Ok(Self {
                     id: wire.id,
-                    op: ClientOp::Submit {
-                        thread_id: wire
-                            .params
-                            .as_ref()
-                            .and_then(|params| params.thread_id.clone()),
-                        prompt: prompt_from_turn_start_params(wire.params),
-                        permissions,
+                    op: if input.bindings.is_empty() {
+                        ClientOp::Submit {
+                            thread_id,
+                            prompt: input.prompt,
+                            permissions,
+                        }
+                    } else {
+                        ClientOp::SubmitWithMentions {
+                            thread_id,
+                            prompt: input.prompt,
+                            bindings: input.bindings,
+                            permissions,
+                        }
                     },
                 })
             }
@@ -1406,6 +1587,117 @@ mod tests {
                     PathBuf::from("/tmp/workspace-one"),
                     PathBuf::from("/tmp/workspace-two")
                 ])
+            }
+        );
+    }
+
+    #[test]
+    fn submission_decodes_fuzzy_file_search_session_operations() {
+        let start = Submission::decode(
+            r#"{"id":"search-start","method":"fuzzyFileSearch/sessionStart","params":{"sessionId":"files-1","roots":["/tmp/one","/tmp/two"],"exclude":["target/**"],"respectGitignore":false,"resultLimit":24}}"#,
+        )
+        .expect("start submission");
+        assert_eq!(
+            start.op,
+            ClientOp::FuzzyFileSearchSessionStart {
+                session_id: "files-1".to_string(),
+                roots: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
+                exclude: vec!["target/**".to_string()],
+                respect_gitignore: false,
+                result_limit: 24,
+            }
+        );
+
+        let update = Submission::decode(
+            r#"{"id":"search-update","method":"fuzzyFileSearch/sessionUpdate","params":{"sessionId":"files-1","query":"src/mai"}}"#,
+        )
+        .expect("update submission");
+        assert_eq!(
+            update.op,
+            ClientOp::FuzzyFileSearchSessionUpdate {
+                session_id: "files-1".to_string(),
+                query: "src/mai".to_string(),
+            }
+        );
+
+        let stop = Submission::decode(
+            r#"{"id":"search-stop","method":"fuzzyFileSearch/sessionStop","params":{"sessionId":"files-1"}}"#,
+        )
+        .expect("stop submission");
+        assert_eq!(
+            stop.op,
+            ClientOp::FuzzyFileSearchSessionStop {
+                session_id: "files-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn submission_decodes_unified_mention_search_session_operations() {
+        let start = Submission::decode(
+            r#"{"id":"mention-start","method":"mention/search/start","params":{"sessionId":"mentions-1","threadId":"thread-1","exclude":["target/**"],"respectGitignore":false,"resultLimit":24}}"#,
+        )
+        .expect("mention search start");
+        assert_eq!(
+            start.op,
+            ClientOp::MentionSearchSessionStart {
+                session_id: "mentions-1".to_string(),
+                thread_id: "thread-1".to_string(),
+                exclude: vec!["target/**".to_string()],
+                respect_gitignore: false,
+                result_limit: 24,
+            }
+        );
+
+        let update = Submission::decode(
+            r#"{"id":"mention-update","method":"mention/search/update","params":{"sessionId":"mentions-1","query":"review"}}"#,
+        )
+        .expect("mention search update");
+        assert_eq!(
+            update.op,
+            ClientOp::MentionSearchSessionUpdate {
+                session_id: "mentions-1".to_string(),
+                query: "review".to_string(),
+            }
+        );
+
+        let stop = Submission::decode(
+            r#"{"id":"mention-stop","method":"mention/search/stop","params":{"sessionId":"mentions-1"}}"#,
+        )
+        .expect("mention search stop");
+        assert_eq!(
+            stop.op,
+            ClientOp::MentionSearchSessionStop {
+                session_id: "mentions-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn submission_decodes_atomic_mention_input() {
+        let submission = Submission::decode(
+            r#"{"id":"turn","method":"turn/start","params":{"threadId":"thread-1","input":[{"type":"text","text":"read "},{"type":"mention","name":"same.txt","target":{"type":"file","root":"/tmp/two","path":"same.txt","kind":"file"}}]}}"#,
+        )
+        .expect("mention submission");
+
+        let ClientOp::SubmitWithMentions {
+            thread_id,
+            prompt,
+            bindings,
+            ..
+        } = submission.op
+        else {
+            panic!("expected bound mention submit");
+        };
+        assert_eq!(thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(prompt, "read @same.txt");
+        assert_eq!(bindings.bindings().len(), 1);
+        assert_eq!(
+            bindings.bindings()[0].target,
+            crate::mentions::MentionTarget::File {
+                root: PathBuf::from("/tmp/two"),
+                path: "same.txt".to_string(),
+                kind: crate::mentions::MentionFileKind::File,
             }
         );
     }

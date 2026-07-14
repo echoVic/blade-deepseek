@@ -9,6 +9,7 @@ pub(in crate::server::router) fn is_submit_operation(op: &ClientOp) -> bool {
     matches!(
         op,
         ClientOp::Submit { .. }
+            | ClientOp::SubmitWithMentions { .. }
             | ClientOp::ThreadStart { .. }
             | ClientOp::ThreadResume { .. }
             | ClientOp::ThreadFork { .. }
@@ -23,7 +24,7 @@ pub(in crate::server::router) fn dispatch_submit_operation<W: Write + Send + 'st
     writer: Arc<Mutex<W>>,
 ) -> io::Result<()> {
     match &op {
-        ClientOp::Submit { thread_id, .. } => {
+        ClientOp::Submit { thread_id, .. } | ClientOp::SubmitWithMentions { thread_id, .. } => {
             if let Some(thread_id) = thread_id {
                 if !state.threads.has_thread(thread_id) && !state.active_turns.has_thread(thread_id)
                 {

@@ -9,7 +9,9 @@ use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 use orca_core::task_types::BackgroundTaskSummary;
+use orca_file_search::{SearchPhase, SearchProgress, SessionGeneration};
 use orca_runtime::history::SessionSummary;
+use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 
@@ -213,6 +215,12 @@ pub enum TuiEvent {
         requested_schema_json: Option<String>,
     },
     Notice(String),
+    MentionSearchDirty {
+        generation: SessionGeneration,
+    },
+    MentionCatalogDirty {
+        generation: u64,
+    },
     Error(String),
     UsageUpdated(UsageTotals),
     ContextUpdated {
@@ -242,6 +250,10 @@ pub enum TuiEvent {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     Submit(String),
+    SubmitWithMentions {
+        prompt: String,
+        bindings: MentionBindings,
+    },
     SubmitWorkflowNotification(PendingWorkflowNotification),
     RunWorkflow {
         name: String,
@@ -488,6 +500,30 @@ pub struct SubMenu {
     pub context: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MentionPopupState {
+    pub candidates: Vec<MentionCandidate>,
+    pub selected: usize,
+    pub selected_identity: Option<String>,
+    pub manual_selection: bool,
+    pub phase: Option<SearchPhase>,
+    pub progress: SearchProgress,
+    pub pending_query: Option<String>,
+    pub dismissed_query: Option<String>,
+}
+
+impl MentionPopupState {
+    pub(crate) fn clear_projection(&mut self) {
+        self.candidates.clear();
+        self.selected = 0;
+        self.selected_identity = None;
+        self.manual_selection = false;
+        self.phase = None;
+        self.progress = SearchProgress::default();
+        self.pending_query = None;
+    }
+}
+
 pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) message_revisions: Vec<u64>,
@@ -534,8 +570,8 @@ pub struct AppState {
     pub context_used_tokens: usize,
     pub context_limit_tokens: usize,
     pub slash_menu: Option<SlashMenu>,
-    pub mention_candidates: Vec<String>,
-    pub mention_selected: usize,
+    pub mention: MentionPopupState,
+    pub mention_bindings: MentionBindings,
     pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
     proposed_plan_parser: ProposedPlanStreamParser,
     /// The most recent update_plan call failed, so `current_plan` may be
@@ -547,6 +583,26 @@ pub struct AppState {
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     pub tick: u64,
+    /// Mouse drag selection over the transcript, anchored in content space.
+    pub selection: Option<crate::selection::TranscriptSelection>,
+    /// Screen rect of the transcript on the last frame; maps mouse to content.
+    pub transcript_area: Option<ratatui::layout::Rect>,
+    /// Absolute visual row of the transcript area's first line last frame.
+    pub viewport_base_row: usize,
+    /// Selected text awaiting a clipboard write by the app loop.
+    pub pending_clipboard_copy: Option<String>,
+    /// Last left-button press (time + cell), for double-click detection.
+    pub last_left_click: Option<(Instant, u16, u16)>,
+    /// Transient "copied N chars" feedback: char count + when it was staged.
+    pub copy_notice: Option<(usize, Instant)>,
+    /// Active edge-drag auto-scroll: direction (-1 up / +1 down) + pointer
+    /// column. Set while a drag sits on the transcript's first/last row and
+    /// applied on every animation tick, so scrolling continues even when the
+    /// pointer stops moving (terminals only send drag events on movement).
+    pub drag_edge_scroll: Option<(i8, u16)>,
+    /// Screen rect of the floating "Jump to bottom" pill on the last frame;
+    /// `None` while auto-follow is on (the pill only shows when scrolled up).
+    pub jump_to_bottom_area: Option<ratatui::layout::Rect>,
 }
 
 pub trait ScrollAmount {
@@ -621,8 +677,8 @@ impl AppState {
             context_used_tokens: 0,
             context_limit_tokens: 0,
             slash_menu: None,
-            mention_candidates: Vec::new(),
-            mention_selected: 0,
+            mention: MentionPopupState::default(),
+            mention_bindings: MentionBindings::default(),
             current_plan: None,
             proposed_plan_parser: ProposedPlanStreamParser::default(),
             plan_update_failed: false,
@@ -632,7 +688,79 @@ impl AppState {
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
             tick: 0,
+            selection: None,
+            transcript_area: None,
+            viewport_base_row: 0,
+            pending_clipboard_copy: None,
+            last_left_click: None,
+            copy_notice: None,
+            drag_edge_scroll: None,
+            jump_to_bottom_area: None,
         }
+    }
+
+    /// Map a mouse position to transcript content space; `None` outside the
+    /// transcript area (or before the first frame rendered it).
+    pub(crate) fn transcript_pos_at(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::selection::SelectionPos> {
+        let area = self.transcript_area?;
+        crate::selection::screen_to_selection_pos(area, self.viewport_base_row, column, row)
+    }
+
+    /// Like [`Self::transcript_pos_at`] but clamps to the nearest transcript
+    /// cell, so drags that leave the area keep tracking.
+    pub(crate) fn transcript_pos_at_clamped(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::selection::SelectionPos> {
+        let area = self.transcript_area?;
+        crate::selection::screen_to_selection_pos_clamped(area, self.viewport_base_row, column, row)
+    }
+
+    /// How long the "copied N chars" notice stays on the status line.
+    pub(crate) const COPY_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+
+    /// Stage `text` for the clipboard and start the status-line notice.
+    pub(crate) fn stage_clipboard_copy(&mut self, text: String, now: Instant) {
+        self.copy_notice = Some((text.chars().count(), now));
+        self.pending_clipboard_copy = Some(text);
+    }
+
+    /// The staged copy's char count while the notice is still fresh.
+    pub fn copy_notice_at(&self, now: Instant) -> Option<usize> {
+        self.copy_notice.and_then(|(chars, at)| {
+            (now.duration_since(at) < Self::COPY_NOTICE_TTL).then_some(chars)
+        })
+    }
+
+    /// One animation-tick step of edge-drag auto-scroll: scroll a line and
+    /// grow the selection head one content row in the drag direction. The
+    /// head moves in content space, so it stays glued to what it selected.
+    pub(crate) fn apply_drag_edge_scroll(&mut self) {
+        let Some((direction, column)) = self.drag_edge_scroll else {
+            return;
+        };
+        let col = self
+            .transcript_area
+            .map(|area| column.saturating_sub(area.x) as usize)
+            .unwrap_or(0);
+        let Some(mut selection) = self.selection.filter(|selection| selection.dragging) else {
+            return;
+        };
+        if direction < 0 {
+            self.scroll_up(1usize);
+            selection.head.row = selection.head.row.saturating_sub(1);
+        } else {
+            self.scroll_down(1usize);
+            let last_row = self.total_lines.saturating_sub(1);
+            selection.head.row = selection.head.row.saturating_add(1).min(last_row);
+        }
+        selection.head.col = col;
+        self.selection = Some(selection);
     }
 
     fn allocate_message_revision(&mut self) -> u64 {
@@ -1496,6 +1624,7 @@ impl AppState {
             TuiEvent::Notice(msg) => {
                 self.push_message(ChatMessage::System(msg));
             }
+            TuiEvent::MentionSearchDirty { .. } | TuiEvent::MentionCatalogDirty { .. } => {}
             TuiEvent::UsageUpdated(usage) => {
                 self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
                 self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);

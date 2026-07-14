@@ -267,8 +267,8 @@ impl McpRegistry {
         }
     }
 
-    #[cfg(test)]
-    fn from_resource_transports_for_test(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_resource_transports_for_test(
         transports: impl IntoIterator<Item = (String, Box<dyn McpTransport>)>,
     ) -> Self {
         let clients = transports

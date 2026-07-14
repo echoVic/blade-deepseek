@@ -457,6 +457,14 @@ impl ServerThread {
         &self.runtime_workspace_roots
     }
 
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    pub fn mcp_registry(&self) -> &orca_mcp::McpRegistry {
+        self.thread.session().mcp_registry()
+    }
+
     pub fn active_permission_profile(&self) -> Option<&ActivePermissionProfile> {
         self.active_permission_profile.as_ref()
     }

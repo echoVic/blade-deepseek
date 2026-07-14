@@ -23,9 +23,11 @@ pub(crate) fn handle_idle_submit(
 ) -> bool {
     state.slash_menu = None;
     let visible_text = textarea_text(textarea);
-    let text = expand_pending_pastes(&visible_text, &state.pending_pastes)
-        .trim()
-        .to_string();
+    state.mention_bindings.reconcile(&visible_text);
+    let expanded_text = expand_pending_pastes(&visible_text, &state.pending_pastes);
+    state.mention_bindings.reconcile(&expanded_text);
+    let text = expanded_text.trim().to_string();
+    state.mention_bindings.reconcile(&text);
     if text.is_empty() {
         return false;
     }
@@ -34,6 +36,7 @@ pub(crate) fn handle_idle_submit(
         match outcome {
             SlashOutcome::Continue => {
                 state.pending_pastes.clear();
+                state.mention_bindings.clear();
                 reset_composer_after_submit(textarea, vim_state, theme);
                 return true;
             }
@@ -51,9 +54,14 @@ pub(crate) fn handle_idle_submit(
         state.push_message(ChatMessage::User(visible_text.trim().to_string()));
         state.enter_running();
         state.scroll_to_bottom();
-        let _ = action_tx.send(UserAction::Submit(text));
+        let bindings = state.mention_bindings.clone();
+        let _ = action_tx.send(UserAction::SubmitWithMentions {
+            prompt: text,
+            bindings,
+        });
     }
     state.pending_pastes.clear();
+    state.mention_bindings.clear();
     reset_composer_after_submit(textarea, vim_state, theme);
     true
 }

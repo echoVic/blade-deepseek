@@ -258,6 +258,16 @@ impl InteractiveSession {
         prompt_for_title: &str,
         preloaded: Option<SessionTranscript>,
     ) -> io::Result<Self> {
+        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+        Self::new_with_preloaded_and_mcp_registry(config, prompt_for_title, preloaded, mcp_registry)
+    }
+
+    pub fn new_with_preloaded_and_mcp_registry(
+        config: &RunConfig,
+        prompt_for_title: &str,
+        preloaded: Option<SessionTranscript>,
+        mcp_registry: McpRegistry,
+    ) -> io::Result<Self> {
         let cwd = config
             .cwd
             .clone()
@@ -265,7 +275,6 @@ impl InteractiveSession {
         let store = SessionStore::new();
         let instructions = instructions::load_for_cwd_or_default(&cwd);
         let memory = memory::load_for_cwd(&cwd);
-        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
         let hooks = HookRunner::new(config.hooks.clone());
         let system_prompt = agent_common::build_agent_system_prompt(
             &cwd,

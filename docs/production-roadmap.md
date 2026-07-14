@@ -3,9 +3,32 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-13
-Current baseline: v0.2.21 gives a DeepSeek turn that ends without visible
-content or a tool call one bounded semantic recovery request. A request-local
+Last updated: 2026-07-15
+Current baseline: v0.2.23 gives the TUI native-feeling mouse text
+interaction. Left-drag selects transcript text with a theme-aware,
+foreground-preserving highlight; release copies through OSC 52 (plus
+`pbcopy` on macOS) with a transient status-line notice. Selections anchor in
+content space so streaming and scrolling never shift them; extraction
+restores whitespace dropped at soft wraps while keeping hard-split words
+unbroken, and counts display width for CJK. Double-click selects and copies
+the word under the cursor, dragging onto the first/last transcript row keeps
+auto-scrolling from the animation tick while the pointer sits still, and a
+floating `Jump to bottom` pill re-arms auto-follow on click.
+
+Earlier v0.2.22 replaces the synchronous TUI-only `@file` index with
+an owned streaming `orca-file-search` subsystem. It supports canonical
+multi-root browse/fuzzy search, exclude and Git-ignore controls, million-path
+bounded latency/memory gates, Codex-compatible app-server `fuzzyFileSearch/*`
+sessions, and thread-bound `mention/search/*` sessions. Files, Skills,
+Plugins, MCP Resources, and Resource Templates now share typed candidates and
+stable target identities. TUI and app-server submissions carry atomic
+bindings, rebase them across preceding edits, invalidate them on overlapping
+edits, and revalidate/expand the exact selected target through the active
+workspace and MCP registry. Legacy `@file` and `$skill` input remains
+compatible.
+
+Earlier v0.2.21 gives a DeepSeek turn that ends without visible content or a
+tool call one bounded semantic recovery request. A request-local
 instruction changes the retry without mutating conversation history, preserves
 the preceding valid tool-call/tool-result boundary, and keeps reasoning-only
 responses invalid. Streaming recovery suppresses reasoning already shown by the
@@ -34,7 +57,7 @@ second time. Detached completions and approved continuations apply exact usage
 deltas, while synchronized Goal-store mutations prevent concurrent updates from
 overwriting each other. Historical cache-inflated Goal values are not migrated
 automatically.
-Next-release candidate (v0.2.22): the local integration branch now closes every
+Next-release candidate (v0.2.24): the local integration branch now closes every
 accepted tool call with one truthful terminal, repairs incomplete historical
 calls without replay, bounds process output and tool-facing file admission,
 and gives ordinary tools, MCP servers, workflows, async subagents, verifier
@@ -42,11 +65,11 @@ commands, and server shells an explicit cleanup or reaper owner. Recovered
 workers are identity-checked before signaling, server shutdown is bounded and
 two-phase, and internal worker API keys use a bounded anonymous stdin pipe
 instead of argv or workflow records. The candidate has passed local workspace,
-Clippy, site, and release-script gates but is not part of the published v0.2.21
+Clippy, site, and release-script gates but is not part of the published v0.2.23
 baseline; live-provider and post-publish verification remain pending.
-Known follow-up areas include Windows descendant-tree parity, a bounded MCP
-response channel, total WorkflowHost deadline and event limits, and managed
-network-proxy connection and I/O limits.
+Known follow-up areas include Windows descendant-tree parity, a total
+WorkflowHost deadline, and a managed-network-proxy connection ceiling with
+unified connection-worker ownership.
 Earlier v0.2.20 makes the TUI
 resilient to long interactive content: large pastes remain compact before and
 after submission, Goal and plan surfaces truncate by display width, approval
@@ -426,22 +449,23 @@ working baseline used to prioritize the next patch releases.
 |------|--------------------|------------------------|--------|
 | Tool registry | Built-ins, MCP tools, and TOML external tools share `ToolSpec` metadata; runtime argument validation covers common object keywords plus `oneOf` / `anyOf` composition | Codex-style spec/capability registry | Implemented |
 | Tool approval | Action kind is derived from tool capabilities, with TOML allow/deny rules | Capability/policy driven approvals | Implemented |
-| File discovery | `glob` is model-facing with normal glob patterns plus `mode: "fuzzy"` path queries; `list_files` remains a compatibility alias | Claude `Glob`, Codex file search | Implemented |
+| File discovery | `glob` remains model-facing; interactive discovery now uses multi-root streaming `orca-file-search` with browse/fuzzy modes, exclude/Git-ignore controls, owned cancellation, million-path acceptance gates, and Codex-compatible app-server sessions | Claude `Glob`, Codex file search | Implemented |
+| Mention system | Files, Skills, Plugins, MCP Resources, and Resource Templates share one typed candidate model in TUI and thread-bound app-server search; visible tokens carry hidden atomic targets that survive preceding edits, invalidate on overlap, and expand against the selected root/registry | Codex atomic structured input and unified mentions; Claude resource/file typeahead | Implemented |
 | Shell execution | `bash` and server shell ops route through a runtime shell-session manager with task ids, stdin, kill, nonblocking incremental reads, optional Unix PTY mode, PTY resize, stdout/stderr collection, macOS Seatbelt path, configurable timeout, and observable requested/effective terminal modes with pipe fallback where PTY is unavailable | Codex `exec_command` sessions, PTY, stdin, timeout | Seeded; richer shell controls still open |
 | Context management | BPE token counting, local compaction, persisted collapse/summary records | Multi-level local/remote compaction | Partial |
-| Tool output control | Runtime task output uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output. The v0.2.22 candidate additionally caps ordinary child stdout/stderr at 1 MiB per stream before final tool-result truncation, preserves omission metadata, and bounds regular-file reads, exact edits, and committed TUI diff previews at admission | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial; v0.2.22 candidate integrated locally, persistent offset polling remains open |
+| Tool output control | Runtime task output uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output. The v0.2.24 candidate additionally caps ordinary child stdout/stderr at 1 MiB per stream before final tool-result truncation, preserves omission metadata, and bounds regular-file reads, exact edits, and committed TUI diff previews at admission | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial; v0.2.24 candidate integrated locally, persistent offset polling remains open |
 | Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |
-| MCP | stdio/SSE config surface, tool routing, read-only resource list/read/template tools, and v0.2.22 candidate timeout/cancel/error/drop cleanup with stdio process reaping | Codex MCP client/server ecosystem | Partial; v0.2.22 candidate integrated locally, and the response channel remains unbounded |
+| MCP | stdio/SSE config surface, tool routing, read-only resource list/read/template tools, unified Mention discovery, same-registry Resource expansion, and v0.2.24 candidate timeout/cancel/error/drop cleanup with bounded stdio response framing and process reaping | Codex MCP client/server ecosystem | Partial; resource/tool/Mention integration and lifecycle hardening seeded |
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state, cumulative active-Goal timing, metadata-preserving atomic resume, plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented; runtime orchestration still open |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
-| Runtime lifecycle | Headless, server-mode, and TUI agent runs now seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` groups runtime-owned interactive session state with lifecycle state, and server-mode `ServerThread`, the headless controller, and the TUI conversation-session wrapper keep long-lived agent state behind it; workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`. The v0.2.22 candidate closes accepted tool calls with truthful terminal metadata and gives external tools, MCP/workflow children, async subagents, verifier commands, server turns, and ordinary shells explicit cleanup or reaper ownership; recovered workers require identity checks, and internal worker credentials no longer use argv or persisted workflow records | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; v0.2.22 candidate integrated locally, with Windows process-tree parity and deeper TUI loop delegation still open |
-| TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, per-turn timers plus cumulative active-Goal timing, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
+| Runtime lifecycle | Headless, server-mode, and TUI agent runs seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` owns long-lived interactive state, and focused server processors/managers handle queries, turn control, shell and command execution, permission/user-input responses, and submit operations. Workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`. The v0.2.24 candidate closes accepted tool calls with truthful terminal metadata and gives external tools, MCP/workflow children, async subagents, verifier commands, server turns, ordinary shells, and mention-search reapers explicit cleanup ownership; recovered workers require identity checks, and internal worker credentials no longer use argv or persisted workflow records | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; v0.2.24 candidate integrated locally, with Windows process-tree parity and deeper TUI loop delegation still open |
+| TUI | Markdown-ish rendering, themes, Vim mode, bounded committed diff previews, slash commands, atomic unified mentions, workflow panel, per-turn timers plus cumulative active-Goal timing, truthful interrupted/indeterminate tool rows, mouse text selection with OSC 52 clipboard copy, double-click word copy, edge auto-scroll, and a jump-to-bottom control | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary; resume normalization drops legacy reasoning-only assistant turns before provider replay | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
-| Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
+| Skills | Markdown discovery, `list_skills`/`read_skill`, explicit `$skill` injection, and atomic unified Mention candidates across runtime workspace roots | Codex skills and plugin-provided skill bundles | Implemented for discovery/injection; plugin tool bundles remain open |
 
 ---
 
@@ -941,7 +965,10 @@ server accepts the original `{"op":"submit"}` wire shape plus Codex-style
 `thread/start` and `turn/start` method requests for the first app-server-shaped
 thread/turn lifecycle entry points. Server-mode `turn/start` now parses
 `params.threadId` and rejects unknown in-process thread ids, while persistent
-ThreadStore-backed materialization remains a follow-up.
+ThreadStore-backed materialization remains a follow-up. The current development
+baseline also exposes multi-root `fuzzyFileSearch/sessionStart|Update|Stop`,
+thread-bound `mention/search/start|update|stop`, streamed candidate targets,
+and structured atomic Mention input on `turn/start`.
 
 **Goal:** introduce a runtime protocol boundary so TUI/headless clients can send
 commands and consume versioned events without owning turn execution details.

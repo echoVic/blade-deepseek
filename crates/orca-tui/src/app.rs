@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,13 +25,17 @@ use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
-use crate::composer_textarea::{make_setup_textarea, make_textarea};
+use crate::clipboard;
+use crate::composer_textarea::{
+    make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
+};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::input_event_actions::{
     BatchedInputEvent, coalesce_input_events, handle_mouse_event, handle_paste_event,
     handle_scroll_lines,
 };
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
+use crate::mention_search_manager::MentionSearchManager;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
@@ -81,6 +86,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
     let (action_tx, action_rx) = mpsc::channel::<UserAction>();
+    let (mention_registry_tx, mention_registry_rx) = mpsc::sync_channel(1);
+    let mut mention_search =
+        MentionSearchManager::new_roots(mention_search_roots(&config), event_tx.clone());
     let pending_workflow_notifications: bridge::PendingWorkflowNotifications =
         bridge::PendingWorkflowNotifications::new();
 
@@ -178,15 +186,19 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let cancel_token = CancelToken::new();
     let agent_cancel = cancel_token.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
+    let agent_mcp_configs = config.mcp_servers.clone();
 
     let _agent_handle = std::thread::spawn(move || {
-        agent_loop_thread(
+        let agent_mcp_registry = orca_mcp::initialize_registry(&agent_mcp_configs);
+        let _ = mention_registry_tx.send(agent_mcp_registry.clone());
+        agent_loop_thread_with_registry(
             agent_config,
             agent_preloaded,
             agent_event_tx,
             action_rx,
             agent_cancel,
             agent_workflow_notifications,
+            agent_mcp_registry,
         );
     });
 
@@ -222,9 +234,24 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     'main: loop {
         let now = Instant::now();
-        let animation_active = state.status == AppStatus::Running;
+        if let Ok(registry) = mention_registry_rx.try_recv() {
+            mention_search.install_registry(registry);
+        }
+        // The copy notice and edge-drag auto-scroll count as animation so the
+        // idle loop keeps drawing frames: the notice until it expires (expiry
+        // clears it while THIS iteration still counts as animating, so
+        // `did_animate` marks the frame dirty and the final redraw removes it
+        // from the screen), and the edge drag so scrolling continues while the
+        // pointer sits still on the transcript's first/last row.
+        let animation_active = state.status == AppStatus::Running
+            || state.copy_notice.is_some()
+            || state.drag_edge_scroll.is_some();
+        if state.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
+            state.copy_notice = None;
+        }
         if animation_active && scheduler.animation_due(now) {
             state.advance_tick();
+            state.apply_drag_edge_scroll();
             scheduler.did_animate(now);
         }
 
@@ -292,24 +319,47 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             }
                         }
                     },
-                    IterationEvent::Runtime(tui_event) => {
-                        handle_runtime_event(
-                            tui_event,
-                            &mut state,
-                            &action_tx,
-                            &pending_workflow_notifications,
-                            &mut textarea,
-                            &mut vim_state,
-                            &theme,
-                        );
-                    }
+                    IterationEvent::Runtime(tui_event) => match tui_event {
+                        TuiEvent::MentionSearchDirty { generation } => {
+                            let text = textarea_text(&textarea);
+                            let cursor = textarea_cursor_byte_index(&textarea);
+                            mention_search
+                                .consume_dirty_at_cursor(generation, &text, cursor, &mut state);
+                        }
+                        TuiEvent::MentionCatalogDirty { generation } => {
+                            mention_search.consume_catalog_dirty(generation, &mut state);
+                        }
+                        tui_event => {
+                            handle_runtime_event(
+                                tui_event,
+                                &mut state,
+                                &action_tx,
+                                &pending_workflow_notifications,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                            );
+                        }
+                    },
                 }
                 Ok(None)
             },
         )?;
+        let mention_enabled = MentionSearchManager::is_enabled(&state);
+        mention_search.set_roots(mention_search_roots(&config), &mut state);
+        let text = textarea_text(&textarea);
+        let cursor = textarea_cursor_byte_index(&textarea);
+        state.mention_bindings.reconcile(&text);
+        mention_search.sync_at_cursor(&text, cursor, mention_enabled, &mut state, Instant::now());
         if let Some(code) = iteration.exit_code {
             exit_code = code;
             break 'main;
+        }
+        // A finished drag staged its text here; write it out via OSC 52 (plus
+        // pbcopy on macOS). The escape sequence is invisible to the UI, so no
+        // redraw coordination is needed.
+        if let Some(text) = state.pending_clipboard_copy.take() {
+            clipboard::copy_to_clipboard(&text);
         }
         if let Some(draw_at) = iteration.draw_at {
             terminal.draw(|f| ui::render(f, &mut state, &textarea, &theme))?;
@@ -322,8 +372,25 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     // Leave the cursor on a fresh line below the final frame so the shell prompt returns cleanly.
     drop(terminal);
     terminal_cleanup.finish();
+    mention_search.shutdown();
 
     Ok(exit_code)
+}
+
+fn mention_search_roots(config: &RunConfig) -> Vec<PathBuf> {
+    config
+        .runtime_workspace_roots
+        .as_ref()
+        .filter(|roots| !roots.is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            vec![
+                config
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+            ]
+        })
 }
 
 fn shorten_home(path: &str) -> String {
@@ -991,7 +1058,7 @@ mod tests {
         unsafe {
             std::env::set_var("ORCA_HOME", home.path());
         }
-        let result = f(home.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(home.path())));
         unsafe {
             if let Some(previous) = previous {
                 std::env::set_var("ORCA_HOME", previous);
@@ -999,7 +1066,10 @@ mod tests {
                 std::env::remove_var("ORCA_HOME");
             }
         }
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     #[test]
@@ -2152,8 +2222,10 @@ mod tests {
 
     #[test]
     fn backgrounded_agent_loop_notifies_approval_required_in_user_language() {
-        with_orca_home(|_| {
-            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+        with_orca_home(|home| {
+            let mut cfg = test_config(HistoryMode::Record);
+            cfg.cwd = Some(home.to_path_buf());
+            let config = Arc::new(Mutex::new(cfg));
             let preloaded = Arc::new(Mutex::new(None));
             let (event_tx, event_rx) = mpsc::channel();
             let (action_tx, action_rx) = mpsc::channel();
@@ -3000,7 +3072,8 @@ mod tests {
 
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::Submit(prompt)) if prompt == pasted.trim()
+            Ok(UserAction::SubmitWithMentions { prompt, bindings })
+                if prompt == pasted.trim() && bindings.is_empty()
         ));
         assert!(state.pending_pastes.is_empty());
         assert!(textarea_text(&textarea).is_empty());
@@ -3009,6 +3082,64 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::User(display)) if display.starts_with("[Pasted Content ")
         ));
+    }
+
+    #[test]
+    fn large_paste_rebases_atomic_mention_binding_before_submit() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::channel();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea = make_textarea(&vim_state, &theme);
+        let pasted = "long line\n".repeat(120);
+        let mention = "@same.txt";
+
+        assert!(insert_composer_paste(
+            &mut textarea,
+            &mut state.pending_pastes,
+            &pasted,
+        ));
+        assert!(textarea.insert_str(&format!(" review {mention}")));
+
+        let visible_prompt = textarea_text(&textarea);
+        let mention_start = visible_prompt.find(mention).expect("visible mention");
+        state.mention_bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+            &visible_prompt,
+            vec![orca_runtime::mentions::MentionBinding {
+                start: mention_start,
+                end: mention_start + mention.len(),
+                visible: mention.to_string(),
+                target: orca_runtime::mentions::MentionTarget::File {
+                    root: PathBuf::from("/workspace/backend"),
+                    path: "same.txt".to_string(),
+                    kind: orca_runtime::mentions::MentionFileKind::File,
+                },
+            }],
+        );
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+        ));
+
+        let action = action_rx.try_recv().expect("submit action");
+        let UserAction::SubmitWithMentions { prompt, bindings } = action else {
+            panic!("expected mention-aware submit");
+        };
+        assert_eq!(prompt, format!("{pasted} review {mention}"));
+        assert_eq!(bindings.bindings().len(), 1);
+        let binding = &bindings.bindings()[0];
+        let rebased_start = prompt.find(mention).expect("expanded mention");
+        assert_eq!(binding.start, rebased_start);
+        assert_eq!(binding.end, rebased_start + mention.len());
+        assert_eq!(binding.visible, mention);
     }
 
     #[test]
@@ -3051,6 +3182,56 @@ mod tests {
                 .is_some_and(|output| output.contains("Inspect external state before retrying"))
         );
     }
+
+    #[test]
+    fn idle_submit_carries_atomic_mention_bindings() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::channel();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let prompt = "review @same.txt";
+        let mut textarea = make_textarea_with_text(prompt, &vim_state, &theme);
+        state.mention_bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+            prompt,
+            vec![orca_runtime::mentions::MentionBinding {
+                start: 7,
+                end: prompt.len(),
+                visible: "@same.txt".to_string(),
+                target: orca_runtime::mentions::MentionTarget::File {
+                    root: PathBuf::from("/workspace/backend"),
+                    path: "same.txt".to_string(),
+                    kind: orca_runtime::mentions::MentionFileKind::File,
+                },
+            }],
+        );
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+        ));
+
+        let action = action_rx.try_recv().expect("submit action");
+        let UserAction::SubmitWithMentions { prompt, bindings } = action else {
+            panic!("expected mention-aware submit");
+        };
+        assert_eq!(prompt, "review @same.txt");
+        assert_eq!(bindings.bindings().len(), 1);
+        assert_eq!(
+            bindings.bindings()[0].target,
+            orca_runtime::mentions::MentionTarget::File {
+                root: PathBuf::from("/workspace/backend"),
+                path: "same.txt".to_string(),
+                kind: orca_runtime::mentions::MentionFileKind::File,
+            }
+        );
+    }
 }
 
 fn ensure_tui_session(
@@ -3059,14 +3240,16 @@ fn ensure_tui_session(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     prompt_for_title: &str,
     event_tx: &mpsc::Sender<TuiEvent>,
+    mcp_registry: &orca_mcp::McpRegistry,
 ) -> Option<String> {
     if session.is_none() {
         let cfg = config.lock().unwrap().clone();
         let transcript = preloaded.lock().unwrap().take();
-        *session = match bridge::TuiConversationSession::new_with_preloaded(
+        *session = match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
             &cfg,
             prompt_for_title,
             transcript,
+            mcp_registry.clone(),
         ) {
             Ok(session) => Some(session),
             Err(error) => {
@@ -3343,6 +3526,7 @@ fn run_goal_turns_for_tui(
     }
 }
 
+#[cfg(test)]
 fn resume_latest_active_goal_for_tui(
     session: &mut Option<bridge::TuiConversationSession>,
     config: &Arc<Mutex<RunConfig>>,
@@ -3352,6 +3536,32 @@ fn resume_latest_active_goal_for_tui(
     pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+) {
+    let registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
+    resume_latest_active_goal_for_tui_with_registry(
+        session,
+        config,
+        preloaded,
+        event_tx,
+        action_rx,
+        pending_actions,
+        cancel,
+        pending_workflow_notifications,
+        &registry,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_latest_active_goal_for_tui_with_registry(
+    session: &mut Option<bridge::TuiConversationSession>,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    action_rx: &mpsc::Receiver<UserAction>,
+    pending_actions: &RefCell<VecDeque<UserAction>>,
+    cancel: &CancelToken,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    mcp_registry: &orca_mcp::McpRegistry,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         let _ = event_tx.send(TuiEvent::Error(
@@ -3388,10 +3598,11 @@ fn resume_latest_active_goal_for_tui(
     let mut cfg = config.lock().unwrap().clone();
     cfg.history_mode = HistoryMode::Resume(goal.session_id.clone());
 
-    let resumed = match bridge::TuiConversationSession::new_with_preloaded(
+    let resumed = match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
         &cfg,
         &goal.objective,
         Some(transcript),
+        mcp_registry.clone(),
     ) {
         Ok(session) => session,
         Err(error) => {
@@ -3476,6 +3687,7 @@ fn handle_submitted_turn_for_tui(
     pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    mcp_registry: &orca_mcp::McpRegistry,
 ) {
     cancel.reset();
     let cfg = config.lock().unwrap().clone();
@@ -3483,31 +3695,46 @@ fn handle_submitted_turn_for_tui(
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let prompt = match submitted_turn.prompt_for_model(&cwd) {
+    if session.is_none() {
+        let transcript = preloaded.lock().unwrap().take();
+        let title_seed = submitted_turn.title_seed(submitted_turn.prompt());
+        *session = match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
+            &cfg,
+            &title_seed,
+            transcript,
+            mcp_registry.clone(),
+        ) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "failed to initialize conversation history: {error}"
+                )));
+                return;
+            }
+        };
+        if let Some(session) = session.as_ref() {
+            notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
+        }
+    }
+    let workspace_roots = cfg
+        .runtime_workspace_roots
+        .clone()
+        .filter(|roots| !roots.is_empty())
+        .unwrap_or_else(|| vec![cwd.clone()]);
+    let prompt = match submitted_turn.prompt_for_model(
+        &cwd,
+        &workspace_roots,
+        session
+            .as_ref()
+            .expect("session initialized")
+            .mcp_registry(),
+    ) {
         Ok(prompt) => prompt,
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error));
             return;
         }
     };
-    if session.is_none() {
-        let transcript = preloaded.lock().unwrap().take();
-        let title_seed = submitted_turn.title_seed(&prompt);
-        *session =
-            match bridge::TuiConversationSession::new_with_preloaded(&cfg, &title_seed, transcript)
-            {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    let _ = event_tx.send(TuiEvent::Error(format!(
-                        "failed to initialize conversation history: {error}"
-                    )));
-                    return;
-                }
-            };
-        if let Some(session) = session.as_ref() {
-            notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
-        }
-    }
     if let Some(session) = session.as_mut() {
         for context in pending_pinned_context.drain(..) {
             session.add_pinned_context(context);
@@ -3529,6 +3756,7 @@ fn handle_submitted_turn_for_tui(
     }
 }
 
+#[cfg(test)]
 fn agent_loop_thread(
     config: Arc<Mutex<RunConfig>>,
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
@@ -3536,6 +3764,27 @@ fn agent_loop_thread(
     action_rx: mpsc::Receiver<UserAction>,
     cancel: CancelToken,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+) {
+    let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
+    agent_loop_thread_with_registry(
+        config,
+        preloaded,
+        event_tx,
+        action_rx,
+        cancel,
+        pending_workflow_notifications,
+        mcp_registry,
+    );
+}
+
+fn agent_loop_thread_with_registry(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    cancel: CancelToken,
+    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+    mcp_registry: orca_mcp::McpRegistry,
 ) {
     let mut session: Option<bridge::TuiConversationSession> = None;
     let mut pending_pinned_context: Vec<String> = Vec::new();
@@ -3555,6 +3804,22 @@ fn agent_loop_thread(
                     &pending_actions,
                     &cancel,
                     &pending_workflow_notifications,
+                    &mcp_registry,
+                );
+            }
+            Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
+                handle_submitted_turn_for_tui(
+                    SubmittedTurn::user_with_mentions(prompt, bindings),
+                    &config,
+                    &preloaded,
+                    &mut session,
+                    &mut pending_pinned_context,
+                    &event_tx,
+                    &action_rx,
+                    &pending_actions,
+                    &cancel,
+                    &pending_workflow_notifications,
+                    &mcp_registry,
                 );
             }
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
@@ -3569,6 +3834,7 @@ fn agent_loop_thread(
                     &pending_actions,
                     &cancel,
                     &pending_workflow_notifications,
+                    &mcp_registry,
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
@@ -3577,17 +3843,21 @@ fn agent_loop_thread(
                 if session.is_none() {
                     let prompt = format!("Run saved workflow `{name}`");
                     let transcript = preloaded.lock().unwrap().take();
-                    session = match bridge::TuiConversationSession::new_with_preloaded(
-                        &cfg, &prompt, transcript,
-                    ) {
-                        Ok(session) => Some(session),
-                        Err(error) => {
-                            let _ = event_tx.send(TuiEvent::Error(format!(
-                                "failed to initialize conversation history: {error}"
-                            )));
-                            continue;
-                        }
-                    };
+                    session =
+                        match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
+                            &cfg,
+                            &prompt,
+                            transcript,
+                            mcp_registry.clone(),
+                        ) {
+                            Ok(session) => Some(session),
+                            Err(error) => {
+                                let _ = event_tx.send(TuiEvent::Error(format!(
+                                    "failed to initialize conversation history: {error}"
+                                )));
+                                continue;
+                            }
+                        };
                     if let Some(session) = session.as_ref() {
                         notify_recovered_background_approvals_for_tui(
                             session.task_registry(),
@@ -3753,9 +4023,14 @@ fn agent_loop_thread(
                 }
             }
             Ok(UserAction::GoalSet(objective)) => {
-                let Some(session_id) =
-                    ensure_tui_session(&mut session, &config, &preloaded, &objective, &event_tx)
-                else {
+                let Some(session_id) = ensure_tui_session(
+                    &mut session,
+                    &config,
+                    &preloaded,
+                    &objective,
+                    &event_tx,
+                    &mcp_registry,
+                ) else {
                     continue;
                 };
                 let mut store = orca_runtime::goals::GoalStore::load_default();
@@ -3849,7 +4124,7 @@ fn agent_loop_thread(
             }
             Ok(UserAction::GoalResume) => {
                 let Some(session_id) = current_goal_session_id(session.as_ref(), &preloaded) else {
-                    resume_latest_active_goal_for_tui(
+                    resume_latest_active_goal_for_tui_with_registry(
                         &mut session,
                         &config,
                         &preloaded,
@@ -3858,6 +4133,7 @@ fn agent_loop_thread(
                         &pending_actions,
                         &cancel,
                         &pending_workflow_notifications,
+                        &mcp_registry,
                     );
                     continue;
                 };

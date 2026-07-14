@@ -4,8 +4,10 @@ use tui_textarea::{Input, TextArea};
 use orca_core::config::RunConfig;
 use orca_runtime::mentions;
 
-use crate::composer_textarea::{make_textarea_with_text, textarea_text};
-use crate::mention_menu_actions::update_mention_candidates;
+use crate::composer_textarea::{
+    make_textarea_with_text, make_textarea_with_text_at_cursor, textarea_cursor_byte_index,
+    textarea_text,
+};
 use crate::slash_menu_actions::update_slash_menu;
 use crate::theme::Theme;
 use crate::types::AppState;
@@ -13,7 +15,6 @@ use crate::vim::VimState;
 
 pub(crate) fn refresh_input_menus(textarea: &TextArea, state: &mut AppState, config: &RunConfig) {
     update_slash_menu(textarea, state, config);
-    update_mention_candidates(textarea, state, config);
 }
 
 pub(crate) fn insert_composer_newline(textarea: &mut TextArea, state: &mut AppState) {
@@ -64,13 +65,30 @@ pub(crate) fn apply_composer_key_input(
     theme: &Theme,
 ) -> bool {
     let changed = if key.code == KeyCode::Tab {
-        let cwd = config
-            .cwd
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let text = textarea_text(textarea);
-        if let Some(completed) = mentions::complete_file_mention(&text, &cwd) {
-            *textarea = make_textarea_with_text(&completed, vim_state, theme);
+        let cursor = textarea_cursor_byte_index(textarea);
+        let candidates = state
+            .mention
+            .candidates
+            .iter()
+            .map(|candidate| candidate.display.clone())
+            .collect::<Vec<_>>();
+        let token_is_current =
+            mentions::mention_token_at_cursor(&text, cursor).is_some_and(|token| {
+                state.mention.pending_query.as_deref() == Some(token.query.as_str())
+            });
+        if let Some(edit) = token_is_current
+            .then(|| {
+                mentions::complete_file_mention_from_candidates_at_cursor(
+                    &text,
+                    cursor,
+                    &candidates,
+                )
+            })
+            .flatten()
+        {
+            *textarea =
+                make_textarea_with_text_at_cursor(&edit.text, edit.cursor, vim_state, theme);
             true
         } else {
             textarea.input(Input::from(ev.clone()))

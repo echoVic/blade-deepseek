@@ -138,6 +138,7 @@ async function stagePlatformPackage(target, version, artifactsDir, stageRoot) {
   });
 
   await cp(path.join(repoRoot, "README.md"), path.join(packageDir, "README.md"));
+  copyFileSync(path.join(repoRoot, "LICENSE"), path.join(packageDir, "LICENSE"));
   return packageDir;
 }
 
@@ -145,6 +146,7 @@ async function stageMainPackage(version, stageRoot) {
   const packageDir = path.join(stageRoot, "orca");
   await cp(path.join(repoRoot, "npm", "orca"), packageDir, { recursive: true });
   await cp(path.join(repoRoot, "README.md"), path.join(packageDir, "README.md"));
+  copyFileSync(path.join(repoRoot, "LICENSE"), path.join(packageDir, "LICENSE"));
 
   const packageJsonPath = path.join(packageDir, "package.json");
   const packageJson = readJson(packageJsonPath);

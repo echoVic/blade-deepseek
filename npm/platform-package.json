@@ -3,7 +3,8 @@
   "homepage": "https://orcaagent.dev/",
   "files": [
     "vendor",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",

@@ -6,7 +6,8 @@ mod processors;
 
 use super::*;
 use processors::{
-    command_exec, mcp_elicitation, permission, shell, submit, thread, turn, user_input,
+    command_exec, fuzzy_file_search, mcp_elicitation, mention_search, permission, shell, submit,
+    thread, turn, user_input,
 };
 
 pub(super) fn dispatch_submission<W: Write + Send + 'static>(
@@ -56,6 +57,24 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
         );
     }
 
+    if fuzzy_file_search::is_fuzzy_file_search_operation(&submission.op) {
+        return fuzzy_file_search::dispatch_fuzzy_file_search_operation(
+            state,
+            &submission.op,
+            submission.id.clone(),
+            writer,
+        );
+    }
+
+    if mention_search::is_mention_search_operation(&submission.op) {
+        return mention_search::dispatch_mention_search_operation(
+            state,
+            &submission.op,
+            submission.id.clone(),
+            writer,
+        );
+    }
+
     if permission::is_permission_operation(&submission.op) {
         let mut writer = writer.lock().map_err(lock_error)?;
         return permission::dispatch_permission_operation(
@@ -98,6 +117,6 @@ pub(super) fn dispatch_submission<W: Write + Send + 'static>(
     }
 
     unreachable!(
-        "thread query, turn control, shell, command exec, permission, user input, MCP elicitation, and submit operations are delegated before router dispatch"
+        "thread query, turn control, shell, command exec, file search, mention search, permission, user input, MCP elicitation, and submit operations are delegated before router dispatch"
     )
 }

@@ -1,5 +1,7 @@
 pub(super) mod command_exec;
+pub(super) mod fuzzy_file_search;
 pub(super) mod mcp_elicitation;
+pub(super) mod mention_search;
 pub(super) mod permission;
 pub(super) mod shell;
 pub(super) mod submit;

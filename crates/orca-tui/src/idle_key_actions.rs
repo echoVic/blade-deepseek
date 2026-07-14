@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
@@ -47,8 +47,9 @@ pub(crate) fn handle_idle_key(
         return;
     }
 
-    if !state.mention_candidates.is_empty()
-        && handle_mention_menu_key(ev, key, state, config, textarea, vim_state, theme)
+    if (!state.mention.candidates.is_empty()
+        || (state.mention.phase.is_some() && key.code == KeyCode::Esc))
+        && handle_mention_menu_key(ev, key, state, textarea, vim_state, theme)
     {
         return;
     }

@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::tempdir;
@@ -33,6 +33,7 @@ fn workflow_run_command_executes_script() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["status"], "async_launched");
     assert_eq!(value["workflowName"], "audit");
+    wait_for_workflow_terminal_status(temp.path(), None, value["taskId"].as_str().unwrap());
 }
 
 #[test]
@@ -62,6 +63,7 @@ fn workflow_run_named_script_resolves_project_workflow() {
     assert_eq!(output.status.code(), Some(0));
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["workflowName"], "audit");
+    wait_for_workflow_terminal_status(temp.path(), None, value["taskId"].as_str().unwrap());
 }
 
 #[test]
@@ -397,6 +399,11 @@ fn workflow_restart_commands_launch_from_persisted_run_record() {
     let restarted: Value = serde_json::from_slice(&restart_phase.stdout).unwrap();
     assert_eq!(restarted["status"], "async_launched");
     assert_eq!(restarted["workflowName"], "restartable");
+    wait_for_workflow_terminal_status(
+        temp.path(),
+        Some(&home),
+        restarted["taskId"].as_str().unwrap(),
+    );
 }
 
 #[test]
@@ -424,6 +431,7 @@ fn workflow_run_resume_from_run_id_rejects_cross_process_cache_resume() {
     assert_eq!(run.status.code(), Some(0));
     let launched: Value = serde_json::from_slice(&run.stdout).unwrap();
     let run_id = launched["runId"].as_str().unwrap();
+    let task_id = launched["taskId"].as_str().unwrap();
 
     let resume = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())
@@ -448,6 +456,8 @@ fn workflow_run_resume_from_run_id_rejects_cross_process_cache_resume() {
         stderr.contains("only available inside the active Orca session"),
         "unexpected stderr: {stderr}"
     );
+
+    wait_for_workflow_terminal_status(temp.path(), None, task_id);
 }
 
 fn workflow_show(cwd: &std::path::Path, home: Option<&std::path::Path>, task_id: &str) -> Value {
@@ -470,15 +480,24 @@ fn wait_for_workflow_terminal_status(
     home: Option<&std::path::Path>,
     task_id: &str,
 ) {
-    for _ in 0..80 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_status = String::new();
+    loop {
         let shown = workflow_show(cwd, home, task_id);
         let status = shown["status"].as_str().unwrap_or_default();
         if matches!(status, "completed" | "failed" | "stopped" | "cancelled") {
             return;
         }
+        last_status.clear();
+        last_status.push_str(status);
+        if Instant::now() >= deadline {
+            break;
+        }
         thread::sleep(Duration::from_millis(100));
     }
-    panic!("workflow task {task_id} did not reach a terminal state");
+    panic!(
+        "workflow task {task_id} did not reach a terminal state within 60s (last status: {last_status})"
+    );
 }
 
 fn wait_for_workflow_status(
@@ -487,15 +506,24 @@ fn wait_for_workflow_status(
     task_id: &str,
     expected: &str,
 ) {
-    for _ in 0..80 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_status = String::new();
+    loop {
         let shown = workflow_show(cwd, home, task_id);
         let status = shown["status"].as_str().unwrap_or_default();
         if status == expected {
             return;
         }
+        last_status.clear();
+        last_status.push_str(status);
+        if Instant::now() >= deadline {
+            break;
+        }
         thread::sleep(Duration::from_millis(100));
     }
-    panic!("workflow task {task_id} did not reach status {expected}");
+    panic!(
+        "workflow task {task_id} did not reach status {expected} within 60s (last status: {last_status})"
+    );
 }
 
 fn write_sleep_hook_config(home: &std::path::Path, seconds: f32) {

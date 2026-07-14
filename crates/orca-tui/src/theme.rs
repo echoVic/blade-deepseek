@@ -15,6 +15,8 @@ pub struct Theme {
     pub plan_mode: Color,
     pub diff_add: Color,
     pub diff_remove: Color,
+    /// Background for the mouse text selection in the transcript.
+    pub selection_bg: Color,
 }
 
 impl Theme {
@@ -34,6 +36,8 @@ impl Theme {
                 plan_mode: Color::Rgb(64, 170, 170),
                 diff_add: Color::Rgb(47, 177, 112),
                 diff_remove: Color::Rgb(214, 81, 81),
+                // Muted brand blue: keeps every foreground legible.
+                selection_bg: Color::Rgb(46, 62, 132),
             },
             ThemeName::Light => Self {
                 border: Color::Rgb(58, 86, 230),
@@ -47,6 +51,7 @@ impl Theme {
                 plan_mode: Color::Rgb(0, 102, 102),
                 diff_add: Color::Rgb(31, 142, 86),
                 diff_remove: Color::Rgb(196, 52, 52),
+                selection_bg: Color::Rgb(198, 210, 250),
             },
             ThemeName::Solarized => Self {
                 border: Color::Rgb(38, 139, 210),
@@ -60,6 +65,8 @@ impl Theme {
                 plan_mode: Color::Rgb(42, 161, 152),
                 diff_add: Color::Rgb(133, 153, 0),
                 diff_remove: Color::Rgb(220, 50, 47),
+                // base02, Solarized's canonical selection background.
+                selection_bg: Color::Rgb(7, 54, 66),
             },
             ThemeName::Catppuccin => Self {
                 border: Color::Rgb(203, 166, 247),
@@ -73,6 +80,8 @@ impl Theme {
                 plan_mode: Color::Rgb(148, 226, 213),
                 diff_add: Color::Rgb(166, 227, 161),
                 diff_remove: Color::Rgb(243, 139, 168),
+                // surface2 from the Mocha palette.
+                selection_bg: Color::Rgb(88, 91, 112),
             },
         }
     }

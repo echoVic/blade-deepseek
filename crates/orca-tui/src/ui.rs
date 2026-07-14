@@ -14,6 +14,7 @@ use orca_core::task_types::{
     BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
+use orca_file_search::SearchPhase;
 use orca_runtime::history::SessionSummary;
 
 use crate::display_text::{compact_long_text, truncate_to_display_width};
@@ -23,6 +24,9 @@ use crate::transcript_view::viewport_paragraph;
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
+    // Recomputed by render_live_messages when the pill is actually shown;
+    // cleared here so panel switches never leave a stale click target behind.
+    state.jump_to_bottom_area = None;
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
         return;
@@ -84,7 +88,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_slash_menu(frame, chunks[4], state, theme);
     }
 
-    if !state.mention_candidates.is_empty() && state.slash_menu.is_none() {
+    if state.mention.phase.is_some() && state.slash_menu.is_none() {
         render_mention_candidates(frame, chunks[4], state, theme);
     }
 
@@ -402,6 +406,7 @@ pub(crate) fn render_live_messages(
     let width = area.width.max(1) as usize;
     let visible_height = area.height as usize;
     state.reconcile_message_tracking();
+    state.transcript_area = Some(area);
 
     if state.messages.is_empty() {
         let lines = build_welcome_lines(state, theme);
@@ -416,6 +421,7 @@ pub(crate) fn render_live_messages(
         state.total_lines = total;
         state.visible_height = visible_height;
         state.scroll_offset = scroll;
+        state.viewport_base_row = scroll;
         frame.render_widget(
             paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             area,
@@ -453,8 +459,54 @@ pub(crate) fn render_live_messages(
     state.total_lines = viewport.total_height;
     state.visible_height = visible_height;
     state.scroll_offset = viewport.scroll_offset;
+    state.viewport_base_row = viewport.base_row;
 
-    frame.render_widget(viewport_paragraph(viewport.lines), area);
+    // Overlay the mouse selection on the materialized rows; the render cache
+    // itself stays selection-agnostic so highlighting never invalidates it.
+    let lines = match state.selection {
+        Some(selection) => viewport
+            .lines
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, line)| match selection.cols_on_row(viewport.base_row + index) {
+                    Some((col_start, col_end)) => crate::selection::apply_selection_to_line(
+                        line,
+                        col_start,
+                        col_end,
+                        theme.selection_bg,
+                    ),
+                    None => line,
+                },
+            )
+            .collect(),
+        None => viewport.lines,
+    };
+
+    frame.render_widget(viewport_paragraph(lines), area);
+
+    // Floating "jump to bottom" pill, shown while the user has scrolled away
+    // from the tail (auto-follow disarmed). Clicking it re-arms follow.
+    if !state.auto_scroll && viewport.total_height > visible_height && area.height > 0 {
+        let label = " Jump to bottom (click) ↓ ";
+        let pill_width = UnicodeWidthStr::width(label) as u16;
+        if area.width >= pill_width {
+            let pill = Rect {
+                x: area.x + (area.width - pill_width) / 2,
+                y: area.y + area.height - 1,
+                width: pill_width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    label,
+                    Style::default().bg(theme.selection_bg).fg(theme.text),
+                )),
+                pill,
+            );
+            state.jump_to_bottom_area = Some(pill);
+        }
+    }
 }
 
 fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1989,13 +2041,18 @@ fn push_hard_wrapped_segment(
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // The live status dot + elapsed time moved to the activity line above the composer
     // (see `render_activity`); this bottom line is now purely persistent metadata.
-    let line = status_line(state, theme, area.width as usize);
+    let line = status_line(state, theme, area.width as usize, std::time::Instant::now());
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 }
 
-fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+fn status_line(
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+    now: std::time::Instant,
+) -> Line<'static> {
     let mode_prefix = " | mode: ";
     let mode_value = state.approval_mode.as_str();
     let mode_width = UnicodeWidthStr::width(mode_prefix) + UnicodeWidthStr::width(mode_value);
@@ -2028,10 +2085,6 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         Style::default().fg(theme.muted),
     ));
     optional.push(Span::styled(
-        " | shift+drag to copy",
-        Style::default().fg(theme.muted),
-    ));
-    optional.push(Span::styled(
         " | F1/ctrl+k shortcuts",
         Style::default().fg(theme.muted),
     ));
@@ -2041,6 +2094,18 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         if used + span_width <= width {
             used += span_width;
             spans.push(span);
+        }
+    }
+
+    // Transient right-aligned "copied N chars to clipboard" feedback, shown
+    // for a few seconds after a mouse selection lands on the clipboard.
+    if let Some(chars) = state.copy_notice_at(now) {
+        let notice = format!("copied {chars} chars to clipboard");
+        let notice_width = UnicodeWidthStr::width(notice.as_str());
+        // Separate it from the metadata by at least two columns.
+        if used + notice_width + 2 <= width {
+            spans.push(Span::raw(" ".repeat(width - used - notice_width)));
+            spans.push(Span::styled(notice, Style::default().fg(theme.approval)));
         }
     }
     Line::from(spans)
@@ -2236,19 +2301,25 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
 }
 
 fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
-    let candidates = &state.mention_candidates;
-    if candidates.is_empty() {
+    let candidates = &state.mention.candidates;
+    let Some(phase) = &state.mention.phase else {
         return;
-    }
+    };
 
     let visible_count = candidates.len().min(12);
     let max_start = candidates.len().saturating_sub(visible_count);
     let start = state
-        .mention_selected
+        .mention
+        .selected
         .saturating_sub(visible_count.saturating_sub(1))
         .min(max_start);
     let end = (start + visible_count).min(candidates.len());
-    let item_count = visible_count as u16;
+    let status = mention_status_text(
+        phase,
+        state.mention.progress.scanned_paths,
+        candidates.is_empty(),
+    );
+    let item_count = visible_count as u16 + u16::from(status.is_some());
     let height = item_count + 2;
     let width = input_area.width;
     let y = input_area.y.saturating_sub(height);
@@ -2256,36 +2327,78 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
 
     frame.render_widget(Clear, popup_area);
 
-    let lines: Vec<Line> = candidates
+    let mut lines: Vec<Line> = candidates
         .iter()
         .enumerate()
         .skip(start)
         .take(end.saturating_sub(start))
-        .map(|(i, c)| {
-            let prefix = if i == state.mention_selected {
+        .map(|(i, candidate)| {
+            let prefix = if i == state.mention.selected {
                 "▸ "
             } else {
                 "  "
             };
-            let style = if i == state.mention_selected {
+            let style = if i == state.mention.selected {
                 Style::default()
                     .fg(theme.border)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text)
             };
-            Line::from(Span::styled(format!("{prefix}@{c}"), style))
+            let mut spans = vec![Span::styled(format!("{prefix}@"), style)];
+            for (index, ch) in candidate.display.chars().enumerate() {
+                let matched = candidate.indices.binary_search(&(index as u32)).is_ok();
+                let char_style = if matched {
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                };
+                spans.push(Span::styled(ch.to_string(), char_style));
+            }
+            spans.push(Span::styled(
+                format!("  [{}] {}", candidate.kind.label(), candidate.description),
+                Style::default().fg(theme.muted),
+            ));
+            Line::from(spans)
         })
         .collect();
+    if let Some((text, color)) = status {
+        lines.push(Line::from(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(color),
+        )));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Files ")
+        .title(" Mentions ")
         .border_style(Style::default().fg(theme.border));
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+}
+
+fn mention_status_text(
+    phase: &SearchPhase,
+    scanned_paths: usize,
+    candidates_empty: bool,
+) -> Option<(String, Color)> {
+    match phase {
+        SearchPhase::Searching => Some(("Searching files…".to_string(), Color::DarkGray)),
+        SearchPhase::Scanning => {
+            Some((format!("Scanning… {scanned_paths} paths"), Color::DarkGray))
+        }
+        SearchPhase::Refreshing => Some(("Refreshing…".to_string(), Color::DarkGray)),
+        SearchPhase::Complete if candidates_empty => {
+            Some(("No matches".to_string(), Color::DarkGray))
+        }
+        SearchPhase::Complete => None,
+        SearchPhase::Incomplete { .. } => Some(("Search incomplete".to_string(), Color::Red)),
+        SearchPhase::Stopping => Some(("Stopping search…".to_string(), Color::DarkGray)),
+    }
 }
 
 fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -3339,8 +3452,21 @@ mod tests {
         assert!(!rendered.contains("/command-00"));
 
         state.slash_menu = None;
-        state.mention_candidates = (0..20).map(|index| format!("file-{index:02}.rs")).collect();
-        state.mention_selected = 19;
+        state.mention.candidates = (0..20)
+            .map(|index| {
+                orca_runtime::mentions::MentionCandidate::from_file_match(
+                    &orca_file_search::SearchMatch {
+                        root: std::path::PathBuf::from("/workspace"),
+                        path: format!("file-{index:02}.rs"),
+                        kind: orca_file_search::MatchKind::File,
+                        score: 1,
+                        indices: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        state.mention.selected = 19;
+        state.mention.phase = Some(orca_file_search::SearchPhase::Complete);
         terminal
             .draw(|frame| {
                 render_mention_candidates(frame, Rect::new(0, 18, 70, 1), &state, &theme);
@@ -3349,6 +3475,101 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("▸ @file-19.rs"));
         assert!(!rendered.contains("@file-00.rs"));
+    }
+
+    #[test]
+    fn mention_popup_reports_every_streaming_phase() {
+        assert_eq!(
+            mention_status_text(&SearchPhase::Searching, 0, true),
+            Some(("Searching files…".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Scanning, 42, false),
+            Some(("Scanning… 42 paths".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Refreshing, 42, false),
+            Some(("Refreshing…".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Complete, 42, true),
+            Some(("No matches".to_string(), Color::DarkGray))
+        );
+        assert_eq!(
+            mention_status_text(
+                &SearchPhase::Incomplete {
+                    message: "walk failed".to_string(),
+                },
+                42,
+                false,
+            ),
+            Some(("Search incomplete".to_string(), Color::Red))
+        );
+        assert_eq!(
+            mention_status_text(&SearchPhase::Stopping, 42, false),
+            Some(("Stopping search…".to_string(), Color::DarkGray))
+        );
+        assert_eq!(mention_status_text(&SearchPhase::Complete, 42, false), None);
+    }
+
+    #[test]
+    fn mention_popup_highlights_unicode_character_indices() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.mention.candidates = vec![orca_runtime::mentions::MentionCandidate::from_file_match(
+            &orca_file_search::SearchMatch {
+                root: std::path::PathBuf::from("/workspace"),
+                path: "src/你好.rs".to_string(),
+                kind: orca_file_search::MatchKind::File,
+                score: 1,
+                indices: vec![4],
+            },
+        )];
+        state.mention.phase = Some(SearchPhase::Complete);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                render_mention_candidates(frame, Rect::new(0, 5, 20, 1), &state, &theme);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let highlighted = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "你")
+            .unwrap();
+        assert_eq!(highlighted.style().fg, Some(theme.warning));
+    }
+
+    #[test]
+    fn mention_popup_renders_in_a_narrow_terminal() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.mention.candidates = vec![orca_runtime::mentions::MentionCandidate::from_file_match(
+            &orca_file_search::SearchMatch {
+                root: std::path::PathBuf::from("/workspace"),
+                path: "src/a-very-long-file-name.rs".to_string(),
+                kind: orca_file_search::MatchKind::File,
+                score: 1,
+                indices: Vec::new(),
+            },
+        )];
+        state.mention.phase = Some(SearchPhase::Scanning);
+        state.mention.progress.scanned_paths = 10;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 5))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                render_mention_candidates(frame, Rect::new(0, 4, 12, 1), &state, &theme);
+            })
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Mentions"));
     }
 
     #[test]
@@ -3620,17 +3841,86 @@ mod tests {
         state.context_used_tokens = 250;
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let narrow = status_line(&state, &theme, 70).to_string();
+        let narrow = status_line(&state, &theme, 70, std::time::Instant::now()).to_string();
         assert!(narrow.contains("mode: suggest"));
         assert!(narrow.contains("context: 75%"));
         assert!(!narrow.contains("cost:"));
         assert!(!narrow.contains("shortcuts"));
 
-        let wide = status_line(&state, &theme, 180).to_string();
+        let wide = status_line(&state, &theme, 180, std::time::Instant::now()).to_string();
         assert!(wide.contains("tokens:"));
         assert!(wide.contains("cost:"));
-        assert!(wide.contains("shift+drag"));
+        // Drag-to-copy is native now; the old shift+drag hint is gone.
+        assert!(!wide.contains("shift+drag"));
         assert!(wide.contains("shortcuts"));
+    }
+
+    #[test]
+    fn jump_pill_appears_when_scrolled_up_and_leaves_with_follow() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        for index in 0..80 {
+            state
+                .messages
+                .push(ChatMessage::System(format!("line {index}")));
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+        let mut draw = |state: &mut AppState| {
+            terminal
+                .draw(|frame| render(frame, state, &textarea, &theme))
+                .expect("draw");
+            format!("{:?}", terminal.backend().buffer())
+        };
+
+        // Following the tail: no pill.
+        let following = draw(&mut state);
+        assert!(!following.contains("Jump to bottom"));
+        assert_eq!(state.jump_to_bottom_area, None);
+
+        // Scrolled up: the pill appears and registers its click target.
+        state.scroll_up(10);
+        let scrolled = draw(&mut state);
+        assert!(scrolled.contains("Jump to bottom (click) ↓"));
+        assert!(state.jump_to_bottom_area.is_some());
+
+        // Back at the bottom: gone again.
+        state.scroll_to_bottom();
+        let back = draw(&mut state);
+        assert!(!back.contains("Jump to bottom"));
+        assert_eq!(state.jump_to_bottom_area, None);
+    }
+
+    #[test]
+    fn copy_notice_shows_right_aligned_and_expires() {
+        let mut state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let staged_at = std::time::Instant::now();
+        state.stage_clipboard_copy("hello".to_string(), staged_at);
+        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello"));
+
+        // Fresh: the notice is appended, padded to the right edge.
+        let line = status_line(&state, &theme, 120, staged_at);
+        let text = line.to_string();
+        assert!(text.contains("copied 5 chars to clipboard"));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()),
+            120,
+            "notice must be padded flush to the right edge"
+        );
+
+        // Too narrow to fit: silently omitted, metadata untouched.
+        let narrow = status_line(&state, &theme, 40, staged_at).to_string();
+        assert!(!narrow.contains("copied"));
+
+        // Expired: gone again.
+        let later = staged_at + crate::types::AppState::COPY_NOTICE_TTL;
+        assert!(
+            !status_line(&state, &theme, 120, later)
+                .to_string()
+                .contains("copied")
+        );
     }
 
     #[test]
