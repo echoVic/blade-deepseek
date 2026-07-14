@@ -3,9 +3,21 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-13
-Current baseline: v0.2.21 gives a DeepSeek turn that ends without visible
-content or a tool call one bounded semantic recovery request. A request-local
+Last updated: 2026-07-14
+Current baseline: v0.2.22 replaces the synchronous TUI-only `@file` index with
+an owned streaming `orca-file-search` subsystem. It supports canonical
+multi-root browse/fuzzy search, exclude and Git-ignore controls, million-path
+bounded latency/memory gates, Codex-compatible app-server `fuzzyFileSearch/*`
+sessions, and thread-bound `mention/search/*` sessions. Files, Skills,
+Plugins, MCP Resources, and Resource Templates now share typed candidates and
+stable target identities. TUI and app-server submissions carry atomic
+bindings, rebase them across preceding edits, invalidate them on overlapping
+edits, and revalidate/expand the exact selected target through the active
+workspace and MCP registry. Legacy `@file` and `$skill` input remains
+compatible.
+
+Earlier v0.2.21 gives a DeepSeek turn that ends without visible content or a
+tool call one bounded semantic recovery request. A request-local
 instruction changes the retry without mutating conversation history, preserves
 the preceding valid tool-call/tool-result boundary, and keeps reasoning-only
 responses invalid. Streaming recovery suppresses reasoning already shown by the
@@ -413,12 +425,13 @@ working baseline used to prioritize the next patch releases.
 |------|--------------------|------------------------|--------|
 | Tool registry | Built-ins, MCP tools, and TOML external tools share `ToolSpec` metadata; runtime argument validation covers common object keywords plus `oneOf` / `anyOf` composition | Codex-style spec/capability registry | Implemented |
 | Tool approval | Action kind is derived from tool capabilities, with TOML allow/deny rules | Capability/policy driven approvals | Implemented |
-| File discovery | `glob` is model-facing with normal glob patterns plus `mode: "fuzzy"` path queries; `list_files` remains a compatibility alias | Claude `Glob`, Codex file search | Implemented |
+| File discovery | `glob` remains model-facing; interactive discovery now uses multi-root streaming `orca-file-search` with browse/fuzzy modes, exclude/Git-ignore controls, owned cancellation, million-path acceptance gates, and Codex-compatible app-server sessions | Claude `Glob`, Codex file search | Implemented |
+| Mention system | Files, Skills, Plugins, MCP Resources, and Resource Templates share one typed candidate model in TUI and thread-bound app-server search; visible tokens carry hidden atomic targets that survive preceding edits, invalidate on overlap, and expand against the selected root/registry | Codex atomic structured input and unified mentions; Claude resource/file typeahead | Implemented |
 | Shell execution | `bash` and server shell ops route through a runtime shell-session manager with task ids, stdin, kill, nonblocking incremental reads, optional Unix PTY mode, PTY resize, stdout/stderr collection, macOS Seatbelt path, configurable timeout, and observable requested/effective terminal modes with pipe fallback where PTY is unavailable | Codex `exec_command` sessions, PTY, stdin, timeout | Seeded; richer shell controls still open |
 | Context management | BPE token counting, local compaction, persisted collapse/summary records | Multi-level local/remote compaction | Partial |
 | Tool output control | Runtime task output now uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output; ordinary tool-result truncation still uses fixed byte helpers | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial |
 | Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |
-| MCP | stdio/SSE config surface, tool routing, and read-only resource list/read/template tools | Codex MCP client/server ecosystem | Partial; resource access seeded |
+| MCP | stdio/SSE config surface, tool routing, read-only resource list/read/template tools, unified Mention discovery, and same-registry Resource expansion | Codex MCP client/server ecosystem | Partial; resource/tool access and Mention integration seeded |
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
@@ -428,7 +441,7 @@ working baseline used to prioritize the next patch releases.
 | TUI | Markdown-ish rendering, themes, Vim mode, diff preview, slash commands, workflow panel, per-turn timers plus cumulative active-Goal timing, and clearer approval dialogs | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary; resume normalization drops legacy reasoning-only assistant turns before provider replay | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
-| Skills | Markdown skill discovery, `list_skills`/`read_skill`, and explicit `$skill` prompt injection | Codex skills and plugin-provided skill bundles | Partial |
+| Skills | Markdown discovery, `list_skills`/`read_skill`, explicit `$skill` injection, and atomic unified Mention candidates across runtime workspace roots | Codex skills and plugin-provided skill bundles | Implemented for discovery/injection; plugin tool bundles remain open |
 
 ---
 
@@ -928,7 +941,10 @@ server accepts the original `{"op":"submit"}` wire shape plus Codex-style
 `thread/start` and `turn/start` method requests for the first app-server-shaped
 thread/turn lifecycle entry points. Server-mode `turn/start` now parses
 `params.threadId` and rejects unknown in-process thread ids, while persistent
-ThreadStore-backed materialization remains a follow-up.
+ThreadStore-backed materialization remains a follow-up. The current development
+baseline also exposes multi-root `fuzzyFileSearch/sessionStart|Update|Stop`,
+thread-bound `mention/search/start|update|stop`, streamed candidate targets,
+and structured atomic Mention input on `turn/start`.
 
 **Goal:** introduce a runtime protocol boundary so TUI/headless clients can send
 commands and consume versioned events without owning turn execution details.
