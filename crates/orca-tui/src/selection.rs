@@ -18,13 +18,27 @@ pub struct SelectionPos {
     pub col: usize,
 }
 
+/// What one drag step extends by. Set by click count: single click drags by
+/// cell, double click by word, triple click by logical line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SelectionGranularity {
+    #[default]
+    Cell,
+    Word,
+    Line,
+}
+
 /// An in-progress or settled drag selection. `anchor` is where the drag
-/// started (mouse down), `head` follows the pointer.
+/// started (mouse down), `head` follows the pointer. For word/line
+/// granularity, `origin` remembers the initially selected unit so dragging
+/// extends symmetrically around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TranscriptSelection {
     pub anchor: SelectionPos,
     pub head: SelectionPos,
     pub dragging: bool,
+    pub granularity: SelectionGranularity,
+    pub origin: (SelectionPos, SelectionPos),
 }
 
 impl TranscriptSelection {
@@ -33,6 +47,54 @@ impl TranscriptSelection {
             anchor: pos,
             head: pos,
             dragging: true,
+            granularity: SelectionGranularity::Cell,
+            origin: (pos, pos),
+        }
+    }
+
+    /// A word or line selection spanning the inclusive cell range
+    /// `start..=end`, ready to be extended by dragging.
+    pub fn unit(granularity: SelectionGranularity, start: SelectionPos, end: SelectionPos) -> Self {
+        Self {
+            anchor: start,
+            head: end,
+            dragging: true,
+            granularity,
+            origin: (start, end),
+        }
+    }
+
+    /// Grow a word/line selection to include the unit under the pointer
+    /// (`unit`, inclusive cells), or the raw pointer cell when the pointer is
+    /// past the content. The origin unit always stays selected.
+    pub fn extend_to_unit(
+        &mut self,
+        pointer: SelectionPos,
+        unit: Option<(SelectionPos, SelectionPos)>,
+    ) {
+        let (origin_start, origin_end) = self.origin;
+        match unit {
+            Some((unit_start, unit_end)) => {
+                if unit_start < origin_start {
+                    self.anchor = origin_end;
+                    self.head = unit_start;
+                } else if unit_end > origin_end {
+                    self.anchor = origin_start;
+                    self.head = unit_end;
+                } else {
+                    self.anchor = origin_start;
+                    self.head = origin_end;
+                }
+            }
+            None => {
+                if pointer < origin_start {
+                    self.anchor = origin_end;
+                    self.head = pointer;
+                } else {
+                    self.anchor = origin_start;
+                    self.head = pointer;
+                }
+            }
         }
     }
 
@@ -118,6 +180,14 @@ pub fn osc52_copy_sequence(text: &str) -> String {
         "\x1b]52;c;{}\x07",
         base64::engine::general_purpose::STANDARD.encode(text)
     )
+}
+
+/// Wrap an escape sequence in a tmux DCS passthrough envelope so tmux relays
+/// it to the outer terminal instead of swallowing it (the user still needs
+/// `set-clipboard on`/`external` in tmux). Every ESC in the payload is
+/// doubled, per the passthrough protocol.
+pub fn tmux_passthrough(sequence: &str) -> String {
+    format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
 }
 
 /// Re-style the display-column range `[col_start, col_end)` of a pre-wrapped
@@ -235,14 +305,25 @@ mod tests {
     use ratatui::text::{Line, Span};
 
     use super::{
-        SelectionPos, TranscriptSelection, apply_selection_to_line, osc52_copy_sequence,
-        screen_to_selection_pos, screen_to_selection_pos_clamped, slice_row_by_columns,
+        SelectionGranularity, SelectionPos, TranscriptSelection, apply_selection_to_line,
+        osc52_copy_sequence, screen_to_selection_pos, screen_to_selection_pos_clamped,
+        slice_row_by_columns, tmux_passthrough,
     };
 
     const SEL_BG: Color = Color::Rgb(46, 62, 132);
 
     fn pos(row: usize, col: usize) -> SelectionPos {
         SelectionPos { row, col }
+    }
+
+    fn sel(anchor: SelectionPos, head: SelectionPos) -> TranscriptSelection {
+        TranscriptSelection {
+            anchor,
+            head,
+            dragging: false,
+            granularity: SelectionGranularity::Cell,
+            origin: (anchor, head),
+        }
     }
 
     /// (text, has-selection-bg, foreground) triples for a highlighted line.
@@ -261,28 +342,16 @@ mod tests {
 
     #[test]
     fn normalized_orders_endpoints_and_makes_end_column_exclusive() {
-        let forward = TranscriptSelection {
-            anchor: pos(1, 4),
-            head: pos(3, 2),
-            dragging: false,
-        };
+        let forward = sel(pos(1, 4), pos(3, 2));
         assert_eq!(forward.normalized(), (pos(1, 4), pos(3, 3)));
 
-        let backward = TranscriptSelection {
-            anchor: pos(3, 2),
-            head: pos(1, 4),
-            dragging: false,
-        };
+        let backward = sel(pos(3, 2), pos(1, 4));
         assert_eq!(backward.normalized(), (pos(1, 4), pos(3, 3)));
     }
 
     #[test]
     fn cols_on_row_covers_first_middle_last_and_outside_rows() {
-        let sel = TranscriptSelection {
-            anchor: pos(1, 4),
-            head: pos(3, 2),
-            dragging: false,
-        };
+        let sel = sel(pos(1, 4), pos(3, 2));
         assert_eq!(sel.cols_on_row(0), None);
         assert_eq!(sel.cols_on_row(1), Some((4, None)));
         assert_eq!(sel.cols_on_row(2), Some((0, None)));
@@ -292,22 +361,46 @@ mod tests {
 
     #[test]
     fn single_row_selection_selects_the_cell_under_both_endpoints() {
-        let sel = TranscriptSelection {
-            anchor: pos(2, 5),
-            head: pos(2, 5),
-            dragging: false,
-        };
+        let click = sel(pos(2, 5), pos(2, 5));
         // Same-cell endpoints: "empty" for click detection, but still one
         // selected cell (a single-character word selection).
-        assert!(sel.is_empty());
-        assert_eq!(sel.cols_on_row(2), Some((5, Some(6))));
+        assert!(click.is_empty());
+        assert_eq!(click.cols_on_row(2), Some((5, Some(6))));
 
-        let sel = TranscriptSelection {
-            anchor: pos(2, 5),
-            head: pos(2, 7),
-            dragging: false,
-        };
-        assert_eq!(sel.cols_on_row(2), Some((5, Some(8))));
+        let range = sel(pos(2, 5), pos(2, 7));
+        assert_eq!(range.cols_on_row(2), Some((5, Some(8))));
+    }
+
+    #[test]
+    fn unit_selection_extends_symmetrically_around_its_origin() {
+        // Origin word occupies cells (0,6)..=(0,10).
+        let mut selection =
+            TranscriptSelection::unit(SelectionGranularity::Word, pos(0, 6), pos(0, 10));
+        assert_eq!((selection.anchor, selection.head), (pos(0, 6), pos(0, 10)));
+
+        // Dragging onto a later word swallows it whole, anchored at origin start.
+        selection.extend_to_unit(pos(0, 14), Some((pos(0, 12), pos(0, 16))));
+        assert_eq!((selection.anchor, selection.head), (pos(0, 6), pos(0, 16)));
+
+        // Dragging onto an earlier word flips the anchor to the origin end.
+        selection.extend_to_unit(pos(0, 1), Some((pos(0, 0), pos(0, 3))));
+        assert_eq!((selection.anchor, selection.head), (pos(0, 10), pos(0, 0)));
+
+        // Back inside the origin: exactly the origin unit again.
+        selection.extend_to_unit(pos(0, 8), Some((pos(0, 6), pos(0, 10))));
+        assert_eq!((selection.anchor, selection.head), (pos(0, 6), pos(0, 10)));
+
+        // Past the content (no unit there): raw pointer cell.
+        selection.extend_to_unit(pos(5, 2), None);
+        assert_eq!((selection.anchor, selection.head), (pos(0, 6), pos(5, 2)));
+    }
+
+    #[test]
+    fn tmux_passthrough_wraps_and_doubles_escapes() {
+        assert_eq!(
+            tmux_passthrough("\x1b]52;c;aGk=\x07"),
+            "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\"
+        );
     }
 
     #[test]

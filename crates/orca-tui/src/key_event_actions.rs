@@ -53,6 +53,13 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
+    // Esc dismisses an active mouse selection before any other Esc meaning
+    // (cancel turn, close panel); a second Esc then does the usual thing.
+    if key.code == KeyCode::Esc && state.selection.is_some() {
+        state.invalidate_selection();
+        return Ok(KeyEventFlow::Continue);
+    }
+
     if key.code == KeyCode::BackTab
         && matches!(
             state.status,

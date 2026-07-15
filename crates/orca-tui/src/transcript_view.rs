@@ -702,14 +702,16 @@ impl TranscriptRenderCache {
         &wrapped.text[wrapped.row_boundaries[row_within]..wrapped.row_boundaries[row_within + 1]]
     }
 
-    /// The word under `pos`, as a settled (non-dragging) selection: a run of
-    /// characters of the same class (alphanumeric/underscore, punctuation, or
-    /// whitespace) within the clicked visual row. `None` when the click lands
-    /// past the end of the row or transcript.
-    pub fn word_selection_at(&self, pos: SelectionPos) -> Option<TranscriptSelection> {
+    /// Inclusive cell bounds of the same-class run (word) under `pos`. The
+    /// run expands across soft-wrap boundaries within the logical line: a
+    /// non-empty wrap gap (whitespace the wrapper dropped) separates words,
+    /// while an empty gap means a hard-split word (URL) that continues on the
+    /// next row. `None` when the click lands past the end of the row or
+    /// transcript.
+    pub fn word_bounds_at(&self, pos: SelectionPos) -> Option<(SelectionPos, SelectionPos)> {
         use unicode_width::UnicodeWidthChar;
 
-        #[derive(PartialEq)]
+        #[derive(Clone, Copy, PartialEq)]
         enum CharClass {
             Whitespace,
             Word,
@@ -725,41 +727,93 @@ impl TranscriptRenderCache {
             }
         }
 
-        let (message_index, line_index, row_within) = self.locate_row(pos.row)?;
-        let text = self.row_text(message_index, line_index, row_within);
+        let (message_index, line_index, clicked_row_within) = self.locate_row(pos.row)?;
+        let cached = self.entries.get(message_index).and_then(Option::as_ref)?;
+        let wrapped = cached.wrapped_lines.get(line_index)?;
+        let line_first_abs_row = pos.row - clicked_row_within;
 
-        // (leading display column, char) pairs for the row.
-        let mut cells: Vec<(usize, char)> = Vec::new();
-        let mut col = 0usize;
-        for ch in text.chars() {
-            cells.push((col, ch));
-            col += ch.width().unwrap_or(0);
+        // Cells across the whole logical line, in reading order. `None`
+        // position marks whitespace the wrapper dropped at a soft wrap — it
+        // separates runs like any other whitespace but cannot be selected.
+        let mut cells: Vec<(Option<SelectionPos>, CharClass)> = Vec::new();
+        let mut clicked: Option<usize> = None;
+        for row_within in 0..wrapped.row_count() {
+            let text = self.row_text(message_index, line_index, row_within);
+            let mut col = 0usize;
+            for ch in text.chars() {
+                let width = ch.width().unwrap_or(0);
+                if row_within == clicked_row_within
+                    && col <= pos.col
+                    && pos.col < col + width.max(1)
+                {
+                    clicked = Some(cells.len());
+                }
+                cells.push((
+                    Some(SelectionPos {
+                        row: line_first_abs_row + row_within,
+                        col,
+                    }),
+                    classify(ch),
+                ));
+                col += width;
+            }
+            let separates = wrapped
+                .wrap_gaps
+                .get(row_within)
+                .is_some_and(|gap| !gap.is_empty());
+            if separates {
+                cells.push((None, CharClass::Whitespace));
+            }
         }
-        let clicked = cells.iter().rposition(|(leading, ch)| {
-            *leading <= pos.col && pos.col < leading + ch.width().unwrap_or(0).max(1)
-        })?;
-        let class = classify(cells[clicked].1);
 
+        let clicked = clicked?;
+        let class = cells[clicked].1;
         let mut first = clicked;
-        while first > 0 && classify(cells[first - 1].1) == class {
+        while first > 0 && cells[first - 1].1 == class {
             first -= 1;
         }
         let mut last = clicked;
-        while last + 1 < cells.len() && classify(cells[last + 1].1) == class {
+        while last + 1 < cells.len() && cells[last + 1].1 == class {
             last += 1;
         }
+        // Virtual gap cells have no position; shrink to the real ends.
+        while first < last && cells[first].0.is_none() {
+            first += 1;
+        }
+        while last > first && cells[last].0.is_none() {
+            last -= 1;
+        }
+        Some((cells[first].0?, cells[last].0?))
+    }
 
-        Some(TranscriptSelection {
-            anchor: crate::selection::SelectionPos {
-                row: pos.row,
-                col: cells[first].0,
+    /// Inclusive cell bounds of the whole logical (unwrapped) line under
+    /// `pos`: from column 0 of its first visual row to the last character's
+    /// leading column on its last visual row.
+    pub fn line_bounds_at(&self, pos: SelectionPos) -> Option<(SelectionPos, SelectionPos)> {
+        use unicode_width::UnicodeWidthChar;
+
+        let (message_index, line_index, row_within) = self.locate_row(pos.row)?;
+        let cached = self.entries.get(message_index).and_then(Option::as_ref)?;
+        let wrapped = cached.wrapped_lines.get(line_index)?;
+        let first_abs_row = pos.row - row_within;
+        let last_row_within = wrapped.row_count().saturating_sub(1);
+        let last_text = self.row_text(message_index, line_index, last_row_within);
+        let mut last_leading_col = 0usize;
+        let mut col = 0usize;
+        for ch in last_text.chars() {
+            last_leading_col = col;
+            col += ch.width().unwrap_or(0);
+        }
+        Some((
+            SelectionPos {
+                row: first_abs_row,
+                col: 0,
             },
-            head: crate::selection::SelectionPos {
-                row: pos.row,
-                col: cells[last].0,
+            SelectionPos {
+                row: first_abs_row + last_row_within,
+                col: last_leading_col,
             },
-            dragging: false,
-        })
+        ))
     }
 
     /// Extract the selected text for clipboard copy.
@@ -885,7 +939,7 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::{TranscriptRenderCache, viewport_paragraph, wrap_line_ratatui_compatible};
-    use crate::selection::{SelectionPos, TranscriptSelection};
+    use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
     use crate::types::ChatMessage;
     use crate::ui::build_lines_for_messages;
@@ -993,17 +1047,29 @@ mod tests {
     }
 
     fn selection(anchor: (usize, usize), head: (usize, usize)) -> TranscriptSelection {
+        let anchor = SelectionPos {
+            row: anchor.0,
+            col: anchor.1,
+        };
+        let head = SelectionPos {
+            row: head.0,
+            col: head.1,
+        };
         TranscriptSelection {
-            anchor: SelectionPos {
-                row: anchor.0,
-                col: anchor.1,
-            },
-            head: SelectionPos {
-                row: head.0,
-                col: head.1,
-            },
+            anchor,
+            head,
             dragging: false,
+            granularity: SelectionGranularity::Cell,
+            origin: (anchor, head),
         }
+    }
+
+    fn unit_text(cache: &TranscriptRenderCache, bounds: (SelectionPos, SelectionPos)) -> String {
+        cache.extract_text(&TranscriptSelection::unit(
+            SelectionGranularity::Word,
+            bounds.0,
+            bounds.1,
+        ))
     }
 
     #[test]
@@ -1083,21 +1149,62 @@ mod tests {
     fn word_selection_expands_over_same_class_runs() {
         let cache = extraction_cache(&[vec![Line::from("hello world(x)")]], 40);
         // Click inside "world" (cols 6-10).
-        let sel = cache
-            .word_selection_at(SelectionPos { row: 0, col: 8 })
+        let bounds = cache
+            .word_bounds_at(SelectionPos { row: 0, col: 8 })
             .unwrap();
-        assert_eq!(cache.extract_text(&sel), "world");
+        assert_eq!(unit_text(&cache, bounds), "world");
         // Click on the parenthesis selects just the punctuation run.
-        let sel = cache
-            .word_selection_at(SelectionPos { row: 0, col: 11 })
+        let bounds = cache
+            .word_bounds_at(SelectionPos { row: 0, col: 11 })
             .unwrap();
-        assert_eq!(cache.extract_text(&sel), "(");
+        assert_eq!(unit_text(&cache, bounds), "(");
         // CJK characters are alphanumeric and select as a run.
         let cache = extraction_cache(&[vec![Line::from("你好 世界")]], 40);
-        let sel = cache
-            .word_selection_at(SelectionPos { row: 0, col: 1 })
+        let bounds = cache
+            .word_bounds_at(SelectionPos { row: 0, col: 1 })
             .unwrap();
-        assert_eq!(cache.extract_text(&sel), "你好");
+        assert_eq!(unit_text(&cache, bounds), "你好");
+    }
+
+    #[test]
+    fn word_selection_crosses_hard_split_rows_but_not_soft_wrap_gaps() {
+        // Width 6 splits the long token across rows with EMPTY gaps: the
+        // word continues across the boundary.
+        let cache = extraction_cache(&[vec![Line::from("https_example")]], 6);
+        let bounds = cache
+            .word_bounds_at(SelectionPos { row: 1, col: 2 })
+            .unwrap();
+        assert_eq!(unit_text(&cache, bounds), "https_example");
+
+        // "foo bar" at width 4 wraps with a DROPPED SPACE between the rows:
+        // the gap separates the words even though the rows are adjacent.
+        let cache = extraction_cache(&[vec![Line::from("foo bar")]], 4);
+        let bounds = cache
+            .word_bounds_at(SelectionPos { row: 1, col: 1 })
+            .unwrap();
+        assert_eq!(unit_text(&cache, bounds), "bar");
+    }
+
+    #[test]
+    fn line_bounds_cover_the_whole_logical_line_across_wrapped_rows() {
+        let cache = extraction_cache(
+            &[vec![Line::from("alpha beta gamma"), Line::from("tail")]],
+            6,
+        );
+        // Click anywhere inside the wrapped first logical line.
+        let bounds = cache
+            .line_bounds_at(SelectionPos { row: 1, col: 0 })
+            .unwrap();
+        assert_eq!(bounds.0, SelectionPos { row: 0, col: 0 });
+        assert_eq!(unit_text(&cache, bounds), "alpha beta gamma");
+        // The second logical line is its own unit.
+        let bounds = cache
+            .line_bounds_at(SelectionPos {
+                row: bounds.1.row + 1,
+                col: 2,
+            })
+            .unwrap();
+        assert_eq!(unit_text(&cache, bounds), "tail");
     }
 
     #[test]
@@ -1105,12 +1212,12 @@ mod tests {
         let cache = extraction_cache(&[vec![Line::from("hi")]], 40);
         assert!(
             cache
-                .word_selection_at(SelectionPos { row: 0, col: 10 })
+                .word_bounds_at(SelectionPos { row: 0, col: 10 })
                 .is_none()
         );
         assert!(
             cache
-                .word_selection_at(SelectionPos { row: 5, col: 0 })
+                .word_bounds_at(SelectionPos { row: 5, col: 0 })
                 .is_none()
         );
     }

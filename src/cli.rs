@@ -2242,7 +2242,7 @@ fn run_placeholder(cli: Cli) -> i32 {
     };
 
     match tui_update_preflight(
-        config.update_check,
+        config.update_check && !is_dev_build_run(),
         &config.app_version,
         orca_runtime::update_check::check_latest_for_prompt,
     ) {
@@ -2263,6 +2263,29 @@ fn run_placeholder(cli: Cli) -> i32 {
     }
 
     app::run_tui(config)
+}
+
+/// True when this process is a development build or run — `cargo run`,
+/// `cargo test`, or a binary executed straight out of a Cargo `target/`
+/// directory. Development runs must never offer self-update: the installer
+/// would clobber `target/{debug,release}` with a downloaded release binary,
+/// and the prompt is pure noise while iterating.
+fn is_dev_build_run() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| exe_in_cargo_target(&exe))
+}
+
+/// Whether `exe` sits underneath a directory named `target` — the Cargo
+/// build layout (`target/debug/orca`, `target/release/orca`,
+/// `target/<triple>/release/orca`). Installed binaries live in places like
+/// `~/.orca/bin` or an npm prefix and never match.
+fn exe_in_cargo_target(exe: &std::path::Path) -> bool {
+    exe.ancestors()
+        .any(|ancestor| ancestor.file_name().is_some_and(|name| name == "target"))
 }
 
 fn tui_update_preflight(
@@ -2524,6 +2547,32 @@ mod tests {
         });
 
         assert_eq!(outcome, TuiUpdatePreflight::Continue);
+    }
+
+    #[test]
+    fn dev_runs_never_offer_self_update() {
+        // Test binaries are debug builds executed from target/: both dev
+        // signals must fire here.
+        assert!(is_dev_build_run());
+
+        // Path heuristic (covers `cargo run --release`, where
+        // debug_assertions is off).
+        assert!(exe_in_cargo_target(std::path::Path::new(
+            "/repo/target/debug/orca"
+        )));
+        assert!(exe_in_cargo_target(std::path::Path::new(
+            "/repo/target/release/orca"
+        )));
+        assert!(exe_in_cargo_target(std::path::Path::new(
+            "/repo/target/aarch64-apple-darwin/release/orca"
+        )));
+        // Installed locations never match.
+        assert!(!exe_in_cargo_target(std::path::Path::new(
+            "/Users/dev/.orca/bin/orca"
+        )));
+        assert!(!exe_in_cargo_target(std::path::Path::new(
+            "/usr/local/lib/node_modules/@blade-ai/orca/bin/orca"
+        )));
     }
 
     #[test]

@@ -24,9 +24,11 @@ use crate::transcript_view::viewport_paragraph;
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
-    // Recomputed by render_live_messages when the pill is actually shown;
-    // cleared here so panel switches never leave a stale click target behind.
+    // Recomputed below when the widgets are actually shown; cleared here so
+    // panel/status switches never leave stale mouse hit targets behind.
     state.jump_to_bottom_area = None;
+    state.frame_area = Some(frame.area());
+    state.input_area = None;
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
         return;
@@ -80,6 +82,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_activity(frame, chunks[3], state, theme);
     }
     if composer_visible(state) {
+        state.input_area = Some(chunks[4]);
         render_input(frame, chunks[4], textarea);
     }
     render_status(frame, chunks[5], state, theme);
@@ -397,6 +400,34 @@ fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<
 /// Render the transcript messages into `area` with no border. While `auto_scroll` is on
 /// the newest content is pinned to the bottom of `area`; once the user scrolls up
 /// (PageUp, k/j, etc.) `auto_scroll` clears and the pane honours `scroll_offset`.
+/// Overlay the mouse selection on materialized transcript rows. The render
+/// caches stay selection-agnostic so highlighting never invalidates them.
+fn apply_selection_overlay(
+    lines: Vec<ratatui::text::Line<'static>>,
+    selection: Option<crate::selection::TranscriptSelection>,
+    base_row: usize,
+    theme: &Theme,
+) -> Vec<ratatui::text::Line<'static>> {
+    let Some(selection) = selection else {
+        return lines;
+    };
+    lines
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, line)| match selection.cols_on_row(base_row + index) {
+                Some((col_start, col_end)) => crate::selection::apply_selection_to_line(
+                    line,
+                    col_start,
+                    col_end,
+                    theme.selection_bg,
+                ),
+                None => line,
+            },
+        )
+        .collect()
+}
+
 pub(crate) fn render_live_messages(
     frame: &mut Frame,
     area: Rect,
@@ -409,23 +440,38 @@ pub(crate) fn render_live_messages(
     state.transcript_area = Some(area);
 
     if state.messages.is_empty() {
+        // The welcome screen renders through its own cache so its text is
+        // selectable and copyable exactly like transcript content.
         let lines = build_welcome_lines(state, theme);
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let total = paragraph.line_count(area.width.max(1));
-        let max_scroll = total.saturating_sub(visible_height);
-        let scroll = if state.auto_scroll {
-            max_scroll
-        } else {
-            state.scroll_offset.min(max_scroll)
-        };
-        state.total_lines = total;
-        state.visible_height = visible_height;
-        state.scroll_offset = scroll;
-        state.viewport_base_row = scroll;
-        frame.render_widget(
-            paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
-            area,
+        let welcome_message = [ChatMessage::System(String::new())];
+        // Sentinel revision: never collides with allocated ones, and the
+        // explicit invalidate below forces a rebuild whenever we redraw.
+        let welcome_revisions = [u64::MAX];
+        state.welcome_render_cache.invalidate(0);
+        state.welcome_render_cache.prepare(
+            &welcome_message,
+            &welcome_revisions,
+            width,
+            theme,
+            state.tick,
+            false,
+            |_, _, _, _, _| lines.clone(),
         );
+        let requested_scroll = if state.auto_scroll {
+            usize::MAX
+        } else {
+            state.scroll_offset
+        };
+        let viewport = state
+            .welcome_render_cache
+            .viewport(0, requested_scroll, visible_height);
+        state.total_lines = viewport.total_height;
+        state.visible_height = visible_height;
+        state.scroll_offset = viewport.scroll_offset;
+        state.viewport_base_row = viewport.base_row;
+        let lines =
+            apply_selection_overlay(viewport.lines, state.selection, viewport.base_row, theme);
+        frame.render_widget(viewport_paragraph(lines), area);
         return;
     }
 
@@ -463,33 +509,21 @@ pub(crate) fn render_live_messages(
 
     // Overlay the mouse selection on the materialized rows; the render cache
     // itself stays selection-agnostic so highlighting never invalidates it.
-    let lines = match state.selection {
-        Some(selection) => viewport
-            .lines
-            .into_iter()
-            .enumerate()
-            .map(
-                |(index, line)| match selection.cols_on_row(viewport.base_row + index) {
-                    Some((col_start, col_end)) => crate::selection::apply_selection_to_line(
-                        line,
-                        col_start,
-                        col_end,
-                        theme.selection_bg,
-                    ),
-                    None => line,
-                },
-            )
-            .collect(),
-        None => viewport.lines,
-    };
+    let lines = apply_selection_overlay(viewport.lines, state.selection, viewport.base_row, theme);
 
     frame.render_widget(viewport_paragraph(lines), area);
 
     // Floating "jump to bottom" pill, shown while the user has scrolled away
-    // from the tail (auto-follow disarmed). Clicking it re-arms follow.
+    // from the tail (auto-follow disarmed). While detached it doubles as an
+    // unread indicator: messages landing below bump `unseen_messages`.
+    // Clicking it re-arms follow and clears the count.
     if !state.auto_scroll && viewport.total_height > visible_height && area.height > 0 {
-        let label = " Jump to bottom (click) ↓ ";
-        let pill_width = UnicodeWidthStr::width(label) as u16;
+        let label = match state.unseen_messages {
+            0 => " Jump to bottom (click) ↓ ".to_string(),
+            1 => " 1 new message (click) ↓ ".to_string(),
+            count => format!(" {count} new messages (click) ↓ "),
+        };
+        let pill_width = UnicodeWidthStr::width(label.as_str()) as u16;
         if area.width >= pill_width {
             let pill = Rect {
                 x: area.x + (area.width - pill_width) / 2,
@@ -2099,13 +2133,17 @@ fn status_line(
 
     // Transient right-aligned "copied N chars to clipboard" feedback, shown
     // for a few seconds after a mouse selection lands on the clipboard.
-    if let Some(chars) = state.copy_notice_at(now) {
-        let notice = format!("copied {chars} chars to clipboard");
-        let notice_width = UnicodeWidthStr::width(notice.as_str());
+    if let Some(notice) = state.copy_notice_at(now) {
+        let text = if notice.local_only {
+            format!("copied {} chars (local clipboard only)", notice.chars)
+        } else {
+            format!("copied {} chars to clipboard", notice.chars)
+        };
+        let notice_width = UnicodeWidthStr::width(text.as_str());
         // Separate it from the metadata by at least two columns.
         if used + notice_width + 2 <= width {
             spans.push(Span::raw(" ".repeat(width - used - notice_width)));
-            spans.push(Span::styled(notice, Style::default().fg(theme.approval)));
+            spans.push(Span::styled(text, Style::default().fg(theme.approval)));
         }
     }
     Line::from(spans)
@@ -2234,6 +2272,87 @@ fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
     }
 }
 
+/// The scrolled 12-item window both popup menus (slash, mention) use: the
+/// selected row stays visible, pinned to the window's bottom while moving
+/// down. Shared by the renderers and the mouse hit-tests so they can never
+/// disagree.
+fn popup_window(len: usize, selected: usize) -> (usize, usize) {
+    let visible_count = len.min(12);
+    let max_start = len.saturating_sub(visible_count);
+    let start = selected
+        .saturating_sub(visible_count.saturating_sub(1))
+        .min(max_start);
+    (start, (start + visible_count).min(len))
+}
+
+/// Which slash-menu item (of the active list — sub-menu when open) a click
+/// lands on, replicating `render_slash_menu` geometry.
+pub(crate) fn slash_menu_hit_index(state: &AppState, column: u16, row: u16) -> Option<usize> {
+    let menu = state.slash_menu.as_ref()?;
+    let input_area = state.input_area?;
+    let (len, selected) = match &menu.sub_menu {
+        Some(sub) => (sub.items.len(), sub.selected),
+        None => (menu.items.len(), menu.selected),
+    };
+    let (start, end) = popup_window(len, selected);
+    let height = ((end - start) as u16 + 2).min(14);
+    let popup = Rect::new(
+        input_area.x,
+        input_area.y.saturating_sub(height),
+        input_area.width,
+        height,
+    );
+    hit_bordered_list_row(popup, column, row).and_then(|offset| {
+        let index = start + offset;
+        (index < end).then_some(index)
+    })
+}
+
+/// Which mention candidate a click lands on, replicating
+/// `render_mention_candidates` geometry. The trailing status row (if any)
+/// is not a candidate and reports `None`.
+pub(crate) fn mention_menu_hit_index(state: &AppState, column: u16, row: u16) -> Option<usize> {
+    // The mention popup only renders while no slash menu is open; the
+    // hit-test must honor the same gate.
+    if state.slash_menu.is_some() {
+        return None;
+    }
+    let phase = state.mention.phase.as_ref()?;
+    let input_area = state.input_area?;
+    let candidates = &state.mention.candidates;
+    let (start, end) = popup_window(candidates.len(), state.mention.selected);
+    let status = mention_status_text(
+        phase,
+        state.mention.progress.scanned_paths,
+        candidates.is_empty(),
+    );
+    let height = (end - start) as u16 + u16::from(status.is_some()) + 2;
+    let popup = Rect::new(
+        input_area.x,
+        input_area.y.saturating_sub(height),
+        input_area.width,
+        height,
+    );
+    hit_bordered_list_row(popup, column, row).and_then(|offset| {
+        let index = start + offset;
+        (index < end).then_some(index)
+    })
+}
+
+/// Row offset within a bordered single-column list popup, if `column`/`row`
+/// land inside its content area.
+fn hit_bordered_list_row(popup: Rect, column: u16, row: u16) -> Option<usize> {
+    if popup.width < 3 || popup.height < 3 {
+        return None;
+    }
+    let content_left = popup.x + 1;
+    let content_right = popup.x + popup.width - 1;
+    let content_top = popup.y + 1;
+    let content_bottom = popup.y + popup.height - 1;
+    (column >= content_left && column < content_right && row >= content_top && row < content_bottom)
+        .then(|| (row - content_top) as usize)
+}
+
 fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
     let menu = match &state.slash_menu {
         Some(m) => m,
@@ -2254,12 +2373,8 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
             (items, menu.selected, " Commands ")
         };
 
-    let visible_count = items.len().min(12);
-    let max_start = items.len().saturating_sub(visible_count);
-    let start = selected
-        .saturating_sub(visible_count.saturating_sub(1))
-        .min(max_start);
-    let end = (start + visible_count).min(items.len());
+    let (start, end) = popup_window(items.len(), selected);
+    let visible_count = end - start;
     let item_count = visible_count as u16;
     let height = (item_count + 2).min(14); // +2 for border
     let width = input_area.width;
@@ -2306,14 +2421,8 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
         return;
     };
 
-    let visible_count = candidates.len().min(12);
-    let max_start = candidates.len().saturating_sub(visible_count);
-    let start = state
-        .mention
-        .selected
-        .saturating_sub(visible_count.saturating_sub(1))
-        .min(max_start);
-    let end = (start + visible_count).min(candidates.len());
+    let (start, end) = popup_window(candidates.len(), state.mention.selected);
+    let visible_count = end - start;
     let status = mention_status_text(
         phase,
         state.mention.progress.scanned_paths,
@@ -2401,16 +2510,20 @@ fn mention_status_text(
     }
 }
 
-fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let Some(dialog) = &state.approval_dialog else {
-        return;
-    };
+/// Shared layout for the approval dialog, used by the renderer and the mouse
+/// hit-test so option rows can never drift apart.
+struct ApprovalDialogGeometry {
+    popup: Rect,
+    shown_diff_lines: usize,
+    diff_truncated: bool,
+    first_option_row: u16,
+}
 
-    let area = frame.area();
-    let target_str = dialog.target.as_deref().unwrap_or("(none)");
+fn approval_dialog_geometry(
+    area: Rect,
+    dialog: &crate::types::ApprovalDialog,
+) -> ApprovalDialogGeometry {
     let width = 64u16.min(area.width.saturating_sub(4));
-    let inner_width = width.saturating_sub(2) as usize;
-    let target_str = truncate_to_display_width(target_str, inner_width.saturating_sub(9));
     let max_height = area.height.saturating_sub(4).max(8);
     let fixed_content_rows = 3 + dialog.options.len() as u16 + 2 + u16::from(dialog.diff.is_some());
     let available_diff_rows = max_height
@@ -2427,6 +2540,60 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let truncation_row = usize::from(diff_truncated && available_diff_rows > 0);
     let shown_diff_lines =
         desired_diff_lines.min(available_diff_rows.saturating_sub(truncation_row));
+    let height = (fixed_content_rows
+        + shown_diff_lines as u16
+        + u16::from(diff_truncated && available_diff_rows > 0)
+        + 2)
+    .min(max_height)
+    .max(8);
+    let popup = centered_rect(area, width, height);
+    // Border, then tool/target/blank, then the bounded diff block.
+    let first_option_row = popup.y
+        + 1
+        + 3
+        + shown_diff_lines as u16
+        + truncation_row as u16
+        + u16::from(dialog.diff.is_some());
+    ApprovalDialogGeometry {
+        popup,
+        shown_diff_lines,
+        diff_truncated,
+        first_option_row,
+    }
+}
+
+/// Which approval option a click lands on, if any.
+pub(crate) fn approval_option_hit_index(state: &AppState, column: u16, row: u16) -> Option<usize> {
+    let dialog = state.approval_dialog.as_ref()?;
+    let area = state.frame_area?;
+    let geometry = approval_dialog_geometry(area, dialog);
+    let popup = geometry.popup;
+    if popup.width < 3 || popup.height < 3 {
+        return None;
+    }
+    if column <= popup.x || column + 1 >= popup.x + popup.width {
+        return None;
+    }
+    if row + 1 >= popup.y + popup.height {
+        return None;
+    }
+    let index = row.checked_sub(geometry.first_option_row)? as usize;
+    (index < dialog.options.len()).then_some(index)
+}
+
+fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let Some(dialog) = &state.approval_dialog else {
+        return;
+    };
+
+    let area = frame.area();
+    let geometry = approval_dialog_geometry(area, dialog);
+    let popup_area = geometry.popup;
+    let shown_diff_lines = geometry.shown_diff_lines;
+    let diff_truncated = geometry.diff_truncated;
+    let target_str = dialog.target.as_deref().unwrap_or("(none)");
+    let inner_width = popup_area.width.saturating_sub(2) as usize;
+    let target_str = truncate_to_display_width(target_str, inner_width.saturating_sub(9));
 
     // Build the diff/preview lines (colored) if a preview is present.
     let diff_lines: Vec<Line<'static>> = match &dialog.diff {
@@ -2451,14 +2618,6 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
             .collect(),
         None => Vec::new(),
     };
-    // Header, bounded preview, all decisions, and footer; clamp to the screen.
-    let height = (fixed_content_rows
-        + shown_diff_lines as u16
-        + u16::from(diff_truncated && available_diff_rows > 0)
-        + 2)
-    .min(max_height)
-    .max(8);
-    let popup_area = centered_rect(area, width, height);
 
     frame.render_widget(Clear, popup_area);
 
@@ -2533,6 +2692,107 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     let paragraph = Paragraph::new(content).block(block);
     frame.render_widget(paragraph, popup_area);
+}
+
+/// Which session (index into `session_picker_sessions`) a click lands on,
+/// replicating `render_session_picker`'s line layout: three header lines,
+/// then one title line per filtered session plus an optional metadata line.
+/// Long wrapped titles can shift rows below them; the mapping is then off by
+/// the wrapped amount, which degrades to selecting a neighbour.
+pub(crate) fn session_picker_hit_index(state: &AppState, row: u16) -> Option<usize> {
+    let area = state.frame_area?;
+    if area.width < 3 || area.height < 3 {
+        return None;
+    }
+    let inner_top = area.y + 1;
+    let inner_bottom = area.y + area.height - 1;
+    if row < inner_top + 3 || row >= inner_bottom {
+        return None;
+    }
+    let mut current = inner_top + 3;
+    for index in state.filtered_session_indices() {
+        let session = &state.session_picker_sessions[index];
+        let rows = 1 + u16::from(session_permission_metadata_label(session).is_some());
+        if row >= current && row < current + rows {
+            return Some(index);
+        }
+        current = current.saturating_add(rows);
+        if current >= inner_bottom {
+            break;
+        }
+    }
+    None
+}
+
+/// Map a click inside the composer to a `(row, col)` cursor position in the
+/// textarea, replicating `render_input`'s wrap and scroll behavior.
+pub(crate) fn composer_click_target(
+    textarea: &TextArea,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<(u16, u16)> {
+    let inner = textarea
+        .block()
+        .map(|block| block.inner(area))
+        .unwrap_or(area);
+    if inner.is_empty() || !inner.contains(ratatui::layout::Position::new(column, row)) {
+        return None;
+    }
+    if textarea.is_empty() {
+        return Some((0, 0));
+    }
+
+    let width = inner.width as usize;
+    let (cursor_row, cursor_col) = textarea.cursor();
+    let mut visual: Vec<(usize, Range<usize>)> = Vec::new();
+    let mut cursor_visual_line = 0usize;
+    for (logical_row, logical_line) in textarea.lines().iter().enumerate() {
+        for range in textarea_wrap_ranges(logical_line, width) {
+            if logical_row == cursor_row && cursor_in_visual_range(cursor_col, &range, logical_line)
+            {
+                cursor_visual_line = visual.len();
+            }
+            visual.push((logical_row, range));
+        }
+    }
+    if visual.is_empty() {
+        return Some((0, 0));
+    }
+
+    // Same scroll-to-cursor behavior as render_input.
+    let visible_height = inner.height as usize;
+    let start = if visual.len() <= visible_height {
+        0
+    } else if cursor_visual_line >= visible_height {
+        cursor_visual_line + 1 - visible_height
+    } else {
+        0
+    };
+    let clicked = (start + (row - inner.y) as usize).min(visual.len() - 1);
+    let (logical_row, range) = visual[clicked].clone();
+    let logical_line = textarea.lines()[logical_row].as_str();
+
+    // Walk display widths to find the character cell under the pointer.
+    let target = (column - inner.x) as usize;
+    let mut acc = 0usize;
+    let mut char_col = range.start;
+    for ch in logical_line
+        .chars()
+        .skip(range.start)
+        .take(range.end.saturating_sub(range.start))
+    {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_width > 0 && target < acc + ch_width {
+            break;
+        }
+        acc += ch_width;
+        char_col += 1;
+    }
+    Some((
+        logical_row.min(u16::MAX as usize) as u16,
+        char_col.min(u16::MAX as usize) as u16,
+    ))
 }
 
 fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme: &Theme) {
@@ -3885,11 +4145,28 @@ mod tests {
         assert!(scrolled.contains("Jump to bottom (click) ↓"));
         assert!(state.jump_to_bottom_area.is_some());
 
-        // Back at the bottom: gone again.
+        // Messages landing while detached turn it into an unread counter.
+        state.push_message(ChatMessage::System("late one".to_string()));
+        let one = draw(&mut state);
+        assert!(one.contains("1 new message (click) ↓"));
+        state.push_message(ChatMessage::System("late two".to_string()));
+        let two = draw(&mut state);
+        assert!(two.contains("2 new messages (click) ↓"));
+
+        // Back at the bottom: gone again, count cleared for the next detach.
         state.scroll_to_bottom();
         let back = draw(&mut state);
         assert!(!back.contains("Jump to bottom"));
+        assert!(!back.contains("new message"));
         assert_eq!(state.jump_to_bottom_area, None);
+        assert_eq!(state.unseen_messages, 0);
+
+        // Messages arriving while FOLLOWING never count as unread.
+        state.push_message(ChatMessage::System("seen".to_string()));
+        assert_eq!(state.unseen_messages, 0);
+        state.scroll_up(10);
+        let detached_again = draw(&mut state);
+        assert!(detached_again.contains("Jump to bottom (click) ↓"));
     }
 
     #[test]
@@ -3921,6 +4198,76 @@ mod tests {
                 .to_string()
                 .contains("copied")
         );
+
+        // Oversized for OSC 52: the notice admits only the local clipboard
+        // saw it instead of overclaiming a remote copy.
+        state.stage_clipboard_copy(
+            "x".repeat(crate::clipboard::OSC52_MAX_TEXT_BYTES + 1),
+            staged_at,
+        );
+        let degraded = status_line(&state, &theme, 140, staged_at).to_string();
+        assert!(degraded.contains("(local clipboard only)"));
+    }
+
+    #[test]
+    fn welcome_screen_text_is_selectable_and_copyable() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut state = test_state();
+        assert!(state.messages.is_empty());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let area = state.transcript_area.expect("transcript area recorded");
+
+        let mut scratch = TextArea::default();
+        let now = std::time::Instant::now();
+        let event_at = |kind, column, row| {
+            crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+        };
+        crate::input_event_actions::handle_mouse_event(
+            &event_at(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                area.x,
+                area.y,
+            ),
+            &mut state,
+            &mut scratch,
+            now,
+        );
+        crate::input_event_actions::handle_mouse_event(
+            &event_at(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                area.x + area.width - 1,
+                area.y + 6,
+            ),
+            &mut state,
+            &mut scratch,
+            now,
+        );
+        crate::input_event_actions::handle_mouse_event(
+            &event_at(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                area.x + area.width - 1,
+                area.y + 6,
+            ),
+            &mut state,
+            &mut scratch,
+            now,
+        );
+
+        let copied = state
+            .pending_clipboard_copy
+            .as_deref()
+            .expect("welcome text should be copyable");
+        assert!(!copied.trim().is_empty());
     }
 
     #[test]

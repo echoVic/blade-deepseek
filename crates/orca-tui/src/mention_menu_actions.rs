@@ -77,7 +77,7 @@ pub(crate) fn handle_mention_menu_key(
     }
 }
 
-fn mark_manual_selection(state: &mut AppState) {
+pub(crate) fn mark_manual_selection(state: &mut AppState) {
     state.mention.manual_selection = true;
     state.mention.selected_identity = state
         .mention

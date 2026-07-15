@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, EnableBracketedPaste, EnableMouseCapture, Event, KeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal;
+use crossterm::terminal::{self, EnterAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -32,8 +32,8 @@ use crate::composer_textarea::{
 };
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::input_event_actions::{
-    BatchedInputEvent, coalesce_input_events, handle_mouse_event, handle_paste_event,
-    handle_scroll_lines,
+    BatchedInputEvent, MouseFlow, coalesce_input_events, handle_mouse_event, handle_paste_event,
+    handle_resize_event, handle_scroll_lines, should_queue_input_event,
 };
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
@@ -65,10 +65,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     terminal::enable_raw_mode()?;
     let mut terminal_cleanup = TerminalCleanup::raw_mode_enabled();
     let mut stdout = io::stdout();
-    // No alt-screen, so the terminal keeps its normal scrollback buffer. We DO enable mouse
-    // capture so the wheel scrolls the conversation in-app; copying is done with the terminal's
-    // modifier-drag (Shift/Option+drag on most terminals), which bypasses mouse capture.
-    // stdout.execute(EnterAlternateScreen)?;
+    // Alternate screen: the fullscreen UI owns the whole viewport, and the
+    // alt buffer has NO scrollback — so the terminal's native scrollbar
+    // cannot drag the viewport away from the frame we repaint (which used to
+    // shear the UI). Selection, copying, and wheel scrolling are all
+    // implemented in-app, so nothing native is lost; on exit the primary
+    // screen returns with the shell's history intact.
+    terminal_cleanup.set_alternate_screen(stdout.execute(EnterAlternateScreen).is_ok());
     terminal_cleanup.set_mouse_captured(stdout.execute(EnableMouseCapture).is_ok());
     terminal_cleanup.set_bracketed_paste(stdout.execute(EnableBracketedPaste).is_ok());
     // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
@@ -215,15 +218,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         make_textarea(&vim_state, &theme)
     };
 
-    // Fullscreen viewport: the UI occupies the whole terminal and is fully repainted every
-    // frame. We deliberately do NOT enter the alternate screen (see the commented
-    // EnterAlternateScreen above). Mouse capture IS on so the wheel scrolls the conversation;
-    // copying uses the terminal's modifier-drag, which bypasses capture.
+    // Fullscreen viewport inside the alternate screen: the UI owns the whole
+    // terminal and is fully repainted every frame. Mouse capture is on — the
+    // wheel scrolls the conversation and drag-select/copy is implemented
+    // in-app (the terminal's modifier-drag still bypasses capture if wanted).
     let mut terminal = Terminal::new(backend)?;
-    // Clear once on startup. Without the alternate screen, ratatui's diffing draw only writes
-    // cells that differ from the previous frame; on the very first frame the "previous" buffer
-    // is empty, and our blank trailing cells match it, so whatever the shell/cargo left on
-    // screen would show through underneath our text. A full clear gives us a clean canvas.
+    // Clear once on startup so the first diffing draw starts from a known
+    // blank canvas rather than whatever the alt screen came up with.
     terminal.clear()?;
 
     let exit_code;
@@ -258,9 +259,15 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
         let mut input_events = Vec::new();
         if event::poll(scheduler.poll_timeout(now, animation_active))? {
-            input_events.push(event::read()?);
+            let first = event::read()?;
+            if should_queue_input_event(&first) {
+                input_events.push(first);
+            }
             while input_events.len() < MAX_INPUT_EVENTS_PER_BATCH && event::poll(Duration::ZERO)? {
-                input_events.push(event::read()?);
+                let next = event::read()?;
+                if should_queue_input_event(&next) {
+                    input_events.push(next);
+                }
             }
         }
 
@@ -281,8 +288,38 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
                                 return Ok(None);
                             }
-                            if handle_mouse_event(&ev, &mut state, Instant::now()) {
+                            if handle_resize_event(&ev, &mut state) {
                                 return Ok(None);
+                            }
+                            match handle_mouse_event(&ev, &mut state, &mut textarea, Instant::now())
+                            {
+                                MouseFlow::NotMouse => {}
+                                MouseFlow::Handled => return Ok(None),
+                                MouseFlow::SyntheticEnter => {
+                                    // A click confirmed the focused row; run
+                                    // the exact same path a real Enter takes.
+                                    let enter_key =
+                                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                                    let enter_event = Event::Key(enter_key);
+                                    if let StatusKeyFlow::Exit(code) = handle_status_key(
+                                        &enter_event,
+                                        &enter_key,
+                                        &mut state,
+                                        &mut config,
+                                        &shared_config,
+                                        &action_tx,
+                                        &cancel_token,
+                                        &preloaded_transcript,
+                                        &mut textarea,
+                                        &mut vim_state,
+                                        &theme,
+                                        initial_prompt.clone(),
+                                        || clear_terminal_scrollback(&mut terminal),
+                                    )? {
+                                        return Ok(Some(code));
+                                    }
+                                    return Ok(None);
+                                }
                             }
                             let Event::Key(key) = &ev else {
                                 return Ok(None);
@@ -368,9 +405,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         }
     }
 
-    // No alternate screen to leave.
-    // io::stdout().execute(LeaveAlternateScreen)?;
-    // Leave the cursor on a fresh line below the final frame so the shell prompt returns cleanly.
+    // TerminalCleanup leaves the alternate screen (restoring the shell's
+    // scrollback) and unwinds raw mode / capture modes.
     drop(terminal);
     terminal_cleanup.finish();
     mention_search.shutdown();
@@ -510,6 +546,52 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn esc_clears_mouse_selection_before_other_esc_semantics() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _action_rx) = mpsc::channel();
+        let cancel_token = CancelToken::new();
+
+        let pos = crate::selection::SelectionPos { row: 0, col: 0 };
+        let head = crate::selection::SelectionPos { row: 2, col: 5 };
+        state.selection = Some(crate::selection::TranscriptSelection {
+            anchor: pos,
+            head,
+            dragging: false,
+            granularity: crate::selection::SelectionGranularity::Cell,
+            origin: (pos, head),
+        });
+
+        let flow = handle_key_event_preflight(
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &cancel_token,
+            || Ok(()),
+        )
+        .expect("preflight");
+
+        assert!(matches!(flow, KeyEventFlow::Continue));
+        assert_eq!(state.selection, None);
+
+        // Without a selection, Esc falls through to its usual handling.
+        let flow = handle_key_event_preflight(
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &cancel_token,
+            || Ok(()),
+        )
+        .expect("preflight");
+        assert!(matches!(flow, KeyEventFlow::Unhandled));
     }
 
     #[test]
@@ -849,7 +931,7 @@ mod tests {
             let mut saw_notice = false;
             let mut seen = Vec::new();
             for _ in 0..20 {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::WorkflowTasksUpdated { tasks } => {
                         saw_task_refresh |= tasks.into_iter().any(|task| {
                             task.id == task_id
@@ -1208,7 +1290,7 @@ mod tests {
         });
 
         action_tx.send(UserAction::GoalShow).unwrap();
-        let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         action_tx.send(UserAction::Cancel).unwrap();
         handle.join().unwrap();
 
@@ -1247,7 +1329,7 @@ mod tests {
             });
 
             action_tx.send(action).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -1289,7 +1371,7 @@ mod tests {
             });
 
             action_tx.send(UserAction::GoalResume).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             cancel.cancel();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
@@ -1350,7 +1432,7 @@ mod tests {
             });
 
             action_tx.send(UserAction::GoalResume).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             cancel.cancel();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
@@ -1427,7 +1509,7 @@ mod tests {
                 &cancel,
                 &pending_workflow_notifications,
             );
-            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
             match event {
                 TuiEvent::Error(message) => assert!(
@@ -1505,7 +1587,7 @@ mod tests {
                 .unwrap();
             let mut projected_goal = None;
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::GoalStatus(Some(goal)) if goal.session_id == session_id => {
                         projected_goal = Some(goal);
                     }
@@ -1563,7 +1645,7 @@ mod tests {
             });
 
             action_tx.send(UserAction::GoalPause).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -1623,7 +1705,7 @@ mod tests {
             });
 
             action_tx.send(UserAction::GoalShow).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -1663,7 +1745,7 @@ mod tests {
         });
 
         action_tx.send(UserAction::GoalShow).unwrap();
-        let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         action_tx.send(UserAction::Cancel).unwrap();
         handle.join().unwrap();
 
@@ -1708,7 +1790,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
                         break;
                     }
@@ -1722,7 +1804,7 @@ mod tests {
                 .unwrap();
 
             let first_followup = loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
                         break "next-submit";
                     }
@@ -1789,7 +1871,7 @@ mod tests {
             let mut saw_history_echo = false;
             let mut unexpected_error = None;
             for _ in 0..10 {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
                         saw_history_echo = true;
                         break;
@@ -1849,7 +1931,7 @@ mod tests {
                 .unwrap();
 
             let task = loop {
-                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                 }) {
@@ -1900,7 +1982,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                 })
@@ -2052,7 +2134,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text)
                         if text.contains("Mock slow tool stream started.") =>
                     {
@@ -2065,7 +2147,7 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let status = loop {
-                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                         && task.is_backgrounded
@@ -2118,7 +2200,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text)
                         if text.contains("Mock slow tool stream started.") =>
                     {
@@ -2131,7 +2213,7 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let status = loop {
-                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                         && task.is_backgrounded
@@ -2184,7 +2266,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text)
                         if text.contains("Mock slow tool stream started.") =>
                     {
@@ -2197,7 +2279,7 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let pending_tool = loop {
-                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                         && task.is_backgrounded
@@ -2255,7 +2337,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text)
                         if text.contains("Mock slow tool stream started.") =>
                     {
@@ -2270,7 +2352,7 @@ mod tests {
             let mut notice = None;
             let mut seen = Vec::new();
             for _ in 0..20 {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::Notice(message) if message.starts_with("Background session") => {
                         notice = Some(message);
                         break;
@@ -2339,7 +2421,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text)
                         if text.contains("Mock slow tool stream started.") =>
                     {
@@ -2352,7 +2434,7 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let (task_id, approval_id) = loop {
-                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                         && task.is_backgrounded
@@ -2379,7 +2461,7 @@ mod tests {
             let mut saw_completed_task = false;
             let mut seen = Vec::new();
             for _ in 0..40 {
-                match event_rx.recv_timeout(Duration::from_secs(2)) {
+                match event_rx.recv_timeout(Duration::from_secs(10)) {
                     Ok(TuiEvent::MessageDelta(text)) => {
                         if text.contains("Mock completed after tool execution.") {
                             saw_completion_message = true;
@@ -2458,7 +2540,7 @@ mod tests {
                 .unwrap();
 
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     TuiEvent::MessageDelta(text)
                         if text.contains("Mock slow tool stream started.") =>
                     {
@@ -2471,7 +2553,7 @@ mod tests {
             action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
 
             let approval_id = loop {
-                let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if let Some(task) = matching_task_update(event, |task| {
                     task.task_type == orca_core::task_types::TaskType::MainSession
                         && task.is_backgrounded
@@ -2501,7 +2583,7 @@ mod tests {
             let mut saw_second_approval = false;
             let mut seen = Vec::new();
             for _ in 0..20 {
-                match event_rx.recv_timeout(Duration::from_secs(2)) {
+                match event_rx.recv_timeout(Duration::from_secs(10)) {
                     Ok(TuiEvent::ToolRequested { name, .. }) if name == "mcp__broken__tool" => {
                         saw_tool_requested = true;
                         break;

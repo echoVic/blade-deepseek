@@ -7,13 +7,38 @@ use orca_core::config::RunConfig;
 
 use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{insert_composer_paste, insert_pasted_text};
-use crate::selection::TranscriptSelection;
+use crate::selection::{SelectionGranularity, TranscriptSelection};
 use crate::types::{AppState, AppStatus, PanelMode};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum BatchedInputEvent {
     ScrollLines(i32),
     Event(Event),
+}
+
+/// Whether an input event is worth queueing at all.
+///
+/// crossterm's `EnableMouseCapture` turns on any-motion tracking (mode 1003),
+/// so the terminal reports pointer movement with NO button held. Orca has no
+/// hover UI, and the event-loop iteration marks the frame dirty for every
+/// queued event — merely gliding the mouse across the window would redraw at
+/// full frame rate. Drop motion events at intake instead.
+pub(crate) fn should_queue_input_event(event: &Event) -> bool {
+    !matches!(
+        event,
+        Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved
+    )
+}
+
+/// A terminal resize re-wraps every transcript line, so content positions
+/// captured under the old width no longer describe the same text. Drop the
+/// selection rather than let it highlight (and copy) unrelated rows.
+pub(crate) fn handle_resize_event(ev: &Event, state: &mut AppState) -> bool {
+    if !matches!(ev, Event::Resize(..)) {
+        return false;
+    }
+    state.invalidate_selection();
+    true
 }
 
 pub(crate) fn coalesce_input_events(
@@ -55,13 +80,77 @@ pub(crate) fn coalesce_input_events(
 }
 
 pub(crate) fn handle_scroll_lines(state: &mut AppState, lines: i32, now: Instant) {
-    if state.panel_mode != PanelMode::Conversation || !state.accepts_mouse_scroll_at(now) {
+    let steps = ((lines.unsigned_abs() as usize) / 3).max(1);
+    let upward = lines < 0;
+
+    // The wheel drives whichever list currently has focus: the session
+    // picker, an open popup menu, the workflows panel — or the transcript.
+    if state.status == AppStatus::SessionPicker {
+        for _ in 0..steps {
+            if upward {
+                state.select_previous_session();
+            } else {
+                state.select_next_session();
+            }
+        }
         return;
     }
-    if lines < 0 {
-        state.scroll_up(lines.unsigned_abs().min(u16::MAX as u32) as u16);
-    } else {
-        state.scroll_down((lines as u32).min(u16::MAX as u32) as u16);
+    if let Some(menu) = state.slash_menu.as_mut() {
+        for _ in 0..steps {
+            match menu.sub_menu.as_mut() {
+                Some(sub) => {
+                    if upward {
+                        sub.selected = sub.selected.saturating_sub(1);
+                    } else if sub.selected + 1 < sub.items.len() {
+                        sub.selected += 1;
+                    }
+                }
+                None => {
+                    if upward {
+                        menu.selected = menu.selected.saturating_sub(1);
+                    } else if menu.selected + 1 < menu.items.len() {
+                        menu.selected += 1;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if state.mention.phase.is_some() && !state.mention.candidates.is_empty() {
+        for _ in 0..steps {
+            if upward {
+                state.mention.selected = state.mention.selected.saturating_sub(1);
+            } else {
+                let max = state.mention.candidates.len().saturating_sub(1);
+                if state.mention.selected < max {
+                    state.mention.selected += 1;
+                }
+            }
+        }
+        crate::mention_menu_actions::mark_manual_selection(state);
+        return;
+    }
+    match state.panel_mode {
+        PanelMode::Workflows => {
+            for _ in 0..steps {
+                if upward {
+                    state.select_previous_workflow_task();
+                } else {
+                    state.select_next_workflow_task();
+                }
+            }
+        }
+        PanelMode::Agents => {}
+        PanelMode::Conversation => {
+            if !state.accepts_mouse_scroll_at(now) {
+                return;
+            }
+            if upward {
+                state.scroll_up(lines.unsigned_abs().min(u16::MAX as u32) as u16);
+            } else {
+                state.scroll_down((lines as u32).min(u16::MAX as u32) as u16);
+            }
+        }
     }
 }
 
@@ -89,65 +178,190 @@ pub(crate) fn handle_paste_event(
     true
 }
 
-pub(crate) fn handle_mouse_event(ev: &Event, state: &mut AppState, now: Instant) -> bool {
+/// How a mouse event was consumed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MouseFlow {
+    /// Not a mouse event at all; fall through to key handling.
+    NotMouse,
+    /// Consumed by the mouse layer.
+    Handled,
+    /// A click confirmed the focused list row (approval option, session,
+    /// menu item). The caller should run the same path a real Enter takes.
+    SyntheticEnter,
+}
+
+pub(crate) fn handle_mouse_event(
+    ev: &Event,
+    state: &mut AppState,
+    textarea: &mut TextArea,
+    now: Instant,
+) -> MouseFlow {
     let Event::Mouse(mouse) = ev else {
-        return false;
+        return MouseFlow::NotMouse;
     };
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            if state.panel_mode == PanelMode::Conversation && state.accepts_mouse_scroll_at(now) {
-                if mouse.kind == MouseEventKind::ScrollUp {
-                    state.scroll_up(3);
-                } else {
-                    state.scroll_down(3);
-                }
-            }
+            let lines = if mouse.kind == MouseEventKind::ScrollUp {
+                -3
+            } else {
+                3
+            };
+            handle_scroll_lines(state, lines, now);
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+            const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
             state.drag_edge_scroll = None;
+
+            // Modal approval dialog: clicks select options, a click on the
+            // already-selected option confirms it, anywhere else is inert.
+            // (Two-step so a stray click can never approve a command.)
+            if state.status == AppStatus::WaitingApproval {
+                state.selection = None;
+                if let Some(index) =
+                    crate::ui::approval_option_hit_index(state, mouse.column, mouse.row)
+                    && let Some(dialog) = state.approval_dialog.as_mut()
+                {
+                    if dialog.selected == index {
+                        return MouseFlow::SyntheticEnter;
+                    }
+                    dialog.selected = index;
+                }
+                return MouseFlow::Handled;
+            }
+
+            // Session picker: click selects, click on the selection resumes.
+            if state.status == AppStatus::SessionPicker {
+                if let Some(index) = crate::ui::session_picker_hit_index(state, mouse.row) {
+                    if state.session_picker_selected == index {
+                        return MouseFlow::SyntheticEnter;
+                    }
+                    state.session_picker_selected = index;
+                }
+                return MouseFlow::Handled;
+            }
+
+            // Popup menus over the composer: click selects, click on the
+            // selection accepts. Clicks outside their popups fall through.
+            // (The hit-tests are mutually exclusive: the mention popup only
+            // renders — and only hits — while no slash menu is open.)
+            if state.slash_menu.is_some()
+                && let Some(index) = crate::ui::slash_menu_hit_index(state, mouse.column, mouse.row)
+            {
+                let menu = state.slash_menu.as_mut().expect("checked above");
+                let selected = match menu.sub_menu.as_mut() {
+                    Some(sub) => {
+                        let confirm = sub.selected == index;
+                        sub.selected = index;
+                        confirm
+                    }
+                    None => {
+                        let confirm = menu.selected == index;
+                        menu.selected = index;
+                        confirm
+                    }
+                };
+                if selected {
+                    return MouseFlow::SyntheticEnter;
+                }
+                return MouseFlow::Handled;
+            }
+            if state.mention.phase.is_some()
+                && let Some(index) =
+                    crate::ui::mention_menu_hit_index(state, mouse.column, mouse.row)
+            {
+                let confirm = state.mention.selected == index;
+                state.mention.selected = index;
+                crate::mention_menu_actions::mark_manual_selection(state);
+                if confirm {
+                    return MouseFlow::SyntheticEnter;
+                }
+                return MouseFlow::Handled;
+            }
+
+            // Composer: a click moves the cursor and starts a (potential)
+            // in-composer drag selection.
+            if matches!(
+                state.status,
+                AppStatus::Idle | AppStatus::WaitingUserInput | AppStatus::Setup
+            ) && let Some(area) = state.input_area
+                && let Some((row, col)) =
+                    crate::ui::composer_click_target(textarea, area, mouse.column, mouse.row)
+            {
+                textarea.cancel_selection();
+                textarea.move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                textarea.start_selection();
+                state.composer_mouse_selecting = true;
+                state.last_left_click = None;
+                return MouseFlow::Handled;
+            }
 
             // The floating "jump to bottom" pill eats the click before any
             // selection handling: re-arm follow instead of starting a drag.
-            if state.panel_mode == PanelMode::Conversation {
-                if let Some(pill) = state.jump_to_bottom_area {
-                    if pill.contains(ratatui::layout::Position::new(mouse.column, mouse.row)) {
-                        state.scroll_to_bottom();
-                        state.last_left_click = None;
-                        return true;
-                    }
-                }
+            if state.panel_mode == PanelMode::Conversation
+                && let Some(pill) = state.jump_to_bottom_area
+                && pill.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+            {
+                state.scroll_to_bottom();
+                state.last_left_click = None;
+                return MouseFlow::Handled;
             }
-            let double_click = state.last_left_click.is_some_and(|(at, column, row)| {
-                now.duration_since(at) <= DOUBLE_CLICK_WINDOW
-                    && column == mouse.column
-                    && row == mouse.row
-            });
-            state.last_left_click = Some((now, mouse.column, mouse.row));
 
-            // A press inside the transcript starts a fresh selection (or, on a
-            // double click, selects the word and copies it right away); a
-            // press anywhere else dismisses the current one.
+            // Click-count state machine with one cell of jitter tolerance
+            // (trackpads rarely double-click on exactly the same cell).
+            // Single → cell drag, double → word, triple → line; a fourth
+            // quick click cycles back to a plain single click.
+            let count = match state.last_left_click {
+                Some((at, column, row, previous))
+                    if now.duration_since(at) <= MULTI_CLICK_WINDOW
+                        && column.abs_diff(mouse.column) <= 1
+                        && row.abs_diff(mouse.row) <= 1 =>
+                {
+                    previous % 3 + 1
+                }
+                _ => 1,
+            };
+            state.last_left_click = Some((now, mouse.column, mouse.row, count));
+
             state.selection = if state.panel_mode == PanelMode::Conversation {
                 let pos = state.transcript_pos_at(mouse.column, mouse.row);
-                if double_click {
-                    let selection =
-                        pos.and_then(|pos| state.transcript_render_cache.word_selection_at(pos));
-                    if let Some(selection) = &selection {
-                        let text = state.transcript_render_cache.extract_text(selection);
-                        if !text.is_empty() {
-                            state.stage_clipboard_copy(text, now);
-                        }
-                    }
-                    selection
-                } else {
-                    pos.map(TranscriptSelection::begin)
+                match (count, pos) {
+                    (2, Some(pos)) => state
+                        .selection_word_bounds(pos)
+                        .map(|(start, end)| {
+                            TranscriptSelection::unit(SelectionGranularity::Word, start, end)
+                        })
+                        .or(Some(TranscriptSelection::begin(pos))),
+                    (3, Some(pos)) => state
+                        .selection_line_bounds(pos)
+                        .map(|(start, end)| {
+                            TranscriptSelection::unit(SelectionGranularity::Line, start, end)
+                        })
+                        .or(Some(TranscriptSelection::begin(pos))),
+                    (_, Some(pos)) => Some(TranscriptSelection::begin(pos)),
+                    (_, None) => None,
                 }
             } else {
                 None
             };
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if state.composer_mouse_selecting {
+                if let Some(area) = state.input_area {
+                    // Clamp into the composer so the drag keeps tracking.
+                    let column = mouse
+                        .column
+                        .clamp(area.x, area.x + area.width.saturating_sub(1).max(1));
+                    let row = mouse
+                        .row
+                        .clamp(area.y, area.y + area.height.saturating_sub(1).max(1));
+                    if let Some((row, col)) =
+                        crate::ui::composer_click_target(textarea, area, column, row)
+                    {
+                        textarea.move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                    }
+                }
+                return MouseFlow::Handled;
+            }
             if state.panel_mode == PanelMode::Conversation {
                 // Dragging onto (or past) the first/last transcript row
                 // scrolls, so the selection can grow beyond the visible
@@ -166,23 +380,48 @@ pub(crate) fn handle_mouse_event(ev: &Event, state: &mut AppState, now: Instant)
                     }
                 }
                 let pos = state.transcript_pos_at_clamped(mouse.column, mouse.row);
-                if let (Some(selection), Some(pos)) = (state.selection.as_mut(), pos) {
-                    if selection.dragging {
-                        selection.head = pos;
+                let dragging = state.selection.filter(|selection| selection.dragging);
+                if let (Some(mut selection), Some(pos)) = (dragging, pos) {
+                    match selection.granularity {
+                        SelectionGranularity::Cell => selection.head = pos,
+                        SelectionGranularity::Word => {
+                            let unit = state.selection_word_bounds(pos);
+                            selection.extend_to_unit(pos, unit);
+                        }
+                        SelectionGranularity::Line => {
+                            let unit = state.selection_line_bounds(pos);
+                            selection.extend_to_unit(pos, unit);
+                        }
                     }
+                    state.selection = Some(selection);
                 }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             state.drag_edge_scroll = None;
-            if let Some(selection) = state.selection.as_mut().filter(|sel| sel.dragging) {
-                selection.dragging = false;
-                let snapshot = *selection;
-                if snapshot.is_empty() {
-                    // A plain click selects nothing.
+            if state.composer_mouse_selecting {
+                state.composer_mouse_selecting = false;
+                // A click without a drag leaves no active selection behind.
+                if textarea
+                    .selection_range()
+                    .is_none_or(|(start, end)| start == end)
+                {
+                    textarea.cancel_selection();
+                }
+                return MouseFlow::Handled;
+            }
+            if let Some(selection) = state.selection.filter(|sel| sel.dragging) {
+                let mut settled = selection;
+                settled.dragging = false;
+                // A plain single click selects nothing; word/line units are
+                // legitimate selections even when anchor == head.
+                let plain_click =
+                    settled.granularity == SelectionGranularity::Cell && settled.is_empty();
+                if plain_click {
                     state.selection = None;
                 } else {
-                    let text = state.transcript_render_cache.extract_text(&snapshot);
+                    state.selection = Some(settled);
+                    let text = state.extract_selection_text(&settled);
                     if !text.is_empty() {
                         state.stage_clipboard_copy(text, now);
                     }
@@ -191,7 +430,7 @@ pub(crate) fn handle_mouse_event(ev: &Event, state: &mut AppState, now: Instant)
         }
         _ => {}
     }
-    true
+    MouseFlow::Handled
 }
 
 #[cfg(test)]
@@ -203,10 +442,23 @@ mod tests {
     };
     use ratatui::layout::Rect;
     use ratatui::text::Line;
+    use tui_textarea::TextArea;
 
-    use super::{BatchedInputEvent, coalesce_input_events, handle_mouse_event};
+    use super::{
+        BatchedInputEvent, MouseFlow, coalesce_input_events, handle_resize_event,
+        handle_scroll_lines, should_queue_input_event,
+    };
     use crate::theme::Theme;
-    use crate::types::{AppState, ChatMessage, UserAction};
+    use crate::types::{
+        AppState, AppStatus, ApprovalDialog, ApprovalOption, ChatMessage, UserAction,
+    };
+
+    /// Test shim: most cases don't care about the composer, so route the real
+    /// handler through a throwaway textarea.
+    fn handle_mouse_event(ev: &Event, state: &mut AppState, now: Instant) -> MouseFlow {
+        let mut textarea = TextArea::default();
+        super::handle_mouse_event(ev, state, &mut textarea, now)
+    }
 
     fn mouse(kind: MouseEventKind) -> Event {
         Event::Mouse(MouseEvent {
@@ -579,5 +831,400 @@ mod tests {
                 BatchedInputEvent::Event(key),
             ]
         );
+    }
+
+    #[test]
+    fn pointer_motion_events_are_dropped_at_intake() {
+        assert!(!should_queue_input_event(&mouse(MouseEventKind::Moved)));
+        assert!(should_queue_input_event(&mouse(MouseEventKind::Drag(
+            MouseButton::Left
+        ))));
+        assert!(should_queue_input_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        ))));
+    }
+
+    #[test]
+    fn resize_invalidates_the_selection() {
+        let mut state = state_with_transcript();
+        let now = Instant::now();
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut state,
+            now,
+        );
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Drag(MouseButton::Left), 8, 0),
+            &mut state,
+            now,
+        );
+        assert!(state.selection.is_some());
+
+        assert!(handle_resize_event(&Event::Resize(100, 40), &mut state));
+        assert_eq!(state.selection, None);
+        assert!(!handle_resize_event(
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut state
+        ));
+    }
+
+    #[test]
+    fn double_click_tolerates_one_cell_of_jitter() {
+        let mut state = state_with_transcript();
+        let now = Instant::now();
+
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 8, 0),
+            &mut state,
+            now,
+        );
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 8, 0),
+            &mut state,
+            now,
+        );
+        // One column over: still a double click.
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 9, 0),
+            &mut state,
+            now,
+        );
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 9, 0),
+            &mut state,
+            now,
+        );
+        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn triple_click_selects_the_logical_line() {
+        let mut state = state_with_transcript();
+        let now = Instant::now();
+
+        for _ in 0..3 {
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 8, 0),
+                &mut state,
+                now,
+            );
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Up(MouseButton::Left), 8, 0),
+                &mut state,
+                now,
+            );
+        }
+
+        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn double_click_then_drag_extends_word_wise() {
+        let mut state = state_with_transcript();
+        let now = Instant::now();
+
+        // Double click lands on "hello" (cols 0-4).
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 2, 0),
+            &mut state,
+            now,
+        );
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 2, 0),
+            &mut state,
+            now,
+        );
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 2, 0),
+            &mut state,
+            now,
+        );
+        // Drag onto "world": the selection swallows both words.
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Drag(MouseButton::Left), 8, 0),
+            &mut state,
+            now,
+        );
+        handle_mouse_event(
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 8, 0),
+            &mut state,
+            now,
+        );
+
+        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn approval_clicks_select_then_confirm_and_suppress_transcript_selection() {
+        let mut state = state_with_transcript();
+        state.status = AppStatus::WaitingApproval;
+        state.frame_area = Some(Rect::new(0, 0, 80, 24));
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".to_string(),
+            tool: "bash".to_string(),
+            target: Some("ls".to_string()),
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::Deny,
+            ],
+            diff: None,
+        });
+        let now = Instant::now();
+
+        let geometry_probe = crate::ui::approval_option_hit_index(&state, 40, 0);
+        assert_eq!(geometry_probe, None, "border row must not hit");
+
+        // Find the actual first option row by probing.
+        let first_option_row = (0..24)
+            .find(|row| crate::ui::approval_option_hit_index(&state, 40, *row) == Some(0))
+            .expect("dialog options must be hittable");
+
+        // Click the third option: selects it, does not confirm.
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    40,
+                    first_option_row + 2
+                ),
+                &mut state,
+                now,
+            ),
+            MouseFlow::Handled
+        );
+        assert_eq!(
+            state.approval_dialog.as_ref().map(|dialog| dialog.selected),
+            Some(2)
+        );
+        // No transcript selection was started underneath the dialog.
+        assert_eq!(state.selection, None);
+
+        // Click it again: confirm via the synthetic Enter path.
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    40,
+                    first_option_row + 2
+                ),
+                &mut state,
+                now,
+            ),
+            MouseFlow::SyntheticEnter
+        );
+    }
+
+    fn test_workflow_task(id: &str) -> orca_core::task_types::BackgroundTaskSummary {
+        orca_core::task_types::BackgroundTaskSummary {
+            id: id.to_string(),
+            task_type: orca_core::task_types::TaskType::Workflow,
+            status: orca_core::task_types::TaskStatus::Running,
+            is_backgrounded: false,
+            description: id.to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: Some(id.to_string()),
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+            result: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn wheel_routes_to_the_focused_list() {
+        let mut state = state_with_transcript();
+        let now = Instant::now();
+
+        // Workflows panel: wheel moves the task selection.
+        state.panel_mode = crate::types::PanelMode::Workflows;
+        state.workflow_panel.tasks = vec![
+            test_workflow_task("a"),
+            test_workflow_task("b"),
+            test_workflow_task("c"),
+        ];
+        state.workflow_panel.selected = 0;
+        handle_scroll_lines(&mut state, 3, now);
+        assert_eq!(state.workflow_panel.selected, 1);
+        handle_scroll_lines(&mut state, -3, now);
+        assert_eq!(state.workflow_panel.selected, 0);
+
+        // Session picker: wheel moves the session selection.
+        state.panel_mode = crate::types::PanelMode::Conversation;
+        state.status = AppStatus::SessionPicker;
+        state.session_picker_sessions = vec![test_session_summary("a"), test_session_summary("b")];
+        state.session_picker_selected = 0;
+        handle_scroll_lines(&mut state, 3, now);
+        assert_eq!(state.session_picker_selected, 1);
+    }
+
+    fn test_session_summary(title: &str) -> orca_runtime::history::SessionSummary {
+        orca_runtime::history::SessionSummary {
+            session_id: title.to_string(),
+            title: title.to_string(),
+            cwd: ".".to_string(),
+            provider: "deepseek".to_string(),
+            model: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            path: std::path::PathBuf::new(),
+            archived: false,
+            parent_id: None,
+            forked: false,
+            approval_mode: None,
+            active_permission_profile: None,
+            runtime_workspace_roots: Vec::new(),
+            permission_rule_count: 0,
+            additional_working_directories: Vec::new(),
+            network_domain_permissions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn session_picker_click_selects_then_resumes() {
+        let mut state = state_with_transcript();
+        state.status = AppStatus::SessionPicker;
+        state.frame_area = Some(Rect::new(0, 0, 80, 24));
+        state.session_picker_sessions =
+            vec![test_session_summary("alpha"), test_session_summary("beta")];
+        state.session_picker_selected = 0;
+        let now = Instant::now();
+
+        // Rows: border(0), query(1), hints(2), blank(3), session0(4), session1(5).
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 5),
+                &mut state,
+                now,
+            ),
+            MouseFlow::Handled
+        );
+        assert_eq!(state.session_picker_selected, 1);
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 5),
+                &mut state,
+                now,
+            ),
+            MouseFlow::SyntheticEnter
+        );
+    }
+
+    #[test]
+    fn slash_menu_click_selects_then_accepts() {
+        let mut state = state_with_transcript();
+        state.input_area = Some(Rect::new(0, 20, 60, 3));
+        state.slash_menu = Some(crate::types::SlashMenu {
+            items: vec![
+                crate::types::SlashMenuItem {
+                    command: "/help".to_string(),
+                    description: "help".to_string(),
+                },
+                crate::types::SlashMenuItem {
+                    command: "/model".to_string(),
+                    description: "model".to_string(),
+                },
+            ],
+            selected: 0,
+            sub_menu: None,
+        });
+        let now = Instant::now();
+
+        // Popup: 2 items + border = height 4, sits at rows 16..20; content
+        // rows 17 (item 0) and 18 (item 1).
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 18),
+                &mut state,
+                now,
+            ),
+            MouseFlow::Handled
+        );
+        assert_eq!(state.slash_menu.as_ref().map(|menu| menu.selected), Some(1));
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 18),
+                &mut state,
+                now,
+            ),
+            MouseFlow::SyntheticEnter
+        );
+    }
+
+    #[test]
+    fn composer_click_positions_cursor_and_drag_selects() {
+        let mut state = state_with_transcript();
+        state.input_area = Some(Rect::new(0, 20, 40, 2));
+        let mut textarea = TextArea::from(["hello world", "second line"]);
+        let now = Instant::now();
+
+        // Click on row 1, column 6 → cursor jumps there.
+        let flow = super::handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 6, 21),
+            &mut state,
+            &mut textarea,
+            now,
+        );
+        assert_eq!(flow, MouseFlow::Handled);
+        assert_eq!(textarea.cursor(), (1, 6));
+        assert!(state.composer_mouse_selecting);
+
+        // Drag to column 11 on the same row: an in-composer selection forms.
+        super::handle_mouse_event(
+            &mouse_at(MouseEventKind::Drag(MouseButton::Left), 11, 21),
+            &mut state,
+            &mut textarea,
+            now,
+        );
+        super::handle_mouse_event(
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 11, 21),
+            &mut state,
+            &mut textarea,
+            now,
+        );
+        assert!(!state.composer_mouse_selecting);
+        assert_eq!(
+            textarea.selection_range(),
+            Some(((1, 6), (1, 11))),
+            "drag should leave the composer selection in place"
+        );
+
+        // A plain click (no drag) leaves no selection behind.
+        super::handle_mouse_event(
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 2, 20),
+            &mut state,
+            &mut textarea,
+            now,
+        );
+        super::handle_mouse_event(
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 2, 20),
+            &mut state,
+            &mut textarea,
+            now,
+        );
+        assert_eq!(textarea.selection_range(), None);
+        assert_eq!(textarea.cursor(), (0, 2));
     }
 }

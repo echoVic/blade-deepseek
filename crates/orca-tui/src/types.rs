@@ -529,6 +529,9 @@ pub struct AppState {
     pub(crate) message_revisions: Vec<u64>,
     next_message_revision: u64,
     pub(crate) transcript_render_cache: TranscriptRenderCache,
+    /// Separate cache for the welcome screen (no messages yet), so its text
+    /// is selectable/copyable through the same machinery as the transcript.
+    pub(crate) welcome_render_cache: TranscriptRenderCache,
     /// Watermark splitting finished turns from the current turn. Streaming appends target
     /// the live suffix, but historical tool/subagent expansion can still mutate an older
     /// message and must advance that message's render revision.
@@ -591,10 +594,11 @@ pub struct AppState {
     pub viewport_base_row: usize,
     /// Selected text awaiting a clipboard write by the app loop.
     pub pending_clipboard_copy: Option<String>,
-    /// Last left-button press (time + cell), for double-click detection.
-    pub last_left_click: Option<(Instant, u16, u16)>,
-    /// Transient "copied N chars" feedback: char count + when it was staged.
-    pub copy_notice: Option<(usize, Instant)>,
+    /// Last left-button press: time, cell, and click count (1 = single,
+    /// 2 = double, 3 = triple; further quick clicks cycle back to 1).
+    pub last_left_click: Option<(Instant, u16, u16, u8)>,
+    /// Transient "copied N chars" feedback on the status line.
+    pub copy_notice: Option<CopyNotice>,
     /// Active edge-drag auto-scroll: direction (-1 up / +1 down) + pointer
     /// column. Set while a drag sits on the transcript's first/last row and
     /// applied on every animation tick, so scrolling continues even when the
@@ -603,10 +607,33 @@ pub struct AppState {
     /// Screen rect of the floating "Jump to bottom" pill on the last frame;
     /// `None` while auto-follow is on (the pill only shows when scrolled up).
     pub jump_to_bottom_area: Option<ratatui::layout::Rect>,
+    /// Full frame rect from the last render, for popup hit-testing
+    /// (approval dialog, session picker).
+    pub frame_area: Option<ratatui::layout::Rect>,
+    /// Composer (input box) outer rect from the last render, `None` while
+    /// the composer is hidden.
+    pub input_area: Option<ratatui::layout::Rect>,
+    /// A mouse drag is adjusting the composer's own text selection.
+    pub composer_mouse_selecting: bool,
+    /// Messages that arrived below the viewport while auto-follow was
+    /// disarmed — the jump pill's "N new messages" unread count. Streaming
+    /// deltas rewrite the tail message and do NOT count; only message
+    /// boundaries do.
+    pub unseen_messages: usize,
 }
 
 pub trait ScrollAmount {
     fn as_usize(self) -> usize;
+}
+
+/// Transient status-line feedback after a mouse copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyNotice {
+    pub chars: usize,
+    pub at: Instant,
+    /// Too large for OSC 52 — only the local helper (pbcopy/wl-copy/xclip)
+    /// received the text, so remote/SSH clipboards were not updated.
+    pub local_only: bool,
 }
 
 impl ScrollAmount for usize {
@@ -645,6 +672,7 @@ impl AppState {
             message_revisions: Vec::new(),
             next_message_revision: 1,
             transcript_render_cache: TranscriptRenderCache::default(),
+            welcome_render_cache: TranscriptRenderCache::default(),
             finalized_count: 0,
             flushed_count: 0,
             status: AppStatus::Idle,
@@ -696,6 +724,10 @@ impl AppState {
             copy_notice: None,
             drag_edge_scroll: None,
             jump_to_bottom_area: None,
+            frame_area: None,
+            input_area: None,
+            composer_mouse_selecting: false,
+            unseen_messages: 0,
         }
     }
 
@@ -721,20 +753,62 @@ impl AppState {
         crate::selection::screen_to_selection_pos_clamped(area, self.viewport_base_row, column, row)
     }
 
+    /// The transcript cache mouse interaction should read from: the welcome
+    /// cache while no messages exist, the live transcript cache afterwards.
+    pub(crate) fn active_transcript_cache(&self) -> &TranscriptRenderCache {
+        if self.messages.is_empty() {
+            &self.welcome_render_cache
+        } else {
+            &self.transcript_render_cache
+        }
+    }
+
+    pub(crate) fn extract_selection_text(
+        &self,
+        selection: &crate::selection::TranscriptSelection,
+    ) -> String {
+        self.active_transcript_cache().extract_text(selection)
+    }
+
+    pub(crate) fn selection_word_bounds(
+        &self,
+        pos: crate::selection::SelectionPos,
+    ) -> Option<(
+        crate::selection::SelectionPos,
+        crate::selection::SelectionPos,
+    )> {
+        self.active_transcript_cache().word_bounds_at(pos)
+    }
+
+    pub(crate) fn selection_line_bounds(
+        &self,
+        pos: crate::selection::SelectionPos,
+    ) -> Option<(
+        crate::selection::SelectionPos,
+        crate::selection::SelectionPos,
+    )> {
+        self.active_transcript_cache().line_bounds_at(pos)
+    }
+
     /// How long the "copied N chars" notice stays on the status line.
     pub(crate) const COPY_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
     /// Stage `text` for the clipboard and start the status-line notice.
     pub(crate) fn stage_clipboard_copy(&mut self, text: String, now: Instant) {
-        self.copy_notice = Some((text.chars().count(), now));
+        self.copy_notice = Some(CopyNotice {
+            chars: text.chars().count(),
+            at: now,
+            // Terminals cap OSC 52 length; the app loop will skip the remote
+            // write for oversized text, so the notice must not overclaim.
+            local_only: text.len() > crate::clipboard::OSC52_MAX_TEXT_BYTES,
+        });
         self.pending_clipboard_copy = Some(text);
     }
 
-    /// The staged copy's char count while the notice is still fresh.
-    pub fn copy_notice_at(&self, now: Instant) -> Option<usize> {
-        self.copy_notice.and_then(|(chars, at)| {
-            (now.duration_since(at) < Self::COPY_NOTICE_TTL).then_some(chars)
-        })
+    /// The staged copy notice while it is still fresh.
+    pub fn copy_notice_at(&self, now: Instant) -> Option<CopyNotice> {
+        self.copy_notice
+            .filter(|notice| now.duration_since(notice.at) < Self::COPY_NOTICE_TTL)
     }
 
     /// One animation-tick step of edge-drag auto-scroll: scroll a line and
@@ -763,6 +837,17 @@ impl AppState {
         self.selection = Some(selection);
     }
 
+    /// Drop the mouse selection (and any armed edge auto-scroll).
+    ///
+    /// Called whenever the transcript's visual row space changes shape —
+    /// terminal resize (re-wrap), message removal/replacement, or an in-place
+    /// rewrite of a non-tail message. Positions kept from the old row space
+    /// would highlight and copy unrelated content.
+    pub(crate) fn invalidate_selection(&mut self) {
+        self.selection = None;
+        self.drag_edge_scroll = None;
+    }
+
     fn allocate_message_revision(&mut self) -> u64 {
         let revision = self.next_message_revision;
         self.next_message_revision = self.next_message_revision.wrapping_add(1).max(1);
@@ -789,6 +874,7 @@ impl AppState {
         if self.message_revisions.len() > self.messages.len() {
             self.message_revisions.truncate(self.messages.len());
             self.transcript_render_cache.truncate(self.messages.len());
+            self.invalidate_selection();
         }
         while self.message_revisions.len() < self.messages.len() {
             let revision = self.allocate_message_revision();
@@ -816,6 +902,11 @@ impl AppState {
         self.message_revisions.push(revision);
         self.transcript_render_cache
             .reconcile_len(self.messages.len());
+        // A message landed below the viewport while the user was scrolled
+        // up: feed the jump pill's unread count.
+        if !self.auto_scroll {
+            self.unseen_messages = self.unseen_messages.saturating_add(1);
+        }
     }
 
     pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
@@ -823,6 +914,8 @@ impl AppState {
         self.reset_message_tracking();
         self.finalized_count = 0;
         self.flushed_count = 0;
+        self.unseen_messages = 0;
+        self.invalidate_selection();
     }
 
     pub(crate) fn clear_messages(&mut self) {
@@ -831,10 +924,15 @@ impl AppState {
         self.transcript_render_cache.clear();
         self.finalized_count = 0;
         self.flushed_count = 0;
+        self.unseen_messages = 0;
+        self.invalidate_selection();
     }
 
     pub(crate) fn truncate_messages(&mut self, len: usize) {
         self.reconcile_message_tracking();
+        if len < self.messages.len() {
+            self.invalidate_selection();
+        }
         self.messages.truncate(len);
         self.message_revisions.truncate(len);
         self.transcript_render_cache.truncate(len);
@@ -868,6 +966,12 @@ impl AppState {
         if index >= self.message_revisions.len() {
             return false;
         }
+        // Rewriting any message but the tail can change its height and shift
+        // every row below it. Tail rewrites (streaming deltas) leave earlier
+        // rows in place, so a selection above the stream stays valid.
+        if index + 1 != self.messages.len() {
+            self.invalidate_selection();
+        }
         let revision = self.allocate_message_revision();
         self.message_revisions[index] = revision;
         self.transcript_render_cache.invalidate(index);
@@ -896,6 +1000,9 @@ impl AppState {
         self.transcript_render_cache.retain(&retained_mask);
         self.finalized_count = retained_finalized;
         self.flushed_count = retained_flushed;
+        if retained_mask.iter().any(|retain| !retain) {
+            self.invalidate_selection();
+        }
     }
 
     pub fn enter_running(&mut self) {
@@ -939,6 +1046,8 @@ impl AppState {
         self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max_scroll);
         if self.scroll_offset >= max_scroll {
             self.auto_scroll = true;
+            // Back at the tail: nothing below is unseen any more.
+            self.unseen_messages = 0;
         }
     }
 
@@ -946,6 +1055,7 @@ impl AppState {
         let max_scroll = self.total_lines.saturating_sub(self.visible_height);
         self.scroll_offset = max_scroll;
         self.auto_scroll = true;
+        self.unseen_messages = 0;
     }
 
     pub fn scroll_to_top(&mut self) {
@@ -2066,6 +2176,58 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    fn dummy_selection() -> crate::selection::TranscriptSelection {
+        let pos = crate::selection::SelectionPos { row: 0, col: 0 };
+        let end = crate::selection::SelectionPos { row: 1, col: 3 };
+        crate::selection::TranscriptSelection {
+            anchor: pos,
+            head: end,
+            dragging: false,
+            granularity: crate::selection::SelectionGranularity::Cell,
+            origin: (pos, end),
+        }
+    }
+
+    #[test]
+    fn transcript_mutations_invalidate_the_selection_only_when_rows_can_shift() {
+        let mut state = state();
+        state.push_message(ChatMessage::System("one".to_string()));
+        state.push_message(ChatMessage::System("two".to_string()));
+        state.push_message(ChatMessage::System("three".to_string()));
+
+        // Appending and rewriting the TAIL keep the selection: earlier rows
+        // cannot move.
+        state.selection = Some(dummy_selection());
+        state.push_message(ChatMessage::System("four".to_string()));
+        assert!(state.selection.is_some());
+        state.touch_message(state.messages.len() - 1);
+        assert!(state.selection.is_some());
+
+        // Rewriting a non-tail message can change its height: cleared.
+        state.touch_message(1);
+        assert_eq!(state.selection, None);
+
+        // Removing messages shifts rows: cleared.
+        state.selection = Some(dummy_selection());
+        state.truncate_messages(3);
+        assert_eq!(state.selection, None);
+
+        state.selection = Some(dummy_selection());
+        state.retain_messages(
+            |message| !matches!(message, ChatMessage::System(text) if text == "two"),
+        );
+        assert_eq!(state.selection, None);
+
+        // A retain that keeps everything moves nothing: selection survives.
+        state.selection = Some(dummy_selection());
+        state.retain_messages(|_| true);
+        assert!(state.selection.is_some());
+
+        state.selection = Some(dummy_selection());
+        state.clear_messages();
+        assert_eq!(state.selection, None);
     }
 
     fn session(id: &str, title: &str) -> SessionSummary {
