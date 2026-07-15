@@ -1,0 +1,66 @@
+crates/orca-tui/src/global_actions.rs
+  s_92469a9d6e3822::t_c84b5be78aed21 118-120 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5764d6bb03144c96aa5a81","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[118,120]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3cfee3f975b49498396fd5b5d7f82f98a0320798",
+  "prompts": {},
+  "sessions": {
+    "s_92469a9d6e3822": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4b98e68e253428758fa904",
+        "model": "gpt-5.6-luna__max"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {
+    "crates/orca-tui/src/global_actions.rs": [
+      {
+        "hash": "s_92469a9d6e3822::t_c84b5be78aed21",
+        "line_ranges": [
+          {
+            "Range": [
+              118,
+              120
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5764d6bb03144c96aa5a81",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  118,
+                  120
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_92469a9d6e3822": {
+      "tool": "trae",
+      "conversation_id": "6a4b98e68e253428758fa904",
+      "session_id": "6a4b98e68e253428758fa904",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_92469a9d6e3822::t_c84b5be78aed21": {
+      "tool": "trae",
+      "conversation_id": "6a4b98e68e253428758fa904",
+      "session_id": "6a4b98e68e253428758fa904",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
