@@ -160,5 +160,8 @@ cargo check --workspace --all-targets --locked --offline
 cargo clippy -p orca-runtime -p orca-tui --all-targets --locked --offline
 ```
 
-The complete workspace, release-script, site, and real-provider gates remain
-required after the candidate rebases onto the latest `main`.
+After rebasing onto the latest `main`, the candidate also passed the complete
+serial workspace suite, all-target Clippy with the repository's existing
+warnings, site build and SEO checks, all release-script tests, and the real
+DeepSeek provider/CLI/history/server/thread gate. Remote Actions and published
+artifact verification remain release gates rather than implementation gates.

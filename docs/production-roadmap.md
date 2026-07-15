@@ -24,7 +24,9 @@ server `command/exec` proxy stops admission, aborts and awaits all active
 connections, closes CONNECT tunnel endpoints, and joins the supervisor thread.
 CLI, TUI, permission-profile, proxy environment, server/JSONL, and persistence
 contracts remain unchanged; overload and framing violations now receive
-bounded HTTP diagnostics.
+bounded HTTP diagnostics. The candidate passed the complete serial workspace,
+Clippy, site, release-script, and real DeepSeek provider gates after rebasing
+onto the latest published main; remote publication verification is pending.
 
 Earlier v0.2.23 gives the TUI native-feeling mouse text
 interaction. Left-drag selects transcript text with a theme-aware,
