@@ -1,6 +1,6 @@
 # ADR 0005: Runtime Host Operation Control Plane
 
-- Status: Accepted; P0.3a implemented but not released
+- Status: Accepted; P0.3a and P0.3b implemented but unreleased
 - Date: 2026-07-15
 - Roadmap: P0.3 Runtime Operation Host and canonical turn executor
 
@@ -180,6 +180,134 @@ with new lifecycle state that belongs in the host.
 The temporary state is explicit: P0.3a may coexist with old surface entry
 points, but there must be only one owner inside each path. No surface may wrap
 the new host with another generation or join state and call that final.
+
+## P0.3b: Actor-Owned Session And Event Lifecycle
+
+### Structural Problem And Evidence
+
+P0.3a deliberately left event and session ownership outside the host. The
+legacy host executor calls `RuntimeThread::run_request_with_cancel`, which
+creates a new `EventFactory` for each operation. The headless controller owns a
+second lifecycle envelope around that path: it constructs `RuntimeThread` and
+`EventFactory`, emits `session.started`, runs `SessionStart`, suppresses the
+turn-level terminal, runs `SessionEnd`, and emits `session.completed`.
+
+Moving headless onto P0.3a unchanged would therefore either reset event
+sequence numbers inside the actor or preserve a controller-owned outer session
+around a host-owned turn. Both outcomes leave two lifecycle facts and make the
+first production migration untrustworthy.
+
+### Target Ownership And Module Boundary
+
+`ThreadActor` owns one idle state bundle containing both `RuntimeThread` and a
+persistent `EventFactory`. The same bundle moves into the one joined operation
+task and returns to the actor before another operation is admitted. The
+operation executor receives the actor-owned factory together with the cancel
+scope; it may emit turn events but may not create a replacement factory.
+
+`HostedTurnRequest` carries a typed operation envelope:
+
+- `Turn` preserves the existing turn-level completion option for legacy
+  callers while they migrate;
+- `HeadlessSession` makes the host the sole owner of `session.started`,
+  `SessionStart`, turn execution, `SessionEnd`, and the final
+  `session.completed` event.
+
+The headless controller becomes a synchronous client of `RuntimeHost`. Its
+public writer APIs continue to accept borrowed writers. A bounded,
+acknowledged event relay bridges the host-owned operation task to that writer:
+each flushed event is accepted only after the caller writer succeeds, and a
+downstream write error is returned through the relay so the operation records
+typed execution failure rather than reporting cancellation.
+
+The host exposes immutable thread-start diagnostics needed by the controller,
+but never mutable `RuntimeThread`, `InteractiveSession`, event-factory, cancel,
+or join ownership.
+
+### TUI User Value
+
+Headless is the smallest production path that can prove the runtime host owns a
+complete operation rather than only wrapping an internal function. This
+removes the event-sequence and session-envelope ambiguity that would otherwise
+be carried into the TUI migration. It directly lowers the risk that a later TUI
+interrupt returns before cleanup, that renderer replacement resets event
+identity, or that terminal state differs between the runtime and the surface.
+
+### External Compatibility
+
+P0.3b keeps CLI arguments, exit codes, text output, JSONL event names and
+payloads, event ordering, persisted session format, provider behavior, and
+desktop-notification behavior compatible. `run_to_writer` and
+`run_to_writer_with_options` retain borrowed-writer support. Server and TUI
+execution ownership do not migrate in this slice.
+
+### Migration Order And Temporary State
+
+1. Add behavior tests for persistent actor event sequence, host-owned session
+   ordering, typed writer failure, and shutdown/join behavior.
+2. Move `EventFactory` into the actor state bundle and pass it through the
+   operation executor with the operation cancel token.
+3. Add the typed headless session envelope and bounded acknowledged writer
+   relay.
+4. Replace `controller::run_inner` with host startup, one hosted headless
+   operation, relay draining, terminal mapping, and host shutdown.
+5. Delete direct headless `RuntimeThread`, `EventFactory`, hook, and session
+   terminal ownership in the controller.
+
+The server and TUI remain temporary legacy surface owners until their own
+vertical migrations. They may use the actor-owned event sequence later, but
+must not add another session envelope around it.
+
+### P0.3b Acceptance Criteria
+
+1. Events emitted by consecutive operations on one actor have one run id and a
+   strictly contiguous sequence.
+2. A headless session emits one `session.started` before turn events and one
+   `session.completed` after `SessionStart` and `SessionEnd` each execute once
+   in order.
+3. Existing headless JSONL and text contracts remain compatible.
+4. A downstream writer or event subscriber failure completes as
+   `OperationOutcome::ExecutionFailed`, never `Cancelled`.
+5. Host or thread shutdown cancels, joins, and publishes one terminal while
+   preserving ownership of the event/thread state until task exit.
+6. The headless controller no longer constructs or mutates `RuntimeThread`,
+   `InteractiveSession`, or `EventFactory`, and no longer emits session
+   lifecycle events or runs session hooks.
+7. Focused runtime-host, controller, lifecycle, and exec JSONL tests pass;
+   shared-runtime and full workspace serial gates pass.
+8. Workspace Clippy passes without new warnings.
+9. A real DeepSeek headless JSONL smoke passes through `RuntimeHost` and shows
+   one contiguous session sequence and one successful terminal.
+
+### P0.3b Deletion Gate
+
+This slice is incomplete until the old headless session envelope is deleted
+from `controller::run_inner`. A helper that keeps controller-owned hooks or
+events beside the host is not an acceptable final state. The legacy
+turn-without-host APIs remain only for server/TUI and focused internal callers;
+their deletion gates remain the later surface migrations listed above.
+
+### P0.3b Verification
+
+- Thirteen runtime-host behavior tests cover actor-owned event continuity,
+  headless session and hook order, direct and relayed writer failure,
+  headless shutdown ordering, and all P0.3a cancellation/join terminals.
+- Controller behavior tests execute the migrated headless path and verify one
+  contiguous session lifecycle plus borrowed-writer failure propagation. The
+  obsolete source-shape test requiring `RuntimeThread::start` inside
+  `run_inner` was deleted.
+- The 14 exec JSONL contracts and the focused runtime-lifecycle controller
+  contract pass with the existing wire shapes, ordering, exit codes, and
+  contiguous sequence assertions.
+- `cargo test -p orca-runtime --all-targets -- --test-threads=1` passes with
+  779 runtime unit tests, 13 runtime-host tests, and 12 task-output tests.
+- `cargo test --workspace --all-targets -- --test-threads=1` passes, including
+  130 server contracts and 467 TUI tests.
+- `cargo clippy --workspace --all-targets` passes with the repository's
+  existing warnings and no warning in the P0.3b implementation or tests.
+- The real DeepSeek release harness passes both the headless CLI sentinel and
+  malformed-history resume sentinel through `RuntimeHost`; the repaired legacy
+  tool call remains non-reexecuted.
 
 ## P0.3a Acceptance Criteria
 

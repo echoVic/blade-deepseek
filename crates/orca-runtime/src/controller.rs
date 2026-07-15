@@ -1,6 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
@@ -21,6 +22,7 @@ use crate::background_turn::RuntimeTurnContinuation;
 #[cfg(test)]
 use crate::cost::CostTracker;
 use crate::extension::ExtensionData;
+#[cfg(test)]
 use crate::hooks::HookContext;
 #[cfg(test)]
 use crate::hooks::HookRunner;
@@ -32,11 +34,16 @@ use crate::lifecycle::{
     AgentLoopContext, RuntimePermissionRequestHandler, RuntimeSessionLifecycle,
     RuntimeUserInputHandler, ThreadSteerHandle,
 };
+use crate::runtime_host::{
+    HostedTurnRequest, OperationHandle, OperationOutcome, OperationTerminal, RuntimeHost,
+    RuntimeHostError,
+};
 use crate::session::{
     AgentConversationContext, InteractiveSession, InteractiveSessionRuntimeParts,
 };
 #[cfg(test)]
 use crate::tasks::TaskRegistry;
+#[cfg(test)]
 use crate::thread::RuntimeThread;
 #[cfg(test)]
 use crate::thread_store::SessionStore;
@@ -46,10 +53,73 @@ use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
 };
 use crate::workflow_execution::{BackgroundWorkflowRun, observe_background_workflows};
+#[cfg(test)]
 use orca_core::hook_types::HookEvent;
 
 #[cfg(test)]
 const DEFAULT_MAX_TURNS: u32 = 128;
+const HOSTED_EVENT_RELAY_CAPACITY: usize = 1;
+const HOSTED_EVENT_RELAY_POLL: Duration = Duration::from_millis(10);
+
+struct HostedEventRelayWriter {
+    tx: mpsc::SyncSender<HostedEventChunk>,
+    buffer: Vec<u8>,
+}
+
+struct HostedEventChunk {
+    bytes: Vec<u8>,
+    ack: mpsc::SyncSender<Result<(), HostedEventRelayError>>,
+}
+
+#[derive(Clone, Debug)]
+struct HostedEventRelayError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl HostedEventRelayError {
+    fn from_io(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(self.kind, self.message)
+    }
+}
+
+impl io::Write for HostedEventRelayWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(HostedEventChunk {
+                bytes: std::mem::take(&mut self.buffer),
+                ack: ack_tx,
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "hosted event relay disconnected")
+            })?;
+        ack_rx
+            .recv()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "hosted event relay acknowledgement closed",
+                )
+            })?
+            .map_err(HostedEventRelayError::into_io)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ControllerRunOptions {
@@ -174,13 +244,23 @@ impl<'a> ThreadTurnExecutor<'a> {
         writer: W,
         events: &mut EventFactory,
     ) -> io::Result<RunStatus> {
+        self.run_request_with_event_factory_and_cancel(request, writer, events, CancelToken::new())
+    }
+
+    pub fn run_request_with_event_factory_and_cancel<W: io::Write>(
+        &mut self,
+        request: &ThreadTurnRequest,
+        writer: W,
+        events: &mut EventFactory,
+        cancel: CancelToken,
+    ) -> io::Result<RunStatus> {
         run_thread_turn_inner_with_events(
             self.config,
             self.session,
             self.lifecycle,
             request,
             writer,
-            CancelToken::new(),
+            cancel,
             Some(events),
             self.thread_extensions.clone(),
             self.turn_extension_id.clone(),
@@ -435,73 +515,80 @@ pub fn run_to_writer_with_options<W: io::Write>(
 
 fn run_inner<W: io::Write>(
     config: RunConfig,
-    writer: W,
+    mut writer: W,
     options: ControllerRunOptions,
 ) -> io::Result<RunStatus> {
-    let cwd_path = config.cwd.clone().unwrap_or(std::env::current_dir()?);
-    let cwd = cwd_path.display().to_string();
     let prompt = if config.prompt.trim().is_empty() {
         "(empty prompt)".to_string()
     } else {
         config.prompt.trim().to_string()
     };
 
-    let mut sink = EventSink::new(writer, config.output_format);
-    let mut thread = RuntimeThread::start(&config, &prompt)?;
-    for error in thread.session().mcp_registry().errors() {
+    let host = RuntimeHost::start().map_err(runtime_host_io_error)?;
+    let thread = host
+        .start_thread(config.clone(), prompt.as_str())
+        .map_err(runtime_host_io_error)?;
+    for error in thread.startup_warnings() {
         eprintln!("orca: warning: {error}");
     }
-    let mut events = EventFactory::new(thread.thread_id().to_string());
-    sink.emit(&events.session_started(
-        &cwd,
-        config.approval_mode.as_str(),
-        config.provider.as_str(),
-        config.verifier.as_deref(),
-    ))?;
-    if let Err(error) = thread.session().hooks().run(
-        HookEvent::SessionStart,
-        HookContext {
-            cwd: &cwd,
-            session_status: None,
-            tool_request: None,
-            tool_result: None,
-            before_messages: None,
-            after_messages: None,
-            usage: None,
-        },
-    ) {
-        sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
-    }
-
-    let status = thread.run_request_with_event_factory(
-        &config,
-        &ThreadTurnRequest::new(&prompt)
-            .with_options(options)
-            .with_session_completed_event(false),
-        sink.writer_mut(),
-        &mut events,
-    )?;
-
-    if let Err(error) = thread.session().hooks().run(
-        HookEvent::SessionEnd,
-        HookContext {
-            cwd: &cwd,
-            session_status: Some(status.as_str()),
-            tool_request: None,
-            tool_result: None,
-            before_messages: None,
-            after_messages: None,
-            usage: None,
-        },
-    ) {
-        sink.emit(&events.error(&format!("session_end hook failed: {error}")))?;
-    }
-
-    sink.emit(&events.session_completed(status))?;
+    let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::headless_session(prompt.clone()).with_options(options),
+            HostedEventRelayWriter {
+                tx: relay_tx,
+                buffer: Vec::new(),
+            },
+        )
+        .map_err(runtime_host_io_error)?;
+    let terminal = drain_hosted_events(&operation, relay_rx, &mut writer);
+    let status = operation_status(&terminal);
+    let shutdown = host.shutdown().map_err(runtime_host_io_error);
+    let status = status?;
+    shutdown?;
     if config.desktop_notifications {
         let _ = crate::notify::notify("Orca", &format!("Session {}", status.as_str()));
     }
     Ok(status)
+}
+
+fn drain_hosted_events<W: io::Write>(
+    operation: &OperationHandle,
+    relay_rx: mpsc::Receiver<HostedEventChunk>,
+    writer: &mut W,
+) -> OperationTerminal {
+    loop {
+        match relay_rx.recv_timeout(HOSTED_EVENT_RELAY_POLL) {
+            Ok(chunk) => {
+                let result = writer.write_all(&chunk.bytes).and_then(|()| writer.flush());
+                let acknowledgement = result
+                    .as_ref()
+                    .map(|()| ())
+                    .map_err(HostedEventRelayError::from_io);
+                let _ = chunk.ack.send(acknowledgement);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(terminal) = operation.completion().try_terminal() {
+                    return terminal;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return operation.wait(),
+        }
+    }
+}
+
+fn operation_status(terminal: &OperationTerminal) -> io::Result<RunStatus> {
+    match terminal.outcome() {
+        OperationOutcome::Completed(status) => Ok(*status),
+        OperationOutcome::ExecutionFailed { kind, message } => {
+            Err(io::Error::new(*kind, message.clone()))
+        }
+        OperationOutcome::Panicked { message } => Err(io::Error::other(message.clone())),
+    }
+}
+
+fn runtime_host_io_error(error: RuntimeHostError) -> io::Error {
+    io::Error::other(error)
 }
 
 pub fn run_thread_turn_to_writer<W: io::Write>(
@@ -911,6 +998,75 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn headless_controller_propagates_borrowed_writer_failure() {
+        struct BrokenWriter;
+
+        impl io::Write for BrokenWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "borrowed writer disconnected",
+                ))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.prompt = "inspect repo".to_string();
+            config.output_format = OutputFormat::Jsonl;
+            let error = run_inner(config, BrokenWriter, ControllerRunOptions::default())
+                .expect_err("borrowed writer failure");
+
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "borrowed writer disconnected");
+        });
+    }
+
+    #[test]
+    fn headless_controller_emits_one_contiguous_session_lifecycle() {
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.prompt = "inspect repo".to_string();
+            config.output_format = OutputFormat::Jsonl;
+            let mut output = Vec::new();
+
+            let status = run_inner(config, &mut output, ControllerRunOptions::default())
+                .expect("headless controller run");
+
+            assert_eq!(status, RunStatus::Success);
+            let events = String::from_utf8(output)
+                .expect("utf8 events")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json event"))
+                .collect::<Vec<_>>();
+            assert_eq!(events.first().unwrap()["type"], "session.started");
+            assert_eq!(events.last().unwrap()["type"], "session.completed");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "session.started")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "session.completed")
+                    .count(),
+                1
+            );
+            for (sequence, event) in events.iter().enumerate() {
+                assert_eq!(event["seq"], sequence);
+                assert_eq!(event["run_id"], events[0]["run_id"]);
+            }
+        });
     }
 
     fn assert_controller_failure_persists_error(use_event_factory: bool) {

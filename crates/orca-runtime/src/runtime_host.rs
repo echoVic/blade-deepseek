@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use orca_core::cancel::{CancelToken, OperationCancellation, OperationId, OperationScope};
 use orca_core::config::RunConfig;
-use orca_core::event_schema::RunStatus;
-use orca_core::event_sink::EventObserver;
+use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::event_sink::{EventObserver, EventSink};
+use orca_core::hook_types::HookEvent;
 use orca_mcp::McpElicitationHandler;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
@@ -18,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::background_turn::RuntimeTurnContinuation;
 use crate::controller::{ControllerRunOptions, ThreadTurnRequest};
+use crate::hooks::HookContext;
 use crate::lifecycle::{
     RuntimePermissionRequestHandler, RuntimeUserInputHandler, ThreadSteerHandle,
 };
@@ -32,6 +34,7 @@ pub trait ThreadOperationExecutor: Send + Sync + 'static {
         thread: &mut RuntimeThread,
         config: &RunConfig,
         request: &HostedTurnRequest,
+        events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
     ) -> io::Result<RunStatus>;
@@ -42,6 +45,7 @@ pub struct HostedTurnRequest {
     prompt: String,
     options: ControllerRunOptions,
     emit_session_completed: bool,
+    envelope: HostedOperationEnvelope,
     steer_handle: Option<ThreadSteerHandle>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
@@ -51,12 +55,19 @@ pub struct HostedTurnRequest {
     resumes_existing_turn: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedOperationEnvelope {
+    Turn,
+    HeadlessSession,
+}
+
 impl HostedTurnRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
+            envelope: HostedOperationEnvelope::Turn,
             steer_handle: None,
             permission_handler: None,
             user_input_handler: None,
@@ -64,6 +75,14 @@ impl HostedTurnRequest {
             event_observer: None,
             continuation: None,
             resumes_existing_turn: false,
+        }
+    }
+
+    pub fn headless_session(prompt: impl Into<String>) -> Self {
+        Self {
+            envelope: HostedOperationEnvelope::HeadlessSession,
+            emit_session_completed: false,
+            ..Self::new(prompt)
         }
     }
 
@@ -133,7 +152,9 @@ impl HostedTurnRequest {
     fn legacy_request(&self) -> ThreadTurnRequest {
         let mut request = ThreadTurnRequest::new(self.prompt.clone())
             .with_options(self.options)
-            .with_session_completed_event(self.emit_session_completed);
+            .with_session_completed_event(
+                self.envelope == HostedOperationEnvelope::Turn && self.emit_session_completed,
+            );
         if let Some(handle) = self.steer_handle.clone() {
             request = request.with_steer_handle(handle);
         }
@@ -157,6 +178,10 @@ impl HostedTurnRequest {
         }
         request
     }
+
+    fn event_observer(&self) -> Option<Arc<dyn EventObserver>> {
+        self.event_observer.clone()
+    }
 }
 
 struct LegacyThreadOperationExecutor;
@@ -167,10 +192,17 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
         thread: &mut RuntimeThread,
         config: &RunConfig,
         request: &HostedTurnRequest,
+        events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
     ) -> io::Result<RunStatus> {
-        thread.run_request_with_cancel(config, &request.legacy_request(), writer, cancel.clone())
+        thread.run_request_with_event_factory_and_cancel(
+            config,
+            &request.legacy_request(),
+            writer,
+            events,
+            cancel.clone(),
+        )
     }
 }
 
@@ -381,12 +413,17 @@ impl fmt::Debug for OperationHandle {
 #[derive(Clone)]
 pub struct RuntimeThreadHandle {
     thread_id: String,
+    startup_warnings: Arc<Vec<String>>,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
 }
 
 impl RuntimeThreadHandle {
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    pub fn startup_warnings(&self) -> &[String] {
+        self.startup_warnings.as_slice()
     }
 
     pub fn start_turn<W>(
@@ -618,6 +655,15 @@ async fn run_host_supervisor(
                     }
                 };
                 let thread_id = thread.thread_id().to_string();
+                let startup_warnings = Arc::new(
+                    thread
+                        .session()
+                        .mcp_registry()
+                        .errors()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                );
                 if actors.contains_key(&thread_id) {
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
                         message: format!("duplicate runtime thread id: {thread_id}"),
@@ -627,6 +673,7 @@ async fn run_host_supervisor(
                 let (command_tx, actor_rx) = tokio_mpsc::channel(THREAD_COMMAND_CAPACITY);
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
+                    startup_warnings,
                     command_tx: command_tx.clone(),
                 };
                 let actor_handle = handle.clone();
@@ -665,12 +712,17 @@ async fn run_host_supervisor(
 }
 
 struct ThreadActor {
-    thread: Option<RuntimeThread>,
+    state: Option<ThreadActorState>,
     config: RunConfig,
     handle: RuntimeThreadHandle,
     executor: Arc<dyn ThreadOperationExecutor>,
     cancellation: OperationCancellation,
     active: Option<ActiveOperation>,
+}
+
+struct ThreadActorState {
+    thread: RuntimeThread,
+    events: EventFactory,
 }
 
 struct ActiveOperation {
@@ -680,7 +732,7 @@ struct ActiveOperation {
 }
 
 struct OperationTaskResult {
-    thread: RuntimeThread,
+    state: ThreadActorState,
     outcome: OperationOutcome,
 }
 
@@ -691,8 +743,9 @@ impl ThreadActor {
         handle: RuntimeThreadHandle,
         executor: Arc<dyn ThreadOperationExecutor>,
     ) -> Self {
+        let events = EventFactory::new(thread.thread_id().to_string());
         Self {
-            thread: Some(thread),
+            state: Some(ThreadActorState { thread, events }),
             config,
             handle,
             executor,
@@ -751,7 +804,7 @@ impl ThreadActor {
                 writer,
                 reply,
             } => {
-                let Some(thread) = self.thread.take() else {
+                let Some(state) = self.state.take() else {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                     return false;
                 };
@@ -763,10 +816,12 @@ impl ThreadActor {
                 let task_scope = scope.clone();
                 let mut writer = writer;
                 let join = tokio::task::spawn_blocking(move || {
-                    let mut thread = thread;
+                    let mut state = state;
                     let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        executor.run_turn(
-                            &mut thread,
+                        run_hosted_operation(
+                            executor.as_ref(),
+                            &mut state.thread,
+                            &mut state.events,
                             &config,
                             request.as_ref(),
                             writer.as_mut(),
@@ -783,7 +838,7 @@ impl ThreadActor {
                             message: panic_message(payload),
                         },
                     };
-                    OperationTaskResult { thread, outcome }
+                    OperationTaskResult { state, outcome }
                 });
                 self.active = Some(ActiveOperation {
                     scope,
@@ -807,7 +862,7 @@ impl ThreadActor {
                 false
             }
             ThreadCommand::ReadState { reply } => {
-                let state = if self.thread.is_some() {
+                let state = if self.state.is_some() {
                     RuntimeThreadState::Idle
                 } else {
                     RuntimeThreadState::Unavailable
@@ -863,7 +918,7 @@ impl ThreadActor {
         let operation_id = active.scope.id();
         let outcome = match result {
             Ok(result) => {
-                self.thread = Some(result.thread);
+                self.state = Some(result.state);
                 result.outcome
             }
             Err(error) => OperationOutcome::Panicked {
@@ -876,6 +931,79 @@ impl ThreadActor {
         });
         debug_assert!(completed, "operation terminal must complete exactly once");
     }
+}
+
+fn run_hosted_operation(
+    executor: &dyn ThreadOperationExecutor,
+    thread: &mut RuntimeThread,
+    events: &mut EventFactory,
+    config: &RunConfig,
+    request: &HostedTurnRequest,
+    writer: &mut (dyn io::Write + Send),
+    cancel: &CancelToken,
+) -> io::Result<RunStatus> {
+    match request.envelope {
+        HostedOperationEnvelope::Turn => {
+            executor.run_turn(thread, config, request, events, writer, cancel)
+        }
+        HostedOperationEnvelope::HeadlessSession => {
+            run_headless_session(executor, thread, events, config, request, writer, cancel)
+        }
+    }
+}
+
+fn run_headless_session(
+    executor: &dyn ThreadOperationExecutor,
+    thread: &mut RuntimeThread,
+    events: &mut EventFactory,
+    config: &RunConfig,
+    request: &HostedTurnRequest,
+    writer: &mut (dyn io::Write + Send),
+    cancel: &CancelToken,
+) -> io::Result<RunStatus> {
+    let cwd_path = config.cwd.clone().unwrap_or(std::env::current_dir()?);
+    let cwd = cwd_path.display().to_string();
+    let mut sink = EventSink::new(writer, config.output_format)
+        .with_optional_observer(request.event_observer());
+    sink.emit(&events.session_started(
+        &cwd,
+        config.approval_mode.as_str(),
+        config.provider.as_str(),
+        config.verifier.as_deref(),
+    ))?;
+    if let Err(error) = thread.session().hooks().run(
+        HookEvent::SessionStart,
+        HookContext {
+            cwd: &cwd,
+            session_status: None,
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+            usage: None,
+        },
+    ) {
+        sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
+    }
+
+    let status = executor.run_turn(thread, config, request, events, sink.writer_mut(), cancel)?;
+
+    if let Err(error) = thread.session().hooks().run(
+        HookEvent::SessionEnd,
+        HookContext {
+            cwd: &cwd,
+            session_status: Some(status.as_str()),
+            tool_request: None,
+            tool_result: None,
+            before_messages: None,
+            after_messages: None,
+            usage: None,
+        },
+    ) {
+        sink.emit(&events.error(&format!("session_end hook failed: {error}")))?;
+    }
+    sink.emit(&events.session_completed(status))?;
+    Ok(status)
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -11,7 +11,9 @@ use orca_core::config::{
     HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig,
     WorkflowConfig,
 };
-use orca_core::event_schema::RunStatus;
+use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::event_sink::EventSink;
+use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
 use orca_runtime::runtime_host::{
@@ -74,6 +76,7 @@ impl ManualGate {
 enum TestBehavior {
     WaitForCancel { finished: Arc<AtomicBool> },
     WaitForRelease { gate: ManualGate, status: RunStatus },
+    EmitEvent { message: String, status: RunStatus },
     Panic,
 }
 
@@ -99,9 +102,10 @@ impl ThreadOperationExecutor for ScriptedExecutor {
     fn run_turn(
         &self,
         _thread: &mut RuntimeThread,
-        _config: &RunConfig,
+        config: &RunConfig,
         _request: &HostedTurnRequest,
-        _writer: &mut (dyn io::Write + Send),
+        events: &mut EventFactory,
+        writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
     ) -> io::Result<RunStatus> {
         self.calls.fetch_add(1, Ordering::AcqRel);
@@ -125,8 +129,39 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                 gate.enter_and_wait();
                 Ok(status)
             }
+            TestBehavior::EmitEvent { message, status } => {
+                EventSink::new(writer, config.output_format).emit(&events.error(&message))?;
+                Ok(status)
+            }
             TestBehavior::Panic => panic!("scripted operation panic"),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SharedWriter {
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn json_events(&self) -> Vec<serde_json::Value> {
+        let output = self.output.lock().unwrap();
+        String::from_utf8(output.clone())
+            .expect("utf8 event output")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json event"))
+            .collect()
+    }
+}
+
+impl Write for SharedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.output.lock().unwrap().extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -194,6 +229,196 @@ fn start_scripted_thread(
         .start_thread(test_config(cwd.path().to_path_buf()), "runtime host test")
         .expect("start runtime thread");
     (cwd, host, thread)
+}
+
+#[test]
+fn actor_owned_events_keep_one_contiguous_sequence_across_operations() {
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::EmitEvent {
+            message: "first operation".to_string(),
+            status: RunStatus::Success,
+        },
+        TestBehavior::EmitEvent {
+            message: "second operation".to_string(),
+            status: RunStatus::Success,
+        },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(executor);
+    let writer = SharedWriter::default();
+
+    let first = thread
+        .start_turn(HostedTurnRequest::new("first"), writer.clone())
+        .expect("start first operation");
+    assert_eq!(
+        first
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("first terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    let second = thread
+        .start_turn(HostedTurnRequest::new("second"), writer.clone())
+        .expect("start second operation");
+    assert_eq!(
+        second
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("second terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    let events = writer.json_events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["seq"], 0);
+    assert_eq!(events[1]["seq"], 1);
+    assert_eq!(events[0]["run_id"], events[1]["run_id"]);
+    assert!(
+        events[0]["run_id"]
+            .as_str()
+            .is_some_and(|run_id| !run_id.is_empty())
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn headless_session_envelope_owns_events_and_hooks_once_in_order() {
+    let cwd = tempfile::tempdir().unwrap();
+    let hook_log = cwd.path().join("session-hooks.log");
+    let quoted_hook_log = format!(
+        "'{}'",
+        hook_log.display().to_string().replace('\'', "'\\''")
+    );
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.hooks = vec![
+        HookConfig {
+            event: HookEvent::SessionStart,
+            command: format!("printf 'session_start\\n' >> {quoted_hook_log}"),
+            tool: None,
+        },
+        HookConfig {
+            event: HookEvent::SessionEnd,
+            command: format!("printf 'session_end\\n' >> {quoted_hook_log}"),
+            tool: None,
+        },
+    ];
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+        message: "turn event".to_string(),
+        status: RunStatus::Success,
+    }]));
+    let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+    let thread = host
+        .start_thread(config, "headless session")
+        .expect("start runtime thread");
+    let writer = SharedWriter::default();
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::headless_session("inspect repo"),
+            writer.clone(),
+        )
+        .expect("start headless session");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("headless terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    let events = writer.json_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["session.started", "error", "session.completed"]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["run_id"] == events[0]["run_id"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(hook_log).expect("session hook log"),
+        "session_start\nsession_end\n"
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn headless_session_writer_failure_is_typed_before_turn_execution() {
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+        message: "must not execute".to_string(),
+        status: RunStatus::Success,
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::headless_session("inspect repo"),
+            DisconnectedWriter,
+        )
+        .expect("start failing headless session");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("writer failure terminal")
+            .outcome(),
+        &OperationOutcome::ExecutionFailed {
+            kind: io::ErrorKind::BrokenPipe,
+            message: "event subscriber disconnected".to_string(),
+        }
+    );
+    assert_eq!(executor.call_count(), 0);
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn host_shutdown_joins_headless_session_before_terminal_completion() {
+    let finished = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::WaitForCancel {
+        finished: Arc::clone(&finished),
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(executor);
+    let writer = SharedWriter::default();
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::headless_session("long headless session"),
+            writer.clone(),
+        )
+        .expect("start headless session");
+
+    host.shutdown().expect("shutdown runtime host");
+
+    assert!(finished.load(Ordering::Acquire));
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("shutdown terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Cancelled)
+    );
+    let events = writer.json_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["session.started", "session.completed"]
+    );
+    assert_eq!(events[1]["payload"]["status"], "cancelled");
+    assert_eq!(events[0]["seq"], 0);
+    assert_eq!(events[1]["seq"], 1);
 }
 
 #[test]

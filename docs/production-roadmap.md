@@ -40,6 +40,20 @@ delegates to the existing `RuntimeThread -> ThreadTurnExecutor` path. No TUI,
 headless, or server surface has migrated yet, so this foundation is not a
 release point and the old surface owners remain deletion-gated work.
 
+P0.3b now moves the persistent event sequence into the thread actor beside
+`RuntimeThread`, gives hosted operations a typed turn-versus-headless-session
+envelope, and migrates headless execution as the first production
+`RuntimeHost` client. The host owns session start/end hooks and events, while a
+bounded acknowledged relay preserves the existing borrowed-writer controller
+API and reports downstream writer loss as typed execution failure. The
+controller's direct thread, event-factory, hook, and session-terminal ownership
+and the obsolete source-shape assertion protecting that path are deleted.
+Focused host/controller/JSONL tests, the runtime and full serial workspace
+gates, Clippy, and real DeepSeek CLI plus history-resume headless smokes pass.
+This remains unreleased architecture work: it removes the lifecycle ambiguity
+that blocked a safe TUI migration, but it does not yet move the TUI's production
+loop onto the host.
+
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
 paused rendering now applies producer backpressure without silently dropping
