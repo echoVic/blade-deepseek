@@ -389,48 +389,6 @@ impl InteractiveSession {
         })
     }
 
-    pub(crate) fn resume_same_thread(
-        config: &RunConfig,
-        transcript: SessionTranscript,
-    ) -> io::Result<Self> {
-        let cwd = config
-            .cwd
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let store = SessionStore::new();
-        let instructions = instructions::load_for_cwd_or_default(&cwd);
-        let memory = memory::load_for_cwd(&cwd);
-        let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-        let hooks = HookRunner::new(config.hooks.clone());
-        let system_prompt = agent_common::build_agent_system_prompt(
-            &cwd,
-            0,
-            &SubagentType::General,
-            Some(&instructions),
-            config.approval_mode,
-            Some(&memory),
-        );
-        let mut conversation = store.resume_conversation(&transcript, system_prompt);
-        conversation.strip_legacy_pinned_volatile();
-        conversation.strip_legacy_summary_messages();
-        let session_id = transcript.meta.session_id.clone();
-        let writer = Some(SessionWriter::append_to_existing(transcript.path)?);
-
-        Ok(Self {
-            store,
-            conversation,
-            writer,
-            session_id: Some(session_id.clone()),
-            completion_error: None,
-            instructions,
-            cost_tracker: CostTracker::new(None),
-            mcp_registry,
-            hooks,
-            memory,
-            task_registry: TaskRegistry::new_for_cwd(session_id, &cwd),
-        })
-    }
-
     pub fn conversation(&self) -> &Conversation {
         &self.conversation
     }

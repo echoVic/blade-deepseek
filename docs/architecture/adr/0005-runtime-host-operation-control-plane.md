@@ -1,6 +1,6 @@
 # ADR 0005: Runtime Host Operation Control Plane
 
-- Status: Accepted; P0.3a through P0.3c implemented but unreleased
+- Status: Accepted; P0.3a through P0.3d implemented, all unreleased
 - Date: 2026-07-15
 - Roadmap: P0.3 Runtime Operation Host and canonical turn executor
 
@@ -245,7 +245,7 @@ desktop-notification behavior compatible. `run_to_writer` and
 `run_to_writer_with_options` retain borrowed-writer support. Server and TUI
 execution ownership do not migrate in this slice.
 
-### Migration Order And Temporary State
+### Completed Migration Order
 
 1. Add behavior tests for persistent actor event sequence, host-owned session
    ordering, typed writer failure, and shutdown/join behavior.
@@ -439,6 +439,180 @@ server migration.
   malformed-history resume and repair, server, server thread memory, active
   turn resume, turn controls, metadata, list/search, and paginated read gates.
 
+## P0.3d: Server Active Turns On The Runtime Host
+
+### Structural Problem And Evidence
+
+P0.3c gives `ThreadActor` the complete logical-turn generation state machine,
+but the production server still runs the same responsibilities a second time:
+
+- `run_thread_submit_async` removes `ServerThread` from the idle registry,
+  spawns a detached OS worker, and owns a loop that creates handlers, cancel
+  tokens, writers, and replacement generations;
+- `ActiveTurnControl` owns another generation id, resettable cancel token,
+  command-admission bit, steer handle, and resume mailbox;
+- `ActiveTurnManager` owns the worker join handle, polling reclamation, bounded
+  shutdown waits, metadata handoff, and an `ActiveTurnReaper` for work that
+  outlives server shutdown;
+- permission, user-input, and MCP replies validate a raw `u64` generation
+  against that manager instead of presenting the actor's `GenerationFence`;
+- `GenerationServerRequestWriter` decides outside the actor whether a
+  terminal-looking JSONL line belongs to a replaced or final generation;
+- `ServerThreadRuntime` must take the whole mutable thread out of its map while
+  a turn runs, so live thread ownership, active-turn routing, projection reads,
+  and metadata updates have different sources of truth.
+
+Wrapping this manager around `RuntimeThreadHandle` would leave the server in
+charge of the exact lifecycle that P0.3 moved into the actor. The migration is
+complete only when the actor permanently owns each server `RuntimeThread` and
+the old worker loop and manager are deleted.
+
+### Target Ownership And Module Boundary
+
+`ServerThreadRuntime` owns one process-level `RuntimeHost` plus a registry of
+server thread records. Each record contains a cloneable `RuntimeThreadHandle`
+and server metadata such as title, cwd, workspace roots, permission profile,
+additional directories, network grants, task registry, and MCP registry. It
+never contains `RuntimeThread` itself.
+
+`ThreadActor` permanently owns the live `RuntimeThread`, including while idle.
+It additionally owns:
+
+- a typed idle snapshot command for conversation projection and next-turn id;
+- the effective `RunConfig` and persisted task id for each logical turn;
+- creation of fresh generation-scoped interaction handlers from the current
+  `GenerationFence` and cancel token;
+- the output lifecycle callback that commits terminal protocol lines only for
+  the final generation and drops replaced-generation terminals;
+- shutdown cancellation and joining for every active server generation.
+
+The server may retain a small `turn_id -> ServerActiveTurn` routing index. Each
+entry contains only the thread id and actor `OperationHandle`. It may route
+interrupt, resume, and steer commands and inspect `OperationCompletion`; it
+must not own a cancel token, generation counter, steer queue, resume mailbox,
+worker/reaper, or returned thread state.
+
+Pending permission, user-input, and MCP records store the actor-issued
+`GenerationFence`. Response processors ask the operation handle to admit that
+exact fence before delivering the response. Session permission metadata is
+updated directly in the persistent server thread record, which remains present
+while a turn runs.
+
+### TUI User Value
+
+The server is the first production surface to exercise actor-owned resume and
+input admission. This removes races before the TUI adopts the same host:
+
+- an interrupted generation cannot overlap its replacement or leak a stale
+  terminal event;
+- server EOF and shutdown cancel and join the same task the control commands
+  address, with no detached reaper continuing after ownership is handed off;
+- permission and user-input answers cannot enter a resumed generation through
+  a raw integer comparison in another manager;
+- thread metadata and control remain available while the actor owns the live
+  conversation, eliminating the take/put gap that the TUI would otherwise
+  inherit.
+
+P0.3d is still unreleased foundation work. It proves the production adapter and
+deletes the duplicate server control plane so the next TUI slice can reuse an
+already exercised lifecycle instead of being the first adopter.
+
+### External Compatibility
+
+P0.3d preserves CLI arguments, server JSONL request and event shapes, persisted
+session format, turn ids, permission request ids, active-turn interrupt/resume/
+steer behavior, thread projections, and DeepSeek provider behavior. The
+server's internal generation identity changes from a raw `u64` to
+`GenerationFence`, but the numeric generation component in request ids remains
+stable.
+
+Thread start, resume, fork, metadata updates, list/search, turns/items
+pagination, mention search, command execution, and session permission grants
+must keep their current observable behavior.
+
+### Migration Order And Temporary State
+
+1. Add RED host tests for per-turn config, persisted task ids, idle snapshots,
+   fresh generation interaction factories, and actor-finalized generation
+   output.
+2. Extend typed host commands and request/output abstractions without changing
+   existing headless callers.
+3. Change `ServerThreadRuntime` into a process-host plus handle/metadata
+   registry; migrate synchronous server-runtime behavior tests to that path.
+4. Replace `run_thread_submit_async` with one actor operation and a routing
+   index; route controls and generation admission through `OperationHandle`.
+5. Move server terminal-line suppression under the actor-owned output
+   lifecycle and create interaction handlers from the actor generation fence.
+6. Delete `ActiveTurnManager`, `ActiveTurnControl`, the worker generation loop,
+   resume mailbox, resettable cancellation record, polling reclamation,
+   `ActiveTurnReaper`, take/put thread ownership, and the old generation writer.
+7. Run focused host/server tests, the full serial workspace gate, workspace
+   Clippy, and the real DeepSeek server resume/control harness.
+
+The temporary overlap existed only while tests moved from the old server path
+to the host. The completed slice retains one production active-turn control
+plane: the runtime host actor.
+
+### P0.3d Acceptance Criteria
+
+1. Every server thread is created, resumed, or forked inside one process-owned
+   `RuntimeHost`; the server registry never owns a live `RuntimeThread`.
+2. Server turn start provides the persisted turn id and effective per-turn
+   config to the actor, and resumed generations reopen that same task id.
+3. Each generation creates permission, user-input, and MCP handlers from its
+   typed `GenerationFence` and fresh cancel token; stale replies are rejected
+   by actor admission.
+4. Replaced generations drop cancellation errors and terminal protocol lines,
+   while the final generation commits exactly one externally visible turn
+   terminal under actor control.
+5. Interrupt, duplicate interrupt, resume, duplicate resume, steer, stale turn
+   controls, and completed-turn errors preserve the server JSONL contract.
+6. Live metadata, task registry, MCP mention search, projections, next-turn id,
+   command execution policy, and session grants remain available without
+   taking the thread out of the registry.
+7. Server EOF and explicit shutdown cancel and join all active actor
+   generations before returning; no detached worker or reaper remains.
+8. `ActiveTurnManager`, `ActiveTurnControl`, `ActiveTurnReaper`,
+   `GenerationServerRequestWriter`, the server generation loop, raw generation
+   admission, and `ServerThreadRuntime::take_thread` / `put_thread` are absent.
+9. Existing server contracts and real DeepSeek thread memory, active-turn
+   resume, turn control, metadata, list/search, and pagination checks pass.
+
+### P0.3d Deletion Gate
+
+The slice is incomplete if server production code still owns any active-turn
+cancel token, generation counter, join handle, resume channel, steer handle, or
+thread reclamation loop; if terminal suppression is decided outside the actor;
+if interaction replies compare raw generation numbers; or if a live
+`RuntimeThread` leaves its actor during normal server operation.
+
+### P0.3d Verification
+
+- `cargo check -p orca-runtime --all-targets` passes, and all 18 runtime-host
+  behavior tests pass. They cover per-turn config and task identity, actor-owned
+  event sequence and steer admission, generation replacement, terminal commit,
+  cancellation, panic recovery, and joined thread/host shutdown.
+- All 21 server-runtime contracts and 132 session-server contracts pass. The
+  latter include duplicate interrupt/resume, active-turn resume and steer,
+  pending interaction cancellation, server EOF cleanup, thread projections,
+  metadata, list/search, and paginated turn/item reads.
+- `cargo test --workspace --all-targets -- --test-threads=1` passes, including
+  767 runtime unit tests, 18 runtime-host tests, 12 task-output tests, 132
+  session-server contracts, and 495 TUI tests.
+- `cargo clippy --workspace --all-targets` passes with the repository's
+  existing warnings and no new warning from the P0.3d implementation or tests.
+- The release harness contract test passes, followed by the complete real
+  DeepSeek harness: provider summary, headless CLI, malformed-history resume
+  and non-reexecution repair, server submit, thread memory, active-turn resume,
+  thread read, metadata update, interrupt/resume/steer controls, list filters,
+  search, and paginated turn/item reads all pass.
+- Deleted-symbol and ownership audits confirm that `ActiveTurnManager`,
+  `ActiveTurnControl`, `ActiveTurnReaper`, `GenerationServerRequestWriter`, the
+  server generation loop, resettable cancellation, resume mailbox, and
+  `ServerThreadRuntime::take_thread` / `put_thread` are absent from production
+  code. No release is made at this checkpoint; the next surface migration is
+  the TUI onto the proven runtime-host control plane.
+
 ### P0.3b Acceptance Criteria
 
 1. Events emitted by consecutive operations on one actor have one run id and a
@@ -515,8 +689,6 @@ their deletion gates remain the later surface migrations listed above.
 
 The P0 architecture stage is not complete until these old owners are removed:
 
-- server `ActiveTurnManager` generation/cancel/reaper ownership after server
-  migration;
 - TUI `OperationCancellation` and the outer agent/provider worker ownership
   after TUI migration;
 - public borrowed `RuntimeThread` mutation paths once all surfaces use actor

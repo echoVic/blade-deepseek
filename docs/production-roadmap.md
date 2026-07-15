@@ -70,14 +70,33 @@ the only steer queue, reopens the same task id as Running for a resumed
 generation, marks the request as an existing turn so the original user prompt
 is not appended again, and publishes one operation terminal after the final
 joined generation. Headless sessions remain single-generation and reject
-resume. The next vertical slice must migrate server active turns onto these
-commands and delete `ActiveTurnManager`, its generation loop, resettable cancel
-record, resume mailbox, generation writer, and reaper ownership. Wrapping those
-owners around `RuntimeHost` is not an accepted migration. Seventeen host
-behavior tests, 780 runtime unit tests, 130 server contracts, 467 TUI tests, the
-full serial workspace gate, workspace Clippy, and the complete real DeepSeek
-release harness pass. This is still unreleased foundation work because no TUI
-task-control flow uses the new generation commands yet.
+resume. Its mandatory follow-up was to migrate server active turns without
+wrapping those old owners around `RuntimeHost`. Seventeen host behavior tests,
+780 runtime unit tests, 130 server contracts, 467 TUI tests, the full serial
+workspace gate, workspace Clippy, and the complete real DeepSeek release
+harness passed at that checkpoint.
+
+P0.3d now migrates production server threads onto one process-owned
+`RuntimeHost`. Each `ThreadActor` permanently owns its live `RuntimeThread`;
+the server keeps only thread metadata plus a `turnId -> {threadId,
+OperationHandle}` routing index. Submit, interrupt, resume, steer, permission,
+user-input, and MCP paths use typed actor commands and `GenerationFence`
+admission. The actor owns effective per-turn config, persisted task identity,
+fresh generation handlers, terminal commit/drop, cancellation, and every join.
+`ActiveTurnManager`, the server generation loop, resettable cancellation,
+resume mailbox, detached reaper, generation writer, and take/put thread path
+are deleted. Server EOF now cancels and joins actor work before returning, and
+live metadata and projections remain available while a turn runs.
+
+All 18 host behavior tests, 21 server-runtime contracts, 132 session-server
+contracts, 767 runtime unit tests, 12 task-output tests, and 495 TUI tests pass.
+The full serial workspace gate and workspace Clippy pass, as does the complete
+real DeepSeek provider/CLI/history/server harness, including thread memory,
+active-turn resume, controls, metadata, list filters, search, and turn/item
+pagination. P0.3d remains unreleased foundation work: the next slice migrates
+the TUI onto this proven control plane and deletes its outer operation,
+provider-worker, and direct turn-loop ownership before claiming the
+user-visible reliability improvement.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or

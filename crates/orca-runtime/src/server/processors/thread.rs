@@ -28,7 +28,7 @@ pub(in crate::server::router) fn dispatch_query_operation<W: Write>(
             include_messages,
             include_turns,
         } => {
-            state.reclaim_finished_thread(thread_id);
+            state.prune_finished_turns();
             run_thread_read(
                 state,
                 thread_id,
@@ -79,7 +79,7 @@ pub(in crate::server::router) fn dispatch_query_operation<W: Write>(
             items_view,
             limit,
         } => {
-            state.reclaim_finished_thread(thread_id);
+            state.prune_finished_turns();
             run_thread_turns_list(
                 state,
                 thread_id,
@@ -98,7 +98,7 @@ pub(in crate::server::router) fn dispatch_query_operation<W: Write>(
             sort_direction,
             limit,
         } => {
-            state.reclaim_finished_thread(thread_id);
+            state.prune_finished_turns();
             run_thread_items_list(
                 state,
                 thread_id,

@@ -18,9 +18,10 @@ use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
 use orca_runtime::lifecycle::RuntimeTaskStatus;
 use orca_runtime::runtime_host::{
-    GenerationAdmissionResult, GenerationContext, GenerationFence, HostedTurnRequest,
-    InterruptOperationResult, OperationOutcome, ResumeOperationResult, RuntimeHost,
-    RuntimeHostError, RuntimeThreadState, SteerOperationResult, ThreadOperationExecutor,
+    GenerationAdmissionResult, GenerationContext, GenerationFence, HostedGenerationHandlers,
+    HostedOperationWriter, HostedTurnRequest, InterruptOperationResult, OperationOutcome,
+    ResumeOperationResult, RuntimeHost, RuntimeHostError, RuntimeThreadState, SteerOperationResult,
+    ThreadOperationExecutor,
 };
 use orca_runtime::thread::RuntimeThread;
 
@@ -179,6 +180,7 @@ struct ScriptedExecutor {
     steer_inputs: Mutex<Vec<Vec<String>>>,
     task_states: Mutex<Vec<(String, RuntimeTaskStatus)>>,
     cancelled_on_entry: Mutex<Vec<bool>>,
+    approval_modes: Mutex<Vec<ApprovalMode>>,
 }
 
 impl ScriptedExecutor {
@@ -190,6 +192,7 @@ impl ScriptedExecutor {
             steer_inputs: Mutex::new(Vec::new()),
             task_states: Mutex::new(Vec::new()),
             cancelled_on_entry: Mutex::new(Vec::new()),
+            approval_modes: Mutex::new(Vec::new()),
         }
     }
 
@@ -212,13 +215,16 @@ impl ScriptedExecutor {
     fn cancelled_on_entry(&self) -> Vec<bool> {
         self.cancelled_on_entry.lock().unwrap().clone()
     }
+
+    fn approval_modes(&self) -> Vec<ApprovalMode> {
+        self.approval_modes.lock().unwrap().clone()
+    }
 }
 
 impl ThreadOperationExecutor for ScriptedExecutor {
     fn run_turn(
         &self,
         thread: &mut RuntimeThread,
-        config: &RunConfig,
         _request: &HostedTurnRequest,
         generation: &GenerationContext,
         events: &mut EventFactory,
@@ -230,6 +236,10 @@ impl ThreadOperationExecutor for ScriptedExecutor {
             .lock()
             .unwrap()
             .push(cancel.is_cancelled());
+        self.approval_modes
+            .lock()
+            .unwrap()
+            .push(generation.config().approval_mode);
         self.generations
             .lock()
             .unwrap()
@@ -276,7 +286,8 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                 Ok(status)
             }
             TestBehavior::EmitEvent { message, status } => {
-                EventSink::new(writer, config.output_format).emit(&events.error(&message))?;
+                EventSink::new(writer, generation.config().output_format)
+                    .emit(&events.error(&message))?;
                 Ok(status)
             }
             TestBehavior::Panic => panic!("scripted operation panic"),
@@ -307,6 +318,38 @@ impl Write for SharedWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingOutput {
+    output: SharedWriter,
+    generation_commits: Arc<Mutex<Vec<bool>>>,
+}
+
+impl RecordingOutput {
+    fn generation_commits(&self) -> Vec<bool> {
+        self.generation_commits.lock().unwrap().clone()
+    }
+}
+
+impl Write for RecordingOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.output.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+impl HostedOperationWriter for RecordingOutput {
+    fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()> {
+        self.generation_commits
+            .lock()
+            .unwrap()
+            .push(commit_terminal);
         Ok(())
     }
 }
@@ -707,6 +750,57 @@ fn stale_interrupt_cannot_cancel_a_newer_operation() {
 }
 
 #[test]
+fn hosted_turn_uses_per_turn_config_task_id_and_idle_snapshot() {
+    let gate = ManualGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::WaitForRelease {
+        gate: gate.clone(),
+        status: RunStatus::Success,
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    let initial = thread.snapshot().expect("read idle snapshot");
+    assert_eq!(initial.thread_id(), thread.thread_id());
+    assert_eq!(
+        initial.active_task_id(),
+        Some(format!("{}:task-1", initial.thread_id()).as_str())
+    );
+
+    let mut turn_config = test_config(PathBuf::from("."));
+    turn_config.approval_mode = ApprovalMode::FullAuto;
+    let operation = thread
+        .start_turn_with_config(
+            HostedTurnRequest::new("configured turn").with_task_id("turn-42"),
+            io::sink(),
+            turn_config,
+        )
+        .expect("start configured turn");
+    gate.wait_until_entered();
+    assert_eq!(
+        thread
+            .snapshot()
+            .expect_err("running snapshot must be rejected"),
+        RuntimeHostError::OperationActive {
+            operation_id: operation.id(),
+        }
+    );
+
+    gate.release();
+    operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("configured turn terminal");
+    assert_eq!(executor.approval_modes(), vec![ApprovalMode::FullAuto]);
+    assert_eq!(executor.task_states()[0].0, "turn-42");
+    assert_eq!(
+        thread
+            .snapshot()
+            .expect("read completed snapshot")
+            .active_task_id(),
+        Some("turn-42")
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
 fn logical_turn_resume_waits_for_join_and_publishes_one_terminal() {
     let first_gate = CancelJoinGate::new();
     let second_gate = ManualGate::new();
@@ -721,8 +815,22 @@ fn logical_turn_resume_waits_for_join_and_publishes_one_terminal() {
     ]));
     let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
 
+    let factory_generations = Arc::new(Mutex::new(Vec::new()));
+    let observed_generations = Arc::clone(&factory_generations);
+    let output = RecordingOutput::default();
     let operation = thread
-        .start_turn(HostedTurnRequest::new("one logical turn"), io::sink())
+        .start_turn_with_output(
+            HostedTurnRequest::new("one logical turn").with_generation_handlers(
+                move |generation, cancel| {
+                    observed_generations
+                        .lock()
+                        .unwrap()
+                        .push((generation, cancel.is_cancelled()));
+                    HostedGenerationHandlers::default()
+                },
+            ),
+            output.clone(),
+        )
         .expect("start logical turn");
     first_gate.wait_until_entered();
     let first_generation = operation.initial_generation();
@@ -853,6 +961,11 @@ fn logical_turn_resume_waits_for_join_and_publishes_one_terminal() {
             vec!["steer resumed generation".to_string()]
         ]
     );
+    assert_eq!(
+        *factory_generations.lock().unwrap(),
+        vec![(first_generation, false), (second_generation, false)]
+    );
+    assert_eq!(output.generation_commits(), vec![false, true]);
 
     host.shutdown().expect("shutdown runtime host");
 }

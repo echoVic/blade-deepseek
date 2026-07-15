@@ -77,11 +77,6 @@ fn run_permission_respond<W: Write>(
             pending.runtime_workspace_roots(),
             &permissions,
         )?;
-        state.active_turns.apply_session_permission_grant(
-            pending.thread_id(),
-            session_grants.additional_working_directories.clone(),
-            session_grants.network_domain_permissions.clone(),
-        );
         state.threads.update_thread_metadata(
             pending.thread_id(),
             ThreadMetadataPatch {

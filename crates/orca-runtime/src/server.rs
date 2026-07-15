@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-mod active_turn_manager;
+mod active_turn_registry;
 mod command_exec_manager;
 mod command_exec_sandbox;
 mod fuzzy_file_search_manager;
@@ -18,15 +17,18 @@ mod user_input_manager;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use orca_core::cancel::CancelToken;
 use serde_json::{Value, json};
 
-use crate::lifecycle::{RuntimePermissionResponse, ThreadSteerHandle};
+use crate::lifecycle::RuntimePermissionResponse;
 use crate::network_proxy::{
     RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy,
     runtime_network_block_channel,
 };
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
+use crate::runtime_host::{
+    HostedGenerationHandlers, HostedOperationWriter, HostedTurnRequest, InterruptOperationResult,
+    ResumeOperationResult, SteerOperationResult,
+};
 use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::server_runtime::{
     PermissionProfileOverride, ServerRequestWriter, ServerThreadRuntime, thread_item_to_json,
@@ -37,7 +39,7 @@ use crate::thread_store::{
     SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
-use active_turn_manager::{ActiveTurnControl, ActiveTurnManager, ActiveTurnReaper};
+use active_turn_registry::ServerActiveTurnRegistry;
 use command_exec_manager::{
     CommandExecDrainOutcome, CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess,
     CommandExecProcessSnapshot,
@@ -76,7 +78,7 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
     writer: W,
 ) -> io::Result<()> {
     let mut line = String::new();
-    let mut state = ServerState::default();
+    let mut state = ServerState::start()?;
     let writer = Arc::new(Mutex::new(writer));
     let result = (|| -> io::Result<()> {
         while reader.read_line(&mut line)? != 0 {
@@ -88,19 +90,15 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
         }
         Ok(())
     })();
-    let reaper = state.shutdown();
-    if let Some(reaper) = reaper {
-        reaper.join();
-    }
-    result
+    let shutdown = state.shutdown();
+    result.and(shutdown)
 }
 
-#[derive(Default)]
 struct ServerState {
     threads: ServerThreadRuntime,
     shells: ServerShellManager,
     command_exec: CommandExecManager,
-    active_turns: ActiveTurnManager,
+    active_turns: ServerActiveTurnRegistry,
     pending_permissions: PendingPermissionManager,
     pending_user_inputs: PendingUserInputManager,
     pending_mcp_elicitations: PendingMcpElicitationManager,
@@ -109,28 +107,29 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn shutdown(&mut self) -> Option<ActiveTurnReaper> {
-        const GRACEFUL_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-        const CANCELLED_TURN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+    fn start() -> io::Result<Self> {
+        Ok(Self {
+            threads: ServerThreadRuntime::start()?,
+            shells: ServerShellManager::default(),
+            command_exec: CommandExecManager::default(),
+            active_turns: ServerActiveTurnRegistry::default(),
+            pending_permissions: PendingPermissionManager::default(),
+            pending_user_inputs: PendingUserInputManager::default(),
+            pending_mcp_elicitations: PendingMcpElicitationManager::default(),
+            fuzzy_file_searches: FuzzyFileSearchManager::default(),
+            mention_searches: MentionSearchManager::default(),
+        })
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
         self.command_exec.terminate_all(self.shells.sessions_mut());
         let _ = self.pending_permissions.close();
         let _ = self.pending_user_inputs.close();
         self.shells.terminate_all();
         self.terminate_searches();
-        if self
-            .active_turns
-            .wait_all_bounded(&mut self.threads, GRACEFUL_TURN_SHUTDOWN_TIMEOUT)
-        {
-            return None;
-        }
-        self.active_turns.cancel_all();
-        if !self
-            .active_turns
-            .wait_all_bounded(&mut self.threads, CANCELLED_TURN_SHUTDOWN_TIMEOUT)
-        {
-            return self.active_turns.handoff_remaining_to_reaper();
-        }
-        None
+        let result = self.threads.shutdown();
+        self.active_turns.clear();
+        result
     }
 
     fn terminate_searches(&mut self) {
@@ -142,16 +141,18 @@ impl ServerState {
 impl ServerState {
     #[cfg(test)]
     fn join_active_turns(&mut self) {
-        self.active_turns.join_all(&mut self.threads);
+        self.active_turns.wait_all();
     }
 
-    fn reclaim_finished_threads(&mut self) {
-        self.active_turns.reclaim_finished(&mut self.threads);
+    fn prune_finished_turns(&mut self) {
+        self.active_turns.prune_finished();
     }
+}
 
-    fn reclaim_finished_thread(&mut self, thread_id: &str) {
-        self.active_turns
-            .reclaim_finished_thread(&mut self.threads, thread_id);
+#[cfg(test)]
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::start().expect("start server state")
     }
 }
 
@@ -161,7 +162,7 @@ fn handle_line<W: Write + Send + 'static>(
     line: &str,
     writer: Arc<Mutex<W>>,
 ) -> io::Result<()> {
-    state.reclaim_finished_threads();
+    state.prune_finished_turns();
     let submission = match Submission::decode(line) {
         Ok(submission) => submission,
         Err(error) => {
@@ -211,7 +212,7 @@ fn handle_line<W: Write + Send + 'static>(
     }
 
     router::dispatch_submission(config, state, submission, writer)?;
-    state.reclaim_finished_threads();
+    state.prune_finished_turns();
     Ok(())
 }
 
@@ -244,7 +245,8 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::other("server writer lock poisoned")
 }
 
-fn generation_scoped_id(base: String, generation: u64) -> String {
+fn generation_scoped_id(base: String, generation: crate::runtime_host::GenerationFence) -> String {
+    let generation = generation.generation_id().as_u64();
     if generation == 0 {
         base
     } else {
@@ -283,13 +285,13 @@ impl<W: Write> Write for SharedServerRequestWriter<W> {
     }
 }
 
-struct GenerationServerRequestWriter<W: Write> {
+struct ServerTurnOutput<W: Write + Send + 'static> {
     inner: SharedServerRequestWriter<W>,
     buffer: Vec<u8>,
     deferred_lines: Vec<Vec<u8>>,
 }
 
-impl<W: Write> GenerationServerRequestWriter<W> {
+impl<W: Write + Send + 'static> ServerTurnOutput<W> {
     fn new(id: Value, inner: Arc<Mutex<W>>) -> Self {
         Self {
             inner: SharedServerRequestWriter::new(id, inner),
@@ -315,19 +317,21 @@ impl<W: Write> GenerationServerRequestWriter<W> {
         self.inner.flush_remaining()
     }
 
-    fn finish(mut self, commit_terminal: bool) -> io::Result<()> {
+    fn finish(&mut self, commit_terminal: bool) -> io::Result<()> {
         self.flush_remaining()?;
         if commit_terminal {
-            for line in self.deferred_lines {
+            for line in self.deferred_lines.drain(..) {
                 self.inner.write_all(&line)?;
             }
             self.inner.flush_remaining()?;
+        } else {
+            self.deferred_lines.clear();
         }
         Ok(())
     }
 }
 
-impl<W: Write> Write for GenerationServerRequestWriter<W> {
+impl<W: Write + Send + 'static> Write for ServerTurnOutput<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.buffer.extend_from_slice(buf);
         while let Some(pos) = self.buffer.iter().position(|byte| *byte == b'\n') {
@@ -339,6 +343,12 @@ impl<W: Write> Write for GenerationServerRequestWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+impl<W: Write + Send + 'static> HostedOperationWriter for ServerTurnOutput<W> {
+    fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()> {
+        self.finish(commit_terminal)
     }
 }
 
@@ -360,13 +370,6 @@ fn is_runtime_generation_terminal_line(line: &[u8]) -> bool {
         }
         _ => false,
     }
-}
-
-fn visible_generation_error<T>(status: &io::Result<T>, replaced: bool) -> Option<String> {
-    if replaced {
-        return None;
-    }
-    status.as_ref().err().map(ToString::to_string)
 }
 
 struct LockedServerWriter<W: Write> {
@@ -870,7 +873,7 @@ fn run_command_exec<W: Write>(
         thread_network_domain_permissions,
     ) = match thread_id {
         Some(thread_id) => {
-            state.reclaim_finished_thread(thread_id);
+            state.prune_finished_turns();
             match state.threads.thread(thread_id) {
                 Some(thread) => (
                     thread
@@ -1938,144 +1941,103 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
         _ => return Ok(()),
     };
 
-    state.reclaim_finished_thread(&thread_id);
-    let Some(mut thread_state) = state.threads.take_thread(&thread_id) else {
-        if state.active_turns.has_thread(&thread_id) {
-            return write_locked_event(
-                &writer,
-                &id,
-                ServerEvent::error(format!("thread has an active turn: {thread_id}")),
-            );
-        }
+    state.prune_finished_turns();
+    if state.active_turns.has_thread(&thread_id) {
+        return write_locked_event(
+            &writer,
+            &id,
+            ServerEvent::error(format!("thread has an active turn: {thread_id}")),
+        );
+    }
+    let Some(submission) = state.threads.submission_context(&thread_id, &permissions) else {
         return write_locked_event(
             &writer,
             &id,
             ServerEvent::error(format!("unknown thread: {thread_id}")),
         );
     };
-    let cancel = CancelToken::new();
-    let steer_handle = ThreadSteerHandle::default();
-    let (command_tx, command_rx) = mpsc::sync_channel(1);
-    let active_turn_id = thread_state.next_persisted_turn_id();
-    let runtime_workspace_roots = permissions
-        .runtime_workspace_roots
-        .clone()
-        .unwrap_or_else(|| thread_state.runtime_workspace_roots().to_vec());
     if let Some(bindings) = bindings {
         match crate::mentions::expand_mentions(
             &prompt,
             &bindings,
-            std::path::Path::new(thread_state.cwd()),
-            &runtime_workspace_roots,
-            thread_state.mcp_registry(),
+            std::path::Path::new(&submission.cwd),
+            &submission.runtime_workspace_roots,
+            &submission.mcp_registry,
         ) {
             Ok(expanded) => prompt = expanded,
             Err(error) => {
-                state.threads.put_thread(thread_state);
                 return write_locked_event(&writer, &id, ServerEvent::error(error));
             }
         }
     }
-    let control = ActiveTurnControl::new(
-        thread_id.clone(),
-        cancel.clone(),
-        steer_handle.clone(),
-        command_tx,
-    );
-
-    let writer_for_thread = Arc::clone(&writer);
-    let active_turn_id_for_worker = active_turn_id.clone();
-    let control_for_worker = control.clone();
+    let prepared = match state
+        .threads
+        .prepare_turn(&run_config, &thread_id, &prompt, permissions)
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
+        }
+    };
+    let active_turn_id = prepared.turn_id().to_string();
+    let active_thread_id = prepared.thread_id().to_string();
+    let writer_for_handlers = Arc::clone(&writer);
+    let event_id_for_handlers = id.clone();
+    let thread_id_for_handlers = active_thread_id.clone();
+    let turn_id_for_handlers = active_turn_id.clone();
     let pending_permissions = state.pending_permissions.clone();
     let pending_user_inputs = state.pending_user_inputs.clone();
     let pending_mcp_elicitations = state.pending_mcp_elicitations.clone();
-    let runtime_workspace_roots_for_worker = runtime_workspace_roots.clone();
-    let handle = thread::spawn(move || {
-        let mut generation = 0_u64;
-        let mut resume_existing_turn = false;
-        loop {
-            let generation_cancel = if generation == 0 {
-                cancel.clone()
-            } else {
-                let _ = steer_handle.drain();
-                control_for_worker.start_generation()
-            };
+    let runtime_workspace_roots = submission.runtime_workspace_roots;
+    let request = HostedTurnRequest::new(prompt)
+        .with_wait_for_background_workflows(false)
+        .with_generation_handlers(move |generation, generation_cancel| {
             let permission_handler = Arc::new(ServerPermissionRequestHandler::new(
-                Arc::clone(&writer_for_thread),
+                Arc::clone(&writer_for_handlers),
                 pending_permissions.clone(),
-                id.clone(),
-                thread_id.clone(),
-                active_turn_id_for_worker.clone(),
+                event_id_for_handlers.clone(),
+                thread_id_for_handlers.clone(),
+                turn_id_for_handlers.clone(),
                 generation,
                 generation_cancel.clone(),
-                runtime_workspace_roots_for_worker.clone(),
+                runtime_workspace_roots.clone(),
             ));
             let user_input_handler = Arc::new(ServerUserInputRequestHandler::new(
-                Arc::clone(&writer_for_thread),
+                Arc::clone(&writer_for_handlers),
                 pending_user_inputs.clone(),
-                id.clone(),
-                thread_id.clone(),
-                active_turn_id_for_worker.clone(),
+                event_id_for_handlers.clone(),
+                thread_id_for_handlers.clone(),
+                turn_id_for_handlers.clone(),
                 generation,
                 generation_cancel.clone(),
             ));
             let mcp_elicitation_handler = Arc::new(ServerMcpElicitationRequestHandler::new(
-                Arc::clone(&writer_for_thread),
+                Arc::clone(&writer_for_handlers),
                 pending_mcp_elicitations.clone(),
-                id.clone(),
-                thread_id.clone(),
-                active_turn_id_for_worker.clone(),
+                event_id_for_handlers.clone(),
+                thread_id_for_handlers.clone(),
+                turn_id_for_handlers.clone(),
                 generation,
-                generation_cancel.clone(),
+                generation_cancel,
             ));
-            let mut generation_writer =
-                GenerationServerRequestWriter::new(id.clone(), Arc::clone(&writer_for_thread));
-            let status = if resume_existing_turn {
-                thread_state
-                    .run_turn_with_permissions_cancel_and_permission_handler_for_existing_turn(
-                        &run_config,
-                        &prompt,
-                        &active_turn_id_for_worker,
-                        permissions.clone(),
-                        &mut generation_writer,
-                        generation_cancel,
-                        steer_handle.clone(),
-                        permission_handler,
-                        user_input_handler,
-                        mcp_elicitation_handler,
-                    )
-            } else {
-                thread_state.run_turn_with_permissions_cancel_and_permission_handler(
-                    &run_config,
-                    &prompt,
-                    permissions.clone(),
-                    &mut generation_writer,
-                    generation_cancel,
-                    steer_handle.clone(),
-                    permission_handler,
-                    user_input_handler,
-                    mcp_elicitation_handler,
-                )
-            };
-            let _ = generation_writer.flush_remaining();
-            let replace_generation =
-                control_for_worker.close_generation_and_take_resume(&command_rx);
-            let _ = generation_writer.finish(!replace_generation);
-            if let Some(error) = visible_generation_error(&status, replace_generation) {
-                let _ = write_locked_event(&writer_for_thread, &id, ServerEvent::error(error));
-            }
-            if !replace_generation {
-                break;
-            }
-            generation = generation.saturating_add(1);
-            resume_existing_turn = true;
+            HostedGenerationHandlers::default()
+                .with_permission_handler(permission_handler)
+                .with_user_input_handler(user_input_handler)
+                .with_mcp_elicitation_handler(mcp_elicitation_handler)
+        });
+    let operation = match prepared.start_with_output(
+        request,
+        ServerTurnOutput::new(id.clone(), Arc::clone(&writer)),
+    ) {
+        Ok(operation) => operation,
+        Err(error) => {
+            return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
         }
-        thread_state
-    });
+    };
     state
         .active_turns
-        .insert_running(active_turn_id, control, handle);
-    state.reclaim_finished_threads();
+        .insert(active_turn_id, active_thread_id, operation);
+    state.prune_finished_turns();
     Ok(())
 }
 
@@ -2313,7 +2275,7 @@ mod tests {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                thread::sleep(self.delay);
+                std::thread::sleep(self.delay);
                 self.delay_finished.store(true, Ordering::Release);
             }
             Ok(written)
@@ -2408,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn run_with_io_waits_for_handed_off_turn_reaper() {
+    fn run_with_io_waits_for_runtime_host_shutdown() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let temp = tempdir().expect("tempdir");
@@ -2434,11 +2396,11 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
         assert!(
             delay_started.load(Ordering::Acquire),
-            "test must hold the active turn past both bounded shutdown phases"
+            "test must hold the active turn until runtime-host shutdown begins"
         );
         assert!(
             delay_finished.load(Ordering::Acquire),
-            "run_with_io must join transferred reaper ownership before returning"
+            "run_with_io must wait for actor-owned generation cleanup before returning"
         );
     }
 
@@ -5668,7 +5630,7 @@ enabled = true
     }
 
     #[test]
-    fn completed_background_turn_is_reclaimed_before_next_thread_turn() {
+    fn completed_hosted_turn_allows_next_thread_turn() {
         with_orca_home(|home| {
             let mut config = test_run_config();
             config.cwd = Some(home.to_path_buf());
@@ -6668,7 +6630,7 @@ rl.on("line", (line) => {
     #[test]
     fn replaced_generation_drops_terminal_event_until_current_generation_commits() {
         let output = Arc::new(Mutex::new(Vec::new()));
-        let mut writer = GenerationServerRequestWriter::new(json!("turn"), Arc::clone(&output));
+        let mut writer = ServerTurnOutput::new(json!("turn"), Arc::clone(&output));
         writer
             .write_all(b"{\"type\":\"session.completed\",\"payload\":{\"status\":\"cancelled\"}}\n")
             .expect("write cancelled terminal");
@@ -6676,7 +6638,7 @@ rl.on("line", (line) => {
         assert!(output.lock().expect("output").is_empty());
 
         let output = Arc::new(Mutex::new(Vec::new()));
-        let mut writer = GenerationServerRequestWriter::new(json!("turn"), Arc::clone(&output));
+        let mut writer = ServerTurnOutput::new(json!("turn"), Arc::clone(&output));
         writer
             .write_all(b"{\"type\":\"session.completed\",\"payload\":{\"status\":\"success\"}}\n")
             .expect("write successful terminal");
@@ -6690,7 +6652,7 @@ rl.on("line", (line) => {
     #[test]
     fn replaced_generation_drops_runtime_cancellation_error() {
         let output = Arc::new(Mutex::new(Vec::new()));
-        let mut writer = GenerationServerRequestWriter::new(json!("turn"), Arc::clone(&output));
+        let mut writer = ServerTurnOutput::new(json!("turn"), Arc::clone(&output));
         writer
             .write_all(
                 b"{\"version\":\"1\",\"run_id\":\"run\",\"seq\":1,\"timestamp_ms\":1,\"type\":\"error\",\"payload\":{\"message\":\"turn cancelled\"}}\n",
@@ -6699,17 +6661,6 @@ rl.on("line", (line) => {
         writer.finish(false).expect("drop replaced error");
 
         assert!(output.lock().expect("output").is_empty());
-    }
-
-    #[test]
-    fn replaced_generation_drops_stale_outer_error() {
-        let status = Err::<(), _>(io::Error::other("turn cancelled"));
-
-        assert_eq!(
-            visible_generation_error(&status, false).as_deref(),
-            Some("turn cancelled")
-        );
-        assert_eq!(visible_generation_error(&status, true), None);
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {

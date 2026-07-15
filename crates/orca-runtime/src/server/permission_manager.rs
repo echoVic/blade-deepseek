@@ -11,6 +11,7 @@ use crate::lifecycle::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
 };
 use crate::protocol::{self, ServerEvent};
+use crate::runtime_host::GenerationFence;
 
 use super::{lock_error, write_locked_event};
 
@@ -32,7 +33,7 @@ pub(super) enum PendingPermissionRequest {
         sender: mpsc::Sender<RuntimePermissionResponse>,
         thread_id: String,
         turn_id: String,
-        generation: u64,
+        generation: GenerationFence,
         runtime_workspace_roots: Vec<PathBuf>,
     },
     CommandExec {
@@ -58,7 +59,7 @@ impl PendingPermissionRequest {
         }
     }
 
-    pub(super) fn runtime_generation(&self) -> Option<(&str, &str, u64)> {
+    pub(super) fn runtime_generation(&self) -> Option<(&str, &str, GenerationFence)> {
         match self {
             Self::Runtime {
                 thread_id,
@@ -152,7 +153,7 @@ pub(super) struct ServerPermissionRequestHandler<W: Write + Send + 'static> {
     event_id: Value,
     thread_id: String,
     turn_id: String,
-    generation: u64,
+    generation: GenerationFence,
     cancel: CancelToken,
     runtime_workspace_roots: Vec<PathBuf>,
 }
@@ -164,7 +165,7 @@ impl<W: Write + Send + 'static> ServerPermissionRequestHandler<W> {
         event_id: Value,
         thread_id: String,
         turn_id: String,
-        generation: u64,
+        generation: GenerationFence,
         cancel: CancelToken,
         runtime_workspace_roots: Vec<PathBuf>,
     ) -> Self {
@@ -245,6 +246,10 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    fn generation(id: u64) -> GenerationFence {
+        GenerationFence::for_test(id)
+    }
+
     #[test]
     fn pending_permission_manager_rejects_duplicate_runtime_request_id_without_overwriting() {
         let manager = PendingPermissionManager::default();
@@ -258,7 +263,7 @@ mod tests {
                     sender: first_sender,
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
-                    generation: 0,
+                    generation: generation(0),
                     runtime_workspace_roots: vec![PathBuf::from("/repo")],
                 },
             )
@@ -271,7 +276,7 @@ mod tests {
                         sender: second_sender,
                         thread_id: "thread-2".to_string(),
                         turn_id: "turn-2".to_string(),
-                        generation: 0,
+                        generation: generation(0),
                         runtime_workspace_roots: vec![PathBuf::from("/other")],
                     },
                 )
@@ -298,7 +303,7 @@ mod tests {
                     sender,
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
-                    generation: 0,
+                    generation: generation(0),
                     runtime_workspace_roots: Vec::new(),
                 },
             )
@@ -318,7 +323,7 @@ mod tests {
                     sender: late_sender,
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-2".to_string(),
-                    generation: 0,
+                    generation: generation(0),
                     runtime_workspace_roots: Vec::new(),
                 },
             )
@@ -337,7 +342,7 @@ mod tests {
             json!("turn"),
             "thread-1".to_string(),
             "turn-1".to_string(),
-            1,
+            generation(1),
             cancel.clone(),
             Vec::new(),
         );

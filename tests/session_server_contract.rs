@@ -2021,22 +2021,38 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
         .expect("write turn/interrupt");
         writeln!(
             stdin,
+            r#"{{"id":"interrupt-active-duplicate","method":"turn/interrupt","params":{{"threadId":"{}","turnId":"{}"}}}}"#,
+            thread_id, turn_id
+        )
+        .expect("write duplicate turn/interrupt");
+        writeln!(
+            stdin,
             r#"{{"id":"resume-active","method":"turn/resume","params":{{"threadId":"{}","turnId":"{}"}}}}"#,
             thread_id, turn_id
         )
         .expect("write turn/resume");
+        writeln!(
+            stdin,
+            r#"{{"id":"resume-active-duplicate","method":"turn/resume","params":{{"threadId":"{}","turnId":"{}"}}}}"#,
+            thread_id, turn_id
+        )
+        .expect("write duplicate turn/resume");
         stdin.flush().expect("flush turn controls");
     }
 
     let interrupt = child.expect_event("interrupt-active", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
+    let duplicate_interrupt = child.expect_event("interrupt-active-duplicate", "turn_controlled");
+    assert_eq!(duplicate_interrupt["status"], "interrupted");
     let resume = child.expect_event("resume-active", "turn_controlled");
     assert_eq!(resume["status"], "resumed");
+    let duplicate_resume = child.expect_event("resume-active-duplicate", "turn_controlled");
+    assert_eq!(duplicate_resume["status"], "resumed");
 
-    child.close_stdin();
     let completed = child.expect_event("turn-slow", "turn_completed");
     assert_eq!(completed["status"], "success");
 
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -2112,7 +2128,6 @@ fn server_mode_steers_active_thread_turn_as_user_item() {
     assert_eq!(controlled["status"], "steered");
     assert_eq!(controlled["input"], "mock_history_echo");
 
-    child.close_stdin();
     let remaining = child.drain_events_until_event("turn-slow", "turn_completed");
     let item_started = remaining
         .iter()
@@ -2139,6 +2154,7 @@ fn server_mode_steers_active_thread_turn_as_user_item() {
         "active steer should be visible to the running model context, got: {message_text}"
     );
 
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -2207,7 +2223,6 @@ fn server_mode_steers_active_thread_turn_with_multi_text_input() {
     assert_eq!(controlled["status"], "steered");
     assert_eq!(controlled["input"], "mock_history_echo\nsecond steer");
 
-    child.close_stdin();
     let remaining = child.drain_events_until_event("turn-slow", "turn_completed");
     let item_started = remaining
         .iter()
@@ -2228,6 +2243,7 @@ fn server_mode_steers_active_thread_turn_with_multi_text_input() {
         "multi-text steer input should be visible to the running model context, got: {message_text}"
     );
 
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -2452,17 +2468,16 @@ fn server_mode_rejects_turn_control_thread_mismatch() {
         stdin.flush().expect("flush mismatched interrupt");
     }
 
-    child.close_stdin();
     let error = child.expect_event("interrupt-mismatch", "error");
     assert_eq!(
         error["message"],
         format!("turn {turn_id} does not belong to thread {thread_b_id}")
     );
 
-    child.close_stdin();
     let completed = child.expect_event("turn-a", "turn_completed");
     assert_eq!(completed["status"], "success");
 
+    child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());

@@ -4771,26 +4771,6 @@ mod tests {
     }
 
     #[test]
-    fn server_thread_runtime_owns_agent_state_through_runtime_thread() {
-        let server_runtime_source = include_str!("server_runtime.rs");
-
-        assert!(
-            server_runtime_source.contains("thread: RuntimeThread"),
-            "ServerThread must hold runtime-owned agent state through RuntimeThread"
-        );
-        for forbidden in [
-            "InteractiveSession",
-            "RuntimeSessionLifecycle",
-            "ThreadTurnExecutor",
-        ] {
-            assert!(
-                !server_runtime_source.contains(forbidden),
-                "server_runtime must not directly own or assemble {forbidden}; use RuntimeThread"
-            );
-        }
-    }
-
-    #[test]
     fn jsonl_thread_store_type_is_owned_by_thread_store_module() {
         let history_source = include_str!("history.rs");
         let thread_store_source = include_str!("thread_store/local.rs");

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::lifecycle::{RuntimeUserInputHandler, RuntimeUserInputRequest};
 use crate::protocol::ServerEvent;
+use crate::runtime_host::GenerationFence;
 
 use super::{lock_error, write_locked_event};
 
@@ -15,11 +16,11 @@ pub(super) struct PendingUserInputRequest {
     pub(super) sender: mpsc::Sender<Option<String>>,
     pub(super) thread_id: String,
     pub(super) turn_id: String,
-    pub(super) generation: u64,
+    pub(super) generation: GenerationFence,
 }
 
 impl PendingUserInputRequest {
-    pub(super) fn generation_scope(&self) -> (&str, &str, u64) {
+    pub(super) fn generation_scope(&self) -> (&str, &str, GenerationFence) {
         (&self.thread_id, &self.turn_id, self.generation)
     }
 }
@@ -82,7 +83,7 @@ pub(super) struct ServerUserInputRequestHandler<W: Write + Send + 'static> {
     event_id: Value,
     thread_id: String,
     turn_id: String,
-    generation: u64,
+    generation: GenerationFence,
     cancel: CancelToken,
 }
 
@@ -93,7 +94,7 @@ impl<W: Write + Send + 'static> ServerUserInputRequestHandler<W> {
         event_id: Value,
         thread_id: String,
         turn_id: String,
-        generation: u64,
+        generation: GenerationFence,
         cancel: CancelToken,
     ) -> Self {
         Self {
@@ -162,6 +163,10 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    fn generation(id: u64) -> GenerationFence {
+        GenerationFence::for_test(id)
+    }
+
     #[test]
     fn pending_user_input_manager_rejects_duplicate_request_id_without_overwriting() {
         let manager = PendingUserInputManager::default();
@@ -175,7 +180,7 @@ mod tests {
                     sender: first_sender,
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
-                    generation: 0,
+                    generation: generation(0),
                 },
             )
             .expect("insert first request");
@@ -187,7 +192,7 @@ mod tests {
                         sender: second_sender,
                         thread_id: "thread-2".to_string(),
                         turn_id: "turn-2".to_string(),
-                        generation: 0,
+                        generation: generation(0),
                     },
                 )
                 .is_err(),
@@ -219,7 +224,7 @@ mod tests {
                     sender,
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
-                    generation: 0,
+                    generation: generation(0),
                 },
             )
             .expect("insert pending request");
@@ -240,7 +245,7 @@ mod tests {
                     sender: late_sender,
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-2".to_string(),
-                    generation: 0,
+                    generation: generation(0),
                 },
             )
             .expect_err("closed manager must reject late requests");
@@ -258,7 +263,7 @@ mod tests {
             json!("turn"),
             "thread-1".to_string(),
             "turn-1".to_string(),
-            1,
+            generation(1),
             cancel.clone(),
         );
         let worker = std::thread::spawn(move || {

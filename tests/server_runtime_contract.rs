@@ -18,7 +18,7 @@ use orca_runtime::lifecycle::ThreadSteerHandle;
 use orca_runtime::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use orca_runtime::server_runtime::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileOverride,
-    PermissionRuleValue, PermissionUpdate, ServerThread, ServerThreadRuntime, ServerThreadTurn,
+    PermissionRuleValue, PermissionUpdate, ServerThreadRuntime, ServerThreadTurn,
 };
 use orca_runtime::session::InteractiveSession;
 use serde_json::Value;
@@ -30,10 +30,11 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn server_thread_owns_live_session_projection_and_turns() {
     with_orca_home(|home| {
         let config = test_run_config(home);
-
-        let mut thread = ServerThread::start(&config).expect("start thread");
-        let thread_id = thread.thread_id().to_string();
-        let projection = thread.read_projection(false, false);
+        let mut runtime = start_server_runtime();
+        let thread_id = runtime.start_thread(&config).expect("start thread");
+        let projection = runtime
+            .read_thread(&thread_id, false, false)
+            .expect("read thread");
 
         assert_eq!(projection.thread_id, thread_id);
         assert_eq!(projection.title, "(empty prompt)");
@@ -43,8 +44,13 @@ fn server_thread_owns_live_session_projection_and_turns() {
         assert!(projection.turns.is_empty());
 
         let mut first_output = Vec::new();
-        thread
-            .run_turn(&config, "first prompt", request_writer(&mut first_output))
+        runtime
+            .run_turn(
+                &config,
+                &thread_id,
+                "first prompt",
+                request_writer(&mut first_output),
+            )
             .expect("run first turn");
         assert!(
             parse_jsonl(&first_output)
@@ -53,9 +59,10 @@ fn server_thread_owns_live_session_projection_and_turns() {
         );
 
         let mut second_output = Vec::new();
-        thread
+        runtime
             .run_turn(
                 &config,
+                &thread_id,
                 "mock_history_echo",
                 request_writer(&mut second_output),
             )
@@ -70,7 +77,9 @@ fn server_thread_owns_live_session_projection_and_turns() {
             "expected second turn to see prior thread history, got: {echoed}"
         );
 
-        let projection = thread.read_projection(true, true);
+        let projection = runtime
+            .read_thread(&thread_id, true, true)
+            .expect("read completed thread");
         assert_eq!(projection.message_count, 5);
         assert!(
             projection
@@ -85,14 +94,20 @@ fn server_thread_owns_live_session_projection_and_turns() {
 fn server_thread_runs_explicit_turn_requests() {
     with_orca_home(|home| {
         let config = test_run_config(home);
-        let mut thread = ServerThread::start(&config).expect("start thread");
+        let mut runtime = start_server_runtime();
+        let thread_id = runtime.start_thread(&config).expect("start thread");
 
         let turn = ServerThreadTurn::new("explicit turn request");
         assert_eq!(turn.prompt(), "explicit turn request");
 
         let mut output = Vec::new();
-        thread
-            .run_turn_request(&config, &turn, request_writer(&mut output))
+        runtime
+            .run_turn(
+                &config,
+                &thread_id,
+                turn.prompt(),
+                request_writer(&mut output),
+            )
             .expect("run explicit turn request");
 
         let events = parse_jsonl(&output);
@@ -100,7 +115,9 @@ fn server_thread_runs_explicit_turn_requests() {
             events.iter().any(|event| event["event"] == "turn_started"),
             "turn request should stream turn_started"
         );
-        let projection = thread.read_projection(true, false);
+        let projection = runtime
+            .read_thread(&thread_id, true, false)
+            .expect("read completed thread");
         assert!(
             projection
                 .messages
@@ -114,7 +131,7 @@ fn server_thread_runs_explicit_turn_requests() {
 fn server_thread_runtime_resolves_completed_turn_owner() {
     with_orca_home(|home| {
         let config = test_run_config(home);
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let thread_id = runtime.start_thread(&config).expect("start thread");
 
         runtime
@@ -144,7 +161,7 @@ fn server_thread_runtime_resolves_completed_turn_owner() {
 fn server_thread_runtime_predicts_next_persisted_turn_id() {
     with_orca_home(|home| {
         let config = test_run_config(home);
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let thread_id = runtime.start_thread(&config).expect("start thread");
         assert_eq!(
             runtime.next_persisted_turn_id(&thread_id).as_deref(),
@@ -365,7 +382,7 @@ fn thread_turn_execution_owns_runtime_event_state() {
 #[test]
 fn server_thread_runtime_starts_thread_with_live_projection() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
 
@@ -386,7 +403,7 @@ fn server_thread_runtime_starts_thread_with_live_projection() {
 #[test]
 fn server_thread_runtime_materializes_started_thread_in_session_store() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
 
@@ -405,7 +422,7 @@ fn server_thread_runtime_materializes_started_thread_in_session_store() {
 #[test]
 fn server_thread_runtime_resumes_and_forks_persisted_threads() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
 
@@ -460,7 +477,7 @@ fn server_thread_runtime_resumes_and_forks_persisted_threads() {
 #[test]
 fn server_thread_runtime_resume_and_fork_inherit_stored_permission_profile() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut original = test_run_config(home);
         original.history_mode = HistoryMode::Record;
         original.active_permission_profile = Some(ActivePermissionProfile::new(
@@ -531,7 +548,7 @@ fn server_thread_runtime_resume_and_fork_inherit_stored_permission_profile() {
 #[test]
 fn server_thread_runtime_resume_and_fork_apply_explicit_permission_override() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut original = test_run_config(home);
         original.history_mode = HistoryMode::Record;
         original.active_permission_profile = Some(ActivePermissionProfile::new(
@@ -644,7 +661,7 @@ fn server_thread_runtime_resume_and_fork_apply_explicit_permission_override() {
 #[test]
 fn server_thread_runtime_turn_start_applies_persistent_permission_override() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
         config.approval_mode = ApprovalMode::Plan;
@@ -708,7 +725,7 @@ fn server_thread_runtime_turn_start_applies_persistent_permission_override() {
 #[test]
 fn server_thread_runtime_turn_start_applies_incremental_permission_updates() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
         config.approval_mode = ApprovalMode::Plan;
@@ -779,7 +796,7 @@ fn server_thread_runtime_turn_start_applies_incremental_permission_updates() {
 #[test]
 fn server_thread_runtime_turn_start_persists_directory_permission_updates() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
         let extra = home.join("extra");
@@ -828,7 +845,7 @@ fn server_thread_runtime_turn_start_persists_directory_permission_updates() {
 #[test]
 fn server_thread_runtime_turn_start_persists_runtime_workspace_roots() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
         let old_root = home.join("old-root");
@@ -871,7 +888,7 @@ fn server_thread_runtime_turn_start_persists_runtime_workspace_roots() {
 #[test]
 fn server_thread_runtime_turn_start_persists_active_permission_profile() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let mut config = test_run_config(home);
         config.history_mode = HistoryMode::Record;
         let thread_id = runtime.start_thread(&config).expect("start thread");
@@ -911,7 +928,7 @@ fn server_thread_runtime_turn_start_persists_active_permission_profile() {
 #[test]
 fn server_thread_runtime_runs_turn_and_preserves_conversation() {
     with_orca_home(|home| {
-        let mut runtime = ServerThreadRuntime::default();
+        let mut runtime = start_server_runtime();
         let config = test_run_config(home);
         let thread_id = runtime.start_thread(&config).expect("start thread");
 
@@ -974,6 +991,10 @@ fn server_thread_runtime_runs_turn_and_preserves_conversation() {
                     .any(|item| item["role"] == "user" && item["content"] == "mock_history_echo")
         }));
     });
+}
+
+fn start_server_runtime() -> ServerThreadRuntime {
+    ServerThreadRuntime::start().expect("start server runtime")
 }
 
 fn request_writer<'a>(output: &'a mut Vec<u8>) -> impl Write + 'a {

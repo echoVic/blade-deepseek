@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_core::config::RunConfig;
+use orca_core::conversation::Message;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::HookEvent;
-use orca_mcp::McpElicitationHandler;
+use orca_mcp::{McpElicitationHandler, McpRegistry};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tokio::task::JoinHandle;
@@ -23,16 +24,96 @@ use crate::hooks::HookContext;
 use crate::lifecycle::{
     RuntimePermissionRequestHandler, RuntimeTaskKind, RuntimeUserInputHandler, ThreadSteerHandle,
 };
+use crate::tasks::TaskRegistry;
 use crate::thread::RuntimeThread;
 
 pub const HOST_COMMAND_CAPACITY: usize = 16;
 pub const THREAD_COMMAND_CAPACITY: usize = 16;
 
+pub trait HostedOperationWriter: io::Write + Send + 'static {
+    fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
+}
+
+struct PassthroughHostedOperationWriter<W> {
+    writer: W,
+}
+
+impl<W> PassthroughHostedOperationWriter<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: io::Write> io::Write for PassthroughHostedOperationWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.writer.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<W: io::Write + Send + 'static> HostedOperationWriter for PassthroughHostedOperationWriter<W> {
+    fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct HostedGenerationHandlers {
+    permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
+    mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
+}
+
+impl fmt::Debug for HostedGenerationHandlers {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostedGenerationHandlers")
+            .field("permission_handler", &self.permission_handler.is_some())
+            .field("user_input_handler", &self.user_input_handler.is_some())
+            .field(
+                "mcp_elicitation_handler",
+                &self.mcp_elicitation_handler.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl HostedGenerationHandlers {
+    pub fn with_permission_handler(
+        mut self,
+        handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
+    ) -> Self {
+        self.permission_handler = Some(handler);
+        self
+    }
+
+    pub fn with_user_input_handler(
+        mut self,
+        handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
+    ) -> Self {
+        self.user_input_handler = Some(handler);
+        self
+    }
+
+    pub fn with_mcp_elicitation_handler(
+        mut self,
+        handler: Arc<dyn McpElicitationHandler + Send + Sync>,
+    ) -> Self {
+        self.mcp_elicitation_handler = Some(handler);
+        self
+    }
+}
+
+type HostedGenerationHandlerFactory =
+    dyn Fn(GenerationFence, CancelToken) -> HostedGenerationHandlers + Send + Sync;
+
 pub trait ThreadOperationExecutor: Send + Sync + 'static {
     fn run_turn(
         &self,
         thread: &mut RuntimeThread,
-        config: &RunConfig,
         request: &HostedTurnRequest,
         generation: &GenerationContext,
         events: &mut EventFactory,
@@ -53,6 +134,8 @@ pub struct HostedTurnRequest {
     event_observer: Option<Arc<dyn EventObserver>>,
     continuation: Option<RuntimeTurnContinuation>,
     resumes_existing_turn: bool,
+    task_id: Option<String>,
+    generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +157,8 @@ impl HostedTurnRequest {
             event_observer: None,
             continuation: None,
             resumes_existing_turn: false,
+            task_id: None,
+            generation_handler_factory: None,
         }
     }
 
@@ -143,6 +228,19 @@ impl HostedTurnRequest {
         self
     }
 
+    pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+
+    pub fn with_generation_handlers<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(GenerationFence, CancelToken) -> HostedGenerationHandlers + Send + Sync + 'static,
+    {
+        self.generation_handler_factory = Some(Arc::new(factory));
+        self
+    }
+
     fn legacy_request(&self, generation: &GenerationContext) -> ThreadTurnRequest {
         let mut request = ThreadTurnRequest::new(self.prompt.clone())
             .with_options(self.options)
@@ -150,13 +248,28 @@ impl HostedTurnRequest {
                 self.envelope == HostedOperationEnvelope::Turn && self.emit_session_completed,
             )
             .with_steer_handle(generation.steer_handle.clone());
-        if let Some(handler) = self.permission_handler.clone() {
+        if let Some(handler) = generation
+            .handlers
+            .permission_handler
+            .clone()
+            .or_else(|| self.permission_handler.clone())
+        {
             request = request.with_permission_handler(handler);
         }
-        if let Some(handler) = self.user_input_handler.clone() {
+        if let Some(handler) = generation
+            .handlers
+            .user_input_handler
+            .clone()
+            .or_else(|| self.user_input_handler.clone())
+        {
             request = request.with_threaded_user_input_handler(handler);
         }
-        if let Some(handler) = self.mcp_elicitation_handler.clone() {
+        if let Some(handler) = generation
+            .handlers
+            .mcp_elicitation_handler
+            .clone()
+            .or_else(|| self.mcp_elicitation_handler.clone())
+        {
             request = request.with_mcp_elicitation_handler(handler);
         }
         if let Some(observer) = self.event_observer.clone() {
@@ -221,6 +334,14 @@ impl GenerationFence {
     pub fn generation_id(self) -> GenerationId {
         self.generation_id
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(generation_id: u64) -> Self {
+        Self {
+            operation_id: OperationIdAllocator::new().allocate(),
+            generation_id: GenerationId(generation_id),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -228,6 +349,8 @@ pub struct GenerationContext {
     fence: GenerationFence,
     steer_handle: ThreadSteerHandle,
     resumes_existing_turn: bool,
+    handlers: HostedGenerationHandlers,
+    config: RunConfig,
 }
 
 impl GenerationContext {
@@ -235,11 +358,15 @@ impl GenerationContext {
         fence: GenerationFence,
         steer_handle: ThreadSteerHandle,
         resumes_existing_turn: bool,
+        handlers: HostedGenerationHandlers,
+        config: RunConfig,
     ) -> Self {
         Self {
             fence,
             steer_handle,
             resumes_existing_turn,
+            handlers,
+            config,
         }
     }
 
@@ -249,6 +376,10 @@ impl GenerationContext {
 
     pub fn resumes_existing_turn(&self) -> bool {
         self.resumes_existing_turn
+    }
+
+    pub fn config(&self) -> &RunConfig {
+        &self.config
     }
 
     pub fn drain_steer_inputs(&self) -> Vec<String> {
@@ -262,7 +393,6 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
     fn run_turn(
         &self,
         thread: &mut RuntimeThread,
-        config: &RunConfig,
         request: &HostedTurnRequest,
         generation: &GenerationContext,
         events: &mut EventFactory,
@@ -270,7 +400,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
         cancel: &CancelToken,
     ) -> io::Result<RunStatus> {
         thread.run_request_with_event_factory_and_cancel(
-            config,
+            generation.config(),
             &request.legacy_request(generation),
             writer,
             events,
@@ -400,6 +530,38 @@ pub enum RuntimeThreadState {
         phase: GenerationPhase,
     },
     Unavailable,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeThreadSnapshot {
+    thread_id: String,
+    messages: Vec<Message>,
+    active_task_id: Option<String>,
+}
+
+impl RuntimeThreadSnapshot {
+    fn from_thread(thread: &RuntimeThread) -> Self {
+        Self {
+            thread_id: thread.thread_id().to_string(),
+            messages: thread.session().conversation().messages.clone(),
+            active_task_id: thread
+                .lifecycle()
+                .active_task()
+                .map(|task| task.id().to_string()),
+        }
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn active_task_id(&self) -> Option<&str> {
+        self.active_task_id.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -538,6 +700,13 @@ impl OperationHandle {
         self.thread.steer_operation(self.operation_id, input)
     }
 
+    pub fn admit_generation(
+        &self,
+        generation: GenerationFence,
+    ) -> Result<GenerationAdmissionResult, RuntimeHostError> {
+        self.thread.admit_generation(generation)
+    }
+
     pub fn wait(&self) -> OperationTerminal {
         self.completion.wait()
     }
@@ -561,6 +730,8 @@ impl fmt::Debug for OperationHandle {
 pub struct RuntimeThreadHandle {
     thread_id: String,
     startup_warnings: Arc<Vec<String>>,
+    task_registry: TaskRegistry,
+    mcp_registry: McpRegistry,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
 }
 
@@ -573,6 +744,14 @@ impl RuntimeThreadHandle {
         self.startup_warnings.as_slice()
     }
 
+    pub fn task_registry(&self) -> TaskRegistry {
+        self.task_registry.clone()
+    }
+
+    pub fn mcp_registry(&self) -> McpRegistry {
+        self.mcp_registry.clone()
+    }
+
     pub fn start_turn<W>(
         &self,
         request: HostedTurnRequest,
@@ -581,10 +760,63 @@ impl RuntimeThreadHandle {
     where
         W: io::Write + Send + 'static,
     {
+        self.start_turn_inner(
+            request,
+            Box::new(PassthroughHostedOperationWriter::new(writer)),
+            None,
+        )
+    }
+
+    pub fn start_turn_with_config<W>(
+        &self,
+        request: HostedTurnRequest,
+        writer: W,
+        config: RunConfig,
+    ) -> Result<OperationHandle, RuntimeHostError>
+    where
+        W: io::Write + Send + 'static,
+    {
+        self.start_turn_inner(
+            request,
+            Box::new(PassthroughHostedOperationWriter::new(writer)),
+            Some(config),
+        )
+    }
+
+    pub fn start_turn_with_output<W>(
+        &self,
+        request: HostedTurnRequest,
+        writer: W,
+    ) -> Result<OperationHandle, RuntimeHostError>
+    where
+        W: HostedOperationWriter,
+    {
+        self.start_turn_inner(request, Box::new(writer), None)
+    }
+
+    pub fn start_turn_with_config_and_output<W>(
+        &self,
+        request: HostedTurnRequest,
+        writer: W,
+        config: RunConfig,
+    ) -> Result<OperationHandle, RuntimeHostError>
+    where
+        W: HostedOperationWriter,
+    {
+        self.start_turn_inner(request, Box::new(writer), Some(config))
+    }
+
+    fn start_turn_inner(
+        &self,
+        request: HostedTurnRequest,
+        writer: Box<dyn HostedOperationWriter>,
+        config: Option<RunConfig>,
+    ) -> Result<OperationHandle, RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::StartTurn {
             request: Box::new(request),
-            writer: Box::new(writer),
+            writer,
+            config: config.map(Box::new),
             reply: reply_tx,
         })?;
         receive_reply(reply_rx, "runtime thread")?
@@ -643,6 +875,12 @@ impl RuntimeThreadHandle {
     pub fn state(&self) -> Result<RuntimeThreadState, RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::ReadState { reply: reply_tx })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub fn snapshot(&self) -> Result<RuntimeThreadSnapshot, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ReadSnapshot { reply: reply_tx })?;
         receive_reply(reply_rx, "runtime thread")?
     }
 
@@ -789,7 +1027,8 @@ enum HostCommand {
 enum ThreadCommand {
     StartTurn {
         request: Box<HostedTurnRequest>,
-        writer: Box<dyn io::Write + Send>,
+        writer: Box<dyn HostedOperationWriter>,
+        config: Option<Box<RunConfig>>,
         reply: SyncSender<Result<OperationHandle, RuntimeHostError>>,
     },
     InterruptOperation {
@@ -811,6 +1050,9 @@ enum ThreadCommand {
     },
     ReadState {
         reply: SyncSender<Result<RuntimeThreadState, RuntimeHostError>>,
+    },
+    ReadSnapshot {
+        reply: SyncSender<Result<RuntimeThreadSnapshot, RuntimeHostError>>,
     },
     ShutdownThread {
         reply: Option<SyncSender<Result<(), RuntimeHostError>>>,
@@ -853,6 +1095,8 @@ async fn run_host_supervisor(
                     }
                 };
                 let thread_id = thread.thread_id().to_string();
+                let task_registry = thread.session().task_registry().clone();
+                let mcp_registry = thread.session().mcp_registry().clone();
                 let startup_warnings = Arc::new(
                     thread
                         .session()
@@ -872,6 +1116,8 @@ async fn run_host_supervisor(
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
                     startup_warnings,
+                    task_registry,
+                    mcp_registry,
                     command_tx: command_tx.clone(),
                 };
                 let actor_handle = handle.clone();
@@ -928,6 +1174,7 @@ struct ActiveOperation {
     task_id: Option<String>,
     completion: OperationCompletion,
     request: HostedTurnRequest,
+    config: RunConfig,
     steer_handle: ThreadSteerHandle,
     resume_queued: bool,
     generation: ActiveGeneration,
@@ -941,7 +1188,7 @@ struct ActiveGeneration {
 
 struct OperationTaskResult {
     state: ThreadActorState,
-    writer: Box<dyn io::Write + Send>,
+    writer: Box<dyn HostedOperationWriter>,
     outcome: OperationOutcome,
 }
 
@@ -1012,9 +1259,10 @@ impl ThreadActor {
             ThreadCommand::StartTurn {
                 request,
                 writer,
+                config,
                 reply,
             } => {
-                let Some(state) = self.state.take() else {
+                let Some(mut state) = self.state.take() else {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                     return false;
                 };
@@ -1022,6 +1270,15 @@ impl ThreadActor {
                 let initial_generation = GenerationFence::initial(operation_id);
                 let completion = OperationCompletion::new();
                 let request = *request;
+                let config = config
+                    .map(|config| *config)
+                    .unwrap_or_else(|| self.config.clone());
+                if let Some(task_id) = request.task_id.as_deref() {
+                    state
+                        .thread
+                        .lifecycle_mut()
+                        .start_task_with_id(RuntimeTaskKind::Agent, task_id);
+                }
                 let task_id = state
                     .thread
                     .lifecycle()
@@ -1036,6 +1293,8 @@ impl ThreadActor {
                         initial_generation,
                         steer_handle.clone(),
                         request.resumes_existing_turn,
+                        HostedGenerationHandlers::default(),
+                        config.clone(),
                     ),
                 );
                 self.active = Some(ActiveOperation {
@@ -1043,6 +1302,7 @@ impl ThreadActor {
                     task_id,
                     completion: completion.clone(),
                     request,
+                    config,
                     steer_handle,
                     resume_queued: false,
                     generation,
@@ -1098,6 +1358,15 @@ impl ThreadActor {
                     RuntimeThreadState::Unavailable
                 };
                 let _ = reply.send(Ok(state));
+                false
+            }
+            ThreadCommand::ReadSnapshot { reply } => {
+                let result = self
+                    .state
+                    .as_ref()
+                    .map(|state| RuntimeThreadSnapshot::from_thread(&state.thread))
+                    .ok_or(RuntimeHostError::ThreadUnavailable);
+                let _ = reply.send(result);
                 false
             }
             ThreadCommand::ShutdownThread { reply } => {
@@ -1203,6 +1472,11 @@ impl ThreadActor {
                 };
                 let _ = reply.send(Ok(RuntimeThreadState::Running { generation, phase }));
             }
+            ThreadCommand::ReadSnapshot { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
             ThreadCommand::ShutdownThread { .. } => unreachable!("shutdown handled by actor loop"),
         }
     }
@@ -1211,14 +1485,16 @@ impl ThreadActor {
         &self,
         state: ThreadActorState,
         request: &HostedTurnRequest,
-        mut writer: Box<dyn io::Write + Send>,
-        context: GenerationContext,
+        mut writer: Box<dyn HostedOperationWriter>,
+        mut context: GenerationContext,
     ) -> ActiveGeneration {
         let executor = Arc::clone(&self.executor);
-        let config = self.config.clone();
         let task_request = request.clone();
-        let task_context = context.clone();
         let cancel = CancelToken::new();
+        if let Some(factory) = request.generation_handler_factory.as_ref() {
+            context.handlers = factory(context.fence(), cancel.clone());
+        }
+        let task_context = context.clone();
         let task_cancel = cancel.clone();
         let join = tokio::task::spawn_blocking(move || {
             let mut state = state;
@@ -1227,7 +1503,6 @@ impl ThreadActor {
                     executor.as_ref(),
                     &mut state.thread,
                     &mut state.events,
-                    &config,
                     &task_request,
                     &task_context,
                     writer.as_mut(),
@@ -1264,34 +1539,52 @@ impl ThreadActor {
         allow_resume: bool,
     ) {
         let outcome = match result {
-            Ok(mut result)
-                if allow_resume
+            Ok(mut result) => {
+                let replace_generation = allow_resume
                     && active.resume_queued
                     && active.request.is_resumable()
-                    && result.outcome == OperationOutcome::Completed(RunStatus::Cancelled) =>
-            {
-                let _ = active.steer_handle.drain();
-                if let Some(task_id) = active.task_id.as_deref() {
-                    result
-                        .state
-                        .thread
-                        .lifecycle_mut()
-                        .start_task_with_id(RuntimeTaskKind::Agent, task_id);
+                    && result.outcome == OperationOutcome::Completed(RunStatus::Cancelled);
+                if replace_generation {
+                    if let Err(error) = result.writer.finish_generation(false) {
+                        self.state = Some(result.state);
+                        OperationOutcome::ExecutionFailed {
+                            kind: error.kind(),
+                            message: error.to_string(),
+                        }
+                    } else {
+                        let _ = active.steer_handle.drain();
+                        if let Some(task_id) = active.task_id.as_deref() {
+                            result
+                                .state
+                                .thread
+                                .lifecycle_mut()
+                                .start_task_with_id(RuntimeTaskKind::Agent, task_id);
+                        }
+                        let context = GenerationContext::new(
+                            active.generation.context.fence().next(),
+                            active.steer_handle.clone(),
+                            true,
+                            HostedGenerationHandlers::default(),
+                            active.config.clone(),
+                        );
+                        active.generation = self.spawn_generation(
+                            result.state,
+                            &active.request,
+                            result.writer,
+                            context,
+                        );
+                        active.resume_queued = false;
+                        self.active = Some(active);
+                        return;
+                    }
+                } else {
+                    let writer_error = result.writer.finish_generation(true).err();
+                    self.state = Some(result.state);
+                    writer_error.map_or(result.outcome, |error| OperationOutcome::ExecutionFailed {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    })
                 }
-                let context = GenerationContext::new(
-                    active.generation.context.fence().next(),
-                    active.steer_handle.clone(),
-                    true,
-                );
-                active.generation =
-                    self.spawn_generation(result.state, &active.request, result.writer, context);
-                active.resume_queued = false;
-                self.active = Some(active);
-                return;
-            }
-            Ok(result) => {
-                self.state = Some(result.state);
-                result.outcome
             }
             Err(error) => OperationOutcome::Panicked {
                 message: error.to_string(),
@@ -1309,7 +1602,6 @@ fn run_hosted_operation(
     executor: &dyn ThreadOperationExecutor,
     thread: &mut RuntimeThread,
     events: &mut EventFactory,
-    config: &RunConfig,
     request: &HostedTurnRequest,
     generation: &GenerationContext,
     writer: &mut (dyn io::Write + Send),
@@ -1317,10 +1609,10 @@ fn run_hosted_operation(
 ) -> io::Result<RunStatus> {
     match request.envelope {
         HostedOperationEnvelope::Turn => {
-            executor.run_turn(thread, config, request, generation, events, writer, cancel)
+            executor.run_turn(thread, request, generation, events, writer, cancel)
         }
         HostedOperationEnvelope::HeadlessSession => run_headless_session(
-            executor, thread, events, config, request, generation, writer, cancel,
+            executor, thread, events, request, generation, writer, cancel,
         ),
     }
 }
@@ -1329,12 +1621,12 @@ fn run_headless_session(
     executor: &dyn ThreadOperationExecutor,
     thread: &mut RuntimeThread,
     events: &mut EventFactory,
-    config: &RunConfig,
     request: &HostedTurnRequest,
     generation: &GenerationContext,
     writer: &mut (dyn io::Write + Send),
     cancel: &CancelToken,
 ) -> io::Result<RunStatus> {
+    let config = generation.config();
     let cwd_path = config.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = cwd_path.display().to_string();
     let mut sink = EventSink::new(writer, config.output_format)
@@ -1362,7 +1654,6 @@ fn run_headless_session(
 
     let status = executor.run_turn(
         thread,
-        config,
         request,
         generation,
         events,

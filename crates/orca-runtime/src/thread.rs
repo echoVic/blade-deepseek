@@ -50,14 +50,6 @@ impl RuntimeThread {
         Ok(Self::from_session(session))
     }
 
-    pub(crate) fn resume_same_thread(
-        config: &RunConfig,
-        transcript: SessionTranscript,
-    ) -> io::Result<Self> {
-        let session = InteractiveSession::resume_same_thread(config, transcript)?;
-        Ok(Self::from_session(session))
-    }
-
     fn from_session(session: InteractiveSession) -> Self {
         let thread_id = session
             .session_id()

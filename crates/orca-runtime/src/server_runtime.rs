@@ -1,22 +1,19 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use orca_core::cancel::CancelToken;
-use orca_core::event_schema::RunStatus;
 use orca_core::{
     approval_rules::{PermissionRule, PermissionRules},
     approval_types::{ApprovalMode, Decision},
 };
 use serde_json::Value;
 
-use crate::controller::ThreadTurnRequest;
-use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeTaskKind, RuntimeUserInputHandler, ThreadSteerHandle,
-};
 use crate::protocol;
 use crate::runtime_event_projector::RuntimeEventProjector;
-use crate::thread::RuntimeThread;
+use crate::runtime_host::{
+    HostedOperationWriter, HostedTurnRequest, OperationHandle, OperationOutcome, RuntimeHost,
+    RuntimeHostError, RuntimeThreadHandle,
+};
 use crate::thread_store::{
     SessionStore, StoredThreadItem, StoredThreadProjection, StoredThreadTurn, ThreadMetadataPatch,
     ThreadStore, TurnItemsView,
@@ -25,10 +22,10 @@ pub use orca_core::config::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
 };
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
-use orca_mcp::McpElicitationHandler;
+use orca_mcp::McpRegistry;
 
-#[derive(Default)]
 pub struct ServerThreadRuntime {
+    host: Option<RuntimeHost>,
     threads: HashMap<String, ServerThread>,
 }
 
@@ -120,13 +117,54 @@ pub struct ServerThreadTurn {
 }
 
 pub struct ServerThread {
-    thread: RuntimeThread,
+    handle: RuntimeThreadHandle,
     title: String,
     cwd: String,
     runtime_workspace_roots: Vec<std::path::PathBuf>,
     active_permission_profile: Option<ActivePermissionProfile>,
     additional_working_directories: Vec<AdditionalWorkingDirectory>,
     network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+}
+
+pub(crate) struct ServerThreadSubmissionContext {
+    pub(crate) cwd: String,
+    pub(crate) runtime_workspace_roots: Vec<std::path::PathBuf>,
+    pub(crate) mcp_registry: McpRegistry,
+}
+
+pub(crate) struct PreparedServerTurn {
+    thread_id: String,
+    turn_id: String,
+    config: RunConfig,
+    handle: RuntimeThreadHandle,
+}
+
+#[derive(Clone, Default)]
+struct SharedTurnOutput {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedTurnOutput {
+    fn bytes(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Write for SharedTurnOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl ServerThreadTurn {
@@ -142,46 +180,21 @@ impl ServerThreadTurn {
 }
 
 impl ServerThread {
-    pub fn start(config: &RunConfig) -> io::Result<Self> {
-        let run_config = thread_run_config(config);
-        Self::start_with_config(&run_config)
-    }
-
-    fn start_with_config(run_config: &RunConfig) -> io::Result<Self> {
+    fn from_handle(
+        handle: RuntimeThreadHandle,
+        run_config: &RunConfig,
+        title: impl Into<String>,
+        network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    ) -> io::Result<Self> {
         let cwd = run_config
             .cwd
             .clone()
             .unwrap_or(std::env::current_dir()?)
             .display()
             .to_string();
-        let thread = RuntimeThread::start(run_config, "")?;
         Ok(Self {
-            thread,
-            title: "(empty prompt)".to_string(),
-            runtime_workspace_roots: run_config
-                .runtime_workspace_roots
-                .clone()
-                .unwrap_or_else(|| vec![std::path::PathBuf::from(&cwd)]),
-            cwd,
-            active_permission_profile: run_config.active_permission_profile.clone(),
-            additional_working_directories: run_config.additional_working_directories.clone(),
-            network_domain_permissions: HashMap::new(),
-        })
-    }
-
-    fn resume_same_thread(run_config: &RunConfig, thread_id: &str) -> io::Result<Self> {
-        let cwd = run_config
-            .cwd
-            .clone()
-            .unwrap_or(std::env::current_dir()?)
-            .display()
-            .to_string();
-        let transcript = SessionStore::new().load_session(thread_id)?;
-        let network_domain_permissions = transcript.meta.network_domain_permissions.clone();
-        let thread = RuntimeThread::resume_same_thread(run_config, transcript)?;
-        Ok(Self {
-            thread,
-            title: "(resumed prompt)".to_string(),
+            handle,
+            title: title.into(),
             runtime_workspace_roots: run_config
                 .runtime_workspace_roots
                 .clone()
@@ -194,21 +207,22 @@ impl ServerThread {
     }
 
     pub fn thread_id(&self) -> &str {
-        self.thread.thread_id()
+        self.handle.thread_id()
     }
 
     pub fn active_task_id(&self) -> Option<String> {
-        self.thread
-            .lifecycle()
-            .active_task()
-            .map(|task| task.id().to_string())
+        self.handle
+            .snapshot()
+            .ok()
+            .and_then(|snapshot| snapshot.active_task_id().map(ToString::to_string))
     }
 
-    pub fn next_persisted_turn_id(&self) -> String {
-        crate::thread_store::next_turn_id_for_messages(
-            self.thread.thread_id(),
-            &self.thread.session().conversation().messages,
-        )
+    pub fn next_persisted_turn_id(&self) -> Option<String> {
+        let snapshot = self.handle.snapshot().ok()?;
+        Some(crate::thread_store::next_turn_id_for_messages(
+            self.thread_id(),
+            snapshot.messages(),
+        ))
     }
 
     pub fn run_turn<W: Write>(
@@ -224,91 +238,29 @@ impl ServerThread {
         &mut self,
         config: &RunConfig,
         turn: &ServerThreadTurn,
-        writer: W,
+        mut writer: W,
     ) -> io::Result<()> {
-        let mut run_config = thread_run_config(config);
-        run_config.prompt = turn.prompt().to_string();
-        run_config.additional_working_directories = self.additional_working_directories.clone();
-        if run_config.runtime_workspace_roots.is_none() {
-            run_config.runtime_workspace_roots = Some(self.runtime_workspace_roots.clone());
-        }
-        self.active_permission_profile = run_config.active_permission_profile.clone();
-        self.runtime_workspace_roots = run_config
-            .runtime_workspace_roots
-            .clone()
-            .unwrap_or_else(|| vec![std::path::PathBuf::from(&self.cwd)]);
-        self.start_persisted_turn_task();
-
-        let request =
-            ThreadTurnRequest::new(turn.prompt()).with_wait_for_background_workflows(false);
-        let status = self.thread.run_request(&run_config, &request, writer)?;
-        let _ = status;
-        Ok(())
+        let prepared =
+            self.prepare_turn(config, turn.prompt(), PermissionProfileOverride::default())?;
+        let output = SharedTurnOutput::default();
+        let operation = prepared.start(
+            HostedTurnRequest::new(turn.prompt()).with_wait_for_background_workflows(false),
+            output.clone(),
+        )?;
+        let terminal = operation.wait();
+        writer.write_all(&output.bytes())?;
+        operation_outcome_result(terminal.outcome())
     }
 
-    pub fn run_turn_with_cancel<W: Write>(
-        &mut self,
-        config: &RunConfig,
-        prompt: &str,
-        writer: W,
-        cancel: CancelToken,
-        steer_handle: ThreadSteerHandle,
-    ) -> io::Result<RunStatus> {
-        let mut run_config = thread_run_config(config);
-        run_config.prompt = prompt.to_string();
-        run_config.additional_working_directories = self.additional_working_directories.clone();
-        if run_config.runtime_workspace_roots.is_none() {
-            run_config.runtime_workspace_roots = Some(self.runtime_workspace_roots.clone());
-        }
-        self.active_permission_profile = run_config.active_permission_profile.clone();
-        self.runtime_workspace_roots = run_config
-            .runtime_workspace_roots
-            .clone()
-            .unwrap_or_else(|| vec![std::path::PathBuf::from(&self.cwd)]);
-        self.start_persisted_turn_task();
-        let request = ThreadTurnRequest::new(prompt)
-            .with_wait_for_background_workflows(false)
-            .with_steer_handle(steer_handle);
-        self.thread
-            .run_request_with_cancel(&run_config, &request, writer, cancel)
-    }
-
-    pub fn run_turn_with_permissions_and_cancel<W: Write>(
+    fn prepare_turn(
         &mut self,
         config: &RunConfig,
         prompt: &str,
         permissions: PermissionProfileOverride,
-        writer: W,
-        cancel: CancelToken,
-        steer_handle: ThreadSteerHandle,
-    ) -> io::Result<RunStatus> {
-        if permissions.is_empty() {
-            return self.run_turn_with_cancel(config, prompt, writer, cancel, steer_handle);
-        }
-        let mut run_config = config.clone();
-        apply_permission_override(&mut run_config, permissions);
-        persist_permission_profile(&run_config, self.thread.thread_id())?;
-        self.active_permission_profile = run_config.active_permission_profile.clone();
-        self.runtime_workspace_roots = run_config
-            .runtime_workspace_roots
-            .clone()
-            .unwrap_or_else(|| vec![std::path::PathBuf::from(&self.cwd)]);
-        self.run_turn_with_cancel(&run_config, prompt, writer, cancel, steer_handle)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_turn_with_permissions_cancel_and_permission_handler<W: Write>(
-        &mut self,
-        config: &RunConfig,
-        prompt: &str,
-        permissions: PermissionProfileOverride,
-        writer: W,
-        cancel: CancelToken,
-        steer_handle: ThreadSteerHandle,
-        permission_handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
-        user_input_handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
-        mcp_elicitation_handler: Arc<dyn McpElicitationHandler + Send + Sync>,
-    ) -> io::Result<RunStatus> {
+    ) -> io::Result<PreparedServerTurn> {
+        let turn_id = self
+            .next_persisted_turn_id()
+            .ok_or_else(|| io::Error::other(format!("thread is not idle: {}", self.thread_id())))?;
         let mut run_config = thread_run_config(config);
         run_config.prompt = prompt.to_string();
         run_config.additional_working_directories = self.additional_working_directories.clone();
@@ -317,7 +269,7 @@ impl ServerThread {
         }
         if !permissions.is_empty() {
             apply_permission_override(&mut run_config, permissions);
-            persist_permission_profile(&run_config, self.thread.thread_id())?;
+            persist_permission_profile(&run_config, self.thread_id())?;
         }
         self.active_permission_profile = run_config.active_permission_profile.clone();
         self.runtime_workspace_roots = run_config
@@ -325,80 +277,23 @@ impl ServerThread {
             .clone()
             .unwrap_or_else(|| vec![std::path::PathBuf::from(&self.cwd)]);
         self.additional_working_directories = run_config.additional_working_directories.clone();
-        self.start_persisted_turn_task();
-        let request = ThreadTurnRequest::new(prompt)
-            .with_wait_for_background_workflows(false)
-            .with_steer_handle(steer_handle)
-            .with_permission_handler(permission_handler)
-            .with_threaded_user_input_handler(user_input_handler)
-            .with_mcp_elicitation_handler(mcp_elicitation_handler);
-        self.thread
-            .run_request_with_cancel(&run_config, &request, writer, cancel)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_turn_with_permissions_cancel_and_permission_handler_for_existing_turn<W: Write>(
-        &mut self,
-        config: &RunConfig,
-        prompt: &str,
-        turn_id: &str,
-        permissions: PermissionProfileOverride,
-        writer: W,
-        cancel: CancelToken,
-        steer_handle: ThreadSteerHandle,
-        permission_handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
-        user_input_handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
-        mcp_elicitation_handler: Arc<dyn McpElicitationHandler + Send + Sync>,
-    ) -> io::Result<RunStatus> {
-        let mut run_config = thread_run_config(config);
-        run_config.prompt = prompt.to_string();
-        run_config.additional_working_directories = self.additional_working_directories.clone();
-        if run_config.runtime_workspace_roots.is_none() {
-            run_config.runtime_workspace_roots = Some(self.runtime_workspace_roots.clone());
-        }
-        if !permissions.is_empty() {
-            apply_permission_override(&mut run_config, permissions);
-            persist_permission_profile(&run_config, self.thread.thread_id())?;
-        }
-        self.active_permission_profile = run_config.active_permission_profile.clone();
-        self.runtime_workspace_roots = run_config
-            .runtime_workspace_roots
-            .clone()
-            .unwrap_or_else(|| vec![std::path::PathBuf::from(&self.cwd)]);
-        self.additional_working_directories = run_config.additional_working_directories.clone();
-        self.start_persisted_turn_task_with_id(turn_id);
-        let request = ThreadTurnRequest::new(prompt)
-            .with_existing_turn_prompt()
-            .with_wait_for_background_workflows(false)
-            .with_steer_handle(steer_handle)
-            .with_permission_handler(permission_handler)
-            .with_threaded_user_input_handler(user_input_handler)
-            .with_mcp_elicitation_handler(mcp_elicitation_handler);
-        self.thread
-            .run_request_with_cancel(&run_config, &request, writer, cancel)
-    }
-
-    fn start_persisted_turn_task(&mut self) {
-        let turn_id = self.next_persisted_turn_id();
-        self.start_persisted_turn_task_with_id(&turn_id);
-    }
-
-    fn start_persisted_turn_task_with_id(&mut self, turn_id: &str) {
-        self.thread
-            .lifecycle_mut()
-            .start_task_with_id(RuntimeTaskKind::Agent, turn_id.to_string());
+        Ok(PreparedServerTurn {
+            thread_id: self.thread_id().to_string(),
+            turn_id,
+            config: run_config,
+            handle: self.handle.clone(),
+        })
     }
 
     pub fn read_projection(
         &self,
         include_messages: bool,
         include_turns: bool,
-    ) -> StoredThreadProjection {
+    ) -> Option<StoredThreadProjection> {
+        let snapshot = self.handle.snapshot().ok()?;
         let messages = if include_messages {
-            self.thread
-                .session()
-                .conversation()
-                .messages
+            snapshot
+                .messages()
                 .iter()
                 .map(crate::thread_store::message_to_thread_json)
                 .collect()
@@ -407,26 +302,26 @@ impl ServerThread {
         };
         let turns = if include_turns {
             crate::thread_store::messages_to_thread_turns(
-                self.thread.thread_id(),
-                &self.thread.session().conversation().messages,
+                self.thread_id(),
+                snapshot.messages(),
                 usize::MAX,
                 TurnItemsView::Full,
             )
         } else {
             Vec::new()
         };
-        StoredThreadProjection {
-            thread_id: self.thread.thread_id().to_string(),
+        Some(StoredThreadProjection {
+            thread_id: self.thread_id().to_string(),
             title: self.title.clone(),
             cwd: self.cwd.clone(),
             runtime_workspace_roots: self.runtime_workspace_roots.clone(),
             active_permission_profile: self.active_permission_profile.clone(),
             additional_working_directories: self.additional_working_directories.clone(),
             network_domain_permissions: self.network_domain_permissions.clone(),
-            message_count: self.thread.session().conversation().messages.len(),
+            message_count: snapshot.messages().len(),
             messages,
             turns,
-        }
+        })
     }
 
     pub fn list_turns(
@@ -435,18 +330,19 @@ impl ServerThread {
         limit: usize,
         sort_direction: crate::thread_store::SortDirection,
         items_view: TurnItemsView,
-    ) -> crate::thread_store::StoredThreadTurnPage {
-        crate::thread_store::page_thread_turns(
+    ) -> Option<crate::thread_store::StoredThreadTurnPage> {
+        let snapshot = self.handle.snapshot().ok()?;
+        Some(crate::thread_store::page_thread_turns(
             crate::thread_store::messages_to_thread_turns(
-                self.thread.thread_id(),
-                &self.thread.session().conversation().messages,
+                self.thread_id(),
+                snapshot.messages(),
                 usize::MAX,
                 items_view,
             ),
             cursor,
             limit,
             sort_direction,
-        )
+        ))
     }
 
     pub fn list_items(
@@ -455,18 +351,19 @@ impl ServerThread {
         cursor: Option<&str>,
         limit: usize,
         sort_direction: crate::thread_store::SortDirection,
-    ) -> crate::thread_store::StoredThreadItemPage {
-        crate::thread_store::page_thread_items(
+    ) -> Option<crate::thread_store::StoredThreadItemPage> {
+        let snapshot = self.handle.snapshot().ok()?;
+        Some(crate::thread_store::page_thread_items(
             crate::thread_store::messages_to_thread_items(
-                self.thread.thread_id(),
-                &self.thread.session().conversation().messages,
+                self.thread_id(),
+                snapshot.messages(),
                 turn_id,
                 usize::MAX,
             ),
             cursor,
             limit,
             sort_direction,
-        )
+        ))
     }
 
     pub fn update_metadata(&mut self, patch: ThreadMetadataPatch) {
@@ -488,7 +385,7 @@ impl ServerThread {
     }
 
     pub fn task_registry(&self) -> crate::tasks::TaskRegistry {
-        self.thread.session().task_registry().clone()
+        self.handle.task_registry()
     }
 
     pub fn additional_working_directories(&self) -> &[AdditionalWorkingDirectory] {
@@ -507,21 +404,119 @@ impl ServerThread {
         &self.cwd
     }
 
-    pub fn mcp_registry(&self) -> &orca_mcp::McpRegistry {
-        self.thread.session().mcp_registry()
+    pub fn mcp_registry(&self) -> McpRegistry {
+        self.handle.mcp_registry()
     }
 
     pub fn active_permission_profile(&self) -> Option<&ActivePermissionProfile> {
         self.active_permission_profile.as_ref()
     }
+
+    fn submission_context(
+        &self,
+        permissions: &PermissionProfileOverride,
+    ) -> ServerThreadSubmissionContext {
+        ServerThreadSubmissionContext {
+            cwd: self.cwd.clone(),
+            runtime_workspace_roots: permissions
+                .runtime_workspace_roots
+                .clone()
+                .unwrap_or_else(|| self.runtime_workspace_roots.clone()),
+            mcp_registry: self.handle.mcp_registry(),
+        }
+    }
+}
+
+impl PreparedServerTurn {
+    pub(crate) fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub(crate) fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub(crate) fn start<W>(
+        self,
+        request: HostedTurnRequest,
+        writer: W,
+    ) -> io::Result<OperationHandle>
+    where
+        W: Write + Send + 'static,
+    {
+        self.handle
+            .start_turn_with_config(request.with_task_id(self.turn_id), writer, self.config)
+            .map_err(runtime_host_error)
+    }
+
+    pub(crate) fn start_with_output<W>(
+        self,
+        request: HostedTurnRequest,
+        writer: W,
+    ) -> io::Result<OperationHandle>
+    where
+        W: HostedOperationWriter,
+    {
+        self.handle
+            .start_turn_with_config_and_output(
+                request.with_task_id(self.turn_id),
+                writer,
+                self.config,
+            )
+            .map_err(runtime_host_error)
+    }
+}
+
+fn operation_outcome_result(outcome: &OperationOutcome) -> io::Result<()> {
+    match outcome {
+        OperationOutcome::Completed(_) => Ok(()),
+        OperationOutcome::ExecutionFailed { kind, message } => {
+            Err(io::Error::new(*kind, message.clone()))
+        }
+        OperationOutcome::Panicked { message } => Err(io::Error::other(message.clone())),
+    }
+}
+
+fn runtime_host_error(error: RuntimeHostError) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 impl ServerThreadRuntime {
-    pub fn start_thread(&mut self, config: &RunConfig) -> io::Result<String> {
-        let thread = ServerThread::start(config)?;
+    pub fn start() -> io::Result<Self> {
+        Ok(Self {
+            host: Some(RuntimeHost::start().map_err(runtime_host_error)?),
+            threads: HashMap::new(),
+        })
+    }
+
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        let Some(host) = self.host.take() else {
+            return Ok(());
+        };
+        host.shutdown().map_err(runtime_host_error)
+    }
+
+    fn start_record(
+        &mut self,
+        run_config: RunConfig,
+        title: impl Into<String>,
+        network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    ) -> io::Result<String> {
+        let handle = self
+            .host
+            .as_ref()
+            .ok_or_else(|| io::Error::other("server runtime host is shut down"))?
+            .start_thread(run_config.clone(), "")
+            .map_err(runtime_host_error)?;
+        let thread =
+            ServerThread::from_handle(handle, &run_config, title, network_domain_permissions)?;
         let thread_id = thread.thread_id().to_string();
         self.threads.insert(thread_id.clone(), thread);
         Ok(thread_id)
+    }
+
+    pub fn start_thread(&mut self, config: &RunConfig) -> io::Result<String> {
+        self.start_record(thread_run_config(config), "(empty prompt)", HashMap::new())
     }
 
     pub fn resume_thread(&mut self, config: &RunConfig, thread_id: &str) -> io::Result<String> {
@@ -542,10 +537,26 @@ impl ServerThreadRuntime {
         merge_stored_permission_profile(&mut run_config, thread_id)?;
         apply_permission_override(&mut run_config, permissions);
         persist_permission_profile(&run_config, thread_id)?;
-        let thread = ServerThread::resume_same_thread(&run_config, thread_id)?;
-        let resumed_thread_id = thread.thread_id().to_string();
-        self.threads.insert(resumed_thread_id.clone(), thread);
-        Ok(resumed_thread_id)
+        if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread.update_metadata(ThreadMetadataPatch {
+                title: None,
+                active_permission_profile: run_config.active_permission_profile.clone(),
+                approval_mode: Some(run_config.approval_mode),
+                runtime_workspace_roots: run_config.runtime_workspace_roots.clone(),
+                permission_rules: Some(run_config.permission_rules.clone()),
+                additional_working_directories: Some(
+                    run_config.additional_working_directories.clone(),
+                ),
+                network_domain_permissions: None,
+            });
+            return Ok(thread_id.to_string());
+        }
+        let transcript = SessionStore::new().load_session(thread_id)?;
+        self.start_record(
+            run_config,
+            "(resumed prompt)",
+            transcript.meta.network_domain_permissions,
+        )
     }
 
     pub fn fork_thread(&mut self, config: &RunConfig, thread_id: &str) -> io::Result<String> {
@@ -565,10 +576,7 @@ impl ServerThreadRuntime {
         run_config.desktop_notifications = false;
         merge_stored_permission_profile(&mut run_config, thread_id)?;
         apply_permission_override(&mut run_config, permissions);
-        let thread = ServerThread::start_with_config(&run_config)?;
-        let forked_thread_id = thread.thread_id().to_string();
-        self.threads.insert(forked_thread_id.clone(), thread);
-        Ok(forked_thread_id)
+        self.start_record(run_config, "(empty prompt)", HashMap::new())
     }
 
     pub fn has_thread(&self, thread_id: &str) -> bool {
@@ -602,14 +610,6 @@ impl ServerThreadRuntime {
         self.threads.get(thread_id)
     }
 
-    pub fn take_thread(&mut self, thread_id: &str) -> Option<ServerThread> {
-        self.threads.remove(thread_id)
-    }
-
-    pub fn put_thread(&mut self, thread: ServerThread) {
-        self.threads.insert(thread.thread_id().to_string(), thread);
-    }
-
     pub fn run_turn<W: Write>(
         &mut self,
         config: &RunConfig,
@@ -640,13 +640,16 @@ impl ServerThreadRuntime {
                 format!("unknown thread: {thread_id}"),
             ));
         };
-        if permissions.is_empty() {
-            return thread.run_turn(config, prompt, writer);
-        }
-        let mut run_config = config.clone();
-        apply_permission_override(&mut run_config, permissions);
-        persist_permission_profile(&run_config, thread_id)?;
-        thread.run_turn(&run_config, prompt, writer)
+        let prepared = thread.prepare_turn(config, prompt, permissions)?;
+        let output = SharedTurnOutput::default();
+        let operation = prepared.start(
+            HostedTurnRequest::new(prompt).with_wait_for_background_workflows(false),
+            output.clone(),
+        )?;
+        let terminal = operation.wait();
+        let mut writer = writer;
+        writer.write_all(&output.bytes())?;
+        operation_outcome_result(terminal.outcome())
     }
 
     pub fn read_thread(
@@ -655,8 +658,9 @@ impl ServerThreadRuntime {
         include_messages: bool,
         include_turns: bool,
     ) -> Option<StoredThreadProjection> {
-        let thread = self.threads.get(thread_id)?;
-        Some(thread.read_projection(include_messages, include_turns))
+        self.threads
+            .get(thread_id)?
+            .read_projection(include_messages, include_turns)
     }
 
     pub fn list_thread_turns(
@@ -667,8 +671,9 @@ impl ServerThreadRuntime {
         sort_direction: crate::thread_store::SortDirection,
         items_view: TurnItemsView,
     ) -> Option<crate::thread_store::StoredThreadTurnPage> {
-        let thread = self.threads.get(thread_id)?;
-        Some(thread.list_turns(cursor, limit, sort_direction, items_view))
+        self.threads
+            .get(thread_id)?
+            .list_turns(cursor, limit, sort_direction, items_view)
     }
 
     pub fn list_thread_items(
@@ -679,8 +684,9 @@ impl ServerThreadRuntime {
         limit: usize,
         sort_direction: crate::thread_store::SortDirection,
     ) -> Option<crate::thread_store::StoredThreadItemPage> {
-        let thread = self.threads.get(thread_id)?;
-        Some(thread.list_items(turn_id, cursor, limit, sort_direction))
+        self.threads
+            .get(thread_id)?
+            .list_items(turn_id, cursor, limit, sort_direction)
     }
 
     pub fn update_thread_metadata(&mut self, thread_id: &str, patch: ThreadMetadataPatch) -> bool {
@@ -703,7 +709,7 @@ impl ServerThreadRuntime {
                     usize::MAX,
                     crate::thread_store::SortDirection::Asc,
                     TurnItemsView::Full,
-                )
+                )?
                 .data
                 .into_iter()
                 .find(|turn| turn.turn_id == turn_id)
@@ -714,7 +720,33 @@ impl ServerThreadRuntime {
     pub fn next_persisted_turn_id(&self, thread_id: &str) -> Option<String> {
         self.threads
             .get(thread_id)
-            .map(ServerThread::next_persisted_turn_id)
+            .and_then(ServerThread::next_persisted_turn_id)
+    }
+
+    pub(crate) fn submission_context(
+        &self,
+        thread_id: &str,
+        permissions: &PermissionProfileOverride,
+    ) -> Option<ServerThreadSubmissionContext> {
+        self.threads
+            .get(thread_id)
+            .map(|thread| thread.submission_context(permissions))
+    }
+
+    pub(crate) fn prepare_turn(
+        &mut self,
+        config: &RunConfig,
+        thread_id: &str,
+        prompt: &str,
+        permissions: PermissionProfileOverride,
+    ) -> io::Result<PreparedServerTurn> {
+        let thread = self.threads.get_mut(thread_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown thread: {thread_id}"),
+            )
+        })?;
+        thread.prepare_turn(config, prompt, permissions)
     }
 }
 
