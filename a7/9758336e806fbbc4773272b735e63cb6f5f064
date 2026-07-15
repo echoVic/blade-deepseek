@@ -1,0 +1,21 @@
+docs/superpowers/specs/2026-07-15-mention-binding-only-design.md
+  s_61c879183fbdff::t_7a63cc6cfef351 1-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a79758336e806fbbc4773272b735e63cb6f5f064",
+  "prompts": {},
+  "sessions": {
+    "s_61c879183fbdff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f63eb-5026-7073-9854-b348079bb9f3",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
