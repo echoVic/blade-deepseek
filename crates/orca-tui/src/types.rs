@@ -858,17 +858,21 @@ impl AppState {
         revision
     }
 
-    fn push_goal_notice(&mut self, notice: String, suppress_duplicate: bool) {
-        let duplicate = suppress_duplicate
-            && self
-                .messages
-                .iter()
-                .rev()
-                .find_map(|message| match message {
-                    ChatMessage::System(text) if text.starts_with("Goal ") => Some(text),
-                    _ => None,
-                })
-                == Some(&notice);
+    fn push_goal_notice(&mut self, notice: String) {
+        // The live Goal banner is the source of truth for current status, so the
+        // transcript only needs a notice when the rendered line actually changes.
+        // Collapsing consecutive identical notices keeps the periodic refreshes
+        // emitted between auto-continuation turns (which land while the app is
+        // Idle) from stacking duplicate lines.
+        let duplicate = self
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ChatMessage::System(text) if text.starts_with("Goal ") => Some(text),
+                _ => None,
+            })
+            == Some(&notice);
         if !duplicate {
             self.push_message(ChatMessage::System(notice));
         }
@@ -1890,7 +1894,7 @@ impl AppState {
                     self.status == AppStatus::Running && goal.status.should_continue();
                 let notice = format_goal_notice(&goal);
                 self.current_goal = Some(goal);
-                self.push_goal_notice(notice, should_keep_running);
+                self.push_goal_notice(notice);
                 if !should_keep_running {
                     self.set_status(AppStatus::Idle);
                 }
@@ -1908,7 +1912,7 @@ impl AppState {
                         should_keep_running =
                             self.status == AppStatus::Running && goal.status.should_continue();
                         let notice = format_goal_notice(&goal);
-                        self.push_goal_notice(notice, should_keep_running);
+                        self.push_goal_notice(notice);
                     }
                     None => self
                         .push_message(ChatMessage::System("No goal is currently set.".to_string())),
@@ -4260,6 +4264,39 @@ mod tests {
             updated_at: 1,
         };
 
+        state.update(TuiEvent::GoalStatus(Some(goal.clone())));
+        state.update(TuiEvent::GoalStatus(Some(goal)));
+
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| matches!(message, ChatMessage::System(text) if text.starts_with("Goal active")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn idle_goal_refreshes_between_turns_do_not_repeat_unchanged_status_notice() {
+        // Between auto-continuation turns the goal loop emits several GoalStatus
+        // refreshes (pre-turn poll, usage accounting, post-turn poll) while the
+        // app has already returned to Idle. They render an identical line, so the
+        // transcript must collapse them to a single notice regardless of status.
+        let mut state = state();
+        state.status = AppStatus::Idle;
+        let goal = ThreadGoal {
+            session_id: "session-1".to_string(),
+            objective: "keep going".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 120,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        state.update(TuiEvent::GoalStatus(Some(goal.clone())));
         state.update(TuiEvent::GoalStatus(Some(goal.clone())));
         state.update(TuiEvent::GoalStatus(Some(goal)));
 
