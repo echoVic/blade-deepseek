@@ -36,6 +36,7 @@ pub mod runtime_capability;
 mod runtime_conversation_bootstrap;
 pub mod runtime_directive;
 pub(crate) mod runtime_event_projector;
+pub mod runtime_host;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;

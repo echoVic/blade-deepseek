@@ -28,6 +28,18 @@ check, four-platform build, GitHub Release, npm publish, and npm release-asset
 jobs. The public verifier confirmed the GitHub Release,
 `@blade-ai/orca@0.2.28`, and `npm exec` installation.
 
+Current unreleased architecture work starts P0.3a. `orca-runtime` now has a
+process-owned `RuntimeHost`, one bounded-mailbox `ThreadActor` per conversation,
+an owned and thread-safe `HostedTurnRequest`, and typed `OperationHandle` /
+`OperationCompletion` terminals. An actor owns idle `RuntimeThread` state; one
+joined operation task owns it while running and returns it before another turn
+can start. Explicit interrupt is fenced by `OperationId`, concurrent start is
+rejected, handle or event-subscriber loss is not reported as cancellation, and
+thread/host shutdown cancels and joins active work. The operation task still
+delegates to the existing `RuntimeThread -> ThreadTurnExecutor` path. No TUI,
+headless, or server surface has migrated yet, so this foundation is not a
+release point and the old surface owners remain deletion-gated work.
+
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
 paused rendering now applies producer backpressure without silently dropping
@@ -549,7 +561,8 @@ The immediate sequence is:
    cancelled and crash-indeterminate turns;
 2. replace resettable shared cancellation with one-shot operation scopes and
    typed terminal outcomes plus stable operation identities;
-3. introduce a runtime host, thread actors, and one canonical turn executor;
+3. finish the seeded runtime host and thread actors by migrating a surface,
+   then move one canonical turn executor under that owner;
 4. run the async provider directly from that host, then delete the temporary
    synchronous provider worker;
 5. migrate server, headless, and TUI surfaces onto runtime command/event
