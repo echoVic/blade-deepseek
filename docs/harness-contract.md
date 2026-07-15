@@ -203,7 +203,8 @@ External tools:
 - Orca loads `~/.orca/tools/*.toml` at startup.
 - Each descriptor defines `name`, `description`, `action_kind`, `command`, and `schema`.
 - Descriptors are advertised to the model as function tools.
-- Commands run from the workspace directory with raw JSON arguments on stdin and in `ORCA_TOOL_ARGS`.
+- Commands run from the workspace directory with raw JSON arguments always on
+  stdin and, up to 64 KiB, mirrored in `ORCA_TOOL_ARGS` for compatibility.
 
 `glob` is the preferred file discovery tool. It accepts the existing `pattern` argument for glob searches and `{"mode":"fuzzy","query":"..."}` for fuzzy path discovery. `list_files` remains accepted for compatibility but is not recommended in the system prompt.
 

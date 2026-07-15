@@ -11,6 +11,8 @@ use orca_core::tool_types::{
 
 use crate::process;
 
+const MAX_EXTERNAL_TOOL_ENV_ARGS_BYTES: usize = 64 * 1024;
+
 // Security: only loads from ORCA_HOME/tools/ (user-controlled), never from
 // project-level directories, to prevent repo poisoning attacks.
 pub fn default_tools_dir() -> Option<PathBuf> {
@@ -116,13 +118,17 @@ pub fn execute_external_tool_with_policy_or_cancel(
         .arg(&config.command)
         .current_dir(cwd)
         .env("ORCA_TOOL_NAME", &config.name)
-        .env("ORCA_TOOL_ARGS", args)
         .env(
             "ORCA_TOOL_TARGET",
             request.target.as_deref().unwrap_or_default(),
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if args.len() <= MAX_EXTERNAL_TOOL_ENV_ARGS_BYTES {
+        command.env("ORCA_TOOL_ARGS", args);
+    } else {
+        command.env_remove("ORCA_TOOL_ARGS");
+    }
     process::prepare_non_interactive_command(&mut command);
     command.stdin(Stdio::piped());
 
@@ -455,7 +461,7 @@ mod tests {
             name: ToolName::External("closed_stdin_tool".to_string()),
             action: ActionKind::Shell,
             target: None,
-            raw_arguments: Some("x".repeat(128 * 1024)),
+            raw_arguments: Some("x".repeat(1024 * 1024)),
         };
 
         let result = execute_external_tool_with_policy(

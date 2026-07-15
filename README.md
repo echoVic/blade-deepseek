@@ -138,7 +138,9 @@ command = "./scripts/deploy.sh"
 schema = { target = { type = "string", description = "environment" } }
 ```
 
-External tool commands run from the workspace directory. The raw JSON arguments are provided on stdin and in `ORCA_TOOL_ARGS`.
+External tool commands run from the workspace directory. Raw JSON arguments are
+always provided on stdin and, when they are at most 64 KiB, are also mirrored
+in `ORCA_TOOL_ARGS` for compatibility.
 
 Tool output truncation can be configured under `[tools]`. Byte mode preserves the historical 8 KiB default; token mode adds an explicit warning with original token and line counts before compacting large outputs:
 
