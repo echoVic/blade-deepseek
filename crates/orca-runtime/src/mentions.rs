@@ -636,15 +636,12 @@ pub fn expand_mentions(
     workspace_roots: &[PathBuf],
     mcp_registry: &orca_mcp::McpRegistry,
 ) -> Result<String, String> {
-    let valid_bindings = bindings
-        .bindings()
-        .iter()
-        .filter(|binding| {
-            binding.end <= input.len()
-                && input.is_char_boundary(binding.start)
-                && input.is_char_boundary(binding.end)
-                && input[binding.start..binding.end] == binding.visible
-        });
+    let valid_bindings = bindings.bindings().iter().filter(|binding| {
+        binding.end <= input.len()
+            && input.is_char_boundary(binding.start)
+            && input.is_char_boundary(binding.end)
+            && input[binding.start..binding.end] == binding.visible
+    });
     let mut blocks = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
     for binding in valid_bindings {

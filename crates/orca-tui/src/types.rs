@@ -221,6 +221,10 @@ pub enum TuiEvent {
     MentionCatalogDirty {
         generation: u64,
     },
+    SubmissionRejected {
+        prompt: String,
+        message: String,
+    },
     Error(String),
     UsageUpdated(UsageTotals),
     ContextUpdated {
@@ -1727,6 +1731,13 @@ impl AppState {
                 }
                 self.push_message(ChatMessage::System(lines.join("\n")));
             }
+            TuiEvent::SubmissionRejected { message, .. } => {
+                self.remove_after_last_user();
+                self.mention_bindings.clear();
+                self.clear_receiving_tool_progress();
+                self.push_message(ChatMessage::Error(message));
+                self.set_status(AppStatus::Idle);
+            }
             TuiEvent::Error(msg) => {
                 self.clear_receiving_tool_progress();
                 self.push_message(ChatMessage::Error(msg));
@@ -3012,6 +3023,27 @@ mod tests {
         // clamped so it can never exceed the remaining message count.
         assert!(state.finalized_count <= state.messages.len());
         assert_eq!(state.messages.len(), 2);
+    }
+
+    #[test]
+    fn submission_rejection_removes_optimistic_user_and_returns_idle() {
+        let mut state = state();
+        state.push_message(ChatMessage::Assistant("before".to_string()));
+        state.push_message(ChatMessage::User("review @gone.txt".to_string()));
+        state.enter_running();
+
+        state.update(TuiEvent::SubmissionRejected {
+            prompt: "review @gone.txt".to_string(),
+            message: "bound file is no longer available".to_string(),
+        });
+
+        assert_eq!(state.status, AppStatus::Idle);
+        assert!(matches!(
+            state.messages.as_slice(),
+            [ChatMessage::Assistant(before), ChatMessage::Error(error)]
+                if before == "before" && error == "bound file is no longer available"
+        ));
+        assert!(state.mention_bindings.is_empty());
     }
 
     #[test]

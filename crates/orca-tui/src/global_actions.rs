@@ -24,11 +24,6 @@ where
 {
     match shortcut {
         GlobalShortcut::Cancel => {
-            if matches!(state.status, AppStatus::Running | AppStatus::Compacting) {
-                cancel_token.cancel();
-                let _ = action_tx.send(UserAction::Interrupt);
-                return Ok(GlobalShortcutFlow::Continue);
-            }
             let now = Instant::now();
             if state
                 .last_ctrl_c
@@ -38,6 +33,10 @@ where
                 return Ok(GlobalShortcutFlow::Exit(130));
             }
             state.last_ctrl_c = Some(now);
+            if matches!(state.status, AppStatus::Running | AppStatus::Compacting) {
+                cancel_token.cancel();
+                let _ = action_tx.send(UserAction::Interrupt);
+            }
             state.push_message(ChatMessage::System("Press Ctrl+C again to quit.".into()));
             state.scroll_to_bottom();
         }
@@ -93,6 +92,41 @@ mod tests {
 
         assert!(cancel.is_cancelled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn second_ctrl_c_exits_even_when_status_remains_running() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let cancel = CancelToken::new();
+
+        let first = handle_global_shortcut(
+            GlobalShortcut::Cancel,
+            &mut state,
+            &action_tx,
+            &cancel,
+            || Ok(()),
+        )
+        .unwrap();
+        let second = handle_global_shortcut(
+            GlobalShortcut::Cancel,
+            &mut state,
+            &action_tx,
+            &cancel,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(first, super::GlobalShortcutFlow::Continue));
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert!(matches!(second, super::GlobalShortcutFlow::Exit(130)));
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Cancel)));
     }
 
     #[test]

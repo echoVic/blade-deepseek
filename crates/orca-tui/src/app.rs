@@ -549,11 +549,41 @@ mod tests {
     }
 
     #[test]
+    fn user_submission_error_emits_rejection_terminal() {
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        send_submission_error(
+            &event_tx,
+            Some("review @gone.txt"),
+            "bound file is no longer available".to_string(),
+        );
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::SubmissionRejected { prompt, message })
+                if prompt == "review @gone.txt"
+                    && message == "bound file is no longer available"
+        ));
+    }
+
+    #[test]
+    fn workflow_submission_error_remains_generic() {
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        send_submission_error(&event_tx, None, "workflow failed".to_string());
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::Error(message)) if message == "workflow failed"
+        ));
+    }
+
+    #[test]
     fn esc_clears_mouse_selection_before_other_esc_semantics() {
         let (mut state, _rx) = test_state();
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (action_tx, _action_rx) = mpsc::channel();
+        let (action_tx, _action_rx) = mpsc::unbounded();
         let cancel_token = CancelToken::new();
 
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
@@ -3773,6 +3803,7 @@ fn handle_submitted_turn_for_tui(
     mcp_registry: &orca_mcp::McpRegistry,
 ) {
     cancel.reset();
+    let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let cfg = config.lock().unwrap().clone();
     let cwd = cfg
         .cwd
@@ -3789,9 +3820,11 @@ fn handle_submitted_turn_for_tui(
         ) {
             Ok(session) => Some(session),
             Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "failed to initialize conversation history: {error}"
-                )));
+                send_submission_error(
+                    event_tx,
+                    rejection_prompt.as_deref(),
+                    format!("failed to initialize conversation history: {error}"),
+                );
                 return;
             }
         };
@@ -3814,7 +3847,7 @@ fn handle_submitted_turn_for_tui(
     ) {
         Ok(prompt) => prompt,
         Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error));
+            send_submission_error(event_tx, rejection_prompt.as_deref(), error);
             return;
         }
     };
@@ -3836,6 +3869,21 @@ fn handle_submitted_turn_for_tui(
     );
     if cfg.desktop_notifications {
         let _ = orca_runtime::notify::notify("Orca", "Task completed");
+    }
+}
+
+fn send_submission_error(
+    event_tx: &mpsc::Sender<TuiEvent>,
+    rejection_prompt: Option<&str>,
+    message: String,
+) {
+    if let Some(prompt) = rejection_prompt {
+        let _ = event_tx.send(TuiEvent::SubmissionRejected {
+            prompt: prompt.to_string(),
+            message,
+        });
+    } else {
+        let _ = event_tx.send(TuiEvent::Error(message));
     }
 }
 

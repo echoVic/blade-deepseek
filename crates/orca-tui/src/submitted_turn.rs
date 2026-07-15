@@ -69,6 +69,13 @@ impl SubmittedTurn {
         }
     }
 
+    pub(crate) fn rejection_prompt(&self) -> Option<&str> {
+        match &self.kind {
+            SubmittedTurnKind::User { prompt, .. } => Some(prompt),
+            SubmittedTurnKind::WorkflowNotification(_) => None,
+        }
+    }
+
     pub(crate) fn task_label(&self) -> Option<&str> {
         self.presentation.task_label.as_deref()
     }
