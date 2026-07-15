@@ -1,16 +1,16 @@
 # ADR 0003: One-Shot TUI Operation Cancellation
 
-Status: proposed for v0.2.27
+Status: accepted; v0.2.27 release candidate
 
 ## Problem Evidence
 
-The production TUI creates one `CancelToken` when the application starts and
-shares it with the agent thread and keyboard handlers. A new submitted turn,
-manual compaction, and saved-workflow path call `CancelToken::reset()` before
-starting work. The same flag therefore represents multiple operations and can
-be cleared after an older interrupt. The agent loop also receives a bare
-`UserAction::Interrupt` after the UI has mutated that shared flag, so the
-action has no operation identity of its own.
+Before this slice, the production TUI created one `CancelToken` when the
+application started and shared it with the agent thread and keyboard handlers.
+A new submitted turn, manual compaction, and saved-workflow path called
+`CancelToken::reset()` before starting work. The same flag therefore represented
+multiple operations and could be cleared after an older interrupt. The agent
+loop also received a bare `UserAction::Interrupt` after the UI mutated that
+shared flag, so the action had no operation identity of its own.
 
 This is a lifecycle boundary defect, not a local reset bug: the UI owns a
 long-lived mutable cancellation flag while the runtime executes separate
@@ -18,9 +18,9 @@ turns, compactions, and continuations with different lifetimes.
 
 ## Target Boundary
 
-`orca-core::cancel` will expose `OperationCancellation`, an owned controller
-for the current operation, and `OperationScope`, a one-shot scope with a
-stable `OperationId` and immutable `CancelToken` view. Starting a scope
+`orca-core::cancel` exposes `OperationCancellation`, an owned controller for
+the current operation, and `OperationScope`, a one-shot scope with a stable
+`OperationId` and immutable `CancelToken` view. Starting a scope
 replaces the controller's current scope; cancelling a scope is permanent and
 cannot affect a later scope. UI interrupt handlers cancel the controller's
 current scope, while the agent loop creates and passes a fresh scope to each
@@ -73,3 +73,25 @@ generation. No new TUI caller may depend on `reset()`.
 - `rg` finds no `CancelToken::reset()` call under `crates/orca-tui`.
 - Focused core/TUI tests, full serial workspace tests, Clippy, and the existing
   release verification helpers pass before integration.
+
+## Candidate Verification
+
+The implementation deletes every production TUI `CancelToken::reset()` call.
+Focused controller tests pass, and a TUI agent-loop behavior test starts a
+delayed turn, cancels it through `OperationCancellation`, then submits a second
+turn and proves that the second turn receives a different operation id,
+produces provider output, and completes successfully. The complete TUI suite
+passes with 467 tests, and workspace Clippy completes with only the repository's
+existing warnings.
+
+The implementation also passed the complete serial workspace gate before the
+final behavior test was added. That gate will run again after the final main
+rebase and release metadata update, together with site, release-helper, and
+real DeepSeek verification. Remote Actions and public GitHub/npm verification
+remain release gates rather than implementation gates.
+
+The server reset path at
+`crates/orca-runtime/src/server/processors/turn.rs` is not accepted as a
+permanent compatibility layer. Its deletion gate is a runtime host/actor that
+owns turn generation and can replace an interrupted server turn with a fresh
+scope while rejecting stale completion, approval, and continuation events.

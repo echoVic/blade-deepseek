@@ -4,7 +4,28 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current baseline: v0.2.26 replaces the TUI's unbounded runtime-event and
+Current candidate: v0.2.27 replaces the production TUI's shared resettable
+cancel flag with one-shot operation ownership. Every submitted turn, manual
+compaction, Goal operation, and approved background continuation receives a
+fresh `OperationScope` with a stable `OperationId`; Esc and Ctrl+C cancel only
+the current scope, and no TUI path can clear that cancellation for a later
+operation. A behavior test cancels a delayed first turn through the production
+agent loop, submits a second turn, and proves that the second turn receives a
+different live scope and completes successfully. CLI arguments, TUI keys and
+flows, server/JSONL, persistence, and DeepSeek behavior remain compatible.
+Focused cancellation tests, the complete 467-test TUI suite, and workspace
+Clippy pass. The complete serial workspace gate passed before the final behavior
+test and will run again after the final main rebase with site, release-helper,
+and real DeepSeek verification.
+
+The server `turn/resume` processor still resets its active `CancelToken`; that
+path is explicitly outside this TUI slice and is not a permanent compatibility
+layer. It must be deleted when a runtime host/actor owns server turn generation,
+restarts interrupted turns with fresh scopes, and rejects stale completion,
+approval, and continuation events. Adding another reset branch or a second
+long-lived cancellation controller does not satisfy that deletion gate.
+
+Public baseline: v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
 paused rendering now applies producer backpressure without silently dropping
 assistant output, approval, error, or terminal events. Runtime compaction and
