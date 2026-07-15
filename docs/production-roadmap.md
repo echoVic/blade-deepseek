@@ -4,31 +4,26 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current baseline: v0.2.27 replaces the production TUI's shared resettable
-cancel flag with one-shot operation ownership. Every submitted turn, manual
-compaction, Goal operation, and approved background continuation receives a
-fresh `OperationScope` with a stable `OperationId`; Esc and Ctrl+C cancel only
-the current scope, and no TUI path can clear that cancellation for a later
-operation. A behavior test cancels a delayed first turn through the production
-agent loop, submits a second turn, and proves that the second turn receives a
-different live scope and completes successfully. CLI arguments, TUI keys and
-flows, server/JSONL, persistence, and DeepSeek behavior remain compatible.
-Focused cancellation tests, the complete 467-test TUI suite, and workspace
-Clippy pass. The final serial workspace gate also passed with 772 runtime tests,
-467 TUI tests, 130 app-server contract tests, and every remaining target. Site
-build and SEO, release-helper tests, and the real DeepSeek provider, CLI,
-history, server, thread-memory, metadata, turn-control, list/search, and
-paginated-read gates pass. Release workflow `29391822282` passed the complete
-test, version check, four-platform build, GitHub Release, npm publish, and npm
-release-asset jobs. The public verifier confirmed the GitHub Release,
-`@blade-ai/orca@0.2.27`, and `npm exec` installation.
+Current candidate: v0.2.28 removes the last production server
+`CancelToken::reset()` path. `ActiveTurnManager` now owns one
+`turnId -> ActiveTurnEntry` record containing the worker, generation control,
+bounded resume mailbox, steer handle, join ownership, and session-permission
+metadata. Interrupt permanently cancels the current generation; resume waits
+for that generation to return, starts a fresh scope on the same logical turn,
+and does not append the original user prompt again. Permission, user-input, and
+MCP waiters are cancellation-aware and generation-fenced, stale responses and
+steer input are rejected, and replaced generations cannot publish stale
+`session.completed` output. The first generation keeps its request-id shape;
+resumed interaction ids carry an internal generation suffix. CLI arguments, TUI
+keys and flows, server/JSONL methods and event names, persistence, and DeepSeek
+request behavior remain compatible.
 
-The server `turn/resume` processor still resets its active `CancelToken`; that
-path is explicitly outside this TUI slice and is not a permanent compatibility
-layer. It must be deleted when a runtime host/actor owns server turn generation,
-restarts interrupted turns with fresh scopes, and rejects stale completion,
-approval, and continuation events. Adding another reset branch or a second
-long-lived cancellation controller does not satisfy that deletion gate.
+Focused cancellation tests, 776 `orca-runtime` tests, and 107 `server_mode_*`
+contracts pass. The full serial workspace gate, workspace Clippy, site build and
+SEO, release-helper tests, and the real DeepSeek provider/CLI/history/server,
+active turn-control, thread-memory, metadata, list/search, and paginated-read
+gates pass. Release workflow and public GitHub/npm verification remain required
+before this becomes the released baseline.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
