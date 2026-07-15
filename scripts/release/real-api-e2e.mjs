@@ -21,6 +21,7 @@ const serverSentinel = "ORCA_SERVER_REAL_OK";
 const serverThreadSentinel = `ORCA_SERVER_THREAD_MEMORY_OK_${Date.now()}_${process.pid}`;
 const serverThreadReadySentinel = "READY";
 const serverThreadTitle = `ORCA server thread metadata e2e ${serverThreadSentinel}`;
+const serverResumeSentinel = `ORCA_SERVER_RESUME_OK_${Date.now()}_${process.pid}`;
 
 function parseArgs(argv) {
   const args = {
@@ -482,6 +483,123 @@ async function runServerThread(args) {
     }
     if (!turnTwoText.includes(serverThreadSentinel)) {
       throw new Error(`Server thread e2e missing sentinel ${serverThreadSentinel}:\n${JSON.stringify(events)}`);
+    }
+
+    send({
+      id: "server-resume-thread",
+      method: "thread/start",
+      params: {},
+    });
+    const resumeThreadStarted = await readUntil(
+      "server active-resume thread/start",
+      (event) => event.id === "server-resume-thread" && (event.event === "thread_started" || event.event === "error"),
+    );
+    if (resumeThreadStarted.event === "error") {
+      throw new Error(`Server active-resume thread/start failed: ${JSON.stringify(resumeThreadStarted)}`);
+    }
+    const resumeThreadId = resumeThreadStarted.threadId;
+    if (typeof resumeThreadId !== "string" || resumeThreadId.length === 0 || resumeThreadId === threadId) {
+      throw new Error(`Server active-resume thread/start returned malformed threadId: ${JSON.stringify(resumeThreadStarted)}`);
+    }
+
+    send({
+      id: "server-resume-turn",
+      method: "turn/start",
+      params: {
+        threadId: resumeThreadId,
+        input: [
+          {
+            type: "text",
+            text: `Write 60 short numbered lines. The final line must be exactly: ${serverResumeSentinel}`,
+          },
+        ],
+      },
+    });
+    const resumeTurnStarted = await readUntil("server active-resume turn/start", (event) => {
+      if (event.id !== "server-resume-turn") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server active-resume turn/start failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_started";
+    });
+    const resumeTurnId = resumeTurnStarted.task?.task_id;
+    if (typeof resumeTurnId !== "string" || resumeTurnId.length === 0) {
+      throw new Error(`Server active-resume turn/start did not expose a turnId: ${JSON.stringify(resumeTurnStarted)}`);
+    }
+    await readUntil("server active-resume first stream delta", (event) => {
+      if (event.id !== "server-resume-turn") {
+        return false;
+      }
+      if (event.event === "error" || event.event === "turn_completed") {
+        throw new Error(`Server active-resume turn ended before interrupt: ${JSON.stringify(event)}`);
+      }
+      return event.event === "reasoning_delta" || event.event === "message_delta";
+    });
+
+    send({
+      id: "server-resume-interrupt",
+      method: "turn/interrupt",
+      params: { threadId: resumeThreadId, turnId: resumeTurnId },
+    });
+    send({
+      id: "server-resume-resume",
+      method: "turn/resume",
+      params: { threadId: resumeThreadId, turnId: resumeTurnId },
+    });
+    const activeInterrupt = await readUntil("server active turn/interrupt", (event) => {
+      if (event.id !== "server-resume-interrupt") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server active turn/interrupt failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_controlled";
+    });
+    if (activeInterrupt.status !== "interrupted" || activeInterrupt.turnId !== resumeTurnId) {
+      throw new Error(`Server active turn/interrupt returned malformed control event: ${JSON.stringify(activeInterrupt)}`);
+    }
+    const activeResume = await readUntil("server active turn/resume", (event) => {
+      if (event.id !== "server-resume-resume") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server active turn/resume failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_controlled";
+    });
+    if (activeResume.status !== "resumed" || activeResume.turnId !== resumeTurnId) {
+      throw new Error(`Server active turn/resume returned malformed control event: ${JSON.stringify(activeResume)}`);
+    }
+    const activeResumeCompleted = await readUntil("server active resumed turn completion", (event) => {
+      if (event.id !== "server-resume-turn") {
+        return false;
+      }
+      if (event.event === "error") {
+        throw new Error(`Server active resumed turn failed: ${JSON.stringify(event)}`);
+      }
+      return event.event === "turn_completed";
+    });
+    const activeResumeText = events
+      .filter((event) => event.id === "server-resume-turn" && event.event === "message_delta")
+      .map((event) => event.text ?? "")
+      .join("");
+    const activeResumeTerminals = events.filter(
+      (event) => event.id === "server-resume-turn" && event.event === "turn_completed",
+    );
+    if (
+      activeResumeCompleted.status !== "success" ||
+      !activeResumeText.includes(serverResumeSentinel) ||
+      activeResumeTerminals.length !== 1
+    ) {
+      throw new Error(
+        `Server active turn resume returned unexpected output: ${JSON.stringify({
+          activeResumeCompleted,
+          activeResumeText,
+          activeResumeTerminals,
+        })}`,
+      );
     }
 
     send({
@@ -1096,6 +1214,7 @@ async function runServerThread(args) {
   }
 
   console.log(`Server thread real API e2e verified: ${serverThreadSentinel}`);
+  console.log(`Server active turn resume e2e verified: ${serverResumeSentinel}`);
   console.log("Server thread/read e2e verified");
   console.log("Server thread/metadata/update e2e verified");
   console.log("Server turn controls e2e verified");
