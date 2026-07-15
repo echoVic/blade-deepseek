@@ -1,0 +1,29 @@
+README.md
+  s_61c879183fbdff::t_ffa2ad4ce58ebb 200-201
+docs/architecture/adr/0002-unified-atomic-mention-system.md
+  s_61c879183fbdff::t_f5845a54254be2 157-159,170,187,189
+docs/architecture/mention-search-glossary.md
+  s_61c879183fbdff::t_d7e1c1191c8a15 75-78
+docs/harness-contract.md
+  s_61c879183fbdff::t_283c7ed49011d1 118-119
+tests/session_server_contract.rs
+  s_61c879183fbdff::t_c91ca0078ec412 6742-6838
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "013482af4e64869f7328386e0664aaa8a47edc16",
+  "prompts": {},
+  "sessions": {
+    "s_61c879183fbdff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f63eb-5026-7073-9854-b348079bb9f3",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
