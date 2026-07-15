@@ -1,4 +1,5 @@
 mod agent_runner;
+mod agent_runtime;
 mod agent_subagent_execution;
 mod agent_tool_execution;
 mod agent_workflow_execution;
@@ -37,6 +38,7 @@ mod slash_command_actions;
 mod slash_menu_actions;
 mod status_key_actions;
 mod submitted_turn;
+mod task_supervisor;
 mod terminal_lifecycle;
 pub mod theme;
 mod transcript_view;

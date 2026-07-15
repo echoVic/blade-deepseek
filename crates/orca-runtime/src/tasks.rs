@@ -669,42 +669,49 @@ impl TaskRegistry {
                 ));
             }
 
-            let transition = TaskTerminalTransition {
-                is_backgrounded: record.is_backgrounded,
-            };
-            match update {
-                MainSessionTerminalUpdate::Completed { result } => {
-                    record.status = TaskStatus::Completed;
-                    record.result = Some(result);
-                    record.error = None;
-                    record.tool = None;
-                    record.pending_tool_call = None;
-                    record.pending_tool_approval_response = None;
-                    record.pending_provider_response = None;
-                }
-                MainSessionTerminalUpdate::Failed { error } => {
-                    record.status = TaskStatus::Failed;
-                    record.result = None;
-                    record.error = Some(error);
-                    record.tool = None;
-                    record.pending_tool_call = None;
-                    record.pending_tool_approval_response = None;
-                    record.pending_provider_response = None;
-                }
-                MainSessionTerminalUpdate::ApprovalRequired {
-                    summary,
-                    pending_tool_call,
-                    pending_provider_response,
-                } => {
-                    record.status = TaskStatus::ApprovalRequired;
-                    record.result = Some(summary);
-                    record.error = None;
-                    record.tool = pending_tool_call
-                        .as_ref()
-                        .map(|pending_tool_call| pending_tool_call.name.clone());
-                    record.pending_tool_call = pending_tool_call;
-                    record.pending_tool_approval_response = None;
-                    record.pending_provider_response = pending_provider_response;
+            if record.control.cancel.is_cancelled() {
+                record.status = TaskStatus::Stopped;
+                record.result = Some("cancelled".to_string());
+                record.error = None;
+                record.tool = None;
+                record.pending_tool_call = None;
+                record.pending_tool_approval_response = None;
+                record.pending_provider_response = None;
+            } else {
+                match update {
+                    MainSessionTerminalUpdate::Completed { result } => {
+                        record.status = TaskStatus::Completed;
+                        record.result = Some(result);
+                        record.error = None;
+                        record.tool = None;
+                        record.pending_tool_call = None;
+                        record.pending_tool_approval_response = None;
+                        record.pending_provider_response = None;
+                    }
+                    MainSessionTerminalUpdate::Failed { error } => {
+                        record.status = TaskStatus::Failed;
+                        record.result = None;
+                        record.error = Some(error);
+                        record.tool = None;
+                        record.pending_tool_call = None;
+                        record.pending_tool_approval_response = None;
+                        record.pending_provider_response = None;
+                    }
+                    MainSessionTerminalUpdate::ApprovalRequired {
+                        summary,
+                        pending_tool_call,
+                        pending_provider_response,
+                    } => {
+                        record.status = TaskStatus::ApprovalRequired;
+                        record.result = Some(summary);
+                        record.error = None;
+                        record.tool = pending_tool_call
+                            .as_ref()
+                            .map(|pending_tool_call| pending_tool_call.name.clone());
+                        record.pending_tool_call = pending_tool_call;
+                        record.pending_tool_approval_response = None;
+                        record.pending_provider_response = pending_provider_response;
+                    }
                 }
             }
             if record.started_at_ms.is_none() {
@@ -714,6 +721,9 @@ impl TaskRegistry {
             record.usage = usage;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
+            let transition = TaskTerminalTransition {
+                is_backgrounded: record.is_backgrounded,
+            };
             self.persist_current_session(tasks)?;
             Ok(transition)
         })
@@ -1070,6 +1080,15 @@ impl TaskRegistry {
     }
 
     pub fn stop(&self, id: &str, summary: String) -> Result<(), String> {
+        self.stop_with_usage(id, summary, None)
+    }
+
+    pub fn stop_with_usage(
+        &self,
+        id: &str,
+        summary: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), String> {
         self.update_task(id, |record| {
             record.status = TaskStatus::Stopped;
             if record.started_at_ms.is_none() {
@@ -1084,6 +1103,9 @@ impl TaskRegistry {
             record.pending_provider_response = None;
             record.worker_pid = None;
             record.control.pause.store(false, Ordering::Release);
+            if usage.is_some() {
+                record.usage = usage;
+            }
             Ok(())
         })
     }
@@ -2940,6 +2962,37 @@ wait
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, TaskStatus::Completed);
         assert!(record.is_backgrounded);
+    }
+
+    #[test]
+    fn main_session_stop_request_wins_atomic_terminal_settlement() {
+        let registry = TaskRegistry::new("session-terminal-stop".to_string());
+        let task = registry.create_main_session("long prompt".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry.request_stop(&task.id).unwrap();
+        let usage = UsageTotals {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_tokens: 1,
+            estimated_cost_usd: 0.01,
+        };
+
+        let transition = registry
+            .apply_main_session_terminal_update(
+                &task.id,
+                MainSessionTerminalUpdate::Completed {
+                    result: "done".to_string(),
+                },
+                Some(usage),
+            )
+            .unwrap();
+
+        assert!(transition.is_backgrounded);
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(record.status, TaskStatus::Stopped);
+        assert_eq!(record.result.as_deref(), Some("cancelled"));
+        assert_eq!(record.usage, Some(usage));
     }
 
     #[test]

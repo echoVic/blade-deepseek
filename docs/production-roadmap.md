@@ -98,6 +98,35 @@ the TUI onto this proven control plane and deletes its outer operation,
 provider-worker, and direct turn-loop ownership before claiming the
 user-visible reliability improvement.
 
+P0.3e1 now begins that TUI migration by making the current worker lifetime
+explicit before changing session ownership. `TuiAgentRuntime` owns and joins
+the agent thread, and a bounded supervisor owns background-current-turn and
+auto-memory tasks. Each provider stream now keeps its receiver, cancel token,
+and join handle together: foreground turns join after the terminal response,
+while backgrounding transfers the complete task to the supervisor. TUI exit
+disconnects the bounded event receiver and restores the terminal before it
+cancels and joins runtime work. Shutdown closes operation admission before a
+non-blocking wake, so a full action mailbox cannot block exit or start a late
+turn. Auto-memory uses a cancellable provider path, and `TaskRegistry`
+atomically makes a background stop request win over a racing provider success
+while preserving incurred usage, including a provider terminal queued before
+the completion consumer observes stop. Backgrounding, next-submit, foreground,
+approval, goal, history, usage, and budget behavior remain compatible.
+
+P0.3e1 is an unreleased reliability checkpoint, not the completed host
+migration. The TUI still owns `OperationCancellation`, mutable
+`TuiConversationSession`/`RuntimeThread`, borrowed interaction adapters, and a
+surface-specific provider/tool loop. P0.3e2 must introduce the owned typed
+interaction broker; later slices move the session and background handoff into
+`RuntimeHost` and delete those remaining paths. The existing detached workflow
+notification watchers are also still visible debt and must move behind the
+host-owned event/task boundary before P0.3e is complete.
+
+P0.3e1 verification passed with core 143/143, runtime 769/769, and TUI 506/506
+tests; the serial workspace all-targets gate; workspace Clippy with only
+pre-existing warnings; the release real-API smoke; and the full DeepSeek
+provider/CLI/history/server control, metadata, search, and pagination harness.
+
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
 paused rendering now applies producer backpressure without silently dropping

@@ -83,6 +83,7 @@ pub struct OperationCancellation {
 #[derive(Debug)]
 struct OperationCancellationState {
     ids: OperationIdAllocator,
+    accepting: AtomicBool,
     current: Mutex<Option<OperationScope>>,
 }
 
@@ -91,6 +92,7 @@ impl OperationCancellation {
         Self {
             state: Arc::new(OperationCancellationState {
                 ids: OperationIdAllocator::new(),
+                accepting: AtomicBool::new(true),
                 current: Mutex::new(None),
             }),
         }
@@ -103,6 +105,9 @@ impl OperationCancellation {
             token: CancelToken::new(),
         };
         *self.lock_current() = Some(scope.clone());
+        if !self.state.accepting.load(Ordering::Acquire) {
+            scope.cancel();
+        }
         scope
     }
 
@@ -115,6 +120,15 @@ impl OperationCancellation {
         let scope = current.as_ref()?;
         scope.cancel();
         Some(scope.id())
+    }
+
+    pub fn shutdown(&self) -> Option<OperationId> {
+        self.state.accepting.store(false, Ordering::Release);
+        self.cancel_current()
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        !self.state.accepting.load(Ordering::Acquire)
     }
 
     pub fn cancel(&self, id: OperationId) -> bool {
@@ -161,6 +175,20 @@ mod tests {
 
         assert_eq!(controller.cancel_current(), Some(second.id()));
         assert!(second.token().is_cancelled());
+    }
+
+    #[test]
+    fn shutdown_cancels_current_and_closes_future_operations() {
+        let controller = OperationCancellation::new();
+        let current = controller.start();
+
+        assert_eq!(controller.shutdown(), Some(current.id()));
+        assert!(controller.is_shutdown());
+        assert!(current.token().is_cancelled());
+
+        let late = controller.start();
+        assert!(late.token().is_cancelled());
+        assert_eq!(controller.shutdown(), Some(late.id()));
     }
 
     #[test]

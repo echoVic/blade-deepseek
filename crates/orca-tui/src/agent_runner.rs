@@ -2,8 +2,8 @@ use crossbeam_channel::{self as mpsc, Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::Arc;
-use std::thread;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orca_approval::ApprovalPolicy;
@@ -39,6 +39,7 @@ use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_f
 use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::{TuiBudgetAdmission, TuiConversationSession, TuiUsageLedger};
 use crate::runtime_event_projection::tui_event_from_runtime_event;
+use crate::task_supervisor::{TuiTaskSpawner, TuiTaskSupervisor};
 use crate::types::{PendingWorkflowNotification, TuiEvent, UserAction};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
@@ -49,6 +50,52 @@ pub(crate) type PendingWorkflowNotifications = crate::types::PendingWorkflowNoti
 enum ProviderStreamEvent {
     Step(ProviderStep),
     Done(ProviderResponse),
+}
+
+struct ProviderStreamTask {
+    receiver: Option<Receiver<ProviderStreamEvent>>,
+    cancel: CancelToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ProviderStreamTask {
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ProviderStreamEvent, mpsc::RecvTimeoutError> {
+        self.receiver
+            .as_ref()
+            .expect("provider stream receiver available")
+            .recv_timeout(timeout)
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    fn join(&mut self) -> io::Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        handle
+            .join()
+            .map_err(|_| io::Error::other("TUI provider stream worker panicked"))
+    }
+
+    fn cancel_and_join(&mut self) -> io::Result<()> {
+        if self.handle.is_none() {
+            return Ok(());
+        }
+        self.cancel();
+        self.receiver.take();
+        self.join()
+    }
+}
+
+impl Drop for ProviderStreamTask {
+    fn drop(&mut self) {
+        let _ = self.cancel_and_join();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,22 +273,29 @@ fn spawn_provider_stream(
     conversation: orca_core::conversation::Conversation,
     provider_config: ProviderConfig,
     cancel: CancelToken,
-) -> Receiver<ProviderStreamEvent> {
+) -> io::Result<ProviderStreamTask> {
     let (tx, rx) = mpsc::bounded(PROVIDER_STREAM_CAPACITY);
-    thread::spawn(move || {
-        let step_tx = tx.clone();
-        let response = orca_provider::call_streaming(
-            provider,
-            &conversation,
-            &provider_config,
-            &cancel,
-            &mut |step| {
-                let _ = step_tx.send(ProviderStreamEvent::Step(step.clone()));
-            },
-        );
-        let _ = tx.send(ProviderStreamEvent::Done(response));
-    });
-    rx
+    let worker_cancel = cancel.clone();
+    let handle = thread::Builder::new()
+        .name("orca-tui-provider-stream".to_string())
+        .spawn(move || {
+            let step_tx = tx.clone();
+            let response = orca_provider::call_streaming(
+                provider,
+                &conversation,
+                &provider_config,
+                &worker_cancel,
+                &mut |step| {
+                    let _ = step_tx.send(ProviderStreamEvent::Step(step.clone()));
+                },
+            );
+            let _ = tx.send(ProviderStreamEvent::Done(response));
+        })?;
+    Ok(ProviderStreamTask {
+        receiver: Some(rx),
+        cancel,
+        handle: Some(handle),
+    })
 }
 
 fn provider_response_status(response: &ProviderResponse) -> &'static str {
@@ -408,22 +462,33 @@ pub(crate) type TuiBackgroundTurnCompletionHandler =
     Box<dyn FnOnce(TuiBackgroundTurnCompletion) + Send>;
 
 fn spawn_background_provider_completion(
-    provider_rx: Receiver<ProviderStreamEvent>,
+    mut provider_task: ProviderStreamTask,
     context: BackgroundProviderCompletionContext,
-) {
+    task_spawner: &TuiTaskSpawner,
+) -> io::Result<()> {
     let BackgroundProviderCompletionContext {
         task_registry,
-        mut history_writer,
+        history_writer,
         model,
         usage_ledger,
-        budget_admission: _budget_admission,
+        budget_admission,
         max_budget_usd,
         event_tx,
         run_id,
         task_id,
         completion_handler,
     } = context;
-    thread::spawn(move || {
+    let fallback_registry = task_registry.clone();
+    let mut fallback_history_writer = history_writer.clone();
+    let fallback_event_tx = event_tx.clone();
+    let fallback_run_id = run_id.clone();
+    let fallback_task_id = task_id.clone();
+    let completion_handler = Arc::new(Mutex::new(completion_handler));
+    let worker_completion_handler = Arc::clone(&completion_handler);
+    let task_name = format!("provider-completion-{task_id}");
+    let spawn_result = task_spawner.spawn(task_name, move |supervisor_cancel| {
+        let mut history_writer = history_writer;
+        let _budget_admission = budget_admission;
         let mut status = "failed";
         let mut pending_tool_call = None;
         let mut pending_provider_response = None;
@@ -432,9 +497,33 @@ fn spawn_background_provider_completion(
         let mut usage_totals = None;
         let mut buffered_steps = Vec::new();
         let mut events = EventFactory::new(run_id);
-        while let Ok(event) = provider_rx.recv() {
+        let mut cancelled = false;
+        loop {
+            if !cancelled
+                && (supervisor_cancel.is_cancelled() || task_registry.is_cancelled(&task_id))
+            {
+                cancelled = true;
+                status = "cancelled";
+                provider_task.cancel();
+            }
+            let event = match provider_task.recv_timeout(Duration::from_millis(10)) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let join_error = provider_task.join().err().map(|error| error.to_string());
+                    if !cancelled {
+                        failure_error = join_error.or_else(|| {
+                            Some("provider stream ended without a response".to_string())
+                        });
+                    }
+                    break;
+                }
+            };
             match event {
                 ProviderStreamEvent::Step(step) => {
+                    if cancelled {
+                        continue;
+                    }
                     if background_task_is_foregrounded(&task_registry, &task_id) {
                         forward_foregrounded_background_steps(
                             &event_tx,
@@ -447,20 +536,35 @@ fn spawn_background_provider_completion(
                     }
                 }
                 ProviderStreamEvent::Done(response) => {
-                    status = provider_response_status(&response);
-                    failure_error = provider_response_error(&response);
-                    usage = provider_response_usage_totals(&response, model.as_deref());
-                    if let Some(usage) = usage {
-                        let totals = usage_ledger.add(usage);
-                        usage_totals = Some(totals);
-                        if let Some(error) = usage_budget_error(totals, max_budget_usd) {
-                            status = "budget_exhausted";
-                            failure_error = Some(error);
+                    match provider_task.join() {
+                        Ok(()) => {
+                            usage = provider_response_usage_totals(&response, model.as_deref());
+                            if let Some(usage) = usage {
+                                let totals = usage_ledger.add(usage);
+                                usage_totals = Some(totals);
+                                if !cancelled
+                                    && let Some(error) = usage_budget_error(totals, max_budget_usd)
+                                {
+                                    status = "budget_exhausted";
+                                    failure_error = Some(error);
+                                }
+                            }
+                            if !cancelled {
+                                if status != "budget_exhausted" {
+                                    status = provider_response_status(&response);
+                                    failure_error = provider_response_error(&response);
+                                }
+                                pending_tool_call = provider_response_pending_tool_call(&response);
+                                if status == "approval_required" {
+                                    pending_provider_response = Some(response);
+                                }
+                            }
                         }
-                    }
-                    pending_tool_call = provider_response_pending_tool_call(&response);
-                    if status == "approval_required" {
-                        pending_provider_response = Some(response);
+                        Err(error) => {
+                            if !cancelled {
+                                failure_error = Some(error.to_string());
+                            }
+                        }
                     }
                     break;
                 }
@@ -475,21 +579,41 @@ fn spawn_background_provider_completion(
             send_runtime_event_as_tui(&event_tx, events.usage_updated(totals));
         }
 
-        let terminal_update = match status {
-            "success" => MainSessionTerminalUpdate::Completed {
-                result: status.to_string(),
-            },
-            "approval_required" => MainSessionTerminalUpdate::ApprovalRequired {
-                summary: status.to_string(),
-                pending_tool_call,
-                pending_provider_response,
-            },
-            _ => MainSessionTerminalUpdate::Failed {
-                error: failure_message.clone(),
-            },
+        let was_backgrounded = task_registry
+            .get(&task_id)
+            .is_some_and(|task| task.is_backgrounded);
+        let result = if status == "cancelled" {
+            task_registry
+                .stop_with_usage(&task_id, "cancelled".to_string(), usage)
+                .map(|()| (was_backgrounded, TaskStatus::Stopped))
+        } else {
+            let terminal_update = match status {
+                "success" => MainSessionTerminalUpdate::Completed {
+                    result: status.to_string(),
+                },
+                "approval_required" => MainSessionTerminalUpdate::ApprovalRequired {
+                    summary: status.to_string(),
+                    pending_tool_call,
+                    pending_provider_response,
+                },
+                _ => MainSessionTerminalUpdate::Failed {
+                    error: failure_message.clone(),
+                },
+            };
+            task_registry
+                .apply_main_session_terminal_update(&task_id, terminal_update, usage)
+                .map(|transition| {
+                    let status = task_registry
+                        .get(&task_id)
+                        .map(|task| task.status)
+                        .unwrap_or(TaskStatus::Failed);
+                    (transition.is_backgrounded, status)
+                })
         };
-        let result =
-            task_registry.apply_main_session_terminal_update(&task_id, terminal_update, usage);
+        if matches!(result, Ok((_, TaskStatus::Stopped))) {
+            status = "cancelled";
+            failure_error = None;
+        }
         if let Some(writer) = &mut history_writer {
             let error = failure_error.as_deref();
             if let Err(error) =
@@ -498,14 +622,12 @@ fn spawn_background_provider_completion(
                 eprintln!("orca: warning: background provider history write failed: {error}");
             }
         }
-        if let Some(completion_handler) = completion_handler {
-            completion_handler(TuiBackgroundTurnCompletion { usage });
-        }
-        if let Ok(transition) = result {
+        invoke_background_completion_handler(&worker_completion_handler, usage);
+        if let Ok((is_backgrounded, _)) = result {
             if let Some(updated_task) = task_summary_for_tui(&task_registry, &task_id) {
                 send_task_status_updated_for_tui(&event_tx, &mut events, &updated_task);
             }
-            if transition.is_backgrounded {
+            if is_backgrounded {
                 let _ = event_tx.send(TuiEvent::Notice(background_completion_notice(
                     status,
                     pending_tool_name.as_deref(),
@@ -519,6 +641,57 @@ fn spawn_background_provider_completion(
             }
         }
     });
+
+    if let Err(error) = spawn_result {
+        let error_message = error.to_string();
+        let mut events = EventFactory::new(fallback_run_id);
+        let _ = fallback_registry.apply_main_session_terminal_update(
+            &fallback_task_id,
+            MainSessionTerminalUpdate::Failed {
+                error: error_message.clone(),
+            },
+            None,
+        );
+        let stopped = fallback_registry
+            .get(&fallback_task_id)
+            .is_some_and(|task| task.status == TaskStatus::Stopped);
+        let (status, terminal_error) = if stopped {
+            ("cancelled", None)
+        } else {
+            ("failed", Some(error_message.as_str()))
+        };
+        if let Some(writer) = &mut fallback_history_writer {
+            let _ = writer.append_background_task_provider_response(
+                &fallback_task_id,
+                status,
+                terminal_error,
+                None,
+            );
+        }
+        invoke_background_completion_handler(&completion_handler, None);
+        if let Some(updated_task) = task_summary_for_tui(&fallback_registry, &fallback_task_id) {
+            send_task_status_updated_for_tui(&fallback_event_tx, &mut events, &updated_task);
+        }
+        if let Some(error) = terminal_error {
+            send_error_for_tui(&fallback_event_tx, &mut events, error);
+        }
+        send_session_completed_status_for_tui(&fallback_event_tx, &mut events, status);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn invoke_background_completion_handler(
+    completion_handler: &Arc<Mutex<Option<TuiBackgroundTurnCompletionHandler>>>,
+    usage: Option<UsageTotals>,
+) {
+    let handler = completion_handler
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(handler) = handler {
+        handler(TuiBackgroundTurnCompletion { usage });
+    }
 }
 
 fn background_task_is_foregrounded(
@@ -1059,7 +1232,9 @@ pub fn run_agent_for_tui(
     allow_goal_tools: bool,
 ) -> String {
     let pending_actions = RefCell::new(VecDeque::new());
-    run_agent_for_tui_with_notification_queue(
+    let mut tasks = TuiTaskSupervisor::new(8);
+    let task_spawner = tasks.spawner();
+    let status = run_agent_for_tui_with_notification_queue(
         config,
         session,
         prompt,
@@ -1072,8 +1247,13 @@ pub fn run_agent_for_tui(
         true,
         None,
         None,
+        &task_spawner,
     )
-    .status
+    .status;
+    if let Err(error) = tasks.shutdown() {
+        eprintln!("orca: warning: TUI test task shutdown failed: {error}");
+    }
+    status
 }
 
 pub(crate) fn run_agent_for_tui_with_notification_queue(
@@ -1089,6 +1269,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     backtrack_target: bool,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
     background_completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
+    task_spawner: &TuiTaskSpawner,
 ) -> TuiAgentTurnResult {
     let cwd = config
         .cwd
@@ -1345,14 +1526,35 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
 
         let mut emitted_message_delta = false;
         let mut stream_events = EventFactory::new(runtime_events.run_id().to_string());
-        let provider_rx = spawn_provider_stream(
+        let mut provider_task = match spawn_provider_stream(
             config.provider,
             model_conversation.clone(),
             turn_provider_config.clone(),
             cancel.clone(),
-        );
+        ) {
+            Ok(provider_task) => provider_task,
+            Err(error) => {
+                let error = format!("failed to start provider stream: {error}");
+                send_error_for_tui(event_tx, &mut runtime_events, &error);
+                send_session_completed_for_tui(
+                    event_tx,
+                    &mut runtime_events,
+                    orca_core::event_schema::RunStatus::Failed,
+                );
+                finish_main_session_task_with_error_for_tui(
+                    session,
+                    event_tx,
+                    &mut runtime_events,
+                    &main_session_task_id,
+                    "failed",
+                    Some(&error),
+                );
+                session.complete_with_error("failed", &error);
+                return TuiAgentTurnResult::new("failed");
+            }
+        };
         let response = loop {
-            match provider_rx.recv_timeout(Duration::from_millis(10)) {
+            match provider_task.recv_timeout(Duration::from_millis(10)) {
                 Ok(ProviderStreamEvent::Step(ProviderStep::ReasoningDelta(text))) => {
                     poll_background_current_turn_for_tui(
                         session,
@@ -1400,7 +1602,28 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     );
                 }
                 Ok(ProviderStreamEvent::Step(_)) => {}
-                Ok(ProviderStreamEvent::Done(response)) => break response,
+                Ok(ProviderStreamEvent::Done(response)) => {
+                    if let Err(error) = provider_task.join() {
+                        let error = error.to_string();
+                        send_error_for_tui(event_tx, &mut runtime_events, &error);
+                        send_session_completed_for_tui(
+                            event_tx,
+                            &mut runtime_events,
+                            orca_core::event_schema::RunStatus::Failed,
+                        );
+                        finish_main_session_task_with_error_for_tui(
+                            session,
+                            event_tx,
+                            &mut runtime_events,
+                            &main_session_task_id,
+                            "failed",
+                            Some(&error),
+                        );
+                        session.complete_with_error("failed", &error);
+                        return TuiAgentTurnResult::new("failed");
+                    }
+                    break response;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     poll_background_current_turn_for_tui(
                         session,
@@ -1413,24 +1636,26 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                     );
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    send_error_for_tui(
-                        event_tx,
-                        &mut runtime_events,
-                        "provider stream ended without a response",
-                    );
+                    let join_error = provider_task.join().err();
+                    let error = join_error
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "provider stream ended without a response".to_string());
+                    send_error_for_tui(event_tx, &mut runtime_events, &error);
                     send_session_completed_for_tui(
                         event_tx,
                         &mut runtime_events,
                         orca_core::event_schema::RunStatus::Failed,
                     );
-                    finish_main_session_task_for_tui(
+                    finish_main_session_task_with_error_for_tui(
                         session,
                         event_tx,
                         &mut runtime_events,
                         &main_session_task_id,
                         "failed",
+                        Some(&error),
                     );
-                    session.complete("failed");
+                    session.complete_with_error("failed", &error);
                     return TuiAgentTurnResult::new("failed");
                 }
             }
@@ -1438,8 +1663,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             if main_session_backgrounded {
                 let history_writer = session.writer_mut().map(|writer| writer.clone());
                 let usage_ledger = session.usage_ledger();
-                spawn_background_provider_completion(
-                    provider_rx,
+                if let Err(error) = spawn_background_provider_completion(
+                    provider_task,
                     BackgroundProviderCompletionContext {
                         task_registry: session.task_registry().clone(),
                         history_writer,
@@ -1452,7 +1677,12 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         task_id: main_session_task_id.clone(),
                         completion_handler: background_completion_handler.take(),
                     },
-                );
+                    task_spawner,
+                ) {
+                    session.finish_agent_lifecycle_task(orca_core::event_schema::RunStatus::Failed);
+                    session.complete_with_error("failed", &error.to_string());
+                    return TuiAgentTurnResult::new("failed");
+                }
                 return TuiAgentTurnResult::new("backgrounded");
             }
         };
@@ -1620,12 +1850,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 let messages = session.conversation().messages.clone();
                 let memory_tx = event_tx.clone();
                 let run_id = runtime_events.run_id().to_string();
-                thread::spawn(move || {
-                    if let Err(error) = memory::extract_project_memory(
+                if let Err(error) = task_spawner.spawn("auto-memory", move |memory_cancel| {
+                    if let Err(error) = memory::extract_project_memory_with_cancel(
                         provider_kind,
                         &provider_config,
                         &memory_cwd,
                         &messages,
+                        &memory_cancel,
                     ) {
                         let mut events = EventFactory::new(run_id);
                         send_error_for_tui(
@@ -1634,7 +1865,13 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                             &format!("memory extraction failed: {error}"),
                         );
                     }
-                });
+                }) {
+                    send_error_for_tui(
+                        event_tx,
+                        &mut runtime_events,
+                        &format!("failed to start memory extraction: {error}"),
+                    );
+                }
             }
             send_session_completed_for_tui(
                 event_tx,
@@ -1982,6 +2219,8 @@ mod tests {
     use orca_runtime::tasks::TaskRegistry;
     use std::collections::VecDeque;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use orca_core::approval_types::ApprovalMode;
@@ -2007,6 +2246,57 @@ mod tests {
             }
         }
         result
+    }
+
+    fn test_task_supervisor() -> (TuiTaskSupervisor, TuiTaskSpawner) {
+        let supervisor = TuiTaskSupervisor::new(8);
+        let spawner = supervisor.spawner();
+        (supervisor, spawner)
+    }
+
+    fn test_provider_stream_task(receiver: Receiver<ProviderStreamEvent>) -> ProviderStreamTask {
+        ProviderStreamTask {
+            receiver: Some(receiver),
+            cancel: CancelToken::new(),
+            handle: Some(thread::spawn(|| {})),
+        }
+    }
+
+    fn spawn_test_background_provider_completion(
+        provider_rx: Receiver<ProviderStreamEvent>,
+        context: BackgroundProviderCompletionContext,
+    ) -> TuiTaskSupervisor {
+        let (supervisor, spawner) = test_task_supervisor();
+        spawn_background_provider_completion(
+            test_provider_stream_task(provider_rx),
+            context,
+            &spawner,
+        )
+        .expect("background provider completion admitted");
+        supervisor
+    }
+
+    fn cancellable_test_provider_stream_task() -> (ProviderStreamTask, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::bounded(1);
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker_joined = Arc::clone(&joined);
+        let handle = thread::spawn(move || {
+            while !worker_cancel.is_cancelled() {
+                thread::yield_now();
+            }
+            worker_joined.store(true, Ordering::SeqCst);
+            drop(tx);
+        });
+        (
+            ProviderStreamTask {
+                receiver: Some(rx),
+                cancel,
+                handle: Some(handle),
+            },
+            joined,
+        )
     }
 
     fn config() -> RunConfig {
@@ -2155,7 +2445,7 @@ mod tests {
             let (provider_tx, provider_rx) = mpsc::unbounded();
             let error = "DeepSeek provider error: api_key=super-secret";
 
-            spawn_background_provider_completion(
+            let _background_tasks = spawn_test_background_provider_completion(
                 provider_rx,
                 BackgroundProviderCompletionContext {
                     task_registry: registry.clone(),
@@ -3230,6 +3520,7 @@ mod tests {
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
         let pending_actions = RefCell::new(VecDeque::new());
+        let (_tasks, task_spawner) = test_task_supervisor();
 
         let result = run_agent_for_tui_with_notification_queue(
             &config,
@@ -3244,6 +3535,7 @@ mod tests {
             true,
             Some(&pending_notifications),
             None,
+            &task_spawner,
         );
 
         assert_eq!(result.status, "success");
@@ -3279,6 +3571,7 @@ mod tests {
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
         let pending_actions = RefCell::new(VecDeque::new());
+        let (_tasks, task_spawner) = test_task_supervisor();
 
         let result = run_agent_for_tui_with_notification_queue(
             &config,
@@ -3293,6 +3586,7 @@ mod tests {
             true,
             Some(&pending_notifications),
             None,
+            &task_spawner,
         );
 
         assert_eq!(result.status, "success");
@@ -3608,7 +3902,7 @@ mod tests {
             target: None,
             raw_arguments: Some("{}".to_string()),
         };
-        spawn_background_provider_completion(
+        let _background_tasks = spawn_test_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
                 task_registry: registry.clone(),
@@ -3681,6 +3975,266 @@ mod tests {
     }
 
     #[test]
+    fn background_task_stop_cancels_and_joins_provider_once() {
+        let registry = TaskRegistry::new("session-background-stop".to_string());
+        let task = registry.create_main_session("Stop provider".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        let (provider_task, provider_joined) = cancellable_test_provider_stream_task();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (mut supervisor, spawner) = test_task_supervisor();
+        spawn_background_provider_completion(
+            provider_task,
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: None,
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-stop".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
+            &spawner,
+        )
+        .expect("background provider admitted");
+
+        registry.request_stop(&task.id).expect("stop requested");
+        let mut stopped_updates = 0;
+        loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stopped task update");
+            if task_update_matches(&event, |summary| summary.status == TaskStatus::Stopped) {
+                stopped_updates += 1;
+                break;
+            }
+        }
+        supervisor.shutdown().expect("background tasks joined");
+        stopped_updates += event_rx
+            .try_iter()
+            .filter(|event| {
+                task_update_matches(event, |summary| summary.status == TaskStatus::Stopped)
+            })
+            .count();
+
+        assert!(provider_joined.load(Ordering::SeqCst));
+        assert_eq!(registry.get(&task.id).unwrap().status, TaskStatus::Stopped);
+        assert_eq!(stopped_updates, 1);
+    }
+
+    #[test]
+    fn background_stop_preserves_already_queued_provider_usage() {
+        let registry = TaskRegistry::new("session-background-stop-usage".to_string());
+        let task = registry.create_main_session("Stop completed provider".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry.request_stop(&task.id).expect("stop requested");
+        let (provider_tx, provider_rx) = mpsc::bounded(1);
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("done".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: Some(orca_core::provider_types::Usage {
+                    input_tokens: 90,
+                    output_tokens: 12,
+                    cache_tokens: 7,
+                }),
+            }))
+            .expect("queued provider terminal");
+        let provider_task = ProviderStreamTask {
+            receiver: Some(provider_rx),
+            cancel: CancelToken::new(),
+            handle: Some(thread::spawn(|| {})),
+        };
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (mut supervisor, spawner) = test_task_supervisor();
+
+        spawn_background_provider_completion(
+            provider_task,
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: Some(orca_core::model::FLASH_MODEL.to_string()),
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-stop-usage".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
+            &spawner,
+        )
+        .expect("background provider admitted");
+        supervisor.shutdown().expect("background tasks joined");
+
+        let record = registry.get(&task.id).expect("stopped task");
+        assert_eq!(record.status, TaskStatus::Stopped);
+        let usage = record.usage.expect("already incurred usage retained");
+        assert_eq!(usage.input_tokens, 90);
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(usage.cache_tokens, 7);
+    }
+
+    #[test]
+    fn stop_wins_while_background_completion_is_joining_provider() {
+        let registry = TaskRegistry::new("session-background-stop-race".to_string());
+        let task = registry.create_main_session("Stop completed provider".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        let (provider_tx, provider_rx) = mpsc::bounded(1);
+        let (release_tx, release_rx) = mpsc::bounded(1);
+        let provider_task = ProviderStreamTask {
+            receiver: Some(provider_rx),
+            cancel: CancelToken::new(),
+            handle: Some(thread::spawn(move || {
+                let _ = release_rx.recv();
+            })),
+        };
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_supervisor, spawner) = test_task_supervisor();
+        spawn_background_provider_completion(
+            provider_task,
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: None,
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-stop-race".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
+            &spawner,
+        )
+        .expect("background provider admitted");
+        provider_tx
+            .send(ProviderStreamEvent::Done(ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("done".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !provider_tx.is_empty() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            provider_tx.is_empty(),
+            "completion did not receive provider terminal"
+        );
+
+        registry.request_stop(&task.id).expect("stop requested");
+        release_tx.send(()).expect("release provider join");
+        loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("terminal task update");
+            if task_update_matches(&event, |summary| {
+                matches!(summary.status, TaskStatus::Completed | TaskStatus::Stopped)
+            }) {
+                break;
+            }
+        }
+
+        assert_eq!(registry.get(&task.id).unwrap().status, TaskStatus::Stopped);
+    }
+
+    #[test]
+    fn supervisor_shutdown_cancels_and_joins_background_provider() {
+        let registry = TaskRegistry::new("session-background-shutdown".to_string());
+        let task = registry.create_main_session("Shutdown provider".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        let (provider_task, provider_joined) = cancellable_test_provider_stream_task();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (mut supervisor, spawner) = test_task_supervisor();
+        spawn_background_provider_completion(
+            provider_task,
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: None,
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-shutdown".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: None,
+            },
+            &spawner,
+        )
+        .expect("background provider admitted");
+
+        supervisor.shutdown().expect("background tasks joined");
+
+        assert!(provider_joined.load(Ordering::SeqCst));
+        assert_eq!(registry.get(&task.id).unwrap().status, TaskStatus::Stopped);
+    }
+
+    #[test]
+    fn stop_wins_when_supervisor_rejects_background_handoff() {
+        let registry = TaskRegistry::new("session-background-admission-stop".to_string());
+        let task = registry.create_main_session("Reject provider handoff".to_string());
+        registry.mark_running(&task.id).unwrap();
+        registry.mark_backgrounded(&task.id).unwrap();
+        registry.request_stop(&task.id).expect("stop requested");
+        let (provider_task, provider_joined) = cancellable_test_provider_stream_task();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (completion_tx, completion_rx) = mpsc::bounded(1);
+        let supervisor = TuiTaskSupervisor::new(0);
+
+        let error = spawn_background_provider_completion(
+            provider_task,
+            BackgroundProviderCompletionContext {
+                task_registry: registry.clone(),
+                history_writer: None,
+                model: None,
+                usage_ledger: TuiUsageLedger::default(),
+                budget_admission: None,
+                max_budget_usd: None,
+                event_tx,
+                run_id: "run-background-admission-stop".to_string(),
+                task_id: task.id.clone(),
+                completion_handler: Some(Box::new(move |completion| {
+                    completion_tx.send(completion).expect("completion callback");
+                })),
+            },
+            &supervisor.spawner(),
+        )
+        .expect_err("zero-capacity supervisor rejects handoff");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(provider_joined.load(Ordering::SeqCst));
+        assert_eq!(registry.get(&task.id).unwrap().status, TaskStatus::Stopped);
+        assert_eq!(
+            completion_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("one completion callback")
+                .usage,
+            None
+        );
+        assert!(completion_rx.try_recv().is_err());
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(event, TuiEvent::SessionCompleted { status } if status == "cancelled")
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(event, TuiEvent::SessionCompleted { status } if status == "failed")
+        }));
+    }
+
+    #[test]
     fn foregrounded_background_provider_completion_forwards_future_message_deltas() {
         let registry = TaskRegistry::new("session-background-foreground".to_string());
         let task = registry.create_main_session("Long answer".to_string());
@@ -3689,7 +4243,7 @@ mod tests {
 
         let (event_tx, event_rx) = mpsc::unbounded();
         let (provider_tx, provider_rx) = mpsc::unbounded();
-        spawn_background_provider_completion(
+        let _background_tasks = spawn_test_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
                 task_registry: registry.clone(),
@@ -3760,7 +4314,7 @@ mod tests {
 
         let (event_tx, event_rx) = mpsc::unbounded();
         let (provider_tx, provider_rx) = mpsc::unbounded();
-        spawn_background_provider_completion(
+        let _background_tasks = spawn_test_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
                 task_registry: registry.clone(),
@@ -3817,7 +4371,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::unbounded();
         let (provider_tx, provider_rx) = mpsc::unbounded();
         let (completion_tx, completion_rx) = mpsc::unbounded();
-        spawn_background_provider_completion(
+        let _background_tasks = spawn_test_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
                 task_registry: registry,
@@ -3872,7 +4426,7 @@ mod tests {
 
         let (event_tx, event_rx) = mpsc::unbounded();
         let (provider_tx, provider_rx) = mpsc::unbounded();
-        spawn_background_provider_completion(
+        let _background_tasks = spawn_test_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
                 task_registry: registry.clone(),
@@ -4128,7 +4682,7 @@ mod tests {
 
         let (event_tx, event_rx) = mpsc::unbounded();
         let (provider_tx, provider_rx) = mpsc::unbounded();
-        spawn_background_provider_completion(
+        let _background_tasks = spawn_test_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
                 task_registry: registry.clone(),
@@ -4352,6 +4906,7 @@ mod tests {
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
         let pending_actions = RefCell::new(VecDeque::new());
+        let (_tasks, task_spawner) = test_task_supervisor();
 
         run_agent_for_tui(
             &config,
@@ -4375,6 +4930,7 @@ mod tests {
             false,
             None,
             None,
+            &task_spawner,
         );
 
         assert_eq!(

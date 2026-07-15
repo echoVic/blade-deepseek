@@ -1,6 +1,6 @@
 # ADR 0005: Runtime Host Operation Control Plane
 
-- Status: Accepted; P0.3a through P0.3d implemented, all unreleased
+- Status: Accepted; P0.3a through P0.3d and P0.3e1 implemented, all unreleased
 - Date: 2026-07-15
 - Roadmap: P0.3 Runtime Operation Host and canonical turn executor
 
@@ -612,6 +612,94 @@ if interaction replies compare raw generation numbers; or if a live
   `ServerThreadRuntime::take_thread` / `put_thread` are absent from production
   code. No release is made at this checkpoint; the next surface migration is
   the TUI onto the proven runtime-host control plane.
+
+## P0.3e1: Joined TUI Worker Supervision
+
+### Structural Problem And Boundary
+
+The server migration made the runtime host the only server turn owner, but the
+TUI could not move directly onto that path without first fixing its worker
+lifetime. The fullscreen entrypoint discarded its agent `JoinHandle`; each
+provider request returned only a receiver while dropping join ownership; a
+background-current-turn handoff spawned a second detached completion worker;
+and auto-memory used a non-cancellable detached provider call. Exiting the TUI
+therefore restored the terminal without proving that any of those workers had
+stopped.
+
+P0.3e1 establishes a temporary, explicit ownership boundary:
+
+- `TuiAgentRuntime` owns the existing agent thread, its operation-cancellation
+  controller, the shutdown command sender, and a bounded `TuiTaskSupervisor`;
+- agent shutdown closes operation admission before cancellation, uses a
+  non-blocking wake command, and makes every later operation scope born
+  cancelled. A full bounded action mailbox therefore cannot deadlock shutdown
+  or admit another turn behind the shutdown boundary;
+- terminal teardown disconnects the runtime event receiver and restores the
+  user's terminal before cancelling and joining the agent runtime;
+- `ProviderStreamTask` owns the stream receiver, cancel token, and join handle.
+  Foreground turns join it after `Done`; backgrounding transfers the complete
+  task into the supervisor;
+- background completion and auto-memory are named supervised tasks. Shutdown
+  closes admission, cancels all admitted work, and joins it; completed tasks
+  are reaped before they consume capacity;
+- auto-memory uses a cancellable streaming provider call and cannot persist a
+  note after cancellation;
+- background `task_stop` and provider completion settle under one atomic
+  `TaskRegistry` lock. A stop request wins over a concurrent success terminal,
+  while usage already incurred by the provider remains recorded. Cancellation
+  drains an already queued provider terminal before join, so stop cannot discard
+  usage merely because the completion consumer had not read `Done` yet.
+
+This is not the final TUI control plane. The existing TUI agent loop still owns
+`TuiConversationSession`, borrows the action receiver for interactions, and
+uses `OperationCancellation`. The bounded supervisor exists only to make every
+provider/completion/auto-memory worker changed in this checkpoint traceable and
+to provide the transfer boundary needed by the next actor migration; it must
+not become a second permanent runtime host. The pre-existing detached workflow
+notification watchers still own `WorkflowBackgroundLaunch` outside this
+supervisor and remain an explicit deletion target for the host migration.
+
+### TUI User Value And Compatibility
+
+Closing the TUI no longer leaves its agent, provider, background-current-turn,
+or auto-memory work detached. Stopping a background provider task cancels the
+network request, waits for the worker, and publishes one stopped terminal even
+when stop races with provider completion. Backgrounding still releases the
+conversation for the next submit, and foregrounding, approvals, goal usage,
+history writes, budget checks, and streamed deltas retain their existing
+behavior.
+
+P0.3e1 preserves CLI arguments, TUI keys and flows, server/JSONL contracts,
+persistence, and DeepSeek request/model behavior. It is an unreleased
+reliability checkpoint, not a feature release.
+
+### P0.3e1 Acceptance And Deletion Gate
+
+1. Explicit shutdown and `Drop` cancel and join the TUI agent thread.
+2. Supervised task admission is bounded; shutdown rejects new work and cancels
+   and joins every admitted task.
+3. Foreground and background provider tasks retain cancel and join ownership;
+   disconnect, cancellation, panic unwind, and shutdown cannot detach the
+   provider worker.
+4. Background stop, completion, usage, history, and callback paths settle once;
+   stop wins the terminal race atomically.
+5. Auto-memory is cancellable and supervised.
+6. Background-current-turn, next submit, foreground, approval, goal, usage,
+   and budget behavior remain compatible.
+
+Checkpoint verification passed with `orca-core` 143/143, `orca-runtime`
+769/769, and `orca-tui` 506/506 tests; the serial workspace all-targets gate;
+workspace Clippy with only pre-existing warnings; the release real-API smoke;
+and the complete DeepSeek harness. The real harness covered provider summary,
+CLI and history replay/repair, server submit and thread memory, active-turn
+resume/control, thread read/metadata, list filters/search, and turn/item
+pagination.
+
+The next P0.3e slice must replace borrowed interaction waits with a typed,
+generation-fenced broker. P0.3e remains incomplete while production TUI code
+owns `OperationCancellation`, a mutable `RuntimeThread`, the TUI-only agent
+loop, or borrowed interaction handlers, or while any remaining TUI worker can
+outlive its owner without cancel and join.
 
 ### P0.3b Acceptance Criteria
 

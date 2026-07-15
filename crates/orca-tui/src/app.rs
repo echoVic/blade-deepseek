@@ -20,6 +20,7 @@ use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
 use orca_runtime::history;
 
+use crate::agent_runtime::TuiAgentRuntime;
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
@@ -40,6 +41,7 @@ use crate::mention_search_manager::MentionSearchManager;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
+use crate::task_supervisor::TuiTaskSpawner;
 use crate::terminal_lifecycle::TerminalCleanup;
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
@@ -61,9 +63,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
     const MAX_INPUT_EVENTS_PER_BATCH: usize = 64;
     const MAX_RUNTIME_EVENTS_PER_BATCH: usize = 256;
+    const MAX_SUPERVISED_TUI_TASKS: usize = 32;
 
     terminal::enable_raw_mode()?;
-    let mut terminal_cleanup = TerminalCleanup::raw_mode_enabled();
+    let mut pending_terminal_cleanup = TerminalCleanup::raw_mode_enabled();
     let mut stdout = io::stdout();
     // Alternate screen: the fullscreen UI owns the whole viewport, and the
     // alt buffer has NO scrollback — so the terminal's native scrollbar
@@ -71,12 +74,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     // shear the UI). Selection, copying, and wheel scrolling are all
     // implemented in-app, so nothing native is lost; on exit the primary
     // screen returns with the shell's history intact.
-    terminal_cleanup.set_alternate_screen(stdout.execute(EnterAlternateScreen).is_ok());
-    terminal_cleanup.set_mouse_captured(stdout.execute(EnableMouseCapture).is_ok());
-    terminal_cleanup.set_bracketed_paste(stdout.execute(EnableBracketedPaste).is_ok());
+    pending_terminal_cleanup.set_alternate_screen(stdout.execute(EnterAlternateScreen).is_ok());
+    pending_terminal_cleanup.set_mouse_captured(stdout.execute(EnableMouseCapture).is_ok());
+    pending_terminal_cleanup.set_bracketed_paste(stdout.execute(EnableBracketedPaste).is_ok());
     // Kitty keyboard protocol: push enhancement AFTER entering alternate screen,
     // otherwise the terminal may reset the keyboard state stack on screen switch.
-    terminal_cleanup.set_keyboard_enhanced(
+    pending_terminal_cleanup.set_keyboard_enhanced(
         stdout
             .execute(PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -88,7 +91,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let backend = CrosstermBackend::new(stdout);
 
-    let (event_tx, event_rx) = tui_event_channel();
+    let (event_tx, pending_event_rx) = tui_event_channel();
     let (action_tx, action_rx) = user_action_channel();
     let (mention_registry_tx, mention_registry_rx) = mpsc::bounded(1);
     let mut mention_search =
@@ -187,24 +190,31 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Arc::new(Mutex::new(startup_preloaded_transcript));
     let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
-    let cancellation = OperationCancellation::new();
-    let agent_cancellation = cancellation.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
     let agent_mcp_configs = config.mcp_servers.clone();
 
-    let _agent_handle = std::thread::spawn(move || {
-        let agent_mcp_registry = orca_mcp::initialize_registry(&agent_mcp_configs);
-        let _ = mention_registry_tx.send(agent_mcp_registry.clone());
-        agent_loop_thread_with_registry(
-            agent_config,
-            agent_preloaded,
-            agent_event_tx,
-            action_rx,
-            agent_cancellation,
-            agent_workflow_notifications,
-            agent_mcp_registry,
-        );
-    });
+    let mut agent_runtime = TuiAgentRuntime::spawn(
+        action_tx.clone(),
+        MAX_SUPERVISED_TUI_TASKS,
+        move |agent_cancellation, task_spawner| {
+            let agent_mcp_registry = orca_mcp::initialize_registry(&agent_mcp_configs);
+            let _ = mention_registry_tx.send(agent_mcp_registry.clone());
+            agent_loop_thread_with_registry(
+                agent_config,
+                agent_preloaded,
+                agent_event_tx,
+                action_rx,
+                agent_cancellation,
+                agent_workflow_notifications,
+                agent_mcp_registry,
+                task_spawner,
+            );
+        },
+    )?;
+    // These moved bindings are declared after the runtime so unwinding drops
+    // the event receiver and restores the terminal before the runtime joins.
+    let terminal_cleanup = pending_terminal_cleanup;
+    let event_rx = pending_event_rx;
 
     let mut vim_state = VimState::new(config.vim_mode);
     let mut textarea = if needs_setup {
@@ -308,7 +318,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         &mut config,
                                         &shared_config,
                                         &action_tx,
-                                        &cancellation,
+                                        agent_runtime.cancellation(),
                                         &preloaded_transcript,
                                         &mut textarea,
                                         &mut vim_state,
@@ -330,7 +340,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut config,
                                 &shared_config,
                                 &action_tx,
-                                &cancellation,
+                                agent_runtime.cancellation(),
                                 || clear_terminal_scrollback(&mut terminal),
                             )? {
                                 KeyEventFlow::Continue => return Ok(None),
@@ -345,7 +355,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut config,
                                 &shared_config,
                                 &action_tx,
-                                &cancellation,
+                                agent_runtime.cancellation(),
                                 &preloaded_transcript,
                                 &mut textarea,
                                 &mut vim_state,
@@ -410,6 +420,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     drop(terminal);
     terminal_cleanup.finish();
     mention_search.shutdown();
+    drop(event_rx);
+    agent_runtime.shutdown()?;
 
     Ok(exit_code)
 }
@@ -581,6 +593,8 @@ mod tests {
         let pending_actions = RefCell::new(VecDeque::new());
         let cancellation = OperationCancellation::new();
         let pending_workflow_notifications = test_pending_workflow_notifications();
+        let tasks = crate::task_supervisor::TuiTaskSupervisor::new(1);
+        let task_spawner = tasks.spawner();
         let mut session = None;
         let mut pending_pinned_context = Vec::new();
         let prompt = "review @gone.txt";
@@ -610,6 +624,7 @@ mod tests {
             &cancellation,
             &pending_workflow_notifications,
             &orca_mcp::McpRegistry::default(),
+            &task_spawner,
         );
 
         let rejection = event_rx
@@ -3709,6 +3724,7 @@ fn run_goal_turns_for_tui(
     cancel: &CancelToken,
     starting_continuation: usize,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    task_spawner: &TuiTaskSpawner,
 ) {
     let Some(session_id) = session.session_id().map(str::to_string) else {
         let _ = event_tx.send(TuiEvent::Error(
@@ -3751,6 +3767,7 @@ fn run_goal_turns_for_tui(
             submitted_turn.is_backtrack_target(),
             Some(pending_workflow_notifications),
             Some(background_completion_handler),
+            task_spawner,
         );
         let status = turn_result.status;
         let token_delta = goal_token_delta(before_usage, session.runtime_usage_totals());
@@ -3833,6 +3850,8 @@ fn resume_latest_active_goal_for_tui(
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
 ) {
     let registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
+    let tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
+    let task_spawner = tasks.spawner();
     resume_latest_active_goal_for_tui_with_registry(
         session,
         config,
@@ -3843,6 +3862,7 @@ fn resume_latest_active_goal_for_tui(
         cancel,
         pending_workflow_notifications,
         &registry,
+        &task_spawner,
     );
 }
 
@@ -3857,6 +3877,7 @@ fn resume_latest_active_goal_for_tui_with_registry(
     cancel: &CancelToken,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
+    task_spawner: &TuiTaskSpawner,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         let _ = event_tx.send(TuiEvent::Error(
@@ -3957,6 +3978,7 @@ fn resume_latest_active_goal_for_tui_with_registry(
             cancel,
             1,
             pending_workflow_notifications,
+            task_spawner,
         );
     }
 }
@@ -3964,11 +3986,21 @@ fn resume_latest_active_goal_for_tui_with_registry(
 fn recv_next_user_action(
     action_rx: &mpsc::Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
+    cancellation: &OperationCancellation,
 ) -> Result<UserAction, mpsc::RecvError> {
-    if let Some(action) = pending_actions.borrow_mut().pop_front() {
-        return Ok(action);
+    if cancellation.is_shutdown() {
+        return Ok(UserAction::Cancel);
     }
-    action_rx.recv()
+    let action = if let Some(action) = pending_actions.borrow_mut().pop_front() {
+        action
+    } else {
+        action_rx.recv()?
+    };
+    Ok(if cancellation.is_shutdown() {
+        UserAction::Cancel
+    } else {
+        action
+    })
 }
 
 fn handle_submitted_turn_for_tui(
@@ -3983,6 +4015,7 @@ fn handle_submitted_turn_for_tui(
     cancellation: &OperationCancellation,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
+    task_spawner: &TuiTaskSpawner,
 ) {
     let operation = cancellation.start();
     let cancel = operation.token();
@@ -4049,6 +4082,7 @@ fn handle_submitted_turn_for_tui(
         cancel,
         0,
         pending_workflow_notifications,
+        task_spawner,
     );
     if cfg.desktop_notifications {
         let _ = orca_runtime::notify::notify("Orca", "Task completed");
@@ -4085,6 +4119,8 @@ fn agent_loop_thread(
         initial.cancel();
     }
     let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
+    let mut tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
+    let task_spawner = tasks.spawner();
     agent_loop_thread_with_registry(
         config,
         preloaded,
@@ -4093,7 +4129,9 @@ fn agent_loop_thread(
         cancellation,
         pending_workflow_notifications,
         mcp_registry,
+        task_spawner,
     );
+    tasks.shutdown().expect("test TUI tasks joined");
 }
 
 #[cfg(test)]
@@ -4106,6 +4144,8 @@ fn agent_loop_thread_with_operation_cancellation(
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
 ) {
     let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
+    let mut tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
+    let task_spawner = tasks.spawner();
     agent_loop_thread_with_registry(
         config,
         preloaded,
@@ -4114,7 +4154,9 @@ fn agent_loop_thread_with_operation_cancellation(
         cancellation,
         pending_workflow_notifications,
         mcp_registry,
+        task_spawner,
     );
+    tasks.shutdown().expect("test TUI tasks joined");
 }
 
 fn agent_loop_thread_with_registry(
@@ -4125,13 +4167,14 @@ fn agent_loop_thread_with_registry(
     cancellation: OperationCancellation,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     mcp_registry: orca_mcp::McpRegistry,
+    task_spawner: TuiTaskSpawner,
 ) {
     let mut session: Option<bridge::TuiConversationSession> = None;
     let mut pending_pinned_context: Vec<String> = Vec::new();
     let pending_actions: RefCell<VecDeque<UserAction>> = RefCell::new(VecDeque::new());
 
     loop {
-        match recv_next_user_action(&action_rx, &pending_actions) {
+        match recv_next_user_action(&action_rx, &pending_actions, &cancellation) {
             Ok(UserAction::Submit(prompt)) => {
                 handle_submitted_turn_for_tui(
                     SubmittedTurn::user(prompt),
@@ -4145,6 +4188,7 @@ fn agent_loop_thread_with_registry(
                     &cancellation,
                     &pending_workflow_notifications,
                     &mcp_registry,
+                    &task_spawner,
                 );
             }
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
@@ -4160,6 +4204,7 @@ fn agent_loop_thread_with_registry(
                     &cancellation,
                     &pending_workflow_notifications,
                     &mcp_registry,
+                    &task_spawner,
                 );
             }
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
@@ -4175,6 +4220,7 @@ fn agent_loop_thread_with_registry(
                     &cancellation,
                     &pending_workflow_notifications,
                     &mcp_registry,
+                    &task_spawner,
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
@@ -4401,6 +4447,7 @@ fn agent_loop_thread_with_registry(
                                 operation.token(),
                                 0,
                                 &pending_workflow_notifications,
+                                &task_spawner,
                             );
                         }
                     }
@@ -4479,6 +4526,7 @@ fn agent_loop_thread_with_registry(
                         operation.token(),
                         &pending_workflow_notifications,
                         &mcp_registry,
+                        &task_spawner,
                     );
                     continue;
                 };
@@ -4507,6 +4555,7 @@ fn agent_loop_thread_with_registry(
                             operation.token(),
                             1,
                             &pending_workflow_notifications,
+                            &task_spawner,
                         );
                     }
                 }

@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::conversation::{Conversation, Message};
 use orca_core::event_schema::EventFactory;
@@ -89,6 +90,25 @@ pub fn extract_project_memory(
     cwd: &Path,
     messages: &[Message],
 ) -> Result<Option<PathBuf>, String> {
+    extract_project_memory_with_cancel(
+        provider_kind,
+        provider_config,
+        cwd,
+        messages,
+        &CancelToken::new(),
+    )
+}
+
+pub fn extract_project_memory_with_cancel(
+    provider_kind: ProviderKind,
+    provider_config: &ProviderConfig,
+    cwd: &Path,
+    messages: &[Message],
+    cancel: &CancelToken,
+) -> Result<Option<PathBuf>, String> {
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
     let source = format_messages_for_memory(messages);
     if source.trim().is_empty() {
         return Ok(None);
@@ -111,7 +131,16 @@ pub fn extract_project_memory(
         mcp_registry: None,
         external_tools: Vec::new(),
     };
-    let response = orca_provider::call(provider_kind, &conversation, &summary_config);
+    let response = orca_provider::call_streaming(
+        provider_kind,
+        &conversation,
+        &summary_config,
+        cancel,
+        &mut |_| {},
+    );
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
     if response
         .steps
         .iter()
@@ -340,5 +369,25 @@ mod tests {
         assert!(matches!(provider_config.tools_override, Some(ref tools) if tools.is_empty()));
         assert!(provider_config.mcp_registry.is_none());
         assert!(provider_config.external_tools.is_empty());
+    }
+
+    #[test]
+    fn cancelled_memory_extraction_does_not_call_provider_or_write_memory() {
+        let dir = TempDir::new().unwrap();
+        let mut conversation = Conversation::new();
+        conversation.add_user("remember cargo test".to_string());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let result = extract_project_memory_with_cancel(
+            ProviderKind::Mock,
+            &auto_memory_provider_config(&config()),
+            dir.path(),
+            &conversation.messages,
+            &cancel,
+        )
+        .expect("cancelled extraction");
+
+        assert!(result.is_none());
     }
 }
