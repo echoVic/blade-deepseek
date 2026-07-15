@@ -1,6 +1,6 @@
 # ADR 0004: Generation-Owned Server Turn Cancellation
 
-Status: accepted; v0.2.28 release candidate
+Status: accepted; released in v0.2.28 on 2026-07-15
 
 ## Problem Evidence
 

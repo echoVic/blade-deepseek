@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current candidate: v0.2.28 removes the last production server
+Current baseline: v0.2.28 removes the last production server
 `CancelToken::reset()` path. `ActiveTurnManager` now owns one
 `turnId -> ActiveTurnEntry` record containing the worker, generation control,
 bounded resume mailbox, steer handle, join ownership, and session-permission
@@ -23,8 +23,10 @@ Focused cancellation tests, 778 `orca-runtime` tests, and 107 `server_mode_*`
 contracts pass. The full serial workspace gate, workspace Clippy, site build and
 SEO, release-helper tests, and the real DeepSeek provider/CLI/history/server,
 active turn-control, thread-memory, metadata, list/search, and paginated-read
-gates pass. Release workflow and public GitHub/npm verification remain required
-before this becomes the released baseline.
+gates pass. Release workflow `29398197850` passed the complete test, version
+check, four-platform build, GitHub Release, npm publish, and npm release-asset
+jobs. The public verifier confirmed the GitHub Release,
+`@blade-ai/orca@0.2.28`, and `npm exec` installation.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
