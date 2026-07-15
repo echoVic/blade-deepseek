@@ -1745,6 +1745,93 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_agent_loop_turn_does_not_cancel_next_submit() {
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let cancellation = OperationCancellation::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancellation = cancellation.clone();
+                move || {
+                    agent_loop_thread_with_operation_cancellation(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancellation,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()))
+                .unwrap();
+
+            let first_id = loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
+                        break cancellation.current_id().expect("first operation id");
+                    }
+                    TuiEvent::Error(message) => panic!("unexpected first-turn error: {message}"),
+                    _ => {}
+                }
+            };
+
+            assert_eq!(cancellation.cancel_current(), Some(first_id));
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::SessionCompleted { status } => {
+                        assert_eq!(status, "cancelled");
+                        break;
+                    }
+                    TuiEvent::Error(message) => panic!("unexpected cancellation error: {message}"),
+                    _ => {}
+                }
+            }
+
+            action_tx
+                .send(UserAction::Submit("mock_history_echo".to_string()))
+                .unwrap();
+
+            let mut second_id = None;
+            let mut saw_second_output = false;
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    TuiEvent::TurnStarted { .. } => {
+                        let current = cancellation.current_id().expect("second operation id");
+                        assert_ne!(current, first_id);
+                        second_id = Some(current);
+                    }
+                    TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
+                        saw_second_output = true;
+                    }
+                    TuiEvent::SessionCompleted { status } => {
+                        assert_eq!(status, "success");
+                        break;
+                    }
+                    TuiEvent::Error(message) => panic!("unexpected second-turn error: {message}"),
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert!(
+                second_id.is_some(),
+                "second turn must start a fresh operation"
+            );
+            assert!(saw_second_output, "second turn must run to provider output");
+        });
+    }
+
+    #[test]
     fn workflow_notification_submit_bypasses_user_file_mention_expansion() {
         with_orca_home(|_| {
             let temp = tempfile::tempdir().unwrap();
