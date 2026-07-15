@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current candidate: v0.2.27 replaces the production TUI's shared resettable
+Current baseline: v0.2.27 replaces the production TUI's shared resettable
 cancel flag with one-shot operation ownership. Every submitted turn, manual
 compaction, Goal operation, and approved background continuation receives a
 fresh `OperationScope` with a stable `OperationId`; Esc and Ctrl+C cancel only
@@ -18,9 +18,10 @@ Clippy pass. The final serial workspace gate also passed with 772 runtime tests,
 467 TUI tests, 130 app-server contract tests, and every remaining target. Site
 build and SEO, release-helper tests, and the real DeepSeek provider, CLI,
 history, server, thread-memory, metadata, turn-control, list/search, and
-paginated-read gates pass. Remote Actions, GitHub Release, npm, and public
-installation verification remain required before this becomes the released
-baseline.
+paginated-read gates pass. Release workflow `29391822282` passed the complete
+test, version check, four-platform build, GitHub Release, npm publish, and npm
+release-asset jobs. The public verifier confirmed the GitHub Release,
+`@blade-ai/orca@0.2.27`, and `npm exec` installation.
 
 The server `turn/resume` processor still resets its active `CancelToken`; that
 path is explicitly outside this TUI slice and is not a permanent compatibility
@@ -29,7 +30,7 @@ restarts interrupted turns with fresh scopes, and rejects stale completion,
 approval, and continuation events. Adding another reset branch or a second
 long-lived cancellation controller does not satisfy that deletion gate.
 
-Public baseline: v0.2.26 replaces the TUI's unbounded runtime-event and
+Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
 paused rendering now applies producer backpressure without silently dropping
 assistant output, approval, error, or terminal events. Runtime compaction and

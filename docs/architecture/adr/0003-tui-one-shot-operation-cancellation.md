@@ -1,6 +1,6 @@
 # ADR 0003: One-Shot TUI Operation Cancellation
 
-Status: accepted; v0.2.27 release candidate
+Status: accepted; released in v0.2.27 on 2026-07-15
 
 ## Problem Evidence
 
