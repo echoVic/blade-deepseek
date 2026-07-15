@@ -34,7 +34,7 @@ libc = "0.2"
 
 [package]
 name = "blade-deepseek"
-version = "0.2.28"
+version = "0.2.29"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"

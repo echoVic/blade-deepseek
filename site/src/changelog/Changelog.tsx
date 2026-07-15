@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.29":
+        "Runtime now has a process-owned RuntimeHost and one bounded ThreadActor per conversation, with typed operation handles and completion terminals so headless and TUI turns share one ownership boundary. Structured @ mention bindings now resolve exact files, skills, plugins, and MCP resources, recover rejected submissions, and keep mention search and history isolated from user data. TUI selection, clipboard, input history, status formatting, and submission hints are also refined.",
       "v0.2.28":
         "Server turn cancellation is now generation-owned. Interrupt permanently cancels the current DeepSeek execution; resume waits for it to return, starts a fresh scope on the same logical turn id, and never appends the original prompt twice. Permission, user-input, and MCP waiters are cancellation-aware and generation-fenced, stale steer and responses are rejected, and a replaced generation cannot publish stale cancellation errors or a stale terminal event. The first interaction request id remains compatible; resumed generations receive an internal generation suffix. A real DeepSeek gate interrupts after the first stream delta and verifies one successful terminal event.",
       "v0.2.27":
@@ -510,6 +512,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.29":
+        "Runtime 现在提供进程级 RuntimeHost，并为每个会话使用一个有界 ThreadActor，通过类型化 operation handle 与 completion terminal 统一 headless 和 TUI turn 的所有权边界。结构化 @ mention binding 现在可以解析文件、skill、plugin 和 MCP resource，恢复被拒绝的提交，并让 mention search 与输入历史和用户数据隔离。TUI 的选择、剪贴板、输入历史、状态栏格式和提交提示也得到优化。",
       "v0.2.28":
         "Server turn cancellation 现在由 generation 独占。Interrupt 会永久取消当前 DeepSeek 执行；resume 等待旧 generation 返回后，在同一个逻辑 turn id 上用新的 scope 重启，并且不会重复追加原始 prompt。Permission、user-input 和 MCP waiter 都支持取消并按 generation 隔离；过期的 steer 与响应会被拒绝，被替换的 generation 不能发布过期取消错误或终态。第一代 interaction request id 保持兼容，续接 generation 会增加内部后缀。真实 DeepSeek gate 会在首个 stream delta 后 interrupt，再验证同一 turn 只产生一个成功终态。",
       "v0.2.27":

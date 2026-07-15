@@ -2892,7 +2892,9 @@ mod tests {
         let mut child = command.spawn().unwrap();
         handoff_workflow_worker_api_key(&mut child, Some(sentinel)).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !key_file.exists() && std::time::Instant::now() < deadline {
+        while fs::read_to_string(&key_file).ok().as_deref() != Some(sentinel)
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(key_file.exists(), "workflow worker fixture did not start");

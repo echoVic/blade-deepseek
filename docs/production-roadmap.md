@@ -4,7 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current baseline: v0.2.28 removes the last production server
+Current baseline: v0.2.29 extends the runtime ownership model into the
+process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
+operation handles and completion terminals now give headless and TUI turns one
+explicit lifecycle boundary. The same release finalizes structured `@` mention
+bindings across files, skills, plugins, and MCP resources, recovers rejected
+submissions, isolates mention search and input history, and improves TUI
+selection, clipboard, status formatting, and submission hints.
+Earlier v0.2.28 removes the last production server
 `CancelToken::reset()` path. `ActiveTurnManager` now owns one
 `turnId -> ActiveTurnEntry` record containing the worker, generation control,
 bounded resume mailbox, steer handle, join ownership, and session-permission
