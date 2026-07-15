@@ -129,3 +129,13 @@ constructor, or a JSON deserialize step between runtime `EventEnvelope` and
 `TuiEvent`. Tests must prove queue and observer behavior rather than asserting
 that source files contain ownership marker strings.
 
+## Candidate Verification
+
+The implementation deleted every item in the deletion gate. After rebasing
+onto the latest published `main`, focused `EventSink`, runtime compaction, TUI
+mailbox, observer, background-continuation, and silent-child tests passed. The
+complete serial workspace suite, all-target Clippy with the repository's
+existing warnings, site build and SEO checks, all release-script tests, and the
+real DeepSeek provider/CLI/history/server/thread gate also passed. Remote
+Actions and published-artifact verification remain release gates rather than
+implementation gates.

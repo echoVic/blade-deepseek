@@ -4,7 +4,22 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current baseline: v0.2.25 gives the managed network proxy one explicit
+Current candidate: v0.2.26 replaces the TUI's unbounded runtime-event and
+user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
+paused rendering now applies producer backpressure without silently dropping
+assistant output, approval, error, or terminal events. Runtime compaction and
+approved background continuation project the original typed `EventEnvelope`
+through `EventObserver`; the TUI-local JSONL writer, partial-frame buffer, and
+deserialize/recreate envelope path are deleted. Provider streaming, mention
+catalog refresh, and silent child-agent event disposal also have explicit
+bounded admission, and the silent drain worker is joined before return. CLI,
+TUI interactions, server/JSONL, persistence, and DeepSeek behavior remain
+compatible. The rebased candidate passed focused observer/mailbox/compaction,
+complete serial workspace, Clippy, site, release-script, and real DeepSeek
+provider gates. Remote Actions, GitHub Release, npm, and public-install
+verification remain required before this becomes the released baseline.
+
+Earlier v0.2.25 gives the managed network proxy one explicit
 supervisor owner. It admits at most 32 concurrent connections, bounds request
 and header framing before parsing, sends permission-block reports through a
 fixed-capacity channel, resolves and connects with deadlines, and keeps every

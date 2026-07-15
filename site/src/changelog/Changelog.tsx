@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.26":
+        "The TUI now admits runtime events through a 256-item mailbox and user actions through a 64-item mailbox with blocking backpressure, so a slow or paused renderer cannot grow an unbounded queue and admitted output, approvals, errors, and terminal state keep FIFO order. Runtime compaction and approved background continuation project the original typed EventEnvelope through EventObserver instead of serializing JSONL into a partial-frame buffer and parsing it back. Provider streaming, mention catalog refresh, and silent child-agent event disposal also use explicit bounded ownership, with the silent drain thread joined before return. CLI/server JSONL, persisted records, DeepSeek behavior, TUI keys, and interaction flows remain compatible.",
       "v0.2.25":
         "Network-restricted TUI bash and server command sessions now own every proxy connection through one managed supervisor. Admission is capped at 32 concurrent connections; excess clients receive a bounded connection-limit response instead of spawning another worker. Request and header framing is bounded before parsing, network-block reports use a fixed-capacity non-blocking queue, and DNS lookup, upstream connect, and socket I/O have explicit deadlines. Stopping a command, cancelling a turn, or dropping the proxy stops admission, aborts and awaits every active connection, closes both ends of CONNECT tunnels, and joins the supervisor thread. CLI flags, permission profiles, proxy environment variables, TUI flows, server/JSONL shapes, and persisted records remain compatible.",
       "v0.2.24":
@@ -504,6 +506,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.26":
+        "TUI 现在通过容量为 256 的 mailbox 接收 runtime event，并通过容量为 64 的 mailbox 接收用户操作；满载时采用阻塞背压，因此终端渲染变慢或暂停时不会无限积压，已准入的输出、审批、错误与终态仍保持 FIFO 顺序。Runtime compaction 和已批准的后台续轮现在通过 EventObserver 直接投影原始的类型化 EventEnvelope，不再先写入带 partial-frame buffer 的 JSONL writer 再反序列化。Provider stream、mention catalog 刷新和静默 child-agent 事件丢弃也都具有明确的有界所有权，静默 drain 线程会在返回前完成 join。CLI/server JSONL、持久化记录、DeepSeek 行为、TUI 快捷键和交互流程保持兼容。",
       "v0.2.25":
         "启用网络权限策略的 TUI bash 与 server command 现在由同一个托管 supervisor 拥有全部代理连接。并发连接上限为 32；超过上限的客户端会收到有界的 connection-limit 响应，不再创建额外 worker。请求行与 header 会在解析前执行字节和数量准入，网络阻断报告使用固定容量的非阻塞队列，DNS、上游连接与 socket I/O 都有明确时限。停止命令、取消 turn 或销毁代理时，会先停止准入，再取消并等待全部活动连接，关闭 CONNECT tunnel 两端，最后 join supervisor 线程。CLI 参数、权限 profile、代理环境变量、TUI 流程、server/JSONL 形状和持久化记录保持兼容。",
       "v0.2.24":
