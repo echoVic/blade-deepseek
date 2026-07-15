@@ -349,6 +349,13 @@ fn is_runtime_terminal_line(line: &[u8]) -> bool {
         .is_some_and(|event_type| event_type == "session.completed")
 }
 
+fn visible_generation_error<T>(status: &io::Result<T>, replaced: bool) -> Option<String> {
+    if replaced {
+        return None;
+    }
+    status.as_ref().err().map(ToString::to_string)
+}
+
 struct LockedServerWriter<W: Write> {
     inner: Arc<Mutex<W>>,
 }
@@ -2041,12 +2048,8 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             let replace_generation =
                 control_for_worker.close_generation_and_take_resume(&command_rx);
             let _ = generation_writer.finish(!replace_generation);
-            if let Err(error) = status {
-                let _ = write_locked_event(
-                    &writer_for_thread,
-                    &id,
-                    ServerEvent::error(error.to_string()),
-                );
+            if let Some(error) = visible_generation_error(&status, replace_generation) {
+                let _ = write_locked_event(&writer_for_thread, &id, ServerEvent::error(error));
             }
             if !replace_generation {
                 break;
@@ -6669,6 +6672,17 @@ rl.on("line", (line) => {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event"], "turn_completed");
         assert_eq!(events[0]["status"], "success");
+    }
+
+    #[test]
+    fn replaced_generation_drops_stale_outer_error() {
+        let status = Err::<(), _>(io::Error::other("turn cancelled"));
+
+        assert_eq!(
+            visible_generation_error(&status, false).as_deref(),
+            Some("turn cancelled")
+        );
+        assert_eq!(visible_generation_error(&status, true), None);
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
