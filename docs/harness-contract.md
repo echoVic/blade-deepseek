@@ -115,8 +115,8 @@ Clients submit the exact selected target instead of sending only display text:
 Supported targets are `file`, `skill`, `plugin`, `resource`, and `resource_template`. The visible
 prompt remains natural (`compare @same.txt`), while the runtime revalidates and expands the bound
 target before it enters model history. Bound MCP Resources are read through the same thread
-registry used during discovery. Unbound legacy `@file` prompts and explicit `$skill` prompts remain
-supported.
+registry used during discovery. Plain text input never infers a Mention: unbound `@...` text remains
+literal, even when it names an existing file. Explicit `$skill` prompts remain supported.
 
 ## Event Envelope
 

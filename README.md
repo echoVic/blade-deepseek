@@ -197,7 +197,8 @@ Options:
 - top-level `--session-picker` — Choose a saved conversation before entering TUI mode
 - top-level `--mode=server` — Run the JSONL app-server, including thread/turn
   methods, multi-root `fuzzyFileSearch/*`, unified `mention/search/*`, and
-  atomic structured Mention input; see [the harness contract](docs/harness-contract.md)
+  atomic structured Mention input. Only bound Mention targets expand; plain `@...`
+  text stays literal. See [the harness contract](docs/harness-contract.md)
 
 ## Workflows
 

@@ -154,9 +154,9 @@ are injected once.
 
 ### Compatibility
 
-Unbound legacy `@file` mentions continue to use the existing workspace-safe parser and expansion
-rules. Explicit `$skill` injection remains supported. Structured clients and TUI selections gain
-atomic identity without breaking shell scripts, historical prompts, or older clients.
+Only a selected TUI candidate or structured app-server Mention creates a binding and expands a
+target. Unbound `@...` text remains ordinary prompt text, including file-shaped tokens, package
+scopes, and email addresses. Explicit `$skill` injection remains supported independently.
 
 ## Required invariants
 
@@ -167,7 +167,7 @@ atomic identity without breaking shell scripts, historical prompts, or older cli
 5. TUI and app-server submissions use the same target expansion and workspace validation code.
 6. File-only app-server compatibility remains independent from the unified Mention protocol.
 7. Search stop and server shutdown retain owned cancellation and join responsibility.
-8. Legacy unbound `@file` and `$skill` inputs remain valid.
+8. Unbound `@...` input remains literal, while explicit `$skill` input remains valid.
 
 ## Verification contract
 
@@ -184,8 +184,9 @@ Automated tests cover:
 - MCP Resource discovery and `resources/read` expansion through one registry;
 - TUI file selection, directory browsing, and mention-aware submit actions;
 - structured app-server mention input and a two-turn model-history echo proving exact expansion;
+- literal unbound `@...` input across runtime, CLI, and app-server surfaces;
 - server shutdown waiting for retained search reaper ownership;
-- legacy file and Skill compatibility.
+- explicit Skill compatibility.
 
 Final release verification includes formatting, diff checks, workspace checking, the full Rust test
 suite with one test thread, npm staging/verifier tests, site build and SEO checks, GitHub Release

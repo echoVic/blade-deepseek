@@ -6744,6 +6744,103 @@ fn server_mode_atomic_file_mention_uses_the_bound_workspace_root() {
 }
 
 #[test]
+fn server_mode_plain_at_file_remains_literal() {
+    let root = tempdir().expect("workspace root");
+    std::fs::write(root.path().join("same.txt"), "must-not-be-injected").expect("workspace file");
+
+    let mut child = orca_command()
+        .args(["--mode", "server", "--provider", "mock"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "thread-req",
+                "method": "thread/start",
+                "params": {
+                    "runtimeWorkspaceRoots": [root.path()]
+                }
+            })
+        )
+        .expect("write thread/start request");
+        stdin.flush().expect("flush thread/start request");
+    }
+    let thread_started = child.expect_event("thread-req", "thread_started");
+    let thread_id = thread_started["threadId"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "turn-1",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "inspect @same.txt"}]
+                }
+            })
+        )
+        .expect("write literal at-token turn");
+        stdin.flush().expect("flush literal at-token turn");
+    }
+    child.expect_event("turn-1", "turn_completed");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "turn-2",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "mock_history_echo"}]
+                }
+            })
+        )
+        .expect("write history echo turn");
+        stdin.flush().expect("flush history echo turn");
+    }
+    let events = child.drain_events_until_event("turn-2", "turn_completed");
+    let echoed = events
+        .iter()
+        .filter(|event| event["event"] == "message_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect::<String>();
+
+    assert!(
+        echoed.contains("inspect @same.txt"),
+        "plain at-token should remain literal in model history: {echoed}"
+    );
+    assert!(
+        !echoed.contains("must-not-be-injected"),
+        "plain at-token must not inject matching file content: {echoed}"
+    );
+    assert!(
+        !echoed.contains("<file"),
+        "plain at-token must not create a file context block: {echoed}"
+    );
+
+    child.close_stdin();
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn server_mode_updates_thread_metadata_and_reads_title() {
     let mut child = orca_command()
         .args(["--mode", "server", "--provider", "mock"])

@@ -72,8 +72,10 @@ all owned walker and matcher workers have terminated and been joined.
 
 ## Mention Token
 
-The active composer text range beginning with `@` that currently owns file-search behavior. The
-token has a range and query text; both can change as the user edits the composer.
+The active composer text range beginning with `@` that currently owns search behavior. The token
+has a range and query text; both can change as the user edits the composer. A token only becomes an
+expandable Mention after the user selects a candidate and creates a binding. Unselected `@...`
+text remains literal prompt content.
 
 ## Path Discovery
 
