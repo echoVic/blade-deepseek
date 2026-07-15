@@ -1,0 +1,21 @@
+crates/orca-tui/src/composer_textarea.rs
+  s_bd921bce96b0c1::t_da481d83f1fece 59-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eff1391e6e79a49db62cf567c5711f4c7f3e2e38",
+  "prompts": {},
+  "sessions": {
+    "s_bd921bce96b0c1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c8e9b68-f49e-4bfb-bc7d-ce69192bb225",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
