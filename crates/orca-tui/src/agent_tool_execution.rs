@@ -834,7 +834,9 @@ fn run_tui_bash(
     tool_types::ToolResult,
     Option<orca_runtime::network_proxy::RuntimeNetworkBlockReport>,
 ) {
-    use orca_runtime::network_proxy::{RuntimeNetworkPolicy, RuntimeNetworkProxy};
+    use orca_runtime::network_proxy::{
+        RuntimeNetworkPolicy, RuntimeNetworkProxy, runtime_network_block_channel,
+    };
     use orca_runtime::shell_session::ShellSandboxMode;
 
     let request = context.request;
@@ -861,7 +863,7 @@ fn run_tui_bash(
     let _network_proxy = if context.sandbox.network_policy_domains.is_empty() {
         None
     } else {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = runtime_network_block_channel();
         block_receiver = Some(receiver);
         match RuntimeNetworkProxy::start_with_block_reporter(
             RuntimeNetworkPolicy::new(context.sandbox.network_policy_domains.clone()),

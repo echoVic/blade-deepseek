@@ -13,8 +13,18 @@ signaling, server shutdown is bounded and two-phase, and internal worker API
 keys use a bounded anonymous stdin pipe instead of argv or workflow records.
 The release passed local workspace, Clippy, site, release-script, and live
 provider gates. Known follow-up areas include Windows descendant-tree parity,
-a total WorkflowHost deadline, and a managed-network-proxy connection ceiling
-with unified connection-worker ownership.
+a total WorkflowHost deadline, and runtime-owned file-input admission.
+
+Current v0.2.25 candidate: the managed network proxy now has one explicit
+supervisor owner. It admits at most 32 concurrent connections, bounds request
+and header framing before parsing, sends permission-block reports through a
+fixed-capacity channel, resolves and connects with deadlines, and keeps every
+connection in one cancellable `JoinSet`. Dropping a TUI bash, runtime bash, or
+server `command/exec` proxy stops admission, aborts and awaits all active
+connections, closes CONNECT tunnel endpoints, and joins the supervisor thread.
+CLI, TUI, permission-profile, proxy environment, server/JSONL, and persistence
+contracts remain unchanged; overload and framing violations now receive
+bounded HTTP diagnostics.
 
 Earlier v0.2.23 gives the TUI native-feeling mouse text
 interaction. Left-drag selects transcript text with a theme-aware,

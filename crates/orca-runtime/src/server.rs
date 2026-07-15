@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -22,7 +22,10 @@ use orca_core::cancel::CancelToken;
 use serde_json::{Value, json};
 
 use crate::lifecycle::{RuntimePermissionResponse, ThreadSteerHandle};
-use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
+use crate::network_proxy::{
+    RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy,
+    runtime_network_block_channel,
+};
 use crate::protocol::{self, ClientOp, ServerEvent, Submission};
 use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::server_runtime::{
@@ -857,7 +860,7 @@ fn run_command_exec<W: Write>(
             event_id: id.clone(),
         });
     if options.permission_profile.is_some() {
-        let (block_sender, block_receiver) = mpsc::channel();
+        let (block_sender, block_receiver) = runtime_network_block_channel();
         retry_block_reporter = Some(block_sender);
         retry_block_receiver = Some(block_receiver);
     }

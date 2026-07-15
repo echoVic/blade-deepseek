@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{PermissionProfileNetworkAccess, RunConfig};
@@ -9,7 +8,10 @@ use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult};
 
 use crate::extension::RuntimeExtensionStores;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
-use crate::network_proxy::{RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy};
+use crate::network_proxy::{
+    RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy,
+    runtime_network_block_channel,
+};
 use crate::protocol::PermissionResponseDecision;
 use crate::runtime_permission::{
     RuntimePermissionDecision, RuntimePermissionOrigin, RuntimePermissionPolicy,
@@ -465,7 +467,7 @@ fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_>) -> BashExec
     let _network_proxy = if sandbox.network_policy_domains.is_empty() {
         None
     } else {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = runtime_network_block_channel();
         block_receiver = Some(receiver);
         match RuntimeNetworkProxy::start_with_block_reporter(
             RuntimeNetworkPolicy::new(sandbox.network_policy_domains.clone()),

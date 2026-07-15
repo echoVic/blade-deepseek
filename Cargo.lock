@@ -1328,6 +1328,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs",
  "globset",
+ "hickory-resolver",
  "libc",
  "nucleo",
  "orca-approval",

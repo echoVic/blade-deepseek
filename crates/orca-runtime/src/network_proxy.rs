@@ -1,15 +1,33 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
-};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use hickory_resolver::TokioResolver;
 use orca_core::config::PermissionProfileNetworkAccess;
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, oneshot};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
+
+const MAX_PROXY_CONNECTIONS: usize = 32;
+const MAX_PROXY_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_PROXY_HEADER_LINE_BYTES: usize = 16 * 1024;
+const MAX_PROXY_HEADER_BYTES: usize = 64 * 1024;
+const MAX_PROXY_HEADERS: usize = 100;
+const MAX_NETWORK_BLOCK_REPORTS: usize = 8;
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PROXY_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const OVERLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
+const PROXY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeNetworkPolicy {
@@ -92,8 +110,10 @@ impl RuntimeNetworkPolicy {
 
 pub struct RuntimeNetworkProxy {
     proxy_url: String,
-    stop: Arc<AtomicBool>,
-    accept_thread: Option<thread::JoinHandle<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    supervisor_thread: Option<thread::JoinHandle<io::Result<()>>>,
+    active_connections: Arc<AtomicUsize>,
+    max_connections: usize,
 }
 
 impl RuntimeNetworkProxy {
@@ -103,51 +123,204 @@ impl RuntimeNetworkProxy {
 
     pub fn start_with_block_reporter(
         policy: RuntimeNetworkPolicy,
-        block_reporter: Option<mpsc::Sender<RuntimeNetworkBlockReport>>,
+        block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
     ) -> io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Self::start_with_connection_limit(policy, block_reporter, MAX_PROXY_CONNECTIONS)
+    }
+
+    fn start_with_connection_limit(
+        policy: RuntimeNetworkPolicy,
+        block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
+        max_connections: usize,
+    ) -> io::Result<Self> {
+        if max_connections == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "network proxy connection limit must be positive",
+            ));
+        }
+        let listener = StdTcpListener::bind(("127.0.0.1", 0))?;
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
-        let policy = Arc::new(policy);
-        let block_reporter = Arc::new(block_reporter);
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let accept_thread = thread::spawn(move || {
-            while !thread_stop.load(Ordering::Relaxed) {
-                let stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(_) => break,
-                };
-                let policy = Arc::clone(&policy);
-                let block_reporter = Arc::clone(&block_reporter);
-                thread::spawn(move || {
-                    let _ = handle_proxy_connection(stream, &policy, block_reporter.as_ref());
-                });
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let supervisor_active_connections = Arc::clone(&active_connections);
+        let supervisor_thread = thread::Builder::new()
+            .name("orca-network-proxy".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(run_proxy_supervisor(
+                    listener,
+                    Arc::new(policy),
+                    block_reporter,
+                    max_connections,
+                    supervisor_active_connections,
+                    shutdown_receiver,
+                    startup_sender,
+                ))
+            })?;
+
+        match startup_receiver.recv_timeout(PROXY_STARTUP_TIMEOUT) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = shutdown.send(());
+                let _ = supervisor_thread.join();
+                return Err(error);
             }
-        });
+            Err(error) => {
+                let _ = shutdown.send(());
+                let _ = supervisor_thread.join();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("network proxy supervisor failed to start: {error}"),
+                ));
+            }
+        }
+
         Ok(Self {
             proxy_url: format!("http://{addr}"),
-            stop,
-            accept_thread: Some(accept_thread),
+            shutdown: Some(shutdown),
+            supervisor_thread: Some(supervisor_thread),
+            active_connections,
+            max_connections,
         })
+    }
+
+    #[cfg(test)]
+    fn start_with_connection_limit_for_test(
+        policy: RuntimeNetworkPolicy,
+        block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
+        max_connections: usize,
+    ) -> io::Result<Self> {
+        Self::start_with_connection_limit(policy, block_reporter, max_connections)
     }
 
     pub fn proxy_url(&self) -> &str {
         &self.proxy_url
     }
+
+    pub fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::Acquire)
+    }
+
+    pub fn max_connection_count(&self) -> usize {
+        self.max_connections
+    }
+
+    pub fn shutdown(mut self) -> io::Result<()> {
+        self.shutdown_inner()
+    }
+
+    fn shutdown_inner(&mut self) -> io::Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let Some(supervisor_thread) = self.supervisor_thread.take() else {
+            return Ok(());
+        };
+        match supervisor_thread.join() {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::other("network proxy supervisor panicked")),
+        }
+    }
 }
 
 impl Drop for RuntimeNetworkProxy {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.accept_thread.take() {
-            let _ = handle.join();
-        }
+        let _ = self.shutdown_inner();
     }
+}
+
+pub fn runtime_network_block_channel() -> (
+    mpsc::SyncSender<RuntimeNetworkBlockReport>,
+    mpsc::Receiver<RuntimeNetworkBlockReport>,
+) {
+    mpsc::sync_channel(MAX_NETWORK_BLOCK_REPORTS)
+}
+
+async fn run_proxy_supervisor(
+    listener: StdTcpListener,
+    policy: Arc<RuntimeNetworkPolicy>,
+    block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
+    max_connections: usize,
+    active_connections: Arc<AtomicUsize>,
+    mut shutdown: oneshot::Receiver<()>,
+    startup_sender: mpsc::SyncSender<io::Result<()>>,
+) -> io::Result<()> {
+    let listener = match TcpListener::from_std(listener) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = startup_sender.send(Err(clone_io_error(&error)));
+            return Err(error);
+        }
+    };
+    let resolver = match TokioResolver::builder_tokio() {
+        Ok(builder) => Arc::new(builder.build()),
+        Err(error) => {
+            let error = io::Error::other(format!("failed to initialize DNS resolver: {error}"));
+            let _ = startup_sender.send(Err(clone_io_error(&error)));
+            return Err(error);
+        }
+    };
+    let _ = startup_sender.send(Ok(()));
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let mut connections = JoinSet::new();
+
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break Ok(()),
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _ = completed;
+            }
+            accepted = listener.accept() => {
+                let (mut stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error),
+                };
+                let permit = match Arc::clone(&permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let _ = timeout(
+                            OVERLOAD_RESPONSE_TIMEOUT,
+                            write_connection_limit_response(&mut stream),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let policy = Arc::clone(&policy);
+                let resolver = Arc::clone(&resolver);
+                let reporter = block_reporter.clone();
+                let active_connections = Arc::clone(&active_connections);
+                active_connections.fetch_add(1, Ordering::AcqRel);
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let _active = ActiveConnectionGuard(active_connections);
+                    let _ = handle_proxy_connection(stream, &policy, reporter.as_ref(), &resolver).await;
+                });
+            }
+        }
+    };
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    result
+}
+
+struct ActiveConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn clone_io_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,59 +329,58 @@ pub struct RuntimeNetworkBlockReport {
     pub error: &'static str,
 }
 
-fn handle_proxy_connection(
+async fn handle_proxy_connection(
     mut client: TcpStream,
     policy: &RuntimeNetworkPolicy,
-    block_reporter: &Option<mpsc::Sender<RuntimeNetworkBlockReport>>,
+    block_reporter: Option<&mpsc::SyncSender<RuntimeNetworkBlockReport>>,
+    resolver: &TokioResolver,
 ) -> io::Result<()> {
-    client.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    client.set_write_timeout(Some(Duration::from_secs(10))).ok();
-    let mut reader = BufReader::new(client.try_clone()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
+    let request = {
+        let mut reader = BufReader::new(&mut client);
+        match read_proxy_request(&mut reader).await {
+            Ok(request) => request,
+            Err(ProxyFrameError::TooLarge) => {
+                return write_header_too_large_response(&mut client).await;
+            }
+            Err(ProxyFrameError::Invalid) => {
+                return write_bad_request_response(&mut client).await;
+            }
+            Err(ProxyFrameError::Io(error)) => return Err(error),
+        }
+    };
+    let Some(request) = request else {
         return Ok(());
-    }
-    let request_line = request_line.trim_end_matches(['\r', '\n']);
-    let mut headers = Vec::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        headers.push(line);
-    }
-
-    let mut parts = request_line.split_whitespace();
+    };
+    let mut parts = request.request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or("HTTP/1.1");
     let host = proxy_target_host(target)
-        .or_else(|| header_host(&headers))
+        .or_else(|| header_host(&request.headers))
         .unwrap_or_default();
     if host.is_empty() {
-        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy, None)?;
+        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy, None).await?;
         return Ok(());
     }
     if let RuntimeNetworkDecision::Block(reason) = policy.decision_for_host(&host) {
         report_block(block_reporter, &host, reason);
-        write_forbidden(&mut client, reason, Some(&host))?;
+        write_forbidden(&mut client, reason, Some(&host)).await?;
         return Ok(());
     }
 
     let proxy_result = if method.eq_ignore_ascii_case("CONNECT") {
-        proxy_connect(client.try_clone()?, target, policy)
+        proxy_connect(&mut client, target, policy, resolver).await
     } else {
         proxy_http(
-            client.try_clone()?,
+            &mut client,
             method,
             target,
             version,
-            &headers,
+            &request.headers,
             policy,
+            resolver,
         )
+        .await
     };
     if matches!(proxy_result, Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied) {
         report_block(
@@ -220,46 +392,133 @@ fn handle_proxy_connection(
             &mut client,
             RuntimeNetworkBlockReason::NotAllowedLocal,
             Some(&host),
-        )?;
+        )
+        .await?;
         return Ok(());
     }
     proxy_result
 }
 
 fn report_block(
-    block_reporter: &Option<mpsc::Sender<RuntimeNetworkBlockReport>>,
+    block_reporter: Option<&mpsc::SyncSender<RuntimeNetworkBlockReport>>,
     host: &str,
     reason: RuntimeNetworkBlockReason,
 ) {
     let Some(block_reporter) = block_reporter else {
         return;
     };
-    let _ = block_reporter.send(RuntimeNetworkBlockReport {
+    let _ = block_reporter.try_send(RuntimeNetworkBlockReport {
         host: normalize_host(host),
         error: reason.proxy_error(),
     });
 }
 
-fn proxy_http(
-    mut client: TcpStream,
+struct ProxyRequest {
+    request_line: String,
+    headers: Vec<String>,
+}
+
+enum ProxyFrameError {
+    Io(io::Error),
+    TooLarge,
+    Invalid,
+}
+
+async fn read_proxy_request<R>(reader: &mut R) -> Result<Option<ProxyRequest>, ProxyFrameError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let Some(request_line) = read_bounded_utf8_line(reader, MAX_PROXY_REQUEST_LINE_BYTES).await?
+    else {
+        return Ok(None);
+    };
+    let request_line = request_line.trim_end_matches(['\r', '\n']).to_string();
+    let mut header_bytes = 0_usize;
+    let mut headers = Vec::new();
+    loop {
+        let Some(line) = read_bounded_utf8_line(reader, MAX_PROXY_HEADER_LINE_BYTES).await? else {
+            break;
+        };
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        header_bytes = header_bytes
+            .checked_add(line.len())
+            .ok_or(ProxyFrameError::TooLarge)?;
+        if header_bytes > MAX_PROXY_HEADER_BYTES || headers.len() >= MAX_PROXY_HEADERS {
+            return Err(ProxyFrameError::TooLarge);
+        }
+        headers.push(line);
+    }
+    Ok(Some(ProxyRequest {
+        request_line,
+        headers,
+    }))
+}
+
+async fn read_bounded_utf8_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>, ProxyFrameError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::with_capacity(max_bytes.min(1024));
+    loop {
+        let available = timeout(PROXY_IO_IDLE_TIMEOUT, reader.fill_buf())
+            .await
+            .map_err(|_| {
+                ProxyFrameError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "network proxy request read timed out",
+                ))
+            })?
+            .map_err(ProxyFrameError::Io)?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|position| position + 1)
+            .unwrap_or(available.len());
+        if line.len().saturating_add(take) > max_bytes {
+            return Err(ProxyFrameError::TooLarge);
+        }
+        let finished = available[..take].last() == Some(&b'\n');
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if finished {
+            break;
+        }
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|_| ProxyFrameError::Invalid)
+}
+
+async fn proxy_http(
+    client: &mut TcpStream,
     method: &str,
     target: &str,
     version: &str,
     headers: &[String],
     policy: &RuntimeNetworkPolicy,
+    resolver: &TokioResolver,
 ) -> io::Result<()> {
     let Some((host, port, path)) = parse_http_target(target, headers) else {
-        write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy, None)?;
+        write_forbidden(client, RuntimeNetworkBlockReason::Policy, None).await?;
         return Ok(());
     };
-    let mut upstream = connect_checked_resolved(&host, port, policy)?;
-    upstream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok();
-    upstream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .ok();
-    write!(upstream, "{method} {path} {version}\r\n")?;
+    let mut upstream = connect_checked_resolved(&host, port, policy, resolver).await?;
+    write_all_with_idle(
+        &mut upstream,
+        format!("{method} {path} {version}\r\n").as_bytes(),
+    )
+    .await?;
     for header in headers {
         if header
             .split_once(':')
@@ -268,52 +527,107 @@ fn proxy_http(
         {
             continue;
         }
-        upstream.write_all(header.as_bytes())?;
+        write_all_with_idle(&mut upstream, header.as_bytes()).await?;
     }
-    upstream.write_all(b"\r\n")?;
-    io::copy(&mut upstream, &mut client)?;
+    write_all_with_idle(&mut upstream, b"\r\n").await?;
+    copy_with_idle(&mut upstream, client).await?;
     Ok(())
 }
 
-fn proxy_connect(
-    mut client: TcpStream,
+async fn proxy_connect(
+    client: &mut TcpStream,
     target: &str,
     policy: &RuntimeNetworkPolicy,
+    resolver: &TokioResolver,
 ) -> io::Result<()> {
     let (host, port) = split_host_port(target, 443);
-    let mut upstream = connect_checked_resolved(&host, port, policy)?;
-    client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-    let mut client_read = client.try_clone()?;
-    let mut upstream_write = upstream.try_clone()?;
-    let join = thread::spawn(move || {
-        let _ = io::copy(&mut client_read, &mut upstream_write);
-        let _ = upstream_write.shutdown(Shutdown::Write);
-    });
-    let _ = io::copy(&mut upstream, &mut client);
-    let _ = client.shutdown(Shutdown::Write);
-    let _ = join.join();
+    let upstream = connect_checked_resolved(&host, port, policy, resolver).await?;
+    write_all_with_idle(client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+    let (mut client_read, mut client_write) = client.split();
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    tokio::try_join!(
+        copy_with_idle(&mut client_read, &mut upstream_write),
+        copy_with_idle(&mut upstream_read, &mut client_write),
+    )?;
     Ok(())
 }
 
-fn connect_checked_resolved(
+async fn connect_checked_resolved(
     host: &str,
     port: u16,
     policy: &RuntimeNetworkPolicy,
+    resolver: &TokioResolver,
 ) -> io::Result<TcpStream> {
-    connect_checked(host, port, policy, (host, port).to_socket_addrs()?)
+    let resolved = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        let lookup = timeout(DNS_LOOKUP_TIMEOUT, resolver.lookup_ip(host))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("network proxy DNS lookup timed out for {host}"),
+                )
+            })?
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("network proxy DNS lookup failed for {host}: {error}"),
+                )
+            })?;
+        lookup
+            .iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect::<Vec<_>>()
+    };
+    let addrs = checked_socket_addrs(host, policy, resolved)?;
+    let mut last_error = None;
+    for addr in addrs {
+        match timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("network proxy connect timed out for {addr}"),
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "network target did not resolve")
+    }))
 }
 
-fn connect_checked<I>(
-    host: &str,
-    _port: u16,
-    policy: &RuntimeNetworkPolicy,
-    resolved: I,
-) -> io::Result<TcpStream>
+async fn write_all_with_idle<W>(writer: &mut W, bytes: &[u8]) -> io::Result<()>
 where
-    I: IntoIterator<Item = SocketAddr>,
+    W: AsyncWrite + Unpin,
 {
-    let addrs = checked_socket_addrs(host, policy, resolved)?;
-    TcpStream::connect(addrs.as_slice())
+    timeout(PROXY_IO_IDLE_TIMEOUT, writer.write_all(bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "network proxy write timed out"))?
+}
+
+async fn copy_with_idle<R, W>(reader: &mut R, writer: &mut W) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let read = timeout(PROXY_IO_IDLE_TIMEOUT, reader.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "network proxy read timed out")
+            })??;
+        if read == 0 {
+            let _ = timeout(PROXY_IO_IDLE_TIMEOUT, writer.shutdown()).await;
+            return Ok(copied);
+        }
+        write_all_with_idle(writer, &buffer[..read]).await?;
+        copied = copied.saturating_add(read as u64);
+    }
 }
 
 fn checked_socket_addrs<I>(
@@ -349,7 +663,36 @@ where
     Ok(addrs)
 }
 
-fn write_forbidden(
+async fn write_connection_limit_response(client: &mut TcpStream) -> io::Result<()> {
+    write_static_response(
+        client,
+        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nx-proxy-error: connection-limit\r\nconnection: close\r\n\r\n",
+    )
+    .await
+}
+
+async fn write_header_too_large_response(client: &mut TcpStream) -> io::Result<()> {
+    write_static_response(
+        client,
+        b"HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nx-proxy-error: request-too-large\r\nconnection: close\r\n\r\n",
+    )
+    .await
+}
+
+async fn write_bad_request_response(client: &mut TcpStream) -> io::Result<()> {
+    write_static_response(
+        client,
+        b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nx-proxy-error: invalid-request\r\nconnection: close\r\n\r\n",
+    )
+    .await
+}
+
+async fn write_static_response(client: &mut TcpStream, response: &[u8]) -> io::Result<()> {
+    write_all_with_idle(client, response).await?;
+    client.shutdown().await
+}
+
+async fn write_forbidden(
     client: &mut TcpStream,
     reason: RuntimeNetworkBlockReason,
     host: Option<&str>,
@@ -359,11 +702,15 @@ fn write_forbidden(
         .filter(|host| !host.is_empty())
         .map(|host| format!("x-proxy-host: {host}\r\n"))
         .unwrap_or_default();
-    write!(
+    write_static_response(
         client,
-        "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nx-proxy-error: {}\r\n{host_header}\r\n",
-        reason.proxy_error(),
+        format!(
+            "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nx-proxy-error: {}\r\n{host_header}\r\n",
+            reason.proxy_error(),
+        )
+        .as_bytes(),
     )
+    .await
 }
 
 fn parse_http_target(target: &str, headers: &[String]) -> Option<(String, u16, String)> {
@@ -480,6 +827,32 @@ fn domain_pattern_matches(pattern: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+
+    fn proxy_addr(proxy: &RuntimeNetworkProxy) -> String {
+        proxy
+            .proxy_url()
+            .strip_prefix("http://")
+            .expect("proxy url prefix")
+            .to_string()
+    }
+
+    fn wait_for_active_connections(proxy: &RuntimeNetworkProxy, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if proxy.active_connection_count() == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "expected {expected} active proxy connections, observed {}",
+            proxy.active_connection_count()
+        );
+    }
 
     #[test]
     fn runtime_network_proxy_stops_accepting_after_drop() {
@@ -503,6 +876,168 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("proxy still accepts connections after drop");
+    }
+
+    #[test]
+    fn runtime_network_proxy_rejects_connections_above_limit_without_spawning_workers() {
+        let proxy = RuntimeNetworkProxy::start_with_connection_limit_for_test(
+            RuntimeNetworkPolicy::new(HashMap::new()),
+            None,
+            1,
+        )
+        .expect("start proxy");
+        let addr = proxy_addr(&proxy);
+        let _held = TcpStream::connect(&addr).expect("connect held client");
+        wait_for_active_connections(&proxy, 1);
+
+        let mut rejected = TcpStream::connect(&addr).expect("connect rejected client");
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set rejected read timeout");
+        let mut response = String::new();
+        rejected
+            .read_to_string(&mut response)
+            .expect("read overload response");
+
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("x-proxy-error: connection-limit"));
+        assert_eq!(proxy.active_connection_count(), 1);
+    }
+
+    #[test]
+    fn runtime_network_proxy_drop_cancels_and_joins_stalled_connection() {
+        let proxy = RuntimeNetworkProxy::start_with_connection_limit_for_test(
+            RuntimeNetworkPolicy::new(HashMap::new()),
+            None,
+            1,
+        )
+        .expect("start proxy");
+        let active_connections = Arc::clone(&proxy.active_connections);
+        let addr = proxy_addr(&proxy);
+        let mut client = TcpStream::connect(&addr).expect("connect stalled client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set client read timeout");
+        wait_for_active_connections(&proxy, 1);
+
+        let started = Instant::now();
+        drop(proxy);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "proxy drop should not wait for the connection idle deadline"
+        );
+        assert_eq!(active_connections.load(Ordering::Acquire), 0);
+        let mut byte = [0_u8; 1];
+        assert!(
+            matches!(client.read(&mut byte), Ok(0) | Err(_)),
+            "proxy shutdown should close the stalled client socket"
+        );
+    }
+
+    #[test]
+    fn runtime_network_proxy_drop_closes_owned_connect_tunnel() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream addr").port();
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+        let upstream_worker = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().expect("accept upstream tunnel");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set upstream read timeout");
+            accepted_tx.send(()).expect("report upstream accepted");
+            let mut byte = [0_u8; 1];
+            let closed = matches!(stream.read(&mut byte), Ok(0) | Err(_));
+            closed_tx.send(closed).expect("report upstream closed");
+        });
+        let proxy = RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(HashMap::from([(
+            "127.0.0.1".to_string(),
+            PermissionProfileNetworkAccess::Allow,
+        )])))
+        .expect("start proxy");
+        let mut client = TcpStream::connect(proxy_addr(&proxy)).expect("connect proxy");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set tunnel read timeout");
+        write!(
+            client,
+            "CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
+        )
+        .expect("write CONNECT request");
+        let mut response = [0_u8; 128];
+        let read = client.read(&mut response).expect("read CONNECT response");
+        assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 200"));
+        accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("upstream accepted tunnel");
+        wait_for_active_connections(&proxy, 1);
+
+        drop(proxy);
+
+        assert_eq!(
+            closed_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(true),
+            "proxy owner should close the upstream tunnel before returning"
+        );
+        upstream_worker.join().expect("join upstream worker");
+    }
+
+    #[test]
+    fn runtime_network_proxy_rejects_oversized_newline_free_request_line() {
+        let proxy = RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(HashMap::new()))
+            .expect("start proxy");
+        let mut client = TcpStream::connect(proxy_addr(&proxy)).expect("connect proxy");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        client
+            .write_all(&vec![b'X'; MAX_PROXY_REQUEST_LINE_BYTES + 1])
+            .expect("write oversized request line");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read framing response");
+
+        assert!(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large"));
+    }
+
+    #[test]
+    fn runtime_network_proxy_block_report_queue_is_bounded_and_nonblocking() {
+        let (reporter, reports) = runtime_network_block_channel();
+        let proxy = RuntimeNetworkProxy::start_with_block_reporter(
+            RuntimeNetworkPolicy::new(HashMap::from([(
+                "allowed.example.com".to_string(),
+                PermissionProfileNetworkAccess::Allow,
+            )])),
+            Some(reporter),
+        )
+        .expect("start proxy");
+        let addr = proxy_addr(&proxy);
+
+        for _ in 0..(MAX_NETWORK_BLOCK_REPORTS * 3) {
+            let mut client = TcpStream::connect(&addr).expect("connect blocked client");
+            client
+                .write_all(
+                    b"GET http://blocked.example.com/ HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n",
+                )
+                .expect("write blocked request");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("read blocked response");
+            assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        }
+        wait_for_active_connections(&proxy, 0);
+
+        let retained = reports.try_iter().count();
+        assert_eq!(retained, MAX_NETWORK_BLOCK_REPORTS);
+        assert_eq!(reports.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_ne!(
+            reports.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Disconnected),
+            "report queue remains owned until the proxy is dropped"
+        );
     }
 
     #[test]
@@ -647,7 +1182,7 @@ mod tests {
         )]));
         let resolved = vec!["127.0.0.1:80".parse().expect("socket addr")];
 
-        let error = connect_checked("private.test", 80, &policy, resolved)
+        let error = checked_socket_addrs("private.test", &policy, resolved)
             .expect_err("resolved private target should be blocked");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
