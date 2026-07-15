@@ -2,7 +2,7 @@ use crossbeam_channel as mpsc;
 use std::io;
 use std::time::{Duration, Instant};
 
-use orca_core::cancel::CancelToken;
+use orca_core::cancel::OperationCancellation;
 
 use crate::shortcuts::GlobalShortcut;
 use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
@@ -16,7 +16,7 @@ pub(crate) fn handle_global_shortcut<F>(
     shortcut: GlobalShortcut,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
-    cancel_token: &CancelToken,
+    cancellation: &OperationCancellation,
     clear_terminal: F,
 ) -> io::Result<GlobalShortcutFlow>
 where
@@ -25,7 +25,7 @@ where
     match shortcut {
         GlobalShortcut::Cancel => {
             if matches!(state.status, AppStatus::Running | AppStatus::Compacting) {
-                cancel_token.cancel();
+                cancellation.cancel_current();
                 let _ = action_tx.send(UserAction::Interrupt);
                 return Ok(GlobalShortcutFlow::Continue);
             }
@@ -64,7 +64,7 @@ where
 mod tests {
     use crossbeam_channel as mpsc;
 
-    use orca_core::cancel::CancelToken;
+    use orca_core::cancel::OperationCancellation;
 
     use super::handle_global_shortcut;
     use crate::shortcuts::GlobalShortcut;
@@ -80,18 +80,19 @@ mod tests {
             "/tmp".to_string(),
         );
         state.set_status(AppStatus::Compacting);
-        let cancel = CancelToken::new();
+        let cancellation = OperationCancellation::new();
+        let operation = cancellation.start();
 
         handle_global_shortcut(
             GlobalShortcut::Cancel,
             &mut state,
             &action_tx,
-            &cancel,
+            &cancellation,
             || Ok(()),
         )
         .expect("cancel compaction");
 
-        assert!(cancel.is_cancelled());
+        assert!(operation.token().is_cancelled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -112,7 +113,7 @@ mod tests {
             GlobalShortcut::ClearScreen,
             &mut state,
             &action_tx,
-            &CancelToken::new(),
+            &OperationCancellation::new(),
             || Ok(()),
         )
         .expect("clear screen");

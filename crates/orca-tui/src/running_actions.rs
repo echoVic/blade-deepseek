@@ -1,6 +1,6 @@
 use crossbeam_channel as mpsc;
 
-use orca_core::cancel::CancelToken;
+use orca_core::cancel::OperationCancellation;
 
 use crate::shortcuts::RunningShortcut;
 use crate::types::{AppState, AppStatus, UserAction};
@@ -9,7 +9,7 @@ pub(crate) fn handle_running_shortcut(
     shortcut: RunningShortcut,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
-    cancel_token: &CancelToken,
+    cancellation: &OperationCancellation,
 ) {
     match shortcut {
         RunningShortcut::BackgroundCurrentTurn => {
@@ -17,7 +17,7 @@ pub(crate) fn handle_running_shortcut(
             state.set_status(AppStatus::Idle);
         }
         RunningShortcut::Interrupt => {
-            cancel_token.cancel();
+            cancellation.cancel_current();
             let _ = action_tx.send(UserAction::Interrupt);
         }
         RunningShortcut::ScrollUp => {

@@ -15,7 +15,7 @@ use crossterm::terminal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use orca_core::cancel::CancelToken;
+use orca_core::cancel::{CancelToken, OperationCancellation};
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
 use orca_runtime::history;
@@ -184,8 +184,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Arc::new(Mutex::new(startup_preloaded_transcript));
     let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
-    let cancel_token = CancelToken::new();
-    let agent_cancel = cancel_token.clone();
+    let cancellation = OperationCancellation::new();
+    let agent_cancellation = cancellation.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
     let agent_mcp_configs = config.mcp_servers.clone();
 
@@ -197,7 +197,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             agent_preloaded,
             agent_event_tx,
             action_rx,
-            agent_cancel,
+            agent_cancellation,
             agent_workflow_notifications,
             agent_mcp_registry,
         );
@@ -293,7 +293,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut config,
                                 &shared_config,
                                 &action_tx,
-                                &cancel_token,
+                                &cancellation,
                                 || clear_terminal_scrollback(&mut terminal),
                             )? {
                                 KeyEventFlow::Continue => return Ok(None),
@@ -308,7 +308,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut config,
                                 &shared_config,
                                 &action_tx,
-                                &cancel_token,
+                                &cancellation,
                                 &preloaded_transcript,
                                 &mut textarea,
                                 &mut vim_state,
@@ -420,10 +420,8 @@ fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
 
 fn run_manual_compaction_with_events(
     event_tx: &mpsc::Sender<TuiEvent>,
-    cancel: &CancelToken,
     compact: impl FnOnce() -> (usize, usize),
 ) {
-    cancel.reset();
     let _ = event_tx.send(TuiEvent::CompactionStarted);
     let (before_messages, after_messages) = compact();
     let _ = event_tx.send(TuiEvent::Compacted {
@@ -515,9 +513,8 @@ mod tests {
     #[test]
     fn manual_compaction_emits_started_before_running_summary_work() {
         let (event_tx, event_rx) = mpsc::unbounded();
-        let cancel = CancelToken::new();
 
-        run_manual_compaction_with_events(&event_tx, &cancel, || {
+        run_manual_compaction_with_events(&event_tx, || {
             assert!(matches!(
                 event_rx.try_recv(),
                 Ok(TuiEvent::CompactionStarted)
@@ -538,12 +535,14 @@ mod tests {
     #[test]
     fn manual_compaction_starts_with_a_fresh_cancel_state() {
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let cancel = CancelToken::new();
-        cancel.cancel();
+        let cancellation = OperationCancellation::new();
+        let previous = cancellation.start();
+        previous.cancel();
+        let current = cancellation.start();
 
-        run_manual_compaction_with_events(&event_tx, &cancel, || {
+        run_manual_compaction_with_events(&event_tx, || {
             assert!(
-                !cancel.is_cancelled(),
+                !current.token().is_cancelled(),
                 "a prior turn interrupt must not cancel the next manual compaction"
             );
             (8, 3)
@@ -1152,20 +1151,20 @@ mod tests {
         let (mut state, action_rx) = test_state();
         state.status = AppStatus::Running;
         let action_tx = state.event_tx.clone();
-        let cancel = CancelToken::new();
+        let cancellation = OperationCancellation::new();
 
         crate::running_actions::handle_running_shortcut(
             crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
             &mut state,
             &action_tx,
-            &cancel,
+            &cancellation,
         );
 
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::BackgroundCurrentTurn)
         ));
-        assert!(!cancel.is_cancelled());
+        assert!(cancellation.current_id().is_none());
         assert_eq!(state.status, AppStatus::Idle);
     }
 
@@ -1331,19 +1330,19 @@ mod tests {
             let preloaded = Arc::new(Mutex::new(None));
             let (event_tx, event_rx) = mpsc::unbounded();
             let (action_tx, action_rx) = mpsc::unbounded();
-            let cancel = CancelToken::new();
+            let cancellation = OperationCancellation::new();
 
             let handle = std::thread::spawn({
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
-                let cancel = cancel.clone();
+                let cancellation = cancellation.clone();
                 move || {
-                    agent_loop_thread(
+                    agent_loop_thread_with_operation_cancellation(
                         config,
                         preloaded,
                         event_tx,
                         action_rx,
-                        cancel,
+                        cancellation,
                         test_pending_workflow_notifications(),
                     )
                 }
@@ -1351,7 +1350,7 @@ mod tests {
 
             action_tx.send(UserAction::GoalResume).unwrap();
             let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            cancel.cancel();
+            cancellation.cancel_current();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -1482,19 +1481,19 @@ mod tests {
             let preloaded = Arc::new(Mutex::new(Some(restored)));
             let (event_tx, event_rx) = mpsc::unbounded();
             let (action_tx, action_rx) = mpsc::unbounded();
-            let cancel = CancelToken::new();
+            let cancellation = OperationCancellation::new();
 
             let handle = std::thread::spawn({
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
-                let cancel = cancel.clone();
+                let cancellation = cancellation.clone();
                 move || {
-                    agent_loop_thread(
+                    agent_loop_thread_with_operation_cancellation(
                         config,
                         preloaded,
                         event_tx,
                         action_rx,
-                        cancel,
+                        cancellation,
                         test_pending_workflow_notifications(),
                     )
                 }
@@ -1515,7 +1514,7 @@ mod tests {
                 }
             }
 
-            cancel.cancel();
+            cancellation.cancel_current();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -3686,11 +3685,12 @@ fn handle_submitted_turn_for_tui(
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
     pending_actions: &RefCell<VecDeque<UserAction>>,
-    cancel: &CancelToken,
+    cancellation: &OperationCancellation,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
 ) {
-    cancel.reset();
+    let operation = cancellation.start();
+    let cancel = operation.token();
     let cfg = config.lock().unwrap().clone();
     let cwd = cfg
         .cwd
@@ -3766,13 +3766,39 @@ fn agent_loop_thread(
     cancel: CancelToken,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
 ) {
+    let cancellation = OperationCancellation::new();
+    let initial = cancellation.start();
+    if cancel.is_cancelled() {
+        initial.cancel();
+    }
     let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
     agent_loop_thread_with_registry(
         config,
         preloaded,
         event_tx,
         action_rx,
-        cancel,
+        cancellation,
+        pending_workflow_notifications,
+        mcp_registry,
+    );
+}
+
+#[cfg(test)]
+fn agent_loop_thread_with_operation_cancellation(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    cancellation: OperationCancellation,
+    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+) {
+    let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
+    agent_loop_thread_with_registry(
+        config,
+        preloaded,
+        event_tx,
+        action_rx,
+        cancellation,
         pending_workflow_notifications,
         mcp_registry,
     );
@@ -3783,7 +3809,7 @@ fn agent_loop_thread_with_registry(
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
-    cancel: CancelToken,
+    cancellation: OperationCancellation,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     mcp_registry: orca_mcp::McpRegistry,
 ) {
@@ -3803,7 +3829,7 @@ fn agent_loop_thread_with_registry(
                     &event_tx,
                     &action_rx,
                     &pending_actions,
-                    &cancel,
+                    &cancellation,
                     &pending_workflow_notifications,
                     &mcp_registry,
                 );
@@ -3818,7 +3844,7 @@ fn agent_loop_thread_with_registry(
                     &event_tx,
                     &action_rx,
                     &pending_actions,
-                    &cancel,
+                    &cancellation,
                     &pending_workflow_notifications,
                     &mcp_registry,
                 );
@@ -3833,13 +3859,12 @@ fn agent_loop_thread_with_registry(
                     &event_tx,
                     &action_rx,
                     &pending_actions,
-                    &cancel,
+                    &cancellation,
                     &pending_workflow_notifications,
                     &mcp_registry,
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
-                cancel.reset();
                 let cfg = config.lock().unwrap().clone();
                 if session.is_none() {
                     let prompt = format!("Run saved workflow `{name}`");
@@ -3897,13 +3922,15 @@ fn agent_loop_thread_with_registry(
             }
             Ok(UserAction::Compact) => {
                 if let Some(session) = session.as_mut() {
+                    let operation = cancellation.start();
+                    let cancel = operation.token();
                     let cfg = config.lock().unwrap().clone();
                     let cwd = cfg
                         .cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    run_manual_compaction_with_events(&event_tx, &cancel, || {
-                        session.compact(&cfg, &cwd, &cancel)
+                    run_manual_compaction_with_events(&event_tx, || {
+                        session.compact(&cfg, &cwd, cancel)
                     });
                 } else {
                     let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
@@ -3950,6 +3977,8 @@ fn agent_loop_thread_with_registry(
                     && let Some(continuation_request) = continuation_request
                     && let Some(session) = session.as_mut()
                 {
+                    let operation = cancellation.start();
+                    let cancel = operation.token();
                     let cfg = config.lock().unwrap().clone();
                     let goal_session_id = session.session_id().map(str::to_string);
                     let before_usage = session.runtime_usage_totals();
@@ -3961,7 +3990,7 @@ fn agent_loop_thread_with_registry(
                         &event_tx,
                         &action_rx,
                         &pending_actions,
-                        &cancel,
+                        cancel,
                         Some(&pending_workflow_notifications),
                     );
                     if let Some(goal_session_id) = goal_session_id {
@@ -4047,6 +4076,7 @@ fn agent_loop_thread_with_registry(
                             "Starting goal. Automatic continuation will keep running while it remains active.".to_string(),
                         ));
                         if let Some(session) = session.as_mut() {
+                            let operation = cancellation.start();
                             let cfg = config.lock().unwrap().clone();
                             run_goal_turns_for_tui(
                                 &cfg,
@@ -4055,7 +4085,7 @@ fn agent_loop_thread_with_registry(
                                 &event_tx,
                                 &action_rx,
                                 &pending_actions,
-                                &cancel,
+                                operation.token(),
                                 0,
                                 &pending_workflow_notifications,
                             );
@@ -4125,6 +4155,7 @@ fn agent_loop_thread_with_registry(
             }
             Ok(UserAction::GoalResume) => {
                 let Some(session_id) = current_goal_session_id(session.as_ref(), &preloaded) else {
+                    let operation = cancellation.start();
                     resume_latest_active_goal_for_tui_with_registry(
                         &mut session,
                         &config,
@@ -4132,7 +4163,7 @@ fn agent_loop_thread_with_registry(
                         &event_tx,
                         &action_rx,
                         &pending_actions,
-                        &cancel,
+                        operation.token(),
                         &pending_workflow_notifications,
                         &mcp_registry,
                     );
@@ -4150,6 +4181,7 @@ fn agent_loop_thread_with_registry(
                         .and_then(|id| orca_runtime::goals::GoalStore::load_default().get(id).ok())
                         .flatten()
                     {
+                        let operation = cancellation.start();
                         let cfg = config.lock().unwrap().clone();
                         let prompt = goal_continuation_prompt(&goal.objective, 1);
                         run_goal_turns_for_tui(
@@ -4159,7 +4191,7 @@ fn agent_loop_thread_with_registry(
                             &event_tx,
                             &action_rx,
                             &pending_actions,
-                            &cancel,
+                            operation.token(),
                             1,
                             &pending_workflow_notifications,
                         );
