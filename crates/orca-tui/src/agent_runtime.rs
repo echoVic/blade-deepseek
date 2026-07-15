@@ -1,57 +1,98 @@
 use std::io;
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use orca_core::cancel::OperationCancellation;
 
+use crate::action_dispatcher::TuiActionDispatcher;
+use crate::channels::USER_ACTION_CAPACITY;
+use crate::interaction_broker::TuiInteractionBroker;
+use crate::operation_controller::TuiOperationController;
 use crate::task_supervisor::{TuiTaskSpawner, TuiTaskSupervisor};
-use crate::types::UserAction;
+use crate::types::{TuiEvent, UserAction};
 
 pub(crate) struct TuiAgentRuntime {
-    cancellation: OperationCancellation,
-    shutdown_tx: Sender<UserAction>,
+    controller: TuiOperationController,
+    dispatcher: TuiActionDispatcher,
     agent: Option<JoinHandle<()>>,
     tasks: TuiTaskSupervisor,
 }
 
 impl TuiAgentRuntime {
     pub(crate) fn spawn(
-        shutdown_tx: Sender<UserAction>,
+        action_rx: Receiver<UserAction>,
+        event_tx: Sender<TuiEvent>,
         task_capacity: usize,
-        run: impl FnOnce(OperationCancellation, TuiTaskSpawner) + Send + 'static,
+        run: impl FnOnce(TuiOperationController, Receiver<UserAction>, TuiTaskSpawner) + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_with_dispatch_capacities(
+            action_rx,
+            event_tx,
+            USER_ACTION_CAPACITY,
+            USER_ACTION_CAPACITY,
+            task_capacity,
+            run,
+        )
+    }
+
+    fn spawn_with_dispatch_capacities(
+        action_rx: Receiver<UserAction>,
+        event_tx: Sender<TuiEvent>,
+        command_capacity: usize,
+        backlog_capacity: usize,
+        task_capacity: usize,
+        run: impl FnOnce(TuiOperationController, Receiver<UserAction>, TuiTaskSpawner) + Send + 'static,
     ) -> io::Result<Self> {
         let tasks = TuiTaskSupervisor::new(task_capacity);
         let task_spawner = tasks.spawner();
-        let cancellation = OperationCancellation::new();
-        let agent_cancellation = cancellation.clone();
+        let controller = TuiOperationController::new(
+            OperationCancellation::new(),
+            TuiInteractionBroker::default(),
+        );
+        let (mut dispatcher, command_rx) = TuiActionDispatcher::spawn(
+            action_rx,
+            event_tx,
+            controller.clone(),
+            command_capacity,
+            backlog_capacity,
+        )?;
+        let agent_controller = controller.clone();
         let agent = thread::Builder::new()
             .name("orca-tui-agent".to_string())
-            .spawn(move || run(agent_cancellation, task_spawner))?;
+            .spawn(move || run(agent_controller, command_rx, task_spawner));
+        let agent = match agent {
+            Ok(agent) => agent,
+            Err(error) => {
+                let _ = dispatcher.shutdown();
+                return Err(error);
+            }
+        };
         Ok(Self {
-            cancellation,
-            shutdown_tx,
+            controller,
+            dispatcher,
             agent: Some(agent),
             tasks,
         })
     }
 
     pub(crate) fn cancellation(&self) -> &OperationCancellation {
-        &self.cancellation
+        self.controller.cancellation()
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {
         let Some(agent) = self.agent.take() else {
-            return self.tasks.shutdown();
+            let dispatcher_result = self.dispatcher.shutdown();
+            return dispatcher_result.and_then(|()| self.tasks.shutdown());
         };
-        self.cancellation.shutdown();
+        self.controller.shutdown();
         self.tasks.begin_shutdown();
-        let _ = self.shutdown_tx.try_send(UserAction::Cancel);
+        let dispatcher_result = self.dispatcher.shutdown();
 
         let agent_result = agent
             .join()
             .map_err(|_| io::Error::other("TUI agent controller panicked during shutdown"));
         let tasks_result = self.tasks.shutdown();
-        agent_result.and(tasks_result)
+        dispatcher_result.and(agent_result).and(tasks_result)
     }
 }
 
@@ -71,16 +112,17 @@ mod tests {
 
     #[test]
     fn shutdown_cancels_current_operation_and_joins_agent_thread() {
-        let (action_tx, _action_rx) = crossbeam_channel::bounded(1);
+        let (_action_tx, action_rx) = crossbeam_channel::bounded(1);
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let started = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
-        let mut runtime = TuiAgentRuntime::spawn(action_tx, 1, {
+        let mut runtime = TuiAgentRuntime::spawn(action_rx, event_tx, 1, {
             let started = Arc::clone(&started);
             let finished = Arc::clone(&finished);
-            move |cancellation, _tasks| {
-                let operation = cancellation.start();
+            move |controller, _commands, _tasks| {
+                let operation = controller.start().expect("operation started");
                 started.store(true, Ordering::SeqCst);
                 ready_tx.send(()).expect("ready signal");
                 while !operation.token().is_cancelled() {
@@ -101,14 +143,15 @@ mod tests {
 
     #[test]
     fn drop_uses_the_same_cancel_and_join_path() {
-        let (action_tx, _action_rx) = crossbeam_channel::bounded(1);
+        let (_action_tx, action_rx) = crossbeam_channel::bounded(1);
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
-        let runtime = TuiAgentRuntime::spawn(action_tx, 1, {
+        let runtime = TuiAgentRuntime::spawn(action_rx, event_tx, 1, {
             let finished = Arc::clone(&finished);
-            move |cancellation, _tasks| {
-                let operation = cancellation.start();
+            move |controller, _commands, _tasks| {
+                let operation = controller.start().expect("operation started");
                 ready_tx.send(()).expect("ready signal");
                 while !operation.token().is_cancelled() {
                     std::thread::yield_now();
@@ -128,18 +171,26 @@ mod tests {
     #[test]
     fn shutdown_does_not_wait_for_capacity_in_full_action_mailbox() {
         let (action_tx, action_rx) = crossbeam_channel::bounded(1);
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         action_tx
-            .send(UserAction::Interrupt)
+            .send(UserAction::Submit("fill command mailbox".to_string()))
             .expect("fill action mailbox");
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
-        let mut runtime = TuiAgentRuntime::spawn(action_tx, 1, move |cancellation, _tasks| {
-            let operation = cancellation.start();
-            ready_tx.send(()).expect("ready signal");
-            while !operation.token().is_cancelled() {
-                std::thread::yield_now();
-            }
-        })
+        let mut runtime = TuiAgentRuntime::spawn_with_dispatch_capacities(
+            action_rx,
+            event_tx,
+            1,
+            1,
+            1,
+            move |controller, _commands, _tasks| {
+                let operation = controller.start().expect("operation started");
+                ready_tx.send(()).expect("ready signal");
+                while !operation.token().is_cancelled() {
+                    std::thread::yield_now();
+                }
+            },
+        )
         .expect("agent runtime spawned");
         ready_rx
             .recv_timeout(Duration::from_secs(1))
@@ -152,8 +203,6 @@ mod tests {
         });
         let result = done_rx.recv_timeout(Duration::from_secs(1));
 
-        // Keep the RED test bounded even when shutdown blocks on send.
-        drop(action_rx);
         shutdown.join().expect("shutdown thread joined");
         result
             .expect("shutdown must not wait for action mailbox capacity")

@@ -962,6 +962,7 @@ mod tests {
         state.frame_area = Some(Rect::new(0, 0, 80, 24));
         state.approval_dialog = Some(ApprovalDialog {
             id: "1".to_string(),
+            interaction: None,
             tool: "bash".to_string(),
             target: Some("ls".to_string()),
             permission_kind: None,

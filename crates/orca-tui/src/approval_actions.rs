@@ -1,6 +1,8 @@
 use crossbeam_channel as mpsc;
 
-use crate::types::{AppState, AppStatus, ApprovalOption, UserAction};
+use crate::types::{
+    AppState, AppStatus, ApprovalOption, TuiInteractionKind, TuiInteractionResponse, UserAction,
+};
 
 /// Resolve the approval dialog by the chosen option. The "always allow"
 /// options record a session allowlist entry so later matching approvals are
@@ -48,14 +50,22 @@ fn resolve_approval(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>, 
         let _ = action_tx.send(UserAction::ResolveBackgroundApproval { id, approved });
         state.set_status(AppStatus::Idle);
     } else {
-        let Some(id) = state
+        let Some(interaction) = state
             .approval_dialog
             .as_ref()
-            .map(|dialog| dialog.id.clone())
+            .and_then(|dialog| dialog.interaction.clone())
         else {
             return;
         };
-        let _ = action_tx.send(UserAction::Approve { id, approved });
+        let response = match interaction.kind {
+            TuiInteractionKind::Approval => TuiInteractionResponse::Approval(approved),
+            TuiInteractionKind::Permission => TuiInteractionResponse::Permission(approved),
+            TuiInteractionKind::UserInput | TuiInteractionKind::McpElicitation => return,
+        };
+        let _ = action_tx.send(UserAction::RespondToInteraction {
+            key: interaction,
+            response,
+        });
         if approved {
             state.enter_running();
         } else {

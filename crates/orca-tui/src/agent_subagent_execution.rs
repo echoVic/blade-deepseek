@@ -1,6 +1,4 @@
-use crossbeam_channel::{Receiver, Sender};
-use std::cell::RefCell;
-use std::collections::VecDeque;
+use crossbeam_channel::Sender;
 use std::path::Path;
 use std::thread;
 
@@ -28,7 +26,8 @@ use crate::agent_runner::{
     task_summary_for_tui,
 };
 use crate::agent_tool_execution::execute_tool_for_tui;
-use crate::types::{TuiEvent, UserAction};
+use crate::operation_controller::TuiTurnControl;
+use crate::types::TuiEvent;
 
 pub(crate) fn config_for_remaining_subagent_budget(
     config: &RunConfig,
@@ -261,8 +260,7 @@ pub(crate) fn execute_subagent_for_tui(
     cwd: &Path,
     tool_request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     instructions: &ProjectInstructions,
@@ -342,8 +340,7 @@ pub(crate) fn execute_subagent_for_tui(
         &request.prompt,
         request.model.clone(),
         event_tx,
-        action_rx,
-        pending_actions,
+        control,
         pending_interactions,
         subagent_depth + 1,
         &subagent_type,
@@ -620,8 +617,7 @@ fn run_child_agent_for_tui(
     prompt: &str,
     subagent_model: Option<String>,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
@@ -635,8 +631,7 @@ fn run_child_agent_for_tui(
         prompt,
         subagent_model,
         event_tx,
-        action_rx,
-        pending_actions,
+        control,
         pending_interactions,
         subagent_depth,
         subagent_type,
@@ -654,8 +649,7 @@ fn run_child_agent_for_tui_observed(
     prompt: &str,
     subagent_model: Option<String>,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     subagent_type: &SubagentType,
@@ -707,8 +701,7 @@ fn run_child_agent_for_tui_observed(
                     cwd,
                     tool_request,
                     event_tx,
-                    action_rx,
-                    pending_actions,
+                    control,
                     pending_interactions.clone(),
                     request.depth,
                     None,
@@ -843,17 +836,16 @@ pub(crate) fn run_child_agent_for_tui_silent(
 ) -> (ChildAgentResult, CostTracker) {
     let (event_tx, event_rx) = crate::channels::tui_event_channel();
     let event_drain = thread::spawn(move || while event_rx.recv().is_ok() {});
-    let (action_tx, action_rx) = crate::channels::user_action_channel();
-    let pending_actions = RefCell::new(VecDeque::new());
-    drop(action_tx);
+    let controller = crate::operation_controller::TuiOperationController::default();
+    let operation = controller.start().expect("silent subagent operation");
+    let control = operation.control();
     let result = run_child_agent_for_tui_observed(
         config,
         cwd,
         prompt,
         subagent_model,
         &event_tx,
-        &action_rx,
-        &pending_actions,
+        &control,
         None,
         subagent_depth,
         subagent_type,

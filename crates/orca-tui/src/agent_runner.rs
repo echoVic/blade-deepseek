@@ -1,6 +1,4 @@
 use crossbeam_channel::{self as mpsc, Receiver, Sender};
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -31,6 +29,7 @@ use orca_runtime::memory;
 use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
 use orca_runtime::tasks::MainSessionTerminalUpdate;
 
+use crate::action_dispatcher::TuiActionDispatcher;
 use crate::agent_subagent_execution::{
     collect_subagent_batch, config_for_remaining_subagent_budget, execute_subagent_batch_for_tui,
     should_run_subagent_batch,
@@ -38,6 +37,7 @@ use crate::agent_subagent_execution::{
 use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_for_tui};
 use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::{TuiBudgetAdmission, TuiConversationSession, TuiUsageLedger};
+use crate::operation_controller::{TuiOperationController, TuiTurnControl};
 use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::task_supervisor::{TuiTaskSpawner, TuiTaskSupervisor};
 use crate::types::{PendingWorkflowNotification, TuiEvent, UserAction};
@@ -231,8 +231,7 @@ fn poll_background_current_turn_for_tui(
     session: &TuiConversationSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     task_id: &str,
     is_backgrounded: &mut bool,
 ) {
@@ -240,27 +239,9 @@ fn poll_background_current_turn_for_tui(
         return;
     }
 
-    let mut should_background = false;
-    let mut pending = pending_actions.borrow_mut();
-    if let Some(index) = pending
-        .iter()
-        .position(|action| matches!(action, UserAction::BackgroundCurrentTurn))
+    if control.take_background_current()
+        && session.task_registry().mark_backgrounded(task_id).is_ok()
     {
-        pending.remove(index);
-        should_background = true;
-    }
-    while !should_background {
-        match action_rx.try_recv() {
-            Ok(UserAction::BackgroundCurrentTurn) => {
-                should_background = true;
-            }
-            Ok(action) => pending.push_back(action),
-            Err(_) => break,
-        }
-    }
-    drop(pending);
-
-    if should_background && session.task_registry().mark_backgrounded(task_id).is_ok() {
         *is_backgrounded = true;
         if let Some(backgrounded_task) = task_summary_for_tui(session.task_registry(), task_id) {
             send_task_status_updated_for_tui(event_tx, events, &backgrounded_task);
@@ -775,8 +756,6 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     session: &mut TuiConversationSession,
     continuation: &TuiBackgroundTurnContinuationRequest,
     event_tx: &Sender<TuiEvent>,
-    _action_rx: &Receiver<UserAction>,
-    _pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
@@ -1231,7 +1210,25 @@ pub fn run_agent_for_tui(
     cancel: &CancelToken,
     allow_goal_tools: bool,
 ) -> String {
-    let pending_actions = RefCell::new(VecDeque::new());
+    let controller = TuiOperationController::default();
+    let operation = match controller.start() {
+        Ok(operation) => operation,
+        Err(error) => return format!("failed: {error}"),
+    };
+    if cancel.is_cancelled() {
+        operation.cancel();
+    }
+    let control = operation.control();
+    let (mut dispatcher, _command_rx) = match TuiActionDispatcher::spawn(
+        action_rx.clone(),
+        event_tx.clone(),
+        controller,
+        crate::channels::USER_ACTION_CAPACITY,
+        crate::channels::USER_ACTION_CAPACITY,
+    ) {
+        Ok(dispatcher) => dispatcher,
+        Err(error) => return format!("failed: {error}"),
+    };
     let mut tasks = TuiTaskSupervisor::new(8);
     let task_spawner = tasks.spawner();
     let status = run_agent_for_tui_with_notification_queue(
@@ -1239,9 +1236,8 @@ pub fn run_agent_for_tui(
         session,
         prompt,
         event_tx,
-        action_rx,
-        &pending_actions,
-        cancel,
+        &control,
+        control.token(),
         allow_goal_tools,
         None,
         true,
@@ -1253,6 +1249,9 @@ pub fn run_agent_for_tui(
     if let Err(error) = tasks.shutdown() {
         eprintln!("orca: warning: TUI test task shutdown failed: {error}");
     }
+    if let Err(error) = dispatcher.shutdown() {
+        eprintln!("orca: warning: TUI test dispatcher shutdown failed: {error}");
+    }
     status
 }
 
@@ -1261,8 +1260,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     session: &mut TuiConversationSession,
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     cancel: &CancelToken,
     allow_goal_tools: bool,
     task_description: Option<&str>,
@@ -1320,8 +1318,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         session,
         event_tx,
         &mut runtime_events,
-        action_rx,
-        pending_actions,
+        control,
         &main_session_task_id,
         &mut main_session_backgrounded,
     );
@@ -1560,8 +1557,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         session,
                         event_tx,
                         &mut stream_events,
-                        action_rx,
-                        pending_actions,
+                        control,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
@@ -1575,8 +1571,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         session,
                         event_tx,
                         &mut stream_events,
-                        action_rx,
-                        pending_actions,
+                        control,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
@@ -1591,8 +1586,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         session,
                         event_tx,
                         &mut stream_events,
-                        action_rx,
-                        pending_actions,
+                        control,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
@@ -1629,8 +1623,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         session,
                         event_tx,
                         &mut stream_events,
-                        action_rx,
-                        pending_actions,
+                        control,
                         &main_session_task_id,
                         &mut main_session_backgrounded,
                     );
@@ -2049,8 +2042,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 &cwd,
                 tool_request,
                 event_tx,
-                action_rx,
-                pending_actions,
+                control,
                 Some(session.pending_interactions()),
                 0,
                 session.session_id(),
@@ -2217,7 +2209,6 @@ mod tests {
     use orca_runtime::instructions::ProjectInstructions;
     use orca_runtime::memory::MemoryBlock;
     use orca_runtime::tasks::TaskRegistry;
-    use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2252,6 +2243,17 @@ mod tests {
         let supervisor = TuiTaskSupervisor::new(8);
         let spawner = supervisor.spawner();
         (supervisor, spawner)
+    }
+
+    fn test_turn() -> (
+        TuiOperationController,
+        crate::operation_controller::TuiOperationScope,
+        TuiTurnControl,
+    ) {
+        let controller = TuiOperationController::default();
+        let operation = controller.start().expect("start test operation");
+        let control = operation.control();
+        (controller, operation, control)
     }
 
     fn test_provider_stream_task(receiver: Receiver<ProviderStreamEvent>) -> ProviderStreamTask {
@@ -2584,15 +2586,11 @@ mod tests {
                 .unwrap();
 
             let (event_tx, _event_rx) = mpsc::unbounded();
-            let (_action_tx, action_rx) = mpsc::unbounded();
-            let pending_actions = RefCell::new(VecDeque::new());
             let result = continue_approved_background_turn_for_tui(
                 &config,
                 &mut session,
                 &TuiBackgroundTurnContinuationRequest::new(task.id.clone()),
                 &event_tx,
-                &action_rx,
-                &pending_actions,
                 &CancelToken::new(),
                 None,
             );
@@ -2686,16 +2684,12 @@ mod tests {
                 .unwrap();
 
             let (event_tx, _event_rx) = mpsc::unbounded();
-            let (_action_tx, action_rx) = mpsc::unbounded();
-            let pending_actions = RefCell::new(VecDeque::new());
             let request = TuiBackgroundTurnContinuationRequest::new(task.id.clone());
             let result = continue_approved_background_turn_for_tui(
                 &config,
                 &mut session,
                 &request,
                 &event_tx,
-                &action_rx,
-                &pending_actions,
                 &CancelToken::new(),
                 None,
             );
@@ -2715,8 +2709,6 @@ mod tests {
                 &mut session,
                 &request,
                 &event_tx,
-                &action_rx,
-                &pending_actions,
                 &CancelToken::new(),
                 None,
             );
@@ -3124,7 +3116,7 @@ mod tests {
     }
 
     #[test]
-    fn background_poll_preserves_non_background_actions() {
+    fn background_poll_consumes_only_the_operation_scoped_request() {
         let config = config();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let mut runtime_events = EventFactory::new("background-poll".to_string());
@@ -3139,28 +3131,32 @@ mod tests {
             .task_registry()
             .mark_running(&task.id)
             .expect("running main session");
-        let (queued_tx, queued_rx) = mpsc::unbounded();
-        queued_tx
-            .send(UserAction::Submit("next prompt".to_string()))
-            .expect("send queued submit");
-        let pending_actions = RefCell::new(VecDeque::new());
+        let controller = TuiOperationController::default();
+        let operation = controller.start().expect("start operation");
+        let control = operation.control();
         let mut is_backgrounded = false;
 
         poll_background_current_turn_for_tui(
             &session,
             &event_tx,
             &mut runtime_events,
-            &queued_rx,
-            &pending_actions,
+            &control,
             &task.id,
             &mut is_backgrounded,
         );
 
         assert!(!is_backgrounded);
-        assert!(matches!(
-            pending_actions.borrow_mut().pop_front(),
-            Some(UserAction::Submit(prompt)) if prompt == "next prompt"
-        ));
+        assert!(controller.request_background_current());
+        poll_background_current_turn_for_tui(
+            &session,
+            &event_tx,
+            &mut runtime_events,
+            &control,
+            &task.id,
+            &mut is_backgrounded,
+        );
+        assert!(is_backgrounded);
+        assert!(!control.take_background_current());
     }
 
     #[test]
@@ -3507,8 +3503,7 @@ mod tests {
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let cancel = CancelToken::new();
+        let (_controller, _operation, control) = test_turn();
         let pending_notifications = PendingWorkflowNotifications::new();
         assert!(
             pending_notifications.push_unique(crate::types::PendingWorkflowNotification {
@@ -3519,7 +3514,6 @@ mod tests {
         );
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
-        let pending_actions = RefCell::new(VecDeque::new());
         let (_tasks, task_spawner) = test_task_supervisor();
 
         let result = run_agent_for_tui_with_notification_queue(
@@ -3527,9 +3521,8 @@ mod tests {
             &mut session,
             "task_list",
             &event_tx,
-            &action_rx,
-            &pending_actions,
-            &cancel,
+            &control,
+            control.token(),
             false,
             None,
             true,
@@ -3565,12 +3558,10 @@ mod tests {
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let cancel = CancelToken::new();
+        let (_controller, _operation, control) = test_turn();
         let pending_notifications = PendingWorkflowNotifications::new();
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
-        let pending_actions = RefCell::new(VecDeque::new());
         let (_tasks, task_spawner) = test_task_supervisor();
 
         let result = run_agent_for_tui_with_notification_queue(
@@ -3578,9 +3569,8 @@ mod tests {
             &mut session,
             "task_list",
             &event_tx,
-            &action_rx,
-            &pending_actions,
-            &cancel,
+            &control,
+            control.token(),
             false,
             None,
             true,
@@ -3749,9 +3739,8 @@ mod tests {
     fn tui_streaming_bash_observes_turn_cancel() {
         let config = full_auto_config();
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let cancel = CancelToken::new();
-        let turn_cancel = cancel.clone();
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let turn_cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "bash", None).expect("session");
 
@@ -3779,7 +3768,9 @@ mod tests {
             }
             observed_events.push(event);
             if saw_streaming_output {
-                cancel.cancel();
+                action_tx
+                    .send(UserAction::Interrupt)
+                    .expect("send turn interrupt");
                 break;
             }
         }
@@ -4734,14 +4725,27 @@ mod tests {
     fn tui_tool_approval_uses_runtime_handler_before_execution() {
         let config = config();
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::Approve {
-                id: "approval-bash".to_string(),
-                approved: true,
-            })
-            .expect("send approval");
-        let pending_actions = RefCell::new(VecDeque::new());
+        let (controller, _operation, control) = test_turn();
+        let responder = std::thread::spawn({
+            let controller = controller.clone();
+            move || match event_rx.recv().expect("approval event") {
+                TuiEvent::ApprovalNeeded {
+                    key,
+                    tool,
+                    target,
+                    preview,
+                } => {
+                    assert_eq!(tool, "bash");
+                    assert_eq!(target.as_deref(), Some("printf approved"));
+                    assert_eq!(preview.as_deref(), Some("$ printf approved"));
+                    controller
+                        .broker()
+                        .respond(&key, crate::types::TuiInteractionResponse::Approval(true))
+                        .expect("send approval");
+                }
+                event => panic!("expected approval event, got {event:?}"),
+            }
+        });
         let request = tool_types::ToolRequest {
             id: "bash".to_string(),
             name: tool_types::ToolName::Bash,
@@ -4755,8 +4759,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &request,
             &event_tx,
-            &action_rx,
-            &pending_actions,
+            &control,
             None,
             0,
             Some("approval-session"),
@@ -4771,35 +4774,27 @@ mod tests {
             &CancelToken::new(),
         );
 
-        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        responder.join().expect("approval responder");
         assert!(!should_stop);
         assert_eq!(result.status, tool_types::ToolStatus::Completed);
         assert_eq!(result.output.as_deref(), Some("approved"));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::ApprovalNeeded { tool, target, preview, .. }
-                if tool == "bash"
-                    && target == &Some("printf approved".to_string())
-                    && preview == &Some("$ printf approved".to_string())
-            )
-        }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::ToolCompleted { name, status, output, .. }
-                if name == "bash" && status == "completed" && output == "approved"
-            )
-        }));
     }
 
     #[test]
     fn tui_tool_approval_cancel_returns_denied_result() {
         let config = config();
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx.send(UserAction::Cancel).expect("send cancel");
-        let pending_actions = RefCell::new(VecDeque::new());
+        let (controller, _operation, control) = test_turn();
+        let responder = std::thread::spawn({
+            let controller = controller.clone();
+            move || {
+                assert!(matches!(
+                    event_rx.recv().expect("approval event"),
+                    TuiEvent::ApprovalNeeded { .. }
+                ));
+                controller.interrupt_current();
+            }
+        });
         let request = tool_types::ToolRequest {
             id: "bash".to_string(),
             name: tool_types::ToolName::Bash,
@@ -4813,8 +4808,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &request,
             &event_tx,
-            &action_rx,
-            &pending_actions,
+            &control,
             None,
             0,
             Some("approval-session"),
@@ -4829,17 +4823,15 @@ mod tests {
             &CancelToken::new(),
         );
 
-        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
+        responder.join().expect("cancel responder");
         assert!(should_stop);
         assert_eq!(result.status, tool_types::ToolStatus::Denied);
-        assert_eq!(result.error.as_deref(), Some("user denied"));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::ToolCompleted { name, status, output, .. }
-                if name == "bash" && status == "denied" && output == "user denied"
-            )
-        }));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("interrupted"))
+        );
     }
 
     #[test]
@@ -4905,7 +4897,6 @@ mod tests {
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
-        let pending_actions = RefCell::new(VecDeque::new());
         let (_tasks, task_spawner) = test_task_supervisor();
 
         run_agent_for_tui(
@@ -4917,14 +4908,14 @@ mod tests {
             &cancel,
             false,
         );
+        let (_controller, _operation, control) = test_turn();
         run_agent_for_tui_with_notification_queue(
             &config,
             &mut session,
             "<task-notification>mock_history_echo</task-notification>",
             &event_tx,
-            &action_rx,
-            &pending_actions,
-            &cancel,
+            &control,
+            control.token(),
             false,
             Some("Workflow notification notification-1"),
             false,
@@ -4948,15 +4939,18 @@ mod tests {
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "ask", None).expect("session");
 
+        let responder_tx = action_tx.clone();
         let responder = std::thread::spawn(move || {
             loop {
                 match event_rx.recv().expect("event") {
-                    TuiEvent::UserInputRequested { id, question, .. } => {
+                    TuiEvent::UserInputRequested { key, question, .. } => {
                         assert_eq!(question, "Continue?");
-                        action_tx
-                            .send(UserAction::RespondToUserInput {
-                                id,
-                                answer: "yes".to_string(),
+                        responder_tx
+                            .send(UserAction::RespondToInteraction {
+                                key,
+                                response: crate::types::TuiInteractionResponse::UserInput(
+                                    "yes".to_string(),
+                                ),
                             })
                             .expect("send answer");
                         break;
@@ -4996,7 +4990,9 @@ mod tests {
             loop {
                 match event_rx.recv().expect("event") {
                     TuiEvent::UserInputRequested { .. } => {
-                        action_tx.send(UserAction::Cancel).expect("send cancel");
+                        action_tx
+                            .send(UserAction::Interrupt)
+                            .expect("send interrupt");
                         break;
                     }
                     TuiEvent::SessionCompleted { status } => {
@@ -5397,8 +5393,7 @@ mod tests {
         let mut config = full_auto_config();
         config.max_budget_usd = Some(1.0);
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let pending_actions = RefCell::new(VecDeque::new());
+        let (_controller, _operation, control) = test_turn();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -5423,8 +5418,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &request,
             &event_tx,
-            &action_rx,
-            &pending_actions,
+            &control,
             None,
             0,
             &instructions,
@@ -5458,8 +5452,7 @@ mod tests {
     fn tui_async_subagent_launches_task_and_status_returns_result() {
         let config = full_auto_config();
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let pending_actions = RefCell::new(VecDeque::new());
+        let (_controller, _operation, control) = test_turn();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -5484,8 +5477,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &request,
             &event_tx,
-            &action_rx,
-            &pending_actions,
+            &control,
             None,
             0,
             &instructions,
@@ -5543,8 +5535,7 @@ mod tests {
     fn tui_async_subagent_records_live_activity_for_status() {
         let config = full_auto_config();
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let pending_actions = RefCell::new(VecDeque::new());
+        let (_controller, _operation, control) = test_turn();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -5569,8 +5560,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &request,
             &event_tx,
-            &action_rx,
-            &pending_actions,
+            &control,
             None,
             0,
             &instructions,

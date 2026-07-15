@@ -1,4 +1,5 @@
 use crossbeam_channel as mpsc;
+#[cfg(test)]
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
@@ -15,6 +16,7 @@ use crossterm::terminal::{self, EnterAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+#[cfg(test)]
 use orca_core::cancel::{CancelToken, OperationCancellation};
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
@@ -38,6 +40,7 @@ use crate::input_event_actions::{
 };
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
+use crate::operation_controller::TuiOperationController;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
@@ -194,17 +197,18 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let agent_mcp_configs = config.mcp_servers.clone();
 
     let mut agent_runtime = TuiAgentRuntime::spawn(
-        action_tx.clone(),
+        action_rx,
+        event_tx.clone(),
         MAX_SUPERVISED_TUI_TASKS,
-        move |agent_cancellation, task_spawner| {
+        move |agent_controller, command_rx, task_spawner| {
             let agent_mcp_registry = orca_mcp::initialize_registry(&agent_mcp_configs);
             let _ = mention_registry_tx.send(agent_mcp_registry.clone());
             agent_loop_thread_with_registry(
                 agent_config,
                 agent_preloaded,
                 agent_event_tx,
-                action_rx,
-                agent_cancellation,
+                command_rx,
+                agent_controller,
                 agent_workflow_notifications,
                 agent_mcp_registry,
                 task_spawner,
@@ -497,7 +501,8 @@ mod tests {
     };
     use crate::idle_submit_actions::handle_idle_submit;
     use crate::slash_command_actions::handle_slash_command;
-    use crate::types::{ApprovalOption, SlashMenu, SlashMenuItem, SubMenu};
+    use crate::types::{ApprovalOption, PendingTuiInput, SlashMenu, SlashMenuItem, SubMenu};
+    use crate::types::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
     use crate::workflow_notifications::drain_pending_workflow_notifications;
     use crate::workflow_notifications::{
         is_workflow_notification_turn_boundary, queue_workflow_terminal_notification,
@@ -558,6 +563,14 @@ mod tests {
         )
     }
 
+    fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
+        TuiInteractionKey::new(
+            orca_core::cancel::OperationIdAllocator::new().allocate(),
+            id,
+            kind,
+        )
+    }
+
     #[test]
     fn user_submission_error_emits_rejection_terminal() {
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -589,9 +602,7 @@ mod tests {
         let config = Arc::new(Mutex::new(config));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let pending_actions = RefCell::new(VecDeque::new());
-        let cancellation = OperationCancellation::new();
+        let controller = TuiOperationController::default();
         let pending_workflow_notifications = test_pending_workflow_notifications();
         let tasks = crate::task_supervisor::TuiTaskSupervisor::new(1);
         let task_spawner = tasks.spawner();
@@ -619,9 +630,7 @@ mod tests {
             &mut session,
             &mut pending_pinned_context,
             &event_tx,
-            &action_rx,
-            &pending_actions,
-            &cancellation,
+            &controller,
             &pending_workflow_notifications,
             &orca_mcp::McpRegistry::default(),
             &task_spawner,
@@ -886,6 +895,7 @@ mod tests {
         let action_tx = state.event_tx.clone();
         state.approval_dialog = Some(crate::types::ApprovalDialog {
             id: "approval-background".to_string(),
+            interaction: None,
             tool: "task_list".to_string(),
             target: None,
             permission_kind: None,
@@ -912,7 +922,7 @@ mod tests {
         let (mut state, rx) = test_state();
         let action_tx = state.event_tx.clone();
         state.update(TuiEvent::ApprovalNeeded {
-            id: "approval-foreground".to_string(),
+            key: interaction_key(TuiInteractionKind::Approval, "approval-foreground"),
             tool: "bash".to_string(),
             target: Some("cargo test".to_string()),
             preview: None,
@@ -922,8 +932,10 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(UserAction::Approve { id, approved })
-                if id == "approval-foreground" && approved
+            Ok(UserAction::RespondToInteraction {
+                key,
+                response: TuiInteractionResponse::Approval(true),
+            }) if key.request_id == "approval-foreground"
         ));
         assert_eq!(state.status, AppStatus::Running);
         assert!(state.approval_dialog.is_none());
@@ -2781,13 +2793,13 @@ mod tests {
                         saw_tool_requested = true;
                         break;
                     }
-                    Ok(TuiEvent::ApprovalNeeded { id, tool, .. }) => {
+                    Ok(TuiEvent::ApprovalNeeded { key, tool, .. }) => {
                         saw_second_approval = true;
                         seen.push(format!("approval: {tool}"));
                         action_tx
-                            .send(UserAction::Approve {
-                                id,
-                                approved: false,
+                            .send(UserAction::RespondToInteraction {
+                                key,
+                                response: TuiInteractionResponse::Approval(false),
                             })
                             .unwrap();
                         break;
@@ -3419,6 +3431,81 @@ mod tests {
     }
 
     #[test]
+    fn waiting_user_input_submit_sends_typed_user_input_response() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea = make_textarea_with_text("continue", &vim_state, &theme);
+        let key = interaction_key(TuiInteractionKind::UserInput, "ask-1");
+        state.set_status(AppStatus::WaitingUserInput);
+        state.pending_input = Some(PendingTuiInput::UserInput(key.clone()));
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+        ));
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                key: actual_key,
+                response: TuiInteractionResponse::UserInput(answer),
+            }) if actual_key == key && answer == "continue"
+        ));
+        assert!(state.pending_input.is_none());
+        assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn waiting_mcp_elicitation_submit_sends_typed_mcp_response() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea = make_textarea_with_text(
+            r#"{"repository":"echoVic/blade-deepseek"}"#,
+            &vim_state,
+            &theme,
+        );
+        let key = interaction_key(TuiInteractionKind::McpElicitation, "mcp-1");
+        state.set_status(AppStatus::WaitingUserInput);
+        state.pending_input = Some(PendingTuiInput::McpElicitation(key.clone()));
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+        ));
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                key: actual_key,
+                response: TuiInteractionResponse::McpElicitation {
+                    accepted: true,
+                    content_json: Some(content),
+                },
+            }) if actual_key == key && content == r#"{"repository":"echoVic/blade-deepseek"}"#
+        ));
+        assert!(state.pending_input.is_none());
+        assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
     fn repaired_indeterminate_history_tool_renders_state_inspection_warning() {
         let request = orca_core::tool_types::ToolRequest {
             id: "legacy-call".to_string(),
@@ -3719,9 +3806,7 @@ fn run_goal_turns_for_tui(
     session: &mut bridge::TuiConversationSession,
     submitted_turn: SubmittedTurn,
     event_tx: &mpsc::Sender<TuiEvent>,
-    action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
-    cancel: &CancelToken,
+    control: &crate::operation_controller::TuiTurnControl,
     starting_continuation: usize,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     task_spawner: &TuiTaskSpawner,
@@ -3759,9 +3844,8 @@ fn run_goal_turns_for_tui(
             session,
             &prompt,
             event_tx,
-            action_rx,
-            pending_actions,
-            cancel,
+            control,
+            control.token(),
             true,
             submitted_turn.task_label(),
             submitted_turn.is_backtrack_target(),
@@ -3845,10 +3929,24 @@ fn resume_latest_active_goal_for_tui(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: &mpsc::Sender<TuiEvent>,
     action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    _pending_actions: &RefCell<VecDeque<UserAction>>,
     cancel: &CancelToken,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
 ) {
+    let controller = TuiOperationController::default();
+    let operation = controller.start().expect("goal resume operation");
+    if cancel.is_cancelled() {
+        operation.cancel();
+    }
+    let control = operation.control();
+    let (mut dispatcher, _commands) = crate::action_dispatcher::TuiActionDispatcher::spawn(
+        action_rx.clone(),
+        event_tx.clone(),
+        controller,
+        crate::channels::USER_ACTION_CAPACITY,
+        crate::channels::USER_ACTION_CAPACITY,
+    )
+    .expect("goal resume dispatcher");
     let registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
     let tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
     let task_spawner = tasks.spawner();
@@ -3857,13 +3955,14 @@ fn resume_latest_active_goal_for_tui(
         config,
         preloaded,
         event_tx,
-        action_rx,
-        pending_actions,
-        cancel,
+        &control,
         pending_workflow_notifications,
         &registry,
         &task_spawner,
     );
+    dispatcher
+        .shutdown()
+        .expect("goal resume dispatcher joined");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3872,9 +3971,7 @@ fn resume_latest_active_goal_for_tui_with_registry(
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: &mpsc::Sender<TuiEvent>,
-    action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
-    cancel: &CancelToken,
+    control: &crate::operation_controller::TuiTurnControl,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
     task_spawner: &TuiTaskSpawner,
@@ -3973,9 +4070,7 @@ fn resume_latest_active_goal_for_tui_with_registry(
             session,
             SubmittedTurn::user(prompt),
             event_tx,
-            action_rx,
-            pending_actions,
-            cancel,
+            control,
             1,
             pending_workflow_notifications,
             task_spawner,
@@ -3985,18 +4080,18 @@ fn resume_latest_active_goal_for_tui_with_registry(
 
 fn recv_next_user_action(
     action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
-    cancellation: &OperationCancellation,
+    pending_actions: &mut VecDeque<UserAction>,
+    controller: &TuiOperationController,
 ) -> Result<UserAction, mpsc::RecvError> {
-    if cancellation.is_shutdown() {
+    if controller.cancellation().is_shutdown() {
         return Ok(UserAction::Cancel);
     }
-    let action = if let Some(action) = pending_actions.borrow_mut().pop_front() {
+    let action = if let Some(action) = pending_actions.pop_front() {
         action
     } else {
         action_rx.recv()?
     };
-    Ok(if cancellation.is_shutdown() {
+    Ok(if controller.cancellation().is_shutdown() {
         UserAction::Cancel
     } else {
         action
@@ -4010,15 +4105,23 @@ fn handle_submitted_turn_for_tui(
     session: &mut Option<bridge::TuiConversationSession>,
     pending_pinned_context: &mut Vec<String>,
     event_tx: &mpsc::Sender<TuiEvent>,
-    action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
-    cancellation: &OperationCancellation,
+    controller: &TuiOperationController,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
     task_spawner: &TuiTaskSpawner,
 ) {
-    let operation = cancellation.start();
-    let cancel = operation.token();
+    let operation = match controller.start() {
+        Ok(operation) => operation,
+        Err(error) => {
+            send_submission_error(
+                event_tx,
+                submitted_turn.rejection_prompt(),
+                format!("TUI operation admission closed: {error}"),
+            );
+            return;
+        }
+    };
+    let control = operation.control();
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let cfg = config.lock().unwrap().clone();
     let cwd = cfg
@@ -4077,9 +4180,7 @@ fn handle_submitted_turn_for_tui(
         session.as_mut().expect("session initialized"),
         submitted_turn.with_model_prompt(prompt),
         event_tx,
-        action_rx,
-        pending_actions,
-        cancel,
+        &control,
         0,
         pending_workflow_notifications,
         task_spawner,
@@ -4113,24 +4214,52 @@ fn agent_loop_thread(
     cancel: CancelToken,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
 ) {
-    let cancellation = OperationCancellation::new();
-    let initial = cancellation.start();
+    let controller = TuiOperationController::default();
+    let initial = controller.start().expect("initial operation");
     if cancel.is_cancelled() {
         initial.cancel();
     }
-    let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
-    let mut tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
-    let task_spawner = tasks.spawner();
-    agent_loop_thread_with_registry(
+    run_test_agent_loop_with_dispatcher(
         config,
         preloaded,
         event_tx,
         action_rx,
-        cancellation,
+        controller,
+        pending_workflow_notifications,
+    );
+}
+
+#[cfg(test)]
+fn run_test_agent_loop_with_dispatcher(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    controller: TuiOperationController,
+    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+) {
+    let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
+    let mut tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
+    let task_spawner = tasks.spawner();
+    let (mut dispatcher, command_rx) = crate::action_dispatcher::TuiActionDispatcher::spawn(
+        action_rx,
+        event_tx.clone(),
+        controller.clone(),
+        crate::channels::USER_ACTION_CAPACITY,
+        crate::channels::USER_ACTION_CAPACITY,
+    )
+    .expect("test TUI dispatcher");
+    agent_loop_thread_with_registry(
+        config,
+        preloaded,
+        event_tx,
+        command_rx,
+        controller,
         pending_workflow_notifications,
         mcp_registry,
         task_spawner,
     );
+    dispatcher.shutdown().expect("test TUI dispatcher joined");
     tasks.shutdown().expect("test TUI tasks joined");
 }
 
@@ -4143,20 +4272,18 @@ fn agent_loop_thread_with_operation_cancellation(
     cancellation: OperationCancellation,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
 ) {
-    let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
-    let mut tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
-    let task_spawner = tasks.spawner();
-    agent_loop_thread_with_registry(
+    let controller = TuiOperationController::new(
+        cancellation,
+        crate::interaction_broker::TuiInteractionBroker::default(),
+    );
+    run_test_agent_loop_with_dispatcher(
         config,
         preloaded,
         event_tx,
         action_rx,
-        cancellation,
+        controller,
         pending_workflow_notifications,
-        mcp_registry,
-        task_spawner,
     );
-    tasks.shutdown().expect("test TUI tasks joined");
 }
 
 fn agent_loop_thread_with_registry(
@@ -4164,17 +4291,17 @@ fn agent_loop_thread_with_registry(
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
-    cancellation: OperationCancellation,
+    controller: TuiOperationController,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     mcp_registry: orca_mcp::McpRegistry,
     task_spawner: TuiTaskSpawner,
 ) {
     let mut session: Option<bridge::TuiConversationSession> = None;
     let mut pending_pinned_context: Vec<String> = Vec::new();
-    let pending_actions: RefCell<VecDeque<UserAction>> = RefCell::new(VecDeque::new());
+    let mut pending_actions = VecDeque::new();
 
     loop {
-        match recv_next_user_action(&action_rx, &pending_actions, &cancellation) {
+        match recv_next_user_action(&action_rx, &mut pending_actions, &controller) {
             Ok(UserAction::Submit(prompt)) => {
                 handle_submitted_turn_for_tui(
                     SubmittedTurn::user(prompt),
@@ -4183,9 +4310,7 @@ fn agent_loop_thread_with_registry(
                     &mut session,
                     &mut pending_pinned_context,
                     &event_tx,
-                    &action_rx,
-                    &pending_actions,
-                    &cancellation,
+                    &controller,
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &task_spawner,
@@ -4199,9 +4324,7 @@ fn agent_loop_thread_with_registry(
                     &mut session,
                     &mut pending_pinned_context,
                     &event_tx,
-                    &action_rx,
-                    &pending_actions,
-                    &cancellation,
+                    &controller,
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &task_spawner,
@@ -4215,9 +4338,7 @@ fn agent_loop_thread_with_registry(
                     &mut session,
                     &mut pending_pinned_context,
                     &event_tx,
-                    &action_rx,
-                    &pending_actions,
-                    &cancellation,
+                    &controller,
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &task_spawner,
@@ -4281,7 +4402,9 @@ fn agent_loop_thread_with_registry(
             }
             Ok(UserAction::Compact) => {
                 if let Some(session) = session.as_mut() {
-                    let operation = cancellation.start();
+                    let Ok(operation) = controller.start() else {
+                        break;
+                    };
                     let cancel = operation.token();
                     let cfg = config.lock().unwrap().clone();
                     let cwd = cfg
@@ -4336,7 +4459,9 @@ fn agent_loop_thread_with_registry(
                     && let Some(continuation_request) = continuation_request
                     && let Some(session) = session.as_mut()
                 {
-                    let operation = cancellation.start();
+                    let Ok(operation) = controller.start() else {
+                        break;
+                    };
                     let cancel = operation.token();
                     let cfg = config.lock().unwrap().clone();
                     let goal_session_id = session.session_id().map(str::to_string);
@@ -4347,8 +4472,6 @@ fn agent_loop_thread_with_registry(
                         session,
                         &continuation_request,
                         &event_tx,
-                        &action_rx,
-                        &pending_actions,
                         cancel,
                         Some(&pending_workflow_notifications),
                     );
@@ -4369,9 +4492,9 @@ fn agent_loop_thread_with_registry(
                             bridge::TuiAgentTurnContinuation::WorkflowNotification(
                                 notification,
                             ) => {
-                                pending_actions.borrow_mut().push_front(
-                                    UserAction::SubmitWorkflowNotification(notification),
-                                );
+                                pending_actions.push_front(UserAction::SubmitWorkflowNotification(
+                                    notification,
+                                ));
                             }
                         }
                     }
@@ -4435,16 +4558,16 @@ fn agent_loop_thread_with_registry(
                             "Starting goal. Automatic continuation will keep running while it remains active.".to_string(),
                         ));
                         if let Some(session) = session.as_mut() {
-                            let operation = cancellation.start();
+                            let Ok(operation) = controller.start() else {
+                                break;
+                            };
                             let cfg = config.lock().unwrap().clone();
                             run_goal_turns_for_tui(
                                 &cfg,
                                 session,
                                 SubmittedTurn::user(objective),
                                 &event_tx,
-                                &action_rx,
-                                &pending_actions,
-                                operation.token(),
+                                &operation.control(),
                                 0,
                                 &pending_workflow_notifications,
                                 &task_spawner,
@@ -4515,15 +4638,15 @@ fn agent_loop_thread_with_registry(
             }
             Ok(UserAction::GoalResume) => {
                 let Some(session_id) = current_goal_session_id(session.as_ref(), &preloaded) else {
-                    let operation = cancellation.start();
+                    let Ok(operation) = controller.start() else {
+                        break;
+                    };
                     resume_latest_active_goal_for_tui_with_registry(
                         &mut session,
                         &config,
                         &preloaded,
                         &event_tx,
-                        &action_rx,
-                        &pending_actions,
-                        operation.token(),
+                        &operation.control(),
                         &pending_workflow_notifications,
                         &mcp_registry,
                         &task_spawner,
@@ -4542,7 +4665,9 @@ fn agent_loop_thread_with_registry(
                         .and_then(|id| orca_runtime::goals::GoalStore::load_default().get(id).ok())
                         .flatten()
                     {
-                        let operation = cancellation.start();
+                        let Ok(operation) = controller.start() else {
+                            break;
+                        };
                         let cfg = config.lock().unwrap().clone();
                         let prompt = goal_continuation_prompt(&goal.objective, 1);
                         run_goal_turns_for_tui(
@@ -4550,9 +4675,7 @@ fn agent_loop_thread_with_registry(
                             session,
                             SubmittedTurn::user(prompt),
                             &event_tx,
-                            &action_rx,
-                            &pending_actions,
-                            operation.token(),
+                            &operation.control(),
                             1,
                             &pending_workflow_notifications,
                             &task_spawner,
@@ -4561,11 +4684,7 @@ fn agent_loop_thread_with_registry(
                 }
             }
             Ok(UserAction::Cancel) | Err(_) => break,
-            Ok(
-                UserAction::Approve { .. }
-                | UserAction::RespondToUserInput { .. }
-                | UserAction::RespondToMcpElicitation { .. },
-            ) => {}
+            Ok(UserAction::RespondToInteraction { .. }) => {}
         }
     }
 }

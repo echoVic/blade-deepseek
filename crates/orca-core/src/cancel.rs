@@ -140,6 +140,16 @@ impl OperationCancellation {
         true
     }
 
+    pub fn complete(&self, id: OperationId) -> bool {
+        let mut current = self.lock_current();
+        if current.as_ref().is_some_and(|scope| scope.id() == id) {
+            current.take();
+            true
+        } else {
+            false
+        }
+    }
+
     fn lock_current(&self) -> MutexGuard<'_, Option<OperationScope>> {
         self.state
             .current
@@ -175,6 +185,19 @@ mod tests {
 
         assert_eq!(controller.cancel_current(), Some(second.id()));
         assert!(second.token().is_cancelled());
+    }
+
+    #[test]
+    fn completing_an_operation_only_clears_the_matching_current_scope() {
+        let controller = OperationCancellation::new();
+        let first = controller.start();
+        let second = controller.start();
+
+        assert!(!controller.complete(first.id()));
+        assert_eq!(controller.current_id(), Some(second.id()));
+        assert!(controller.complete(second.id()));
+        assert_eq!(controller.current_id(), None);
+        assert!(!controller.complete(second.id()));
     }
 
     #[test]

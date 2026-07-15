@@ -24,7 +24,13 @@ where
 {
     match shortcut {
         GlobalShortcut::Cancel => {
-            if matches!(state.status, AppStatus::Running | AppStatus::Compacting) {
+            if matches!(
+                state.status,
+                AppStatus::Running
+                    | AppStatus::Compacting
+                    | AppStatus::WaitingApproval
+                    | AppStatus::WaitingUserInput
+            ) {
                 cancellation.cancel_current();
                 let _ = action_tx.send(UserAction::Interrupt);
                 return Ok(GlobalShortcutFlow::Continue);
@@ -94,6 +100,36 @@ mod tests {
 
         assert!(operation.token().is_cancelled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
+    fn cancel_interrupts_waiting_interactions_without_arming_idle_exit() {
+        for status in [AppStatus::WaitingApproval, AppStatus::WaitingUserInput] {
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let mut state = AppState::new(
+                action_tx.clone(),
+                "test".to_string(),
+                "model".to_string(),
+                "/tmp".to_string(),
+            );
+            state.set_status(status);
+            let cancellation = OperationCancellation::new();
+            let operation = cancellation.start();
+
+            let flow = handle_global_shortcut(
+                GlobalShortcut::Cancel,
+                &mut state,
+                &action_tx,
+                &cancellation,
+                || Ok(()),
+            )
+            .expect("interrupt pending interaction");
+
+            assert!(matches!(flow, super::GlobalShortcutFlow::Continue));
+            assert!(operation.token().is_cancelled());
+            assert!(state.last_ctrl_c.is_none());
+            assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        }
     }
 
     #[test]

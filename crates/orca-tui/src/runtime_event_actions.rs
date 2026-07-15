@@ -23,13 +23,13 @@ pub(crate) fn handle_runtime_event(
     theme: &Theme,
 ) {
     if let TuiEvent::ApprovalNeeded {
-        id, tool, target, ..
+        key, tool, target, ..
     } = &tui_event
         && state.approval_is_allowlisted(tool, target.as_deref())
     {
-        let _ = action_tx.send(UserAction::Approve {
-            id: id.clone(),
-            approved: true,
+        let _ = action_tx.send(UserAction::RespondToInteraction {
+            key: key.clone(),
+            response: crate::types::TuiInteractionResponse::Approval(true),
         });
         state.enter_running();
         return;

@@ -1,6 +1,4 @@
-use crossbeam_channel::{Receiver, Sender};
-use std::cell::RefCell;
-use std::collections::VecDeque;
+use crossbeam_channel::Sender;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -38,11 +36,12 @@ use crate::agent_workflow_execution::{
     execute_workflow_draft_action_for_tui, execute_workflow_draft_for_tui, execute_workflow_for_tui,
 };
 use crate::diff;
+use crate::operation_controller::TuiTurnControl;
 use crate::runtime_interaction_adapter::{
     AutoAllowPermissionRequests, TuiMcpElicitationHandler, TuiPermissionRequestHandler,
     TuiToolApprovalOutcome, TuiUserInputHandler, resolve_tui_tool_approval,
 };
-use crate::types::{TuiEvent, UserAction};
+use crate::types::TuiEvent;
 
 pub(crate) fn execute_readonly_batch_for_tui(
     config: &RunConfig,
@@ -175,8 +174,7 @@ pub(crate) fn execute_tool_for_tui(
     cwd: &Path,
     tool_request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     session_id: Option<&str>,
@@ -195,8 +193,7 @@ pub(crate) fn execute_tool_for_tui(
         cwd,
         tool_request,
         event_tx,
-        action_rx,
-        pending_actions,
+        control,
         pending_interactions,
         subagent_depth,
         session_id,
@@ -218,8 +215,7 @@ fn execute_tool_for_tui_inner(
     cwd: &Path,
     tool_request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
     session_id: Option<&str>,
@@ -259,8 +255,7 @@ fn execute_tool_for_tui_inner(
             policy,
             &mut runtime_context,
             event_tx,
-            action_rx,
-            pending_actions,
+            control,
             pending_interactions.as_ref(),
         )
     {
@@ -276,8 +271,7 @@ fn execute_tool_for_tui_inner(
             cwd,
             tool_request,
             event_tx,
-            action_rx,
-            pending_actions,
+            control,
             pending_interactions.clone(),
             subagent_depth,
             instructions,
@@ -361,8 +355,7 @@ fn execute_tool_for_tui_inner(
                         policy,
                         permission_overlay,
                         event_tx,
-                        action_rx,
-                        pending_actions,
+                        control,
                         pending_interactions.as_ref(),
                         &mut on_output,
                     )
@@ -370,7 +363,7 @@ fn execute_tool_for_tui_inner(
             }
         } else if execution_request.name == tool_types::ToolName::RequestPermissions {
             let handler = with_pending_interactions(
-                TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions),
+                TuiPermissionRequestHandler::new(event_tx.clone(), control.clone()),
                 pending_interactions.as_ref(),
             );
             let result = runtime_context.execute_request_permissions_tool_with_policy(
@@ -384,8 +377,7 @@ fn execute_tool_for_tui_inner(
             execute_user_input_request_for_tui(
                 execution_request,
                 event_tx,
-                action_rx,
-                pending_actions,
+                control,
                 pending_interactions.as_ref(),
             )
         } else if execution_request.name == tool_types::ToolName::WorkflowDraft {
@@ -560,9 +552,9 @@ fn execute_tool_for_tui_inner(
             })
         } else if matches!(execution_request.name, tool_types::ToolName::Mcp(_)) {
             let handler = match pending_interactions.as_ref() {
-                Some(store) => TuiMcpElicitationHandler::new(event_tx, action_rx, pending_actions)
+                Some(store) => TuiMcpElicitationHandler::new(event_tx.clone(), control.clone())
                     .with_pending_interactions(store.clone()),
-                None => TuiMcpElicitationHandler::new(event_tx, action_rx, pending_actions),
+                None => TuiMcpElicitationHandler::new(event_tx.clone(), control.clone()),
             };
             orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
                 execution_request,
@@ -687,8 +679,7 @@ fn resolve_tui_permission_escalation(
     approval: &ApprovalRequest,
     permission_request: RuntimePermissionRequest,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<&RuntimePendingInteractionStore>,
 ) -> std::io::Result<bool> {
     let resolution = policy.resolve_for_tool(
@@ -701,7 +692,7 @@ fn resolve_tui_permission_escalation(
         ApprovalDecision::Allow => permission_overlay
             .request_and_merge(&AutoAllowPermissionRequests, permission_request)?,
         ApprovalDecision::Ask => {
-            let handler = TuiPermissionRequestHandler::new(event_tx, action_rx, pending_actions)
+            let handler = TuiPermissionRequestHandler::new(event_tx.clone(), control.clone())
                 .with_display(
                     approval.tool.clone().unwrap_or_default(),
                     approval.target.clone(),
@@ -719,8 +710,7 @@ fn execute_tui_bash_with_escalations(
     policy: &ApprovalPolicy,
     permission_overlay: &mut TurnPermissionOverlay,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<&RuntimePendingInteractionStore>,
     on_output: &mut dyn FnMut(&str),
 ) -> tool_types::ToolResult {
@@ -758,8 +748,7 @@ fn execute_tui_bash_with_escalations(
             &approval,
             permission_request,
             event_tx,
-            action_rx,
-            pending_actions,
+            control,
             pending_interactions,
         ) {
             Ok(allowed) => allowed,
@@ -785,8 +774,7 @@ fn execute_tui_bash_with_escalations(
         policy,
         permission_overlay,
         event_tx,
-        action_rx,
-        pending_actions,
+        control,
         pending_interactions,
         context.cancel,
         &mut |retry| match retry {
@@ -1003,8 +991,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
     policy: &ApprovalPolicy,
     permission_overlay: &mut TurnPermissionOverlay,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<&RuntimePendingInteractionStore>,
     cancel: &CancelToken,
     retry: &mut dyn FnMut(TuiBashRetry) -> tool_types::ToolResult,
@@ -1055,8 +1042,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
             &approval,
             permission_request,
             event_tx,
-            action_rx,
-            pending_actions,
+            control,
             pending_interactions,
         ) {
             Ok(allowed) => allowed,
@@ -1110,8 +1096,7 @@ pub(crate) fn escalate_sandbox_denied_bash_for_tui(
         &approval,
         permission_request,
         event_tx,
-        action_rx,
-        pending_actions,
+        control,
         pending_interactions,
     ) {
         Ok(allowed) => allowed,
@@ -1155,14 +1140,13 @@ fn with_sandbox_diagnostic(
 fn execute_user_input_request_for_tui(
     request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<&RuntimePendingInteractionStore>,
 ) -> tool_types::ToolResult {
     let handler = match pending_interactions {
-        Some(store) => TuiUserInputHandler::new(event_tx, action_rx, pending_actions)
+        Some(store) => TuiUserInputHandler::new(event_tx.clone(), control.clone())
             .with_pending_interactions(store.clone()),
-        None => TuiUserInputHandler::new(event_tx, action_rx, pending_actions),
+        None => TuiUserInputHandler::new(event_tx.clone(), control.clone()),
     };
     let mut runtime_context = RuntimeToolActorContext::new("tui-user-input", DEFAULT_MAX_TURNS);
     match runtime_context.execute_user_input_tool(request, &handler) {
@@ -1171,10 +1155,10 @@ fn execute_user_input_request_for_tui(
     }
 }
 
-fn with_pending_interactions<'a>(
-    handler: TuiPermissionRequestHandler<'a>,
+fn with_pending_interactions(
+    handler: TuiPermissionRequestHandler,
     pending_interactions: Option<&RuntimePendingInteractionStore>,
-) -> TuiPermissionRequestHandler<'a> {
+) -> TuiPermissionRequestHandler {
     match pending_interactions {
         Some(store) => handler.with_pending_interactions(store.clone()),
         None => handler,
@@ -1196,6 +1180,8 @@ pub(crate) fn canonical_action_for_tool(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use crossbeam_channel as mpsc;
 
     use orca_core::approval_types::ApprovalMode;
@@ -1278,6 +1264,17 @@ mod tests {
         }
     }
 
+    fn test_turn() -> (
+        crate::operation_controller::TuiOperationController,
+        crate::operation_controller::TuiOperationScope,
+        TuiTurnControl,
+    ) {
+        let controller = crate::operation_controller::TuiOperationController::default();
+        let operation = controller.start().expect("start test operation");
+        let control = operation.control();
+        (controller, operation, control)
+    }
+
     fn bash_request(command: &str) -> tool_types::ToolRequest {
         tool_types::ToolRequest {
             id: "bash-1".to_string(),
@@ -1306,9 +1303,11 @@ mod tests {
         workspace: TempDir,
         event_tx: Sender<TuiEvent>,
         event_rx: mpsc::Receiver<TuiEvent>,
-        action_tx: Sender<UserAction>,
-        action_rx: Receiver<UserAction>,
-        pending_actions: RefCell<VecDeque<UserAction>>,
+        controller: crate::operation_controller::TuiOperationController,
+        _operation: crate::operation_controller::TuiOperationScope,
+        control: TuiTurnControl,
+        decisions: std::sync::Mutex<VecDeque<bool>>,
+        observed_events: std::sync::Arc<std::sync::Mutex<Vec<TuiEvent>>>,
     }
 
     impl EscalationHarness {
@@ -1316,15 +1315,63 @@ mod tests {
             let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
             std::fs::create_dir(workspace.path().join(".git")).unwrap();
             let (event_tx, event_rx) = mpsc::unbounded();
-            let (action_tx, action_rx) = mpsc::unbounded();
+            let controller = crate::operation_controller::TuiOperationController::default();
+            let operation = controller.start().expect("start escalation operation");
+            let control = operation.control();
             Self {
                 workspace,
                 event_tx,
                 event_rx,
-                action_tx,
-                action_rx,
-                pending_actions: RefCell::new(VecDeque::new()),
+                controller,
+                _operation: operation,
+                control,
+                decisions: std::sync::Mutex::new(VecDeque::new()),
+                observed_events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        fn queue_approval(&self, approved: bool) {
+            self.decisions.lock().unwrap().push_back(approved);
+        }
+
+        fn spawn_approval_responder(&self) -> Option<std::thread::JoinHandle<()>> {
+            let decisions = self.decisions.lock().unwrap().drain(..).collect::<Vec<_>>();
+            (!decisions.is_empty()).then(|| {
+                let event_rx = self.event_rx.clone();
+                let controller = self.controller.clone();
+                let observed_events = std::sync::Arc::clone(&self.observed_events);
+                std::thread::spawn(move || {
+                    for approved in decisions {
+                        loop {
+                            let event = event_rx.recv().expect("approval event");
+                            let key = match &event {
+                                TuiEvent::ApprovalNeeded { key, .. }
+                                | TuiEvent::PermissionApprovalNeeded { key, .. } => {
+                                    Some(key.clone())
+                                }
+                                _ => None,
+                            };
+                            observed_events.lock().unwrap().push(event);
+                            if let Some(key) = key {
+                                let response = match key.kind {
+                                    crate::types::TuiInteractionKind::Approval => {
+                                        crate::types::TuiInteractionResponse::Approval(approved)
+                                    }
+                                    crate::types::TuiInteractionKind::Permission => {
+                                        crate::types::TuiInteractionResponse::Permission(approved)
+                                    }
+                                    _ => panic!("unexpected approval interaction kind"),
+                                };
+                                controller
+                                    .broker()
+                                    .respond(&key, response)
+                                    .expect("approval response");
+                                break;
+                            }
+                        }
+                    }
+                })
+            })
         }
 
         fn run(
@@ -1352,15 +1399,15 @@ mod tests {
             let policy = ApprovalPolicy::new(approval_mode);
             let cancel = CancelToken::new();
             let cwd = self.workspace.path().to_path_buf();
-            escalate_sandbox_denied_bash_for_tui(
+            let responder = self.spawn_approval_responder();
+            let result = escalate_sandbox_denied_bash_for_tui(
                 result,
                 request,
                 &cwd,
                 &policy,
                 permission_overlay,
                 &self.event_tx,
-                &self.action_rx,
-                &self.pending_actions,
+                &self.control,
                 None,
                 &cancel,
                 &mut |retry| match retry {
@@ -1389,18 +1436,29 @@ mod tests {
                         )
                     }
                 },
-            )
+            );
+            if let Some(responder) = responder {
+                responder.join().expect("approval responder");
+            }
+            result
         }
 
         fn approval_events(&self) -> Vec<TuiEvent> {
-            self.event_rx
-                .try_iter()
+            self.observed_events
+                .lock()
+                .unwrap()
+                .extend(self.event_rx.try_iter());
+            self.observed_events
+                .lock()
+                .unwrap()
+                .iter()
                 .filter(|event| {
                     matches!(
                         event,
                         TuiEvent::ApprovalNeeded { .. } | TuiEvent::PermissionApprovalNeeded { .. }
                     )
                 })
+                .cloned()
                 .collect()
         }
     }
@@ -1411,13 +1469,7 @@ mod tests {
         let marker = harness.workspace.path().join(".git/escalation-marker");
         let request = bash_request(&format!("printf granted > {}", marker.display()));
         let denied = git_denied_result(&request, harness.workspace.path());
-        harness
-            .action_tx
-            .send(UserAction::Approve {
-                id: "approval-bash-1-sandbox".to_string(),
-                approved: true,
-            })
-            .unwrap();
+        harness.queue_approval(true);
 
         let result = harness.run(ApprovalMode::Suggest, &request, denied);
 
@@ -1445,13 +1497,7 @@ mod tests {
         let marker = harness.workspace.path().join(".git/escalation-marker");
         let request = bash_request(&format!("printf granted > {}", marker.display()));
         let denied = git_denied_result(&request, harness.workspace.path());
-        harness
-            .action_tx
-            .send(UserAction::Approve {
-                id: "approval-bash-1-sandbox".to_string(),
-                approved: false,
-            })
-            .unwrap();
+        harness.queue_approval(false);
 
         let result = harness.run(ApprovalMode::Suggest, &request, denied);
 
@@ -1487,13 +1533,7 @@ mod tests {
         let marker = harness.workspace.path().join(".git/escalation-marker");
         let request = bash_request(&format!("printf granted > {}", marker.display()));
         let denied = git_denied_result(&request, harness.workspace.path());
-        harness
-            .action_tx
-            .send(UserAction::Approve {
-                id: "approval-bash-1-sandbox".to_string(),
-                approved: true,
-            })
-            .unwrap();
+        harness.queue_approval(true);
         let mut overlay = TurnPermissionOverlay::default();
 
         let result =
@@ -1512,8 +1552,7 @@ mod tests {
     fn execute_tool_for_tui_rejects_malformed_subagent_before_task_creation() {
         let workspace = TempDir::new().unwrap();
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let (_action_tx, action_rx) = mpsc::unbounded();
-        let pending_actions = RefCell::new(VecDeque::new());
+        let (_controller, _operation, control) = test_turn();
         let config = config(ApprovalMode::FullAuto);
         let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
         let registry = TaskRegistry::new("session-malformed-single-subagent".to_string());
@@ -1531,8 +1570,7 @@ mod tests {
             workspace.path(),
             &request,
             &event_tx,
-            &action_rx,
-            &pending_actions,
+            &control,
             None,
             0,
             None,
@@ -1614,31 +1652,21 @@ mod tests {
             "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
             marker.display()
         ));
-        harness
-            .action_tx
-            .send(UserAction::Approve {
-                id: "approval-bash-1".to_string(),
-                approved: true,
-            })
-            .unwrap();
-        harness
-            .action_tx
-            .send(UserAction::Approve {
-                id: "approval-bash-1-unsandboxed".to_string(),
-                approved: true,
-            })
-            .unwrap();
+        harness.queue_approval(true);
+        harness.queue_approval(true);
         let config = config(ApprovalMode::Suggest);
         let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
         let mut overlay = TurnPermissionOverlay::default();
 
+        let responder = harness
+            .spawn_approval_responder()
+            .expect("bash approval responder");
         let (_, result, _) = execute_tool_for_tui(
             &config,
             harness.workspace.path(),
             &request,
             &harness.event_tx,
-            &harness.action_rx,
-            &harness.pending_actions,
+            &harness.control,
             None,
             0,
             None,
@@ -1652,6 +1680,7 @@ mod tests {
             &mut overlay,
             &CancelToken::new(),
         );
+        responder.join().expect("bash approval responder joined");
 
         assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
         assert!(marker.exists());
@@ -1692,24 +1721,20 @@ mod tests {
                 .to_string(),
             ),
         };
-        harness
-            .action_tx
-            .send(UserAction::Approve {
-                id: "perm-1".to_string(),
-                approved: true,
-            })
-            .unwrap();
+        harness.queue_approval(true);
         let config = config(ApprovalMode::Suggest);
         let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
         let mut overlay = TurnPermissionOverlay::default();
 
+        let responder = harness
+            .spawn_approval_responder()
+            .expect("permission responder");
         let (should_stop, result, _) = execute_tool_for_tui(
             &config,
             harness.workspace.path(),
             &request,
             &harness.event_tx,
-            &harness.action_rx,
-            &harness.pending_actions,
+            &harness.control,
             None,
             0,
             None,
@@ -1723,6 +1748,7 @@ mod tests {
             &mut overlay,
             &CancelToken::new(),
         );
+        responder.join().expect("permission responder joined");
 
         assert!(!should_stop);
         assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
@@ -1754,24 +1780,20 @@ mod tests {
                 .to_string(),
             ),
         };
-        harness
-            .action_tx
-            .send(UserAction::Approve {
-                id: "perm-1".to_string(),
-                approved: false,
-            })
-            .unwrap();
+        harness.queue_approval(false);
         let config = config(ApprovalMode::Suggest);
         let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
         let mut overlay = TurnPermissionOverlay::default();
 
+        let responder = harness
+            .spawn_approval_responder()
+            .expect("permission responder");
         let (_, result, _) = execute_tool_for_tui(
             &config,
             harness.workspace.path(),
             &request,
             &harness.event_tx,
-            &harness.action_rx,
-            &harness.pending_actions,
+            &harness.control,
             None,
             0,
             None,
@@ -1785,6 +1807,7 @@ mod tests {
             &mut overlay,
             &CancelToken::new(),
         );
+        responder.join().expect("permission responder joined");
 
         assert_ne!(result.status, ToolStatus::Completed);
         assert!(overlay.additional_working_directories().is_empty());
@@ -1795,7 +1818,7 @@ mod tests {
         let config = config(ApprovalMode::Suggest);
         let cwd = config.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
+        let (controller, _operation, control) = test_turn();
         let store = RuntimePendingInteractionStore::default();
         let request = tool_types::ToolRequest {
             id: "ask-1".to_string(),
@@ -1807,15 +1830,13 @@ mod tests {
         let worker_store = store.clone();
 
         let handle = std::thread::spawn(move || {
-            let pending_actions = RefCell::new(VecDeque::new());
             let mut overlay = TurnPermissionOverlay::default();
             execute_tool_for_tui(
                 &config,
                 &cwd,
                 &request,
                 &event_tx,
-                &action_rx,
-                &pending_actions,
+                &control,
                 Some(worker_store),
                 0,
                 None,
@@ -1840,8 +1861,8 @@ mod tests {
             }
         };
         assert!(matches!(
-            prompt,
-            TuiEvent::UserInputRequested { id, .. } if id == "ask-1"
+            &prompt,
+            TuiEvent::UserInputRequested { key, .. } if key.request_id == "ask-1"
         ));
         assert_eq!(
             store.get("ask-1").map(|record| record.kind),
@@ -1850,11 +1871,16 @@ mod tests {
             )
         );
 
-        action_tx
-            .send(UserAction::RespondToUserInput {
-                id: "ask-1".to_string(),
-                answer: "yes".to_string(),
-            })
+        let key = match prompt {
+            TuiEvent::UserInputRequested { key, .. } => key,
+            _ => unreachable!(),
+        };
+        controller
+            .broker()
+            .respond(
+                &key,
+                crate::types::TuiInteractionResponse::UserInput("yes".to_string()),
+            )
             .expect("send answer");
         let (should_stop, result, _) = handle.join().expect("executor thread");
 
@@ -1932,20 +1958,18 @@ done
             raw_arguments: Some(serde_json::json!({}).to_string()),
         };
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
+        let (controller, _operation, control) = test_turn();
         let store = RuntimePendingInteractionStore::default();
         let worker_store = store.clone();
 
         let handle = std::thread::spawn(move || {
-            let pending_actions = RefCell::new(VecDeque::new());
             let mut overlay = TurnPermissionOverlay::default();
             execute_tool_for_tui(
                 &config,
                 workspace.path(),
                 &request,
                 &event_tx,
-                &action_rx,
-                &pending_actions,
+                &control,
                 Some(worker_store),
                 0,
                 None,
@@ -1971,7 +1995,7 @@ done
         };
         let request_id = match prompt {
             TuiEvent::McpElicitationRequested {
-                id,
+                key,
                 server_name,
                 message,
                 url,
@@ -1980,22 +2004,25 @@ done
                 assert_eq!(server_name, "elicits");
                 assert_eq!(message, "Authorize GitHub");
                 assert_eq!(url.as_deref(), Some("https://github.com/login/device"));
-                id
+                key
             }
             other => panic!("unexpected event: {other:?}"),
         };
         assert_eq!(
-            store.get(&request_id).map(|record| record.kind),
+            store.get(&request_id.request_id).map(|record| record.kind),
             Some(
                 orca_runtime::runtime_pending_interaction::RuntimePendingInteractionKind::McpElicitation
             )
         );
-        action_tx
-            .send(UserAction::RespondToMcpElicitation {
-                id: request_id,
-                accepted: true,
-                content_json: Some(serde_json::json!({"code":"1234"}).to_string()),
-            })
+        controller
+            .broker()
+            .respond(
+                &request_id,
+                crate::types::TuiInteractionResponse::McpElicitation {
+                    accepted: true,
+                    content_json: Some(serde_json::json!({"code":"1234"}).to_string()),
+                },
+            )
             .expect("send mcp elicitation response");
 
         let (should_stop, result, _) = handle.join().expect("executor thread");
@@ -2037,8 +2064,7 @@ done
             harness.workspace.path(),
             &request,
             &harness.event_tx,
-            &harness.action_rx,
-            &harness.pending_actions,
+            &harness.control,
             None,
             0,
             None,
@@ -2077,8 +2103,7 @@ done
             harness.workspace.path(),
             &request,
             &harness.event_tx,
-            &harness.action_rx,
-            &harness.pending_actions,
+            &harness.control,
             None,
             0,
             None,

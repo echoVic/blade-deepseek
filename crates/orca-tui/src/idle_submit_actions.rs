@@ -8,7 +8,9 @@ use orca_core::config::RunConfig;
 use crate::composer_textarea::{expand_pending_pastes, make_textarea, textarea_text};
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
+use crate::types::{
+    AppState, AppStatus, ChatMessage, PendingTuiInput, TuiInteractionResponse, UserAction,
+};
 use crate::vim::VimState;
 
 #[allow(clippy::too_many_arguments)]
@@ -46,8 +48,18 @@ pub(crate) fn handle_idle_submit(
     if state.status == AppStatus::WaitingUserInput {
         state.enter_running();
         state.scroll_to_bottom();
-        if let Some(id) = state.pending_user_input_id.take() {
-            let _ = action_tx.send(UserAction::RespondToUserInput { id, answer: text });
+        if let Some(pending) = state.pending_input.take() {
+            let (key, response) = match pending {
+                PendingTuiInput::UserInput(key) => (key, TuiInteractionResponse::UserInput(text)),
+                PendingTuiInput::McpElicitation(key) => (
+                    key,
+                    TuiInteractionResponse::McpElicitation {
+                        accepted: true,
+                        content_json: Some(text),
+                    },
+                ),
+            };
+            let _ = action_tx.send(UserAction::RespondToInteraction { key, response });
         }
     } else {
         state.record_prompt(text.clone());

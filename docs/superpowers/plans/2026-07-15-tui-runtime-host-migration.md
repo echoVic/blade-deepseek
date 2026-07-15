@@ -1,8 +1,8 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1 complete, P0.3e2 next
+- Status: Active; P0.3e1 and P0.3e2 complete, P0.3e3 next
 - Date: 2026-07-15
-- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8`
+- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e2 validation)
 - Branch: `codex/tui-runtime-host-migration`
 - ADR: `docs/architecture/adr/0005-runtime-host-operation-control-plane.md`
 
@@ -158,14 +158,76 @@ This slice retains the existing TUI turn loop temporarily, but removes its
 detached lifetime. It is independently valuable because TUI shutdown no longer
 leaks work, and it creates the transfer boundary required by the host.
 
-### P0.3e2: Typed Interaction Broker And Dispatcher
+### P0.3e2: Typed Interaction Broker And Dispatcher (Complete)
 
-1. Replace borrowed `Receiver`/`RefCell` interaction adapters with owned,
-   thread-safe handlers.
-2. Keep the controller dispatch loop active while a turn or interaction wait
-   runs.
-3. Fence permission, user-input, and MCP responses by operation generation.
-4. Prove interrupt and shutdown wake every pending waiter.
+This slice removes the raw action mailbox from every interaction waiter. One
+joined `TuiActionDispatcher` owns the raw UI receiver for its entire lifetime.
+It routes ordinary agent commands into a bounded internal mailbox while
+handling interaction responses, interrupt, shutdown, and
+background-current-turn directly. A full agent-command mailbox therefore
+cannot prevent a response or interrupt from reaching the active operation.
+
+One `TuiInteractionBroker` is the live waiter authority. Its key contains the
+`OperationId`, request id, and interaction kind. `RuntimePendingInteractionStore`
+remains only a session/UI projection during this slice; insertion or removal
+there never delivers a response. A `TuiOperationScope` activates one operation
+fence and clears all of that operation's waiters on drop. Broker shutdown
+closes admission, removes all waiters, and wakes them before the dispatcher and
+agent threads are joined.
+
+Migration order:
+
+1. Add broker and dispatcher behavior tests for duplicate registration, stale
+   operation responses, request-id reuse, interrupt, shutdown, and command
+   mailbox backpressure.
+2. Route typed approval, permission, user-input, and MCP responses through the
+   broker. Events and responses carry the operation fence that was active when
+   the waiter was registered.
+3. Replace borrowed `Receiver`/`RefCell` interaction adapters with owned
+   `Send + Sync` handlers backed by broker waiters.
+4. Move background-current-turn polling off the raw receiver and onto the
+   operation controller.
+5. Store user-input versus MCP elicitation explicitly in `AppState`, then fix
+   composer submit and `Ctrl-C` behavior against that typed state.
+
+Temporary state: the synchronous TUI agent loop and UI-side
+`OperationCancellation` remain until P0.3e3, but neither owns or consumes the
+raw action receiver. P0.3e2 is incomplete until production interaction handlers
+have no lifetime parameter, no `Receiver<UserAction>`, and no
+`RefCell<VecDeque<UserAction>>`; `poll_background_current_turn_for_tui` must not
+read an action receiver; and `TuiAgentRuntime` must join both dispatcher and
+agent threads.
+
+Implementation checkpoint:
+
+- one joined `TuiActionDispatcher` exclusively owns the raw UI receiver and
+  routes ordinary commands through a bounded mailbox plus bounded backlog;
+- interaction responses, interrupt, shutdown, and background-current-turn
+  bypass ordinary command backpressure through `TuiOperationController`;
+- `TuiInteractionBroker` is the only response authority and atomically
+  deactivates an interrupted or completed operation before waking its waiters,
+  so cancelled operations cannot admit a late waiter;
+- approval, permission, user-input, and MCP handlers are owned `Send + Sync`
+  values, while `RuntimePendingInteractionStore` remains projection-only;
+- the old unfenced approval/user-input/MCP action variants and runtime-event
+  approval projection are deleted; actionable UI events carry a typed
+  operation/request/kind fence;
+- `AppState` distinguishes user input from MCP elicitation, composer submit
+  sends the matching typed response, terminal completion clears stale
+  interaction presentation, and `Ctrl-C` interrupts both waiting states;
+- background-current-turn polling reads only operation-scoped control, and
+  the background/approval agent-loop behavior tests now run through the real
+  dispatcher boundary.
+
+Final verification followed a fresh `git fetch origin` and rebase onto the
+latest `origin/main` (a no-op because the validated base remained current).
+Focused tests passed with `orca-core` 144/144, `orca-runtime` 769/769 plus
+runtime-host 18/18 and task-output 12/12, and `orca-tui` 508/508. The serial
+workspace all-targets gate and workspace Clippy passed with only pre-existing
+warnings. The release real-API harness tests passed, and the live DeepSeek
+smoke verified provider summary, CLI, history replay and repair, server and
+thread memory, active-turn resume/control, thread read and metadata updates,
+list filters and search, and turn/item pagination within the `$0.02` budget.
 
 ### P0.3e3: Actor-Owned TUI Session And Operation Control
 
@@ -205,11 +267,18 @@ leaks work, and it creates the transfer boundary required by the host.
 
 1. Interaction handlers are owned `Send + Sync` values with no borrowed action
    receiver or `RefCell` queue.
-2. Responses are delivered only to the matching active generation.
-3. Duplicate, stale, cancelled, and shutdown responses fail closed and wake
-   waiters.
-4. TUI interrupt remains responsive while approval, permission, user-input, or
-   MCP waits are active.
+2. Duplicate request keys cannot replace a live waiter. A response is delivered
+   only when operation id, request id, and interaction kind all match the
+   active waiter; a delayed response cannot hit a reused id in a new operation.
+3. Interrupt wakes approval, permission, user-input, and MCP waiters. Shutdown
+   closes admission, wakes every waiter, rejects late requests/responses, and
+   joins the dispatcher.
+4. Interaction response and interrupt routing remains responsive while the
+   bounded ordinary-command mailbox is full.
+5. MCP composer submit sends an MCP response, and `Ctrl-C` during approval or
+   input wait cancels the active interaction instead of entering idle quit
+   confirmation.
+6. Background-current-turn no longer consumes the raw UI action receiver.
 
 ### P0.3e3
 

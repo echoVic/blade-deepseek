@@ -3413,7 +3413,7 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SlashMenu, SlashMenuItem, TuiEvent};
+    use crate::types::{SlashMenu, SlashMenuItem, TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use chrono::Utc;
     use crossbeam_channel as mpsc;
     use orca_core::config::AdditionalWorkingDirectory;
@@ -3491,6 +3491,14 @@ mod tests {
             "0.0.0".to_string(),
             "deepseek".to_string(),
             "/tmp".to_string(),
+        )
+    }
+
+    fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
+        TuiInteractionKey::new(
+            orca_core::cancel::OperationIdAllocator::new().allocate(),
+            id,
+            kind,
         )
     }
 
@@ -3605,7 +3613,7 @@ mod tests {
     fn waiting_approval_does_not_render_composer_under_dialog() {
         let mut state = test_state();
         state.update(TuiEvent::ApprovalNeeded {
-            id: "approval-1".to_string(),
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
             tool: "web_search".to_string(),
             target: Some("A股 2026年6月30日 尾盘资金走向".to_string()),
             preview: None,
@@ -3632,7 +3640,7 @@ mod tests {
     fn waiting_approval_renders_numeric_shortcuts_in_semantic_order() {
         let mut state = test_state();
         state.update(TuiEvent::ApprovalNeeded {
-            id: "approval-1".to_string(),
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
             tool: "edit".to_string(),
             target: Some("src/main.rs".to_string()),
             preview: None,
@@ -3668,7 +3676,7 @@ mod tests {
     fn waiting_permission_approval_renders_specific_risk_title() {
         let mut state = test_state();
         state.update(TuiEvent::PermissionApprovalNeeded {
-            id: "approval-1".to_string(),
+            key: interaction_key(TuiInteractionKind::Permission, "approval-1"),
             tool: "bash".to_string(),
             target: Some("curl https://api.orca.invalid".to_string()),
             preview: Some("bash attempted network access to api.orca.invalid".to_string()),
@@ -3694,7 +3702,7 @@ mod tests {
     fn approval_dialog_keeps_actions_visible_with_long_content() {
         let mut state = test_state();
         state.update(TuiEvent::ApprovalNeeded {
-            id: "approval-long".to_string(),
+            key: interaction_key(TuiInteractionKind::Approval, "approval-long"),
             tool: "bash".to_string(),
             target: Some(format!("echo {}", "very-long-target ".repeat(30))),
             preview: Some(

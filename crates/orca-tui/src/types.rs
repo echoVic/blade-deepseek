@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use orca_core::approval_types::ApprovalMode;
+use orca_core::cancel::OperationId;
 use orca_core::cost_types::UsageTotals;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
@@ -20,6 +21,71 @@ use crate::transcript_view::TranscriptRenderCache;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
 const GOAL_NOTICE_OBJECTIVE_WIDTH: usize = 80;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TuiInteractionKind {
+    Approval,
+    Permission,
+    UserInput,
+    McpElicitation,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TuiInteractionKey {
+    pub operation_id: OperationId,
+    pub request_id: String,
+    pub kind: TuiInteractionKind,
+}
+
+impl TuiInteractionKey {
+    pub fn new(
+        operation_id: OperationId,
+        request_id: impl Into<String>,
+        kind: TuiInteractionKind,
+    ) -> Self {
+        Self {
+            operation_id,
+            request_id: request_id.into(),
+            kind,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiInteractionResponse {
+    Approval(bool),
+    Permission(bool),
+    UserInput(String),
+    McpElicitation {
+        accepted: bool,
+        content_json: Option<String>,
+    },
+}
+
+impl TuiInteractionResponse {
+    pub fn kind(&self) -> TuiInteractionKind {
+        match self {
+            Self::Approval(_) => TuiInteractionKind::Approval,
+            Self::Permission(_) => TuiInteractionKind::Permission,
+            Self::UserInput(_) => TuiInteractionKind::UserInput,
+            Self::McpElicitation { .. } => TuiInteractionKind::McpElicitation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingTuiInput {
+    UserInput(TuiInteractionKey),
+    McpElicitation(TuiInteractionKey),
+}
+
+impl PendingTuiInput {
+    pub fn key(&self) -> &TuiInteractionKey {
+        match self {
+            Self::UserInput(key) | Self::McpElicitation(key) => key,
+        }
+    }
+}
 
 fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
     use orca_core::goal_types::{
@@ -189,25 +255,25 @@ pub enum TuiEvent {
         summary: String,
     },
     ApprovalNeeded {
-        id: String,
+        key: TuiInteractionKey,
         tool: String,
         target: Option<String>,
         preview: Option<String>,
     },
     PermissionApprovalNeeded {
-        id: String,
+        key: TuiInteractionKey,
         tool: String,
         target: Option<String>,
         preview: Option<String>,
         permission_kind: RuntimePermissionRequestKind,
     },
     UserInputRequested {
-        id: String,
+        key: TuiInteractionKey,
         question: String,
         choices: Vec<String>,
     },
     McpElicitationRequested {
-        id: String,
+        key: TuiInteractionKey,
         server_name: String,
         mode: RuntimeMcpElicitationMode,
         message: String,
@@ -272,10 +338,6 @@ pub enum UserAction {
     GoalClear,
     GoalPause,
     GoalResume,
-    Approve {
-        id: String,
-        approved: bool,
-    },
     ResolveBackgroundApproval {
         id: String,
         approved: bool,
@@ -286,14 +348,9 @@ pub enum UserAction {
     ForegroundTask {
         task_id: String,
     },
-    RespondToUserInput {
-        id: String,
-        answer: String,
-    },
-    RespondToMcpElicitation {
-        id: String,
-        accepted: bool,
-        content_json: Option<String>,
+    RespondToInteraction {
+        key: TuiInteractionKey,
+        response: TuiInteractionResponse,
     },
     Backtrack,
     BackgroundCurrentTurn,
@@ -401,6 +458,7 @@ impl ApprovalOption {
 #[derive(Debug, Clone)]
 pub struct ApprovalDialog {
     pub id: String,
+    pub interaction: Option<TuiInteractionKey>,
     pub tool: String,
     pub target: Option<String>,
     pub permission_kind: Option<RuntimePermissionRequestKind>,
@@ -558,7 +616,7 @@ pub struct AppState {
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
-    pub pending_user_input_id: Option<String>,
+    pub pending_input: Option<PendingTuiInput>,
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
@@ -692,7 +750,7 @@ impl AppState {
             cwd,
             event_tx,
             approval_dialog: None,
-            pending_user_input_id: None,
+            pending_input: None,
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
             show_shortcuts: false,
@@ -1129,6 +1187,7 @@ impl AppState {
         self.set_status(AppStatus::WaitingApproval);
         self.approval_dialog = Some(ApprovalDialog {
             id,
+            interaction: None,
             tool,
             target,
             permission_kind: None,
@@ -1743,7 +1802,7 @@ impl AppState {
                 }
             }
             TuiEvent::ApprovalNeeded {
-                id,
+                key,
                 tool,
                 target,
                 preview,
@@ -1751,7 +1810,8 @@ impl AppState {
                 self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
-                    id,
+                    id: key.request_id.clone(),
+                    interaction: Some(key),
                     tool,
                     target,
                     permission_kind: None,
@@ -1762,7 +1822,7 @@ impl AppState {
                 });
             }
             TuiEvent::PermissionApprovalNeeded {
-                id,
+                key,
                 tool,
                 target,
                 preview,
@@ -1771,7 +1831,8 @@ impl AppState {
                 self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
                 self.approval_dialog = Some(ApprovalDialog {
-                    id,
+                    id: key.request_id.clone(),
+                    interaction: Some(key),
                     tool,
                     target,
                     permission_kind: Some(permission_kind),
@@ -1782,12 +1843,12 @@ impl AppState {
                 });
             }
             TuiEvent::UserInputRequested {
-                id,
+                key,
                 question,
                 choices,
             } => {
                 self.set_status(AppStatus::WaitingUserInput);
-                self.pending_user_input_id = Some(id);
+                self.pending_input = Some(PendingTuiInput::UserInput(key));
                 let mut message = question;
                 if !choices.is_empty() {
                     message.push_str("\nChoices: ");
@@ -1796,7 +1857,7 @@ impl AppState {
                 self.push_message(ChatMessage::System(message));
             }
             TuiEvent::McpElicitationRequested {
-                id,
+                key,
                 server_name,
                 mode,
                 message,
@@ -1804,7 +1865,7 @@ impl AppState {
                 requested_schema_json,
             } => {
                 self.set_status(AppStatus::WaitingUserInput);
-                self.pending_user_input_id = Some(id);
+                self.pending_input = Some(PendingTuiInput::McpElicitation(key));
                 let mut lines = vec![format!("MCP {server_name} requests input: {message}")];
                 match mode {
                     RuntimeMcpElicitationMode::Form => {
@@ -1857,6 +1918,8 @@ impl AppState {
             TuiEvent::SessionCompleted { status } => {
                 let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
+                self.approval_dialog = None;
+                self.pending_input = None;
                 self.clear_receiving_tool_progress();
                 self.flush_proposed_plan_parser();
                 self.promote_trailing_reasoning();
@@ -2280,6 +2343,14 @@ mod tests {
         )
     }
 
+    fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
+        TuiInteractionKey::new(
+            orca_core::cancel::OperationIdAllocator::new().allocate(),
+            id,
+            kind,
+        )
+    }
+
     fn dummy_selection() -> crate::selection::TranscriptSelection {
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
         let end = crate::selection::SelectionPos { row: 1, col: 3 };
@@ -2512,6 +2583,7 @@ mod tests {
     fn approval_dialog_resolves_numeric_and_legacy_keys_by_visible_options() {
         let dialog = ApprovalDialog {
             id: "approval-1".to_string(),
+            interaction: None,
             tool: "edit".to_string(),
             target: Some("src/main.rs".to_string()),
             permission_kind: None,
@@ -2538,6 +2610,7 @@ mod tests {
 
         let dynamic = ApprovalDialog {
             id: "approval-2".to_string(),
+            interaction: None,
             tool: "web_search".to_string(),
             target: Some("query".to_string()),
             permission_kind: None,
@@ -2616,7 +2689,7 @@ mod tests {
     fn approval_needed_event_populates_dialog_options_and_diff() {
         let mut state = state();
         state.update(TuiEvent::ApprovalNeeded {
-            id: "approval-1".to_string(),
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
             tool: "edit".to_string(),
             target: Some("src/auth/token.rs".to_string()),
             preview: Some("@@ token.rs @@\n- a\n+ b".to_string()),
@@ -2632,20 +2705,26 @@ mod tests {
     fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
         let mut state = state();
         state.update(TuiEvent::UserInputRequested {
-            id: "ask-1".to_string(),
+            key: interaction_key(TuiInteractionKind::UserInput, "ask-1"),
             question: "Continue?".to_string(),
             choices: vec!["yes".to_string(), "no".to_string()],
         });
 
         assert_eq!(state.status, AppStatus::WaitingUserInput);
-        assert_eq!(state.pending_user_input_id.as_deref(), Some("ask-1"));
+        assert!(matches!(
+            state.pending_input.as_ref(),
+            Some(PendingTuiInput::UserInput(key)) if key.request_id == "ask-1"
+        ));
     }
 
     #[test]
     fn mcp_elicitation_requested_event_tracks_pending_runtime_interaction_id() {
         let mut state = state();
         state.update(TuiEvent::McpElicitationRequested {
-            id: "mcp_elicitation:github:42".to_string(),
+            key: interaction_key(
+                TuiInteractionKind::McpElicitation,
+                "mcp_elicitation:github:42",
+            ),
             server_name: "github".to_string(),
             mode: RuntimeMcpElicitationMode::Url,
             message: "Authorize GitHub".to_string(),
@@ -2654,10 +2733,11 @@ mod tests {
         });
 
         assert_eq!(state.status, AppStatus::WaitingUserInput);
-        assert_eq!(
-            state.pending_user_input_id.as_deref(),
-            Some("mcp_elicitation:github:42")
-        );
+        assert!(matches!(
+            state.pending_input.as_ref(),
+            Some(PendingTuiInput::McpElicitation(key))
+                if key.request_id == "mcp_elicitation:github:42"
+        ));
         assert!(matches!(
             state.messages.last(),
             Some(ChatMessage::System(message))
@@ -2665,6 +2745,38 @@ mod tests {
                     && message.contains("Mode: url")
                     && message.contains("URL: https://github.com/login/device")
         ));
+    }
+
+    #[test]
+    fn session_completion_clears_pending_interaction_projection() {
+        let mut input_state = state();
+        input_state.update(TuiEvent::UserInputRequested {
+            key: interaction_key(TuiInteractionKind::UserInput, "ask-1"),
+            question: "Continue?".to_string(),
+            choices: Vec::new(),
+        });
+
+        input_state.update(TuiEvent::SessionCompleted {
+            status: "interrupted".to_string(),
+        });
+
+        assert_eq!(input_state.status, AppStatus::Idle);
+        assert!(input_state.pending_input.is_none());
+
+        let mut approval_state = state();
+        approval_state.update(TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
+            tool: "bash".to_string(),
+            target: Some("cargo test".to_string()),
+            preview: None,
+        });
+
+        approval_state.update(TuiEvent::SessionCompleted {
+            status: "interrupted".to_string(),
+        });
+
+        assert_eq!(approval_state.status, AppStatus::Idle);
+        assert!(approval_state.approval_dialog.is_none());
     }
 
     #[test]
@@ -4379,7 +4491,7 @@ mod tests {
         state.running_started_at = Some(started_at);
 
         state.update(TuiEvent::ApprovalNeeded {
-            id: "approval-1".to_string(),
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
             tool: "bash".to_string(),
             target: Some("cargo test".to_string()),
             preview: None,

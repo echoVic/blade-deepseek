@@ -1,6 +1,4 @@
-use crossbeam_channel::{Receiver, Sender};
-use std::cell::RefCell;
-use std::collections::VecDeque;
+use crossbeam_channel::Sender;
 use std::io;
 
 use orca_approval::ApprovalPolicy;
@@ -20,51 +18,71 @@ use orca_runtime::runtime_pending_interaction::{
 };
 use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
 
-use crate::types::{TuiEvent, UserAction};
+use crate::operation_controller::TuiTurnControl;
+use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 
 pub(crate) enum TuiToolApprovalOutcome {
     Continue,
     Denied(tool_types::ToolResult),
 }
 
-pub(crate) struct TuiApprovalHandler<'a> {
-    action_rx: &'a Receiver<UserAction>,
-    pending_actions: &'a RefCell<VecDeque<UserAction>>,
+pub(crate) struct TuiApprovalHandler {
+    event_tx: Sender<TuiEvent>,
+    control: TuiTurnControl,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
-impl<'a> TuiApprovalHandler<'a> {
-    pub(crate) fn new(
-        action_rx: &'a Receiver<UserAction>,
-        pending_actions: &'a RefCell<VecDeque<UserAction>>,
-    ) -> Self {
+impl TuiApprovalHandler {
+    pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
         Self {
-            action_rx,
-            pending_actions,
+            event_tx,
+            control,
+            pending_interactions: None,
         }
+    }
+
+    pub(crate) fn with_pending_interactions(
+        mut self,
+        store: RuntimePendingInteractionStore,
+    ) -> Self {
+        self.pending_interactions = Some(store);
+        self
     }
 }
 
-impl RuntimeApprovalHandler for TuiApprovalHandler<'_> {
+impl RuntimeApprovalHandler for TuiApprovalHandler {
     fn resolve_interactive(
         &self,
         approval: &ApprovalRequest,
         _request: &tool_types::ToolRequest,
     ) -> std::io::Result<ApprovalResolution> {
-        let allowed = loop {
-            match self.action_rx.recv() {
-                Ok(UserAction::Approve { id, approved }) if id == approval.id => break approved,
-                Ok(action @ UserAction::Approve { .. }) => {
-                    self.pending_actions.borrow_mut().push_back(action)
-                }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break false,
-                Err(error) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("TUI action channel closed while waiting for approval: {error}"),
-                    ));
-                }
-                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
-            }
+        let pending = RuntimePendingInteractionRecord::from_tool_approval(approval, _request);
+        let waiter = self
+            .control
+            .register_interaction(TuiInteractionKind::Approval, &approval.id)?;
+        let key = waiter.key().clone();
+        let projected =
+            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
+        if self
+            .event_tx
+            .send(approval_event_from_pending_interaction(&key, &pending))
+            .is_err()
+        {
+            remove_projected_interaction(
+                self.pending_interactions.as_ref(),
+                &approval.id,
+                projected,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUI event channel closed while waiting for approval",
+            ));
+        }
+        let response = waiter.wait();
+        remove_projected_interaction(self.pending_interactions.as_ref(), &approval.id, projected);
+        let allowed = match response? {
+            TuiInteractionResponse::Approval(allowed) => allowed,
+            _ => return Err(io::Error::other("invalid TUI approval response")),
         };
         Ok(ApprovalResolution {
             id: approval.id.clone(),
@@ -88,8 +106,7 @@ pub(crate) fn resolve_tui_tool_approval(
     policy: &ApprovalPolicy,
     runtime_context: &mut RuntimeToolActorContext,
     event_tx: &Sender<TuiEvent>,
-    action_rx: &Receiver<UserAction>,
-    pending_actions: &RefCell<VecDeque<UserAction>>,
+    control: &TuiTurnControl,
     pending_interactions: Option<&RuntimePendingInteractionStore>,
 ) -> TuiToolApprovalOutcome {
     let Some(approval) = approval_request_for_invocation(invocation) else {
@@ -108,17 +125,11 @@ pub(crate) fn resolve_tui_tool_approval(
         RuntimeApprovalDecision::Ask(approval) => {
             let mut approval = approval.clone();
             approval.preview = build_approval_preview(tool_request);
-            let pending =
-                RuntimePendingInteractionRecord::from_tool_approval(&approval, tool_request);
-            if let Err(error) = insert_pending_interaction(pending_interactions, pending.clone()) {
-                return TuiToolApprovalOutcome::Denied(tool_types::ToolResult::denied(
-                    tool_request,
-                    error.to_string(),
-                ));
-            }
-            let _ = event_tx.send(approval_event_from_pending_interaction(&pending));
-
-            let handler = TuiApprovalHandler::new(action_rx, pending_actions);
+            let handler = match pending_interactions {
+                Some(store) => TuiApprovalHandler::new(event_tx.clone(), control.clone())
+                    .with_pending_interactions(store.clone()),
+                None => TuiApprovalHandler::new(event_tx.clone(), control.clone()),
+            };
             let resolution = runtime_context
                 .resolve_interactive_tool_approval(&handler, &approval, tool_request)
                 .unwrap_or_else(|error| ApprovalResolution {
@@ -126,8 +137,6 @@ pub(crate) fn resolve_tui_tool_approval(
                     decision: ApprovalDecision::Deny,
                     reason: format!("interactive approval failed: {error}"),
                 });
-            remove_pending_interaction(pending_interactions, &approval.id);
-
             if resolution.decision == ApprovalDecision::Deny {
                 TuiToolApprovalOutcome::Denied(tool_types::ToolResult::denied(
                     tool_request,
@@ -193,26 +202,20 @@ fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
 /// `request_permissions` tool) through the TUI approval channel. Display
 /// fields can be overridden so callers like the bash sandbox escalation can
 /// show the failing command instead of the generic permission summary.
-pub(crate) struct TuiPermissionRequestHandler<'a> {
-    event_tx: &'a Sender<TuiEvent>,
-    action_rx: &'a Receiver<UserAction>,
-    pending_actions: &'a RefCell<VecDeque<UserAction>>,
+pub(crate) struct TuiPermissionRequestHandler {
+    event_tx: Sender<TuiEvent>,
+    control: TuiTurnControl,
     tool: String,
     target: Option<String>,
     preview: Option<String>,
     pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
-impl<'a> TuiPermissionRequestHandler<'a> {
-    pub(crate) fn new(
-        event_tx: &'a Sender<TuiEvent>,
-        action_rx: &'a Receiver<UserAction>,
-        pending_actions: &'a RefCell<VecDeque<UserAction>>,
-    ) -> Self {
+impl TuiPermissionRequestHandler {
+    pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
         Self {
             event_tx,
-            action_rx,
-            pending_actions,
+            control,
             tool: "request_permissions".to_string(),
             target: None,
             preview: None,
@@ -241,7 +244,7 @@ impl<'a> TuiPermissionRequestHandler<'a> {
     }
 }
 
-impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
+impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler {
     fn request_permissions(
         &self,
         request: &RuntimePermissionRequest,
@@ -256,30 +259,35 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler<'_> {
             self.target.clone(),
             Some(preview),
         );
-        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone())?;
-        let _ = self
+        let waiter = self
+            .control
+            .register_interaction(TuiInteractionKind::Permission, &request.id)?;
+        let key = waiter.key().clone();
+        let projected =
+            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
+        if self
             .event_tx
-            .send(approval_event_from_pending_interaction(&pending));
-        let allowed = loop {
-            match self.action_rx.recv() {
-                Ok(UserAction::Approve { id, approved }) if id == request.id => {
-                    break Ok(approved);
-                }
-                Ok(action @ UserAction::Approve { .. }) => {
-                    self.pending_actions.borrow_mut().push_back(action)
-                }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break Ok(false),
-                Err(error) => {
-                    break Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("TUI action channel closed while waiting for permission: {error}"),
-                    ));
-                }
-                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
-            }
+            .send(approval_event_from_pending_interaction(&key, &pending))
+            .is_err()
+        {
+            remove_projected_interaction(
+                self.pending_interactions.as_ref(),
+                &request.id,
+                projected,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUI event channel closed while waiting for permission",
+            ));
+        }
+        let response = waiter.wait();
+        remove_projected_interaction(self.pending_interactions.as_ref(), &request.id, projected);
+        let allowed = match response {
+            Ok(TuiInteractionResponse::Permission(allowed)) => allowed,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => false,
+            Err(error) => return Err(error),
+            Ok(_) => return Err(io::Error::other("invalid TUI permission response")),
         };
-        remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
-        let allowed = allowed?;
         Ok(RuntimePermissionResponse {
             decision: if allowed {
                 PermissionResponseDecision::Allow
@@ -349,23 +357,17 @@ fn describe_permission_request(request: &RuntimePermissionRequest) -> String {
     lines.join("\n")
 }
 
-pub(crate) struct TuiUserInputHandler<'a> {
-    event_tx: &'a Sender<TuiEvent>,
-    action_rx: &'a Receiver<UserAction>,
-    pending_actions: &'a RefCell<VecDeque<UserAction>>,
+pub(crate) struct TuiUserInputHandler {
+    event_tx: Sender<TuiEvent>,
+    control: TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
-impl<'a> TuiUserInputHandler<'a> {
-    pub(crate) fn new(
-        event_tx: &'a Sender<TuiEvent>,
-        action_rx: &'a Receiver<UserAction>,
-        pending_actions: &'a RefCell<VecDeque<UserAction>>,
-    ) -> Self {
+impl TuiUserInputHandler {
+    pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
         Self {
             event_tx,
-            action_rx,
-            pending_actions,
+            control,
             pending_interactions: None,
         }
     }
@@ -379,57 +381,55 @@ impl<'a> TuiUserInputHandler<'a> {
     }
 }
 
-impl RuntimeUserInputHandler for TuiUserInputHandler<'_> {
+impl RuntimeUserInputHandler for TuiUserInputHandler {
     fn request_user_input(
         &self,
         request: &RuntimeUserInputRequest,
     ) -> std::io::Result<Option<String>> {
         let pending = RuntimePendingInteractionRecord::from_user_input(request);
-        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone())?;
-        let _ = self
+        let waiter = self
+            .control
+            .register_interaction(TuiInteractionKind::UserInput, &request.id)?;
+        let key = waiter.key().clone();
+        let projected =
+            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
+        if self
             .event_tx
-            .send(user_input_event_from_pending_interaction(&pending));
-
-        let response = loop {
-            match self.action_rx.recv() {
-                Ok(UserAction::RespondToUserInput { id, answer }) if id == request.id => {
-                    break Ok(Some(answer));
-                }
-                Ok(action @ UserAction::RespondToUserInput { .. }) => {
-                    self.pending_actions.borrow_mut().push_back(action)
-                }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break Ok(None),
-                Err(error) => {
-                    break Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("TUI action channel closed while waiting for user input: {error}"),
-                    ));
-                }
-                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
-            }
-        };
-        remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
-        response
+            .send(user_input_event_from_pending_interaction(&key, &pending))
+            .is_err()
+        {
+            remove_projected_interaction(
+                self.pending_interactions.as_ref(),
+                &request.id,
+                projected,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUI event channel closed while waiting for user input",
+            ));
+        }
+        let response = waiter.wait();
+        remove_projected_interaction(self.pending_interactions.as_ref(), &request.id, projected);
+        match response {
+            Ok(TuiInteractionResponse::UserInput(answer)) => Ok(Some(answer)),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other("invalid TUI user-input response")),
+        }
     }
 }
 
-pub(crate) struct TuiMcpElicitationHandler<'a> {
-    event_tx: &'a Sender<TuiEvent>,
-    action_rx: &'a Receiver<UserAction>,
-    pending_actions: &'a RefCell<VecDeque<UserAction>>,
+pub(crate) struct TuiMcpElicitationHandler {
+    event_tx: Sender<TuiEvent>,
+    control: TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
-impl<'a> TuiMcpElicitationHandler<'a> {
-    pub(crate) fn new(
-        event_tx: &'a Sender<TuiEvent>,
-        action_rx: &'a Receiver<UserAction>,
-        pending_actions: &'a RefCell<VecDeque<UserAction>>,
-    ) -> Self {
+impl TuiMcpElicitationHandler {
+    pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
         Self {
             event_tx,
-            action_rx,
-            pending_actions,
+            control,
             pending_interactions: None,
         }
     }
@@ -447,41 +447,44 @@ impl<'a> TuiMcpElicitationHandler<'a> {
         request: &RuntimeMcpElicitationRequest,
     ) -> io::Result<Option<String>> {
         let pending = RuntimePendingInteractionRecord::from_mcp_elicitation(request);
-        insert_pending_interaction(self.pending_interactions.as_ref(), pending.clone())?;
-        let _ = self
+        let waiter = self
+            .control
+            .register_interaction(TuiInteractionKind::McpElicitation, &request.id)?;
+        let key = waiter.key().clone();
+        let projected =
+            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
+        if self
             .event_tx
-            .send(mcp_elicitation_event_from_pending_interaction(&pending));
-
-        let response = loop {
-            match self.action_rx.recv() {
-                Ok(UserAction::RespondToMcpElicitation {
-                    id,
-                    accepted,
-                    content_json,
-                }) if id == request.id => {
-                    break Ok(accepted.then_some(content_json.unwrap_or_else(|| "{}".to_string())));
-                }
-                Ok(action @ UserAction::RespondToMcpElicitation { .. }) => {
-                    self.pending_actions.borrow_mut().push_back(action)
-                }
-                Ok(UserAction::Interrupt) | Ok(UserAction::Cancel) => break Ok(None),
-                Err(error) => {
-                    break Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!(
-                            "TUI action channel closed while waiting for MCP elicitation: {error}"
-                        ),
-                    ));
-                }
-                Ok(action) => self.pending_actions.borrow_mut().push_back(action),
-            }
-        };
-        remove_pending_interaction(self.pending_interactions.as_ref(), &request.id);
-        response
+            .send(mcp_elicitation_event_from_pending_interaction(
+                &key, &pending,
+            ))
+            .is_err()
+        {
+            remove_projected_interaction(
+                self.pending_interactions.as_ref(),
+                &request.id,
+                projected,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUI event channel closed while waiting for MCP elicitation",
+            ));
+        }
+        let response = waiter.wait();
+        remove_projected_interaction(self.pending_interactions.as_ref(), &request.id, projected);
+        match response {
+            Ok(TuiInteractionResponse::McpElicitation {
+                accepted,
+                content_json,
+            }) => Ok(accepted.then_some(content_json.unwrap_or_else(|| "{}".to_string()))),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other("invalid TUI MCP elicitation response")),
+        }
     }
 }
 
-impl McpElicitationHandler for TuiMcpElicitationHandler<'_> {
+impl McpElicitationHandler for TuiMcpElicitationHandler {
     fn handle_elicitation(
         &self,
         request: McpElicitationRequest,
@@ -516,32 +519,33 @@ impl McpElicitationHandler for TuiMcpElicitationHandler<'_> {
     }
 }
 
-fn insert_pending_interaction(
+fn project_pending_interaction(
     store: Option<&RuntimePendingInteractionStore>,
     record: RuntimePendingInteractionRecord,
-) -> io::Result<()> {
+) -> bool {
     if let Some(store) = store {
-        let id = record.id.clone();
-        store.insert(record).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("duplicate pending interaction id: {id}"),
-            )
-        })?;
+        return store.insert(record).is_ok();
     }
-    Ok(())
+    false
 }
 
-fn remove_pending_interaction(store: Option<&RuntimePendingInteractionStore>, id: &str) {
-    if let Some(store) = store {
+fn remove_projected_interaction(
+    store: Option<&RuntimePendingInteractionStore>,
+    id: &str,
+    projected: bool,
+) {
+    if projected && let Some(store) = store {
         store.remove(id);
     }
 }
 
-fn approval_event_from_pending_interaction(record: &RuntimePendingInteractionRecord) -> TuiEvent {
+fn approval_event_from_pending_interaction(
+    key: &TuiInteractionKey,
+    record: &RuntimePendingInteractionRecord,
+) -> TuiEvent {
     if let Some(permission_kind) = record.permission_kind {
         return TuiEvent::PermissionApprovalNeeded {
-            id: record.id.clone(),
+            key: key.clone(),
             tool: record.tool.clone().unwrap_or_default(),
             target: record.target.clone(),
             preview: record.preview.clone(),
@@ -550,22 +554,26 @@ fn approval_event_from_pending_interaction(record: &RuntimePendingInteractionRec
     }
 
     TuiEvent::ApprovalNeeded {
-        id: record.id.clone(),
+        key: key.clone(),
         tool: record.tool.clone().unwrap_or_default(),
         target: record.target.clone(),
         preview: record.preview.clone(),
     }
 }
 
-fn user_input_event_from_pending_interaction(record: &RuntimePendingInteractionRecord) -> TuiEvent {
+fn user_input_event_from_pending_interaction(
+    key: &TuiInteractionKey,
+    record: &RuntimePendingInteractionRecord,
+) -> TuiEvent {
     TuiEvent::UserInputRequested {
-        id: record.id.clone(),
+        key: key.clone(),
         question: record.question.clone().unwrap_or_default(),
         choices: record.choices.clone(),
     }
 }
 
 fn mcp_elicitation_event_from_pending_interaction(
+    key: &TuiInteractionKey,
     record: &RuntimePendingInteractionRecord,
 ) -> TuiEvent {
     let elicitation = record
@@ -573,7 +581,7 @@ fn mcp_elicitation_event_from_pending_interaction(
         .as_ref()
         .expect("mcp elicitation pending record has details");
     TuiEvent::McpElicitationRequested {
-        id: record.id.clone(),
+        key: key.clone(),
         server_name: elicitation.server_name.clone(),
         mode: elicitation.mode.clone(),
         message: record.question.clone().unwrap_or_default(),
@@ -583,812 +591,5 @@ fn mcp_elicitation_event_from_pending_interaction(
 }
 
 #[cfg(test)]
-mod tests {
-    use crossbeam_channel as mpsc;
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-
-    use orca_runtime::lifecycle::RuntimeToolActorContext;
-    use orca_runtime::runtime_pending_interaction::{
-        RuntimeMcpElicitationMode, RuntimeMcpElicitationRequest, RuntimePendingInteractionKind,
-        RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
-    };
-
-    use super::*;
-
-    #[test]
-    fn tui_approval_handler_resolves_approve_action_through_runtime_context() {
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::Approve {
-                id: "approval-1".to_string(),
-                approved: true,
-            })
-            .expect("send approval");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
-        let approval = orca_core::approval_types::ApprovalRequest {
-            id: "approval-1".to_string(),
-            action: orca_core::approval_types::ActionKind::Shell,
-            description: "bash requested shell".to_string(),
-            tool: Some("bash".to_string()),
-            target: Some("echo hi".to_string()),
-            preview: Some("$ echo hi".to_string()),
-        };
-        let request = tool_types::ToolRequest {
-            id: "bash".to_string(),
-            name: tool_types::ToolName::Bash,
-            action: orca_core::approval_types::ActionKind::Shell,
-            target: Some("echo hi".to_string()),
-            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
-        };
-
-        let resolution = context
-            .resolve_interactive_tool_approval(&handler, &approval, &request)
-            .expect("approval resolution");
-
-        assert_eq!(resolution.id, "approval-1");
-        assert_eq!(
-            resolution.decision,
-            orca_core::approval_types::ApprovalDecision::Allow
-        );
-        assert_eq!(resolution.reason, "user approved");
-    }
-
-    #[test]
-    fn tui_approval_handler_preserves_queued_app_actions() {
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::Submit("next prompt".to_string()))
-            .expect("send queued submit");
-        action_tx
-            .send(UserAction::Approve {
-                id: "approval-1".to_string(),
-                approved: true,
-            })
-            .expect("send approval");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
-        let approval = orca_core::approval_types::ApprovalRequest {
-            id: "approval-1".to_string(),
-            action: orca_core::approval_types::ActionKind::Shell,
-            description: "bash requested shell".to_string(),
-            tool: Some("bash".to_string()),
-            target: Some("echo hi".to_string()),
-            preview: Some("$ echo hi".to_string()),
-        };
-        let request = tool_types::ToolRequest {
-            id: "bash".to_string(),
-            name: tool_types::ToolName::Bash,
-            action: orca_core::approval_types::ActionKind::Shell,
-            target: Some("echo hi".to_string()),
-            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
-        };
-
-        let resolution = context
-            .resolve_interactive_tool_approval(&handler, &approval, &request)
-            .expect("approval resolution");
-
-        assert_eq!(
-            resolution.decision,
-            orca_core::approval_types::ApprovalDecision::Allow
-        );
-        assert!(matches!(
-            pending_actions.borrow_mut().pop_front(),
-            Some(UserAction::Submit(prompt)) if prompt == "next prompt"
-        ));
-    }
-
-    #[test]
-    fn tui_approval_handler_resolves_only_matching_runtime_interaction_id() {
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::Approve {
-                id: "approval-other".to_string(),
-                approved: false,
-            })
-            .expect("send unrelated approval");
-        action_tx
-            .send(UserAction::Approve {
-                id: "approval-1".to_string(),
-                approved: true,
-            })
-            .expect("send matching approval");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
-        let approval = orca_core::approval_types::ApprovalRequest {
-            id: "approval-1".to_string(),
-            action: orca_core::approval_types::ActionKind::Shell,
-            description: "bash requested shell".to_string(),
-            tool: Some("bash".to_string()),
-            target: Some("echo hi".to_string()),
-            preview: Some("$ echo hi".to_string()),
-        };
-        let request = tool_types::ToolRequest {
-            id: "bash".to_string(),
-            name: tool_types::ToolName::Bash,
-            action: orca_core::approval_types::ActionKind::Shell,
-            target: Some("echo hi".to_string()),
-            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
-        };
-
-        let resolution = context
-            .resolve_interactive_tool_approval(&handler, &approval, &request)
-            .expect("approval resolution");
-
-        assert_eq!(
-            resolution.decision,
-            orca_core::approval_types::ApprovalDecision::Allow
-        );
-        assert!(matches!(
-            pending_actions.borrow_mut().pop_front(),
-            Some(UserAction::Approve { id, approved: false }) if id == "approval-other"
-        ));
-    }
-
-    #[test]
-    fn tui_tool_approval_rejects_duplicate_pending_interaction_id_before_prompting() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::Approve {
-                id: "approval-bash-1".to_string(),
-                approved: true,
-            })
-            .expect("send approval");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let store = RuntimePendingInteractionStore::default();
-        let approval = orca_core::approval_types::ApprovalRequest {
-            id: "approval-bash-1".to_string(),
-            action: orca_core::approval_types::ActionKind::Shell,
-            description: "bash requested shell".to_string(),
-            tool: Some("bash".to_string()),
-            target: Some("echo existing".to_string()),
-            preview: Some("$ echo existing".to_string()),
-        };
-        let request = tool_types::ToolRequest {
-            id: "bash-1".to_string(),
-            name: tool_types::ToolName::Bash,
-            action: orca_core::approval_types::ActionKind::Shell,
-            target: Some("echo duplicate".to_string()),
-            raw_arguments: Some(serde_json::json!({ "command": "echo duplicate" }).to_string()),
-        };
-        let first = RuntimePendingInteractionRecord::from_tool_approval(&approval, &request);
-        store.insert(first.clone()).expect("seed pending");
-        let invocation = ToolInvocation {
-            requested: request.clone(),
-            effective: request.clone(),
-            action: Some(orca_core::approval_types::ActionKind::Shell),
-        };
-        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
-
-        let outcome = resolve_tui_tool_approval(
-            &invocation,
-            &request,
-            &ApprovalPolicy::new(orca_core::approval_types::ApprovalMode::Suggest),
-            &mut context,
-            &event_tx,
-            &action_rx,
-            &pending_actions,
-            Some(&store),
-        );
-
-        let TuiToolApprovalOutcome::Denied(result) = outcome else {
-            panic!("duplicate pending id should deny before prompting");
-        };
-        assert_eq!(result.status, tool_types::ToolStatus::Denied);
-        assert!(result.error.as_deref().is_some_and(|error| {
-            error.contains("duplicate pending interaction id: approval-bash-1")
-        }));
-        assert_eq!(store.get("approval-bash-1"), Some(first));
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn tui_approval_handler_maps_cancel_to_runtime_denial() {
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx.send(UserAction::Cancel).expect("send cancel");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-approval", 2);
-        let approval = orca_core::approval_types::ApprovalRequest {
-            id: "approval-1".to_string(),
-            action: orca_core::approval_types::ActionKind::Shell,
-            description: "bash requested shell".to_string(),
-            tool: Some("bash".to_string()),
-            target: Some("echo hi".to_string()),
-            preview: Some("$ echo hi".to_string()),
-        };
-        let request = tool_types::ToolRequest {
-            id: "bash".to_string(),
-            name: tool_types::ToolName::Bash,
-            action: orca_core::approval_types::ActionKind::Shell,
-            target: Some("echo hi".to_string()),
-            raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
-        };
-
-        let resolution = context
-            .resolve_interactive_tool_approval(&handler, &approval, &request)
-            .expect("approval resolution");
-
-        assert_eq!(resolution.id, "approval-1");
-        assert_eq!(
-            resolution.decision,
-            orca_core::approval_types::ApprovalDecision::Deny
-        );
-        assert_eq!(resolution.reason, "user denied");
-    }
-
-    #[test]
-    fn tui_user_input_handler_routes_answer_through_runtime_context() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::RespondToUserInput {
-                id: "ask".to_string(),
-                answer: "yes".to_string(),
-            })
-            .expect("send answer");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
-        let request = tool_types::ToolRequest {
-            id: "ask".to_string(),
-            name: tool_types::ToolName::RequestUserInput,
-            action: orca_core::approval_types::ActionKind::Read,
-            target: None,
-            raw_arguments: Some(
-                serde_json::json!({
-                    "question": "Continue?",
-                    "choices": ["yes", "no"]
-                })
-                .to_string(),
-            ),
-        };
-
-        let result = context
-            .execute_user_input_tool(&request, &handler)
-            .expect("user input result");
-        let events: Vec<TuiEvent> = event_rx.try_iter().collect();
-
-        assert_eq!(result.status, tool_types::ToolStatus::Completed);
-        assert_eq!(result.output.as_deref(), Some("yes"));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                TuiEvent::UserInputRequested { id, question, choices }
-                if id == "ask"
-                    && question == "Continue?"
-                    && choices == &vec!["yes".to_string(), "no".to_string()]
-            )
-        }));
-    }
-
-    #[test]
-    fn tui_user_input_handler_tracks_runtime_pending_interaction_until_answered() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        let store = RuntimePendingInteractionStore::default();
-        let request = tool_types::ToolRequest {
-            id: "ask".to_string(),
-            name: tool_types::ToolName::RequestUserInput,
-            action: orca_core::approval_types::ActionKind::Read,
-            target: None,
-            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
-        };
-        let worker_store = store.clone();
-
-        let handle = std::thread::spawn(move || {
-            let pending_actions = RefCell::new(VecDeque::new());
-            let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions)
-                .with_pending_interactions(worker_store);
-            let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
-            context
-                .execute_user_input_tool(&request, &handler)
-                .expect("user input result")
-        });
-        let prompt = event_rx.recv().expect("user input prompt");
-        assert!(matches!(
-            prompt,
-            TuiEvent::UserInputRequested { id, .. } if id == "ask"
-        ));
-        assert_eq!(
-            store.get("ask").map(|record| record.kind),
-            Some(RuntimePendingInteractionKind::UserInput)
-        );
-
-        action_tx
-            .send(UserAction::RespondToUserInput {
-                id: "ask".to_string(),
-                answer: "yes".to_string(),
-            })
-            .expect("send answer");
-        let result = handle.join().expect("user input thread");
-
-        assert_eq!(result.status, tool_types::ToolStatus::Completed);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn tui_user_input_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx.send(UserAction::Cancel).expect("send cancel");
-        let store = RuntimePendingInteractionStore::default();
-        let first = RuntimePendingInteractionRecord::from_user_input(&RuntimeUserInputRequest {
-            id: "ask".to_string(),
-            question: "Existing?".to_string(),
-            choices: Vec::new(),
-        });
-        store.insert(first.clone()).expect("seed pending");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions)
-            .with_pending_interactions(store.clone());
-        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
-        let request = tool_types::ToolRequest {
-            id: "ask".to_string(),
-            name: tool_types::ToolName::RequestUserInput,
-            action: orca_core::approval_types::ActionKind::Read,
-            target: None,
-            raw_arguments: Some(serde_json::json!({ "question": "Duplicate?" }).to_string()),
-        };
-
-        let error = context
-            .execute_user_input_tool(&request, &handler)
-            .expect_err("duplicate pending id should fail before waiting");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(store.get("ask"), Some(first));
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn tui_user_input_handler_preserves_queued_app_actions() {
-        let (event_tx, _event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::Submit("next prompt".to_string()))
-            .expect("send queued submit");
-        action_tx
-            .send(UserAction::RespondToUserInput {
-                id: "ask".to_string(),
-                answer: "yes".to_string(),
-            })
-            .expect("send answer");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
-        let request = tool_types::ToolRequest {
-            id: "ask".to_string(),
-            name: tool_types::ToolName::RequestUserInput,
-            action: orca_core::approval_types::ActionKind::Read,
-            target: None,
-            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
-        };
-
-        let result = context
-            .execute_user_input_tool(&request, &handler)
-            .expect("user input result");
-
-        assert_eq!(result.status, tool_types::ToolStatus::Completed);
-        assert!(matches!(
-            pending_actions.borrow_mut().pop_front(),
-            Some(UserAction::Submit(prompt)) if prompt == "next prompt"
-        ));
-    }
-
-    #[test]
-    fn tui_user_input_handler_resolves_only_matching_runtime_interaction_id() {
-        let (event_tx, _event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::RespondToUserInput {
-                id: "ask-other".to_string(),
-                answer: "wrong".to_string(),
-            })
-            .expect("send unrelated answer");
-        action_tx
-            .send(UserAction::RespondToUserInput {
-                id: "ask".to_string(),
-                answer: "yes".to_string(),
-            })
-            .expect("send matching answer");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
-        let request = tool_types::ToolRequest {
-            id: "ask".to_string(),
-            name: tool_types::ToolName::RequestUserInput,
-            action: orca_core::approval_types::ActionKind::Read,
-            target: None,
-            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
-        };
-
-        let result = context
-            .execute_user_input_tool(&request, &handler)
-            .expect("user input result");
-
-        assert_eq!(result.status, tool_types::ToolStatus::Completed);
-        assert_eq!(result.output.as_deref(), Some("yes"));
-        assert!(matches!(
-            pending_actions.borrow_mut().pop_front(),
-            Some(UserAction::RespondToUserInput { id, answer }) if id == "ask-other" && answer == "wrong"
-        ));
-    }
-
-    #[test]
-    fn tui_user_input_handler_maps_cancel_to_cancelled_terminal() {
-        let (event_tx, _event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx.send(UserAction::Cancel).expect("send cancel");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
-        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
-        let request = tool_types::ToolRequest {
-            id: "ask".to_string(),
-            name: tool_types::ToolName::RequestUserInput,
-            action: orca_core::approval_types::ActionKind::Read,
-            target: None,
-            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
-        };
-
-        let result = context
-            .execute_user_input_tool(&request, &handler)
-            .expect("user input result");
-
-        assert_eq!(result.status, tool_types::ToolStatus::Cancelled);
-        assert_eq!(
-            result.error.as_deref(),
-            Some("user input request cancelled")
-        );
-    }
-
-    #[test]
-    fn tui_user_input_handler_reports_closed_action_channel() {
-        let (event_tx, _event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        drop(action_tx);
-        let store = RuntimePendingInteractionStore::default();
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions)
-            .with_pending_interactions(store.clone());
-        let mut context = RuntimeToolActorContext::new("tui-user-input", 2);
-        let request = tool_types::ToolRequest {
-            id: "ask".to_string(),
-            name: tool_types::ToolName::RequestUserInput,
-            action: orca_core::approval_types::ActionKind::Read,
-            target: None,
-            raw_arguments: Some(serde_json::json!({ "question": "Continue?" }).to_string()),
-        };
-
-        let error = context
-            .execute_user_input_tool(&request, &handler)
-            .expect_err("closed action channel must not be reported as user cancellation");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn tui_mcp_elicitation_handler_tracks_runtime_pending_interaction_until_resolved() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        let store = RuntimePendingInteractionStore::default();
-        let request = RuntimeMcpElicitationRequest::new(
-            "github",
-            "42",
-            RuntimeMcpElicitationMode::Url,
-            "Authorize GitHub",
-            Some("https://github.com/login/device".to_string()),
-            None,
-        );
-        let request_id = request.id.clone();
-        let worker_store = store.clone();
-
-        let handle = std::thread::spawn(move || {
-            let pending_actions = RefCell::new(VecDeque::new());
-            let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions)
-                .with_pending_interactions(worker_store);
-            handler
-                .request_mcp_elicitation(&request)
-                .expect("mcp elicitation response")
-        });
-
-        let prompt = event_rx.recv().expect("mcp elicitation prompt");
-        assert!(matches!(
-            prompt,
-            TuiEvent::McpElicitationRequested {
-                id,
-                server_name,
-                mode,
-                message,
-                url,
-                ..
-            } if id == request_id
-                && server_name == "github"
-                && mode == RuntimeMcpElicitationMode::Url
-                && message == "Authorize GitHub"
-                && url.as_deref() == Some("https://github.com/login/device")
-        ));
-        assert_eq!(
-            store.get(&request_id).map(|record| record.kind),
-            Some(RuntimePendingInteractionKind::McpElicitation)
-        );
-
-        action_tx
-            .send(UserAction::RespondToMcpElicitation {
-                id: request_id.clone(),
-                accepted: true,
-                content_json: Some(r#"{"code":"1234"}"#.to_string()),
-            })
-            .expect("send mcp elicitation response");
-        let response = handle.join().expect("mcp elicitation thread");
-
-        assert_eq!(response.as_deref(), Some(r#"{"code":"1234"}"#));
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn tui_mcp_elicitation_handler_resolves_only_matching_runtime_interaction_id() {
-        let (event_tx, _event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::RespondToMcpElicitation {
-                id: "mcp_elicitation:github:wrong".to_string(),
-                accepted: true,
-                content_json: Some(r#"{"wrong":true}"#.to_string()),
-            })
-            .expect("send unrelated response");
-        action_tx
-            .send(UserAction::RespondToMcpElicitation {
-                id: "mcp_elicitation:github:42".to_string(),
-                accepted: true,
-                content_json: Some(r#"{"ok":true}"#.to_string()),
-            })
-            .expect("send matching response");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions);
-        let request = RuntimeMcpElicitationRequest::new(
-            "github",
-            "42",
-            RuntimeMcpElicitationMode::Form,
-            "Fill required fields",
-            None,
-            Some(r#"{"type":"object"}"#.to_string()),
-        );
-
-        let response = handler
-            .request_mcp_elicitation(&request)
-            .expect("mcp elicitation response");
-
-        assert_eq!(response.as_deref(), Some(r#"{"ok":true}"#));
-        assert!(matches!(
-            pending_actions.borrow_mut().pop_front(),
-            Some(UserAction::RespondToMcpElicitation { id, content_json, .. })
-                if id == "mcp_elicitation:github:wrong"
-                    && content_json.as_deref() == Some(r#"{"wrong":true}"#)
-        ));
-    }
-
-    #[test]
-    fn tui_mcp_elicitation_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx.send(UserAction::Cancel).expect("send cancel");
-        let store = RuntimePendingInteractionStore::default();
-        let request = RuntimeMcpElicitationRequest::new(
-            "github",
-            "42",
-            RuntimeMcpElicitationMode::Url,
-            "Authorize GitHub",
-            Some("https://github.com/login/device".to_string()),
-            None,
-        );
-        let first = RuntimePendingInteractionRecord::from_mcp_elicitation(&request);
-        store.insert(first.clone()).expect("seed pending");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions)
-            .with_pending_interactions(store.clone());
-
-        let error = handler
-            .request_mcp_elicitation(&request)
-            .expect_err("duplicate pending id should fail before waiting");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(store.get(&request.id), Some(first));
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn tui_mcp_elicitation_handler_reports_closed_action_channel() {
-        let (event_tx, _event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        drop(action_tx);
-        let store = RuntimePendingInteractionStore::default();
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiMcpElicitationHandler::new(&event_tx, &action_rx, &pending_actions)
-            .with_pending_interactions(store.clone());
-        let request = RuntimeMcpElicitationRequest::new(
-            "github",
-            "42",
-            RuntimeMcpElicitationMode::Form,
-            "Fill required fields",
-            None,
-            Some(r#"{"type":"object"}"#.to_string()),
-        );
-
-        let error = handler
-            .request_mcp_elicitation(&request)
-            .expect_err("closed action channel must not be reported as user cancellation");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn tui_permission_handler_tracks_runtime_pending_interaction_until_resolved() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        let store = RuntimePendingInteractionStore::default();
-        let request = RuntimePermissionRequest {
-            id: "permission-1".to_string(),
-            reason: Some("need write".to_string()),
-            permissions: Default::default(),
-        };
-        let worker_store = store.clone();
-
-        let handle = std::thread::spawn(move || {
-            let pending_actions = RefCell::new(VecDeque::new());
-            let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions)
-                .with_pending_interactions(worker_store);
-            handler
-                .request_permissions(&request)
-                .expect("permission response")
-        });
-        let prompt = event_rx.recv().expect("approval prompt");
-        assert!(matches!(
-            prompt,
-            TuiEvent::ApprovalNeeded { id, .. } if id == "permission-1"
-        ));
-        assert_eq!(
-            store.get("permission-1").map(|record| record.kind),
-            Some(RuntimePendingInteractionKind::PermissionRequest)
-        );
-
-        action_tx
-            .send(UserAction::Approve {
-                id: "permission-1".to_string(),
-                approved: true,
-            })
-            .expect("send approval");
-        let response = handle.join().expect("permission thread");
-
-        assert_eq!(response.decision, PermissionResponseDecision::Allow);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn tui_permission_handler_projects_runtime_permission_kind() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        let store = RuntimePendingInteractionStore::default();
-        let mut domains = std::collections::HashMap::new();
-        domains.insert(
-            "api.orca.invalid".to_string(),
-            orca_core::config::PermissionProfileNetworkAccess::Allow,
-        );
-        let request = RuntimePermissionRequest {
-            id: "permission-network".to_string(),
-            reason: Some("bash attempted network access to api.orca.invalid".to_string()),
-            permissions: orca_runtime::protocol::RequestPermissionProfile {
-                file_system: None,
-                network: Some(orca_runtime::protocol::RequestNetworkPermissions {
-                    enabled: None,
-                    domains,
-                }),
-                shell: None,
-            },
-        };
-        let worker_store = store.clone();
-
-        let handle = std::thread::spawn(move || {
-            let pending_actions = RefCell::new(VecDeque::new());
-            let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions)
-                .with_pending_interactions(worker_store);
-            handler
-                .request_permissions(&request)
-                .expect("permission response")
-        });
-        let prompt = event_rx.recv().expect("approval prompt");
-
-        assert!(matches!(
-            prompt,
-            TuiEvent::PermissionApprovalNeeded {
-                id,
-                permission_kind:
-                    orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock,
-                ..
-            } if id == "permission-network"
-        ));
-
-        action_tx
-            .send(UserAction::Approve {
-                id: "permission-network".to_string(),
-                approved: true,
-            })
-            .expect("send approval");
-        let response = handle.join().expect("permission thread");
-
-        assert_eq!(response.decision, PermissionResponseDecision::Allow);
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn tui_permission_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx.send(UserAction::Cancel).expect("send cancel");
-        let store = RuntimePendingInteractionStore::default();
-        let request = RuntimePermissionRequest {
-            id: "permission-1".to_string(),
-            reason: Some("need write".to_string()),
-            permissions: Default::default(),
-        };
-        let first = RuntimePendingInteractionRecord::from_permission_request(
-            &request,
-            "request_permissions",
-            None,
-            Some("existing".to_string()),
-        );
-        store.insert(first.clone()).expect("seed pending");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions)
-            .with_pending_interactions(store.clone());
-
-        let error = handler
-            .request_permissions(&request)
-            .expect_err("duplicate pending id should fail before waiting");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(store.get("permission-1"), Some(first));
-        assert!(event_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn tui_permission_handler_resolves_only_matching_runtime_interaction_id() {
-        let (event_tx, _event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        action_tx
-            .send(UserAction::Approve {
-                id: "permission-other".to_string(),
-                approved: false,
-            })
-            .expect("send unrelated approval");
-        action_tx
-            .send(UserAction::Approve {
-                id: "permission-1".to_string(),
-                approved: true,
-            })
-            .expect("send matching approval");
-        let pending_actions = RefCell::new(VecDeque::new());
-        let handler = TuiPermissionRequestHandler::new(&event_tx, &action_rx, &pending_actions);
-        let request = RuntimePermissionRequest {
-            id: "permission-1".to_string(),
-            reason: Some("need write".to_string()),
-            permissions: Default::default(),
-        };
-
-        let response = handler
-            .request_permissions(&request)
-            .expect("permission response");
-
-        assert_eq!(response.decision, PermissionResponseDecision::Allow);
-        assert!(matches!(
-            pending_actions.borrow_mut().pop_front(),
-            Some(UserAction::Approve { id, approved: false }) if id == "permission-other"
-        ));
-    }
-}
+#[path = "runtime_interaction_adapter_tests.rs"]
+mod tests;

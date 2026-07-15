@@ -84,31 +84,9 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
             explanation: serde_json::from_value(event.payload["explanation"].clone()).ok()?,
             plan: serde_json::from_value(event.payload["plan"].clone()).ok()?,
         }),
-        EventType::ApprovalRequested => Some(TuiEvent::ApprovalNeeded {
-            id: event.payload["id"].as_str()?.to_string(),
-            tool: event
-                .payload
-                .get("tool")
-                .and_then(|value| value.as_str())
-                .or_else(|| event.payload["action"].as_str())?
-                .to_string(),
-            target: event
-                .payload
-                .get("target")
-                .and_then(|value| value.as_str())
-                .or_else(|| {
-                    event
-                        .payload
-                        .get("description")
-                        .and_then(|value| value.as_str())
-                })
-                .map(str::to_string),
-            preview: event
-                .payload
-                .get("preview")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-        }),
+        // An actionable approval must carry the active operation fence. The
+        // surface interaction handler emits that typed event directly.
+        EventType::ApprovalRequested => None,
         EventType::ApprovalResolved => Some(TuiEvent::Notice(format!(
             "Approval {} resolved: {} ({})",
             event.payload["id"].as_str()?,
@@ -603,8 +581,7 @@ mod tests {
 
         let plan =
             tui_event_from_runtime_event(&events.plan_updated(&plan_update)).expect("plan event");
-        let approval =
-            tui_event_from_runtime_event(&events.approval_requested(&approval)).expect("approval");
+        let approval = tui_event_from_runtime_event(&events.approval_requested(&approval));
         let subagent_started =
             tui_event_from_runtime_event(&events.subagent_started("agent-1", "review code"))
                 .expect("subagent started");
@@ -630,11 +607,8 @@ mod tests {
             other => panic!("expected plan event, got {other:?}"),
         }
         assert!(
-            matches!(approval, TuiEvent::ApprovalNeeded { id, tool, target, preview }
-                if id == "approval-1"
-                    && tool == "bash"
-                    && target == Some("cargo test".to_string())
-                    && preview == Some("$ cargo test".to_string()))
+            approval.is_none(),
+            "unfenced approval events are not actionable"
         );
         assert!(
             matches!(subagent_started, TuiEvent::SubagentStarted { id, description }

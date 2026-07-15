@@ -1,3 +1,4 @@
+mod action_dispatcher;
 mod agent_runner;
 mod agent_runtime;
 mod agent_subagent_execution;
@@ -23,9 +24,11 @@ mod idle_key_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;
 mod input_event_actions;
+mod interaction_broker;
 mod key_event_actions;
 mod mention_menu_actions;
 mod mention_search_manager;
+mod operation_controller;
 mod running_actions;
 mod runtime_event_actions;
 mod runtime_event_projection;
@@ -569,10 +572,6 @@ mod tests {
         assert!(
             idle_submit_actions.contains("fn reset_composer_after_submit"),
             "idle_submit_actions should own composer reset after submit"
-        );
-        assert!(
-            idle_submit_actions.contains("UserAction::RespondToUserInput"),
-            "idle_submit_actions should own user-input answer submission"
         );
         assert!(
             idle_submit_actions.contains("UserAction::Submit"),
