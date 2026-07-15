@@ -83,7 +83,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
     if composer_visible(state) {
         state.input_area = Some(chunks[4]);
-        render_input(frame, chunks[4], textarea);
+        render_input(frame, chunks[4], textarea, state, theme);
     }
     render_status(frame, chunks[5], state, theme);
 
@@ -1317,7 +1317,11 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
         Line::from(""),
         Line::from(Span::styled("  Tips", Style::default().fg(theme.success))),
         Line::from(Span::styled(
-            "  • Shift+Enter to insert newline, Enter to send",
+            "  • Enter to send, Alt+Enter (or Shift+Enter) for newline",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  • / commands, @ to mention files, $ to invoke skills",
             muted,
         )),
         Line::from(Span::styled(
@@ -1809,7 +1813,13 @@ fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
     }
 }
 
-fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
+fn render_input(
+    frame: &mut Frame,
+    area: Rect,
+    textarea: &TextArea,
+    state: &AppState,
+    theme: &Theme,
+) {
     let inner = if let Some(block) = textarea.block() {
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1817,6 +1827,30 @@ fn render_input(frame: &mut Frame, area: Rect, textarea: &TextArea) {
     } else {
         area
     };
+
+    // Transient "copied N chars" feedback overlays the right end of the top
+    // border, mirroring the " Input " title on the left.
+    if let Some(notice) = state.copy_notice_at(std::time::Instant::now()) {
+        let text = if notice.local_only {
+            format!(" copied {} chars (local clipboard only) ", notice.chars)
+        } else {
+            format!(" copied {} chars to clipboard ", notice.chars)
+        };
+        let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
+        // Keep one border cell visible on each side of the overlay.
+        if area.height > 0 && text_width + 2 < area.width {
+            let overlay = Rect::new(
+                area.x + area.width - text_width - 2,
+                area.y,
+                text_width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(text, Style::default().fg(theme.approval))),
+                overlay,
+            );
+        }
+    }
 
     if inner.is_empty() {
         return;
@@ -2075,23 +2109,19 @@ fn push_hard_wrapped_segment(
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // The live status dot + elapsed time moved to the activity line above the composer
     // (see `render_activity`); this bottom line is now purely persistent metadata.
-    let line = status_line(state, theme, area.width as usize, std::time::Instant::now());
+    let line = status_line(state, theme, area.width as usize);
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 }
 
-fn status_line(
-    state: &AppState,
-    theme: &Theme,
-    width: usize,
-    now: std::time::Instant,
-) -> Line<'static> {
-    let mode_prefix = " | mode: ";
+fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+    let separator = "  ·  ";
+    let mode_prefix = separator;
     let mode_value = state.approval_mode.as_str();
     let mode_width = UnicodeWidthStr::width(mode_prefix) + UnicodeWidthStr::width(mode_value);
     let model = format!(
-        " model: {} ({})",
+        " {} ({})",
         state.model_name,
         state.reasoning_effort.as_str()
     );
@@ -2110,16 +2140,20 @@ fn status_line(
     if state.context_limit_tokens > 0 {
         optional.push(context_cell(state, theme));
     }
+    // Session cost only appears once there is something to report; a fresh
+    // session keeps the bar clean instead of showing zeros.
+    if state.usage.total_tokens() > 0 {
+        optional.push(Span::styled(
+            format!(
+                "{separator}{} tokens{separator}{}",
+                format_token_count(state.usage.total_tokens()),
+                format_cost(state.usage.estimated_cost_usd),
+            ),
+            Style::default().fg(theme.muted),
+        ));
+    }
     optional.push(Span::styled(
-        format!(" | tokens: {}", state.usage.total_tokens()),
-        Style::default().fg(theme.muted),
-    ));
-    optional.push(Span::styled(
-        format!(" | cost: ${:.6}", state.usage.estimated_cost_usd),
-        Style::default().fg(theme.muted),
-    ));
-    optional.push(Span::styled(
-        " | F1/ctrl+k shortcuts",
+        format!("{separator}F1 shortcuts"),
         Style::default().fg(theme.muted),
     ));
 
@@ -2131,22 +2165,29 @@ fn status_line(
         }
     }
 
-    // Transient right-aligned "copied N chars to clipboard" feedback, shown
-    // for a few seconds after a mouse selection lands on the clipboard.
-    if let Some(notice) = state.copy_notice_at(now) {
-        let text = if notice.local_only {
-            format!("copied {} chars (local clipboard only)", notice.chars)
-        } else {
-            format!("copied {} chars to clipboard", notice.chars)
-        };
-        let notice_width = UnicodeWidthStr::width(text.as_str());
-        // Separate it from the metadata by at least two columns.
-        if used + notice_width + 2 <= width {
-            spans.push(Span::raw(" ".repeat(width - used - notice_width)));
-            spans.push(Span::styled(text, Style::default().fg(theme.approval)));
-        }
-    }
     Line::from(spans)
+}
+
+/// Humanize token counts for the status bar: 950 → "950", 8_664 → "8.7k",
+/// 1_250_000 → "1.3M". Full precision lives in `/cost`.
+fn format_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 1_000_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    }
+}
+
+/// Session cost with just enough precision to be meaningful: sub-cent costs
+/// show four decimals, anything larger the familiar two.
+fn format_cost(cost_usd: f64) -> String {
+    if cost_usd < 0.01 {
+        format!("${cost_usd:.4}")
+    } else {
+        format!("${cost_usd:.2}")
+    }
 }
 
 fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
@@ -2232,7 +2273,7 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
         theme.error
     };
     Span::styled(
-        format!(" | context: {percent}%"),
+        format!("  ·  context {percent}%"),
         Style::default().fg(color),
     )
 }
@@ -4011,7 +4052,7 @@ mod tests {
         state.context_used_tokens = 250;
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        assert_eq!(cell.content.as_ref(), " | context: 75%");
+        assert_eq!(cell.content.as_ref(), "  ·  context 75%");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
@@ -4082,9 +4123,9 @@ mod tests {
             let row = (0..width)
                 .map(|x| buffer[(x, 0)].symbol())
                 .collect::<String>();
-            let marker = format!("mode: {}", mode.as_str());
+            let marker = format!("  ·  {}", mode.as_str());
             let marker_start = row.find(&marker).expect("mode should be visible");
-            let value_x = (marker_start + "mode: ".len()) as u16;
+            let value_x = (marker_start + "  ·  ".len()) as u16;
             assert_eq!(
                 buffer[(value_x, 0)].fg,
                 approval_mode_color(mode, &theme),
@@ -4099,20 +4140,44 @@ mod tests {
         let mut state = test_state();
         state.context_limit_tokens = 1000;
         state.context_used_tokens = 250;
+        state.usage.input_tokens = 8_000;
+        state.usage.output_tokens = 664;
+        state.usage.estimated_cost_usd = 0.003852;
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let narrow = status_line(&state, &theme, 70, std::time::Instant::now()).to_string();
-        assert!(narrow.contains("mode: suggest"));
-        assert!(narrow.contains("context: 75%"));
-        assert!(!narrow.contains("cost:"));
+        let narrow = status_line(&state, &theme, 46).to_string();
+        assert!(narrow.contains("suggest"));
+        assert!(narrow.contains("context 75%"));
+        assert!(!narrow.contains("tokens"));
         assert!(!narrow.contains("shortcuts"));
 
-        let wide = status_line(&state, &theme, 180, std::time::Instant::now()).to_string();
-        assert!(wide.contains("tokens:"));
-        assert!(wide.contains("cost:"));
+        let wide = status_line(&state, &theme, 180).to_string();
+        // Token counts humanize (8664 → 8.7k) and sub-cent costs keep 4 decimals.
+        assert!(wide.contains("8.7k tokens"));
+        assert!(wide.contains("$0.0039"));
         // Drag-to-copy is native now; the old shift+drag hint is gone.
         assert!(!wide.contains("shift+drag"));
         assert!(wide.contains("shortcuts"));
+    }
+
+    #[test]
+    fn status_line_hides_usage_until_tokens_accumulate() {
+        let state = test_state();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let text = status_line(&state, &theme, 180).to_string();
+        assert!(!text.contains("tokens"));
+        assert!(!text.contains('$'));
+        assert!(text.contains("shortcuts"));
+    }
+
+    #[test]
+    fn token_and_cost_formatting_scale_with_magnitude() {
+        assert_eq!(format_token_count(950), "950");
+        assert_eq!(format_token_count(8_664), "8.7k");
+        assert_eq!(format_token_count(1_250_000), "1.2M");
+        assert_eq!(format_cost(0.003852), "$0.0039");
+        assert_eq!(format_cost(1.25), "$1.25");
     }
 
     #[test]
@@ -4170,34 +4235,44 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_shows_right_aligned_and_expires() {
-        let mut state = test_state();
+    fn copy_notice_overlays_input_border_and_expires() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let vim = crate::vim::VimState::new(false);
+        let textarea = crate::composer_textarea::make_textarea(&vim, &theme);
+        let mut state = test_state();
         let staged_at = std::time::Instant::now();
         state.stage_clipboard_copy("hello".to_string(), staged_at);
         assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello"));
 
-        // Fresh: the notice is appended, padded to the right edge.
-        let line = status_line(&state, &theme, 120, staged_at);
-        let text = line.to_string();
-        assert!(text.contains("copied 5 chars to clipboard"));
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(text.as_str()),
-            120,
-            "notice must be padded flush to the right edge"
-        );
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
+            .expect("test backend");
+        let mut draw = |state: &mut AppState| {
+            terminal
+                .draw(|frame| render(frame, state, &textarea, &theme))
+                .expect("draw");
+            format!("{:?}", terminal.backend().buffer())
+        };
 
-        // Too narrow to fit: silently omitted, metadata untouched.
-        let narrow = status_line(&state, &theme, 40, staged_at).to_string();
-        assert!(!narrow.contains("copied"));
+        // Fresh: the notice overlays the input box's top border, on the right.
+        let fresh = draw(&mut state);
+        assert!(fresh.contains("copied 5 chars to clipboard"));
 
-        // Expired: gone again.
-        let later = staged_at + crate::types::AppState::COPY_NOTICE_TTL;
+        // Status line never carries the notice anymore.
         assert!(
-            !status_line(&state, &theme, 120, later)
+            !status_line(&state, &theme, 120)
                 .to_string()
                 .contains("copied")
         );
+
+        // Expired: gone again.
+        state.copy_notice = state.copy_notice.take().map(|mut notice| {
+            notice.at = staged_at
+                .checked_sub(crate::types::AppState::COPY_NOTICE_TTL)
+                .expect("test instant");
+            notice
+        });
+        let expired = draw(&mut state);
+        assert!(!expired.contains("copied"));
 
         // Oversized for OSC 52: the notice admits only the local clipboard
         // saw it instead of overclaiming a remote copy.
@@ -4205,7 +4280,7 @@ mod tests {
             "x".repeat(crate::clipboard::OSC52_MAX_TEXT_BYTES + 1),
             staged_at,
         );
-        let degraded = status_line(&state, &theme, 140, staged_at).to_string();
+        let degraded = draw(&mut state);
         assert!(degraded.contains("(local clipboard only)"));
     }
 
@@ -5730,7 +5805,7 @@ mod tests {
             "input box must stay visible when the transcript overflows"
         );
         assert!(
-            has("model:"),
+            has("suggest"),
             "status line must stay visible when the transcript overflows"
         );
         // The composer (input) needs its full height; the messages area is everything above

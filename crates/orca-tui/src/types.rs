@@ -1180,6 +1180,10 @@ impl AppState {
 }
 
 fn input_history_path() -> Option<std::path::PathBuf> {
+    // Unit tests must never read or pollute the real user history.
+    if cfg!(test) {
+        return None;
+    }
     dirs::home_dir().map(|h| h.join(".orca").join("history.jsonl"))
 }
 
