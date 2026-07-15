@@ -1,6 +1,6 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1 through P0.3e4b3 complete; P0.3e4b full gate next
+- Status: Active; P0.3e1 through P0.3e4b complete; P0.3e4c next
 - Date: 2026-07-15
 - Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3c validation)
 - Branch: `codex/tui-runtime-host-migration`
@@ -777,6 +777,37 @@ P0.3e4b3 checkpoint result:
 - the complete P0.3e4b workspace gate, workspace Clippy, real DeepSeek harness,
   and production PTY TUI smoke remain the next checkpoint before P0.3e4c or any
   push/release decision.
+
+P0.3e4b stage validation result:
+
+- after the P0.3e4b3 commit, `cargo test --workspace --all-targets --
+  --test-threads=1` completed with exit 0, including `orca-runtime` 769/769,
+  runtime-host 32/32, task-output 12/12, and `orca-tui` 523/523. `cargo clippy
+  --workspace --all-targets` also completed with exit 0 and only the existing
+  non-deny warning baseline;
+- `node scripts/release/test-real-api-e2e.mjs` passed, followed by the complete
+  `$0.02` real DeepSeek harness. Provider summary, CLI, malformed-history replay
+  and compatibility repair, server submit, thread memory, active-turn
+  resume/control, thread read/metadata, list filters/search, and turn/item
+  pagination all reached their expected successful sentinels;
+- a production TUI run in a real PTY streamed canonical reasoning and answer
+  deltas, returned `ORCA_TUI_CANONICAL_OK`, displayed `context 94%`, `6.7k
+  tokens`, and `$0.0003`, then restored cursor, keyboard mode, bracketed paste,
+  mouse modes, and the alternate screen through the normal double-`Ctrl-C`
+  exit path;
+- a second production PTY run interrupted a long live DeepSeek stream with
+  `Ctrl-C`, released the foreground operation, accepted a fresh submit, returned
+  `ORCA_TUI_AFTER_INTERRUPT_OK`, updated usage to `9.0k tokens` and `$0.0023`,
+  and restored the terminal on exit. The current product retains the interrupted
+  user message in conversation history, so a terse follow-up
+  can be interpreted as additive rather than superseding; sharper cancellation
+  supersession UX is a separate product candidate, not a reason to add a second
+  lifecycle or conversation owner during this migration;
+- a final `git fetch origin` confirmed `origin/main` remained `35c6361c1`; the
+  branch stayed linearly based on current main. P0.3e4b is therefore complete.
+  P0.3e4c must now move background handoff ownership into the runtime host and
+  delete `TuiThreadOperationExecutor`, `ProviderStreamTask`, the duplicate test
+  foreground loop, and `TuiTaskSupervisor` before any push or release decision.
 
 ## Slice Acceptance Criteria
 
