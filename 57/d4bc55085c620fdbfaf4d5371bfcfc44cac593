@@ -1,0 +1,19 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "57d4bc55085c620fdbfaf4d5371bfcfc44cac593",
+  "prompts": {},
+  "sessions": {
+    "s_22ca44302a5252": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ae693cd2-b97d-4e49-b4c5-92daa63a1db3",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
