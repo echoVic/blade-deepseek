@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use orca_core::approval_types::ApprovalMode;
+use orca_core::approval_types::{
+    ApprovalDecision, ApprovalMode, ApprovalRequest, ApprovalResolution,
+};
 use orca_core::cancel::CancelToken;
 use orca_core::config::{
     HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig,
@@ -21,7 +23,7 @@ use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
 use orca_mcp::McpRegistry;
 use orca_runtime::history::{self, SessionTranscript};
-use orca_runtime::lifecycle::RuntimeTaskStatus;
+use orca_runtime::lifecycle::{RuntimeApprovalHandler, RuntimeTaskStatus};
 use orca_runtime::runtime_host::{
     GenerationAdmissionResult, GenerationContext, GenerationFence, HostedGenerationHandlers,
     HostedOperationWriter, HostedTurnRequest, InterruptOperationResult, OperationOutcome,
@@ -371,6 +373,64 @@ impl io::Write for DisconnectedWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct AllowApprovalHandler {
+    calls: Arc<AtomicUsize>,
+}
+
+impl RuntimeApprovalHandler for AllowApprovalHandler {
+    fn resolve_interactive(
+        &self,
+        approval: &ApprovalRequest,
+        _request: &orca_core::tool_types::ToolRequest,
+    ) -> io::Result<ApprovalResolution> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Ok(ApprovalResolution {
+            id: approval.id.clone(),
+            decision: ApprovalDecision::Allow,
+            reason: "generation-scoped approval allowed".to_string(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CancelledApprovalHandler {
+    cancel: CancelToken,
+    entered: Arc<AtomicBool>,
+}
+
+impl RuntimeApprovalHandler for CancelledApprovalHandler {
+    fn resolve_interactive(
+        &self,
+        _approval: &ApprovalRequest,
+        _request: &orca_core::tool_types::ToolRequest,
+    ) -> io::Result<ApprovalResolution> {
+        self.entered.store(true, Ordering::Release);
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while !self.cancel.is_cancelled() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "approval generation was not cancelled",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "approval generation interrupted",
+        ))
+    }
+}
+
+fn wait_until_true(flag: &AtomicBool, message: &str) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !flag.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "{message}");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1460,6 +1520,152 @@ fn default_executor_delegates_to_runtime_thread_turn_executor() {
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
     );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn generation_scoped_approval_handler_controls_canonical_tool_execution() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(test_config(cwd.path().to_path_buf()), "canonical approval")
+        .expect("start runtime thread");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let request =
+        HostedTurnRequest::new("bash true").with_generation_handlers(move |_fence, _cancel| {
+            HostedGenerationHandlers::default().with_approval_handler(Arc::new(
+                AllowApprovalHandler {
+                    calls: Arc::clone(&handler_calls),
+                },
+            ))
+        });
+
+    let output = SharedWriter::default();
+    let operation = thread
+        .start_turn(request, output.clone())
+        .expect("start canonical approval turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("canonical approval terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        output
+            .json_events()
+            .into_iter()
+            .filter(|event| {
+                event["type"] == "tool.call.completed" && event["payload"]["status"] == "completed"
+            })
+            .count(),
+        1
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn request_scoped_approval_handler_remains_the_hosted_fallback() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(test_config(cwd.path().to_path_buf()), "approval fallback")
+        .expect("start runtime thread");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let request =
+        HostedTurnRequest::new("bash true").with_approval_handler(Arc::new(AllowApprovalHandler {
+            calls: Arc::clone(&calls),
+        }));
+
+    let operation = thread
+        .start_turn(request, io::sink())
+        .expect("start fallback approval turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("fallback approval terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn interrupting_generation_scoped_approval_wait_cancels_only_that_operation() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "canonical approval interrupt",
+        )
+        .expect("start runtime thread");
+    let first_entered = Arc::new(AtomicBool::new(false));
+    let entered = Arc::clone(&first_entered);
+    let first =
+        HostedTurnRequest::new("bash true").with_generation_handlers(move |_fence, cancel| {
+            HostedGenerationHandlers::default().with_approval_handler(Arc::new(
+                CancelledApprovalHandler {
+                    cancel,
+                    entered: Arc::clone(&entered),
+                },
+            ))
+        });
+    let output = SharedWriter::default();
+    let operation = thread
+        .start_turn(first, output.clone())
+        .expect("start waiting approval turn");
+    wait_until_true(&first_entered, "approval handler did not start waiting");
+    assert!(matches!(
+        operation.interrupt().expect("interrupt approval wait"),
+        InterruptOperationResult::Requested { .. }
+    ));
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("cancelled approval terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Cancelled)
+    );
+    let cancelled_tools = output
+        .json_events()
+        .into_iter()
+        .filter(|event| {
+            event["type"] == "tool.call.completed" && event["payload"]["status"] == "cancelled"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cancelled_tools.len(), 1);
+    assert_eq!(
+        cancelled_tools[0]["payload"]["error"],
+        "interactive approval was interrupted"
+    );
+
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&second_calls);
+    let second =
+        HostedTurnRequest::new("bash true").with_generation_handlers(move |_fence, _cancel| {
+            HostedGenerationHandlers::default().with_approval_handler(Arc::new(
+                AllowApprovalHandler {
+                    calls: Arc::clone(&handler_calls),
+                },
+            ))
+        });
+    let next = thread
+        .start_turn(second, io::sink())
+        .expect("start fresh approval turn");
+    assert_eq!(
+        next.wait_timeout(TEST_TIMEOUT)
+            .expect("fresh approval terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    assert_eq!(second_calls.load(Ordering::Acquire), 1);
 
     host.shutdown().expect("shutdown runtime host");
 }

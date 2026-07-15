@@ -31,8 +31,8 @@ use crate::instructions::ProjectInstructions;
 #[cfg(test)]
 use crate::lifecycle::RuntimeTaskKind;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimePermissionRequestHandler, RuntimeSessionLifecycle,
-    RuntimeUserInputHandler, ThreadSteerHandle,
+    AgentLoopContext, RuntimeApprovalHandler, RuntimePermissionRequestHandler,
+    RuntimeSessionLifecycle, RuntimeUserInputHandler, ThreadSteerHandle,
 };
 use crate::runtime_host::{
     HostedTurnRequest, OperationHandle, OperationOutcome, OperationTerminal, RuntimeHost,
@@ -169,6 +169,7 @@ pub struct ThreadTurnRequest {
     options: ControllerRunOptions,
     emit_session_completed: bool,
     steer_handle: Option<ThreadSteerHandle>,
+    approval_handler: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
@@ -366,6 +367,7 @@ impl ThreadTurnRequest {
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
             steer_handle: None,
+            approval_handler: None,
             permission_handler: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
@@ -415,6 +417,14 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_approval_handler(
+        mut self,
+        handler: Arc<dyn RuntimeApprovalHandler + Send + Sync>,
+    ) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
     pub fn with_user_input_handler(mut self, handler: Arc<dyn RuntimeUserInputHandler>) -> Self {
         self.user_input_handler = Some(handler);
         self
@@ -459,6 +469,10 @@ impl ThreadTurnRequest {
         &self,
     ) -> Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)> {
         self.permission_handler.as_deref()
+    }
+
+    pub fn approval_handler(&self) -> Option<&(dyn RuntimeApprovalHandler + Send + Sync)> {
+        self.approval_handler.as_deref()
     }
 
     pub fn user_input_handler(&self) -> Option<&dyn RuntimeUserInputHandler> {
@@ -698,6 +712,7 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
             loop_context
                 .with_execution(&mut background_workflows, None, Some(lifecycle))
                 .with_steer_handle(request.steer_handle())
+                .with_approval_handler(request.approval_handler())
                 .with_permission_handler(request.permission_handler())
                 .with_user_input_handler(request.user_input_handler())
                 .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
@@ -762,6 +777,7 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         loop_context
             .with_execution(&mut execution.background_workflows, None, Some(lifecycle))
             .with_steer_handle(request.steer_handle())
+            .with_approval_handler(request.approval_handler())
             .with_permission_handler(request.permission_handler())
             .with_user_input_handler(request.user_input_handler())
             .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
@@ -1710,6 +1726,7 @@ mod tests {
         let invocation = prepare_tool_invocation(&request, 0, &registry, &config);
         let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
         let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
+        let cancel = CancelToken::new();
 
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
         let execution = actor.handle_approval(ToolApprovalGateContext {
@@ -1720,6 +1737,8 @@ mod tests {
             invocation: &invocation,
             policy: &policy,
             permission_overlay: &mut permission_overlay,
+            approval_handler: None,
+            cancel: &cancel,
             emit_deltas: true,
         });
 

@@ -100,6 +100,7 @@ impl RuntimeTurnIterationStep {
                     input.loop_state.cancel,
                     input.loop_state.task_registry,
                     input.workflow.workflow_ipc,
+                    input.deps.turn_interactions.approval_handler(),
                     input.deps.turn_interactions.permission_handler(),
                     input.deps.turn_interactions.user_input_handler(),
                     input.deps.turn_interactions.mcp_elicitation_handler(),

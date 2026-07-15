@@ -1154,6 +1154,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let outcome = RuntimeProviderResponseStep::new()
@@ -1231,6 +1232,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
             None,
@@ -1370,6 +1372,7 @@ mod tests {
                         &hooks,
                         &cancel,
                         &task_registry,
+                        None,
                         None,
                         None,
                         None,

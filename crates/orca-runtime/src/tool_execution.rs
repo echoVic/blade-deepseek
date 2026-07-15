@@ -19,9 +19,10 @@ use crate::extension::{
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    RuntimeApprovalDecision, RuntimeConfigApprovalHandler, RuntimePermissionRequestHandler,
-    RuntimeTaskActor, RuntimeToolActorContext, RuntimeToolApprovalPolicy, RuntimeUserInputHandler,
-    TurnPermissionOverlay, run_status_from_tool_status,
+    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeConfigApprovalHandler,
+    RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeToolActorContext,
+    RuntimeToolApprovalPolicy, RuntimeUserInputHandler, TurnPermissionOverlay,
+    run_status_from_tool_status,
 };
 use crate::memory::MemoryBlock;
 use crate::tasks::TaskRegistry;
@@ -51,6 +52,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     background_workflows: Option<&'a mut Vec<BackgroundWorkflowRun>>,
     workflow_ipc: Option<&'a WorkflowIpcContext>,
     permission_overlay: Option<&'a mut TurnPermissionOverlay>,
+    approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
@@ -66,6 +68,8 @@ pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
     pub(crate) invocation: &'a ToolInvocation,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
+    pub(crate) approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
+    pub(crate) cancel: &'a CancelToken,
     pub(crate) emit_deltas: bool,
 }
 
@@ -135,6 +139,7 @@ impl<'a> ToolExecutionContext<'a> {
             background_workflows: None,
             workflow_ipc: None,
             permission_overlay: None,
+            approval_handler: None,
             permission_handler: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
@@ -170,6 +175,14 @@ impl<'a> ToolExecutionContext<'a> {
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     ) -> Self {
         self.permission_handler = permission_handler;
+        self
+    }
+
+    pub(crate) fn with_approval_handler(
+        mut self,
+        approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
+    ) -> Self {
+        self.approval_handler = approval_handler;
         self
     }
 
@@ -393,6 +406,7 @@ impl ToolExecutionActor {
             background_workflows,
             workflow_ipc,
             permission_overlay,
+            approval_handler,
             permission_handler,
             user_input_handler,
             mcp_elicitation_handler,
@@ -438,6 +452,8 @@ impl ToolExecutionActor {
             invocation: &invocation,
             policy,
             permission_overlay,
+            approval_handler,
+            cancel,
             emit_deltas,
         });
         match (approval_execution.outcome, approval_execution.event_error) {
@@ -598,6 +614,8 @@ impl ToolExecutionActor {
             invocation,
             policy,
             permission_overlay,
+            approval_handler,
+            cancel,
             emit_deltas,
         } = context;
 
@@ -648,13 +666,35 @@ impl ToolExecutionActor {
                             "tool dispatch stopped before interactive approval because the request event could not be delivered",
                         );
                     }
-                    let handler = RuntimeConfigApprovalHandler::new(config);
+                    let fallback_handler = RuntimeConfigApprovalHandler::new(config);
+                    let handler: &dyn RuntimeApprovalHandler = approval_handler
+                        .map(|handler| handler as &dyn RuntimeApprovalHandler)
+                        .unwrap_or(&fallback_handler);
                     let final_resolution = match self.runtime.resolve_interactive_tool_approval(
-                        &handler,
+                        handler,
                         &approval,
                         tool_request,
                     ) {
                         Ok(resolution) => resolution,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::Interrupted
+                                || cancel.is_cancelled() =>
+                        {
+                            let result = tool_types::ToolResult::cancelled(
+                                tool_request,
+                                "interactive approval was interrupted",
+                                None,
+                            );
+                            return finish_approval_gate_terminal(
+                                events,
+                                sink,
+                                tool_request,
+                                emit_deltas,
+                                event_error,
+                                RunStatus::Cancelled,
+                                result,
+                            );
+                        }
                         Err(error) => {
                             return failed_approval_gate_before_start(
                                 events,
@@ -1203,6 +1243,7 @@ mod tests {
         let mut overlay = TurnPermissionOverlay::default();
         overlay.set_preapproved_tool_call_id(Some("shell-1".to_string()));
         let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+        let cancel = orca_core::cancel::CancelToken::new();
 
         let execution = actor.handle_approval(ToolApprovalGateContext {
             config: &config,
@@ -1212,6 +1253,8 @@ mod tests {
             invocation: &invocation,
             policy: &policy,
             permission_overlay: &mut overlay,
+            approval_handler: None,
+            cancel: &cancel,
             emit_deltas: true,
         });
 

@@ -16,7 +16,8 @@ use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeTaskActor, RuntimeUserInputHandler,
+    RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeTaskActor,
+    RuntimeUserInputHandler,
 };
 use crate::memory::MemoryBlock;
 #[cfg(test)]
@@ -127,6 +128,7 @@ pub(crate) struct RuntimeNormalToolTurnRuntime<'a> {
 }
 
 pub(crate) struct RuntimeNormalToolTurnInteractions<'a> {
+    pub(crate) approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
@@ -209,6 +211,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let cancel = capabilities.cancel;
     let task_registry = capabilities.task_registry;
     let workflow_ipc = capabilities.workflow_ipc;
+    let approval_handler = capabilities.approval_handler;
     let permission_handler = capabilities.permission_handler;
     let user_input_handler = capabilities.user_input_handler;
     let mcp_elicitation_handler = capabilities.mcp_elicitation_handler;
@@ -421,6 +424,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 workflow_ipc,
             },
             interactions: RuntimeNormalToolTurnInteractions {
+                approval_handler,
                 permission_handler,
                 user_input_handler,
                 mcp_elicitation_handler,
@@ -615,6 +619,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         workflow_ipc,
     } = runtime;
     let RuntimeNormalToolTurnInteractions {
+        approval_handler,
         permission_handler,
         user_input_handler,
         mcp_elicitation_handler,
@@ -652,6 +657,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             workflow_ipc,
         )
         .with_permission_overlay(sampling_state.permission_overlay_mut())
+        .with_approval_handler(approval_handler)
         .with_permission_handler(permission_handler)
         .with_user_input_handler(user_input_handler)
         .with_mcp_elicitation_handler(mcp_elicitation_handler);
@@ -1282,6 +1288,7 @@ mod tests {
                 workflow_ipc: None,
             },
             interactions: RuntimeNormalToolTurnInteractions {
+                approval_handler: None,
                 permission_handler: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
@@ -1618,6 +1625,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
@@ -1755,6 +1763,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let error = match run_tool_turns(RuntimeToolTurnsContext {
@@ -1861,6 +1870,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let error = match run_tool_turns(RuntimeToolTurnsContext {
@@ -1958,6 +1968,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
             None,
@@ -2073,6 +2084,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let error = match run_tool_turns(RuntimeToolTurnsContext {
@@ -2178,6 +2190,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
             None,
@@ -2289,6 +2302,7 @@ mod tests {
             &task_registry,
             None,
             None,
+            None,
             Some(&handler),
             None,
         );
@@ -2392,6 +2406,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
             None,
@@ -2520,6 +2535,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
@@ -2612,6 +2628,7 @@ mod tests {
                 workflow_ipc: None,
             },
             interactions: RuntimeNormalToolTurnInteractions {
+                approval_handler: None,
                 permission_handler: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
@@ -2691,6 +2708,7 @@ mod tests {
             &hooks,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
             None,

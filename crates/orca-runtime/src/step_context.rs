@@ -14,8 +14,8 @@ use crate::extension::RuntimeExtensionContext;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeTurnContext, RuntimeUserInputHandler,
-    TurnPermissionOverlay,
+    RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeTurnContext,
+    RuntimeUserInputHandler, TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
 use crate::session::{record_plan_state_for_agent, record_tool_result_for_agent};
@@ -33,6 +33,7 @@ pub(crate) struct RuntimeStepCapabilitySnapshot<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
@@ -190,6 +191,7 @@ impl<'a> RuntimeStepSnapshot<'a> {
         cancel: &'a CancelToken,
         task_registry: &'a TaskRegistry,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
+        approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
         mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
@@ -209,6 +211,7 @@ impl<'a> RuntimeStepSnapshot<'a> {
                 cancel,
                 task_registry,
                 workflow_ipc,
+                approval_handler,
                 permission_handler,
                 user_input_handler,
                 mcp_elicitation_handler,
@@ -247,6 +250,7 @@ impl<'a> RuntimeStepCapabilitySnapshot<'a> {
         cancel: &'a CancelToken,
         task_registry: &'a TaskRegistry,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
+        approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
         mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
@@ -259,6 +263,7 @@ impl<'a> RuntimeStepCapabilitySnapshot<'a> {
             cancel,
             task_registry,
             workflow_ipc,
+            approval_handler,
             permission_handler,
             user_input_handler,
             mcp_elicitation_handler,
@@ -283,6 +288,7 @@ impl<'a> RuntimeStepContext<'a> {
         cancel: &'a CancelToken,
         task_registry: &'a TaskRegistry,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
+        approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
         mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
@@ -302,6 +308,7 @@ impl<'a> RuntimeStepContext<'a> {
                 cancel,
                 task_registry,
                 workflow_ipc,
+                approval_handler,
                 permission_handler,
                 user_input_handler,
                 mcp_elicitation_handler,

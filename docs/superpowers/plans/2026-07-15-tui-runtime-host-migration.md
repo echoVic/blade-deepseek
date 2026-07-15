@@ -1,6 +1,6 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1, P0.3e2, and P0.3e3 complete; P0.3e4 next
+- Status: Active; P0.3e1 through P0.3e4a complete; P0.3e4b next
 - Date: 2026-07-15
 - Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3c validation)
 - Branch: `codex/tui-runtime-host-migration`
@@ -443,14 +443,131 @@ transition must be attributable to a matching `OperationCompletion`.
 
 ### P0.3e4: Canonical Turn And Background Handoff
 
-1. Move background provider admission and completion under the runtime host.
-2. Run TUI turns through the same canonical executor as server and headless.
-3. Delete the TUI provider/tool/compaction/hook loop and its provider worker
-   facade.
-4. Replace detached TUI workflow notification watchers with host-owned task
-   events and joined ownership.
-5. Remove temporary adapter APIs and source-shape tests that protect deleted
-   ownership.
+Structural problem and evidence:
+
+- the actor-owned `TuiThreadOperationExecutor` still invokes
+  `run_agent_for_tui_with_event_factory`, which duplicates provider streaming,
+  compaction, tool scheduling, subagents, hooks, usage, task settlement, and
+  terminal mapping beside canonical `ThreadTurnExecutor`;
+- canonical turn execution accepts permission, user-input, and MCP handlers,
+  but interactive tool approval is still hard-coded to
+  `RuntimeConfigApprovalHandler`. A TUI operation-fenced approval broker cannot
+  therefore own canonical approval waits, and an interrupted wait is currently
+  surfaced as a generic tool failure;
+- canonical runtime events do not yet carry every TUI projection needed for
+  turn/context state, streaming shell output, and committed file-change
+  previews;
+- background-current-turn still transfers a TUI-owned provider worker and
+  completion closure into `TuiTaskSupervisor`, while canonical provider turns
+  are synchronous and cannot hand an in-flight request back to the host;
+- canonical non-waiting workflow execution leaves completion joins outside the
+  host-owned task model. Deleting the TUI loop before those ownership gaps are
+  closed would regress task visibility and shutdown cleanup.
+
+Target ownership and module boundary:
+
+- `ThreadTurnExecutor` is the only provider/tool/compaction/hook turn kernel for
+  TUI, server, and headless surfaces;
+- `HostedGenerationHandlers` is the typed operation-generation interaction
+  bundle and owns approval, permission, user-input, and MCP handlers. Each
+  handler is fenced to the generation cancel scope and cannot resolve a newer
+  operation;
+- canonical runtime emits the typed events required by TUI presentation. The
+  TUI adapter only projects runtime events and never re-executes tool or
+  lifecycle logic;
+- the runtime host supervisor owns provider and workflow background tasks,
+  including cancellation, join, terminal publication, persisted usage, and
+  resumable continuation state;
+- background-current-turn is a typed host handoff of an in-flight provider
+  phase, not a detached worker or cloned session. Returning the thread to the
+  actor cannot orphan the provider request.
+
+TUI user value:
+
+- approvals, permission prompts, user input, MCP elicitation, interrupts, and
+  terminal state use the same operation fence even after the canonical switch;
+- DeepSeek streaming, retry, compaction, tool-call recovery, hooks, subagents,
+  budget enforcement, and persistence cannot drift between TUI and server;
+- backgrounded turns and workflows remain visible, cancellable, foregroundable,
+  and joined at shutdown with exactly one usage and terminal settlement.
+
+External compatibility remains unchanged for CLI arguments, key bindings,
+TUI status/transcript behavior, server/JSONL shapes, persistence, goals, tasks,
+workflows, MCP, model routing, and provider semantics. New runtime events may be
+added only as backward-compatible typed events needed to preserve existing TUI
+presentation.
+
+Migration checkpoints:
+
+1. **P0.3e4a - generation-scoped canonical approval.** Add
+   `RuntimeApprovalHandler` to `HostedGenerationHandlers`, `ThreadTurnRequest`,
+   and the grouped runtime interaction/capability contexts. Canonical tool
+   execution uses the injected handler when present and maps an interrupted
+   generation-scoped wait to `RunStatus::Cancelled`. Behavior tests must prove
+   an injected approval controls execution, interrupt wakes the wait, and a
+   stale generation handler cannot resolve a later operation. This is an
+   internal reliability slice that removes the first blocker to running the TUI
+   on the canonical kernel; it does not add a compatibility loop.
+2. **P0.3e4b - canonical foreground TUI turn.** Move goal-tool exposure,
+   main-session task/backtrack metadata, context state, committed diff, shell
+   output, and TUI event projection into typed canonical request/event
+   boundaries. Run production foreground TUI turns through
+   `ThreadTurnExecutor` while retaining the explicit background handoff as the
+   final temporary path.
+3. **P0.3e4c - host-owned background handoff and deletion.** Move in-flight
+   provider and workflow task ownership into the runtime host, route
+   background continuation through canonical `RuntimeTurnContinuation`, then
+   delete `TuiThreadOperationExecutor`, the TUI provider/tool loop,
+   `TuiTaskSupervisor`, provider worker facade, and remaining source-shape tests
+   that protect those paths.
+
+P0.3e4a acceptance:
+
+- the approval handler travels through one named generation interaction bundle
+  instead of a parallel TUI-only parameter;
+- request-level fallback preserves CLI/server behavior when no generation
+  handler is installed;
+- an allowed injected approval executes the requested tool once and publishes
+  one successful terminal;
+- interrupting a generation-scoped approval wait publishes one cancelled tool
+  terminal and one cancelled operation terminal, then the next operation can
+  use a fresh handler;
+- focused runtime-host, controller/tool, and TUI interaction tests pass before
+  the full shared-runtime gate.
+
+P0.3e4a implementation checkpoint:
+
+- `HostedGenerationHandlers` now carries approval beside permission,
+  user-input, and MCP handlers. `HostedTurnRequest` resolves the active
+  generation handler first, preserves the request-level handler as the
+  CLI/server compatibility fallback, and leaves config-backed approval as the
+  canonical final fallback;
+- `ThreadTurnRequest` installs the selected approval handler into
+  `RuntimeTurnInteractionState`. The handler then travels through the named
+  step capability and normal tool-turn interaction snapshots to
+  `ToolExecutionContext`; no second approval state or TUI-specific execution
+  branch was introduced;
+- canonical interactive approval maps an interrupted handler or cancelled
+  generation token to one cancelled tool terminal and `RunStatus::Cancelled`
+  instead of relabelling the wait as a generic failed tool;
+- runtime-host behavior tests prove generation injection, request fallback,
+  interrupt wakeup, one cancelled tool terminal, operation cancellation, and a
+  fresh handler on the next operation in the same actor-owned thread;
+- the Mock provider now scopes tool-result completion to the current user turn
+  rather than all historical turns. This repairs the shared multi-turn
+  validation path that previously hid the second operation behind a stale tool
+  result; real provider behavior and external protocol shapes are unchanged.
+
+Verification followed a fresh `git fetch origin`; `origin/main` remained
+`35c6361c1`, so the branch was already based on current main and rebase was a
+no-op. Formatting and diff checks passed, followed by `orca-provider` 164/164,
+runtime-host 24/24, `orca-runtime` 769/769, and `orca-tui` 510/510. The serial
+workspace all-targets gate and workspace Clippy completed successfully with the
+repository's existing non-deny warning baseline. The release harness contract
+and complete real DeepSeek E2E passed within the `$0.02` budget, including
+provider summary, CLI, history replay and repair, server/thread memory,
+active-turn resume/control, metadata, list filters/search, and turn/item
+pagination.
 
 ## Slice Acceptance Criteria
 

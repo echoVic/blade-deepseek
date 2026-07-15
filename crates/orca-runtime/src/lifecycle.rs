@@ -182,6 +182,7 @@ pub(crate) struct RuntimeTurnExecution<'a> {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RuntimeTurnInteractionState<'a> {
+    approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
@@ -874,6 +875,18 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_approval_handler(
+        mut self,
+        approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
+    ) -> Self {
+        self.turn_deps = Some(
+            self.turn_deps
+                .expect("agent loop turn deps")
+                .with_approval_handler(approval_handler),
+        );
+        self
+    }
+
     pub(crate) fn with_user_input_handler(
         mut self,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
@@ -1045,6 +1058,16 @@ impl<'a> RuntimeTurnDeps<'a> {
         self
     }
 
+    pub(crate) fn with_approval_handler(
+        mut self,
+        approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
+    ) -> Self {
+        self.turn_interactions = self
+            .turn_interactions
+            .with_approval_handler(approval_handler);
+        self
+    }
+
     pub(crate) fn with_user_input_handler(
         mut self,
         user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
@@ -1074,10 +1097,25 @@ impl<'a> RuntimeTurnDeps<'a> {
 impl<'a> RuntimeTurnInteractionState<'a> {
     pub(crate) fn new() -> Self {
         Self {
+            approval_handler: None,
             permission_handler: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
         }
+    }
+
+    pub(crate) fn with_approval_handler(
+        mut self,
+        approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
+    ) -> Self {
+        self.approval_handler = approval_handler;
+        self
+    }
+
+    pub(crate) fn approval_handler(
+        &self,
+    ) -> Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)> {
+        self.approval_handler
     }
 
     pub(crate) fn with_permission_handler(

@@ -168,11 +168,7 @@ pub async fn call_streaming_async(
 ) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => {
-            if conversation
-                .messages
-                .iter()
-                .any(|m| matches!(m, Message::Tool { .. }))
-            {
+            if current_turn_has_tool_results(conversation) {
                 let response = mock_call(conversation);
                 for step in &response.steps {
                     on_step(step);
@@ -381,11 +377,17 @@ fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
         .map(|delay| delay.min(10_000))
 }
 
-fn mock_call(conversation: &Conversation) -> ProviderResponse {
-    let has_tool_results = conversation
+fn current_turn_has_tool_results(conversation: &Conversation) -> bool {
+    conversation
         .messages
         .iter()
-        .any(|m| matches!(m, Message::Tool { .. }));
+        .rev()
+        .take_while(|message| !matches!(message, Message::User { .. }))
+        .any(|message| matches!(message, Message::Tool { .. }))
+}
+
+fn mock_call(conversation: &Conversation) -> ProviderResponse {
+    let has_tool_results = current_turn_has_tool_results(conversation);
     let prompt = conversation.last_user_message().unwrap_or("");
 
     if prompt.trim() == "mock_provider_error" {
@@ -1875,5 +1877,46 @@ mod tests {
             response.assistant_content.as_deref(),
             Some("Mock completed after tool execution.")
         );
+    }
+
+    #[test]
+    fn mock_streaming_ignores_tool_results_from_previous_turns() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("bash true".to_string());
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "mock-tool-1".to_string(),
+                function_name: "bash".to_string(),
+                arguments: serde_json::json!({ "command": "true" }).to_string(),
+            }],
+        );
+        conversation.add_tool_result("mock-tool-1".to_string(), "".to_string());
+        conversation.add_assistant(Some("first turn completed".to_string()), None, Vec::new());
+        conversation.add_user("bash true".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &CancelToken::new(),
+            &mut |_| {},
+        );
+
+        assert!(matches!(
+            response.steps.iter().find(|step| matches!(step, ProviderStep::ToolCall(_))),
+            Some(ProviderStep::ToolCall(request)) if request.name == ToolName::Bash
+        ));
+        assert!(response.assistant_content.is_none());
     }
 }

@@ -23,7 +23,8 @@ use crate::background_turn::RuntimeTurnContinuation;
 use crate::controller::{ControllerRunOptions, ThreadTurnRequest};
 use crate::hooks::HookContext;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeTaskKind, RuntimeUserInputHandler, ThreadSteerHandle,
+    RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeTaskKind,
+    RuntimeUserInputHandler, ThreadSteerHandle,
 };
 use crate::tasks::TaskRegistry;
 use crate::thread::RuntimeThread;
@@ -64,6 +65,7 @@ impl<W: io::Write + Send + 'static> HostedOperationWriter for PassthroughHostedO
 
 #[derive(Clone, Default)]
 pub struct HostedGenerationHandlers {
+    approval_handler: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
@@ -73,6 +75,7 @@ impl fmt::Debug for HostedGenerationHandlers {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HostedGenerationHandlers")
+            .field("approval_handler", &self.approval_handler.is_some())
             .field("permission_handler", &self.permission_handler.is_some())
             .field("user_input_handler", &self.user_input_handler.is_some())
             .field(
@@ -84,6 +87,14 @@ impl fmt::Debug for HostedGenerationHandlers {
 }
 
 impl HostedGenerationHandlers {
+    pub fn with_approval_handler(
+        mut self,
+        handler: Arc<dyn RuntimeApprovalHandler + Send + Sync>,
+    ) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
     pub fn with_permission_handler(
         mut self,
         handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
@@ -135,6 +146,7 @@ pub struct HostedTurnRequest {
     track_goal_usage: bool,
     emit_session_completed: bool,
     envelope: HostedOperationEnvelope,
+    approval_handler: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
@@ -170,6 +182,7 @@ impl HostedTurnRequest {
             track_goal_usage: false,
             emit_session_completed: true,
             envelope: HostedOperationEnvelope::Turn,
+            approval_handler: None,
             permission_handler: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
@@ -261,6 +274,14 @@ impl HostedTurnRequest {
         self
     }
 
+    pub fn with_approval_handler(
+        mut self,
+        handler: Arc<dyn RuntimeApprovalHandler + Send + Sync>,
+    ) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
     pub fn with_user_input_handler(
         mut self,
         handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
@@ -312,6 +333,14 @@ impl HostedTurnRequest {
                 self.envelope == HostedOperationEnvelope::Turn && self.emit_session_completed,
             )
             .with_steer_handle(generation.steer_handle.clone());
+        if let Some(handler) = generation
+            .handlers
+            .approval_handler
+            .clone()
+            .or_else(|| self.approval_handler.clone())
+        {
+            request = request.with_approval_handler(handler);
+        }
         if let Some(handler) = generation
             .handlers
             .permission_handler
