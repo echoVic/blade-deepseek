@@ -18,7 +18,7 @@
 - Modify: `crates/orca-runtime/src/mentions.rs:1084-1312`
 - Test: `crates/orca-runtime/src/mentions.rs:1331-1880`
 
-- [ ] **Step 1: Write failing literal-text tests**
+- [x] **Step 1: Write failing literal-text tests**
 
 Add tests that call the shared `expand_mentions` API with empty bindings:
 
@@ -45,7 +45,7 @@ fn unbound_at_tokens_remain_literal_even_when_they_look_like_paths() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run:
 
@@ -55,7 +55,7 @@ cargo test -p orca-runtime unbound_at_tokens_remain_literal_even_when_they_look_
 
 Expected: FAIL because `@oai/sky还能逆向吗` is resolved as a path or `@README.md` injects a `<file>` block.
 
-- [ ] **Step 3: Remove raw-text expansion from `expand_mentions`**
+- [x] **Step 3: Remove raw-text expansion from `expand_mentions`**
 
 Keep only validated binding expansion:
 
@@ -137,11 +137,11 @@ fn file_block(
 }
 ```
 
-- [ ] **Step 4: Rewrite legacy tests around selected bindings**
+- [x] **Step 4: Rewrite legacy tests around selected bindings**
 
 Remove tests whose only contract is automatic raw `@file` expansion. Preserve admission coverage by calling the simplified `file_block` directly, and retain all atomic binding, same-name, multi-root, Skill, Plugin, and MCP Resource tests.
 
-- [ ] **Step 5: Run runtime Mention tests and confirm GREEN**
+- [x] **Step 5: Run runtime Mention tests and confirm GREEN**
 
 Run:
 
@@ -151,7 +151,7 @@ cargo test -p orca-runtime mentions::tests -- --nocapture
 
 Expected: all Mention unit tests PASS.
 
-- [ ] **Step 6: Commit runtime semantics**
+- [x] **Step 6: Commit runtime semantics**
 
 ```bash
 git add crates/orca-runtime/src/mentions.rs
@@ -164,7 +164,7 @@ git commit -m "fix(runtime): require bindings for at mentions"
 - Modify: `src/cli.rs:742-771`
 - Modify: `tests/history_contract.rs:43-75`
 
-- [ ] **Step 1: Rewrite the history contract to expect literal text**
+- [x] **Step 1: Rewrite the history contract to expect literal text**
 
 Replace the legacy expansion test with:
 
@@ -201,7 +201,7 @@ fn exec_preserves_unbound_at_tokens_as_literal_history() {
 }
 ```
 
-- [ ] **Step 2: Run the contract and confirm RED**
+- [x] **Step 2: Run the contract and confirm RED**
 
 Run:
 
@@ -211,7 +211,7 @@ cargo test --test history_contract exec_preserves_unbound_at_tokens_as_literal_h
 
 Expected: FAIL because CLI preprocessing injects the file block.
 
-- [ ] **Step 3: Delete CLI mention preprocessing**
+- [x] **Step 3: Delete CLI mention preprocessing**
 
 Remove the `cwd_for_mentions` setup and this branch:
 
@@ -227,7 +227,7 @@ let prompt = match crate::mentions::expand_file_mentions(&prompt, &cwd_for_menti
 
 Pass the assembled prompt directly into the existing exec request.
 
-- [ ] **Step 4: Run history and exec contracts**
+- [x] **Step 4: Run history and exec contracts**
 
 Run:
 
@@ -238,7 +238,7 @@ cargo test --test exec_jsonl -- --nocapture
 
 Expected: both commands PASS.
 
-- [ ] **Step 5: Commit CLI behavior**
+- [x] **Step 5: Commit CLI behavior**
 
 ```bash
 git add src/cli.rs tests/history_contract.rs
@@ -256,7 +256,7 @@ git commit -m "fix(cli): keep unbound at tokens literal"
 - Test: `crates/orca-tui/src/app.rs` existing test module
 - Test: `crates/orca-tui/src/types.rs` existing test module
 
-- [ ] **Step 1: Write failing AppState rejection tests**
+- [x] **Step 1: Write failing AppState rejection tests**
 
 Add a state test that starts from an optimistic running submission:
 
@@ -285,7 +285,7 @@ fn submission_rejection_removes_optimistic_user_and_returns_idle() {
 
 Add an app/runtime-event test asserting the textarea becomes `review @gone.txt` after handling the event.
 
-- [ ] **Step 2: Run focused TUI tests and confirm RED**
+- [x] **Step 2: Run focused TUI tests and confirm RED**
 
 Run:
 
@@ -295,7 +295,7 @@ cargo test -p orca-tui submission_rejection -- --nocapture
 
 Expected: compile failure because `SubmissionRejected` does not exist.
 
-- [ ] **Step 3: Define the event and recovery projection**
+- [x] **Step 3: Define the event and recovery projection**
 
 Add:
 
@@ -330,7 +330,7 @@ let restored_prompt = match &tui_event {
 
 After `state.update`, rebuild the textarea from `restored_prompt` with `make_textarea_with_text`.
 
-- [ ] **Step 4: Emit rejection for user submission preparation failures**
+- [x] **Step 4: Emit rejection for user submission preparation failures**
 
 Add a `SubmittedTurn` method that returns a restorable prompt only for user turns:
 
@@ -345,7 +345,7 @@ pub(crate) fn rejection_prompt(&self) -> Option<&str> {
 
 Before initializing or expanding, save `submitted_turn.rejection_prompt().map(str::to_string)`. On user-turn initialization or expansion failure, send `SubmissionRejected { prompt, message }` and return. Preserve the existing workflow-notification error handling without restoring its internal prompt into the composer.
 
-- [ ] **Step 5: Run focused TUI tests and confirm GREEN**
+- [x] **Step 5: Run focused TUI tests and confirm GREEN**
 
 Run:
 
@@ -356,7 +356,7 @@ cargo test -p orca-tui idle_submit_carries_atomic_mention_bindings -- --nocaptur
 
 Expected: all focused tests PASS.
 
-- [ ] **Step 6: Commit rejection lifecycle**
+- [x] **Step 6: Commit rejection lifecycle**
 
 ```bash
 git add crates/orca-tui/src/types.rs crates/orca-tui/src/runtime_event_actions.rs crates/orca-tui/src/submitted_turn.rs crates/orca-tui/src/app.rs
@@ -369,7 +369,7 @@ git commit -m "fix(tui): recover rejected mention submissions"
 - Modify: `crates/orca-tui/src/global_actions.rs:15-58`
 - Test: `crates/orca-tui/src/global_actions.rs:63-123`
 
-- [ ] **Step 1: Write the failing running-state double-cancel test**
+- [x] **Step 1: Write the failing running-state double-cancel test**
 
 ```rust
 #[test]
@@ -408,7 +408,7 @@ fn second_ctrl_c_exits_even_when_status_remains_running() {
 }
 ```
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run:
 
@@ -418,7 +418,7 @@ cargo test -p orca-tui second_ctrl_c_exits_even_when_status_remains_running -- -
 
 Expected: FAIL because running cancellation returns before setting `last_ctrl_c`.
 
-- [ ] **Step 3: Check force-exit before the running interrupt branch**
+- [x] **Step 3: Check force-exit before the running interrupt branch**
 
 Refactor `GlobalShortcut::Cancel` so it always computes `now`, exits on a recent prior Ctrl+C, records the first press, and then either interrupts a running turn or shows the idle exit hint:
 
@@ -440,7 +440,7 @@ state.push_message(ChatMessage::System("Press Ctrl+C again to quit.".into()));
 state.scroll_to_bottom();
 ```
 
-- [ ] **Step 4: Run global action tests**
+- [x] **Step 4: Run global action tests**
 
 Run:
 
@@ -450,7 +450,7 @@ cargo test -p orca-tui global_actions::tests -- --nocapture
 
 Expected: all global shortcut tests PASS.
 
-- [ ] **Step 5: Commit the exit fail-safe**
+- [x] **Step 5: Commit the exit fail-safe**
 
 ```bash
 git add crates/orca-tui/src/global_actions.rs
@@ -466,7 +466,7 @@ git commit -m "fix(tui): allow force exit after interrupt"
 - Modify: `docs/harness-contract.md:95-120`
 - Modify: `README.md` Mention usage sections
 
-- [ ] **Step 1: Add a failing app-server literal-text regression**
+- [x] **Step 1: Add a failing app-server literal-text regression**
 
 Start a thread rooted at a temp directory containing `same.txt`, submit plain text `inspect @same.txt`, then submit `mock_history_echo`. Assert the echoed history contains the literal prompt and does not contain the file body:
 
@@ -476,7 +476,7 @@ assert!(!echoed.contains("must-not-be-injected"));
 assert!(!echoed.contains("<file"));
 ```
 
-- [ ] **Step 2: Run the focused server contract and confirm RED**
+- [x] **Step 2: Run the focused server contract and confirm RED**
 
 Run:
 
@@ -487,11 +487,11 @@ PATH=/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/n
 
 Expected: FAIL because shared expansion currently injects the file.
 
-- [ ] **Step 3: Run again after Tasks 1-2 and confirm GREEN**
+- [x] **Step 3: Run again after Tasks 1-2 and confirm GREEN**
 
 Use the same command. Expected: PASS without additional server branching, proving the shared expansion boundary is correct.
 
-- [ ] **Step 4: Update source-of-truth documentation**
+- [x] **Step 4: Update source-of-truth documentation**
 
 Make these exact contract changes:
 
@@ -502,7 +502,7 @@ Make these exact contract changes:
 - Harness contract: plain text never infers a target; structured `mention` input is required.
 - README: remove raw `@file` attachment claims and state that candidate selection performs attachment.
 
-- [ ] **Step 5: Run docs and server checks**
+- [x] **Step 5: Run docs and server checks**
 
 Run:
 
@@ -516,7 +516,7 @@ PATH=/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/n
 
 Expected: diff check and both structured/literal contracts PASS.
 
-- [ ] **Step 6: Commit protocol and documentation contracts**
+- [x] **Step 6: Commit protocol and documentation contracts**
 
 ```bash
 git add tests/session_server_contract.rs README.md docs/architecture/adr/0002-unified-atomic-mention-system.md docs/architecture/mention-search-glossary.md docs/harness-contract.md
@@ -528,7 +528,7 @@ git commit -m "docs(mentions): require structured at bindings"
 **Files:**
 - Verify all modified source, test, and documentation files.
 
-- [ ] **Step 1: Format and inspect whitespace**
+- [x] **Step 1: Format and inspect whitespace**
 
 Run:
 
@@ -539,7 +539,9 @@ git diff --check
 
 Expected: both commands exit 0.
 
-- [ ] **Step 2: Run focused crates and contracts**
+Verification note: workspace-wide formatting reports only concurrent changes in `crates/orca-tools/src/skills.rs`, `crates/orca-tui/src/slash_command_actions.rs`, and `crates/orca-tui/src/slash_menu_actions.rs`; all files changed by this plan pass `rustfmt --check` individually.
+
+- [x] **Step 2: Run focused crates and contracts**
 
 Run:
 
@@ -556,7 +558,9 @@ PATH=/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/n
 
 Expected: all commands exit 0.
 
-- [ ] **Step 3: Run workspace check**
+Verification note: the focused acceptance commands all passed. The full `orca-tui` crate run reached 491/492; the only failure was the pre-existing `large_paste_submits_full_content_and_clears_pending_payload` fixture, whose expected history was changed by the concurrent input-history persistence work in `033df63c`. The binding-only runtime tests and all new TUI tests passed independently.
+
+- [x] **Step 3: Run workspace check**
 
 Run:
 
@@ -566,7 +570,7 @@ PATH=/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/n
 
 Expected: exit 0.
 
-- [ ] **Step 4: Review final scope**
+- [x] **Step 4: Review final scope**
 
 Run:
 
