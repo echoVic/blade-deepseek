@@ -344,6 +344,34 @@ pub async fn call_streaming_async(
                     usage: None,
                 };
             }
+            if let Some(delay_ms) = mock_stream_usage_delay_ms(conversation) {
+                let started =
+                    ProviderStep::ReasoningDelta("Mock delayed usage started.".to_string());
+                on_step(&started);
+                if !sleep_with_cancel(Duration::from_millis(delay_ms), cancel).await {
+                    return ProviderResponse {
+                        steps: vec![started],
+                        assistant_content: None,
+                        assistant_reasoning: Some("Mock delayed usage started.".to_string()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    };
+                }
+                let completed =
+                    ProviderStep::MessageDelta("Mock delayed usage completed.".to_string());
+                on_step(&completed);
+                return ProviderResponse {
+                    steps: vec![started, completed],
+                    assistant_content: Some("Mock delayed usage completed.".to_string()),
+                    assistant_reasoning: Some("Mock delayed usage started.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(Usage {
+                        input_tokens: 120,
+                        output_tokens: 30,
+                        cache_tokens: 10,
+                    }),
+                };
+            }
             let response = call(kind, conversation, config);
             for step in &response.steps {
                 on_step(step);
@@ -489,6 +517,16 @@ fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
         .unwrap_or("")
         .trim()
         .strip_prefix("mock_stream_delay_ms ")
+        .and_then(|delay| delay.trim().parse::<u64>().ok())
+        .map(|delay| delay.min(10_000))
+}
+
+fn mock_stream_usage_delay_ms(conversation: &Conversation) -> Option<u64> {
+    conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_usage_delay_ms ")
         .and_then(|delay| delay.trim().parse::<u64>().ok())
         .map(|delay| delay.min(10_000))
 }

@@ -1,15 +1,13 @@
 use crossbeam_channel::Sender;
 use std::io;
 
-#[cfg(test)]
-use orca_approval::ApprovalPolicy;
+use crate::operation_controller::TuiTurnControl;
+use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::tool_types;
 use orca_mcp::{
     McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,
 };
-#[cfg(test)]
-use orca_runtime::lifecycle::{RuntimeApprovalDecision, RuntimeToolActorContext};
 use orca_runtime::lifecycle::{
     RuntimeApprovalHandler, RuntimePermissionRequest, RuntimePermissionRequestHandler,
     RuntimePermissionResponse, RuntimeUserInputHandler, RuntimeUserInputRequest,
@@ -18,17 +16,6 @@ use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
 use orca_runtime::runtime_pending_interaction::{
     RuntimeMcpElicitationRequest, RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
 };
-#[cfg(test)]
-use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
-
-use crate::operation_controller::TuiTurnControl;
-use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
-
-#[cfg(test)]
-pub(crate) enum TuiToolApprovalOutcome {
-    Continue,
-    Denied(tool_types::ToolResult),
-}
 
 pub(crate) struct TuiApprovalHandler {
     event_tx: Sender<TuiEvent>,
@@ -45,6 +32,7 @@ impl TuiApprovalHandler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_pending_interactions(
         mut self,
         store: RuntimePendingInteractionStore,
@@ -104,150 +92,14 @@ impl RuntimeApprovalHandler for TuiApprovalHandler {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn resolve_tui_tool_approval(
-    invocation: &ToolInvocation,
-    tool_request: &tool_types::ToolRequest,
-    policy: &ApprovalPolicy,
-    runtime_context: &mut RuntimeToolActorContext,
-    event_tx: &Sender<TuiEvent>,
-    control: &TuiTurnControl,
-    pending_interactions: Option<&RuntimePendingInteractionStore>,
-) -> TuiToolApprovalOutcome {
-    let Some(approval) = approval_request_for_invocation(invocation) else {
-        return TuiToolApprovalOutcome::Continue;
-    };
-    if !orca_runtime::agent_common::requires_approval(approval.action) {
-        return TuiToolApprovalOutcome::Continue;
-    }
-
-    let approval_decision =
-        runtime_context.resolve_tool_approval(policy, Some(approval.clone()), tool_request);
-    match approval_decision {
-        RuntimeApprovalDecision::Allowed(_) | RuntimeApprovalDecision::NotRequired => {
-            TuiToolApprovalOutcome::Continue
-        }
-        RuntimeApprovalDecision::Ask(approval) => {
-            let mut approval = approval.clone();
-            approval.preview = build_approval_preview(tool_request);
-            let handler = match pending_interactions {
-                Some(store) => TuiApprovalHandler::new(event_tx.clone(), control.clone())
-                    .with_pending_interactions(store.clone()),
-                None => TuiApprovalHandler::new(event_tx.clone(), control.clone()),
-            };
-            let resolution = runtime_context
-                .resolve_interactive_tool_approval(&handler, &approval, tool_request)
-                .unwrap_or_else(|error| ApprovalResolution {
-                    id: approval.id.clone(),
-                    decision: ApprovalDecision::Deny,
-                    reason: format!("interactive approval failed: {error}"),
-                });
-            if resolution.decision == ApprovalDecision::Deny {
-                TuiToolApprovalOutcome::Denied(tool_types::ToolResult::denied(
-                    tool_request,
-                    resolution.reason,
-                ))
-            } else {
-                TuiToolApprovalOutcome::Continue
-            }
-        }
-        RuntimeApprovalDecision::Denied { result, .. } => TuiToolApprovalOutcome::Denied(result),
-    }
-}
-
-/// Build a human-readable preview of what a tool call will do, parsed from its
-/// raw JSON arguments. Returns `None` when there is nothing meaningful to show.
-/// This is best-effort: the strings come straight from the pending request, so
-/// the diff/command shown is exactly what would run.
-#[cfg(test)]
-fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
-    use orca_core::tool_types::ToolName;
-
-    let raw = request.raw_arguments.as_deref()?;
-    let args: serde_json::Value = serde_json::from_str(raw).ok()?;
-
-    match &request.name {
-        ToolName::Edit => {
-            let path = args["path"].as_str().unwrap_or("(file)");
-            let old_text = args["old_text"].as_str().unwrap_or_default();
-            let new_text = args["new_text"].as_str().unwrap_or_default();
-            let mut out = format!("@@ {path} @@\n");
-            for line in old_text.lines() {
-                out.push_str(&format!("- {line}\n"));
-            }
-            for line in new_text.lines() {
-                out.push_str(&format!("+ {line}\n"));
-            }
-            Some(out.trim_end().to_string())
-        }
-        ToolName::WriteFile => {
-            let path = args["path"].as_str().unwrap_or("(file)");
-            let content = args["content"]
-                .as_str()
-                .or_else(|| args["contents"].as_str())
-                .unwrap_or_default();
-            let mut out = format!("@@ write {path} @@\n");
-            for line in content.lines().take(40) {
-                out.push_str(&format!("+ {line}\n"));
-            }
-            let total = content.lines().count();
-            if total > 40 {
-                out.push_str(&format!("+ … (+{} more lines)\n", total - 40));
-            }
-            Some(out.trim_end().to_string())
-        }
-        ToolName::Bash => {
-            let command = args["command"].as_str().or_else(|| args.as_str())?;
-            Some(format!("$ {command}"))
-        }
-        _ => None,
-    }
-}
-
-/// Routes runtime permission requests (sandbox escalations and the
-/// `request_permissions` tool) through the TUI approval channel. Display
-/// fields can be overridden so callers like the bash sandbox escalation can
-/// show the failing command instead of the generic permission summary.
 pub(crate) struct TuiPermissionRequestHandler {
     event_tx: Sender<TuiEvent>,
     control: TuiTurnControl,
-    tool: String,
-    target: Option<String>,
-    preview: Option<String>,
-    pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
 impl TuiPermissionRequestHandler {
     pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
-        Self {
-            event_tx,
-            control,
-            tool: "request_permissions".to_string(),
-            target: None,
-            preview: None,
-            pending_interactions: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_display(
-        mut self,
-        tool: impl Into<String>,
-        target: Option<String>,
-        preview: Option<String>,
-    ) -> Self {
-        self.tool = tool.into();
-        self.target = target;
-        self.preview = preview;
-        self
-    }
-
-    pub(crate) fn with_pending_interactions(
-        mut self,
-        store: RuntimePendingInteractionStore,
-    ) -> Self {
-        self.pending_interactions = Some(store);
-        self
+        Self { event_tx, control }
     }
 }
 
@@ -256,39 +108,27 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler {
         &self,
         request: &RuntimePermissionRequest,
     ) -> std::io::Result<RuntimePermissionResponse> {
-        let preview = self
-            .preview
-            .clone()
-            .unwrap_or_else(|| describe_permission_request(request));
         let pending = RuntimePendingInteractionRecord::from_permission_request(
             request,
-            self.tool.clone(),
-            self.target.clone(),
-            Some(preview),
+            "request_permissions",
+            None,
+            Some(describe_permission_request(request)),
         );
         let waiter = self
             .control
             .register_interaction(TuiInteractionKind::Permission, &request.id)?;
         let key = waiter.key().clone();
-        let projected =
-            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
         if self
             .event_tx
             .send(approval_event_from_pending_interaction(&key, &pending))
             .is_err()
         {
-            remove_projected_interaction(
-                self.pending_interactions.as_ref(),
-                &request.id,
-                projected,
-            );
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TUI event channel closed while waiting for permission",
             ));
         }
         let response = waiter.wait();
-        remove_projected_interaction(self.pending_interactions.as_ref(), &request.id, projected);
         let allowed = match response {
             Ok(TuiInteractionResponse::Permission(allowed)) => allowed,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => false,
@@ -301,26 +141,6 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler {
             } else {
                 PermissionResponseDecision::Deny
             },
-            scope: PermissionGrantScope::Turn,
-            permissions: request.permissions.clone(),
-            strict_auto_review: false,
-        })
-    }
-}
-
-/// Grants whatever was requested without prompting; used when the approval
-/// policy already resolved the escalation to Allow (e.g. full-auto mode).
-#[cfg(test)]
-pub(crate) struct AutoAllowPermissionRequests;
-
-#[cfg(test)]
-impl RuntimePermissionRequestHandler for AutoAllowPermissionRequests {
-    fn request_permissions(
-        &self,
-        request: &RuntimePermissionRequest,
-    ) -> std::io::Result<RuntimePermissionResponse> {
-        Ok(RuntimePermissionResponse {
-            decision: PermissionResponseDecision::Allow,
             scope: PermissionGrantScope::Turn,
             permissions: request.permissions.clone(),
             strict_auto_review: false,
@@ -381,6 +201,7 @@ impl TuiUserInputHandler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_pending_interactions(
         mut self,
         store: RuntimePendingInteractionStore,
@@ -431,24 +252,11 @@ impl RuntimeUserInputHandler for TuiUserInputHandler {
 pub(crate) struct TuiMcpElicitationHandler {
     event_tx: Sender<TuiEvent>,
     control: TuiTurnControl,
-    pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
 impl TuiMcpElicitationHandler {
     pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
-        Self {
-            event_tx,
-            control,
-            pending_interactions: None,
-        }
-    }
-
-    pub(crate) fn with_pending_interactions(
-        mut self,
-        store: RuntimePendingInteractionStore,
-    ) -> Self {
-        self.pending_interactions = Some(store);
-        self
+        Self { event_tx, control }
     }
 
     pub(crate) fn request_mcp_elicitation(
@@ -460,8 +268,6 @@ impl TuiMcpElicitationHandler {
             .control
             .register_interaction(TuiInteractionKind::McpElicitation, &request.id)?;
         let key = waiter.key().clone();
-        let projected =
-            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
         if self
             .event_tx
             .send(mcp_elicitation_event_from_pending_interaction(
@@ -469,18 +275,12 @@ impl TuiMcpElicitationHandler {
             ))
             .is_err()
         {
-            remove_projected_interaction(
-                self.pending_interactions.as_ref(),
-                &request.id,
-                projected,
-            );
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TUI event channel closed while waiting for MCP elicitation",
             ));
         }
         let response = waiter.wait();
-        remove_projected_interaction(self.pending_interactions.as_ref(), &request.id, projected);
         match response {
             Ok(TuiInteractionResponse::McpElicitation {
                 accepted,

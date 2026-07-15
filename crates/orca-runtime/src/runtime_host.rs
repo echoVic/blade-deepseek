@@ -14,26 +14,38 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::HookEvent;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::task_types::TaskStatus;
+use orca_core::workflow_types::{WorkflowInput, WorkflowOutput};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
+use serde_json::Value;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tokio::task::JoinHandle;
 
 use crate::background_turn::RuntimeTurnContinuation;
 use crate::controller::{
-    ControllerRunOptions, ThreadTurnPromptPlacement, ThreadTurnRequest, ThreadTurnToolMode,
+    ControllerRunOptions, RuntimeBackgroundWorkflows, ThreadTurnPromptPlacement, ThreadTurnRequest,
+    ThreadTurnToolMode,
 };
 use crate::hooks::HookContext;
 use crate::lifecycle::{
     RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeTaskKind,
     RuntimeUserInputHandler, ThreadSteerHandle,
 };
-use crate::tasks::TaskRegistry;
+use crate::provider_stream::{
+    RuntimeProviderSuspension, RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
+};
+use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 use crate::thread::RuntimeThread;
 use crate::thread_store::SessionTranscript;
+use crate::workflow::runner::{WorkflowLaunchRequest, WorkflowRunner};
+use crate::workflow_execution::BackgroundWorkflowRun;
 
 pub const HOST_COMMAND_CAPACITY: usize = 16;
 pub const THREAD_COMMAND_CAPACITY: usize = 16;
+pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
+const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
@@ -71,6 +83,7 @@ pub struct HostedGenerationHandlers {
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
+    provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
 }
 
 impl fmt::Debug for HostedGenerationHandlers {
@@ -83,6 +96,10 @@ impl fmt::Debug for HostedGenerationHandlers {
             .field(
                 "mcp_elicitation_handler",
                 &self.mcp_elicitation_handler.is_some(),
+            )
+            .field(
+                "provider_suspension_control",
+                &self.provider_suspension_control.is_some(),
             )
             .finish()
     }
@@ -120,6 +137,14 @@ impl HostedGenerationHandlers {
         self.mcp_elicitation_handler = Some(handler);
         self
     }
+
+    pub fn with_provider_suspension_control(
+        mut self,
+        control: Arc<dyn RuntimeProviderSuspensionControl>,
+    ) -> Self {
+        self.provider_suspension_control = Some(control);
+        self
+    }
 }
 
 type HostedGenerationHandlerFactory =
@@ -134,7 +159,59 @@ pub trait ThreadOperationExecutor: Send + Sync + 'static {
         events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
-    ) -> io::Result<RunStatus>;
+    ) -> io::Result<ThreadOperationOutcome>;
+}
+
+pub enum ThreadOperationOutcome {
+    Completed {
+        status: RunStatus,
+        background_workflows: RuntimeBackgroundWorkflows,
+    },
+    ProviderSuspended {
+        suspension: Box<RuntimeProviderSuspension>,
+        background_workflows: RuntimeBackgroundWorkflows,
+    },
+}
+
+impl From<RunStatus> for ThreadOperationOutcome {
+    fn from(status: RunStatus) -> Self {
+        Self::Completed {
+            status,
+            background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+        }
+    }
+}
+
+impl ThreadOperationOutcome {
+    fn background_workflow_count(&self) -> usize {
+        match self {
+            Self::Completed {
+                background_workflows,
+                ..
+            }
+            | Self::ProviderSuspended {
+                background_workflows,
+                ..
+            } => background_workflows.len(),
+        }
+    }
+
+    fn take_background_workflows(&mut self) -> RuntimeBackgroundWorkflows {
+        match self {
+            Self::Completed {
+                background_workflows,
+                ..
+            }
+            | Self::ProviderSuspended {
+                background_workflows,
+                ..
+            } => std::mem::take(background_workflows),
+        }
+    }
+
+    fn suspends_provider(&self) -> bool {
+        matches!(self, Self::ProviderSuspended { .. })
+    }
 }
 
 #[derive(Clone)]
@@ -156,7 +233,9 @@ pub struct HostedTurnRequest {
     continuation: Option<RuntimeTurnContinuation>,
     resumes_existing_turn: bool,
     task_id: Option<String>,
+    main_session_task_id: Option<String>,
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
+    usage_credit: UsageTotals,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,7 +271,9 @@ impl HostedTurnRequest {
             continuation: None,
             resumes_existing_turn: false,
             task_id: None,
+            main_session_task_id: None,
             generation_handler_factory: None,
+            usage_credit: UsageTotals::default(),
         }
     }
 
@@ -337,7 +418,9 @@ impl HostedTurnRequest {
             return Ok(());
         };
         if let Some(task_id) = self.task_id.as_deref() {
-            return registry.mark_running(task_id);
+            registry.mark_running(task_id)?;
+            self.main_session_task_id = Some(task_id.to_string());
+            return Ok(());
         }
 
         let task = registry.create_main_session(description.clone());
@@ -348,7 +431,30 @@ impl HostedTurnRequest {
             );
             return Err(error);
         }
-        self.task_id = Some(task.id);
+        self.task_id = Some(task.id.clone());
+        self.main_session_task_id = Some(task.id);
+        Ok(())
+    }
+
+    fn prepare_background_continuation(&mut self, registry: &TaskRegistry) -> Result<(), String> {
+        let HostedOperationKind::BackgroundContinuation { task_id } = &self.operation_kind else {
+            return Ok(());
+        };
+        let continuation =
+            crate::background_turn::take_approved_background_turn_continuation(registry, task_id)?
+                .ok_or_else(|| {
+                    format!(
+                        "background task {task_id} has no approved provider response to continue"
+                    )
+                })?;
+        self.usage_credit = registry
+            .get(task_id)
+            .and_then(|task| task.usage)
+            .unwrap_or_default();
+        self.continuation = Some(continuation.into_runtime_turn_continuation());
+        self.resumes_existing_turn = true;
+        self.task_id = Some(task_id.clone());
+        self.main_session_task_id = Some(task_id.clone());
         Ok(())
     }
 
@@ -411,9 +517,10 @@ impl HostedTurnRequest {
         if let Some(continuation) = self.continuation.clone() {
             request = request.with_continuation(continuation);
         }
-        if self.task_description.is_some()
-            && let Some(task_id) = self.task_id.as_deref()
-        {
+        if let Some(control) = generation.handlers.provider_suspension_control.clone() {
+            request = request.with_provider_suspension_control(control);
+        }
+        if let Some(task_id) = self.main_session_task_id.as_deref() {
             request = request.with_main_session_task_id(task_id);
         }
         request
@@ -425,6 +532,94 @@ impl HostedTurnRequest {
 
     fn is_resumable(&self) -> bool {
         self.envelope == HostedOperationEnvelope::Turn
+    }
+}
+
+#[derive(Clone)]
+pub struct HostedWorkflowRequest {
+    name: String,
+    args: Option<Value>,
+    config: Option<RunConfig>,
+    tool_use_id: Option<String>,
+    event_observer: Option<Arc<dyn EventObserver>>,
+}
+
+impl HostedWorkflowRequest {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            args: None,
+            config: None,
+            tool_use_id: None,
+            event_observer: None,
+        }
+    }
+
+    pub fn with_args(mut self, args: Value) -> Self {
+        self.args = Some(args);
+        self
+    }
+
+    pub fn with_command_args(mut self, raw: &str) -> Result<Self, String> {
+        self.args = Some(parse_hosted_workflow_args(raw)?);
+        Ok(self)
+    }
+
+    pub fn with_config(mut self, config: RunConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    pub fn with_tool_use_id(mut self, tool_use_id: impl Into<String>) -> Self {
+        self.tool_use_id = Some(tool_use_id.into());
+        self
+    }
+
+    pub fn with_event_observer(mut self, observer: Arc<dyn EventObserver>) -> Self {
+        self.event_observer = Some(observer);
+        self
+    }
+}
+
+impl fmt::Debug for HostedWorkflowRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostedWorkflowRequest")
+            .field("name", &self.name)
+            .field("args", &self.args)
+            .field("tool_use_id", &self.tool_use_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HostedWorkflowLaunch {
+    task_id: String,
+    run_id: String,
+    workflow_name: String,
+    tool_use_id: String,
+    output: WorkflowOutput,
+}
+
+impl HostedWorkflowLaunch {
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn workflow_name(&self) -> &str {
+        &self.workflow_name
+    }
+
+    pub fn tool_use_id(&self) -> &str {
+        &self.tool_use_id
+    }
+
+    pub fn output(&self) -> &WorkflowOutput {
+        &self.output
     }
 }
 
@@ -533,20 +728,61 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
         events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
-    ) -> io::Result<RunStatus> {
-        if request.operation_kind() != &HostedOperationKind::Turn {
+    ) -> io::Result<ThreadOperationOutcome> {
+        if request.operation_kind() == &HostedOperationKind::ManualCompaction {
+            let config = generation.config();
+            let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
+            let before_messages = thread.session().conversation().messages.len();
+            let mut sink = EventSink::new(writer, config.output_format)
+                .with_optional_observer(request.event_observer());
+            sink.emit(&events.context_compaction_started("manual", before_messages))?;
+            let (before_messages, after_messages) =
+                thread.session_mut().compact(config, &cwd, cancel);
+            sink.emit(&events.context_compacted(
+                "manual",
+                "manual",
+                before_messages,
+                after_messages,
+                before_messages.saturating_sub(after_messages),
+                "compacted context manually",
+            ))?;
+            return Ok(RunStatus::Success.into());
+        }
+        if request.operation_kind() != &HostedOperationKind::Turn
+            && !matches!(
+                request.operation_kind(),
+                HostedOperationKind::BackgroundContinuation { .. }
+            )
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "legacy runtime executor only supports turn operations",
+                "runtime executor received an unsupported operation kind",
             ));
         }
-        thread.run_request_with_event_factory_and_cancel(
-            generation.config(),
-            &request.thread_turn_request(generation),
-            writer,
-            events,
-            cancel.clone(),
-        )
+        thread
+            .run_request_with_event_factory_and_cancel_outcome(
+                generation.config(),
+                &request.thread_turn_request(generation),
+                writer,
+                events,
+                cancel.clone(),
+            )
+            .map(|outcome| match outcome {
+                crate::controller::ThreadTurnOutcome::Completed {
+                    status,
+                    background_workflows,
+                } => ThreadOperationOutcome::Completed {
+                    status,
+                    background_workflows,
+                },
+                crate::controller::ThreadTurnOutcome::ProviderSuspended {
+                    suspension,
+                    background_workflows,
+                } => ThreadOperationOutcome::ProviderSuspended {
+                    suspension,
+                    background_workflows,
+                },
+            })
     }
 }
 
@@ -558,6 +794,7 @@ pub enum RuntimeHostError {
     ResponseChannelClosed { owner: &'static str },
     OperationActive { operation_id: OperationId },
     ThreadStartFailed { message: String },
+    WorkflowLaunchFailed { message: String },
     RuntimeStartFailed { message: String },
     ThreadActorPanicked { thread_id: String, message: String },
     SupervisorPanicked,
@@ -577,6 +814,9 @@ impl fmt::Display for RuntimeHostError {
             }
             Self::ThreadStartFailed { message } => {
                 write!(formatter, "failed to start runtime thread: {message}")
+            }
+            Self::WorkflowLaunchFailed { message } => {
+                write!(formatter, "failed to launch workflow: {message}")
             }
             Self::RuntimeStartFailed { message } => {
                 write!(formatter, "failed to start runtime host: {message}")
@@ -748,12 +988,12 @@ pub struct RuntimeThreadSnapshot {
 }
 
 impl RuntimeThreadSnapshot {
-    fn from_thread(thread: &RuntimeThread) -> Self {
+    fn from_thread(thread: &RuntimeThread, usage_totals: UsageTotals) -> Self {
         Self {
             thread_id: thread.thread_id().to_string(),
             session_id: thread.session().session_id().map(str::to_string),
             conversation: thread.session().conversation().clone(),
-            usage_totals: thread.session().aggregate_usage_totals(),
+            usage_totals,
             completion_error: thread.session().completion_error().map(str::to_string),
             has_active_workflows: thread.session().has_active_workflows(),
             active_task_id: thread
@@ -799,6 +1039,9 @@ impl RuntimeThreadSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationOutcome {
     Completed(RunStatus),
+    Backgrounded {
+        task_id: String,
+    },
     ExecutionFailed {
         kind: io::ErrorKind,
         message: String,
@@ -1059,6 +1302,18 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    pub fn launch_workflow(
+        &self,
+        request: HostedWorkflowRequest,
+    ) -> Result<HostedWorkflowLaunch, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::LaunchWorkflow {
+            request: Box::new(request),
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     pub fn interrupt_operation(
         &self,
         operation_id: OperationId,
@@ -1196,11 +1451,24 @@ impl RuntimeHostHandle {
 
 impl RuntimeHost {
     pub fn start() -> Result<Self, RuntimeHostError> {
-        Self::start_with_executor(Arc::new(LegacyThreadOperationExecutor))
+        Self::start_with_background_capacity(HOST_BACKGROUND_TASK_CAPACITY)
+    }
+
+    pub fn start_with_background_capacity(
+        background_capacity: usize,
+    ) -> Result<Self, RuntimeHostError> {
+        Self::start_inner(Arc::new(LegacyThreadOperationExecutor), background_capacity)
     }
 
     pub fn start_with_executor(
         executor: Arc<dyn ThreadOperationExecutor>,
+    ) -> Result<Self, RuntimeHostError> {
+        Self::start_inner(executor, HOST_BACKGROUND_TASK_CAPACITY)
+    }
+
+    fn start_inner(
+        executor: Arc<dyn ThreadOperationExecutor>,
+        background_capacity: usize,
     ) -> Result<Self, RuntimeHostError> {
         let (command_tx, command_rx) = tokio_mpsc::channel(HOST_COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -1217,7 +1485,11 @@ impl RuntimeHost {
                 match runtime {
                     Ok(runtime) => {
                         let _ = ready_tx.send(Ok(()));
-                        runtime.block_on(run_host_supervisor(command_rx, executor));
+                        runtime.block_on(run_host_supervisor(
+                            command_rx,
+                            executor,
+                            background_capacity,
+                        ));
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -1306,6 +1578,10 @@ enum ThreadCommand {
         config: Option<Box<RunConfig>>,
         reply: SyncSender<Result<OperationHandle, RuntimeHostError>>,
     },
+    LaunchWorkflow {
+        request: Box<HostedWorkflowRequest>,
+        reply: SyncSender<Result<HostedWorkflowLaunch, RuntimeHostError>>,
+    },
     InterruptOperation {
         operation_id: OperationId,
         reply: SyncSender<Result<InterruptOperationResult, RuntimeHostError>>,
@@ -1349,6 +1625,7 @@ struct ThreadActorEntry {
 async fn run_host_supervisor(
     mut command_rx: tokio_mpsc::Receiver<HostCommand>,
     executor: Arc<dyn ThreadOperationExecutor>,
+    background_capacity: usize,
 ) {
     let mut actors = HashMap::<String, ThreadActorEntry>::new();
     while let Some(command) = command_rx.recv().await {
@@ -1402,9 +1679,15 @@ async fn run_host_supervisor(
                 let actor_handle = handle.clone();
                 let actor_executor = Arc::clone(&executor);
                 let join = tokio::spawn(async move {
-                    ThreadActor::new(thread, actor_config, actor_handle, actor_executor)
-                        .run(actor_rx)
-                        .await;
+                    ThreadActor::new(
+                        thread,
+                        actor_config,
+                        actor_handle,
+                        actor_executor,
+                        background_capacity,
+                    )
+                    .run(actor_rx)
+                    .await;
                 });
                 actors.insert(thread_id, ThreadActorEntry { command_tx, join });
                 let _ = reply.send(Ok(handle));
@@ -1458,6 +1741,11 @@ struct ThreadActor {
     executor: Arc<dyn ThreadOperationExecutor>,
     operation_ids: OperationIdAllocator,
     active: Option<ActiveOperation>,
+    background_tasks: HashMap<String, HostBackgroundTask>,
+    background_capacity: usize,
+    background_completion_tx: tokio_mpsc::UnboundedSender<String>,
+    background_completion_rx: tokio_mpsc::UnboundedReceiver<String>,
+    usage_ledger: RuntimeUsageLedger,
 }
 
 struct ThreadActorState {
@@ -1467,7 +1755,8 @@ struct ThreadActorState {
 
 struct ActiveOperation {
     operation_id: OperationId,
-    task_id: Option<String>,
+    runtime_task_id: Option<String>,
+    main_session_task_id: Option<String>,
     completion: OperationCompletion,
     request: HostedTurnRequest,
     config: RunConfig,
@@ -1485,7 +1774,68 @@ struct ActiveGeneration {
 struct OperationTaskResult {
     state: ThreadActorState,
     writer: Box<dyn HostedOperationWriter>,
-    outcome: OperationOutcome,
+    outcome: GenerationTaskOutcome,
+    usage_delta: UsageTotals,
+}
+
+enum GenerationTaskOutcome {
+    Executed(ThreadOperationOutcome),
+    ExecutionFailed {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    Panicked {
+        message: String,
+    },
+}
+
+struct HostBackgroundTask {
+    cancel: CancelToken,
+    join: JoinHandle<()>,
+}
+
+struct ProviderBackgroundTaskContext {
+    task_registry: TaskRegistry,
+    history_writer: Option<crate::history::SessionWriter>,
+    observer: Option<Arc<dyn EventObserver>>,
+    model: Option<String>,
+    run_id: String,
+    task_id: String,
+    usage_ledger: RuntimeUsageLedger,
+}
+
+struct WorkflowBackgroundTaskContext {
+    task_registry: TaskRegistry,
+    observer: Option<Arc<dyn EventObserver>>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeUsageLedger {
+    totals: Arc<Mutex<UsageTotals>>,
+}
+
+impl RuntimeUsageLedger {
+    fn new(totals: UsageTotals) -> Self {
+        Self {
+            totals: Arc::new(Mutex::new(totals)),
+        }
+    }
+
+    fn add(&self, usage: UsageTotals) -> UsageTotals {
+        let mut totals = self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *totals = add_usage_totals(*totals, usage);
+        *totals
+    }
+
+    fn totals(&self) -> UsageTotals {
+        *self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl ThreadActor {
@@ -1494,8 +1844,11 @@ impl ThreadActor {
         config: RunConfig,
         handle: RuntimeThreadHandle,
         executor: Arc<dyn ThreadOperationExecutor>,
+        background_capacity: usize,
     ) -> Self {
+        let usage_ledger = RuntimeUsageLedger::new(thread.session().aggregate_usage_totals());
         let events = EventFactory::new(thread.thread_id().to_string());
+        let (background_completion_tx, background_completion_rx) = tokio_mpsc::unbounded_channel();
         Self {
             state: Some(ThreadActorState { thread, events }),
             config,
@@ -1503,17 +1856,38 @@ impl ThreadActor {
             executor,
             operation_ids: OperationIdAllocator::new(),
             active: None,
+            background_tasks: HashMap::new(),
+            background_capacity,
+            background_completion_tx,
+            background_completion_rx,
+            usage_ledger,
         }
     }
 
     async fn run(mut self, mut command_rx: tokio_mpsc::Receiver<ThreadCommand>) {
         loop {
             let Some(mut active) = self.active.take() else {
-                let Some(command) = command_rx.recv().await else {
-                    break;
-                };
-                if self.handle_idle_command(command) {
-                    break;
+                tokio::select! {
+                    biased;
+                    command = command_rx.recv() => {
+                        let Some(command) = command else {
+                            self.shutdown_background_tasks().await;
+                            break;
+                        };
+                        if let ThreadCommand::ShutdownThread { reply } = command {
+                            self.shutdown_background_tasks().await;
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Ok(()));
+                            }
+                            break;
+                        }
+                        self.handle_idle_command(command);
+                    }
+                    task_id = self.background_completion_rx.recv(), if !self.background_tasks.is_empty() => {
+                        if let Some(task_id) = task_id {
+                            self.reap_background_task(&task_id).await;
+                        }
+                    }
                 }
                 continue;
             };
@@ -1526,6 +1900,7 @@ impl ThreadActor {
                             active.generation.cancel.cancel();
                             let result = (&mut active.generation.join).await;
                             self.finish_generation(active, result, false);
+                            self.shutdown_background_tasks().await;
                             if let Some(reply) = reply {
                                 let _ = reply.send(Ok(()));
                             }
@@ -1539,6 +1914,7 @@ impl ThreadActor {
                             active.generation.cancel.cancel();
                             let result = (&mut active.generation.join).await;
                             self.finish_generation(active, result, false);
+                            self.shutdown_background_tasks().await;
                             break;
                         }
                     }
@@ -1546,11 +1922,17 @@ impl ThreadActor {
                 result = &mut active.generation.join => {
                     self.finish_generation(active, result, true);
                 }
+                task_id = self.background_completion_rx.recv(), if !self.background_tasks.is_empty() => {
+                    if let Some(task_id) = task_id {
+                        self.reap_background_task(&task_id).await;
+                    }
+                    self.active = Some(active);
+                }
             }
         }
     }
 
-    fn handle_idle_command(&mut self, command: ThreadCommand) -> bool {
+    fn handle_idle_command(&mut self, command: ThreadCommand) {
         match command {
             ThreadCommand::StartTurn {
                 request,
@@ -1560,7 +1942,7 @@ impl ThreadActor {
             } => {
                 let Some(mut state) = self.state.take() else {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
-                    return false;
+                    return;
                 };
                 let operation_id = self.operation_ids.allocate();
                 let initial_generation = GenerationFence::initial(operation_id);
@@ -1570,13 +1952,20 @@ impl ThreadActor {
                     .map(|config| *config)
                     .unwrap_or_else(|| self.config.clone());
                 if let Err(error) =
+                    request.prepare_background_continuation(state.thread.session().task_registry())
+                {
+                    self.state = Some(state);
+                    let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed { message: error }));
+                    return;
+                }
+                if let Err(error) =
                     request.prepare_main_session_task(state.thread.session().task_registry())
                 {
                     self.state = Some(state);
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
                         message: format!("failed to prepare main-session task: {error}"),
                     }));
-                    return false;
+                    return;
                 }
                 if let Some(task_id) = request.task_id.as_deref() {
                     state
@@ -1584,11 +1973,12 @@ impl ThreadActor {
                         .lifecycle_mut()
                         .start_task_with_id(RuntimeTaskKind::Agent, task_id);
                 }
-                let task_id = state
+                let runtime_task_id = state
                     .thread
                     .lifecycle()
                     .active_task()
                     .map(|task| task.id().to_string());
+                let main_session_task_id = request.main_session_task_id.clone();
                 let steer_handle = ThreadSteerHandle::default();
                 let generation = self.spawn_generation(
                     state,
@@ -1604,7 +1994,8 @@ impl ThreadActor {
                 );
                 self.active = Some(ActiveOperation {
                     operation_id,
-                    task_id,
+                    runtime_task_id,
+                    main_session_task_id,
                     completion: completion.clone(),
                     request,
                     config,
@@ -1618,7 +2009,10 @@ impl ThreadActor {
                     thread: self.handle.clone(),
                     completion,
                 }));
-                false
+            }
+            ThreadCommand::LaunchWorkflow { request, reply } => {
+                let result = self.launch_hosted_workflow(*request);
+                let _ = reply.send(result);
             }
             ThreadCommand::InterruptOperation {
                 operation_id,
@@ -1627,7 +2021,6 @@ impl ThreadActor {
                 let _ = reply.send(Ok(InterruptOperationResult::Idle {
                     requested_operation_id: operation_id,
                 }));
-                false
             }
             ThreadCommand::ResumeOperation {
                 operation_id,
@@ -1636,7 +2029,6 @@ impl ThreadActor {
                 let _ = reply.send(Ok(ResumeOperationResult::Idle {
                     requested_operation_id: operation_id,
                 }));
-                false
             }
             ThreadCommand::SteerOperation {
                 operation_id,
@@ -1647,14 +2039,12 @@ impl ThreadActor {
                     requested_operation_id: operation_id,
                     active: None,
                 }));
-                false
             }
             ThreadCommand::AdmitGeneration { generation, reply } => {
                 let _ = reply.send(Ok(GenerationAdmissionResult::Rejected {
                     requested: generation,
                     active: None,
                 }));
-                false
             }
             ThreadCommand::ReadState { reply } => {
                 let state = if self.state.is_some() {
@@ -1663,16 +2053,19 @@ impl ThreadActor {
                     RuntimeThreadState::Unavailable
                 };
                 let _ = reply.send(Ok(state));
-                false
             }
             ThreadCommand::ReadSnapshot { reply } => {
                 let result = self
                     .state
                     .as_ref()
-                    .map(|state| RuntimeThreadSnapshot::from_thread(&state.thread))
+                    .map(|state| {
+                        RuntimeThreadSnapshot::from_thread(
+                            &state.thread,
+                            self.usage_ledger.totals(),
+                        )
+                    })
                     .ok_or(RuntimeHostError::ThreadUnavailable);
                 let _ = reply.send(result);
-                false
             }
             ThreadCommand::MutateIdle { mutation, reply } => {
                 let result = self
@@ -1681,7 +2074,6 @@ impl ThreadActor {
                     .ok_or(RuntimeHostError::ThreadUnavailable)
                     .map(|state| mutation.apply(&mut state.thread));
                 let _ = reply.send(result);
-                false
             }
             ThreadCommand::BacktrackLastUser { reply } => {
                 let result = self
@@ -1690,14 +2082,8 @@ impl ThreadActor {
                     .ok_or(RuntimeHostError::ThreadUnavailable)
                     .map(|state| state.thread.session_mut().backtrack_last_user());
                 let _ = reply.send(result);
-                false
             }
-            ThreadCommand::ShutdownThread { reply } => {
-                if let Some(reply) = reply {
-                    let _ = reply.send(Ok(()));
-                }
-                true
-            }
+            ThreadCommand::ShutdownThread { .. } => unreachable!("shutdown handled by actor loop"),
         }
     }
 
@@ -1705,6 +2091,11 @@ impl ThreadActor {
         let generation = active.generation.context.fence();
         match command {
             ThreadCommand::StartTurn { reply, .. } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::LaunchWorkflow { reply, .. } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));
@@ -1829,8 +2220,14 @@ impl ThreadActor {
         }
         let task_context = context.clone();
         let task_cancel = cancel.clone();
+        let usage_credit = if context.fence().generation_id().as_u64() == 0 {
+            request.usage_credit
+        } else {
+            UsageTotals::default()
+        };
         let join = tokio::task::spawn_blocking(move || {
             let mut state = state;
+            let usage_before = state.thread.session().aggregate_usage_totals();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 run_hosted_operation(
                     executor.as_ref(),
@@ -1843,19 +2240,24 @@ impl ThreadActor {
                 )
             }));
             let outcome = match outcome {
-                Ok(Ok(status)) => OperationOutcome::Completed(status),
-                Ok(Err(error)) => OperationOutcome::ExecutionFailed {
+                Ok(Ok(outcome)) => GenerationTaskOutcome::Executed(outcome),
+                Ok(Err(error)) => GenerationTaskOutcome::ExecutionFailed {
                     kind: error.kind(),
                     message: error.to_string(),
                 },
-                Err(payload) => OperationOutcome::Panicked {
+                Err(payload) => GenerationTaskOutcome::Panicked {
                     message: panic_message(payload),
                 },
             };
+            let usage_after = state.thread.session().aggregate_usage_totals();
             OperationTaskResult {
                 state,
                 writer,
                 outcome,
+                usage_delta: subtract_usage_totals(
+                    usage_totals_delta(usage_before, usage_after),
+                    usage_credit,
+                ),
             }
         });
         ActiveGeneration {
@@ -1873,50 +2275,132 @@ impl ThreadActor {
     ) {
         let outcome = match result {
             Ok(mut result) => {
-                let replace_generation = allow_resume
-                    && active.resume_queued
-                    && active.request.is_resumable()
-                    && result.outcome == OperationOutcome::Completed(RunStatus::Cancelled);
-                if replace_generation {
-                    if let Err(error) = result.writer.finish_generation(false) {
-                        self.state = Some(result.state);
-                        OperationOutcome::ExecutionFailed {
-                            kind: error.kind(),
-                            message: error.to_string(),
+                self.usage_ledger.add(result.usage_delta);
+                let background_error = match &mut result.outcome {
+                    GenerationTaskOutcome::Executed(outcome) => {
+                        let required = outcome
+                            .background_workflow_count()
+                            .saturating_add(usize::from(outcome.suspends_provider()));
+                        if let Err(error) = self.ensure_background_capacity(required) {
+                            let workflows = outcome.take_background_workflows();
+                            cancel_and_join_background_workflows(
+                                result.state.thread.session().task_registry(),
+                                active.request.event_observer(),
+                                workflows,
+                            );
+                            Some(error)
+                        } else {
+                            let workflows = outcome.take_background_workflows();
+                            self.spawn_workflow_background_tasks(
+                                result.state.thread.session().task_registry().clone(),
+                                active.request.event_observer(),
+                                workflows,
+                            );
+                            None
                         }
-                    } else {
-                        let _ = active.steer_handle.drain();
-                        if let Some(task_id) = active.task_id.as_deref() {
-                            result
-                                .state
-                                .thread
-                                .lifecycle_mut()
-                                .start_task_with_id(RuntimeTaskKind::Agent, task_id);
-                        }
-                        let context = GenerationContext::new(
-                            active.generation.context.fence().next(),
-                            active.steer_handle.clone(),
-                            true,
-                            HostedGenerationHandlers::default(),
-                            active.config.clone(),
-                        );
-                        active.generation = self.spawn_generation(
-                            result.state,
-                            &active.request,
-                            result.writer,
-                            context,
-                        );
-                        active.resume_queued = false;
-                        self.active = Some(active);
-                        return;
                     }
-                } else {
-                    let writer_error = result.writer.finish_generation(true).err();
+                    GenerationTaskOutcome::ExecutionFailed { .. }
+                    | GenerationTaskOutcome::Panicked { .. } => None,
+                };
+                if let Some(error) = background_error {
+                    let _ = result.writer.finish_generation(true);
                     self.state = Some(result.state);
-                    writer_error.map_or(result.outcome, |error| OperationOutcome::ExecutionFailed {
+                    OperationOutcome::ExecutionFailed {
                         kind: error.kind(),
                         message: error.to_string(),
-                    })
+                    }
+                } else {
+                    let replace_generation = allow_resume
+                        && active.resume_queued
+                        && active.request.is_resumable()
+                        && matches!(
+                            result.outcome,
+                            GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
+                                status: RunStatus::Cancelled,
+                                ..
+                            })
+                        );
+                    if replace_generation {
+                        if let Err(error) = result.writer.finish_generation(false) {
+                            self.state = Some(result.state);
+                            OperationOutcome::ExecutionFailed {
+                                kind: error.kind(),
+                                message: error.to_string(),
+                            }
+                        } else {
+                            let _ = active.steer_handle.drain();
+                            if let Some(task_id) = active.runtime_task_id.as_deref() {
+                                result
+                                    .state
+                                    .thread
+                                    .lifecycle_mut()
+                                    .start_task_with_id(RuntimeTaskKind::Agent, task_id);
+                            }
+                            let context = GenerationContext::new(
+                                active.generation.context.fence().next(),
+                                active.steer_handle.clone(),
+                                true,
+                                HostedGenerationHandlers::default(),
+                                active.config.clone(),
+                            );
+                            active.generation = self.spawn_generation(
+                                result.state,
+                                &active.request,
+                                result.writer,
+                                context,
+                            );
+                            active.resume_queued = false;
+                            self.active = Some(active);
+                            return;
+                        }
+                    } else {
+                        let writer_error = result.writer.finish_generation(true).err();
+                        if let Some(error) = writer_error {
+                            self.state = Some(result.state);
+                            OperationOutcome::ExecutionFailed {
+                                kind: error.kind(),
+                                message: error.to_string(),
+                            }
+                        } else {
+                            match result.outcome {
+                                GenerationTaskOutcome::Executed(
+                                    ThreadOperationOutcome::Completed { status, .. },
+                                ) => {
+                                    self.state = Some(result.state);
+                                    OperationOutcome::Completed(status)
+                                }
+                                GenerationTaskOutcome::Executed(
+                                    ThreadOperationOutcome::ProviderSuspended {
+                                        suspension, ..
+                                    },
+                                ) => match self.spawn_provider_background_task(
+                                    &active,
+                                    &mut result.state,
+                                    suspension,
+                                ) {
+                                    Ok(task_id) => {
+                                        self.state = Some(result.state);
+                                        OperationOutcome::Backgrounded { task_id }
+                                    }
+                                    Err(error) => {
+                                        self.state = Some(result.state);
+                                        OperationOutcome::ExecutionFailed {
+                                            kind: error.kind(),
+                                            message: error.to_string(),
+                                        }
+                                    }
+                                },
+                                GenerationTaskOutcome::ExecutionFailed { kind, message } => {
+                                    self.state = Some(result.state);
+                                    OperationOutcome::ExecutionFailed { kind, message }
+                                }
+                                GenerationTaskOutcome::Panicked { message } => {
+                                    self.state = Some(result.state);
+                                    OperationOutcome::Panicked { message }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Err(error) => OperationOutcome::Panicked {
@@ -1929,6 +2413,451 @@ impl ThreadActor {
         });
         debug_assert!(completed, "operation terminal must complete exactly once");
     }
+
+    fn launch_hosted_workflow(
+        &mut self,
+        request: HostedWorkflowRequest,
+    ) -> Result<HostedWorkflowLaunch, RuntimeHostError> {
+        self.ensure_background_capacity(1).map_err(|error| {
+            RuntimeHostError::WorkflowLaunchFailed {
+                message: error.to_string(),
+            }
+        })?;
+        let Some(mut state) = self.state.take() else {
+            return Err(RuntimeHostError::ThreadUnavailable);
+        };
+        let result = self.launch_hosted_workflow_with_state(&mut state, request);
+        self.state = Some(state);
+        result
+    }
+
+    fn launch_hosted_workflow_with_state(
+        &mut self,
+        state: &mut ThreadActorState,
+        request: HostedWorkflowRequest,
+    ) -> Result<HostedWorkflowLaunch, RuntimeHostError> {
+        let HostedWorkflowRequest {
+            name,
+            args,
+            config,
+            tool_use_id,
+            event_observer,
+        } = request;
+        let tool_use_id =
+            tool_use_id.unwrap_or_else(|| format!("workflow-{}", uuid::Uuid::new_v4()));
+        let tool_request = orca_core::tool_types::ToolRequest {
+            id: tool_use_id.clone(),
+            name: orca_core::tool_types::ToolName::Workflow,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some(name.clone()),
+            raw_arguments: serde_json::to_string(&WorkflowInput {
+                name: Some(name.clone()),
+                args: args.clone(),
+                ..Default::default()
+            })
+            .ok(),
+        };
+        observe_runtime_event(
+            event_observer.as_deref(),
+            &state.events.tool_call_requested(&tool_request),
+        );
+
+        let config = config.unwrap_or_else(|| self.config.clone());
+        if !config.workflows.enabled {
+            let message = "workflows are disabled".to_string();
+            let failed =
+                orca_core::tool_types::ToolResult::failed(&tool_request, message.clone(), None);
+            observe_runtime_event(
+                event_observer.as_deref(),
+                &state.events.tool_call_completed(&failed),
+            );
+            return Err(RuntimeHostError::WorkflowLaunchFailed { message });
+        }
+        let cwd = config
+            .cwd
+            .clone()
+            .unwrap_or(std::env::current_dir().map_err(|error| {
+                RuntimeHostError::WorkflowLaunchFailed {
+                    message: error.to_string(),
+                }
+            })?);
+        let task_registry = state.thread.session().task_registry().clone();
+        let session_dir = cwd
+            .join(".orca")
+            .join("workflow-sessions")
+            .join(task_registry.session_id());
+        let runner = WorkflowRunner::new(config, task_registry.clone(), session_dir);
+        let launch = match runner.launch_background(WorkflowLaunchRequest::from(WorkflowInput {
+            name: Some(name),
+            args,
+            ..Default::default()
+        })) {
+            Ok(launch) => launch,
+            Err(error) => {
+                let message = error.to_string();
+                let failed =
+                    orca_core::tool_types::ToolResult::failed(&tool_request, message.clone(), None);
+                observe_runtime_event(
+                    event_observer.as_deref(),
+                    &state.events.tool_call_completed(&failed),
+                );
+                return Err(RuntimeHostError::WorkflowLaunchFailed { message });
+            }
+        };
+        let response = HostedWorkflowLaunch {
+            task_id: launch.task_id.clone(),
+            run_id: launch.run_id.clone(),
+            workflow_name: launch.workflow_name.clone(),
+            tool_use_id: tool_use_id.clone(),
+            output: launch.output.clone(),
+        };
+        observe_runtime_event(
+            event_observer.as_deref(),
+            &state.events.workflow_started(
+                &launch.task_id,
+                &launch.run_id,
+                &launch.workflow_name,
+                &launch.phases,
+            ),
+        );
+        if let Some(task) = task_registry
+            .list()
+            .into_iter()
+            .find(|task| task.id == launch.task_id)
+        {
+            observe_runtime_event(
+                event_observer.as_deref(),
+                &state.events.task_status_updated(&task),
+            );
+        }
+        if let Ok(output) = serde_json::to_string(&launch.output) {
+            let completed =
+                orca_core::tool_types::ToolResult::completed(&tool_request, output, false);
+            observe_runtime_event(
+                event_observer.as_deref(),
+                &state.events.tool_call_completed(&completed),
+            );
+        }
+
+        self.spawn_workflow_background_tasks(
+            task_registry,
+            event_observer,
+            RuntimeBackgroundWorkflows::from_vec(vec![BackgroundWorkflowRun::new(
+                launch,
+                Some(tool_use_id),
+            )]),
+        );
+        Ok(response)
+    }
+
+    fn ensure_background_capacity(&self, additional: usize) -> io::Result<()> {
+        if self.background_tasks.len().saturating_add(additional) > self.background_capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "runtime host background task capacity exhausted ({})",
+                    self.background_capacity
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn spawn_workflow_background_tasks(
+        &mut self,
+        task_registry: TaskRegistry,
+        observer: Option<Arc<dyn EventObserver>>,
+        workflows: RuntimeBackgroundWorkflows,
+    ) {
+        for workflow in workflows.into_inner() {
+            let task_id = workflow.task_id.clone();
+            let completion_task_id = task_id.clone();
+            let completion_tx = self.background_completion_tx.clone();
+            let cancel = CancelToken::new();
+            let worker_cancel = cancel.clone();
+            let context = WorkflowBackgroundTaskContext {
+                task_registry: task_registry.clone(),
+                observer: observer.clone(),
+            };
+            let join = tokio::task::spawn_blocking(move || {
+                let panic_registry = context.task_registry.clone();
+                let panic_observer = context.observer.clone();
+                let panic_task_id = workflow.task_id.clone();
+                let panic_run_id = workflow.run_id.clone();
+                let panic_workflow_name = workflow.workflow_name.clone();
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    run_workflow_background_task(workflow, context, &worker_cancel)
+                }));
+                if let Err(payload) = outcome {
+                    let message = panic_message(payload);
+                    let _ = panic_registry.fail(&panic_task_id, message.clone());
+                    let mut events = EventFactory::new(panic_run_id.clone());
+                    emit_workflow_task_status(
+                        panic_observer.as_deref(),
+                        &mut events,
+                        &panic_registry,
+                        &panic_task_id,
+                    );
+                    observe_runtime_event(
+                        panic_observer.as_deref(),
+                        &events.workflow_failed(
+                            &panic_task_id,
+                            &panic_run_id,
+                            &panic_workflow_name,
+                            None,
+                            &message,
+                        ),
+                    );
+                }
+                let _ = completion_tx.send(completion_task_id);
+            });
+            self.background_tasks
+                .insert(task_id, HostBackgroundTask { cancel, join });
+        }
+    }
+
+    fn spawn_provider_background_task(
+        &mut self,
+        active: &ActiveOperation,
+        state: &mut ThreadActorState,
+        suspension: Box<RuntimeProviderSuspension>,
+    ) -> io::Result<String> {
+        let task_id = active
+            .main_session_task_id
+            .clone()
+            .ok_or_else(|| io::Error::other("provider suspension requires a main-session task"))?;
+        if self.background_tasks.len() >= self.background_capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "runtime host background task capacity exhausted ({})",
+                    self.background_capacity
+                ),
+            ));
+        }
+
+        let task_registry = state.thread.session().task_registry().clone();
+        task_registry
+            .mark_backgrounded(&task_id)
+            .map_err(io::Error::other)?;
+        emit_task_status_update(
+            active.request.event_observer(),
+            &mut state.events,
+            &task_registry,
+            &task_id,
+        )?;
+
+        let history_writer = state.thread.session_mut().writer_mut().cloned();
+        let context = ProviderBackgroundTaskContext {
+            task_registry,
+            history_writer,
+            observer: active.request.event_observer(),
+            model: suspension.model().map(str::to_string),
+            run_id: state.events.run_id().to_string(),
+            task_id: task_id.clone(),
+            usage_ledger: self.usage_ledger.clone(),
+        };
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let completion_tx = self.background_completion_tx.clone();
+        let completion_task_id = task_id.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let panic_registry = context.task_registry.clone();
+            let panic_task_id = context.task_id.clone();
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                run_provider_background_task(*suspension, context, &worker_cancel)
+            }));
+            if let Err(payload) = outcome {
+                let _ = panic_registry.apply_main_session_terminal_update(
+                    &panic_task_id,
+                    MainSessionTerminalUpdate::Failed {
+                        error: panic_message(payload),
+                    },
+                    None,
+                );
+            }
+            let _ = completion_tx.send(completion_task_id);
+        });
+        self.background_tasks
+            .insert(task_id.clone(), HostBackgroundTask { cancel, join });
+        Ok(task_id)
+    }
+
+    async fn reap_background_task(&mut self, task_id: &str) {
+        if let Some(task) = self.background_tasks.remove(task_id) {
+            let _ = task.join.await;
+        }
+    }
+
+    async fn shutdown_background_tasks(&mut self) {
+        for task in self.background_tasks.values() {
+            task.cancel.cancel();
+        }
+        for (_, task) in self.background_tasks.drain() {
+            let _ = task.join.await;
+        }
+    }
+}
+
+fn cancel_and_join_background_workflows(
+    task_registry: &TaskRegistry,
+    observer: Option<Arc<dyn EventObserver>>,
+    workflows: RuntimeBackgroundWorkflows,
+) {
+    for workflow in workflows.into_inner() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        run_workflow_background_task(
+            workflow,
+            WorkflowBackgroundTaskContext {
+                task_registry: task_registry.clone(),
+                observer: observer.clone(),
+            },
+            &cancel,
+        );
+    }
+}
+
+fn parse_hosted_workflow_args(raw: &str) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    if trimmed.starts_with('{') {
+        let value: Value = serde_json::from_str(trimmed).map_err(|error| error.to_string())?;
+        if value.is_object() {
+            return Ok(value);
+        }
+        return Err("workflow args JSON must be an object".to_string());
+    }
+
+    let mut object = serde_json::Map::new();
+    for part in trimmed.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(format!("workflow arg `{part}` must use key=value"));
+        };
+        if key.trim().is_empty() {
+            return Err("workflow arg key cannot be empty".to_string());
+        }
+        let parsed_value =
+            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+        object.insert(key.to_string(), parsed_value);
+    }
+    Ok(Value::Object(object))
+}
+
+fn run_workflow_background_task(
+    workflow: BackgroundWorkflowRun,
+    context: WorkflowBackgroundTaskContext,
+    cancel: &CancelToken,
+) {
+    let BackgroundWorkflowRun {
+        task_id,
+        run_id,
+        workflow_name,
+        handle,
+        tool_use_id,
+        ..
+    } = workflow;
+    let mut events = EventFactory::new(run_id.clone());
+    let mut stop_requested = false;
+    while !handle.is_finished() {
+        if cancel.is_cancelled() && !stop_requested {
+            let _ = context.task_registry.request_stop(&task_id);
+            stop_requested = true;
+        }
+        observe_runtime_event(
+            context.observer.as_deref(),
+            &events.workflow_tasks_updated(&context.task_registry.list()),
+        );
+        thread::sleep(WORKFLOW_BACKGROUND_POLL_INTERVAL);
+    }
+
+    let joined = handle.join();
+    emit_workflow_task_status(
+        context.observer.as_deref(),
+        &mut events,
+        &context.task_registry,
+        &task_id,
+    );
+    let task_status = context.task_registry.get(&task_id).map(|task| task.status);
+    match joined {
+        Ok(Ok(result)) if task_status == Some(TaskStatus::Completed) => {
+            observe_runtime_event(
+                context.observer.as_deref(),
+                &events.workflow_completed(&task_id, &run_id, &workflow_name),
+            );
+            observe_runtime_event(
+                context.observer.as_deref(),
+                &events.workflow_result_available(
+                    &task_id,
+                    &run_id,
+                    &workflow_name,
+                    tool_use_id.as_deref(),
+                    "completed",
+                    &result.status_line,
+                ),
+            );
+        }
+        Ok(Ok(result)) => {
+            observe_runtime_event(
+                context.observer.as_deref(),
+                &events.workflow_failed(
+                    &task_id,
+                    &run_id,
+                    &workflow_name,
+                    tool_use_id.as_deref(),
+                    &result.status_line,
+                ),
+            );
+        }
+        Ok(Err(error)) => {
+            observe_runtime_event(
+                context.observer.as_deref(),
+                &events.workflow_failed(
+                    &task_id,
+                    &run_id,
+                    &workflow_name,
+                    tool_use_id.as_deref(),
+                    &error.to_string(),
+                ),
+            );
+        }
+        Err(_) => {
+            let _ = context
+                .task_registry
+                .fail(&task_id, "workflow thread panicked".to_string());
+            emit_workflow_task_status(
+                context.observer.as_deref(),
+                &mut events,
+                &context.task_registry,
+                &task_id,
+            );
+            observe_runtime_event(
+                context.observer.as_deref(),
+                &events.workflow_failed(
+                    &task_id,
+                    &run_id,
+                    &workflow_name,
+                    tool_use_id.as_deref(),
+                    "workflow thread panicked",
+                ),
+            );
+        }
+    }
+}
+
+fn emit_workflow_task_status(
+    observer: Option<&dyn EventObserver>,
+    events: &mut EventFactory,
+    task_registry: &TaskRegistry,
+    task_id: &str,
+) {
+    let tasks = task_registry.list();
+    if let Some(task) = tasks.iter().find(|task| task.id == task_id) {
+        observe_runtime_event(observer, &events.task_status_updated(task));
+    }
+    observe_runtime_event(observer, &events.workflow_tasks_updated(&tasks));
 }
 
 fn run_hosted_operation(
@@ -1939,7 +2868,7 @@ fn run_hosted_operation(
     generation: &GenerationContext,
     writer: &mut (dyn io::Write + Send),
     cancel: &CancelToken,
-) -> io::Result<RunStatus> {
+) -> io::Result<ThreadOperationOutcome> {
     match request.envelope {
         HostedOperationEnvelope::Turn => {
             executor.run_turn(thread, request, generation, events, writer, cancel)
@@ -1958,7 +2887,7 @@ fn run_headless_session(
     generation: &GenerationContext,
     writer: &mut (dyn io::Write + Send),
     cancel: &CancelToken,
-) -> io::Result<RunStatus> {
+) -> io::Result<ThreadOperationOutcome> {
     let config = generation.config();
     let cwd_path = config.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = cwd_path.display().to_string();
@@ -1985,7 +2914,7 @@ fn run_headless_session(
         sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
     }
 
-    let status = executor.run_turn(
+    let outcome = executor.run_turn(
         thread,
         request,
         generation,
@@ -1994,6 +2923,10 @@ fn run_headless_session(
         cancel,
     )?;
 
+    let status = match &outcome {
+        ThreadOperationOutcome::Completed { status, .. } => *status,
+        ThreadOperationOutcome::ProviderSuspended { .. } => RunStatus::Success,
+    };
     if let Err(error) = thread.session().hooks().run(
         HookEvent::SessionEnd,
         HookContext {
@@ -2008,8 +2941,262 @@ fn run_headless_session(
     ) {
         sink.emit(&events.error(&format!("session_end hook failed: {error}")))?;
     }
-    sink.emit(&events.session_completed(status))?;
-    Ok(status)
+    if matches!(outcome, ThreadOperationOutcome::Completed { .. }) {
+        sink.emit(&events.session_completed(status))?;
+    }
+    Ok(outcome)
+}
+
+fn run_provider_background_task(
+    mut suspension: RuntimeProviderSuspension,
+    mut context: ProviderBackgroundTaskContext,
+    cancel: &CancelToken,
+) {
+    let mut events = EventFactory::new(context.run_id.clone());
+    let mut buffered_steps = Vec::new();
+    let mut cancelled = false;
+    let mut response = None;
+    let mut disconnected = false;
+
+    loop {
+        if !cancelled
+            && (cancel.is_cancelled() || context.task_registry.is_cancelled(&context.task_id))
+        {
+            cancelled = true;
+            suspension.cancel();
+        }
+        match suspension.recv_timeout(Duration::from_millis(10)) {
+            Ok(RuntimeProviderSuspensionEvent::Step(step)) => {
+                if cancelled {
+                    continue;
+                }
+                if background_task_is_foregrounded(&context.task_registry, &context.task_id) {
+                    emit_provider_steps(
+                        context.observer.as_deref(),
+                        &mut events,
+                        buffered_steps.drain(..),
+                    );
+                    emit_provider_steps(
+                        context.observer.as_deref(),
+                        &mut events,
+                        std::iter::once(step),
+                    );
+                } else if background_step_is_visible(&step) {
+                    buffered_steps.push(step);
+                }
+            }
+            Ok(RuntimeProviderSuspensionEvent::Completed(completed)) => {
+                response = Some(completed);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+
+    let usage = response
+        .as_ref()
+        .and_then(|response| provider_response_usage_totals(response, context.model.as_deref()));
+    if let Some(usage) = usage {
+        let totals = context.usage_ledger.add(usage);
+        observe_runtime_event(context.observer.as_deref(), &events.usage_updated(totals));
+    }
+    let was_backgrounded = context
+        .task_registry
+        .get(&context.task_id)
+        .is_some_and(|task| task.is_backgrounded);
+    let mut status = RunStatus::Failed;
+    let mut error = None;
+
+    if cancelled {
+        status = RunStatus::Cancelled;
+        let _ = context.task_registry.stop_with_usage(
+            &context.task_id,
+            status.as_str().to_string(),
+            usage,
+        );
+    } else if disconnected {
+        error = Some("provider stream ended without a response".to_string());
+        let _ = context.task_registry.apply_main_session_terminal_update(
+            &context.task_id,
+            MainSessionTerminalUpdate::Failed {
+                error: error.clone().expect("background provider error"),
+            },
+            usage,
+        );
+    } else if let Some(response) = response {
+        if provider_response_requires_approval(&response) {
+            status = RunStatus::ApprovalRequired;
+            let _ = context
+                .task_registry
+                .approval_required_for_pending_provider_response_with_usage(
+                    &context.task_id,
+                    status.as_str().to_string(),
+                    response,
+                    usage,
+                );
+        } else if let Some(provider_error) = provider_response_error(&response) {
+            error = Some(provider_error);
+            let _ = context.task_registry.apply_main_session_terminal_update(
+                &context.task_id,
+                MainSessionTerminalUpdate::Failed {
+                    error: error.clone().expect("background provider error"),
+                },
+                usage,
+            );
+        } else {
+            status = RunStatus::Success;
+            let _ = context.task_registry.apply_main_session_terminal_update(
+                &context.task_id,
+                MainSessionTerminalUpdate::Completed {
+                    result: status.as_str().to_string(),
+                },
+                usage,
+            );
+        }
+    }
+
+    if let Some(writer) = &mut context.history_writer {
+        let _ = writer.append_background_task_provider_response(
+            &context.task_id,
+            status.as_str(),
+            error.as_deref(),
+            usage,
+        );
+    }
+    emit_task_status_update(
+        context.observer.clone(),
+        &mut events,
+        &context.task_registry,
+        &context.task_id,
+    )
+    .ok();
+    if !was_backgrounded {
+        emit_provider_steps(context.observer.as_deref(), &mut events, buffered_steps);
+        if let Some(error) = error.as_deref() {
+            observe_runtime_event(context.observer.as_deref(), &events.error(error));
+        }
+        observe_runtime_event(
+            context.observer.as_deref(),
+            &events.session_completed(status),
+        );
+    }
+}
+
+fn emit_task_status_update(
+    observer: Option<Arc<dyn EventObserver>>,
+    events: &mut EventFactory,
+    task_registry: &TaskRegistry,
+    task_id: &str,
+) -> io::Result<()> {
+    let task = task_registry
+        .list()
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "background task not found"))?;
+    if let Some(observer) = observer {
+        observer.observe(&events.task_status_updated(&task))?;
+    }
+    Ok(())
+}
+
+fn background_task_is_foregrounded(task_registry: &TaskRegistry, task_id: &str) -> bool {
+    task_registry
+        .get(task_id)
+        .is_some_and(|task| task.status == TaskStatus::Running && !task.is_backgrounded)
+}
+
+fn background_step_is_visible(step: &ProviderStep) -> bool {
+    matches!(
+        step,
+        ProviderStep::ReasoningDelta(_)
+            | ProviderStep::MessageDelta(_)
+            | ProviderStep::ToolCallProgress(_)
+    )
+}
+
+fn emit_provider_steps(
+    observer: Option<&dyn EventObserver>,
+    events: &mut EventFactory,
+    steps: impl IntoIterator<Item = ProviderStep>,
+) {
+    for step in steps {
+        match step {
+            ProviderStep::ReasoningDelta(text) => {
+                observe_runtime_event(observer, &events.assistant_reasoning_delta(&text));
+            }
+            ProviderStep::MessageDelta(text) => {
+                observe_runtime_event(observer, &events.assistant_message_delta(&text));
+            }
+            ProviderStep::ToolCallProgress(progress) => {
+                observe_runtime_event(observer, &events.tool_call_progress(&progress));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn observe_runtime_event(
+    observer: Option<&dyn EventObserver>,
+    event: &orca_core::event_schema::EventEnvelope,
+) {
+    if let Some(observer) = observer {
+        let _ = observer.observe(event);
+    }
+}
+
+fn provider_response_requires_approval(response: &ProviderResponse) -> bool {
+    !response.tool_calls.is_empty()
+        || response
+            .steps
+            .iter()
+            .any(|step| matches!(step, ProviderStep::ToolCall(_)))
+}
+
+fn provider_response_error(response: &ProviderResponse) -> Option<String> {
+    response.steps.iter().find_map(|step| match step {
+        ProviderStep::Error(error) => Some(error.clone()),
+        _ => None,
+    })
+}
+
+fn provider_response_usage_totals(
+    response: &ProviderResponse,
+    model: Option<&str>,
+) -> Option<UsageTotals> {
+    let usage = response.usage.filter(|usage| !usage.is_empty())?;
+    let mut tracker = crate::cost::CostTracker::new(model);
+    Some(tracker.add_usage(usage))
+}
+
+fn usage_totals_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens),
+        estimated_cost_usd: (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0),
+    }
+}
+
+fn add_usage_totals(left: UsageTotals, right: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_tokens: left.cache_tokens.saturating_add(right.cache_tokens),
+        estimated_cost_usd: left.estimated_cost_usd + right.estimated_cost_usd,
+    }
+}
+
+fn subtract_usage_totals(total: UsageTotals, credit: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: total.input_tokens.saturating_sub(credit.input_tokens),
+        output_tokens: total.output_tokens.saturating_sub(credit.output_tokens),
+        cache_tokens: total.cache_tokens.saturating_sub(credit.cache_tokens),
+        estimated_cost_usd: (total.estimated_cost_usd - credit.estimated_cost_usd).max(0.0),
+    }
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {

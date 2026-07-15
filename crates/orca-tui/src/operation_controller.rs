@@ -188,6 +188,7 @@ impl TuiOperationController {
                 return Ok(TuiTurnControl {
                     controller: self.clone(),
                     operation_id,
+                    cancel: cancel.clone(),
                 });
             }
             let (next, _) = self
@@ -243,15 +244,30 @@ impl TuiOperationInterrupt for TuiOperationController {
 pub(crate) struct TuiTurnControl {
     controller: TuiOperationController,
     operation_id: OperationId,
+    cancel: CancelToken,
 }
 
 impl TuiTurnControl {
+    pub(crate) fn for_generation(
+        controller: TuiOperationController,
+        operation_id: OperationId,
+        cancel: CancelToken,
+    ) -> Self {
+        Self {
+            controller,
+            operation_id,
+            cancel,
+        }
+    }
+
     pub(crate) fn register_interaction(
         &self,
         kind: TuiInteractionKind,
         request_id: impl Into<String>,
     ) -> io::Result<TuiInteractionWaiter> {
         self.controller
+            .wait_for_hosted(self.operation_id, &self.cancel)?
+            .controller
             .broker()
             .register(self.operation_id, kind, request_id)
     }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,12 +16,13 @@ use orca_core::config::{
 };
 use orca_core::conversation::Message;
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::{EventFactory, EventType, RunStatus};
-use orca_core::event_sink::EventSink;
+use orca_core::event_schema::{EventEnvelope, EventFactory, EventType, RunStatus};
+use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::mcp_types::McpServerConfig;
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
+use orca_core::task_types::TaskStatus;
 use orca_mcp::McpRegistry;
 use orca_runtime::controller::{ThreadTurnOutcome, ThreadTurnRequest};
 use orca_runtime::history::{self, SessionTranscript};
@@ -30,9 +32,10 @@ use orca_runtime::provider_stream::{
 };
 use orca_runtime::runtime_host::{
     GenerationAdmissionResult, GenerationContext, GenerationFence, HostedGenerationHandlers,
-    HostedOperationWriter, HostedTurnRequest, InterruptOperationResult, OperationOutcome,
-    ResumeOperationResult, RuntimeHost, RuntimeHostError, RuntimeThreadMutation,
+    HostedOperationWriter, HostedTurnRequest, HostedWorkflowRequest, InterruptOperationResult,
+    OperationOutcome, ResumeOperationResult, RuntimeHost, RuntimeHostError, RuntimeThreadMutation,
     RuntimeThreadStartRequest, RuntimeThreadState, SteerOperationResult, ThreadOperationExecutor,
+    ThreadOperationOutcome,
 };
 use orca_runtime::thread::RuntimeThread;
 
@@ -260,7 +263,7 @@ impl ThreadOperationExecutor for ScriptedExecutor {
         events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
-    ) -> io::Result<RunStatus> {
+    ) -> io::Result<ThreadOperationOutcome> {
         self.calls.fetch_add(1, Ordering::AcqRel);
         self.cancelled_on_entry
             .lock()
@@ -296,7 +299,7 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 finished.store(true, Ordering::Release);
-                Ok(RunStatus::Cancelled)
+                Ok(RunStatus::Cancelled.into())
             }
             TestBehavior::WaitForCancelAndRelease { gate } => {
                 gate.enter_wait_for_cancel_and_release(cancel);
@@ -305,7 +308,7 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                     .unwrap()
                     .push(generation.drain_steer_inputs());
                 thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
-                Ok(RunStatus::Cancelled)
+                Ok(RunStatus::Cancelled.into())
             }
             TestBehavior::WaitForRelease { gate, status } => {
                 gate.enter_and_wait();
@@ -313,12 +316,12 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                     .lock()
                     .unwrap()
                     .push(generation.drain_steer_inputs());
-                Ok(status)
+                Ok(status.into())
             }
             TestBehavior::EmitEvent { message, status } => {
                 EventSink::new(writer, generation.config().output_format)
                     .emit(&events.error(&message))?;
-                Ok(status)
+                Ok(status.into())
             }
             TestBehavior::Panic => panic!("scripted operation panic"),
         }
@@ -328,6 +331,29 @@ impl ThreadOperationExecutor for ScriptedExecutor {
 #[derive(Clone, Default)]
 struct SharedWriter {
     output: Arc<Mutex<Vec<u8>>>,
+}
+
+#[derive(Clone, Default)]
+struct RecordingEventObserver {
+    events: Arc<Mutex<Vec<EventEnvelope>>>,
+}
+
+impl RecordingEventObserver {
+    fn count(&self, event_type: EventType) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_type == event_type)
+            .count()
+    }
+}
+
+impl EventObserver for RecordingEventObserver {
+    fn observe(&self, event: &EventEnvelope) -> io::Result<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
 }
 
 impl SharedWriter {
@@ -2057,9 +2083,14 @@ fn canonical_turn_can_suspend_one_in_flight_provider_without_committing_terminal
             CancelToken::new(),
         )
         .expect("run canonical turn until provider suspension");
-    let ThreadTurnOutcome::ProviderSuspended(mut suspension) = outcome else {
+    let ThreadTurnOutcome::ProviderSuspended {
+        mut suspension,
+        background_workflows,
+    } = outcome
+    else {
         panic!("canonical turn must return the in-flight provider handle");
     };
+    assert!(background_workflows.is_empty());
     assert_eq!(thread.session().completion_error(), None);
 
     let mut completed = None;
@@ -2078,4 +2109,349 @@ fn canonical_turn_can_suspend_one_in_flight_provider_without_committing_terminal
             .and_then(|response| response.assistant_content.as_deref()),
         Some("Mock slow stream started.Mock slow stream completed.")
     );
+}
+
+#[test]
+fn runtime_host_owns_suspended_provider_and_releases_actor_for_the_next_turn() {
+    let cwd = tempfile::tempdir().unwrap();
+    let config = test_config(cwd.path().to_path_buf());
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "host-owned provider suspension")
+        .expect("start hosted runtime thread");
+    let request = HostedTurnRequest::new("mock_stream_delay_ms 500")
+        .with_task_description("slow provider turn")
+        .with_generation_handlers(|_fence, _cancel| {
+            HostedGenerationHandlers::default()
+                .with_provider_suspension_control(Arc::new(OneShotProviderSuspension::new()))
+        });
+
+    let first = thread
+        .start_turn(request, io::sink())
+        .expect("start suspendable turn");
+    let terminal = first
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("background handoff terminal");
+    let task_id = match terminal.outcome() {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected host-owned background handoff, got {other:?}"),
+    };
+    let backgrounded = thread
+        .task_registry()
+        .get(&task_id)
+        .expect("background task record");
+    assert_eq!(backgrounded.status, TaskStatus::Running);
+    assert!(backgrounded.is_backgrounded);
+
+    let second = thread
+        .start_turn(HostedTurnRequest::new("next foreground turn"), io::sink())
+        .expect("actor must accept a foreground turn while provider is backgrounded");
+    assert_eq!(
+        second
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("next foreground terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    wait_until_task_status(&thread, &task_id, TaskStatus::Completed);
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn runtime_host_shutdown_cancels_and_joins_suspended_provider_work() {
+    let cwd = tempfile::tempdir().unwrap();
+    let config = test_config(cwd.path().to_path_buf());
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "shutdown suspended provider")
+        .expect("start hosted runtime thread");
+    let request = HostedTurnRequest::new("mock_stream_delay_ms 5000")
+        .with_task_description("provider cancelled by host shutdown")
+        .with_generation_handlers(|_fence, _cancel| {
+            HostedGenerationHandlers::default()
+                .with_provider_suspension_control(Arc::new(OneShotProviderSuspension::new()))
+        });
+    let operation = thread
+        .start_turn(request, io::sink())
+        .expect("start suspendable turn");
+    let terminal = operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("background handoff terminal");
+    let task_id = match terminal.outcome() {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected host-owned background handoff, got {other:?}"),
+    };
+
+    let started = Instant::now();
+    host.shutdown().expect("shutdown joins background provider");
+    assert!(
+        started.elapsed() < TEST_TIMEOUT,
+        "shutdown waited for the provider's full delay instead of cancelling it"
+    );
+    assert_eq!(
+        thread
+            .task_registry()
+            .get(&task_id)
+            .expect("settled background task")
+            .status,
+        TaskStatus::Stopped
+    );
+}
+
+#[test]
+fn runtime_host_commits_background_provider_usage_once() {
+    let cwd = tempfile::tempdir().unwrap();
+    let config = test_config(cwd.path().to_path_buf());
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "background usage ledger")
+        .expect("start hosted runtime thread");
+    let request = HostedTurnRequest::new("mock_stream_usage_delay_ms 100")
+        .with_task_description("usage-bearing background turn")
+        .with_generation_handlers(|_fence, _cancel| {
+            HostedGenerationHandlers::default()
+                .with_provider_suspension_control(Arc::new(OneShotProviderSuspension::new()))
+        });
+    let operation = thread
+        .start_turn(request, io::sink())
+        .expect("start usage-bearing turn");
+    let task_id = match operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("background handoff terminal")
+        .outcome()
+    {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected background handoff, got {other:?}"),
+    };
+    wait_until_task_status(&thread, &task_id, TaskStatus::Completed);
+
+    let task_usage = thread
+        .task_registry()
+        .get(&task_id)
+        .and_then(|task| task.usage)
+        .expect("background task usage");
+    assert_eq!(task_usage.input_tokens, 120);
+    assert_eq!(task_usage.output_tokens, 30);
+    let snapshot = thread.snapshot().expect("usage snapshot");
+    assert_eq!(snapshot.usage_totals().input_tokens, 120);
+    assert_eq!(snapshot.usage_totals().output_tokens, 30);
+
+    let foreground = thread
+        .start_turn(HostedTurnRequest::new("mock_usage"), io::sink())
+        .expect("start foreground usage turn");
+    assert_eq!(
+        foreground
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("foreground terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    let snapshot = thread.snapshot().expect("combined usage snapshot");
+    assert_eq!(snapshot.usage_totals().input_tokens, 240);
+    assert_eq!(snapshot.usage_totals().output_tokens, 60);
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn runtime_host_owns_turn_launched_workflow_until_shutdown() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let cwd = tempfile::tempdir().unwrap();
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "host-owned turn workflow")
+        .expect("start hosted runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("workflow inline")
+                .with_wait_for_background_workflows(false)
+                .with_event_observer(observer.clone()),
+            io::sink(),
+        )
+        .expect("start workflow turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("workflow foreground terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    let workflow_task = thread
+        .task_registry()
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == orca_core::task_types::TaskType::Workflow)
+        .expect("background workflow task");
+    assert_eq!(workflow_task.status, TaskStatus::Running);
+
+    let next = thread
+        .start_turn(HostedTurnRequest::new("next foreground turn"), io::sink())
+        .expect("actor accepts next turn while workflow is running");
+    assert_eq!(
+        next.wait_timeout(TEST_TIMEOUT)
+            .expect("next foreground terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    host.shutdown().expect("shutdown joins background workflow");
+    assert_eq!(
+        thread
+            .task_registry()
+            .get(&workflow_task.id)
+            .expect("settled workflow task")
+            .status,
+        TaskStatus::Stopped
+    );
+    assert_eq!(observer.count(EventType::WorkflowFailed), 1);
+}
+
+#[test]
+fn runtime_host_launches_saved_workflow_without_blocking_the_next_turn() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let cwd = tempfile::tempdir().unwrap();
+    write_saved_workflow(cwd.path(), "slow-audit", "mock_stream_delay_ms 1200");
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "hosted saved workflow")
+        .expect("start hosted runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let launched = thread
+        .launch_workflow(
+            HostedWorkflowRequest::new("slow-audit").with_event_observer(observer.clone()),
+        )
+        .expect("launch saved workflow");
+    assert_eq!(
+        thread
+            .task_registry()
+            .get(launched.task_id())
+            .expect("running workflow task")
+            .status,
+        TaskStatus::Running
+    );
+
+    let next = thread
+        .start_turn(HostedTurnRequest::new("next foreground turn"), io::sink())
+        .expect("actor accepts next turn");
+    assert_eq!(
+        next.wait_timeout(TEST_TIMEOUT)
+            .expect("next foreground terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    wait_until_task_status(&thread, launched.task_id(), TaskStatus::Completed);
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while observer.count(EventType::WorkflowResultAvailable) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "workflow terminal event was not published"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(observer.count(EventType::WorkflowResultAvailable), 1);
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn runtime_host_shutdown_cancels_and_joins_saved_workflow() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let cwd = tempfile::tempdir().unwrap();
+    write_saved_workflow(cwd.path(), "shutdown-audit", "mock_stream_delay_ms 5000");
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "shutdown saved workflow")
+        .expect("start hosted runtime thread");
+    let launched = thread
+        .launch_workflow(HostedWorkflowRequest::new("shutdown-audit"))
+        .expect("launch saved workflow");
+    let task_id = launched.task_id().to_string();
+
+    let started = Instant::now();
+    host.shutdown().expect("shutdown joins saved workflow");
+    assert!(
+        started.elapsed() < TEST_TIMEOUT,
+        "shutdown waited for the workflow's full provider delay"
+    );
+    assert_eq!(
+        thread
+            .task_registry()
+            .get(&task_id)
+            .expect("settled workflow task")
+            .status,
+        TaskStatus::Stopped
+    );
+}
+
+#[test]
+fn runtime_host_rejects_saved_workflow_before_launch_when_background_capacity_is_exhausted() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let cwd = tempfile::tempdir().unwrap();
+    write_saved_workflow(cwd.path(), "capacity-audit", "inspect repo");
+    let host = RuntimeHost::start_with_background_capacity(0).expect("start runtime host");
+    let thread = host
+        .start_thread(test_config(cwd.path().to_path_buf()), "workflow capacity")
+        .expect("start hosted runtime thread");
+
+    let error = thread
+        .launch_workflow(HostedWorkflowRequest::new("capacity-audit"))
+        .expect_err("capacity exhaustion rejects launch");
+    assert!(error.to_string().contains("capacity exhausted (0)"));
+    assert!(thread.task_registry().list().is_empty());
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+fn write_saved_workflow(cwd: &std::path::Path, name: &str, prompt: &str) {
+    let workflow_dir = cwd.join(".orca").join("workflows");
+    fs::create_dir_all(&workflow_dir).unwrap();
+    fs::write(
+        workflow_dir.join(format!("{name}.js")),
+        format!(
+            "export const meta = {{ name: '{name}', description: 'Runtime host ownership test', phases: ['main'] }};\nexport default await phase('main', async () => agent('{prompt}'));"
+        ),
+    )
+    .unwrap();
+}
+
+fn wait_until_task_status(
+    thread: &orca_runtime::runtime_host::RuntimeThreadHandle,
+    task_id: &str,
+    expected: TaskStatus,
+) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        if thread
+            .task_registry()
+            .get(task_id)
+            .is_some_and(|task| task.status == expected)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} did not reach {expected:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

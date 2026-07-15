@@ -470,6 +470,9 @@ impl PreparedServerTurn {
 fn operation_outcome_result(outcome: &OperationOutcome) -> io::Result<()> {
     match outcome {
         OperationOutcome::Completed(_) => Ok(()),
+        OperationOutcome::Backgrounded { task_id } => Err(io::Error::other(format!(
+            "server operation backgrounded unexpectedly as task {task_id}"
+        ))),
         OperationOutcome::ExecutionFailed { kind, message } => {
             Err(io::Error::new(*kind, message.clone()))
         }

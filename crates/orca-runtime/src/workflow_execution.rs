@@ -23,11 +23,31 @@ const WORKFLOW_STARTUP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(3
 
 #[derive(Debug)]
 pub(crate) struct BackgroundWorkflowRun {
-    task_id: String,
-    run_id: String,
-    workflow_name: String,
-    task: crate::lifecycle::RuntimeTaskLifecycle,
-    handle: WorkflowBackgroundLaunch,
+    pub(crate) task_id: String,
+    pub(crate) run_id: String,
+    pub(crate) workflow_name: String,
+    pub(crate) task: crate::lifecycle::RuntimeTaskLifecycle,
+    pub(crate) handle: WorkflowBackgroundLaunch,
+    pub(crate) tool_use_id: Option<String>,
+}
+
+impl BackgroundWorkflowRun {
+    pub(crate) fn new(launch: WorkflowBackgroundLaunch, tool_use_id: Option<String>) -> Self {
+        let mut lifecycle = RuntimeSessionLifecycle::new(launch.run_id.clone());
+        let task = lifecycle.start_task(RuntimeTaskKind::Workflow).clone();
+        Self {
+            task_id: launch.task_id.clone(),
+            run_id: launch.run_id.clone(),
+            workflow_name: launch.workflow_name.clone(),
+            task,
+            handle: launch,
+            tool_use_id,
+        }
+    }
+
+    pub(crate) fn join_silently(self) {
+        let _ = self.handle.join();
+    }
 }
 
 enum WorkflowStartupStatus {
@@ -175,6 +195,7 @@ pub(crate) fn execute_workflow_tool(
                 workflow_name: launch.workflow_name.clone(),
                 task: workflow_task,
                 handle: launch,
+                tool_use_id: None,
             });
             Ok(tool_types::ToolResult::completed(
                 tool_request,
@@ -283,6 +304,7 @@ pub(crate) fn execute_workflow_draft_action_tool(
                         workflow_name: launch.workflow_name.clone(),
                         task: workflow_task,
                         handle: launch,
+                        tool_use_id: None,
                     });
                     action_output
                 }
@@ -422,6 +444,9 @@ pub(crate) fn observe_background_workflows(
     background_workflows: &mut Vec<BackgroundWorkflowRun>,
 ) -> io::Result<()> {
     if !wait {
+        for workflow in background_workflows.drain(..) {
+            workflow.join_silently();
+        }
         return Ok(());
     }
 

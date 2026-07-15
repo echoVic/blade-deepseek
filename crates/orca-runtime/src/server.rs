@@ -5653,20 +5653,27 @@ enabled = true
                 .expect("thread id");
 
             let writer = Arc::new(Mutex::new(Vec::new()));
+            let first_turn_id = state
+                .threads
+                .next_persisted_turn_id(&thread_id)
+                .expect("first turn id");
             let first = format!(
                 r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"first prompt"}}]}}}}"#
             );
             handle_line(&server_config, &mut state, &first, Arc::clone(&writer))
                 .expect("first turn");
-            loop {
-                let events = parse_complete_jsonl(&writer.lock().expect("writer").clone());
-                if events
-                    .iter()
-                    .any(|event| event["id"] == "turn-1" && event["event"] == "turn_completed")
-                {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            let completion = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["id"] == "turn-1" && event["event"] == "turn_completed"
+            });
+            if completion.is_none() {
+                let terminal = state
+                    .active_turns
+                    .get(&first_turn_id)
+                    .and_then(|turn| turn.operation().completion().try_terminal());
+                panic!(
+                    "timed out waiting for first turn completion; terminal={terminal:?}, events={:?}",
+                    parse_complete_jsonl(&writer.lock().expect("writer").clone()),
+                );
             }
 
             let second = format!(

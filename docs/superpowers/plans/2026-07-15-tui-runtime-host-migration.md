@@ -1,8 +1,8 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1 through P0.3e4b complete; P0.3e4c next
+- Status: P0.3e1 through P0.3e4c complete; feature integration pending
 - Date: 2026-07-15
-- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3c validation)
+- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e4c validation)
 - Branch: `codex/tui-runtime-host-migration`
 - ADR: `docs/architecture/adr/0005-runtime-host-operation-control-plane.md`
 
@@ -808,6 +808,118 @@ P0.3e4b stage validation result:
   P0.3e4c must now move background handoff ownership into the runtime host and
   delete `TuiThreadOperationExecutor`, `ProviderStreamTask`, the duplicate test
   foreground loop, and `TuiTaskSupervisor` before any push or release decision.
+
+P0.3e4c slice contract:
+
+- **Current structural problem and evidence.** `ThreadActor` moves its entire
+  `ThreadActorState` into one blocking generation, while
+  `ThreadOperationExecutor::run_turn` returns only `io::Result<RunStatus>`.
+  The host therefore cannot distinguish a completed turn from a canonical
+  provider suspension or regain the thread while retaining the in-flight
+  provider request. `TuiThreadOperationExecutor` currently receives
+  `ThreadTurnOutcome::ProviderSuspended`, marks the task backgrounded, clones
+  the history writer and usage ledger, transfers budget admission, and spawns
+  `spawn_background_provider_task_completion` in `TuiTaskSupervisor`. That
+  completion path separately owns provider cancellation/join, task settlement,
+  history writes, usage and goal accounting, foreground replay, approval
+  continuation, and completion notices. Host shutdown joins only actor
+  generations, so this TUI supervisor remains a second lifecycle authority.
+- **Target ownership and module boundary.** A typed host execution result
+  distinguishes a completed operation from a background handoff. The handoff
+  returns `ThreadActorState` immediately and moves the provider suspension plus
+  its typed settlement context into a bounded runtime-host background task.
+  The host owns admission, cancellation, join, task terminal, history and
+  usage settlement, pending continuation, and completion publication. The
+  actor can admit the next foreground turn while the background task remains
+  addressable through the existing task id. Foregrounding or approved
+  continuation consumes one `RuntimeTurnContinuation` exactly once and starts
+  a normal actor generation; no background worker borrows or mutates the live
+  `RuntimeThread`.
+- **TUI user value.** `Ctrl-B` releases the exact provider request without
+  making it unowned; the user can immediately submit the next turn, stop the
+  background task, or foreground it once. Closing the TUI cancels and joins
+  both active and background provider/workflow work before terminal restore.
+  A stopped, completed, foregrounded, or approval-pending task publishes one
+  terminal and contributes usage once, even when those actions race.
+- **External compatibility.** CLI arguments, TUI keys and transcript/status
+  behavior, task ids and task panel actions, goals, workflow notifications,
+  server/JSONL events, persisted history/task/usage formats, MCP behavior,
+  model selection, and DeepSeek request semantics remain unchanged. New
+  runtime-host result and background-task types are internal typed boundaries;
+  no wire or persistence migration is introduced.
+- **Migration order and temporary state.** First add runtime-host RED behavior
+  tests for suspension ownership, actor reuse, bounded admission, stop,
+  foreground, shutdown join, exactly-once terminal/usage settlement, and stale
+  continuation rejection. Then replace the executor's `RunStatus` result with
+  the typed completed-or-backgrounded result and add the host supervisor. Next
+  move canonical provider completion and `RuntimeTurnContinuation` resumption
+  into runtime, route TUI task controls and event projection through host APIs,
+  and move non-waiting workflow joins under the same host-owned task boundary.
+  Finally delete the TUI executor, supervisor, provider facade, duplicate loop,
+  and source-shape tests in the same complete slice. No compatibility adapter
+  introduced here may remain after the deletion checkpoint.
+- **Acceptance.** Runtime-host behavior tests prove: a suspended provider is
+  host-owned while the actor accepts a second turn; task stop and host/thread
+  shutdown cancel and join it; capacity is bounded and closes before shutdown;
+  completion, stop, foreground, and approval races settle task/history/usage
+  once; foreground and approved continuation are one-shot and stale requests
+  cannot resume a newer operation; the next foreground generation remains
+  usable after every background terminal. TUI behavior tests prove background,
+  foreground, stop, approval continuation, goal accounting, workflow notices,
+  interrupt, and shutdown through the production host path. Focused provider,
+  runtime-host, runtime, and TUI tests pass before the serial workspace gate,
+  workspace Clippy, real DeepSeek harness, and production PTY validation.
+- **Final deletion gate.** `orca-tui` contains no
+  `TuiThreadOperationExecutor`, `TuiTaskSupervisor`, `TuiTaskSpawner`,
+  `ProviderStreamTask`, `run_agent_for_tui_with_event_factory`, or background
+  provider completion loop. `TuiAgentRuntime` owns one `RuntimeHost` and no
+  separate task supervisor. Runtime host is the only owner of active and
+  background operation joins, and there is one typed continuation path and one
+  source of task, history, conversation, and usage settlement.
+
+P0.3e4c implementation checkpoint:
+
+- `ThreadTurnOutcome` and `ThreadOperationOutcome` now carry an opaque typed
+  background-workflow batch for both completed and provider-suspended turns.
+  `wait=false` no longer drops workflow handles; direct non-host callers join
+  them synchronously, while the runtime host adopts them into its bounded
+  background registry.
+- `RuntimeThreadHandle::launch_workflow` is the typed saved-workflow command.
+  It preserves the existing TUI tool/task/workflow event projection, starts the
+  next foreground turn immediately, and gives host shutdown cancellation and
+  join ownership. Capacity exhaustion rejects before creating a workflow task.
+- Workflow workers publish progress and exactly one completion/failure event,
+  request task stop on host cancellation, and are joined during actor/host
+  shutdown. Tests cover turn-launched and saved workflows, next-turn reuse,
+  terminal-event uniqueness, capacity exhaustion, and fast shutdown join.
+- `TuiThreadOperationExecutor`, `TuiTaskSupervisor`, `TuiTaskSpawner`, the TUI
+  provider/tool/workflow/subagent loop modules, the old saved-workflow watcher,
+  and their source-shape tests are deleted. Production `/workflow` now submits
+  a typed `HostedWorkflowRequest` to the runtime host.
+- The runtime lifecycle operation ID and the `TaskRegistry` main-session task
+  ID are now distinct. This fixes a server regression where persisted request
+  ID `turn-1` was incorrectly used to settle the registry task. The server
+  regression test now has a two-second deadline and reports the hosted
+  operation terminal instead of polling forever.
+- Focused validation passed: runtime-host 39/39, hosted TUI behavior 28/28,
+  approved background tool continuation 2/2, runtime interaction adapter 6/6,
+  and the complete `orca-runtime` all-targets gate.
+- The serial workspace all-targets gate and workspace Clippy completed with
+  exit 0; Clippy retained only the repository's existing non-deny warning
+  baseline. Formatting and diff checks also passed.
+- The release harness contract and complete `$0.02` real DeepSeek E2E passed,
+  covering provider summary, CLI, history replay and repair, server submit and
+  thread memory, active-turn resume/control, thread read and metadata, list
+  filters/search, and turn/item pagination.
+- Production PTY validation streamed a live `deepseek-v4-flash` response and
+  returned `ORCA_TUI_RUNTIME_HOST_OK` with live context state. A second run
+  interrupted a long live stream with `Ctrl-C`, accepted a fresh submit, and
+  returned `ORCA_TUI_AFTER_RUNTIME_HOST_INTERRUPT_OK`. Both runs restored the
+  cursor, keyboard mode, bracketed paste, mouse modes, and alternate screen
+  through the normal consecutive double-`Ctrl-C` exit path.
+- A final fetch confirmed `origin/main` remained `35c6361c1`; the feature branch
+  is linearly based on current main. P0.3e4c has passed its deletion and
+  validation gates and is ready for commit and main-worktree integration.
 
 ## Slice Acceptance Criteria
 

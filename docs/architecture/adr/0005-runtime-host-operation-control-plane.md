@@ -1,30 +1,30 @@
 # ADR 0005: Runtime Host Operation Control Plane
 
-- Status: Accepted; P0.3a through P0.3d and P0.3e1 implemented, all unreleased
+- Status: Accepted; P0.3a through P0.3e4c implemented, final release validation pending
 - Date: 2026-07-15
 - Roadmap: P0.3 Runtime Operation Host and canonical turn executor
 
 ## Context
 
-Orca has improved cancellation and worker cleanup, but it still has multiple
-owners for one conceptual agent operation.
+At the start of P0.3, Orca had improved cancellation and worker cleanup, but
+still had multiple owners for one conceptual agent operation.
 
-- `orca-tui::agent_runner` owns a TUI-only provider, tool, compaction, hook,
+- `orca-tui::agent_runner` owned a TUI-only provider, tool, compaction, hook,
   and turn loop plus an outer agent thread and provider workers.
-- `RuntimeThread` exposes borrowed synchronous mutation and delegates each
+- `RuntimeThread` exposed borrowed synchronous mutation and delegated each
   request to `ThreadTurnExecutor`.
-- `run_thread_turn_inner_with_events` has separate branches for caller-owned
+- `run_thread_turn_inner_with_events` had separate branches for caller-owned
   and internally-created `EventFactory` values, duplicating turn assembly.
-- The server moves a whole `ServerThread` into a per-turn OS thread while
+- The server moved a whole `ServerThread` into a per-turn OS thread while
   `ActiveTurnManager` separately owns generation, cancellation, resume, join,
   and reclamation state.
-- `orca-runtime/src/lib.rs` contains more than one thousand
+- `orca-runtime/src/lib.rs` contained more than one thousand
   `include_str!`/`contains` source-shape checks. These tests can preserve
   obsolete names and file layouts without proving cancellation, joining, or
   terminal delivery.
 
-The result is an architecture defect, not a local cancellation defect. There
-is no shared runtime handle that can prove all of the following for TUI,
+The result was an architecture defect, not a local cancellation defect. There
+was no shared runtime handle that could prove all of the following for TUI,
 server, and headless callers:
 
 1. exactly one owner admits commands for a thread;
@@ -104,16 +104,19 @@ An interrupt request is only an acknowledgement that the actor cancelled the
 matching scope. The terminal outcome is published after the operation task has
 actually stopped and returned its owned thread state.
 
-### Initial Turn Kernel
+### Canonical Turn Kernel And Background Handoff
 
-P0.3a delegates turn execution to the existing
-`RuntimeThread -> ThreadTurnExecutor` path through one narrow runtime-owned
-kernel interface. This is a migration boundary, not a second agent loop. It
-must not assemble provider, tool, compaction, hook, or event behavior itself.
+`ThreadTurnExecutor` is the only provider, tool, compaction, hook, persistence,
+usage, and terminal kernel used by TUI, server, and headless operations.
+`HostedGenerationHandlers` carries generation-fenced approval, permission,
+user-input, MCP elicitation, and provider-suspension control into that kernel.
 
-P0.5 will replace the legacy borrowed executor internals with the canonical
-actor-owned turn executor. The kernel boundary remains only if it continues to
-represent a useful testable execution contract after that replacement.
+The kernel returns a typed completed-or-provider-suspended outcome plus every
+non-waiting workflow handle it launched. `ThreadActor` returns its
+`RuntimeThread` to idle ownership before handing provider or workflow work to
+the host's bounded background registry. That registry owns cancellation, join,
+task settlement, usage, continuation state, and terminal event publication.
+No surface-specific executor assembles a second agent loop.
 
 ## User Value
 
@@ -147,10 +150,16 @@ RuntimeHost supervisor
                  -> fresh cancel token
                  -> joined task handle
                  -> RuntimeThread + EventFactory + writer (inside task)
+       -> background registry (bounded)
+            -> provider suspension + cancel + joined task
+            -> workflow handle + cancel + joined task
+            -> task/history/usage/continuation settlement
 ```
 
 No external caller owns `RuntimeThread`, the operation join handle, or the
-cancel token. Handles carry command authority only.
+cancel token. Handles carry command authority only. TUI task controls address
+the same host-owned task registry and continuation path used by canonical turn
+execution.
 
 ## External Compatibility
 
@@ -162,28 +171,28 @@ P0.3a does not change:
 - persisted thread/session formats;
 - provider retry, streaming, compaction, or tool semantics.
 
-Existing surface execution paths remain temporarily available until their
-individual migrations pass behavior parity tests. They must not be extended
-with new lifecycle state that belongs in the host.
+TUI, server, and headless now use the same host and canonical turn behavior.
+The migration added only internal typed host commands and additive runtime
+events; it did not require a wire or persistence migration.
 
 ## Migration Sequence
 
 1. Add the host, actor, typed commands, operation handle, and terminal cell
    behind behavior tests.
-2. Run the existing legacy `ThreadTurnExecutor` through the actor-owned task.
+2. Move headless session and event ownership into the actor.
 3. Add actor-owned logical-turn generations and typed resume, steer, and
    generation-fenced input admission.
 4. Migrate server active turns to `RuntimeThreadHandle`; delete server-owned
    generation, cancellation, resume mailbox, and reaper state.
-5. Move the canonical turn executor under the actor in P0.5.
-6. Move provider awaiting into the runtime and delete the synchronous provider
-   compatibility worker in P0.6.
-7. Migrate headless and TUI execution; delete the TUI provider/tool loop and
-   outer operation cancellation owner in P0.7.
+5. Migrate the TUI session and operation controller to `RuntimeHost`, then
+   replace its provider/tool loop with the canonical `ThreadTurnExecutor`.
+6. Move provider suspension and non-waiting workflow ownership into the host's
+   bounded background registry.
+7. Delete the TUI executor, provider/tool/workflow loop, task supervisor,
+   provider facade, detached workflow watcher, and their source-shape tests.
 
-The temporary state is explicit: P0.3a may coexist with old surface entry
-points, but there must be only one owner inside each path. No surface may wrap
-the new host with another generation or join state and call that final.
+All seven steps are implemented in P0.3a through P0.3e4c. Release validation
+and main-worktree integration remain separate from this architecture decision.
 
 ## P0.3b: Actor-Owned Session And Event Lifecycle
 
@@ -695,11 +704,11 @@ CLI and history replay/repair, server submit and thread memory, active-turn
 resume/control, thread read/metadata, list filters/search, and turn/item
 pagination.
 
-The next P0.3e slice must replace borrowed interaction waits with a typed,
-generation-fenced broker. P0.3e remains incomplete while production TUI code
-owns `OperationCancellation`, a mutable `RuntimeThread`, the TUI-only agent
-loop, or borrowed interaction handlers, or while any remaining TUI worker can
-outlive its owner without cancel and join.
+At this P0.3e1 checkpoint, the next slice had to replace borrowed interaction
+waits with a typed, generation-fenced broker. Those deletion conditions were
+closed by P0.3e2 through P0.3e4c: production TUI code no longer owns
+`OperationCancellation`, a mutable `RuntimeThread`, the TUI-only agent loop,
+borrowed interaction handlers, or unjoined provider/workflow work.
 
 ### P0.3b Acceptance Criteria
 
@@ -775,17 +784,17 @@ their deletion gates remain the later surface migrations listed above.
 
 ## Final Deletion Gates
 
-The P0 architecture stage is not complete until these old owners are removed:
+The P0.3e4c deletion gate is complete. The production TUI has no
+`OperationCancellation`, mutable `RuntimeThread`, TUI-specific provider/tool
+loop, task supervisor, provider facade, detached workflow watcher, or source
+shape test protecting those owners. `RuntimeHost` is the only owner of active
+and background operation joins, and provider suspension plus non-waiting
+workflow execution use typed host-owned tasks.
 
-- TUI `OperationCancellation` and the outer agent/provider worker ownership
-  after TUI migration;
-- public borrowed `RuntimeThread` mutation paths once all surfaces use actor
-  commands;
-- duplicated event-factory branches and turn-loop assembly after the canonical
-  executor lands;
-- obsolete source-shape assertions replaced by ownership and lifecycle tests;
-- the synchronous provider compatibility worker after async provider execution
-  moves under the runtime.
+Broader P0 cleanup remains separately scoped: public borrowed runtime mutation
+APIs and unrelated historical source-shape tests can be removed only after
+all remaining internal callers migrate to actor commands. They are not
+alternate lifecycle authorities for the shipped TUI/server/headless paths.
 
 ## Rejected Alternatives
 

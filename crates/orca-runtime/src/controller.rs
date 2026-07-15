@@ -167,6 +167,8 @@ pub struct ThreadTurnExecution<W: io::Write> {
 struct ThreadTurnMainSessionTask {
     registry: TaskRegistry,
     id: String,
+    usage_before: UsageTotals,
+    task_usage_before: UsageTotals,
 }
 
 struct PreparedThreadTurn<'a, 'session, W: io::Write> {
@@ -187,16 +189,53 @@ struct ThreadTurnCompletion {
     error: Option<String>,
     usage: UsageTotals,
     main_session_task: Option<ThreadTurnMainSessionTask>,
+    background_workflows: RuntimeBackgroundWorkflows,
 }
 
 enum PreparedThreadTurnOutcome {
     Completed(ThreadTurnCompletion),
-    ProviderSuspended(RuntimeProviderSuspension),
+    ProviderSuspended {
+        suspension: Box<RuntimeProviderSuspension>,
+        background_workflows: RuntimeBackgroundWorkflows,
+    },
 }
 
 pub enum ThreadTurnOutcome {
-    Completed(RunStatus),
-    ProviderSuspended(RuntimeProviderSuspension),
+    Completed {
+        status: RunStatus,
+        background_workflows: RuntimeBackgroundWorkflows,
+    },
+    ProviderSuspended {
+        suspension: Box<RuntimeProviderSuspension>,
+        background_workflows: RuntimeBackgroundWorkflows,
+    },
+}
+
+#[derive(Default)]
+pub struct RuntimeBackgroundWorkflows(Vec<BackgroundWorkflowRun>);
+
+impl RuntimeBackgroundWorkflows {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn from_vec(workflows: Vec<BackgroundWorkflowRun>) -> Self {
+        Self(workflows)
+    }
+
+    pub(crate) fn into_inner(self) -> Vec<BackgroundWorkflowRun> {
+        self.0
+    }
+
+    fn join_silently(self) {
+        for workflow in self.0 {
+            workflow.join_silently();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -441,10 +480,19 @@ impl<W: io::Write> ThreadTurnExecution<W> {
 }
 
 impl ThreadTurnMainSessionTask {
-    fn from_request(request: &ThreadTurnRequest, registry: &TaskRegistry) -> Option<Self> {
+    fn from_request(
+        request: &ThreadTurnRequest,
+        registry: &TaskRegistry,
+        usage_before: UsageTotals,
+    ) -> Option<Self> {
         request.main_session_task_id().map(|id| Self {
             registry: registry.clone(),
             id: id.to_string(),
+            usage_before,
+            task_usage_before: registry
+                .get(id)
+                .and_then(|task| task.usage)
+                .unwrap_or_default(),
         })
     }
 
@@ -468,6 +516,10 @@ impl ThreadTurnMainSessionTask {
     }
 
     fn finish(&self, status: RunStatus, error: Option<&str>, usage: UsageTotals) -> io::Result<()> {
+        let usage = add_task_usage(
+            self.task_usage_before,
+            task_usage_delta(self.usage_before, usage),
+        );
         let result = match status {
             RunStatus::Success => self
                 .registry
@@ -513,6 +565,24 @@ impl ThreadTurnMainSessionTask {
     }
 }
 
+fn task_usage_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens),
+        estimated_cost_usd: (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0),
+    }
+}
+
+fn add_task_usage(base: UsageTotals, delta: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: base.input_tokens.saturating_add(delta.input_tokens),
+        output_tokens: base.output_tokens.saturating_add(delta.output_tokens),
+        cache_tokens: base.cache_tokens.saturating_add(delta.cache_tokens),
+        estimated_cost_usd: base.estimated_cost_usd + delta.estimated_cost_usd,
+    }
+}
+
 impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
     fn execute(self) -> io::Result<PreparedThreadTurnOutcome> {
         let Self {
@@ -528,8 +598,11 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             turn_extension_id,
         } = self;
         let ThreadTurnContext { cwd, prompt, parts } = context;
-        let main_session_task =
-            ThreadTurnMainSessionTask::from_request(request, parts.task_registry);
+        let main_session_task = ThreadTurnMainSessionTask::from_request(
+            request,
+            parts.task_registry,
+            parts.cost_tracker.totals(),
+        );
         if let Some(task) = main_session_task.as_ref()
             && let Err(error) = task.emit_current(events, sink)
         {
@@ -588,7 +661,12 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         let usage = parts.cost_tracker.totals();
         let result = match turn_result {
             Ok(AgentLoopOutcome::ProviderSuspended(suspension)) => {
-                return Ok(PreparedThreadTurnOutcome::ProviderSuspended(suspension));
+                return Ok(PreparedThreadTurnOutcome::ProviderSuspended {
+                    suspension: Box::new(suspension),
+                    background_workflows: RuntimeBackgroundWorkflows::from_vec(std::mem::take(
+                        background_workflows,
+                    )),
+                });
             }
             Ok(AgentLoopOutcome::Completed(result)) => result,
             Err(error) => {
@@ -607,12 +685,9 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         let completion = (|| -> io::Result<(RunStatus, Option<String>)> {
             let status = result.status;
             lifecycle.finish_task(status);
-            observe_background_workflows(
-                request.options().wait_for_background_workflows,
-                events,
-                sink,
-                background_workflows,
-            )?;
+            if request.options().wait_for_background_workflows {
+                observe_background_workflows(true, events, sink, background_workflows)?;
+            }
             let status = run_verifier_if_needed(status, config.verifier.as_deref(), events, sink)?;
             Ok((status, result.error))
         })();
@@ -632,11 +707,14 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             }
         };
 
+        let background_workflows =
+            RuntimeBackgroundWorkflows::from_vec(std::mem::take(background_workflows));
         Ok(PreparedThreadTurnOutcome::Completed(ThreadTurnCompletion {
             status,
             error,
             usage,
             main_session_task,
+            background_workflows,
         }))
     }
 }
@@ -669,12 +747,22 @@ impl PreparedThreadTurnOutcome {
         sink: &mut EventSink<W>,
     ) -> io::Result<ThreadTurnOutcome> {
         match self {
-            Self::Completed(completion) => completion
-                .commit(session, request, events, sink)
-                .map(ThreadTurnOutcome::Completed),
-            Self::ProviderSuspended(suspension) => {
-                Ok(ThreadTurnOutcome::ProviderSuspended(suspension))
+            Self::Completed(mut completion) => {
+                let background_workflows = std::mem::take(&mut completion.background_workflows);
+                completion
+                    .commit(session, request, events, sink)
+                    .map(|status| ThreadTurnOutcome::Completed {
+                        status,
+                        background_workflows,
+                    })
             }
+            Self::ProviderSuspended {
+                suspension,
+                background_workflows,
+            } => Ok(ThreadTurnOutcome::ProviderSuspended {
+                suspension,
+                background_workflows,
+            }),
         }
     }
 }
@@ -682,10 +770,23 @@ impl PreparedThreadTurnOutcome {
 impl ThreadTurnOutcome {
     fn into_completed(self) -> io::Result<RunStatus> {
         match self {
-            Self::Completed(status) => Ok(status),
-            Self::ProviderSuspended(_) => Err(io::Error::other(
-                "provider turn suspended without a suspension-aware caller",
-            )),
+            Self::Completed {
+                status,
+                background_workflows,
+            } => {
+                background_workflows.join_silently();
+                Ok(status)
+            }
+            Self::ProviderSuspended {
+                suspension,
+                background_workflows,
+            } => {
+                background_workflows.join_silently();
+                drop(suspension);
+                Err(io::Error::other(
+                    "provider turn suspended without a suspension-aware caller",
+                ))
+            }
         }
     }
 }
@@ -972,6 +1073,9 @@ fn drain_hosted_events<W: io::Write>(
 fn operation_status(terminal: &OperationTerminal) -> io::Result<RunStatus> {
     match terminal.outcome() {
         OperationOutcome::Completed(status) => Ok(*status),
+        OperationOutcome::Backgrounded { task_id } => Err(io::Error::other(format!(
+            "hosted operation backgrounded as task {task_id} without a background-aware caller"
+        ))),
         OperationOutcome::ExecutionFailed { kind, message } => {
             Err(io::Error::new(*kind, message.clone()))
         }
