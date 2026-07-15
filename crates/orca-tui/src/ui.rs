@@ -1839,12 +1839,7 @@ fn render_input(
         let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
         // Keep one border cell visible on each side of the overlay.
         if area.height > 0 && text_width + 2 < area.width {
-            let overlay = Rect::new(
-                area.x + area.width - text_width - 2,
-                area.y,
-                text_width,
-                1,
-            );
+            let overlay = Rect::new(area.x + area.width - text_width - 2, area.y, text_width, 1);
             frame.render_widget(
                 Paragraph::new(Span::styled(text, Style::default().fg(theme.approval))),
                 overlay,

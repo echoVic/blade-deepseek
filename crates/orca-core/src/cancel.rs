@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Debug)]
 pub struct CancelToken(Arc<AtomicBool>);
@@ -28,9 +29,146 @@ impl Default for CancelToken {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OperationId(u64);
+
+#[derive(Debug)]
+pub struct OperationIdAllocator {
+    next_id: AtomicU64,
+}
+
+impl OperationIdAllocator {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    pub fn allocate(&self) -> OperationId {
+        OperationId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for OperationIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OperationScope {
+    id: OperationId,
+    token: CancelToken,
+}
+
+impl OperationScope {
+    pub fn id(&self) -> OperationId {
+        self.id
+    }
+
+    pub fn token(&self) -> &CancelToken {
+        &self.token
+    }
+
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OperationCancellation {
+    state: Arc<OperationCancellationState>,
+}
+
+#[derive(Debug)]
+struct OperationCancellationState {
+    ids: OperationIdAllocator,
+    current: Mutex<Option<OperationScope>>,
+}
+
+impl OperationCancellation {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(OperationCancellationState {
+                ids: OperationIdAllocator::new(),
+                current: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn start(&self) -> OperationScope {
+        let id = self.state.ids.allocate();
+        let scope = OperationScope {
+            id,
+            token: CancelToken::new(),
+        };
+        *self.lock_current() = Some(scope.clone());
+        scope
+    }
+
+    pub fn current_id(&self) -> Option<OperationId> {
+        self.lock_current().as_ref().map(OperationScope::id)
+    }
+
+    pub fn cancel_current(&self) -> Option<OperationId> {
+        let current = self.lock_current();
+        let scope = current.as_ref()?;
+        scope.cancel();
+        Some(scope.id())
+    }
+
+    pub fn cancel(&self, id: OperationId) -> bool {
+        let current = self.lock_current();
+        let Some(scope) = current.as_ref().filter(|scope| scope.id() == id) else {
+            return false;
+        };
+        scope.cancel();
+        true
+    }
+
+    fn lock_current(&self) -> MutexGuard<'_, Option<OperationScope>> {
+        self.state
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for OperationCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_scopes_are_one_shot_and_replaceable() {
+        let controller = OperationCancellation::new();
+        let first = controller.start();
+        let first_id = first.id();
+
+        first.cancel();
+        assert!(first.token().is_cancelled());
+
+        let second = controller.start();
+        assert_ne!(second.id(), first_id);
+        assert!(!second.token().is_cancelled());
+        assert!(!controller.cancel(first_id));
+        assert_eq!(controller.current_id(), Some(second.id()));
+
+        assert_eq!(controller.cancel_current(), Some(second.id()));
+        assert!(second.token().is_cancelled());
+    }
+
+    #[test]
+    fn operation_id_allocator_is_independent_of_cancellation_scope() {
+        let ids = OperationIdAllocator::new();
+
+        assert_ne!(ids.allocate(), ids.allocate());
+    }
 
     #[test]
     fn cancel_token_lifecycle() {

@@ -145,14 +145,20 @@ pub(crate) fn handle_slash_command(
                                 "${} [{}] — {}",
                                 s.id,
                                 s.source.as_str(),
-                                if s.description.is_empty() { &s.name } else { &s.description }
+                                if s.description.is_empty() {
+                                    &s.name
+                                } else {
+                                    &s.description
+                                }
                             )
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
                     state.push_message(ChatMessage::System(format!("Available skills:\n{list}")));
                 }
-                Err(e) => state.push_message(ChatMessage::Error(format!("failed to list skills: {e}"))),
+                Err(e) => {
+                    state.push_message(ChatMessage::Error(format!("failed to list skills: {e}")))
+                }
             }
         }
         SlashCommand::WorkflowRun { name, args } => {

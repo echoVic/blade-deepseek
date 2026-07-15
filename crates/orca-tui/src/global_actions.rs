@@ -2,7 +2,7 @@ use crossbeam_channel as mpsc;
 use std::io;
 use std::time::{Duration, Instant};
 
-use orca_core::cancel::CancelToken;
+use orca_core::cancel::OperationCancellation;
 
 use crate::shortcuts::GlobalShortcut;
 use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
@@ -16,7 +16,7 @@ pub(crate) fn handle_global_shortcut<F>(
     shortcut: GlobalShortcut,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
-    cancel_token: &CancelToken,
+    cancellation: &OperationCancellation,
     clear_terminal: F,
 ) -> io::Result<GlobalShortcutFlow>
 where
@@ -24,6 +24,11 @@ where
 {
     match shortcut {
         GlobalShortcut::Cancel => {
+            if matches!(state.status, AppStatus::Running | AppStatus::Compacting) {
+                cancellation.cancel_current();
+                let _ = action_tx.send(UserAction::Interrupt);
+                return Ok(GlobalShortcutFlow::Continue);
+            }
             let now = Instant::now();
             if state
                 .last_ctrl_c
@@ -33,10 +38,6 @@ where
                 return Ok(GlobalShortcutFlow::Exit(130));
             }
             state.last_ctrl_c = Some(now);
-            if matches!(state.status, AppStatus::Running | AppStatus::Compacting) {
-                cancel_token.cancel();
-                let _ = action_tx.send(UserAction::Interrupt);
-            }
             state.push_message(ChatMessage::System("Press Ctrl+C again to quit.".into()));
             state.scroll_to_bottom();
         }
@@ -63,7 +64,7 @@ where
 mod tests {
     use crossbeam_channel as mpsc;
 
-    use orca_core::cancel::CancelToken;
+    use orca_core::cancel::OperationCancellation;
 
     use super::handle_global_shortcut;
     use crate::shortcuts::GlobalShortcut;
@@ -79,23 +80,24 @@ mod tests {
             "/tmp".to_string(),
         );
         state.set_status(AppStatus::Compacting);
-        let cancel = CancelToken::new();
+        let cancellation = OperationCancellation::new();
+        let operation = cancellation.start();
 
         handle_global_shortcut(
             GlobalShortcut::Cancel,
             &mut state,
             &action_tx,
-            &cancel,
+            &cancellation,
             || Ok(()),
         )
         .expect("cancel compaction");
 
-        assert!(cancel.is_cancelled());
+        assert!(operation.token().is_cancelled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
     #[test]
-    fn second_ctrl_c_exits_even_when_status_remains_running() {
+    fn second_ctrl_c_exits_when_idle() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
             action_tx.clone(),
@@ -103,14 +105,13 @@ mod tests {
             "model".to_string(),
             "/tmp".to_string(),
         );
-        state.enter_running();
-        let cancel = CancelToken::new();
+        let cancellation = OperationCancellation::new();
 
         let first = handle_global_shortcut(
             GlobalShortcut::Cancel,
             &mut state,
             &action_tx,
-            &cancel,
+            &cancellation,
             || Ok(()),
         )
         .unwrap();
@@ -118,13 +119,13 @@ mod tests {
             GlobalShortcut::Cancel,
             &mut state,
             &action_tx,
-            &cancel,
+            &cancellation,
             || Ok(()),
         )
         .unwrap();
 
         assert!(matches!(first, super::GlobalShortcutFlow::Continue));
-        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert!(action_rx.try_recv().is_err());
         assert!(matches!(second, super::GlobalShortcutFlow::Exit(130)));
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Cancel)));
     }
@@ -146,7 +147,7 @@ mod tests {
             GlobalShortcut::ClearScreen,
             &mut state,
             &action_tx,
-            &CancelToken::new(),
+            &OperationCancellation::new(),
             || Ok(()),
         )
         .expect("clear screen");

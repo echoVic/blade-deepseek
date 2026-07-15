@@ -70,7 +70,11 @@ pub fn discover_from_env(cwd: &Path) -> Result<Vec<Skill>, String> {
     discover(cwd, orca_home.as_deref(), agents_home.as_deref())
 }
 
-pub fn discover(cwd: &Path, orca_home: Option<&Path>, agents_home: Option<&Path>) -> Result<Vec<Skill>, String> {
+pub fn discover(
+    cwd: &Path,
+    orca_home: Option<&Path>,
+    agents_home: Option<&Path>,
+) -> Result<Vec<Skill>, String> {
     let project_root = project_root(cwd);
     let mut skills = Vec::new();
     if let Some(home) = orca_home {
@@ -271,7 +275,10 @@ fn paths_match(patterns: &[String], root: &Path) -> bool {
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_str().unwrap_or("");
-            !matches!(name, "target" | "node_modules" | ".git" | "dist" | ".next" | "build")
+            !matches!(
+                name,
+                "target" | "node_modules" | ".git" | "dist" | ".next" | "build"
+            )
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -310,7 +317,9 @@ fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
     (Some(frontmatter), body)
 }
 
-fn parse_frontmatter(frontmatter: Option<&str>) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
+fn parse_frontmatter(
+    frontmatter: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
     let mut name = None;
     let mut description = None;
     let mut when_to_use = None;
@@ -323,7 +332,12 @@ fn parse_frontmatter(frontmatter: Option<&str>) -> (Option<String>, Option<Strin
         if in_paths {
             let trimmed = line.trim();
             if trimmed.starts_with('-') {
-                let pat = trimmed.trim_start_matches('-').trim().trim_matches('"').trim_matches('\'').to_string();
+                let pat = trimmed
+                    .trim_start_matches('-')
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
                 if !pat.is_empty() {
                     paths.push(pat);
                 }

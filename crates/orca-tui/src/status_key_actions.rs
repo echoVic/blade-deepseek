@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{Event, KeyEvent};
 use tui_textarea::TextArea;
 
-use orca_core::cancel::CancelToken;
+use orca_core::cancel::OperationCancellation;
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
 
@@ -32,7 +32,7 @@ pub(crate) fn handle_status_key<F>(
     config: &mut RunConfig,
     shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
-    cancel_token: &CancelToken,
+    cancellation: &OperationCancellation,
     preloaded_transcript: &Arc<Mutex<Option<SessionTranscript>>>,
     textarea: &mut TextArea,
     vim_state: &mut VimState,
@@ -97,7 +97,7 @@ where
         && let Some(ShortcutAction::Running(shortcut)) =
             resolve_shortcut(ShortcutContext::Running, *key)
     {
-        handle_running_shortcut(shortcut, state, action_tx, cancel_token);
+        handle_running_shortcut(shortcut, state, action_tx, cancellation);
     }
 
     if state.status == AppStatus::Compacting
@@ -105,7 +105,7 @@ where
             resolve_shortcut(ShortcutContext::Running, *key)
         && compacting_shortcut_allowed(shortcut)
     {
-        handle_running_shortcut(shortcut, state, action_tx, cancel_token);
+        handle_running_shortcut(shortcut, state, action_tx, cancellation);
     }
 
     Ok(StatusKeyFlow::Continue)
@@ -183,7 +183,8 @@ mod tests {
         state.set_status(AppStatus::Compacting);
         let mut config = config();
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let cancel = CancelToken::new();
+        let cancellation = OperationCancellation::new();
+        let operation = cancellation.start();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::default();
         let mut vim_state = VimState::new(false);
@@ -198,7 +199,7 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancel,
+            &cancellation,
             &preloaded,
             &mut textarea,
             &mut vim_state,
@@ -208,7 +209,7 @@ mod tests {
         )
         .expect("handle compacting shortcut");
 
-        assert!(cancel.is_cancelled());
+        assert!(operation.token().is_cancelled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -224,7 +225,8 @@ mod tests {
         state.enter_running();
         let mut config = config();
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let cancel = CancelToken::new();
+        let cancellation = OperationCancellation::new();
+        let operation = cancellation.start();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::default();
         let mut vim_state = VimState::new(false);
@@ -239,7 +241,7 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancel,
+            &cancellation,
             &preloaded,
             &mut textarea,
             &mut vim_state,
@@ -251,7 +253,7 @@ mod tests {
 
         assert!(matches!(flow, StatusKeyFlow::Continue));
         assert_eq!(state.status, AppStatus::Running);
-        assert!(cancel.is_cancelled());
+        assert!(operation.token().is_cancelled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -267,7 +269,7 @@ mod tests {
         state.set_status(AppStatus::Compacting);
         let mut config = config();
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let cancel = CancelToken::new();
+        let cancellation = OperationCancellation::new();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::default();
         let mut vim_state = VimState::new(false);
@@ -282,7 +284,7 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancel,
+            &cancellation,
             &preloaded,
             &mut textarea,
             &mut vim_state,
@@ -294,6 +296,6 @@ mod tests {
 
         assert_eq!(state.status, AppStatus::Compacting);
         assert!(action_rx.try_recv().is_err());
-        assert!(!cancel.is_cancelled());
+        assert!(cancellation.current_id().is_none());
     }
 }

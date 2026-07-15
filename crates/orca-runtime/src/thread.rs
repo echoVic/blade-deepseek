@@ -161,6 +161,23 @@ impl RuntimeThread {
         writer: W,
         events: &mut EventFactory,
     ) -> io::Result<RunStatus> {
+        self.run_request_with_event_factory_and_cancel(
+            config,
+            request,
+            writer,
+            events,
+            CancelToken::new(),
+        )
+    }
+
+    pub fn run_request_with_event_factory_and_cancel<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        request: &ThreadTurnRequest,
+        writer: W,
+        events: &mut EventFactory,
+        cancel: CancelToken,
+    ) -> io::Result<RunStatus> {
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         ThreadTurnExecutor::new_with_thread_extensions(
@@ -170,7 +187,7 @@ impl RuntimeThread {
             thread_extensions,
             turn_extension_id,
         )
-        .run_request_with_event_factory(request, writer, events)
+        .run_request_with_event_factory_and_cancel(request, writer, events, cancel)
     }
 
     fn next_turn_extension_id(&mut self) -> String {

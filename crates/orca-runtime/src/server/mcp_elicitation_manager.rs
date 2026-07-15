@@ -16,6 +16,15 @@ use super::{lock_error, write_locked_event};
 
 pub(super) struct PendingMcpElicitationRequest {
     pub(super) sender: mpsc::Sender<McpElicitationResponse>,
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) generation: u64,
+}
+
+impl PendingMcpElicitationRequest {
+    pub(super) fn generation_scope(&self) -> (&str, &str, u64) {
+        (&self.thread_id, &self.turn_id, self.generation)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -55,6 +64,7 @@ pub(super) struct ServerMcpElicitationRequestHandler<W: Write + Send + 'static> 
     event_id: Value,
     thread_id: String,
     turn_id: String,
+    generation: u64,
     cancel: CancelToken,
 }
 
@@ -65,6 +75,7 @@ impl<W: Write + Send + 'static> ServerMcpElicitationRequestHandler<W> {
         event_id: Value,
         thread_id: String,
         turn_id: String,
+        generation: u64,
         cancel: CancelToken,
     ) -> Self {
         Self {
@@ -73,6 +84,7 @@ impl<W: Write + Send + 'static> ServerMcpElicitationRequestHandler<W> {
             event_id,
             thread_id,
             turn_id,
+            generation,
             cancel,
         }
     }
@@ -91,8 +103,9 @@ impl<W: Write + Send + 'static> McpElicitationHandler for ServerMcpElicitationRe
             .requested_schema
             .as_ref()
             .map(serde_json::Value::to_string);
+        let scoped_turn_id = super::generation_scoped_id(self.turn_id.clone(), self.generation);
         let runtime_request = RuntimeMcpElicitationRequest::new_scoped(
-            &self.turn_id,
+            &scoped_turn_id,
             request.server_name,
             request.id,
             mode,
@@ -113,7 +126,12 @@ impl<W: Write + Send + 'static> McpElicitationHandler for ServerMcpElicitationRe
         self.pending
             .insert(
                 runtime_request.id.clone(),
-                PendingMcpElicitationRequest { sender },
+                PendingMcpElicitationRequest {
+                    sender,
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    generation: self.generation,
+                },
             )
             .map_err(|error| error.to_string())?;
         if let Err(error) = write_locked_event(
@@ -169,6 +187,9 @@ mod tests {
                 "mcp_elicitation:github:device-flow".to_string(),
                 PendingMcpElicitationRequest {
                     sender: first_sender,
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    generation: 0,
                 },
             )
             .expect("insert first request");
@@ -178,6 +199,9 @@ mod tests {
                     "mcp_elicitation:github:device-flow".to_string(),
                     PendingMcpElicitationRequest {
                         sender: second_sender,
+                        thread_id: "thread-2".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        generation: 0,
                     },
                 )
                 .is_err(),
@@ -208,6 +232,7 @@ mod tests {
             json!("turn"),
             "thread-1".to_string(),
             "turn-1".to_string(),
+            0,
             CancelToken::new(),
         );
 
@@ -263,6 +288,7 @@ mod tests {
             json!("turn"),
             "thread-1".to_string(),
             "turn-1".to_string(),
+            0,
             cancel.clone(),
         );
 

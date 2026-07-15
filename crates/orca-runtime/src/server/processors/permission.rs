@@ -56,6 +56,19 @@ fn run_permission_respond<W: Write>(
             ServerEvent::error(format!("unknown permission request: {request_id}")),
         );
     };
+    if let Some((pending_thread_id, pending_turn_id, generation)) = pending.runtime_generation()
+        && !state
+            .active_turns
+            .accepts_generation(pending_turn_id, pending_thread_id, generation)
+    {
+        return protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!(
+                "permission request is no longer active: {request_id}"
+            )),
+        );
+    }
     if decision == protocol::PermissionResponseDecision::Allow
         && scope == protocol::PermissionGrantScope::Session
     {

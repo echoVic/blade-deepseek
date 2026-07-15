@@ -168,7 +168,8 @@ pub(crate) fn handle_slash_menu_key(
             if let Some(id) = selected_cmd.strip_prefix('/') {
                 if let Ok(skills) = orca_tools::skills::discover_from_env(&cwd) {
                     if skills.iter().any(|s| s.id == id) {
-                        *textarea = make_textarea_with_text(&format!("{selected_cmd} "), vim_state, theme);
+                        *textarea =
+                            make_textarea_with_text(&format!("{selected_cmd} "), vim_state, theme);
                         state.slash_menu = None;
                         return true;
                     }

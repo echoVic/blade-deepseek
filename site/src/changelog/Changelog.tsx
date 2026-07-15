@@ -76,6 +76,10 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.28":
+        "Server turn cancellation is now generation-owned. Interrupt permanently cancels the current DeepSeek execution; resume waits for it to return, starts a fresh scope on the same logical turn id, and never appends the original prompt twice. Permission, user-input, and MCP waiters are cancellation-aware and generation-fenced, stale steer and responses are rejected, and a replaced generation cannot publish stale cancellation errors or a stale terminal event. The first interaction request id remains compatible; resumed generations receive an internal generation suffix. A real DeepSeek gate interrupts after the first stream delta and verifies one successful terminal event.",
+      "v0.2.27":
+        "Every submitted TUI turn, manual compaction, Goal operation, and approved background continuation now receives a fresh one-shot cancellation scope with a stable operation id. Esc and Ctrl+C cancel only the active scope, so interrupting a DeepSeek stream cannot be undone by a later reset or leave the next turn born cancelled. All production TUI reset calls are gone, and an agent-loop behavior test cancels a delayed first turn before proving that a second submit gets a different scope, produces output, and completes successfully. CLI arguments, TUI keys and flows, server JSONL, persisted records, and DeepSeek behavior remain compatible. The server turn/resume reset path remains an explicit actor-owned follow-up rather than a permanent compatibility layer.",
       "v0.2.26":
         "The TUI now admits runtime events through a 256-item mailbox and user actions through a 64-item mailbox with blocking backpressure, so a slow or paused renderer cannot grow an unbounded queue and admitted output, approvals, errors, and terminal state keep FIFO order. Runtime compaction and approved background continuation project the original typed EventEnvelope through EventObserver instead of serializing JSONL into a partial-frame buffer and parsing it back. Provider streaming, mention catalog refresh, and silent child-agent event disposal also use explicit bounded ownership, with the silent drain thread joined before return. CLI/server JSONL, persisted records, DeepSeek behavior, TUI keys, and interaction flows remain compatible.",
       "v0.2.25":
@@ -506,6 +510,10 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.28":
+        "Server turn cancellation 现在由 generation 独占。Interrupt 会永久取消当前 DeepSeek 执行；resume 等待旧 generation 返回后，在同一个逻辑 turn id 上用新的 scope 重启，并且不会重复追加原始 prompt。Permission、user-input 和 MCP waiter 都支持取消并按 generation 隔离；过期的 steer 与响应会被拒绝，被替换的 generation 不能发布过期取消错误或终态。第一代 interaction request id 保持兼容，续接 generation 会增加内部后缀。真实 DeepSeek gate 会在首个 stream delta 后 interrupt，再验证同一 turn 只产生一个成功终态。",
+      "v0.2.27":
+        "每次 TUI 提交、手动 compaction、Goal 操作和已批准的后台续轮现在都会获得新的 one-shot cancellation scope，并带有稳定的 operation id。Esc 与 Ctrl+C 只取消当前 scope，因此中断 DeepSeek 流后，后续 reset 不会把旧操作重新激活，也不会让下一轮一开始就处于已取消状态。生产 TUI 中的 reset 调用已全部删除；agent-loop 行为测试会取消延迟中的第一轮，再证明第二次提交拿到不同 scope、正常产生输出并成功完成。CLI 参数、TUI 快捷键与流程、server JSONL、持久化记录和 DeepSeek 行为保持兼容。Server turn/resume 的 reset 路径仍是明确的 actor-owned 后续边界，不会被当作永久兼容层。",
       "v0.2.26":
         "TUI 现在通过容量为 256 的 mailbox 接收 runtime event，并通过容量为 64 的 mailbox 接收用户操作；满载时采用阻塞背压，因此终端渲染变慢或暂停时不会无限积压，已准入的输出、审批、错误与终态仍保持 FIFO 顺序。Runtime compaction 和已批准的后台续轮现在通过 EventObserver 直接投影原始的类型化 EventEnvelope，不再先写入带 partial-frame buffer 的 JSONL writer 再反序列化。Provider stream、mention catalog 刷新和静默 child-agent 事件丢弃也都具有明确的有界所有权，静默 drain 线程会在返回前完成 join。CLI/server JSONL、持久化记录、DeepSeek 行为、TUI 快捷键和交互流程保持兼容。",
       "v0.2.25":

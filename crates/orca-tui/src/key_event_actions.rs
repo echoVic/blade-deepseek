@@ -5,7 +5,7 @@ use crossbeam_channel as mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
-use orca_core::cancel::CancelToken;
+use orca_core::cancel::OperationCancellation;
 use orca_core::config::RunConfig;
 
 use crate::approval_mode_actions::cycle_approval_mode;
@@ -25,7 +25,7 @@ pub(crate) fn handle_key_event_preflight<F>(
     config: &mut RunConfig,
     shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
-    cancel_token: &CancelToken,
+    cancellation: &OperationCancellation,
     clear_terminal: F,
 ) -> io::Result<KeyEventFlow>
 where
@@ -40,7 +40,7 @@ where
             shortcut,
             state,
             action_tx,
-            cancel_token,
+            cancellation,
             clear_terminal,
         )? {
             GlobalShortcutFlow::Continue => Ok(KeyEventFlow::Continue),

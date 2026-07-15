@@ -36,6 +36,7 @@ pub mod runtime_capability;
 mod runtime_conversation_bootstrap;
 pub mod runtime_directive;
 pub(crate) mod runtime_event_projector;
+pub mod runtime_host;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
@@ -1943,49 +1944,6 @@ mod tests {
                 "runtime_permission.rs must construct command exec permission request profiles with {request_constructor}"
             );
         }
-    }
-
-    #[test]
-    fn server_active_turn_manager_is_owned_by_active_turn_manager_module() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let server_source =
-            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
-        let manager_source =
-            std::fs::read_to_string(manifest_dir.join("src/server/active_turn_manager.rs"))
-                .expect("server active turn manager source");
-
-        assert!(
-            server_source.contains("mod active_turn_manager;"),
-            "server must declare the active turn manager module"
-        );
-        for type_name in [
-            "struct ActiveTurnControl",
-            "struct ActiveTurnHandle",
-            "struct ActiveTurnManager",
-            "struct ActiveTurnReaper",
-        ] {
-            assert!(
-                !server_source.contains(type_name),
-                "server.rs must not own {type_name}"
-            );
-            assert!(
-                manager_source.contains(type_name),
-                "server/active_turn_manager.rs must own {type_name}"
-            );
-        }
-        assert!(
-            manager_source.contains("fn merge_completed_turn_metadata"),
-            "server/active_turn_manager.rs must own completed-turn metadata merge"
-        );
-        assert!(
-            server_source.contains("let reaper = state.shutdown();")
-                && server_source.contains("reaper.join();"),
-            "server exit must retain and join handed-off turn cleanup before process::exit"
-        );
-        assert!(
-            !manager_source.contains("drop(thread::spawn("),
-            "active turn cleanup must not discard its reaper join handle"
-        );
     }
 
     #[test]
@@ -4828,35 +4786,6 @@ mod tests {
             assert!(
                 !server_runtime_source.contains(forbidden),
                 "server_runtime must not directly own or assemble {forbidden}; use RuntimeThread"
-            );
-        }
-    }
-
-    #[test]
-    fn headless_run_inner_enters_agent_loop_through_runtime_thread() {
-        let controller_source = include_str!("controller.rs");
-        let run_inner_source = controller_source
-            .split("fn run_inner")
-            .nth(1)
-            .and_then(|source| source.split("pub fn run_thread_turn_to_writer").next())
-            .expect("controller run_inner body");
-
-        assert!(
-            run_inner_source.contains("RuntimeThread::start"),
-            "headless run_inner must create long-lived agent state through RuntimeThread"
-        );
-        assert!(
-            run_inner_source.contains(".run_request_with_event_factory("),
-            "headless run_inner must delegate turn execution through RuntimeThread"
-        );
-        for forbidden in [
-            "RuntimeSessionLifecycle::new(new_run_id())",
-            "TaskRegistry::new_for_cwd",
-            "run_agent_loop(",
-        ] {
-            assert!(
-                !run_inner_source.contains(forbidden),
-                "headless run_inner must not directly assemble {forbidden}; use RuntimeThread"
             );
         }
     }

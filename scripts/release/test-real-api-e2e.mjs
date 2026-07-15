@@ -88,6 +88,7 @@ if (args[0] === "exec") {
 if (args[0] === "--mode" && args[1] === "server") {
   const rl = readline.createInterface({ input: process.stdin });
   let serverThreadSentinel = "ORCA_SERVER_THREAD_MEMORY_OK";
+  const activeResumeTurnId = "turn-resume-test";
   rl.on("line", (line) => {
     appendFileSync(logPath, \`server-stdin \${line}\\n\`);
     const request = JSON.parse(line);
@@ -98,7 +99,11 @@ if (args[0] === "--mode" && args[1] === "server") {
       return;
     }
     if (request.method === "thread/start") {
-      const threadId = request.id === "server-thread-extra" ? "thread-test-extra" : "thread-test";
+      const threadId = request.id === "server-thread-extra"
+        ? "thread-test-extra"
+        : request.id === "server-resume-thread"
+          ? "thread-test-resume"
+          : "thread-test";
       process.stdout.write(JSON.stringify({ id: request.id, event: "thread_started", threadId }) + "\\n");
       return;
     }
@@ -114,6 +119,15 @@ if (args[0] === "--mode" && args[1] === "server") {
       process.stdout.write(JSON.stringify({ id: request.id, event: "turn_completed", status: "success" }) + "\\n");
       return;
     }
+    if (request.method === "turn/start" && request.id === "server-resume-turn") {
+      process.stdout.write(JSON.stringify({
+        id: request.id,
+        event: "turn_started",
+        task: { task_id: activeResumeTurnId }
+      }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: request.id, event: "reasoning_delta", text: "first generation" }) + "\\n");
+      return;
+    }
     if (request.method === "turn/start" && request.id === "server-thread-extra-turn") {
       process.stdout.write(JSON.stringify({ id: request.id, event: "message_delta", text: serverThreadSentinel }) + "\\n");
       process.stdout.write(JSON.stringify({ id: request.id, event: "turn_completed", status: "success" }) + "\\n");
@@ -121,14 +135,20 @@ if (args[0] === "--mode" && args[1] === "server") {
     }
     if (request.method === "turn/interrupt" || request.method === "turn/resume" || request.method === "turn/steer") {
       const action = request.method.split("/")[1];
+      const isActiveResumeControl = request.id === "server-resume-interrupt" || request.id === "server-resume-resume";
       process.stdout.write(JSON.stringify({
         id: request.id,
         event: "turn_controlled",
         action,
         turnId: request.params.turnId,
-        status: "idle",
+        status: isActiveResumeControl ? (action === "interrupt" ? "interrupted" : "resumed") : "idle",
         input: request.params.input?.filter?.((item) => item.type === "text").map((item) => item.text).join("\\n") ?? null
       }) + "\\n");
+      if (request.id === "server-resume-resume") {
+        const text = readFileSync(logPath, "utf8").match(/ORCA_SERVER_RESUME_OK_\\d+_\\d+/)?.[0] ?? "ORCA_SERVER_RESUME_OK";
+        process.stdout.write(JSON.stringify({ id: "server-resume-turn", event: "message_delta", text }) + "\\n");
+        process.stdout.write(JSON.stringify({ id: "server-resume-turn", event: "turn_completed", status: "success" }) + "\\n");
+      }
       return;
     }
     if (request.method === "thread/metadata/update") {
@@ -440,6 +460,7 @@ if (args[0] === "--mode" && args[1] === "server") {
     "History replay invocation not re-executed: legacy-missing-tool-call",
     "Server real API e2e verified: ORCA_SERVER_REAL_OK",
     "Server thread real API e2e verified: ORCA_SERVER_THREAD_MEMORY_OK_",
+    "Server active turn resume e2e verified: ORCA_SERVER_RESUME_OK_",
     "Server thread/read e2e verified",
     "Server thread/metadata/update e2e verified",
     "Server turn controls e2e verified",
@@ -460,6 +481,11 @@ if (args[0] === "--mode" && args[1] === "server") {
     throw new Error(`missing unique server thread token in log:\n${log}`);
   }
   const serverThreadSentinel = tokenMatch[0];
+  const resumeTokenMatch = log.match(/ORCA_SERVER_RESUME_OK_\d+_\d+/);
+  if (!resumeTokenMatch) {
+    throw new Error(`missing unique server resume token in log:\n${log}`);
+  }
+  const serverResumeSentinel = resumeTokenMatch[0];
   for (const expected of [
     "cargo build --bin orca",
     "cargo run -p orca-provider --example summary_render_realapi",
@@ -472,6 +498,10 @@ if (args[0] === "--mode" && args[1] === "server") {
     "server-stdin {\"id\":\"server-thread\",\"method\":\"thread/start\",\"params\":{}}",
     `server-stdin {"id":"server-thread-turn-1","method":"turn/start","params":{"threadId":"thread-test","input":[{"type":"text","text":"Remember this exact token for the next turn: ${serverThreadSentinel}. Reply with exactly: READY."}]}}`,
     "server-stdin {\"id\":\"server-thread-turn-2\",\"method\":\"turn/start\",\"params\":{\"threadId\":\"thread-test\",\"input\":[{\"type\":\"text\",\"text\":\"Reply with exactly the token I asked you to remember.\"}]}}",
+    "server-stdin {\"id\":\"server-resume-thread\",\"method\":\"thread/start\",\"params\":{}}",
+    `server-stdin {"id":"server-resume-turn","method":"turn/start","params":{"threadId":"thread-test-resume","approvalPolicy":"never","input":[{"type":"text","text":"Do not call tools or inspect files. This is a text-only streaming test. Write 80 short numbered lines containing STREAM. The final line must be exactly: ${serverResumeSentinel}"}]}}`,
+    "server-stdin {\"id\":\"server-resume-interrupt\",\"method\":\"turn/interrupt\",\"params\":{\"threadId\":\"thread-test-resume\",\"turnId\":\"turn-resume-test\"}}",
+    "server-stdin {\"id\":\"server-resume-resume\",\"method\":\"turn/resume\",\"params\":{\"threadId\":\"thread-test-resume\",\"turnId\":\"turn-resume-test\"}}",
     "server-stdin {\"id\":\"server-turn-interrupt\",\"method\":\"turn/interrupt\",\"params\":{\"turnId\":\"turn-idle-real-api\"}}",
     "server-stdin {\"id\":\"server-turn-resume\",\"method\":\"turn/resume\",\"params\":{\"turnId\":\"turn-idle-real-api\"}}",
     "server-stdin {\"id\":\"server-turn-steer\",\"method\":\"turn/steer\",\"params\":{\"turnId\":\"turn-idle-real-api\",\"input\":[{\"type\":\"text\",\"text\":\"steer this idle turn\"}]}}",

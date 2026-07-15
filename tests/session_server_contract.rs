@@ -2040,6 +2040,11 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
+    let terminal_events = parse_jsonl(&output.stdout)
+        .into_iter()
+        .filter(|event| event["id"] == "turn-slow" && event["event"] == "turn_completed")
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_events.len(), 1);
 }
 
 #[test]
