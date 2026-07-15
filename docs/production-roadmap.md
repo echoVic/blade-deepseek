@@ -4,7 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current candidate: v0.2.26 replaces the TUI's unbounded runtime-event and
+Current baseline: v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
 paused rendering now applies producer backpressure without silently dropping
 assistant output, approval, error, or terminal events. Runtime compaction and
@@ -14,10 +14,12 @@ deserialize/recreate envelope path are deleted. Provider streaming, mention
 catalog refresh, and silent child-agent event disposal also have explicit
 bounded admission, and the silent drain worker is joined before return. CLI,
 TUI interactions, server/JSONL, persistence, and DeepSeek behavior remain
-compatible. The rebased candidate passed focused observer/mailbox/compaction,
-complete serial workspace, Clippy, site, release-script, and real DeepSeek
-provider gates. Remote Actions, GitHub Release, npm, and public-install
-verification remain required before this becomes the released baseline.
+compatible. The release passed focused observer/mailbox/compaction, complete
+serial workspace, Clippy, site, release-script, and real DeepSeek provider
+gates. Release workflow `29388934712` passed the complete test, four-platform
+build, GitHub Release, npm publish, and npm release-asset jobs; the public
+verifier confirmed the GitHub Release, `@blade-ai/orca@0.2.26`, and `npm exec`
+installation.
 
 Earlier v0.2.25 gives the managed network proxy one explicit
 supervisor owner. It admits at most 32 concurrent connections, bounds request
