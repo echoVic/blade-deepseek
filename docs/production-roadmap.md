@@ -4,7 +4,19 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current baseline: v0.2.23 gives the TUI native-feeling mouse text
+Current baseline: v0.2.24 closes every accepted tool call with one truthful
+terminal, repairs incomplete historical calls without replay, bounds process
+output and tool-facing file admission, and gives ordinary tools, MCP servers,
+workflows, async subagents, verifier commands, and server shells an explicit
+cleanup or reaper owner. Recovered workers are identity-checked before
+signaling, server shutdown is bounded and two-phase, and internal worker API
+keys use a bounded anonymous stdin pipe instead of argv or workflow records.
+The release passed local workspace, Clippy, site, release-script, and live
+provider gates. Known follow-up areas include Windows descendant-tree parity,
+a total WorkflowHost deadline, and a managed-network-proxy connection ceiling
+with unified connection-worker ownership.
+
+Earlier v0.2.23 gives the TUI native-feeling mouse text
 interaction. Left-drag selects transcript text with a theme-aware,
 foreground-preserving highlight; release copies through OSC 52 (plus
 `pbcopy` on macOS) with a transient status-line notice. Selections anchor in
@@ -57,19 +69,6 @@ second time. Detached completions and approved continuations apply exact usage
 deltas, while synchronized Goal-store mutations prevent concurrent updates from
 overwriting each other. Historical cache-inflated Goal values are not migrated
 automatically.
-Next-release candidate (v0.2.24): the local integration branch now closes every
-accepted tool call with one truthful terminal, repairs incomplete historical
-calls without replay, bounds process output and tool-facing file admission,
-and gives ordinary tools, MCP servers, workflows, async subagents, verifier
-commands, and server shells an explicit cleanup or reaper owner. Recovered
-workers are identity-checked before signaling, server shutdown is bounded and
-two-phase, and internal worker API keys use a bounded anonymous stdin pipe
-instead of argv or workflow records. The candidate has passed local workspace,
-Clippy, site, and release-script gates but is not part of the published v0.2.23
-baseline; live-provider and post-publish verification remain pending.
-Known follow-up areas include Windows descendant-tree parity, a total
-WorkflowHost deadline, and a managed-network-proxy connection ceiling with
-unified connection-worker ownership.
 Earlier v0.2.20 makes the TUI
 resilient to long interactive content: large pastes remain compact before and
 after submission, Goal and plan surfaces truncate by display width, approval
@@ -453,15 +452,15 @@ working baseline used to prioritize the next patch releases.
 | Mention system | Files, Skills, Plugins, MCP Resources, and Resource Templates share one typed candidate model in TUI and thread-bound app-server search; visible tokens carry hidden atomic targets that survive preceding edits, invalidate on overlap, and expand against the selected root/registry | Codex atomic structured input and unified mentions; Claude resource/file typeahead | Implemented |
 | Shell execution | `bash` and server shell ops route through a runtime shell-session manager with task ids, stdin, kill, nonblocking incremental reads, optional Unix PTY mode, PTY resize, stdout/stderr collection, macOS Seatbelt path, configurable timeout, and observable requested/effective terminal modes with pipe fallback where PTY is unavailable | Codex `exec_command` sessions, PTY, stdin, timeout | Seeded; richer shell controls still open |
 | Context management | BPE token counting, local compaction, persisted collapse/summary records | Multi-level local/remote compaction | Partial |
-| Tool output control | Runtime task output uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output. The v0.2.24 candidate additionally caps ordinary child stdout/stderr at 1 MiB per stream before final tool-result truncation, preserves omission metadata, and bounds regular-file reads, exact edits, and committed TUI diff previews at admission | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial; v0.2.24 candidate integrated locally, persistent offset polling remains open |
+| Tool output control | Runtime task output uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output. v0.2.24 additionally caps ordinary child stdout/stderr at 1 MiB per stream before final tool-result truncation, preserves omission metadata, and bounds regular-file reads, exact edits, and committed TUI diff previews at admission | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial; v0.2.24 published, persistent offset polling remains open |
 | Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |
-| MCP | stdio/SSE config surface, tool routing, read-only resource list/read/template tools, unified Mention discovery, same-registry Resource expansion, and v0.2.24 candidate timeout/cancel/error/drop cleanup with bounded stdio response framing and process reaping | Codex MCP client/server ecosystem | Partial; resource/tool/Mention integration and lifecycle hardening seeded |
+| MCP | stdio/SSE config surface, tool routing, read-only resource list/read/template tools, unified Mention discovery, same-registry Resource expansion, and v0.2.24 timeout/cancel/error/drop cleanup with bounded stdio response framing and process reaping | Codex MCP client/server ecosystem | Partial; resource/tool/Mention integration and lifecycle hardening seeded |
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
 | Persistent goals | `/goal` with persisted state, cumulative active-Goal timing, metadata-preserving atomic resume, plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented; runtime orchestration still open |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
-| Runtime lifecycle | Headless, server-mode, and TUI agent runs seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` owns long-lived interactive state, and focused server processors/managers handle queries, turn control, shell and command execution, permission/user-input responses, and submit operations. Workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`. The v0.2.24 candidate closes accepted tool calls with truthful terminal metadata and gives external tools, MCP/workflow children, async subagents, verifier commands, server turns, ordinary shells, and mention-search reapers explicit cleanup ownership; recovered workers require identity checks, and internal worker credentials no longer use argv or persisted workflow records | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; v0.2.24 candidate integrated locally, with Windows process-tree parity and deeper TUI loop delegation still open |
+| Runtime lifecycle | Headless, server-mode, and TUI agent runs seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` owns long-lived interactive state, and focused server processors/managers handle queries, turn control, shell and command execution, permission/user-input responses, and submit operations. Workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`. v0.2.24 closes accepted tool calls with truthful terminal metadata and gives external tools, MCP/workflow children, async subagents, verifier commands, server turns, ordinary shells, and mention-search reapers explicit cleanup ownership; recovered workers require identity checks, and internal worker credentials no longer use argv or persisted workflow records | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; v0.2.24 published, with Windows process-tree parity and deeper TUI loop delegation still open |
 | TUI | Markdown-ish rendering, themes, Vim mode, bounded committed diff previews, slash commands, atomic unified mentions, workflow panel, per-turn timers plus cumulative active-Goal timing, truthful interrupted/indeterminate tool rows, mouse text selection with OSC 52 clipboard copy, double-click word copy, edge auto-scroll, and a jump-to-bottom control | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary; resume normalization drops legacy reasoning-only assistant turns before provider replay | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |

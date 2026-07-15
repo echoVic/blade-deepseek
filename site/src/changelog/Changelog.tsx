@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.24":
+        "Every accepted tool invocation now reaches one truthful terminal result, including interruption, pre-execution rejection, and siblings that never started. Incomplete legacy history is repaired as indeterminate without replaying old calls. Ordinary process stdout and stderr are capped at 1 MiB per stream, while file reads and exact edits reject non-regular, binary, invalid UTF-8, growing, and oversized inputs before unsafe admission. External tools, MCP servers, workflows, async subagents, verifier commands, server turns, shells, and search managers now have explicit cleanup or reaper ownership; MCP and WorkflowHost transports and shutdown paths are bounded; observed completion wins cancellation and timeout races; and internal worker API keys no longer persist or appear in process arguments. Windows descendant-tree parity, a total WorkflowHost deadline, and a managed-proxy connection ceiling remain follow-up work.",
       "v0.2.23":
         "The Orca TUI gains native-feeling mouse text interaction. Drag over the transcript to select text with an editor-style theme-aware highlight that preserves syntax foregrounds; releasing the button copies the selection to the system clipboard through OSC 52 (VS Code, iTerm2, kitty, WezTerm, and SSH sessions) with a pbcopy fallback on macOS, and a transient `copied N chars to clipboard` notice appears on the status line. Selections are anchored in content space rather than screen space, so streaming output and scrolling never shift what was selected. Soft-wrapped prose copies back as one line with the wrap-dropped whitespace restored, while hard-split long words such as URLs stay unbroken. Double-click selects the word under the cursor and copies it immediately; dragging onto the transcript's first or last row auto-scrolls on the animation timer so the selection keeps growing while the pointer sits still; and a floating `Jump to bottom` pill appears whenever auto-follow is disarmed and re-arms it on click. The obsolete `shift+drag to copy` status hint is gone, and the mouse wheel keeps its existing scroll behavior.",
       "v0.2.22":
@@ -500,6 +502,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.24":
+        "每个已接受的工具调用现在都会得到一个真实且唯一的终态结果，包括中断、执行前拒绝和未启动的同批调用；旧历史中缺失的终态会修复为 indeterminate，绝不会重放旧调用。普通进程的 stdout 与 stderr 分别限制为 1 MiB，文件读取和精确编辑会在准入前拒绝非普通文件、二进制、非法 UTF-8、持续增长及超限输入。外部工具、MCP server、workflow、异步 subagent、验证命令、server turn、shell 和搜索管理器都有明确的清理或 reaper 所有者；MCP 与 WorkflowHost 传输和关闭路径具备边界；已观察到的完成结果优先于取消和超时竞争；内部 worker API key 不再持久化，也不会出现在进程参数中。Windows 后代进程树清理、WorkflowHost 总时限及托管代理连接上限仍是后续工作。",
       "v0.2.23":
         "Orca TUI 迎来接近原生体验的鼠标文本交互。在 transcript 上拖拽即可选中文本，编辑器风格的选区高亮按主题取色并保留语法前景色；松开鼠标即通过 OSC 52 写入系统剪贴板（VS Code、iTerm2、kitty、WezTerm 及 SSH 会话可用，macOS 额外以 pbcopy 兜底），状态栏同时浮现短暂的 `copied N chars to clipboard` 提示。选区锚定在内容坐标而非屏幕坐标，流式输出和滚动不会移动已选内容。软换行的段落复制回来仍是一行，折行处被丢弃的空白会补回，而被硬切断的长词（如 URL）保持完整。双击选中光标下的单词并立即复制；拖到 transcript 首行或末行时按动画节拍持续自动滚动，指针静止选区也能继续增长；脱离自动跟随时浮现 `Jump to bottom` 按钮，点击即回到底部并恢复跟随。过时的 `shift+drag to copy` 状态栏提示已移除，滚轮滚动行为保持不变。",
       "v0.2.22":

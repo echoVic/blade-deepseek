@@ -11,11 +11,10 @@ The machine freeze was caused by orphaned Node test workers, not by an Orca
 transcript heap leak. A sandboxed Vitest/Tinypool parent repeatedly failed to
 signal its workers with `kill EPERM`; 10 workers remained alive and reached
 40.51 GiB of resident pages in aggregate. v0.2.19 fixed that direct macOS
-Seatbelt signal-policy defect. The integrated v0.2.24 resource-governance
-candidate adds broader process ownership, bounded output, shutdown, and
-credential protections so unrelated terminal paths do not leave children
-running or retain arbitrarily large captured output. That broader hardening is
-not part of the published contract until v0.2.24 is released.
+Seatbelt signal-policy defect. v0.2.24 adds broader process ownership, bounded
+output, shutdown, and credential protections so unrelated terminal paths do
+not leave children running or retain arbitrarily large captured output. That
+broader hardening is part of the published v0.2.24 contract.
 
 ## Evidence
 
@@ -61,18 +60,18 @@ Orca.
 - **v0.2.19**: allowed a sandboxed process to signal only itself and its own
   descendants. Broader signal targets remain denied. This is the direct
   incident fix.
-- **v0.2.24 (candidate)**: the integrated candidate adds
+- **v0.2.24**: the release adds
   defense in depth across other lifecycle paths: process-tree termination and
   wait on external-tool stdin failure; 1 MiB per-stream capture limits; MCP and
   workflow reaping; owned and identity-checked async subagent workers; bounded
   two-phase server shutdown; ordinary shell-tree cleanup; and anonymous bounded
-  stdin handoff for worker API keys. None of this candidate scope is attributed
-  to the published v0.2.23 release.
+  stdin handoff for worker API keys. None of this scope is attributed to the
+  earlier v0.2.23 release.
 
 ## Security Review
 
 The focused source review identified plausible resource-exhaustion and
-credential-exposure paths, and the v0.2.24 candidate addresses them. The
+credential-exposure paths, and v0.2.24 addresses them. The
 formal Codex Security Deep Scan was not completed: its
 preflight requires six usable discovery workers per round, while the review
 session exposed only three worker slots. No Deep Scan findings or report are
@@ -88,9 +87,8 @@ Open hardening items:
 
 ## Operational Guidance
 
-Upgrade macOS installations to at least v0.2.19 for the direct incident fix. Do
-not rely on the v0.2.24 resource-lifecycle hardening until the integrated
-candidate is published. If a
+Upgrade macOS installations to v0.2.24 for both the direct incident fix and the
+published resource-lifecycle hardening. If a
 pre-v0.2.19 session exhibits `kill EPERM`, inspect the process tree for orphaned
 test workers and terminate only descendants attributable to that workload. Do
 not infer an Orca heap leak from total terminal memory without separating the
