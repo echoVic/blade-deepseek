@@ -811,22 +811,20 @@ mod tests {
     #[test]
     fn bash_wait_preserves_one_shot_cancel_observation() {
         let dir = tempfile::TempDir::new().unwrap();
-        let request = bash_request("printf before; sleep 5; printf after");
-        let calls = std::cell::Cell::new(0usize);
+        let cancel_ready = dir.path().join("cancel-ready");
+        let request = bash_request("printf before; : > cancel-ready; sleep 5; printf after");
+        let cancellation_delivered = std::cell::Cell::new(false);
 
         let result = execute_with_policy_or_cancel(
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
             Duration::from_secs(30),
-            || {
-                let call = calls.get();
-                calls.set(call + 1);
-                call == 2
-            },
+            || cancel_ready.exists() && !cancellation_delivered.replace(true),
         );
 
         assert_eq!(result.status, ToolStatus::Cancelled);
+        assert!(cancellation_delivered.get());
         assert!(
             result
                 .error
