@@ -5,8 +5,6 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{Event, KeyEvent};
 use tui_textarea::TextArea;
 
-#[cfg(test)]
-use orca_core::cancel::OperationCancellation;
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
 
@@ -129,6 +127,7 @@ fn compacting_shortcut_allowed(shortcut: RunningShortcut) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestOperationInterrupt;
     use crossterm::event::{KeyCode, KeyModifiers};
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{
@@ -185,8 +184,7 @@ mod tests {
         state.set_status(AppStatus::Compacting);
         let mut config = config();
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let cancellation = OperationCancellation::new();
-        let operation = cancellation.start();
+        let operation = TestOperationInterrupt::default();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::default();
         let mut vim_state = VimState::new(false);
@@ -201,7 +199,7 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancellation,
+            &operation,
             &preloaded,
             &mut textarea,
             &mut vim_state,
@@ -211,7 +209,7 @@ mod tests {
         )
         .expect("handle compacting shortcut");
 
-        assert!(operation.token().is_cancelled());
+        assert_eq!(operation.call_count(), 1);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -227,8 +225,7 @@ mod tests {
         state.enter_running();
         let mut config = config();
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let cancellation = OperationCancellation::new();
-        let operation = cancellation.start();
+        let operation = TestOperationInterrupt::default();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::default();
         let mut vim_state = VimState::new(false);
@@ -243,7 +240,7 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancellation,
+            &operation,
             &preloaded,
             &mut textarea,
             &mut vim_state,
@@ -255,7 +252,7 @@ mod tests {
 
         assert!(matches!(flow, StatusKeyFlow::Continue));
         assert_eq!(state.status, AppStatus::Running);
-        assert!(operation.token().is_cancelled());
+        assert_eq!(operation.call_count(), 1);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -271,7 +268,7 @@ mod tests {
         state.set_status(AppStatus::Compacting);
         let mut config = config();
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let cancellation = OperationCancellation::new();
+        let operation = TestOperationInterrupt::default();
         let preloaded = Arc::new(Mutex::new(None));
         let mut textarea = TextArea::default();
         let mut vim_state = VimState::new(false);
@@ -286,7 +283,7 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancellation,
+            &operation,
             &preloaded,
             &mut textarea,
             &mut vim_state,
@@ -298,6 +295,6 @@ mod tests {
 
         assert_eq!(state.status, AppStatus::Compacting);
         assert!(action_rx.try_recv().is_err());
-        assert!(cancellation.current_id().is_none());
+        assert_eq!(operation.call_count(), 0);
     }
 }

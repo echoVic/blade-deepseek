@@ -195,18 +195,24 @@ mod tests {
     use crossbeam_channel as mpsc;
 
     use super::TuiActionDispatcher;
+    use crate::interaction_broker::TuiInteractionBroker;
     use crate::operation_controller::TuiOperationController;
+    use crate::test_support::HostedOperationHarness;
     use crate::types::{TuiEvent, TuiInteractionKind, TuiInteractionResponse, UserAction};
 
     #[test]
     fn full_command_mailbox_does_not_block_interaction_response() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let controller = TuiOperationController::default();
-        let operation = controller.start().expect("start operation");
+        let operation = HostedOperationHarness::start();
+        let controller = operation.controller().clone();
         let waiter = controller
             .broker()
-            .register(operation.id(), TuiInteractionKind::UserInput, "ask")
+            .register(
+                operation.operation().id(),
+                TuiInteractionKind::UserInput,
+                "ask",
+            )
             .expect("register waiter");
         let key = waiter.key().clone();
         let (mut dispatcher, command_rx) =
@@ -244,18 +250,21 @@ mod tests {
             Ok(UserAction::Submit(prompt)) if prompt == "second"
         ));
         dispatcher.shutdown().expect("shutdown dispatcher");
-        drop(operation);
     }
 
     #[test]
     fn full_command_mailbox_does_not_block_interrupt() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let controller = TuiOperationController::default();
-        let operation = controller.start().expect("start operation");
+        let operation = HostedOperationHarness::start();
+        let controller = operation.controller().clone();
         let waiter = controller
             .broker()
-            .register(operation.id(), TuiInteractionKind::Approval, "approval")
+            .register(
+                operation.operation().id(),
+                TuiInteractionKind::Approval,
+                "approval",
+            )
             .expect("register waiter");
         let (mut dispatcher, _command_rx) =
             TuiActionDispatcher::spawn(raw_rx, event_tx, controller.clone(), 1, 1)
@@ -275,7 +284,7 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(1)),
             Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted
         ));
-        assert!(operation.token().is_cancelled());
+        assert!(operation.cancel_token().is_cancelled());
         dispatcher.shutdown().expect("shutdown dispatcher");
     }
 
@@ -283,11 +292,15 @@ mod tests {
     fn cancel_shuts_down_broker_and_dispatcher_without_command_capacity() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let controller = TuiOperationController::default();
-        let operation = controller.start().expect("start operation");
+        let operation = HostedOperationHarness::start();
+        let controller = operation.controller().clone();
         let waiter = controller
             .broker()
-            .register(operation.id(), TuiInteractionKind::McpElicitation, "mcp")
+            .register(
+                operation.operation().id(),
+                TuiInteractionKind::McpElicitation,
+                "mcp",
+            )
             .expect("register waiter");
         let (mut dispatcher, _command_rx) =
             TuiActionDispatcher::spawn(raw_rx, event_tx, controller.clone(), 1, 1)
@@ -306,7 +319,7 @@ mod tests {
             controller
                 .broker()
                 .register(
-                    operation.id(),
+                    operation.operation().id(),
                     TuiInteractionKind::UserInput,
                     "late",
                 ),
@@ -318,7 +331,7 @@ mod tests {
     fn overflowed_submit_is_rejected_with_its_prompt() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
-        let controller = TuiOperationController::default();
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
         let (mut dispatcher, _command_rx) =
             TuiActionDispatcher::spawn(raw_rx, event_tx, controller, 1, 1)
                 .expect("spawn dispatcher");

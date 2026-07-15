@@ -1,6 +1,4 @@
 use crossbeam_channel as mpsc;
-#[cfg(test)]
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
@@ -17,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 #[cfg(test)]
-use orca_core::cancel::{CancelToken, OperationCancellation};
+use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
 use orca_runtime::history;
@@ -32,8 +30,6 @@ use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
-#[cfg(test)]
-use crate::bridge::TuiSession;
 use crate::channels::{tui_event_channel, user_action_channel};
 use crate::clipboard;
 use crate::composer_textarea::{
@@ -228,7 +224,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             ))
         },
         move |agent_controller, command_rx, task_spawner, host| {
-            agent_loop_thread_hosted(
+            hosted_tui_controller_loop(
                 agent_config,
                 agent_preloaded,
                 agent_event_tx,
@@ -515,6 +511,74 @@ fn run_manual_compaction_with_events(
 }
 
 #[cfg(test)]
+fn spawn_hosted_tui_test_runtime(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+) -> TuiAgentRuntime {
+    let pending = bridge::PendingWorkflowNotifications::new();
+    let registry = orca_mcp::initialize_registry(&[]);
+    let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+    let executor_controller = controller.clone();
+    let executor_events = event_tx.clone();
+    let executor_pending = pending.clone();
+    let (result_tx, result_rx) = mpsc::unbounded();
+    let agent_config = Arc::clone(&config);
+    let agent_preloaded = Arc::clone(&preloaded);
+    let agent_events = event_tx.clone();
+    let agent_pending = pending.clone();
+    let agent_registry = registry.clone();
+    TuiAgentRuntime::spawn_hosted(
+        action_rx,
+        event_tx,
+        8,
+        controller,
+        move |task_spawner| {
+            Arc::new(TuiThreadOperationExecutor::new(
+                executor_controller,
+                executor_events,
+                executor_pending,
+                task_spawner,
+                result_tx,
+            ))
+        },
+        move |controller, commands, task_spawner, host| {
+            hosted_tui_controller_loop(
+                agent_config,
+                agent_preloaded,
+                agent_events,
+                commands,
+                controller,
+                agent_pending,
+                agent_registry,
+                task_spawner,
+                host,
+                result_rx,
+            );
+        },
+    )
+    .expect("hosted TUI test runtime")
+}
+
+#[cfg(test)]
+fn run_hosted_tui_controller_for_test(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    _cancel: CancelToken,
+    _pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+) {
+    let mut runtime = spawn_hosted_tui_test_runtime(config, preloaded, event_tx, action_rx);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !runtime.controller().is_shutdown() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    runtime.shutdown().expect("hosted TUI test shutdown");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyCode;
@@ -591,6 +655,10 @@ mod tests {
         )
     }
 
+    fn test_pending_workflow_notifications() -> bridge::PendingWorkflowNotifications {
+        bridge::PendingWorkflowNotifications::new()
+    }
+
     fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
         TuiInteractionKey::new(
             orca_core::cancel::OperationIdAllocator::new().allocate(),
@@ -619,61 +687,46 @@ mod tests {
 
     #[test]
     fn stale_bound_file_preparation_emits_submission_rejected() {
-        let root = tempdir().expect("workspace root");
-        let root_path = root
-            .path()
-            .canonicalize()
-            .expect("canonical workspace root");
-        let mut config = test_config(HistoryMode::Disabled);
-        config.cwd = Some(root_path.clone());
-        config.runtime_workspace_roots = Some(vec![root_path.clone()]);
-        let config = Arc::new(Mutex::new(config));
-        let preloaded = Arc::new(Mutex::new(None));
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let controller = TuiOperationController::default();
-        let pending_workflow_notifications = test_pending_workflow_notifications();
-        let tasks = crate::task_supervisor::TuiTaskSupervisor::new(1);
-        let task_spawner = tasks.spawner();
-        let mut session = None;
-        let mut pending_pinned_context = Vec::new();
-        let prompt = "review @gone.txt";
-        let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
-            prompt,
-            vec![orca_runtime::mentions::MentionBinding {
-                start: 7,
-                end: prompt.len(),
-                visible: "@gone.txt".to_string(),
-                target: orca_runtime::mentions::MentionTarget::File {
-                    root: root_path,
-                    path: "gone.txt".to_string(),
-                    kind: orca_runtime::mentions::MentionFileKind::File,
-                },
-            }],
-        );
+        with_orca_home(|_| {
+            let root = tempdir().expect("workspace root");
+            let root_path = root
+                .path()
+                .canonicalize()
+                .expect("canonical workspace root");
+            let mut config = test_config(HistoryMode::Disabled);
+            config.cwd = Some(root_path.clone());
+            config.runtime_workspace_roots = Some(vec![root_path.clone()]);
+            let prompt = "review @gone.txt";
+            let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+                prompt,
+                vec![orca_runtime::mentions::MentionBinding {
+                    start: 7,
+                    end: prompt.len(),
+                    visible: "@gone.txt".to_string(),
+                    target: orca_runtime::mentions::MentionTarget::File {
+                        root: root_path,
+                        path: "gone.txt".to_string(),
+                        kind: orca_runtime::mentions::MentionFileKind::File,
+                    },
+                }],
+            );
+            let mut harness = HostedTuiHarness::start(config, None);
 
-        handle_submitted_turn_for_tui(
-            SubmittedTurn::user_with_mentions(prompt.to_string(), bindings),
-            &config,
-            &preloaded,
-            &mut session,
-            &mut pending_pinned_context,
-            &event_tx,
-            &controller,
-            &pending_workflow_notifications,
-            &orca_mcp::McpRegistry::default(),
-            &task_spawner,
-        );
+            harness.send(UserAction::SubmitWithMentions {
+                prompt: prompt.to_string(),
+                bindings,
+            });
 
-        let rejection = event_rx
-            .try_iter()
-            .find(|event| matches!(event, TuiEvent::SubmissionRejected { .. }))
-            .expect("submission rejection event");
-        assert!(matches!(
-            rejection,
-            TuiEvent::SubmissionRejected { prompt, message }
-                if prompt == "review @gone.txt"
-                    && message.contains("failed to resolve bound @gone.txt")
-        ));
+            let rejection =
+                harness.recv_until(|event| matches!(event, TuiEvent::SubmissionRejected { .. }));
+            assert!(matches!(
+                rejection,
+                TuiEvent::SubmissionRejected { prompt, message }
+                    if prompt == "review @gone.txt"
+                        && message.contains("failed to resolve bound @gone.txt")
+            ));
+            harness.shutdown();
+        });
     }
 
     #[test]
@@ -694,8 +747,7 @@ mod tests {
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
         let (action_tx, _action_rx) = mpsc::unbounded();
-        let cancellation = OperationCancellation::new();
-        let operation = cancellation.start();
+        let operation = crate::test_support::TestOperationInterrupt::default();
 
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
         let head = crate::selection::SelectionPos { row: 2, col: 5 };
@@ -713,7 +765,7 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancellation,
+            &operation,
             || Ok(()),
         )
         .expect("preflight");
@@ -728,12 +780,12 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &cancellation,
+            &operation,
             || Ok(()),
         )
         .expect("preflight");
         assert!(matches!(flow, KeyEventFlow::Unhandled));
-        assert!(!operation.token().is_cancelled());
+        assert_eq!(operation.call_count(), 0);
     }
 
     #[test]
@@ -761,14 +813,15 @@ mod tests {
     #[test]
     fn manual_compaction_starts_with_a_fresh_cancel_state() {
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let cancellation = OperationCancellation::new();
-        let previous = cancellation.start();
-        previous.cancel();
-        let current = cancellation.start();
+        let previous = crate::test_support::HostedOperationHarness::start();
+        previous.controller().interrupt_current();
+        assert!(previous.cancel_token().is_cancelled());
+        drop(previous);
+        let current = crate::test_support::HostedOperationHarness::start();
 
         run_manual_compaction_with_events(&event_tx, || {
             assert!(
-                !current.token().is_cancelled(),
+                !current.cancel_token().is_cancelled(),
                 "a prior turn interrupt must not cancel the next manual compaction"
             );
             (8, 3)
@@ -1058,7 +1111,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -1301,6 +1354,56 @@ mod tests {
         }
     }
 
+    struct HostedTuiHarness {
+        action_tx: mpsc::Sender<UserAction>,
+        event_rx: mpsc::Receiver<TuiEvent>,
+        runtime: TuiAgentRuntime,
+        config: Arc<Mutex<RunConfig>>,
+        preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    }
+
+    impl HostedTuiHarness {
+        fn start(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
+            let config = Arc::new(Mutex::new(config));
+            let preloaded = Arc::new(Mutex::new(preloaded));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let runtime = spawn_hosted_tui_test_runtime(
+                Arc::clone(&config),
+                Arc::clone(&preloaded),
+                event_tx,
+                action_rx,
+            );
+            Self {
+                action_tx,
+                event_rx,
+                runtime,
+                config,
+                preloaded,
+            }
+        }
+
+        fn send(&self, action: UserAction) {
+            self.action_tx.send(action).expect("hosted TUI action");
+        }
+
+        fn recv_until(&self, mut predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+            loop {
+                let event = self
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("hosted TUI event");
+                if predicate(&event) {
+                    return event;
+                }
+            }
+        }
+
+        fn shutdown(&mut self) {
+            self.runtime.shutdown().expect("hosted TUI shutdown");
+        }
+    }
+
     #[test]
     fn hosted_tui_submit_clears_actor_operation_before_terminal_ui_event() {
         with_orca_home(|_| {
@@ -1335,7 +1438,7 @@ mod tests {
                     ))
                 },
                 move |controller, commands, task_spawner, host| {
-                    agent_loop_thread_hosted(
+                    hosted_tui_controller_loop(
                         agent_config,
                         agent_preloaded,
                         agent_events,
@@ -1409,7 +1512,7 @@ mod tests {
                     ))
                 },
                 move |controller, commands, task_spawner, host| {
-                    agent_loop_thread_hosted(
+                    hosted_tui_controller_loop(
                         config,
                         preloaded,
                         event_tx,
@@ -1548,7 +1651,7 @@ mod tests {
                     ))
                 },
                 move |controller, commands, task_spawner, host| {
-                    agent_loop_thread_hosted(
+                    hosted_tui_controller_loop(
                         config,
                         preloaded,
                         event_tx,
@@ -1581,98 +1684,24 @@ mod tests {
     }
 
     #[test]
-    fn incident_goal_usage_counts_cache_as_input_subset() {
-        let incident_usage = orca_core::cost_types::UsageTotals {
-            input_tokens: 49_909_209,
-            output_tokens: 191_567,
-            cache_tokens: 47_879_040,
-            estimated_cost_usd: 3.156_464_565,
-        };
-
-        assert_eq!(goal_tokens_for_usage(incident_usage), 50_100_776);
-        assert_eq!(
-            goal_token_delta(
-                orca_core::cost_types::UsageTotals::default(),
-                incident_usage,
-            ),
-            50_100_776
-        );
-        assert_ne!(
-            goal_tokens_for_usage(incident_usage),
-            97_979_816,
-            "cache hits are already included in input_tokens"
-        );
-    }
-
-    #[test]
-    fn background_goal_completion_accounts_usage_exactly_once() {
-        with_orca_home(|_| {
-            let session_id = "background-goal-usage";
-            orca_runtime::goals::GoalStore::load_default()
-                .replace(
-                    session_id,
-                    "account detached provider usage",
-                    orca_core::goal_types::ThreadGoalStatus::Active,
-                    None,
-                )
-                .unwrap();
-            let (event_tx, event_rx) = mpsc::unbounded();
-            let (foreground_token_tx, foreground_token_rx) = mpsc::bounded(1);
-            let handler = background_goal_completion_handler(
-                session_id.to_string(),
-                Instant::now(),
-                event_tx,
-                foreground_token_rx,
-            );
-            foreground_token_tx.send(200).unwrap();
-
-            handler(bridge::TuiBackgroundTurnCompletion {
-                usage: Some(orca_core::cost_types::UsageTotals {
-                    input_tokens: 49_909_209,
-                    output_tokens: 191_567,
-                    cache_tokens: 47_879_040,
-                    estimated_cost_usd: 3.156_464_565,
-                }),
-            });
-
-            let goal = orca_runtime::goals::GoalStore::load_default()
-                .get(session_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(goal.tokens_used, 50_100_976);
-            assert_eq!(
-                event_rx
-                    .try_iter()
-                    .filter(|event| matches!(event, TuiEvent::GoalStatus(Some(_))))
-                    .count(),
-                1
-            );
-        });
-    }
-
-    fn test_pending_workflow_notifications() -> bridge::PendingWorkflowNotifications {
-        bridge::PendingWorkflowNotifications::new()
-    }
-
-    #[test]
     fn running_background_shortcut_dispatches_action_and_returns_to_idle_without_cancelling() {
         let (mut state, action_rx) = test_state();
         state.status = AppStatus::Running;
         let action_tx = state.event_tx.clone();
-        let cancellation = OperationCancellation::new();
+        let operation = crate::test_support::TestOperationInterrupt::default();
 
         crate::running_actions::handle_running_shortcut(
             crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
             &mut state,
             &action_tx,
-            &cancellation,
+            &operation,
         );
 
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::BackgroundCurrentTurn)
         ));
-        assert!(cancellation.current_id().is_none());
+        assert_eq!(operation.call_count(), 0);
         assert_eq!(state.status, AppStatus::Idle);
     }
 
@@ -1691,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_recorded_agent_loop_goal_show_reports_no_goal() {
+    fn empty_recorded_hosted_tui_goal_show_reports_no_goal() {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -1703,7 +1732,7 @@ mod tests {
             let preloaded = Arc::clone(&preloaded);
             let cancel = cancel.clone();
             move || {
-                agent_loop_thread(
+                run_hosted_tui_controller_for_test(
                     config,
                     preloaded,
                     event_tx,
@@ -1723,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_recorded_agent_loop_goal_controls_report_session_not_started() {
+    fn empty_recorded_hosted_tui_goal_controls_report_session_not_started() {
         let cases = [
             UserAction::GoalEdit("better goal".to_string()),
             UserAction::GoalClear,
@@ -1742,7 +1771,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -1771,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_recorded_agent_loop_goal_resume_without_active_goal_reports_none() {
+    fn empty_recorded_hosted_tui_goal_resume_without_active_goal_reports_none() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -1784,7 +1813,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -1806,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_recorded_agent_loop_goal_resume_restores_latest_active_goal() {
+    fn empty_recorded_hosted_tui_goal_resume_restores_latest_active_goal() {
         with_orca_home(|home| {
             let mut writer =
                 history::SessionWriter::start(home, "mock", Some("auto".to_string()), "goal")
@@ -1838,19 +1867,19 @@ mod tests {
             let preloaded = Arc::new(Mutex::new(None));
             let (event_tx, event_rx) = mpsc::unbounded();
             let (action_tx, action_rx) = mpsc::unbounded();
-            let cancellation = OperationCancellation::new();
+            let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
-                let cancellation = cancellation.clone();
+                let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread_with_operation_cancellation(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
                         action_rx,
-                        cancellation,
+                        cancel,
                         test_pending_workflow_notifications(),
                     )
                 }
@@ -1858,7 +1887,7 @@ mod tests {
 
             action_tx.send(UserAction::GoalResume).unwrap();
             let event = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            cancellation.cancel_current();
+            action_tx.send(UserAction::Interrupt).unwrap();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -1915,26 +1944,10 @@ mod tests {
                 .unwrap();
             std::fs::create_dir(home.join("goals_1.json.tmp")).unwrap();
 
-            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
-            let preloaded = Arc::new(Mutex::new(Some(transcript("untouched-preloaded"))));
-            let (event_tx, event_rx) = mpsc::unbounded();
-            let (_action_tx, action_rx) = mpsc::unbounded();
-            let cancel = CancelToken::new();
-            let pending_actions = RefCell::new(VecDeque::new());
-            let pending_workflow_notifications = test_pending_workflow_notifications();
-            let mut session = None;
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
 
-            resume_latest_active_goal_for_tui(
-                &mut session,
-                &config,
-                &preloaded,
-                &event_tx,
-                &action_rx,
-                &pending_actions,
-                &cancel,
-                &pending_workflow_notifications,
-            );
-            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            harness.send(UserAction::GoalResume);
+            let event = harness.recv_until(|event| matches!(event, TuiEvent::Error(_)));
 
             match event {
                 TuiEvent::Error(message) => assert!(
@@ -1943,19 +1956,12 @@ mod tests {
                 ),
                 other => panic!("expected restored-session error, got {other:?}"),
             }
-            assert!(session.is_none());
             assert!(matches!(
-                &config.lock().unwrap().history_mode,
+                &harness.config.lock().unwrap().history_mode,
                 HistoryMode::Record
             ));
-            assert_eq!(
-                preloaded
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|transcript| transcript.meta.session_id.as_str()),
-                Some("untouched-preloaded")
-            );
+            assert!(harness.preloaded.lock().unwrap().is_none());
+            harness.shutdown();
         });
     }
 
@@ -1989,19 +1995,19 @@ mod tests {
             let preloaded = Arc::new(Mutex::new(Some(restored)));
             let (event_tx, event_rx) = mpsc::unbounded();
             let (action_tx, action_rx) = mpsc::unbounded();
-            let cancellation = OperationCancellation::new();
+            let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
                 let config = Arc::clone(&config);
                 let preloaded = Arc::clone(&preloaded);
-                let cancellation = cancellation.clone();
+                let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread_with_operation_cancellation(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
                         action_rx,
-                        cancellation,
+                        cancel,
                         test_pending_workflow_notifications(),
                     )
                 }
@@ -2022,7 +2028,7 @@ mod tests {
                 }
             }
 
-            cancellation.cancel_current();
+            action_tx.send(UserAction::Interrupt).unwrap();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -2058,7 +2064,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2118,7 +2124,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2158,7 +2164,7 @@ mod tests {
             let preloaded = Arc::clone(&preloaded);
             let cancel = cancel.clone();
             move || {
-                agent_loop_thread(
+                run_hosted_tui_controller_for_test(
                     config,
                     preloaded,
                     event_tx,
@@ -2186,7 +2192,7 @@ mod tests {
     }
 
     #[test]
-    fn backgrounded_agent_loop_accepts_next_submit_before_first_turn_completes() {
+    fn backgrounded_hosted_tui_accepts_next_submit_before_first_turn_completes() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -2199,7 +2205,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2253,47 +2259,36 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_agent_loop_turn_does_not_cancel_next_submit() {
+    fn cancelled_hosted_tui_turn_does_not_cancel_next_submit() {
         with_orca_home(|_| {
-            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
-            let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::unbounded();
-            let (action_tx, action_rx) = mpsc::unbounded();
-            let cancellation = OperationCancellation::new();
-
-            let handle = std::thread::spawn({
-                let config = Arc::clone(&config);
-                let preloaded = Arc::clone(&preloaded);
-                let cancellation = cancellation.clone();
-                move || {
-                    agent_loop_thread_with_operation_cancellation(
-                        config,
-                        preloaded,
-                        event_tx,
-                        action_rx,
-                        cancellation,
-                        test_pending_workflow_notifications(),
-                    )
-                }
-            });
-
-            action_tx
-                .send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()))
-                .unwrap();
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
 
             let first_id = loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                {
                     TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
-                        break cancellation.current_id().expect("first operation id");
+                        break harness
+                            .runtime
+                            .controller()
+                            .current_id()
+                            .expect("first operation id");
                     }
                     TuiEvent::Error(message) => panic!("unexpected first-turn error: {message}"),
                     _ => {}
                 }
             };
 
-            assert_eq!(cancellation.cancel_current(), Some(first_id));
+            harness.send(UserAction::Interrupt);
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                {
                     TuiEvent::SessionCompleted { status } => {
                         assert_eq!(status, "cancelled");
                         break;
@@ -2303,16 +2298,22 @@ mod tests {
                 }
             }
 
-            action_tx
-                .send(UserAction::Submit("mock_history_echo".to_string()))
-                .unwrap();
+            harness.send(UserAction::Submit("mock_history_echo".to_string()));
 
             let mut second_id = None;
             let mut saw_second_output = false;
             loop {
-                match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                {
                     TuiEvent::TurnStarted { .. } => {
-                        let current = cancellation.current_id().expect("second operation id");
+                        let current = harness
+                            .runtime
+                            .controller()
+                            .current_id()
+                            .expect("second operation id");
                         assert_ne!(current, first_id);
                         second_id = Some(current);
                     }
@@ -2328,8 +2329,7 @@ mod tests {
                 }
             }
 
-            action_tx.send(UserAction::Cancel).unwrap();
-            handle.join().unwrap();
+            harness.shutdown();
 
             assert!(
                 second_id.is_some(),
@@ -2360,7 +2360,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2421,7 +2421,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2472,7 +2472,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2514,44 +2514,6 @@ mod tests {
             );
             assert!(!transcript.meta.title.contains("<task-notification>"));
         });
-    }
-
-    #[test]
-    fn submitted_turn_boundary_owns_goal_loop_presentation_inputs() {
-        let source = include_str!("app.rs");
-        let goal_loop_start = source
-            .rfind("fn run_goal_turns_for_tui(")
-            .expect("goal loop function");
-        let agent_loop_start = source
-            .rfind("fn agent_loop_thread(")
-            .expect("agent loop function");
-        let goal_loop_section = &source[goal_loop_start..agent_loop_start];
-
-        assert!(
-            goal_loop_section.contains("fn run_goal_turns_for_tui(\n")
-                && goal_loop_section.contains("    submitted_turn: SubmittedTurn,\n"),
-            "goal loop entry should receive the typed submitted-turn boundary"
-        );
-        assert!(
-            !goal_loop_section.contains("initial_task_description"),
-            "task labels should stay inside SubmittedTurn presentation metadata"
-        );
-        assert!(
-            !goal_loop_section.contains("initial_backtrack_target"),
-            "backtrack policy should stay inside SubmittedTurn presentation metadata"
-        );
-        assert!(
-            goal_loop_section.contains("submitted_turn.task_label()"),
-            "goal loop should read the task label through the submitted-turn boundary"
-        );
-        assert!(
-            goal_loop_section.contains("submitted_turn.is_backtrack_target()"),
-            "goal loop should read backtrack policy through the submitted-turn boundary"
-        );
-        assert!(
-            !goal_loop_section.contains(".presentation."),
-            "goal loop should not reach into SubmittedTurnPresentation internals"
-        );
     }
 
     #[test]
@@ -2615,7 +2577,7 @@ mod tests {
     }
 
     #[test]
-    fn backgrounded_agent_loop_does_not_complete_unexecuted_tool_calls() {
+    fn backgrounded_hosted_tui_does_not_complete_unexecuted_tool_calls() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -2628,7 +2590,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2681,7 +2643,7 @@ mod tests {
     }
 
     #[test]
-    fn backgrounded_agent_loop_marks_unexecuted_tool_calls_approval_required() {
+    fn backgrounded_hosted_tui_marks_unexecuted_tool_calls_approval_required() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -2694,7 +2656,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2747,7 +2709,7 @@ mod tests {
     }
 
     #[test]
-    fn backgrounded_agent_loop_reports_pending_tool_name() {
+    fn backgrounded_hosted_tui_reports_pending_tool_name() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -2760,7 +2722,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2816,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn backgrounded_agent_loop_notifies_approval_required_in_user_language() {
+    fn backgrounded_hosted_tui_notifies_approval_required_in_user_language() {
         with_orca_home(|home| {
             let mut cfg = test_config(HistoryMode::Record);
             cfg.cwd = Some(home.to_path_buf());
@@ -2831,7 +2793,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -2915,7 +2877,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3034,7 +2996,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    agent_loop_thread(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3938,48 +3900,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-fn ensure_tui_session(
-    session: &mut Option<bridge::TuiConversationSession>,
-    config: &Arc<Mutex<RunConfig>>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    prompt_for_title: &str,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    mcp_registry: &orca_mcp::McpRegistry,
-) -> Option<String> {
-    if session.is_none() {
-        let cfg = config.lock().unwrap().clone();
-        let transcript = preloaded.lock().unwrap().take();
-        *session = match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
-            &cfg,
-            prompt_for_title,
-            transcript,
-            mcp_registry.clone(),
-        ) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "failed to initialize conversation history: {error}"
-                )));
-                None
-            }
-        };
-        if let Some(session) = session.as_ref() {
-            notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
-        }
-    }
-    match session.as_ref().and_then(|session| session.session_id()) {
-        Some(session_id) => Some(session_id.to_string()),
-        None => {
-            let _ = event_tx.send(TuiEvent::Error(
-                "persistent goals require recorded history; enable history before using /goal"
-                    .to_string(),
-            ));
-            None
-        }
-    }
-}
-
 fn update_goal_status_for_session(
     session_id: Option<&str>,
     status: orca_core::goal_types::ThreadGoalStatus,
@@ -4012,501 +3932,13 @@ fn update_goal_status_for_session(
     }
 }
 
-#[cfg(test)]
-fn existing_goal_session_id(
-    session: Option<&bridge::TuiConversationSession>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    config: &Arc<Mutex<RunConfig>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> Option<String> {
-    if let Some(session_id) = current_goal_session_id(session, preloaded) {
-        return Some(session_id);
-    }
-
-    let history_mode = config.lock().unwrap().history_mode.clone();
-    let message = if matches!(history_mode, HistoryMode::Disabled) {
-        "persistent goals require recorded history; enable history before using /goal"
-    } else {
-        "The session must start before you can change a goal."
-    };
-    let _ = event_tx.send(TuiEvent::Error(message.to_string()));
-    None
-}
-
-#[cfg(test)]
-fn current_goal_session_id(
-    session: Option<&bridge::TuiConversationSession>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-) -> Option<String> {
-    if let Some(session_id) = session.and_then(|session| session.session_id().map(str::to_string)) {
-        return Some(session_id);
-    }
-    preloaded
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|transcript| transcript.meta.session_id.clone())
-}
-
-const MAX_GOAL_CONTINUATIONS: usize = 64;
-
 fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     format!(
         "[Goal continuation #{continuation}]\nContinue working on this persistent goal:\n{objective}\n\nWork from current evidence. Preserve the full objective, verify every requirement before completion, and call update_goal only with status \"complete\" when the goal is actually finished or status \"blocked\" after the same blocker has repeated for at least three consecutive goal turns."
     )
 }
 
-#[cfg(test)]
-fn goal_tokens_for_usage(usage: orca_core::cost_types::UsageTotals) -> i64 {
-    usage
-        .input_tokens
-        .saturating_add(usage.output_tokens)
-        .min(i64::MAX as u64) as i64
-}
-
-#[cfg(test)]
-fn goal_token_delta(
-    before: orca_core::cost_types::UsageTotals,
-    after: orca_core::cost_types::UsageTotals,
-) -> i64 {
-    after
-        .input_tokens
-        .saturating_sub(before.input_tokens)
-        .saturating_add(after.output_tokens.saturating_sub(before.output_tokens))
-        .min(i64::MAX as u64) as i64
-}
-
-#[cfg(test)]
-fn account_goal_usage_for_tui(
-    session_id: &str,
-    token_delta: i64,
-    elapsed_delta: i64,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) {
-    if token_delta <= 0 && elapsed_delta <= 0 {
-        return;
-    }
-    if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().account_usage(
-        session_id,
-        token_delta,
-        elapsed_delta,
-    ) {
-        let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
-    }
-}
-
-#[cfg(test)]
-fn background_goal_completion_handler(
-    session_id: String,
-    started_at: Instant,
-    event_tx: mpsc::Sender<TuiEvent>,
-    foreground_token_rx: mpsc::Receiver<i64>,
-) -> bridge::TuiBackgroundTurnCompletionHandler {
-    Box::new(move |completion: bridge::TuiBackgroundTurnCompletion| {
-        let foreground_token_delta = foreground_token_rx.recv().unwrap_or_default();
-        let token_delta = foreground_token_delta.saturating_add(
-            completion
-                .usage
-                .map(goal_tokens_for_usage)
-                .unwrap_or_default(),
-        );
-        let elapsed_delta = started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
-        account_goal_usage_for_tui(&session_id, token_delta, elapsed_delta, &event_tx);
-    })
-}
-
-#[cfg(test)]
-fn run_goal_turns_for_tui(
-    config: &RunConfig,
-    session: &mut bridge::TuiConversationSession,
-    submitted_turn: SubmittedTurn,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    control: &crate::operation_controller::TuiTurnControl,
-    starting_continuation: usize,
-    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    task_spawner: &TuiTaskSpawner,
-) {
-    let Some(session_id) = session.session_id().map(str::to_string) else {
-        let _ = event_tx.send(TuiEvent::Error(
-            "persistent goals require recorded history".to_string(),
-        ));
-        return;
-    };
-
-    let mut submitted_turn = submitted_turn;
-    let mut continuation = starting_continuation;
-    loop {
-        if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
-            && goal.status.should_continue()
-        {
-            session.replace_goal_context(
-                orca_runtime::agent_common::format_goal_mode_instructions(&goal),
-            );
-            let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
-        }
-        let before_usage = session.runtime_usage_totals();
-        let started_at = std::time::Instant::now();
-        let (foreground_token_tx, foreground_token_rx) = mpsc::bounded(1);
-        let background_completion_handler = background_goal_completion_handler(
-            session_id.clone(),
-            started_at,
-            event_tx.clone(),
-            foreground_token_rx,
-        );
-        let prompt = submitted_turn.prompt().to_string();
-        let turn_result = bridge::run_agent_for_tui_with_notification_queue(
-            config,
-            session,
-            &prompt,
-            event_tx,
-            control,
-            control.token(),
-            true,
-            submitted_turn.task_label(),
-            submitted_turn.is_backtrack_target(),
-            Some(pending_workflow_notifications),
-            Some(background_completion_handler),
-            task_spawner,
-        );
-        let status = turn_result.status;
-        let token_delta = goal_token_delta(before_usage, session.runtime_usage_totals());
-        if status == "backgrounded" {
-            let _ = foreground_token_tx.send(token_delta);
-        } else {
-            let elapsed_delta = started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
-            account_goal_usage_for_tui(&session_id, token_delta, elapsed_delta, event_tx);
-        }
-        if status != "success" {
-            if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
-                && goal.status.should_continue()
-            {
-                let _ = event_tx.send(TuiEvent::Notice(format!(
-                    "Goal paused because the last turn ended with status `{status}`. Resolve the issue, then use /goal resume to continue."
-                )));
-            }
-            break;
-        }
-        if let Some(continuation) = turn_result.continuation {
-            // Workflow failure notifications are diagnostic follow-ups for the turn that just
-            // finished, so they do not consume goal-continuation quota or wait for the next
-            // goal-status poll.
-            match continuation {
-                bridge::TuiAgentTurnContinuation::WorkflowNotification(notification) => {
-                    submitted_turn = SubmittedTurn::workflow_notification(notification);
-                    continue;
-                }
-            }
-        }
-        if session.has_active_workflows() {
-            let _ = event_tx.send(TuiEvent::Notice(
-                "Goal is waiting for active workflow tasks to finish.".to_string(),
-            ));
-            break;
-        }
-
-        let goal = match orca_runtime::goals::GoalStore::load_default().get(&session_id) {
-            Ok(Some(goal)) => goal,
-            Ok(None) => break,
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
-                break;
-            }
-        };
-        let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
-        if !goal.status.should_continue() {
-            let label = orca_core::goal_types::goal_status_label(goal.status);
-            let _ = event_tx.send(TuiEvent::Notice(format!(
-                "Goal auto-continuation stopped because the goal is {label}."
-            )));
-            break;
-        }
-        continuation += 1;
-        if continuation > MAX_GOAL_CONTINUATIONS {
-            update_goal_status_for_session(
-                Some(&session_id),
-                orca_core::goal_types::ThreadGoalStatus::UsageLimited,
-                event_tx,
-            );
-            let _ = event_tx.send(TuiEvent::Notice(
-                "Goal auto-continuation stopped after reaching the continuation limit.".to_string(),
-            ));
-            break;
-        }
-        submitted_turn =
-            SubmittedTurn::user(goal_continuation_prompt(&goal.objective, continuation));
-    }
-}
-
-#[cfg(test)]
-fn resume_latest_active_goal_for_tui(
-    session: &mut Option<bridge::TuiConversationSession>,
-    config: &Arc<Mutex<RunConfig>>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    action_rx: &mpsc::Receiver<UserAction>,
-    _pending_actions: &RefCell<VecDeque<UserAction>>,
-    cancel: &CancelToken,
-    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-) {
-    let controller = TuiOperationController::default();
-    let operation = controller.start().expect("goal resume operation");
-    if cancel.is_cancelled() {
-        operation.cancel();
-    }
-    let control = operation.control();
-    let (mut dispatcher, _commands) = crate::action_dispatcher::TuiActionDispatcher::spawn(
-        action_rx.clone(),
-        event_tx.clone(),
-        controller,
-        crate::channels::USER_ACTION_CAPACITY,
-        crate::channels::USER_ACTION_CAPACITY,
-    )
-    .expect("goal resume dispatcher");
-    let registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
-    let tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
-    let task_spawner = tasks.spawner();
-    resume_latest_active_goal_for_tui_with_registry(
-        session,
-        config,
-        preloaded,
-        event_tx,
-        &control,
-        pending_workflow_notifications,
-        &registry,
-        &task_spawner,
-    );
-    dispatcher
-        .shutdown()
-        .expect("goal resume dispatcher joined");
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn resume_latest_active_goal_for_tui_with_registry(
-    session: &mut Option<bridge::TuiConversationSession>,
-    config: &Arc<Mutex<RunConfig>>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    control: &crate::operation_controller::TuiTurnControl,
-    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    mcp_registry: &orca_mcp::McpRegistry,
-    task_spawner: &TuiTaskSpawner,
-) {
-    if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
-        let _ = event_tx.send(TuiEvent::Error(
-            "persistent goals require recorded history; enable history before using /goal"
-                .to_string(),
-        ));
-        return;
-    }
-
-    let mut store = orca_runtime::goals::GoalStore::load_default();
-    let goal = match store.latest_active() {
-        Ok(Some(goal)) => goal,
-        Ok(None) => {
-            let _ = event_tx.send(TuiEvent::GoalStatus(None));
-            return;
-        }
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!("failed to read goals: {error}")));
-            return;
-        }
-    };
-
-    let transcript = match history::load_session(&goal.session_id) {
-        Ok(transcript) => transcript,
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to load goal session {}: {error}",
-                goal.session_id
-            )));
-            return;
-        }
-    };
-
-    let mut cfg = config.lock().unwrap().clone();
-    cfg.history_mode = HistoryMode::Resume(goal.session_id.clone());
-
-    let resumed = match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
-        &cfg,
-        &goal.objective,
-        Some(transcript),
-        mcp_registry.clone(),
-    ) {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to initialize resumed goal session: {error}"
-            )));
-            return;
-        }
-    };
-
-    let Some(new_session_id) = resumed.session_id().map(str::to_string) else {
-        let _ = event_tx.send(TuiEvent::Error(
-            "persistent goals require recorded history; enable history before using /goal"
-                .to_string(),
-        ));
-        return;
-    };
-
-    let active_goal = match store.resume_into(&goal.session_id, &new_session_id) {
-        Ok(Some(goal)) => goal,
-        Ok(None) => {
-            let _ = event_tx.send(TuiEvent::Error(
-                "goal disappeared while restoring its session".to_string(),
-            ));
-            return;
-        }
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to resume goal in restored session: {error}"
-            )));
-            return;
-        }
-    };
-
-    if let Ok(mut shared) = config.lock() {
-        shared.history_mode = cfg.history_mode.clone();
-    }
-    *preloaded.lock().unwrap() = None;
-    *session = Some(resumed);
-    if let Some(session) = session.as_ref() {
-        notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
-    }
-    let _ = event_tx.send(TuiEvent::GoalUpdated(active_goal.clone()));
-    let _ = event_tx.send(TuiEvent::Notice(
-        "Resumed latest active goal in a restored session.".to_string(),
-    ));
-
-    if let Some(session) = session.as_mut() {
-        let prompt = goal_continuation_prompt(&active_goal.objective, 1);
-        run_goal_turns_for_tui(
-            &cfg,
-            session,
-            SubmittedTurn::user(prompt),
-            event_tx,
-            control,
-            1,
-            pending_workflow_notifications,
-            task_spawner,
-        );
-    }
-}
-
-#[cfg(test)]
-fn recv_next_user_action(
-    action_rx: &mpsc::Receiver<UserAction>,
-    pending_actions: &mut VecDeque<UserAction>,
-    controller: &TuiOperationController,
-) -> Result<UserAction, mpsc::RecvError> {
-    if controller.cancellation().is_shutdown() {
-        return Ok(UserAction::Cancel);
-    }
-    let action = if let Some(action) = pending_actions.pop_front() {
-        action
-    } else {
-        action_rx.recv()?
-    };
-    Ok(if controller.cancellation().is_shutdown() {
-        UserAction::Cancel
-    } else {
-        action
-    })
-}
-
-#[cfg(test)]
-fn handle_submitted_turn_for_tui(
-    submitted_turn: SubmittedTurn,
-    config: &Arc<Mutex<RunConfig>>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    session: &mut Option<bridge::TuiConversationSession>,
-    pending_pinned_context: &mut Vec<String>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
-    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    mcp_registry: &orca_mcp::McpRegistry,
-    task_spawner: &TuiTaskSpawner,
-) {
-    let operation = match controller.start() {
-        Ok(operation) => operation,
-        Err(error) => {
-            send_submission_error(
-                event_tx,
-                submitted_turn.rejection_prompt(),
-                format!("TUI operation admission closed: {error}"),
-            );
-            return;
-        }
-    };
-    let control = operation.control();
-    let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
-    let cfg = config.lock().unwrap().clone();
-    let cwd = cfg
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    if session.is_none() {
-        let transcript = preloaded.lock().unwrap().take();
-        let title_seed = submitted_turn.title_seed(submitted_turn.prompt());
-        *session = match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
-            &cfg,
-            &title_seed,
-            transcript,
-            mcp_registry.clone(),
-        ) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                send_submission_error(
-                    event_tx,
-                    rejection_prompt.as_deref(),
-                    format!("failed to initialize conversation history: {error}"),
-                );
-                return;
-            }
-        };
-        if let Some(session) = session.as_ref() {
-            notify_recovered_background_approvals_for_tui(session.task_registry(), event_tx);
-        }
-    }
-    let workspace_roots = cfg
-        .runtime_workspace_roots
-        .clone()
-        .filter(|roots| !roots.is_empty())
-        .unwrap_or_else(|| vec![cwd.clone()]);
-    let prompt = match submitted_turn.prompt_for_model(
-        &cwd,
-        &workspace_roots,
-        session
-            .as_ref()
-            .expect("session initialized")
-            .mcp_registry(),
-    ) {
-        Ok(prompt) => prompt,
-        Err(error) => {
-            send_submission_error(event_tx, rejection_prompt.as_deref(), error);
-            return;
-        }
-    };
-    if let Some(session) = session.as_mut() {
-        for context in pending_pinned_context.drain(..) {
-            session.add_pinned_context(context);
-        }
-    }
-    run_goal_turns_for_tui(
-        &cfg,
-        session.as_mut().expect("session initialized"),
-        submitted_turn.with_model_prompt(prompt),
-        event_tx,
-        &control,
-        0,
-        pending_workflow_notifications,
-        task_spawner,
-    );
-    if cfg.desktop_notifications {
-        let _ = orca_runtime::notify::notify("Orca", "Task completed");
-    }
-}
+const MAX_GOAL_CONTINUATIONS: usize = 64;
 
 fn send_submission_error(
     event_tx: &mpsc::Sender<TuiEvent>,
@@ -4524,7 +3956,7 @@ fn send_submission_error(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn agent_loop_thread_hosted(
+fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: mpsc::Sender<TuiEvent>,
@@ -5340,491 +4772,6 @@ fn resume_latest_active_goal_hosted(
             1,
             hosted_result_rx,
         );
-    }
-}
-
-#[cfg(test)]
-fn agent_loop_thread(
-    config: Arc<Mutex<RunConfig>>,
-    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    action_rx: mpsc::Receiver<UserAction>,
-    cancel: CancelToken,
-    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-) {
-    let controller = TuiOperationController::default();
-    let initial = controller.start().expect("initial operation");
-    if cancel.is_cancelled() {
-        initial.cancel();
-    }
-    run_test_agent_loop_with_dispatcher(
-        config,
-        preloaded,
-        event_tx,
-        action_rx,
-        controller,
-        pending_workflow_notifications,
-    );
-}
-
-#[cfg(test)]
-fn run_test_agent_loop_with_dispatcher(
-    config: Arc<Mutex<RunConfig>>,
-    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    action_rx: mpsc::Receiver<UserAction>,
-    controller: TuiOperationController,
-    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-) {
-    let mcp_registry = orca_mcp::initialize_registry(&config.lock().unwrap().mcp_servers);
-    let mut tasks = crate::task_supervisor::TuiTaskSupervisor::new(8);
-    let task_spawner = tasks.spawner();
-    let (mut dispatcher, command_rx) = crate::action_dispatcher::TuiActionDispatcher::spawn(
-        action_rx,
-        event_tx.clone(),
-        controller.clone(),
-        crate::channels::USER_ACTION_CAPACITY,
-        crate::channels::USER_ACTION_CAPACITY,
-    )
-    .expect("test TUI dispatcher");
-    agent_loop_thread_with_registry(
-        config,
-        preloaded,
-        event_tx,
-        command_rx,
-        controller,
-        pending_workflow_notifications,
-        mcp_registry,
-        task_spawner,
-    );
-    dispatcher.shutdown().expect("test TUI dispatcher joined");
-    tasks.shutdown().expect("test TUI tasks joined");
-}
-
-#[cfg(test)]
-fn agent_loop_thread_with_operation_cancellation(
-    config: Arc<Mutex<RunConfig>>,
-    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    action_rx: mpsc::Receiver<UserAction>,
-    cancellation: OperationCancellation,
-    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-) {
-    let controller = TuiOperationController::new(
-        cancellation,
-        crate::interaction_broker::TuiInteractionBroker::default(),
-    );
-    run_test_agent_loop_with_dispatcher(
-        config,
-        preloaded,
-        event_tx,
-        action_rx,
-        controller,
-        pending_workflow_notifications,
-    );
-}
-
-#[cfg(test)]
-fn agent_loop_thread_with_registry(
-    config: Arc<Mutex<RunConfig>>,
-    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: mpsc::Sender<TuiEvent>,
-    action_rx: mpsc::Receiver<UserAction>,
-    controller: TuiOperationController,
-    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
-    mcp_registry: orca_mcp::McpRegistry,
-    task_spawner: TuiTaskSpawner,
-) {
-    let mut session: Option<bridge::TuiConversationSession> = None;
-    let mut pending_pinned_context: Vec<String> = Vec::new();
-    let mut pending_actions = VecDeque::new();
-
-    loop {
-        match recv_next_user_action(&action_rx, &mut pending_actions, &controller) {
-            Ok(UserAction::Submit(prompt)) => {
-                handle_submitted_turn_for_tui(
-                    SubmittedTurn::user(prompt),
-                    &config,
-                    &preloaded,
-                    &mut session,
-                    &mut pending_pinned_context,
-                    &event_tx,
-                    &controller,
-                    &pending_workflow_notifications,
-                    &mcp_registry,
-                    &task_spawner,
-                );
-            }
-            Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
-                handle_submitted_turn_for_tui(
-                    SubmittedTurn::user_with_mentions(prompt, bindings),
-                    &config,
-                    &preloaded,
-                    &mut session,
-                    &mut pending_pinned_context,
-                    &event_tx,
-                    &controller,
-                    &pending_workflow_notifications,
-                    &mcp_registry,
-                    &task_spawner,
-                );
-            }
-            Ok(UserAction::SubmitWorkflowNotification(notification)) => {
-                handle_submitted_turn_for_tui(
-                    SubmittedTurn::workflow_notification(notification),
-                    &config,
-                    &preloaded,
-                    &mut session,
-                    &mut pending_pinned_context,
-                    &event_tx,
-                    &controller,
-                    &pending_workflow_notifications,
-                    &mcp_registry,
-                    &task_spawner,
-                );
-            }
-            Ok(UserAction::RunWorkflow { name, args }) => {
-                let cfg = config.lock().unwrap().clone();
-                if session.is_none() {
-                    let prompt = format!("Run saved workflow `{name}`");
-                    let transcript = preloaded.lock().unwrap().take();
-                    session =
-                        match bridge::TuiConversationSession::new_with_preloaded_and_mcp_registry(
-                            &cfg,
-                            &prompt,
-                            transcript,
-                            mcp_registry.clone(),
-                        ) {
-                            Ok(session) => Some(session),
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::Error(format!(
-                                    "failed to initialize conversation history: {error}"
-                                )));
-                                continue;
-                            }
-                        };
-                    if let Some(session) = session.as_ref() {
-                        notify_recovered_background_approvals_for_tui(
-                            session.task_registry(),
-                            &event_tx,
-                        );
-                    }
-                }
-                if let Some(session) = session.as_ref() {
-                    bridge::launch_saved_workflow_for_tui(
-                        &cfg,
-                        session,
-                        &name,
-                        args.as_deref(),
-                        &event_tx,
-                    );
-                }
-                if cfg.desktop_notifications {
-                    let _ = orca_runtime::notify::notify("Orca", "Workflow launched");
-                }
-            }
-            Ok(UserAction::Interrupt) => {
-                // Cancel already set by TUI thread; just continue waiting for next Submit
-            }
-            Ok(UserAction::SetModel(model)) => {
-                if let Some(session) = session.as_mut() {
-                    session.set_model(Some(&model));
-                }
-            }
-            Ok(UserAction::Remember(note)) => {
-                let context = format!("[Pinned remembered note]\n{}", note.trim());
-                if let Some(session) = session.as_mut() {
-                    session.add_pinned_context(context);
-                } else {
-                    pending_pinned_context.push(context);
-                }
-            }
-            Ok(UserAction::Compact) => {
-                if let Some(session) = session.as_mut() {
-                    let Ok(operation) = controller.start() else {
-                        break;
-                    };
-                    let cancel = operation.token();
-                    let cfg = config.lock().unwrap().clone();
-                    let cwd = cfg
-                        .cwd
-                        .clone()
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    run_manual_compaction_with_events(&event_tx, || {
-                        session.compact(&cfg, &cwd, cancel)
-                    });
-                } else {
-                    let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
-                }
-            }
-            Ok(UserAction::Backtrack) => {
-                if let Some(session) = session.as_mut() {
-                    match session.backtrack_last_user() {
-                        Some(prompt) => {
-                            let _ = event_tx.send(TuiEvent::Backtracked { prompt });
-                        }
-                        None => {
-                            let _ =
-                                event_tx.send(TuiEvent::Error("nothing to backtrack".to_string()));
-                        }
-                    }
-                } else {
-                    let _ = event_tx.send(TuiEvent::Error("nothing to backtrack".to_string()));
-                }
-            }
-            Ok(UserAction::BackgroundCurrentTurn) => {}
-            Ok(UserAction::StopTask { task_id }) => {
-                stop_task_for_tui(
-                    session.as_ref().map(|session| session.task_registry()),
-                    &task_id,
-                    &event_tx,
-                );
-            }
-            Ok(UserAction::ForegroundTask { task_id }) => {
-                foreground_task_for_tui(
-                    session.as_ref().map(|session| session.task_registry()),
-                    &task_id,
-                    &event_tx,
-                );
-            }
-            Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
-                let continuation_request = submit_background_approval_response_for_tui(
-                    session.as_ref().map(|session| session.task_registry()),
-                    &id,
-                    approved,
-                    &event_tx,
-                );
-                if approved
-                    && let Some(continuation_request) = continuation_request
-                    && let Some(session) = session.as_mut()
-                {
-                    let Ok(operation) = controller.start() else {
-                        break;
-                    };
-                    let cancel = operation.token();
-                    let cfg = config.lock().unwrap().clone();
-                    let goal_session_id = session.session_id().map(str::to_string);
-                    let before_usage = session.runtime_usage_totals();
-                    let started_at = Instant::now();
-                    let result = bridge::continue_approved_background_turn_for_tui(
-                        &cfg,
-                        session,
-                        &continuation_request,
-                        &event_tx,
-                        cancel,
-                        Some(&pending_workflow_notifications),
-                    );
-                    if let Some(goal_session_id) = goal_session_id {
-                        let token_delta =
-                            goal_token_delta(before_usage, session.runtime_usage_totals());
-                        let elapsed_delta =
-                            started_at.elapsed().as_secs().min(i64::MAX as u64) as i64;
-                        account_goal_usage_for_tui(
-                            &goal_session_id,
-                            token_delta,
-                            elapsed_delta,
-                            &event_tx,
-                        );
-                    }
-                    if let Some(continuation) = result.continuation {
-                        match continuation {
-                            bridge::TuiAgentTurnContinuation::WorkflowNotification(
-                                notification,
-                            ) => {
-                                pending_actions.push_front(UserAction::SubmitWorkflowNotification(
-                                    notification,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(UserAction::GoalShow) => {
-                let session_id = session
-                    .as_ref()
-                    .and_then(|s| s.session_id().map(str::to_string))
-                    .or_else(|| {
-                        preloaded
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .map(|transcript| transcript.meta.session_id.clone())
-                    });
-                let Some(session_id) = session_id else {
-                    let history_mode = config.lock().unwrap().history_mode.clone();
-                    if matches!(history_mode, HistoryMode::Disabled) {
-                        let _ = event_tx.send(TuiEvent::Error(
-                            "persistent goals require recorded history; enable history before using /goal"
-                                .to_string(),
-                        ));
-                    } else {
-                        let _ = event_tx.send(TuiEvent::GoalStatus(None));
-                    }
-                    continue;
-                };
-                let store = orca_runtime::goals::GoalStore::load_default();
-                match store.get(&session_id) {
-                    Ok(goal) => {
-                        let _ = event_tx.send(TuiEvent::GoalStatus(goal));
-                    }
-                    Err(error) => {
-                        let _ =
-                            event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
-                    }
-                }
-            }
-            Ok(UserAction::GoalSet(objective)) => {
-                let Some(session_id) = ensure_tui_session(
-                    &mut session,
-                    &config,
-                    &preloaded,
-                    &objective,
-                    &event_tx,
-                    &mcp_registry,
-                ) else {
-                    continue;
-                };
-                let mut store = orca_runtime::goals::GoalStore::load_default();
-                match store.replace(
-                    &session_id,
-                    &objective,
-                    orca_core::goal_types::ThreadGoalStatus::Active,
-                    None,
-                ) {
-                    Ok(goal) => {
-                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
-                        let _ = event_tx.send(TuiEvent::Notice(
-                            "Starting goal. Automatic continuation will keep running while it remains active.".to_string(),
-                        ));
-                        if let Some(session) = session.as_mut() {
-                            let Ok(operation) = controller.start() else {
-                                break;
-                            };
-                            let cfg = config.lock().unwrap().clone();
-                            run_goal_turns_for_tui(
-                                &cfg,
-                                session,
-                                SubmittedTurn::user(objective),
-                                &event_tx,
-                                &operation.control(),
-                                0,
-                                &pending_workflow_notifications,
-                                &task_spawner,
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        let _ =
-                            event_tx.send(TuiEvent::Error(format!("failed to set goal: {error}")));
-                    }
-                }
-            }
-            Ok(UserAction::GoalEdit(objective)) => {
-                let Some(session_id) =
-                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
-                else {
-                    continue;
-                };
-                let mut store = orca_runtime::goals::GoalStore::load_default();
-                match store.update(
-                    &session_id,
-                    orca_core::goal_types::GoalUpdate {
-                        objective: Some(objective),
-                        status: Some(orca_core::goal_types::ThreadGoalStatus::Active),
-                        token_budget: None,
-                    },
-                ) {
-                    Ok(Some(goal)) => {
-                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
-                    }
-                    Ok(None) => {
-                        let _ =
-                            event_tx.send(TuiEvent::Error("no goal is currently set".to_string()));
-                    }
-                    Err(error) => {
-                        let _ =
-                            event_tx.send(TuiEvent::Error(format!("failed to edit goal: {error}")));
-                    }
-                }
-            }
-            Ok(UserAction::GoalClear) => {
-                let Some(session_id) =
-                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
-                else {
-                    continue;
-                };
-                let mut store = orca_runtime::goals::GoalStore::load_default();
-                match store.clear(&session_id) {
-                    Ok(_) => {
-                        let _ = event_tx.send(TuiEvent::GoalCleared);
-                    }
-                    Err(error) => {
-                        let _ = event_tx
-                            .send(TuiEvent::Error(format!("failed to clear goal: {error}")));
-                    }
-                }
-            }
-            Ok(UserAction::GoalPause) => {
-                if let Some(session_id) =
-                    existing_goal_session_id(session.as_ref(), &preloaded, &config, &event_tx)
-                {
-                    update_goal_status_for_session(
-                        Some(&session_id),
-                        orca_core::goal_types::ThreadGoalStatus::Paused,
-                        &event_tx,
-                    );
-                }
-            }
-            Ok(UserAction::GoalResume) => {
-                let Some(session_id) = current_goal_session_id(session.as_ref(), &preloaded) else {
-                    let Ok(operation) = controller.start() else {
-                        break;
-                    };
-                    resume_latest_active_goal_for_tui_with_registry(
-                        &mut session,
-                        &config,
-                        &preloaded,
-                        &event_tx,
-                        &operation.control(),
-                        &pending_workflow_notifications,
-                        &mcp_registry,
-                        &task_spawner,
-                    );
-                    continue;
-                };
-                update_goal_status_for_session(
-                    Some(&session_id),
-                    orca_core::goal_types::ThreadGoalStatus::Active,
-                    &event_tx,
-                );
-                if let Some(session) = session.as_mut() {
-                    if let Some(goal) = session
-                        .session_id()
-                        .filter(|id| *id == session_id)
-                        .and_then(|id| orca_runtime::goals::GoalStore::load_default().get(id).ok())
-                        .flatten()
-                    {
-                        let Ok(operation) = controller.start() else {
-                            break;
-                        };
-                        let cfg = config.lock().unwrap().clone();
-                        let prompt = goal_continuation_prompt(&goal.objective, 1);
-                        run_goal_turns_for_tui(
-                            &cfg,
-                            session,
-                            SubmittedTurn::user(prompt),
-                            &event_tx,
-                            &operation.control(),
-                            1,
-                            &pending_workflow_notifications,
-                            &task_spawner,
-                        );
-                    }
-                }
-            }
-            Ok(UserAction::Cancel) | Err(_) => break,
-            Ok(UserAction::RespondToInteraction { .. }) => {}
-        }
     }
 }
 

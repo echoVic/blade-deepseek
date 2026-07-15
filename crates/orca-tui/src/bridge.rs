@@ -1,26 +1,18 @@
 pub(crate) use crate::agent_runner::{
     PendingWorkflowNotifications, TuiAgentTurnContinuation, TuiBackgroundTurnContinuationRequest,
 };
-#[allow(unused_imports)]
-pub(crate) use crate::agent_runner::{
-    TuiBackgroundTurnCompletion, TuiBackgroundTurnCompletionHandler,
-    continue_approved_background_turn_for_tui, run_agent_for_tui_with_notification_queue,
-};
-pub use crate::agent_runner::{launch_saved_workflow_for_tui, run_agent_for_tui};
-
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
-use orca_core::config::{HistoryMode, RunConfig};
+use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::RunStatus;
 use orca_core::provider_types::Usage;
 use orca_mcp::McpRegistry;
 use orca_runtime::controller::ThreadTurnRequest;
 use orca_runtime::cost::CostTracker;
-use orca_runtime::history;
 use orca_runtime::hooks::HookRunner;
 use orca_runtime::instructions::ProjectInstructions;
 use orca_runtime::lifecycle::{RuntimeTaskKind, RuntimeTurnRunner};
@@ -31,13 +23,7 @@ use orca_runtime::thread::RuntimeThread;
 
 use crate::types::TuiTaskLifecycle;
 
-pub struct TuiConversationSession {
-    runtime: RuntimeThread,
-    pending_interactions: RuntimePendingInteractionStore,
-    usage_ledger: TuiUsageLedger,
-}
-
-pub(crate) struct TuiHostedConversationSession<'a> {
+pub(crate) struct TuiSession<'a> {
     runtime: &'a mut RuntimeThread,
     pending_interactions: RuntimePendingInteractionStore,
     usage_ledger: TuiUsageLedger,
@@ -170,56 +156,7 @@ impl Drop for TuiBudgetAdmission {
     }
 }
 
-fn preloaded_usage_baseline(
-    history_mode: &HistoryMode,
-    preloaded: Option<&history::SessionTranscript>,
-) -> UsageTotals {
-    if matches!(history_mode, HistoryMode::Resume(_)) {
-        preloaded
-            .and_then(|transcript| transcript.usage)
-            .unwrap_or_default()
-    } else {
-        UsageTotals::default()
-    }
-}
-
-impl TuiConversationSession {
-    pub fn new_with_preloaded(
-        config: &RunConfig,
-        prompt_for_title: &str,
-        preloaded: Option<history::SessionTranscript>,
-    ) -> std::io::Result<Self> {
-        let usage_baseline = preloaded_usage_baseline(&config.history_mode, preloaded.as_ref());
-        let runtime = RuntimeThread::start_with_preloaded(config, prompt_for_title, preloaded)?;
-        Ok(Self {
-            runtime,
-            pending_interactions: RuntimePendingInteractionStore::default(),
-            usage_ledger: TuiUsageLedger::from_totals(usage_baseline),
-        })
-    }
-
-    pub fn new_with_preloaded_and_mcp_registry(
-        config: &RunConfig,
-        prompt_for_title: &str,
-        preloaded: Option<history::SessionTranscript>,
-        mcp_registry: McpRegistry,
-    ) -> std::io::Result<Self> {
-        let usage_baseline = preloaded_usage_baseline(&config.history_mode, preloaded.as_ref());
-        let runtime = RuntimeThread::start_with_preloaded_and_mcp_registry(
-            config,
-            prompt_for_title,
-            preloaded,
-            mcp_registry,
-        )?;
-        Ok(Self {
-            runtime,
-            pending_interactions: RuntimePendingInteractionStore::default(),
-            usage_ledger: TuiUsageLedger::from_totals(usage_baseline),
-        })
-    }
-}
-
-impl<'a> TuiHostedConversationSession<'a> {
+impl<'a> TuiSession<'a> {
     pub(crate) fn new(runtime: &'a mut RuntimeThread) -> Self {
         let aggregate_usage = runtime.session().aggregate_usage_totals();
         let auxiliary = runtime
@@ -234,44 +171,51 @@ impl<'a> TuiHostedConversationSession<'a> {
             usage_ledger: auxiliary.usage_ledger.clone(),
         }
     }
-}
+    pub(crate) fn runtime(&self) -> &RuntimeThread {
+        self.runtime
+    }
 
-#[allow(dead_code)]
-pub(crate) trait TuiSession {
-    fn runtime(&self) -> &RuntimeThread;
-    fn runtime_mut(&mut self) -> &mut RuntimeThread;
-    fn pending_interaction_store(&self) -> RuntimePendingInteractionStore;
-    fn shared_usage_ledger(&self) -> TuiUsageLedger;
+    pub(crate) fn runtime_mut(&mut self) -> &mut RuntimeThread {
+        self.runtime
+    }
 
-    fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
+    pub(crate) fn pending_interaction_store(&self) -> RuntimePendingInteractionStore {
+        self.pending_interactions.clone()
+    }
+
+    pub(crate) fn shared_usage_ledger(&self) -> TuiUsageLedger {
+        self.usage_ledger.clone()
+    }
+
+    pub(crate) fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
         self.runtime().session()
     }
 
-    fn runtime_session_mut(&mut self) -> &mut orca_runtime::session::InteractiveSession {
+    pub(crate) fn runtime_session_mut(&mut self) -> &mut orca_runtime::session::InteractiveSession {
         self.runtime_mut().session_mut()
     }
 
-    fn conversation(&self) -> &orca_core::conversation::Conversation {
+    pub(crate) fn conversation(&self) -> &orca_core::conversation::Conversation {
         self.runtime().session().conversation()
     }
 
-    fn conversation_mut(&mut self) -> &mut orca_core::conversation::Conversation {
+    pub(crate) fn conversation_mut(&mut self) -> &mut orca_core::conversation::Conversation {
         self.runtime_mut().session_mut().conversation_mut()
     }
 
-    fn writer_mut(&mut self) -> Option<&mut orca_runtime::history::SessionWriter> {
+    pub(crate) fn writer_mut(&mut self) -> Option<&mut orca_runtime::history::SessionWriter> {
         self.runtime_mut().session_mut().writer_mut()
     }
 
-    fn instructions(&self) -> &ProjectInstructions {
+    pub(crate) fn instructions(&self) -> &ProjectInstructions {
         self.runtime().session().instructions()
     }
 
-    fn cost_tracker_mut(&mut self) -> &mut CostTracker {
+    pub(crate) fn cost_tracker_mut(&mut self) -> &mut CostTracker {
         self.runtime_mut().session_mut().cost_tracker_mut()
     }
 
-    fn record_provider_usage(&mut self, usage: Usage) -> UsageTotals {
+    pub(crate) fn record_provider_usage(&mut self, usage: Usage) -> UsageTotals {
         let before = self.runtime().session().usage_totals();
         let after = self
             .runtime_mut()
@@ -281,7 +225,7 @@ pub(crate) trait TuiSession {
         self.shared_usage_ledger().add(usage_delta(before, after))
     }
 
-    fn record_external_usage(&mut self, usage: UsageTotals) -> UsageTotals {
+    pub(crate) fn record_external_usage(&mut self, usage: UsageTotals) -> UsageTotals {
         self.runtime_mut()
             .session_mut()
             .cost_tracker_mut()
@@ -289,79 +233,81 @@ pub(crate) trait TuiSession {
         self.shared_usage_ledger().add(usage)
     }
 
-    fn usage_ledger(&self) -> TuiUsageLedger {
+    pub(crate) fn usage_ledger(&self) -> TuiUsageLedger {
         self.shared_usage_ledger()
     }
 
-    fn mcp_registry(&self) -> &McpRegistry {
+    pub(crate) fn mcp_registry(&self) -> &McpRegistry {
         self.runtime().session().mcp_registry()
     }
 
-    fn hooks(&self) -> &HookRunner {
+    pub(crate) fn hooks(&self) -> &HookRunner {
         self.runtime().session().hooks()
     }
 
-    fn memory(&self) -> &MemoryBlock {
+    pub(crate) fn memory(&self) -> &MemoryBlock {
         self.runtime().session().memory()
     }
 
-    fn task_registry(&self) -> &TaskRegistry {
+    pub(crate) fn task_registry(&self) -> &TaskRegistry {
         self.runtime().session().task_registry()
     }
 
-    fn pending_interactions(&self) -> RuntimePendingInteractionStore {
+    pub(crate) fn pending_interactions(&self) -> RuntimePendingInteractionStore {
         self.pending_interaction_store()
     }
 
-    fn append_message(&mut self, message: &orca_core::conversation::Message) {
+    pub(crate) fn append_message(&mut self, message: &orca_core::conversation::Message) {
         self.runtime_mut().session_mut().append_message(message);
     }
 
-    fn complete(&mut self, status: &str) {
+    pub(crate) fn complete(&mut self, status: &str) {
         self.runtime_mut().session_mut().complete(status);
     }
 
-    fn complete_with_error(&mut self, status: &str, error: &str) {
+    pub(crate) fn complete_with_error(&mut self, status: &str, error: &str) {
         self.runtime_mut()
             .session_mut()
             .complete_with_error(status, Some(error));
     }
 
-    fn start_agent_lifecycle_task_with_id(&mut self, task_id: &str) {
+    pub(crate) fn start_agent_lifecycle_task_with_id(&mut self, task_id: &str) {
         self.runtime_mut()
             .lifecycle_mut()
             .start_task_with_id(RuntimeTaskKind::Agent, task_id.to_string());
     }
 
-    fn finish_agent_lifecycle_task(&mut self, status: RunStatus) {
+    pub(crate) fn finish_agent_lifecycle_task(&mut self, status: RunStatus) {
         let _ = self.runtime_mut().lifecycle_mut().finish_task(status);
     }
 
-    fn session_id(&self) -> Option<&str> {
+    pub(crate) fn session_id(&self) -> Option<&str> {
         self.runtime().session().session_id()
     }
 
-    fn completion_error(&self) -> Option<&str> {
+    pub(crate) fn completion_error(&self) -> Option<&str> {
         self.runtime().session().completion_error()
     }
 
-    fn thread_extensions(&self) -> &orca_runtime::extension::ExtensionData {
+    pub(crate) fn thread_extensions(&self) -> &orca_runtime::extension::ExtensionData {
         self.runtime().thread_extensions()
     }
 
-    fn thread_extensions_handle(&self) -> std::sync::Arc<orca_runtime::extension::ExtensionData> {
+    pub(crate) fn thread_extensions_handle(
+        &self,
+    ) -> std::sync::Arc<orca_runtime::extension::ExtensionData> {
         self.runtime().thread_extensions_handle()
     }
 
-    fn usage_totals(&self) -> UsageTotals {
+    pub(crate) fn usage_totals(&self) -> UsageTotals {
         self.shared_usage_ledger().totals()
     }
 
-    fn runtime_usage_totals(&self) -> UsageTotals {
+    pub(crate) fn runtime_usage_totals(&self) -> UsageTotals {
         self.runtime().session().usage_totals()
     }
 
-    fn run_request_with_cancel_for_tui(
+    pub(crate) fn run_request_with_cancel_for_tui(
         &mut self,
         config: &RunConfig,
         request: &ThreadTurnRequest,
@@ -408,35 +354,30 @@ pub(crate) trait TuiSession {
         Ok(status)
     }
 
-    fn has_active_workflows(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn has_active_workflows(&self) -> bool {
         self.runtime().session().has_active_workflows()
     }
 
-    fn backtrack_last_user(&mut self) -> Option<String> {
+    #[cfg(test)]
+    pub(crate) fn backtrack_last_user(&mut self) -> Option<String> {
         self.runtime_mut().session_mut().backtrack_last_user()
     }
 
-    fn set_model(&mut self, model: Option<&str>) {
-        self.runtime_mut().session_mut().set_model(model);
-    }
-
-    fn add_pinned_context(&mut self, content: String) {
-        self.runtime_mut().session_mut().add_pinned_context(content);
-    }
-
-    fn replace_goal_context(&mut self, content: String) {
+    #[cfg(test)]
+    pub(crate) fn replace_goal_context(&mut self, content: String) {
         self.runtime_mut()
             .session_mut()
             .replace_goal_context(content);
     }
 
-    fn replace_skill_context(&mut self, content: Option<String>) {
+    pub(crate) fn replace_skill_context(&mut self, content: Option<String>) {
         self.runtime_mut()
             .session_mut()
             .replace_skill_context(content);
     }
 
-    fn compact(
+    pub(crate) fn compact(
         &mut self,
         config: &RunConfig,
         cwd: &Path,
@@ -447,7 +388,7 @@ pub(crate) trait TuiSession {
             .compact(config, cwd, cancel)
     }
 
-    fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
+    pub(crate) fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
         if self.runtime().lifecycle().active_task().is_none() {
             self.runtime_mut()
                 .lifecycle_mut()
@@ -461,42 +402,6 @@ pub(crate) trait TuiSession {
             turn: task.current_turn(),
         });
         (started.turn(), task)
-    }
-}
-
-impl TuiSession for TuiConversationSession {
-    fn runtime(&self) -> &RuntimeThread {
-        &self.runtime
-    }
-
-    fn runtime_mut(&mut self) -> &mut RuntimeThread {
-        &mut self.runtime
-    }
-
-    fn pending_interaction_store(&self) -> RuntimePendingInteractionStore {
-        self.pending_interactions.clone()
-    }
-
-    fn shared_usage_ledger(&self) -> TuiUsageLedger {
-        self.usage_ledger.clone()
-    }
-}
-
-impl TuiSession for TuiHostedConversationSession<'_> {
-    fn runtime(&self) -> &RuntimeThread {
-        self.runtime
-    }
-
-    fn runtime_mut(&mut self) -> &mut RuntimeThread {
-        self.runtime
-    }
-
-    fn pending_interaction_store(&self) -> RuntimePendingInteractionStore {
-        self.pending_interactions.clone()
-    }
-
-    fn shared_usage_ledger(&self) -> TuiUsageLedger {
-        self.usage_ledger.clone()
     }
 }
 
@@ -550,39 +455,6 @@ mod tests {
         assert_eq!(actual.output_tokens, expected.output_tokens);
         assert_eq!(actual.cache_tokens, expected.cache_tokens);
         assert!((actual.estimated_cost_usd - expected.estimated_cost_usd).abs() < 1e-12);
-    }
-
-    #[test]
-    fn resume_initializes_shared_usage_ledger_from_transcript_aggregate() {
-        let baseline = usage(130, 30, 55, 0.15);
-        let transcript = history::SessionTranscript {
-            meta: history::create_meta(Path::new("/tmp"), "mock", None, "resume usage"),
-            messages: Vec::new(),
-            compactions: Vec::new(),
-            summaries: Vec::new(),
-            usage: Some(baseline),
-            plan: None,
-            completion_status: None,
-            completion_error: None,
-            path: Path::new("/tmp/resume-usage.jsonl").to_path_buf(),
-        };
-
-        let loaded = preloaded_usage_baseline(
-            &HistoryMode::Resume("resume-usage".to_string()),
-            Some(&transcript),
-        );
-        let ledger = TuiUsageLedger::from_totals(loaded);
-        let background = ledger.clone();
-        background.add(usage(20, 5, 8, 0.03));
-
-        assert_usage(ledger.totals(), usage(150, 35, 63, 0.18));
-        assert_eq!(
-            preloaded_usage_baseline(
-                &HistoryMode::Fork("resume-usage".to_string()),
-                Some(&transcript),
-            ),
-            UsageTotals::default()
-        );
     }
 
     #[test]

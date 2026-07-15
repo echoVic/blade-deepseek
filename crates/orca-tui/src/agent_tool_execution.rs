@@ -1323,11 +1323,11 @@ mod tests {
 
     fn test_turn() -> (
         crate::operation_controller::TuiOperationController,
-        crate::operation_controller::TuiOperationScope,
+        crate::test_support::HostedOperationHarness,
         TuiTurnControl,
     ) {
-        let controller = crate::operation_controller::TuiOperationController::default();
-        let operation = controller.start().expect("start test operation");
+        let operation = crate::test_support::HostedOperationHarness::start();
+        let controller = operation.controller().clone();
         let control = operation.control();
         (controller, operation, control)
     }
@@ -1361,7 +1361,7 @@ mod tests {
         event_tx: Sender<TuiEvent>,
         event_rx: mpsc::Receiver<TuiEvent>,
         controller: crate::operation_controller::TuiOperationController,
-        _operation: crate::operation_controller::TuiOperationScope,
+        _operation: crate::test_support::HostedOperationHarness,
         control: TuiTurnControl,
         decisions: std::sync::Mutex<VecDeque<bool>>,
         observed_events: std::sync::Arc<std::sync::Mutex<Vec<TuiEvent>>>,
@@ -1372,8 +1372,8 @@ mod tests {
             let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
             std::fs::create_dir(workspace.path().join(".git")).unwrap();
             let (event_tx, event_rx) = mpsc::unbounded();
-            let controller = crate::operation_controller::TuiOperationController::default();
-            let operation = controller.start().expect("start escalation operation");
+            let operation = crate::test_support::HostedOperationHarness::start();
+            let controller = operation.controller().clone();
             let control = operation.control();
             Self {
                 workspace,

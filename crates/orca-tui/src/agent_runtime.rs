@@ -20,28 +20,6 @@ pub(crate) struct TuiAgentRuntime {
 }
 
 impl TuiAgentRuntime {
-    #[cfg(test)]
-    pub(crate) fn spawn(
-        action_rx: Receiver<UserAction>,
-        event_tx: Sender<TuiEvent>,
-        task_capacity: usize,
-        run: impl FnOnce(TuiOperationController, Receiver<UserAction>, TuiTaskSpawner) + Send + 'static,
-    ) -> io::Result<Self> {
-        let controller = TuiOperationController::default();
-        let host = RuntimeHost::start().map_err(runtime_host_error)?;
-        let tasks = TuiTaskSupervisor::new(task_capacity);
-        Self::spawn_with_dispatch_capacities(
-            action_rx,
-            event_tx,
-            USER_ACTION_CAPACITY,
-            USER_ACTION_CAPACITY,
-            controller,
-            host,
-            tasks,
-            move |controller, commands, tasks, _host| run(controller, commands, tasks),
-        )
-    }
-
     pub(crate) fn spawn_hosted(
         action_rx: Receiver<UserAction>,
         event_tx: Sender<TuiEvent>,
@@ -163,11 +141,86 @@ impl Drop for TuiAgentRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use orca_core::cancel::CancelToken;
+    use orca_core::event_schema::{EventFactory, RunStatus};
+    use orca_runtime::runtime_host::{
+        GenerationContext, HostedTurnRequest, ThreadOperationExecutor,
+    };
+    use orca_runtime::thread::RuntimeThread;
+
     use super::*;
+    use crate::interaction_broker::TuiInteractionBroker;
+
+    struct BlockingExecutor {
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl ThreadOperationExecutor for BlockingExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<RunStatus> {
+            self.started.store(true, Ordering::SeqCst);
+            while !cancel.is_cancelled() {
+                std::thread::yield_now();
+            }
+            self.finished.store(true, Ordering::SeqCst);
+            Ok(RunStatus::Cancelled)
+        }
+    }
+
+    fn run_blocking_hosted_operation(
+        controller: TuiOperationController,
+        host: RuntimeHostHandle,
+        ready_tx: crossbeam_channel::Sender<()>,
+    ) {
+        let thread = host
+            .start_thread(crate::test_support::test_run_config(), "agent runtime test")
+            .expect("hosted test thread");
+        let operation = Arc::new(
+            thread
+                .start_turn(HostedTurnRequest::new("block until shutdown"), io::sink())
+                .expect("hosted test operation"),
+        );
+        controller
+            .install_hosted(Arc::clone(&operation))
+            .expect("install hosted test operation");
+        ready_tx.send(()).expect("ready signal");
+        operation.wait();
+        controller.complete_hosted(operation.id());
+    }
+
+    fn spawn_blocking_runtime(
+        action_rx: Receiver<UserAction>,
+        event_tx: Sender<TuiEvent>,
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+        ready_tx: crossbeam_channel::Sender<()>,
+    ) -> TuiAgentRuntime {
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        TuiAgentRuntime::spawn_hosted(
+            action_rx,
+            event_tx,
+            1,
+            controller,
+            move |_| Arc::new(BlockingExecutor { started, finished }),
+            move |controller, _commands, _tasks, host| {
+                run_blocking_hosted_operation(controller, host, ready_tx)
+            },
+        )
+        .expect("hosted agent runtime spawned")
+    }
 
     #[test]
     fn shutdown_cancels_current_operation_and_joins_agent_thread() {
@@ -177,20 +230,13 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
-        let mut runtime = TuiAgentRuntime::spawn(action_rx, event_tx, 1, {
-            let started = Arc::clone(&started);
-            let finished = Arc::clone(&finished);
-            move |controller, _commands, _tasks| {
-                let operation = controller.start().expect("operation started");
-                started.store(true, Ordering::SeqCst);
-                ready_tx.send(()).expect("ready signal");
-                while !operation.token().is_cancelled() {
-                    std::thread::yield_now();
-                }
-                finished.store(true, Ordering::SeqCst);
-            }
-        })
-        .expect("agent runtime spawned");
+        let mut runtime = spawn_blocking_runtime(
+            action_rx,
+            event_tx,
+            Arc::clone(&started),
+            Arc::clone(&finished),
+            ready_tx,
+        );
 
         ready_rx
             .recv_timeout(Duration::from_secs(1))
@@ -207,18 +253,13 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
-        let runtime = TuiAgentRuntime::spawn(action_rx, event_tx, 1, {
-            let finished = Arc::clone(&finished);
-            move |controller, _commands, _tasks| {
-                let operation = controller.start().expect("operation started");
-                ready_tx.send(()).expect("ready signal");
-                while !operation.token().is_cancelled() {
-                    std::thread::yield_now();
-                }
-                finished.store(true, Ordering::SeqCst);
-            }
-        })
-        .expect("agent runtime spawned");
+        let runtime = spawn_blocking_runtime(
+            action_rx,
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&finished),
+            ready_tx,
+        );
 
         ready_rx
             .recv_timeout(Duration::from_secs(1))
@@ -235,8 +276,12 @@ mod tests {
             .send(UserAction::Submit("fill command mailbox".to_string()))
             .expect("fill action mailbox");
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
-        let controller = TuiOperationController::default();
-        let host = RuntimeHost::start().expect("runtime host");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let host =
+            RuntimeHost::start_with_executor(Arc::new(BlockingExecutor { started, finished }))
+                .expect("runtime host");
         let tasks = TuiTaskSupervisor::new(1);
 
         let mut runtime = TuiAgentRuntime::spawn_with_dispatch_capacities(
@@ -247,12 +292,8 @@ mod tests {
             controller,
             host,
             tasks,
-            move |controller, _commands, _tasks, _host| {
-                let operation = controller.start().expect("operation started");
-                ready_tx.send(()).expect("ready signal");
-                while !operation.token().is_cancelled() {
-                    std::thread::yield_now();
-                }
+            move |controller, _commands, _tasks, host| {
+                run_blocking_hosted_operation(controller, host, ready_tx)
             },
         )
         .expect("agent runtime spawned");

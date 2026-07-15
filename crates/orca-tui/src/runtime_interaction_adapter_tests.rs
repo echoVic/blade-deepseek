@@ -17,12 +17,17 @@ use orca_runtime::runtime_pending_interaction::{
 use super::{
     TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
 };
-use crate::operation_controller::{TuiOperationController, TuiOperationScope, TuiTurnControl};
+use crate::operation_controller::{TuiOperationController, TuiTurnControl};
+use crate::test_support::HostedOperationHarness;
 use crate::types::{TuiEvent, TuiInteractionResponse};
 
-fn operation() -> (TuiOperationController, TuiOperationScope, TuiTurnControl) {
-    let controller = TuiOperationController::default();
-    let operation = controller.start().expect("start operation");
+fn operation() -> (
+    TuiOperationController,
+    HostedOperationHarness,
+    TuiTurnControl,
+) {
+    let operation = HostedOperationHarness::start();
+    let controller = operation.controller().clone();
     let control = operation.control();
     (controller, operation, control)
 }

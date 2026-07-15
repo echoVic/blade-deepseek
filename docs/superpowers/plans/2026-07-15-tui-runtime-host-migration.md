@@ -1,8 +1,8 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1, P0.3e2, P0.3e3a, and P0.3e3b complete; P0.3e3c next
+- Status: Active; P0.3e1, P0.3e2, and P0.3e3 complete; P0.3e4 next
 - Date: 2026-07-15
-- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3a validation)
+- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3c validation)
 - Branch: `codex/tui-runtime-host-migration`
 - ADR: `docs/architecture/adr/0005-runtime-host-operation-control-plane.md`
 
@@ -357,18 +357,84 @@ the legacy agent-loop helpers, and replace the remaining source-shape ownership
 tests with behavior tests. `TuiThreadOperationExecutor` and the TUI turn kernel
 remain temporary until P0.3e4 replaces them with the canonical runtime turn.
 
+P0.3e3c slice contract:
+
+- Structural problem and evidence: production turns use actor-owned
+  `RuntimeHost`, but tests can still construct a surface-owned
+  `TuiConversationSession`, start a local `OperationCancellation`, or execute
+  `agent_loop_thread_with_registry`. This leaves two ownership models and lets
+  cancellation, interaction, task, goal, and persistence tests pass without
+  exercising the production control plane. A source-text assertion additionally
+  protects the obsolete owner instead of observable behavior.
+- Target ownership and module boundary: `TuiSession<'_>` is the only TUI
+  turn-kernel adapter and always borrows an actor-owned or test-owned
+  `RuntimeThread`; it never constructs or stores one. The
+  `TuiOperationController` is host-backed only and tracks an
+  `Arc<OperationHandle>`. High-level TUI tests start the same hosted controller
+  as production. Low-level kernel tests may construct a local `RuntimeThread`,
+  but must borrow it through the single hosted adapter for the duration of the
+  call.
+- TUI user value: cancellation, shutdown, interaction fencing, goal resume,
+  and task/background behavior are now verified against the same actor and
+  joined-operation lifecycle users run. This removes false confidence from a
+  second test-only loop and protects the user-visible guarantee that a terminal
+  state is emitted only after the addressed operation has completed cleanup.
+- External compatibility: no CLI, key binding, TUI event, JSONL, persistence,
+  goal/task/workflow, MCP, model, or DeepSeek provider behavior changes in this
+  slice.
+- Migration order and temporary state: first add reusable hosted and borrowed
+  kernel test harnesses; then migrate behavior tests; then delete
+  `TuiConversationSession`, local controller construction, compatibility
+  cancellation traits, and legacy app loop/session/goal helpers. The
+  `TuiThreadOperationExecutor` and TUI-specific turn kernel remain the only
+  intentional P0.3e4 transition state.
+- Acceptance: no `TuiConversationSession`, `TuiOperationScope`, local
+  `OperationCancellation`, `agent_loop_thread`, or source-shape assertion for
+  the deleted session/cancellation owner remains in `orca-tui`; production and
+  high-level tests use the hosted runtime; low-level tests use the borrowed
+  adapter; focused TUI tests, the serial workspace gate, workspace Clippy, real
+  DeepSeek harness, and PTY TUI smoke pass.
+- Final deletion gate for this slice: there is one session adapter, one
+  operation-control authority, and no test-only path that can own a live TUI
+  conversation or acknowledge cancellation independently of
+  `OperationCompletion`.
+
+P0.3e3c implementation checkpoint:
+
+- `TuiSession<'_>` is the single session adapter. It borrows `&mut
+  RuntimeThread` for one kernel call and cannot construct, retain, or replace
+  the actor-owned thread;
+- `TuiOperationController` is host-backed only and retains at most one
+  `Arc<OperationHandle>`. `TuiTurnControl` carries the operation fence but no
+  cancel token;
+- the local `OperationCancellation`, `TuiOperationScope`, compatibility
+  interrupt implementation, legacy session constructors, legacy app
+  agent-loop/session/goal helpers, and dual hosted/local controller branches
+  are deleted;
+- production and high-level app tests run through `RuntimeHost`,
+  `TuiAgentRuntime`, and `TuiThreadOperationExecutor`; low-level kernel tests
+  own a `RuntimeThread` only in the test harness and borrow it through
+  `TuiSession` for each call;
+- synchronous, silent, and asynchronous child-agent execution explicitly
+  inherits the current `TuiTurnControl`, preserving the addressed operation
+  fence through nested work;
+- hosted behavior tests now prove interrupt, shutdown/join, operation
+  replacement rejection, interaction cleanup, background continuation, goal
+  accounting, and terminal ordering without constructing the deleted owner or
+  asserting its source-text shape.
+
 Verification ran after a fresh fetch confirmed `origin/main` was still
-`35c6361c1`, so the branch was already rebased on the current main. Clean
-`cargo check -p orca-tui`, hosted/action-dispatcher focused tests, TUI 518/518,
-`orca-runtime` 769/769 plus runtime-host 21/21 and task-output 12/12, the serial
-workspace all-targets gate, and workspace Clippy all passed; Clippy reported
-only the repository's pre-existing warning set. The release harness contract
-and complete real DeepSeek E2E passed within the `$0.02` budget, covering
-provider summary, CLI/history replay and repair, server/thread memory,
-active-turn resume/control, metadata, list filters/search, and turn/item
-pagination. A real 120x40 PTY TUI run through the production hosted path
-returned `ORCA_TUI_HOSTED_OK`, displayed live usage/context state, and exited
-cleanly through the normal double-`Ctrl-C` flow.
+`35c6361c1`, so the branch was already based on the current main. Formatting,
+`cargo check -p orca-tui`, TUI 510/510, `orca-runtime` 769/769 plus runtime-host
+21/21 and task-output 12/12, the serial workspace all-targets gate, and
+workspace Clippy completed successfully; Clippy retained the repository's
+non-deny warning baseline. The release harness contract and complete real
+DeepSeek E2E passed within the `$0.02` budget, covering provider summary,
+CLI/history replay and repair, server/thread memory, active-turn resume/control,
+metadata, list filters/search, and turn/item pagination. A separate real PTY
+TUI run through the production hosted path returned `ORCA_TUI_HOSTED_OK`,
+displayed live context and usage (`7.0k` tokens, `$0.0031`), and restored the
+terminal through the normal double-`Ctrl-C` exit flow.
 
 P0.3e3 is incomplete until production TUI code contains no directly owned
 `RuntimeThread`, `InteractiveSession`, `OperationCancellation`, operation cancel

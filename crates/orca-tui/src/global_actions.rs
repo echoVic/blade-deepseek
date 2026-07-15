@@ -69,10 +69,9 @@ where
 mod tests {
     use crossbeam_channel as mpsc;
 
-    use orca_core::cancel::OperationCancellation;
-
     use super::handle_global_shortcut;
     use crate::shortcuts::GlobalShortcut;
+    use crate::test_support::TestOperationInterrupt;
     use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
 
     #[test]
@@ -85,19 +84,18 @@ mod tests {
             "/tmp".to_string(),
         );
         state.set_status(AppStatus::Compacting);
-        let cancellation = OperationCancellation::new();
-        let operation = cancellation.start();
+        let operation = TestOperationInterrupt::default();
 
         handle_global_shortcut(
             GlobalShortcut::Cancel,
             &mut state,
             &action_tx,
-            &cancellation,
+            &operation,
             || Ok(()),
         )
         .expect("cancel compaction");
 
-        assert!(operation.token().is_cancelled());
+        assert_eq!(operation.call_count(), 1);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -112,20 +110,19 @@ mod tests {
                 "/tmp".to_string(),
             );
             state.set_status(status);
-            let cancellation = OperationCancellation::new();
-            let operation = cancellation.start();
+            let operation = TestOperationInterrupt::default();
 
             let flow = handle_global_shortcut(
                 GlobalShortcut::Cancel,
                 &mut state,
                 &action_tx,
-                &cancellation,
+                &operation,
                 || Ok(()),
             )
             .expect("interrupt pending interaction");
 
             assert!(matches!(flow, super::GlobalShortcutFlow::Continue));
-            assert!(operation.token().is_cancelled());
+            assert_eq!(operation.call_count(), 1);
             assert!(state.last_ctrl_c.is_none());
             assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
         }
@@ -140,13 +137,13 @@ mod tests {
             "model".to_string(),
             "/tmp".to_string(),
         );
-        let cancellation = OperationCancellation::new();
+        let operation = TestOperationInterrupt::default();
 
         let first = handle_global_shortcut(
             GlobalShortcut::Cancel,
             &mut state,
             &action_tx,
-            &cancellation,
+            &operation,
             || Ok(()),
         )
         .unwrap();
@@ -157,7 +154,7 @@ mod tests {
             GlobalShortcut::Cancel,
             &mut state,
             &action_tx,
-            &cancellation,
+            &operation,
             || Ok(()),
         )
         .unwrap();
@@ -183,7 +180,7 @@ mod tests {
             GlobalShortcut::ClearScreen,
             &mut state,
             &action_tx,
-            &OperationCancellation::new(),
+            &TestOperationInterrupt::default(),
             || Ok(()),
         )
         .expect("clear screen");

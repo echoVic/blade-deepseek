@@ -85,6 +85,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
     cwd: &Path,
     tool_requests: &[tool_types::ToolRequest],
     event_tx: &Sender<TuiEvent>,
+    control: &TuiTurnControl,
     subagent_depth: u32,
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
@@ -152,6 +153,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
         let child_hooks = hooks.clone();
         let child_tool_request = tool_request.clone();
         let child_event_tx = event_tx.clone();
+        let child_control = control.clone();
         let child_registry = task_registry.cloned();
         let child_registry_task_id = registry_task_id.clone();
         handles.push((
@@ -176,6 +178,7 @@ pub(crate) fn execute_subagent_batch_for_tui(
                     &child_memory,
                     &child_hooks,
                     Some(&observer),
+                    &child_control,
                 );
                 (child_tool_request, child, child_cost_tracker)
             }),
@@ -362,6 +365,7 @@ pub(crate) fn execute_subagent_for_tui_with_background_events(
             memory,
             hooks,
             task_registry,
+            control,
         );
         return (result, CostTracker::new(None));
     }
@@ -434,6 +438,7 @@ fn launch_async_subagent_for_tui(
     memory: &MemoryBlock,
     hooks: &HookRunner,
     task_registry: &TaskRegistry,
+    control: &TuiTurnControl,
 ) -> tool_types::ToolResult {
     let agent_type = serde_json::to_value(&request.subagent_type)
         .ok()
@@ -453,6 +458,7 @@ fn launch_async_subagent_for_tui(
     let thread_agent_id = agent_id.clone();
     let child_chat_id = tool_request.id.clone();
     let child_description = request.description.clone();
+    let child_control = control.clone();
 
     thread::spawn(move || {
         let mut events = EventFactory::new(thread_agent_id.clone());
@@ -474,6 +480,7 @@ fn launch_async_subagent_for_tui(
             &child_memory,
             &child_hooks,
             Some(&observer),
+            &child_control,
         );
         let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
         if child.status == RunStatus::Success {
@@ -865,19 +872,17 @@ pub(crate) fn run_child_agent_for_tui_silent(
     memory: &MemoryBlock,
     hooks: &HookRunner,
     observer: Option<&ChildAgentActivityObserver<'_>>,
+    control: &TuiTurnControl,
 ) -> (ChildAgentResult, CostTracker) {
     let (event_tx, event_rx) = crate::channels::tui_event_channel();
     let event_drain = thread::spawn(move || while event_rx.recv().is_ok() {});
-    let controller = crate::operation_controller::TuiOperationController::default();
-    let operation = controller.start().expect("silent subagent operation");
-    let control = operation.control();
     let result = run_child_agent_for_tui_observed(
         config,
         cwd,
         prompt,
         subagent_model,
         &event_tx,
-        &control,
+        control,
         None,
         subagent_depth,
         subagent_type,

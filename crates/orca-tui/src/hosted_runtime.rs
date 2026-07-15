@@ -17,7 +17,7 @@ use crate::agent_runner::{
     TuiBackgroundTurnCompletionHandler, TuiBackgroundTurnContinuationRequest,
     continue_approved_background_turn_for_tui_with_events, run_agent_for_tui_with_event_factory,
 };
-use crate::bridge::{TuiHostedConversationSession, TuiSession};
+use crate::bridge::TuiSession;
 use crate::operation_controller::TuiOperationController;
 use crate::task_supervisor::TuiTaskSpawner;
 use crate::types::TuiEvent;
@@ -71,7 +71,7 @@ impl TuiThreadOperationExecutor {
             .wait_for_hosted(generation.fence().operation_id(), cancel)?;
         let mut relay = TuiOperationEventRelay::spawn(self.event_tx.clone())?;
         let operation_event_tx = relay.sender();
-        let mut session = TuiHostedConversationSession::new(thread);
+        let mut session = TuiSession::new(thread);
 
         let result = match request.operation_kind() {
             HostedOperationKind::Turn => {
@@ -156,7 +156,7 @@ impl TuiThreadOperationExecutor {
 
     fn run_turn(
         &self,
-        session: &mut dyn TuiSession,
+        session: &mut TuiSession<'_>,
         request: &HostedTurnRequest,
         config: &orca_core::config::RunConfig,
         event_tx: &Sender<TuiEvent>,
@@ -461,9 +461,31 @@ pub(crate) fn receive_hosted_result(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use super::*;
+
+    fn with_orca_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().expect("ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(home.path())));
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
 
     #[test]
     fn operation_event_relay_holds_terminal_until_join() {
@@ -537,5 +559,55 @@ mod tests {
         state.foreground_tokens = Some(5);
         assert_eq!(take_background_goal_total(&mut state), Some(12));
         assert_eq!(take_background_goal_total(&mut state), None);
+    }
+
+    #[test]
+    fn hosted_goal_token_delta_counts_cache_as_input_subset() {
+        let incident_usage = UsageTotals {
+            input_tokens: 49_909_209,
+            output_tokens: 191_567,
+            cache_tokens: 47_879_040,
+            estimated_cost_usd: 3.156_464_565,
+        };
+
+        assert_eq!(
+            goal_token_delta(UsageTotals::default(), incident_usage),
+            50_100_776
+        );
+    }
+
+    #[test]
+    fn hosted_background_goal_accounting_commits_exactly_once() {
+        with_orca_home(|_| {
+            let session_id = "hosted-background-goal-usage";
+            orca_runtime::goals::GoalStore::load_default()
+                .replace(
+                    session_id,
+                    "account hosted provider usage",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            let accounting =
+                BackgroundGoalAccounting::new(session_id.to_string(), Instant::now(), event_tx);
+
+            accounting.record_foreground(200);
+            accounting.record_background(50_100_776);
+            accounting.record_background(999);
+
+            let goal = orca_runtime::goals::GoalStore::load_default()
+                .get(session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(goal.tokens_used, 50_100_976);
+            assert_eq!(
+                event_rx
+                    .try_iter()
+                    .filter(|event| matches!(event, TuiEvent::GoalStatus(Some(_))))
+                    .count(),
+                1
+            );
+        });
     }
 }

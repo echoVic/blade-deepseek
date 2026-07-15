@@ -28,7 +28,10 @@ use orca_runtime::hooks::{HookContext, conversation_with_hook_context};
 use orca_runtime::memory;
 use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
 use orca_runtime::tasks::MainSessionTerminalUpdate;
+#[cfg(test)]
+use orca_runtime::thread::RuntimeThread;
 
+#[cfg(test)]
 use crate::action_dispatcher::TuiActionDispatcher;
 use crate::agent_subagent_execution::{
     collect_subagent_batch, config_for_remaining_subagent_budget, execute_subagent_batch_for_tui,
@@ -38,11 +41,17 @@ use crate::agent_tool_execution::{
     execute_readonly_batch_for_tui, execute_tool_for_tui_with_background_events,
 };
 use crate::agent_workflow_execution::execute_workflow_for_tui;
-use crate::bridge::{TuiBudgetAdmission, TuiConversationSession, TuiSession, TuiUsageLedger};
-use crate::operation_controller::{TuiOperationController, TuiTurnControl};
+use crate::bridge::{TuiBudgetAdmission, TuiSession, TuiUsageLedger};
+#[cfg(test)]
+use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::TuiTurnControl;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
-use crate::task_supervisor::{TuiTaskSpawner, TuiTaskSupervisor};
-use crate::types::{PendingWorkflowNotification, TuiEvent, UserAction};
+use crate::task_supervisor::TuiTaskSpawner;
+#[cfg(test)]
+use crate::task_supervisor::TuiTaskSupervisor;
+#[cfg(test)]
+use crate::types::UserAction;
+use crate::types::{PendingWorkflowNotification, TuiEvent};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
 const PROVIDER_STREAM_CAPACITY: usize = 256;
@@ -213,7 +222,7 @@ pub(crate) fn task_summary_for_tui(
 }
 
 fn start_main_session_task_for_tui(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     prompt: &str,
@@ -230,7 +239,7 @@ fn start_main_session_task_for_tui(
 }
 
 fn poll_background_current_turn_for_tui(
-    session: &dyn TuiSession,
+    session: &TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     control: &TuiTurnControl,
@@ -331,7 +340,7 @@ fn usage_budget_error(
 }
 
 fn persist_merged_usage(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     usage: orca_core::cost_types::UsageTotals,
@@ -346,7 +355,7 @@ fn persist_merged_usage(
 }
 
 fn finish_budget_exhausted_after_usage(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -756,7 +765,7 @@ impl TuiBackgroundTurnContinuationRequest {
 #[allow(dead_code)]
 pub(crate) fn continue_approved_background_turn_for_tui(
     config: &RunConfig,
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     continuation: &TuiBackgroundTurnContinuationRequest,
     event_tx: &Sender<TuiEvent>,
     cancel: &CancelToken,
@@ -781,7 +790,7 @@ pub(crate) fn continue_approved_background_turn_for_tui(
 
 pub(crate) fn continue_approved_background_turn_for_tui_with_events(
     config: &RunConfig,
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     continuation: &TuiBackgroundTurnContinuationRequest,
     event_tx: &Sender<TuiEvent>,
     cancel: &CancelToken,
@@ -918,7 +927,7 @@ pub(crate) fn continue_approved_background_turn_for_tui_with_events(
 }
 
 fn finish_main_session_task_for_tui(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -928,7 +937,7 @@ fn finish_main_session_task_for_tui(
 }
 
 fn finish_main_session_task_with_error_for_tui(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -948,7 +957,7 @@ fn finish_main_session_task_with_error_for_tui(
 }
 
 fn finish_main_session_task_with_error_and_usage_for_tui(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -989,7 +998,7 @@ fn run_status_for_tui_status(status: &str) -> orca_core::event_schema::RunStatus
 }
 
 fn maybe_stop_cancelled_main_session_for_tui(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -1016,7 +1025,7 @@ fn maybe_stop_cancelled_main_session_for_tui(
 }
 
 fn close_unstarted_tool_requests_for_tui(
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     pending_tool_requests: &[tool_types::ToolRequest],
@@ -1129,23 +1138,6 @@ pub(crate) fn send_workflow_notification_for_tui(
     send_runtime_event_as_tui(event_tx, event);
 }
 
-pub fn launch_saved_workflow_for_tui(
-    config: &RunConfig,
-    session: &TuiConversationSession,
-    name: &str,
-    raw_args: Option<&str>,
-    event_tx: &Sender<TuiEvent>,
-) {
-    launch_saved_workflow_for_tui_with_registry(
-        config,
-        session.session_id(),
-        session.task_registry(),
-        name,
-        raw_args,
-        event_tx,
-    );
-}
-
 pub(crate) fn launch_saved_workflow_for_tui_with_registry(
     config: &RunConfig,
     session_id: Option<&str>,
@@ -1238,24 +1230,23 @@ fn tui_tools_schema(
     }
 }
 
-pub fn run_agent_for_tui(
+#[cfg(test)]
+pub(crate) fn run_agent_for_tui(
     config: &RunConfig,
-    session: &mut TuiConversationSession,
+    runtime: &mut RuntimeThread,
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
     action_rx: &Receiver<UserAction>,
     cancel: &CancelToken,
     allow_goal_tools: bool,
 ) -> String {
-    let controller = TuiOperationController::default();
-    let operation = match controller.start() {
-        Ok(operation) => operation,
-        Err(error) => return format!("failed: {error}"),
-    };
+    let operation = crate::test_support::HostedOperationHarness::start();
+    let controller = operation.controller().clone();
     if cancel.is_cancelled() {
-        operation.cancel();
+        controller.interrupt_current();
     }
     let control = operation.control();
+    let mut session = TuiSession::new(runtime);
     let (mut dispatcher, _command_rx) = match TuiActionDispatcher::spawn(
         action_rx.clone(),
         event_tx.clone(),
@@ -1270,11 +1261,11 @@ pub fn run_agent_for_tui(
     let task_spawner = tasks.spawner();
     let status = run_agent_for_tui_with_notification_queue(
         config,
-        session,
+        &mut session,
         prompt,
         event_tx,
         &control,
-        control.token(),
+        operation.cancel_token(),
         allow_goal_tools,
         None,
         true,
@@ -1292,9 +1283,10 @@ pub fn run_agent_for_tui(
     status
 }
 
+#[cfg(test)]
 pub(crate) fn run_agent_for_tui_with_notification_queue(
     config: &RunConfig,
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
     control: &TuiTurnControl,
@@ -1333,7 +1325,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_agent_for_tui_with_event_factory(
     config: &RunConfig,
-    session: &mut dyn TuiSession,
+    session: &mut TuiSession<'_>,
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
     background_event_tx: &Sender<TuiEvent>,
@@ -1981,6 +1973,7 @@ pub(crate) fn run_agent_for_tui_with_event_factory(
                     &cwd,
                     &tool_requests[index..batch_end],
                     event_tx,
+                    control,
                     0,
                     session.instructions(),
                     session.memory(),
@@ -2251,7 +2244,7 @@ fn take_pending_workflow_notification(
 }
 
 fn record_tui_goal_tool_finish(
-    session: &dyn TuiSession,
+    session: &TuiSession<'_>,
     turn_extension_id: &str,
     result: &tool_types::ToolResult,
 ) {
@@ -2321,11 +2314,11 @@ mod tests {
 
     fn test_turn() -> (
         TuiOperationController,
-        crate::operation_controller::TuiOperationScope,
+        crate::test_support::HostedOperationHarness,
         TuiTurnControl,
     ) {
-        let controller = TuiOperationController::default();
-        let operation = controller.start().expect("start test operation");
+        let operation = crate::test_support::HostedOperationHarness::start();
+        let controller = operation.controller().clone();
         let control = operation.control();
         (controller, operation, control)
     }
@@ -2454,9 +2447,12 @@ mod tests {
             let mut config = config();
             config.history_mode = HistoryMode::Record;
             let mut session =
-                TuiConversationSession::new_with_preloaded(&config, "provider failure", None)
+                RuntimeThread::start_with_preloaded(&config, "provider failure", None)
                     .expect("session");
-            let session_id = session.session_id().expect("session id").to_string();
+            let session_id = {
+                let session = TuiSession::new(&mut session);
+                session.session_id().expect("session id").to_string()
+            };
             let (event_tx, event_rx) = mpsc::unbounded();
             let (_action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
@@ -2478,7 +2474,7 @@ mod tests {
                     .try_iter()
                     .any(|event| matches!(event, TuiEvent::Error(message) if message == error))
             );
-            let task = session
+            let task = TuiSession::new(&mut session)
                 .task_registry()
                 .list()
                 .into_iter()
@@ -2509,11 +2505,16 @@ mod tests {
             let mut config = config();
             config.history_mode = HistoryMode::Record;
             let mut session =
-                TuiConversationSession::new_with_preloaded(&config, "background failure", None)
+                RuntimeThread::start_with_preloaded(&config, "background failure", None)
                     .expect("session");
-            let session_id = session.session_id().expect("session id").to_string();
-            let registry = session.task_registry().clone();
-            let history_writer = session.writer_mut().map(|writer| writer.clone());
+            let (session_id, registry, history_writer) = {
+                let mut tui_session = TuiSession::new(&mut session);
+                (
+                    tui_session.session_id().expect("session id").to_string(),
+                    tui_session.task_registry().clone(),
+                    tui_session.writer_mut().cloned(),
+                )
+            };
             let task = registry.create_main_session("Provider failure".to_string());
             registry.mark_running(&task.id).unwrap();
             registry.mark_backgrounded(&task.id).unwrap();
@@ -2536,7 +2537,7 @@ mod tests {
                     completion_handler: None,
                 },
             );
-            session.complete("success");
+            TuiSession::new(&mut session).complete("success");
             provider_tx
                 .send(ProviderStreamEvent::Done(ProviderResponse {
                     steps: vec![ProviderStep::Error(error.to_string())],
@@ -2611,9 +2612,10 @@ mod tests {
         with_isolated_orca_home(|_| {
             let mut config = config();
             config.history_mode = HistoryMode::Record;
-            let mut session =
-                TuiConversationSession::new_with_preloaded(&config, "approved failure", None)
+            let mut runtime =
+                RuntimeThread::start_with_preloaded(&config, "approved failure", None)
                     .expect("session");
+            let mut session = TuiSession::new(&mut runtime);
             let session_id = session.session_id().expect("session id").to_string();
             session
                 .conversation_mut()
@@ -2697,12 +2699,10 @@ mod tests {
         with_isolated_orca_home(|_| {
             let mut config = full_auto_config();
             config.history_mode = HistoryMode::Record;
-            let mut session = TuiConversationSession::new_with_preloaded(
-                &config,
-                "approved task-local usage",
-                None,
-            )
-            .expect("session");
+            let mut runtime =
+                RuntimeThread::start_with_preloaded(&config, "approved task-local usage", None)
+                    .expect("session");
+            let mut session = TuiSession::new(&mut runtime);
             session.record_external_usage(UsageTotals {
                 input_tokens: 10_000,
                 output_tokens: 1_000,
@@ -2815,36 +2815,31 @@ mod tests {
     }
 
     #[test]
-    fn tui_session_owns_runtime_thread_boundary() {
-        let source = include_str!("bridge.rs");
-        let session_start = source
-            .find("pub struct TuiConversationSession")
-            .expect("TuiConversationSession source");
-        let session_source = &source[session_start..];
-        let session_end = session_source
-            .find("impl TuiConversationSession")
-            .expect("TuiConversationSession impl");
-        let session_struct = &session_source[..session_end];
+    fn borrowed_tui_session_reuses_runtime_owned_auxiliary_state() {
+        let config = config();
+        let mut runtime =
+            RuntimeThread::start_with_preloaded(&config, "borrowed session", None).unwrap();
+        let charged = UsageTotals {
+            input_tokens: 40,
+            output_tokens: 10,
+            cache_tokens: 20,
+            estimated_cost_usd: 0.01,
+        };
 
-        assert!(
-            session_struct.contains("runtime: RuntimeThread"),
-            "TUI session must own RuntimeThread instead of rebuilding runtime state locally"
-        );
-        assert!(
-            !session_struct.contains("RuntimeSessionLifecycle"),
-            "TUI session lifecycle must be owned through RuntimeThread"
-        );
-        assert!(
-            !session_struct.contains("InteractiveSession"),
-            "TUI session must not own InteractiveSession outside RuntimeThread"
-        );
+        {
+            let mut session = TuiSession::new(&mut runtime);
+            session.record_external_usage(charged);
+        }
+        let session = TuiSession::new(&mut runtime);
+
+        assert_eq!(session.usage_totals(), charged);
     }
 
     #[test]
     fn tui_completed_tool_finish_updates_runtime_reducer_progress() {
         let config = config();
-        let session = TuiConversationSession::new_with_preloaded(&config, "goal progress", None)
-            .expect("session");
+        let mut runtime =
+            RuntimeThread::start_with_preloaded(&config, "goal progress", None).expect("session");
         let request = tool_types::ToolRequest {
             id: "call-1".to_string(),
             name: tool_types::ToolName::plain("bash"),
@@ -2854,9 +2849,12 @@ mod tests {
         };
         let result = tool_types::ToolResult::completed(&request, "ok".to_string(), false);
 
-        record_tui_goal_tool_finish(&session, "turn-1", &result);
+        {
+            let session = TuiSession::new(&mut runtime);
+            record_tui_goal_tool_finish(&session, "turn-1", &result);
+        }
 
-        let progress = session
+        let progress = runtime
             .thread_extensions()
             .get::<orca_runtime::goals::GoalToolProgressState>()
             .expect("completed TUI tool should update runtime goal progress");
@@ -2872,7 +2870,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+            RuntimeThread::start_with_preloaded(&config, "first", None).expect("session");
 
         run_agent_for_tui(
             &config,
@@ -2942,12 +2940,13 @@ mod tests {
             path: transcript_path,
         };
 
-        let session = TuiConversationSession::new_with_preloaded(
+        let mut runtime = RuntimeThread::start_with_preloaded(
             &config,
             "resume reasoning-only history",
             Some(transcript),
         )
         .expect("TUI session resumes malformed legacy history");
+        let session = TuiSession::new(&mut runtime);
 
         assert!(
             !session
@@ -2982,7 +2981,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "silent", None).expect("session");
+            RuntimeThread::start_with_preloaded(&config, "silent", None).expect("session");
 
         let status = run_agent_for_tui(
             &config,
@@ -3011,8 +3010,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "task lifecycle", None)
-                .expect("session");
+            RuntimeThread::start_with_preloaded(&config, "task lifecycle", None).expect("session");
 
         let status = run_agent_for_tui(
             &config,
@@ -3045,8 +3043,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "task identity", None)
-                .expect("session");
+            RuntimeThread::start_with_preloaded(&config, "task identity", None).expect("session");
 
         let status = run_agent_for_tui(
             &config,
@@ -3094,9 +3091,8 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
-        let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "main session task", None)
-                .expect("session");
+        let mut session = RuntimeThread::start_with_preloaded(&config, "main session task", None)
+            .expect("session");
 
         let status = run_agent_for_tui(
             &config,
@@ -3109,7 +3105,7 @@ mod tests {
         );
 
         assert_eq!(status, "success");
-        let main_tasks = session
+        let main_tasks = TuiSession::new(&mut session)
             .runtime_session()
             .task_registry()
             .list()
@@ -3151,8 +3147,7 @@ mod tests {
         let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "background turn", None)
-                .expect("session");
+            RuntimeThread::start_with_preloaded(&config, "background turn", None).expect("session");
 
         action_tx
             .send(UserAction::BackgroundCurrentTurn)
@@ -3168,7 +3163,7 @@ mod tests {
         );
 
         assert_eq!(status, "success");
-        let main_task = session
+        let main_task = TuiSession::new(&mut session)
             .runtime_session()
             .task_registry()
             .list()
@@ -3194,8 +3189,9 @@ mod tests {
         let config = config();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let mut runtime_events = EventFactory::new("background-poll".to_string());
-        let session = TuiConversationSession::new_with_preloaded(&config, "background poll", None)
-            .expect("session");
+        let mut runtime =
+            RuntimeThread::start_with_preloaded(&config, "background poll", None).expect("session");
+        let session = TuiSession::new(&mut runtime);
         let task = session
             .runtime_session()
             .task_registry()
@@ -3205,8 +3201,8 @@ mod tests {
             .task_registry()
             .mark_running(&task.id)
             .expect("running main session");
-        let controller = TuiOperationController::default();
-        let operation = controller.start().expect("start operation");
+        let operation = crate::test_support::HostedOperationHarness::start();
+        let controller = operation.controller();
         let control = operation.control();
         let mut is_backgrounded = false;
 
@@ -3239,9 +3235,8 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
-        let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "main session stop", None)
-                .expect("session");
+        let mut session = RuntimeThread::start_with_preloaded(&config, "main session stop", None)
+            .expect("session");
 
         let status = run_agent_for_tui(
             &config,
@@ -3254,7 +3249,7 @@ mod tests {
         );
 
         assert_eq!(status, "interrupted");
-        let main_task = session
+        let main_task = TuiSession::new(&mut session)
             .runtime_session()
             .task_registry()
             .list()
@@ -3292,32 +3287,23 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
-        let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "main session stop", None)
-                .expect("session");
-        let task = session
-            .runtime_session()
-            .task_registry()
-            .create_main_session("background approval".to_string());
-        session
-            .runtime_session()
-            .task_registry()
-            .mark_running(&task.id)
-            .unwrap();
-        session
-            .runtime_session()
-            .task_registry()
-            .mark_backgrounded(&task.id)
-            .unwrap();
-        session
-            .runtime_session()
-            .task_registry()
-            .approval_required_for_tool(
-                &task.id,
-                "approval_required".to_string(),
-                Some("task_list".to_string()),
-            )
-            .unwrap();
+        let mut session = RuntimeThread::start_with_preloaded(&config, "main session stop", None)
+            .expect("session");
+        let task = {
+            let tui_session = TuiSession::new(&mut session);
+            let registry = tui_session.runtime_session().task_registry();
+            let task = registry.create_main_session("background approval".to_string());
+            registry.mark_running(&task.id).unwrap();
+            registry.mark_backgrounded(&task.id).unwrap();
+            registry
+                .approval_required_for_tool(
+                    &task.id,
+                    "approval_required".to_string(),
+                    Some("task_list".to_string()),
+                )
+                .unwrap();
+            task
+        };
 
         let status = run_agent_for_tui(
             &config,
@@ -3330,7 +3316,7 @@ mod tests {
         );
 
         assert_eq!(status, "success");
-        let stopped_task = session
+        let stopped_task = TuiSession::new(&mut session)
             .runtime_session()
             .task_registry()
             .get(&task.id)
@@ -3362,8 +3348,9 @@ mod tests {
     #[test]
     fn tui_tool_schema_exposes_goal_tool_only_for_goal_turns() {
         let config = config();
-        let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+        let mut runtime =
+            RuntimeThread::start_with_preloaded(&config, "first", None).expect("session");
+        let mut session = TuiSession::new(&mut runtime);
         session.replace_goal_context("goal instructions".to_string());
 
         let base_names = tui_tools_schema(session.mcp_registry(), &config.external_tools, false)
@@ -3384,8 +3371,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = config();
         config.cwd = Some(temp.path().to_path_buf());
-        let session = TuiConversationSession::new_with_preloaded(&config, "workflow state", None)
-            .expect("session");
+        let mut runtime =
+            RuntimeThread::start_with_preloaded(&config, "workflow state", None).expect("session");
+        let session = TuiSession::new(&mut runtime);
 
         assert!(!session.runtime_session().has_active_workflows());
         let handle = session.runtime_session().task_registry().create_workflow(
@@ -3411,19 +3399,22 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
-        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
-            .expect("session");
-        let task = session.runtime_session().task_registry().create_workflow(
-            "workflow-run-1".to_string(),
-            "mock-workflow".to_string(),
-            "demo workflow".to_string(),
-            1,
-        );
-        session
-            .runtime_session()
-            .task_registry()
-            .mark_running(&task.id)
-            .expect("mark workflow running");
+        let mut session =
+            RuntimeThread::start_with_preloaded(&config, "task_list", None).expect("session");
+        let _task = {
+            let tui_session = TuiSession::new(&mut session);
+            let registry = tui_session.runtime_session().task_registry();
+            let task = registry.create_workflow(
+                "workflow-run-1".to_string(),
+                "mock-workflow".to_string(),
+                "demo workflow".to_string(),
+                1,
+            );
+            registry
+                .mark_running(&task.id)
+                .expect("mark workflow running");
+            task
+        };
 
         run_agent_for_tui(
             &config,
@@ -3475,22 +3466,20 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
-        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
-            .expect("session");
-        let task = session
-            .runtime_session()
-            .task_registry()
-            .create_main_session("backgrounded turn".to_string());
-        session
-            .runtime_session()
-            .task_registry()
-            .mark_running(&task.id)
-            .expect("mark main session running");
-        session
-            .runtime_session()
-            .task_registry()
-            .mark_backgrounded(&task.id)
-            .expect("mark main session backgrounded");
+        let mut session =
+            RuntimeThread::start_with_preloaded(&config, "task_list", None).expect("session");
+        let _task = {
+            let tui_session = TuiSession::new(&mut session);
+            let registry = tui_session.runtime_session().task_registry();
+            let task = registry.create_main_session("backgrounded turn".to_string());
+            registry
+                .mark_running(&task.id)
+                .expect("mark main session running");
+            registry
+                .mark_backgrounded(&task.id)
+                .expect("mark main session backgrounded");
+            task
+        };
 
         run_agent_for_tui(
             &config,
@@ -3520,64 +3509,12 @@ mod tests {
     }
 
     #[test]
-    fn tui_agent_turn_result_owns_typed_continuation_boundary() {
-        let source = include_str!("agent_runner.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source before tests");
-
-        assert!(
-            production.contains("pub(crate) enum TuiAgentTurnContinuation"),
-            "turn results should name continuation intent with a typed boundary"
-        );
-        assert!(
-            production.contains("pub(crate) continuation: Option<TuiAgentTurnContinuation>"),
-            "turn results should expose a generic continuation slot"
-        );
-        assert!(
-            !production.contains("next_workflow_notification"),
-            "workflow notifications should be one continuation variant, not the result field"
-        );
-    }
-
-    #[test]
-    fn approved_background_turn_runner_takes_typed_continuation_request() {
-        let source = include_str!("agent_runner.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source before tests");
-        let runner = production
-            .split("pub(crate) fn continue_approved_background_turn_for_tui(")
-            .nth(1)
-            .expect("background continuation runner");
-        let runner_signature = runner
-            .split(") -> TuiAgentTurnResult")
-            .next()
-            .expect("background continuation runner signature");
-
-        assert!(
-            production.contains("pub(crate) struct TuiBackgroundTurnContinuationRequest"),
-            "background continuations should cross the TUI runner boundary as a typed request"
-        );
-        assert!(
-            runner_signature.contains("continuation: &TuiBackgroundTurnContinuationRequest"),
-            "runner should take the typed continuation request"
-        );
-        assert!(
-            !runner_signature.contains("task_id: &str"),
-            "runner should not expose a naked task id in the continuation boundary"
-        );
-    }
-
-    #[test]
     fn failed_workflow_notification_is_returned_after_tool_batch_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (_controller, _operation, control) = test_turn();
+        let (_controller, operation, control) = test_turn();
         let pending_notifications = PendingWorkflowNotifications::new();
         assert!(
             pending_notifications.push_unique(crate::types::PendingWorkflowNotification {
@@ -3586,8 +3523,9 @@ mod tests {
                     .to_string(),
             })
         );
-        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
-            .expect("session");
+        let mut runtime =
+            RuntimeThread::start_with_preloaded(&config, "task_list", None).expect("session");
+        let mut session = TuiSession::new(&mut runtime);
         let (_tasks, task_spawner) = test_task_supervisor();
 
         let result = run_agent_for_tui_with_notification_queue(
@@ -3596,7 +3534,7 @@ mod tests {
             "task_list",
             &event_tx,
             &control,
-            control.token(),
+            operation.cancel_token(),
             false,
             None,
             true,
@@ -3632,10 +3570,11 @@ mod tests {
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
         let (event_tx, _event_rx) = mpsc::unbounded();
-        let (_controller, _operation, control) = test_turn();
+        let (_controller, operation, control) = test_turn();
         let pending_notifications = PendingWorkflowNotifications::new();
-        let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
-            .expect("session");
+        let mut runtime =
+            RuntimeThread::start_with_preloaded(&config, "task_list", None).expect("session");
+        let mut session = TuiSession::new(&mut runtime);
         let (_tasks, task_spawner) = test_task_supervisor();
 
         let result = run_agent_for_tui_with_notification_queue(
@@ -3644,7 +3583,7 @@ mod tests {
             "task_list",
             &event_tx,
             &control,
-            control.token(),
+            operation.cancel_token(),
             false,
             None,
             true,
@@ -3668,8 +3607,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "workflow inline", None)
-                .expect("session");
+            RuntimeThread::start_with_preloaded(&config, "workflow inline", None).expect("session");
 
         run_agent_for_tui(
             &config,
@@ -3777,8 +3715,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "workflow draft", None)
-                .expect("session");
+            RuntimeThread::start_with_preloaded(&config, "workflow draft", None).expect("session");
 
         run_agent_for_tui(
             &config,
@@ -3816,7 +3753,7 @@ mod tests {
         let (action_tx, action_rx) = mpsc::unbounded();
         let turn_cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "bash", None).expect("session");
+            RuntimeThread::start_with_preloaded(&config, "bash", None).expect("session");
 
         let handle = std::thread::spawn(move || {
             run_agent_for_tui(
@@ -3871,9 +3808,8 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
-        let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "task stop siblings", None)
-                .expect("session");
+        let mut session = RuntimeThread::start_with_preloaded(&config, "task stop siblings", None)
+            .expect("session");
 
         let status = run_agent_for_tui(
             &config,
@@ -3886,6 +3822,7 @@ mod tests {
         );
 
         assert_eq!(status, "interrupted");
+        let session = TuiSession::new(&mut session);
         let assistant_call_ids = session
             .conversation()
             .messages
@@ -4560,10 +4497,12 @@ mod tests {
             let mut config = full_auto_config();
             config.history_mode = HistoryMode::Record;
             config.max_budget_usd = Some(0.0);
-            let mut session =
-                TuiConversationSession::new_with_preloaded(&config, "budgeted child", None)
-                    .expect("session");
-            let session_id = session.session_id().expect("session id").to_string();
+            let mut session = RuntimeThread::start_with_preloaded(&config, "budgeted child", None)
+                .expect("session");
+            let session_id = {
+                let session = TuiSession::new(&mut session);
+                session.session_id().expect("session id").to_string()
+            };
             let (event_tx, event_rx) = mpsc::unbounded();
             let (_action_tx, action_rx) = mpsc::unbounded();
 
@@ -4578,7 +4517,7 @@ mod tests {
             );
 
             assert_eq!(status, "budget_exhausted");
-            let totals = session.usage_totals();
+            let totals = TuiSession::new(&mut session).usage_totals();
             assert_eq!(totals.input_tokens, 120);
             assert_eq!(totals.output_tokens, 30);
             assert_eq!(totals.cache_tokens, 10);
@@ -4634,11 +4573,15 @@ mod tests {
                     if persisted_id == tool_call_id
             ));
             assert!(
-                !session.conversation().messages.iter().any(|message| {
-                    message
-                        .content_str()
-                        .is_some_and(|content| content == "Mock completed after tool execution.")
-                }),
+                !TuiSession::new(&mut session)
+                    .conversation()
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        message.content_str().is_some_and(|content| {
+                            content == "Mock completed after tool execution."
+                        })
+                    }),
                 "budget enforcement must stop before another parent provider request"
             );
         });
@@ -4649,14 +4592,15 @@ mod tests {
         let mut config = full_auto_config();
         config.max_budget_usd = Some(0.25);
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "budgeted child", None)
-                .expect("session");
-        session.usage_ledger().add(UsageTotals {
-            input_tokens: 100,
-            output_tokens: 25,
-            cache_tokens: 8,
-            estimated_cost_usd: 0.25,
-        });
+            RuntimeThread::start_with_preloaded(&config, "budgeted child", None).expect("session");
+        TuiSession::new(&mut session)
+            .usage_ledger()
+            .add(UsageTotals {
+                input_tokens: 100,
+                output_tokens: 25,
+                cache_tokens: 8,
+                estimated_cost_usd: 0.25,
+            });
         let (event_tx, event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
 
@@ -4690,8 +4634,8 @@ mod tests {
         config.cwd = Some(temp.path().to_path_buf());
         config.max_budget_usd = Some(0.5);
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "budgeted turn", None).unwrap();
-        session
+            RuntimeThread::start_with_preloaded(&config, "budgeted turn", None).unwrap();
+        TuiSession::new(&mut session)
             .usage_ledger()
             .add(orca_core::cost_types::UsageTotals {
                 input_tokens: 100,
@@ -4713,6 +4657,7 @@ mod tests {
         );
 
         assert_eq!(status, "budget_exhausted");
+        let session = TuiSession::new(&mut session);
         assert!(
             !session
                 .conversation()
@@ -4915,7 +4860,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+            RuntimeThread::start_with_preloaded(&config, "first", None).expect("session");
 
         run_agent_for_tui(
             &config,
@@ -4937,7 +4882,7 @@ mod tests {
         );
 
         assert_eq!(
-            session.backtrack_last_user(),
+            TuiSession::new(&mut session).backtrack_last_user(),
             Some("second prompt".to_string())
         );
 
@@ -4970,7 +4915,7 @@ mod tests {
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
+            RuntimeThread::start_with_preloaded(&config, "first", None).expect("session");
         let (_tasks, task_spawner) = test_task_supervisor();
 
         run_agent_for_tui(
@@ -4982,26 +4927,29 @@ mod tests {
             &cancel,
             false,
         );
-        let (_controller, _operation, control) = test_turn();
-        run_agent_for_tui_with_notification_queue(
-            &config,
-            &mut session,
-            "<task-notification>mock_history_echo</task-notification>",
-            &event_tx,
-            &control,
-            control.token(),
-            false,
-            Some("Workflow notification notification-1"),
-            false,
-            None,
-            None,
-            &task_spawner,
-        );
+        let (_controller, operation, control) = test_turn();
+        {
+            let mut tui_session = TuiSession::new(&mut session);
+            run_agent_for_tui_with_notification_queue(
+                &config,
+                &mut tui_session,
+                "<task-notification>mock_history_echo</task-notification>",
+                &event_tx,
+                &control,
+                operation.cancel_token(),
+                false,
+                Some("Workflow notification notification-1"),
+                false,
+                None,
+                None,
+                &task_spawner,
+            );
 
-        assert_eq!(
-            session.backtrack_last_user(),
-            Some("first prompt".to_string())
-        );
+            assert_eq!(
+                tui_session.backtrack_last_user(),
+                Some("first prompt".to_string())
+            );
+        }
     }
 
     #[test]
@@ -5011,7 +4959,7 @@ mod tests {
         let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "ask", None).expect("session");
+            RuntimeThread::start_with_preloaded(&config, "ask", None).expect("session");
 
         let responder_tx = action_tx.clone();
         let responder = std::thread::spawn(move || {
@@ -5058,7 +5006,7 @@ mod tests {
         let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
-            TuiConversationSession::new_with_preloaded(&config, "ask", None).expect("session");
+            RuntimeThread::start_with_preloaded(&config, "ask", None).expect("session");
 
         let responder = std::thread::spawn(move || {
             loop {
@@ -5097,6 +5045,7 @@ mod tests {
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
+        let (_controller, _operation, control) = test_turn();
 
         let (child, _child_cost_tracker) = run_child_agent_for_tui_silent(
             &config,
@@ -5109,6 +5058,7 @@ mod tests {
             &memory,
             &hooks,
             None,
+            &control,
         );
 
         assert_eq!(child.status, RunStatus::Success);
@@ -5127,8 +5077,8 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::unbounded();
         let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
-        let mut session = TuiConversationSession::new_with_preloaded(&config, "unknown tool", None)
-            .expect("session");
+        let mut session =
+            RuntimeThread::start_with_preloaded(&config, "unknown tool", None).expect("session");
 
         let status = run_agent_for_tui(
             &config,
@@ -5141,6 +5091,7 @@ mod tests {
         );
 
         assert_eq!(status, "success");
+        let session = TuiSession::new(&mut session);
         let unknown_tool_result_index = session
             .conversation()
             .messages
@@ -5177,6 +5128,7 @@ mod tests {
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
+        let (_controller, _operation, control) = test_turn();
         let failing = tool_types::ToolRequest {
             id: "subagent-failing".to_string(),
             name: tool_types::ToolName::Subagent,
@@ -5209,6 +5161,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &[failing, succeeding],
             &event_tx,
+            &control,
             0,
             &instructions,
             &memory,
@@ -5232,6 +5185,7 @@ mod tests {
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
         let registry = TaskRegistry::new("session-malformed-subagent".to_string());
+        let (_controller, _operation, control) = test_turn();
         let request = tool_types::ToolRequest {
             id: "subagent-malformed".to_string(),
             name: tool_types::ToolName::Subagent,
@@ -5245,6 +5199,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &[request],
             &event_tx,
+            &control,
             0,
             &instructions,
             &memory,
@@ -5282,6 +5237,7 @@ mod tests {
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
+        let (_controller, _operation, control) = test_turn();
         let request = tool_types::ToolRequest {
             id: "subagent-progress".to_string(),
             name: tool_types::ToolName::Subagent,
@@ -5301,6 +5257,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &[request],
             &event_tx,
+            &control,
             0,
             &instructions,
             &memory,
@@ -5331,6 +5288,7 @@ mod tests {
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
         let registry = TaskRegistry::new("session-sync-progress".to_string());
+        let (_controller, _operation, control) = test_turn();
         let request = tool_types::ToolRequest {
             id: "subagent-sync-progress".to_string(),
             name: tool_types::ToolName::Subagent,
@@ -5350,6 +5308,7 @@ mod tests {
             config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
             &[request],
             &event_tx,
+            &control,
             0,
             &instructions,
             &memory,

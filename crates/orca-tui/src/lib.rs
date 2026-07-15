@@ -56,7 +56,29 @@ pub use app::run_tui;
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::{Mutex, MutexGuard};
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::Duration;
+
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::cancel::CancelToken;
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, ReasoningEffort, RunConfig,
+        ThemeName, ToolConfig, WorkflowConfig,
+    };
+    use orca_core::event_schema::{EventFactory, RunStatus};
+    use orca_core::model::ModelSelection;
+    use orca_runtime::runtime_host::{
+        GenerationContext, HostedTurnRequest, OperationHandle, RuntimeHost, RuntimeThreadHandle,
+        ThreadOperationExecutor,
+    };
+    use orca_runtime::thread::RuntimeThread;
+
+    use crate::interaction_broker::TuiInteractionBroker;
+    use crate::operation_controller::{
+        TuiOperationController, TuiOperationInterrupt, TuiTurnControl,
+    };
 
     static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -65,106 +87,196 @@ pub(crate) mod test_support {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct TestOperationInterrupt {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TestOperationInterrupt {
+        pub(crate) fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TuiOperationInterrupt for TestOperationInterrupt {
+        fn interrupt_current(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct HostedControlExecutor {
+        controller: TuiOperationController,
+        control_tx: crossbeam_channel::Sender<(TuiTurnControl, CancelToken)>,
+        release_rx: crossbeam_channel::Receiver<()>,
+    }
+
+    impl ThreadOperationExecutor for HostedControlExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<RunStatus> {
+            let control = self
+                .controller
+                .wait_for_hosted(generation.fence().operation_id(), cancel)?;
+            self.control_tx
+                .send((control, cancel.clone()))
+                .map_err(|_| io::Error::other("hosted test control receiver closed"))?;
+            loop {
+                if cancel.is_cancelled() {
+                    return Ok(RunStatus::Cancelled);
+                }
+                match self.release_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) => return Ok(RunStatus::Success),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Ok(RunStatus::Cancelled);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) struct HostedOperationHarness {
+        controller: TuiOperationController,
+        control: TuiTurnControl,
+        cancel: CancelToken,
+        operation: Arc<OperationHandle>,
+        thread: RuntimeThreadHandle,
+        release_tx: crossbeam_channel::Sender<()>,
+        host: Option<RuntimeHost>,
+        completed: bool,
+    }
+
+    impl HostedOperationHarness {
+        pub(crate) fn start() -> Self {
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let (control_tx, control_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            let executor = Arc::new(HostedControlExecutor {
+                controller: controller.clone(),
+                control_tx,
+                release_rx,
+            });
+            let host = RuntimeHost::start_with_executor(executor).expect("hosted test runtime");
+            let thread = host
+                .start_thread(test_run_config(), "hosted TUI test")
+                .expect("hosted test thread");
+            let operation = Arc::new(
+                thread
+                    .start_turn(HostedTurnRequest::new("hosted TUI test"), io::sink())
+                    .expect("hosted test operation"),
+            );
+            controller
+                .install_hosted(Arc::clone(&operation))
+                .expect("install hosted test operation");
+            let (control, cancel) = control_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("hosted test turn control");
+            Self {
+                controller,
+                control,
+                cancel,
+                operation,
+                thread,
+                release_tx,
+                host: Some(host),
+                completed: false,
+            }
+        }
+
+        pub(crate) fn controller(&self) -> &TuiOperationController {
+            &self.controller
+        }
+
+        pub(crate) fn control(&self) -> TuiTurnControl {
+            self.control.clone()
+        }
+
+        pub(crate) fn cancel_token(&self) -> &CancelToken {
+            &self.cancel
+        }
+
+        pub(crate) fn operation(&self) -> &OperationHandle {
+            &self.operation
+        }
+
+        pub(crate) fn operation_handle(&self) -> Arc<OperationHandle> {
+            Arc::clone(&self.operation)
+        }
+
+        pub(crate) fn finish(&mut self) {
+            if self.completed {
+                return;
+            }
+            let _ = self.release_tx.try_send(());
+            self.operation
+                .wait_timeout(Duration::from_secs(2))
+                .expect("hosted test operation completion");
+            self.controller.complete_hosted(self.operation.id());
+            self.completed = true;
+        }
+    }
+
+    impl Drop for HostedOperationHarness {
+        fn drop(&mut self) {
+            if !self.completed {
+                let _ = self.operation.interrupt();
+                let _ = self.release_tx.try_send(());
+                let _ = self.operation.wait_timeout(Duration::from_secs(2));
+                self.controller.complete_hosted(self.operation.id());
+            }
+            let _ = self.thread.shutdown();
+            if let Some(host) = self.host.take() {
+                let _ = host.shutdown();
+            }
+        }
+    }
+
+    pub(crate) fn test_run_config() -> RunConfig {
+        RunConfig {
+            app_version: "0.0.0-test".to_string(),
+            prompt: String::new(),
+            cwd: std::env::current_dir().ok(),
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::from_unchecked(Some("auto".to_string())),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: Default::default(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            subagents: Default::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::Dark,
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn runtime_event_projection_is_owned_by_dedicated_module() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let projection =
-            std::fs::read_to_string(format!("{manifest_dir}/src/runtime_event_projection.rs"))
-                .expect("runtime event projection module should exist");
-        assert!(
-            projection.contains("pub(crate) fn tui_event_from_runtime_event"),
-            "runtime_event_projection should export the TUI runtime event adapter"
-        );
-        assert!(
-            projection.contains("EventType::ContextCompacted"),
-            "runtime_event_projection should map runtime context compaction events into TUI events"
-        );
-        assert!(
-            projection.contains("TuiEvent::Compacted"),
-            "runtime_event_projection should preserve compacted context notices for TUI users"
-        );
-
-        let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
-            .expect("bridge source should be readable");
-        assert!(
-            !bridge.contains("fn tui_event_from_runtime_event"),
-            "bridge should call the shared TUI runtime event adapter instead of owning it"
-        );
-    }
-
-    #[test]
-    fn runtime_interaction_adapters_are_owned_by_dedicated_module() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let adapter =
-            std::fs::read_to_string(format!("{manifest_dir}/src/runtime_interaction_adapter.rs"))
-                .expect("runtime interaction adapter module should exist");
-        assert!(
-            adapter.contains("pub(crate) struct TuiApprovalHandler"),
-            "runtime_interaction_adapter should own the TUI approval handler"
-        );
-        assert!(
-            adapter.contains("pub(crate) struct TuiUserInputHandler"),
-            "runtime_interaction_adapter should own the TUI user-input handler"
-        );
-        assert!(
-            adapter.contains("pub(crate) fn resolve_tui_tool_approval"),
-            "runtime_interaction_adapter should own the TUI tool approval gate"
-        );
-        assert!(
-            adapter.contains("RuntimePendingInteractionRecord"),
-            "runtime_interaction_adapter should project runtime-owned pending interaction records"
-        );
-        assert!(
-            adapter.contains("fn approval_event_from_pending_interaction"),
-            "runtime_interaction_adapter should map runtime pending approval records into TUI events"
-        );
-        assert!(
-            adapter.contains("fn user_input_event_from_pending_interaction"),
-            "runtime_interaction_adapter should map runtime pending user-input records into TUI events"
-        );
-
-        let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
-            .expect("bridge source should be readable");
-        assert!(
-            !bridge.contains("struct TuiApprovalHandler"),
-            "bridge should use the TUI approval adapter instead of owning it"
-        );
-        assert!(
-            !bridge.contains("struct TuiUserInputHandler"),
-            "bridge should use the TUI user-input adapter instead of owning it"
-        );
-        assert!(
-            !bridge.contains("approval_request_for_invocation"),
-            "bridge should delegate TUI approval request construction to the interaction adapter"
-        );
-        assert!(
-            !bridge.contains("resolve_interactive_tool_approval"),
-            "bridge should delegate interactive approval waits to the interaction adapter"
-        );
-    }
-
-    #[test]
-    fn tui_agent_runner_is_owned_by_dedicated_module() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
-            .expect("TUI agent runner module should exist");
-        assert!(
-            runner.contains("pub fn run_agent_for_tui"),
-            "agent_runner should own the TUI agent turn loop entrypoint"
-        );
-
-        let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
-            .expect("bridge source should be readable");
-        assert!(
-            !bridge.contains("pub fn run_agent_for_tui"),
-            "bridge should not own the TUI agent turn loop"
-        );
-    }
-
     #[test]
     fn tui_main_agent_compaction_is_runtime_owned() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1328,40 +1440,6 @@ mod tests {
         assert!(
             !runner.contains("fn execute_tool_for_tui"),
             "agent_runner should not own TUI tool execution helpers"
-        );
-    }
-
-    #[test]
-    fn tui_goal_updates_use_runtime_thread_extension_guard() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let bridge = std::fs::read_to_string(format!("{manifest_dir}/src/bridge.rs"))
-            .expect("bridge source should be readable");
-        assert!(
-            bridge.contains("thread_extensions"),
-            "TUI session should expose RuntimeThread thread extension state"
-        );
-
-        let execution =
-            std::fs::read_to_string(format!("{manifest_dir}/src/agent_tool_execution.rs"))
-                .expect("TUI agent tool execution source should be readable");
-        assert!(
-            execution.contains("validate_goal_terminal_update_against_extensions"),
-            "TUI goal update handler must guard terminal updates with live runtime extension state"
-        );
-
-        let runner = std::fs::read_to_string(format!("{manifest_dir}/src/agent_runner.rs"))
-            .expect("TUI agent runner source should be readable");
-        assert!(
-            runner.contains("record_tui_goal_tool_finish"),
-            "TUI agent runner must record completed tools into live runtime thread extension state"
-        );
-        assert!(
-            runner.contains("RuntimeTurnReducer"),
-            "TUI completed-tool recording should route through the runtime turn reducer"
-        );
-        assert!(
-            !runner.contains("goals::record_goal_tool_finish"),
-            "TUI should not write goal progress directly; runtime turn reducer owns tool finish state"
         );
     }
 
