@@ -84,11 +84,12 @@ produces provider output, and completes successfully. The complete TUI suite
 passes with 467 tests, and workspace Clippy completes with only the repository's
 existing warnings.
 
-The implementation also passed the complete serial workspace gate before the
-final behavior test was added. That gate will run again after the final main
-rebase and release metadata update, together with site, release-helper, and
-real DeepSeek verification. Remote Actions and public GitHub/npm verification
-remain release gates rather than implementation gates.
+After the final main check and release metadata update, the complete serial
+workspace gate passed with 772 runtime tests, 467 TUI tests, 130 app-server
+contract tests, and every remaining workspace target. Site build and SEO,
+release-helper tests, and the real DeepSeek provider/CLI/history/server/thread
+gate also passed. Remote Actions and public GitHub/npm verification remain
+release gates rather than implementation gates.
 
 The server reset path at
 `crates/orca-runtime/src/server/processors/turn.rs` is not accepted as a

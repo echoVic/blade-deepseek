@@ -14,9 +14,13 @@ agent loop, submits a second turn, and proves that the second turn receives a
 different live scope and completes successfully. CLI arguments, TUI keys and
 flows, server/JSONL, persistence, and DeepSeek behavior remain compatible.
 Focused cancellation tests, the complete 467-test TUI suite, and workspace
-Clippy pass. The complete serial workspace gate passed before the final behavior
-test and will run again after the final main rebase with site, release-helper,
-and real DeepSeek verification.
+Clippy pass. The final serial workspace gate also passed with 772 runtime tests,
+467 TUI tests, 130 app-server contract tests, and every remaining target. Site
+build and SEO, release-helper tests, and the real DeepSeek provider, CLI,
+history, server, thread-memory, metadata, turn-control, list/search, and
+paginated-read gates pass. Remote Actions, GitHub Release, npm, and public
+installation verification remain required before this becomes the released
+baseline.
 
 The server `turn/resume` processor still resets its active `CancelToken`; that
 path is explicitly outside this TUI slice and is not a permanent compatibility
