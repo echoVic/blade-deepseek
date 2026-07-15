@@ -499,7 +499,7 @@ if (args[0] === "--mode" && args[1] === "server") {
     `server-stdin {"id":"server-thread-turn-1","method":"turn/start","params":{"threadId":"thread-test","input":[{"type":"text","text":"Remember this exact token for the next turn: ${serverThreadSentinel}. Reply with exactly: READY."}]}}`,
     "server-stdin {\"id\":\"server-thread-turn-2\",\"method\":\"turn/start\",\"params\":{\"threadId\":\"thread-test\",\"input\":[{\"type\":\"text\",\"text\":\"Reply with exactly the token I asked you to remember.\"}]}}",
     "server-stdin {\"id\":\"server-resume-thread\",\"method\":\"thread/start\",\"params\":{}}",
-    `server-stdin {"id":"server-resume-turn","method":"turn/start","params":{"threadId":"thread-test-resume","input":[{"type":"text","text":"Write 60 short numbered lines. The final line must be exactly: ${serverResumeSentinel}"}]}}`,
+    `server-stdin {"id":"server-resume-turn","method":"turn/start","params":{"threadId":"thread-test-resume","approvalPolicy":"never","input":[{"type":"text","text":"Do not call tools or inspect files. This is a text-only streaming test. Write 80 short numbered lines containing STREAM. The final line must be exactly: ${serverResumeSentinel}"}]}}`,
     "server-stdin {\"id\":\"server-resume-interrupt\",\"method\":\"turn/interrupt\",\"params\":{\"threadId\":\"thread-test-resume\",\"turnId\":\"turn-resume-test\"}}",
     "server-stdin {\"id\":\"server-resume-resume\",\"method\":\"turn/resume\",\"params\":{\"threadId\":\"thread-test-resume\",\"turnId\":\"turn-resume-test\"}}",
     "server-stdin {\"id\":\"server-turn-interrupt\",\"method\":\"turn/interrupt\",\"params\":{\"turnId\":\"turn-idle-real-api\"}}",

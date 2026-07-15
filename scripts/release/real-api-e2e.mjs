@@ -507,10 +507,11 @@ async function runServerThread(args) {
       method: "turn/start",
       params: {
         threadId: resumeThreadId,
+        approvalPolicy: "never",
         input: [
           {
             type: "text",
-            text: `Write 60 short numbered lines. The final line must be exactly: ${serverResumeSentinel}`,
+            text: `Do not call tools or inspect files. This is a text-only streaming test. Write 80 short numbered lines containing STREAM. The final line must be exactly: ${serverResumeSentinel}`,
           },
         ],
       },
