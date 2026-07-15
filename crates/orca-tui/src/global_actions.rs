@@ -115,6 +115,9 @@ mod tests {
             || Ok(()),
         )
         .unwrap();
+        assert!(matches!(first, super::GlobalShortcutFlow::Continue));
+        assert!(action_rx.try_recv().is_err());
+
         let second = handle_global_shortcut(
             GlobalShortcut::Cancel,
             &mut state,
@@ -124,8 +127,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(first, super::GlobalShortcutFlow::Continue));
-        assert!(action_rx.try_recv().is_err());
         assert!(matches!(second, super::GlobalShortcutFlow::Exit(130)));
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Cancel)));
     }
