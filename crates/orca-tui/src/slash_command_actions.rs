@@ -114,8 +114,46 @@ pub(crate) fn handle_slash_command(
             state.enter_running();
             let _ = action_tx.send(action);
         }
+        SlashCommand::SkillRun { id, args } => {
+            let prompt = match args {
+                Some(a) => format!("${id}:{a}"),
+                None => format!("${id}"),
+            };
+            state.record_prompt(prompt.clone());
+            state.push_message(ChatMessage::User(prompt.clone()));
+            state.enter_running();
+            let _ = action_tx.send(UserAction::Submit(prompt));
+        }
         SlashCommand::WorkflowList => {
             state.show_workflows();
+        }
+        SlashCommand::SkillList => {
+            let cwd = config
+                .cwd
+                .as_deref()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            match orca_tools::skills::discover_from_env(&cwd) {
+                Ok(skills) if skills.is_empty() => {
+                    state.push_message(ChatMessage::System("No skills found. Add SKILL.md files under .orca/skills/ or .agents/skills/.".to_string()));
+                }
+                Ok(skills) => {
+                    let list = skills
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "${} [{}] — {}",
+                                s.id,
+                                s.source.as_str(),
+                                if s.description.is_empty() { &s.name } else { &s.description }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    state.push_message(ChatMessage::System(format!("Available skills:\n{list}")));
+                }
+                Err(e) => state.push_message(ChatMessage::Error(format!("failed to list skills: {e}"))),
+            }
         }
         SlashCommand::WorkflowRun { name, args } => {
             state.enter_running();

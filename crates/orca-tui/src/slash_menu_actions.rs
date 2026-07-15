@@ -159,6 +159,21 @@ pub(crate) fn handle_slash_menu_key(
                 state.slash_menu = None;
                 return true;
             }
+            // skill commands: fill textarea so user can add args before submitting
+            let cwd = config
+                .cwd
+                .as_deref()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            if let Some(id) = selected_cmd.strip_prefix('/') {
+                if let Ok(skills) = orca_tools::skills::discover_from_env(&cwd) {
+                    if skills.iter().any(|s| s.id == id) {
+                        *textarea = make_textarea_with_text(&format!("{selected_cmd} "), vim_state, theme);
+                        state.slash_menu = None;
+                        return true;
+                    }
+                }
+            }
             select_slash_menu_command(
                 selected_cmd,
                 menu.items.clone(),

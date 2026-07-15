@@ -567,6 +567,66 @@ mod tests {
     }
 
     #[test]
+    fn stale_bound_file_preparation_emits_submission_rejected() {
+        let root = tempdir().expect("workspace root");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonical workspace root");
+        let mut config = test_config(HistoryMode::Disabled);
+        config.cwd = Some(root_path.clone());
+        config.runtime_workspace_roots = Some(vec![root_path.clone()]);
+        let config = Arc::new(Mutex::new(config));
+        let preloaded = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
+        let pending_actions = RefCell::new(VecDeque::new());
+        let cancel = CancelToken::new();
+        let pending_workflow_notifications = test_pending_workflow_notifications();
+        let mut session = None;
+        let mut pending_pinned_context = Vec::new();
+        let prompt = "review @gone.txt";
+        let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+            prompt,
+            vec![orca_runtime::mentions::MentionBinding {
+                start: 7,
+                end: prompt.len(),
+                visible: "@gone.txt".to_string(),
+                target: orca_runtime::mentions::MentionTarget::File {
+                    root: root_path,
+                    path: "gone.txt".to_string(),
+                    kind: orca_runtime::mentions::MentionFileKind::File,
+                },
+            }],
+        );
+
+        handle_submitted_turn_for_tui(
+            SubmittedTurn::user_with_mentions(prompt.to_string(), bindings),
+            &config,
+            &preloaded,
+            &mut session,
+            &mut pending_pinned_context,
+            &event_tx,
+            &action_rx,
+            &pending_actions,
+            &cancel,
+            &pending_workflow_notifications,
+            &orca_mcp::McpRegistry::default(),
+        );
+
+        let rejection = event_rx
+            .try_iter()
+            .find(|event| matches!(event, TuiEvent::SubmissionRejected { .. }))
+            .expect("submission rejection event");
+        assert!(matches!(
+            rejection,
+            TuiEvent::SubmissionRejected { prompt, message }
+                if prompt == "review @gone.txt"
+                    && message.contains("failed to resolve bound @gone.txt")
+        ));
+    }
+
+    #[test]
     fn workflow_submission_error_remains_generic() {
         let (event_tx, event_rx) = mpsc::unbounded();
 
@@ -3344,6 +3404,40 @@ mod tests {
                 kind: orca_runtime::mentions::MentionFileKind::File,
             }
         );
+    }
+
+    #[test]
+    fn idle_submit_with_open_empty_mention_popup_keeps_unbound_at_literal() {
+        let (mut state, _rx) = test_state();
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let prompt = "@oai/sky还能逆向吗";
+        let mut textarea = make_textarea_with_text(prompt, &vim_state, &theme);
+        state.mention.phase = Some(orca_file_search::SearchPhase::Scanning);
+        assert!(state.mention.candidates.is_empty());
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        crate::idle_key_actions::handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+        );
+
+        let action = action_rx.try_recv().expect("literal submit action");
+        let UserAction::SubmitWithMentions { prompt, bindings } = action else {
+            panic!("expected mention-aware submit boundary");
+        };
+        assert_eq!(prompt, "@oai/sky还能逆向吗");
+        assert!(bindings.is_empty());
     }
 }
 

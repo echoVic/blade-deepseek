@@ -55,6 +55,7 @@ fn exec_preserves_unbound_at_tokens_as_literal_history() {
         .arg(project.path())
         .arg("summarize")
         .arg("@notes.txt#L2")
+        .arg("@oai/sky还能逆向吗")
         .output()
         .expect("run orca");
 
@@ -68,7 +69,7 @@ fn exec_preserves_unbound_at_tokens_as_literal_history() {
 
     assert_eq!(show.status.code(), Some(0));
     let show_stdout = String::from_utf8_lossy(&show.stdout);
-    assert!(show_stdout.contains("summarize @notes.txt#L2"));
+    assert!(show_stdout.contains("summarize @notes.txt#L2 @oai/sky还能逆向吗"));
     assert!(!show_stdout.contains("<file"));
     assert!(!show_stdout.contains("beta</file>"));
 }

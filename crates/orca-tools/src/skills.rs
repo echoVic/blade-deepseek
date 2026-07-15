@@ -1,14 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use globset::{Glob, GlobSetBuilder};
 use orca_core::tool_types::{ToolRequest, ToolResult};
 use serde::Deserialize;
+use walkdir::WalkDir;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Skill {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub when_to_use: Option<String>,
+    pub paths: Vec<String>,
     pub source: SkillSource,
     pub path: PathBuf,
     pub body: String,
@@ -21,7 +25,7 @@ pub enum SkillSource {
 }
 
 impl SkillSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Project => "project",
@@ -62,18 +66,29 @@ pub fn discover_from_env(cwd: &Path) -> Result<Vec<Skill>, String> {
     let orca_home = std::env::var_os("ORCA_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".orca")));
-    discover(cwd, orca_home.as_deref())
+    let agents_home = dirs::home_dir().map(|home| home.join(".agents"));
+    discover(cwd, orca_home.as_deref(), agents_home.as_deref())
 }
 
-pub fn discover(cwd: &Path, orca_home: Option<&Path>) -> Result<Vec<Skill>, String> {
+pub fn discover(cwd: &Path, orca_home: Option<&Path>, agents_home: Option<&Path>) -> Result<Vec<Skill>, String> {
     let project_root = project_root(cwd);
     let mut skills = Vec::new();
     if let Some(home) = orca_home {
         collect_skills(&home.join("skills"), SkillSource::User, None, &mut skills)?;
     }
+    if let Some(home) = agents_home {
+        // ~/.agents/<skill-name>/SKILL.md  (no "skills" subdirectory at global level)
+        collect_skills(home, SkillSource::User, None, &mut skills)?;
+    }
     if let Some(project_root) = project_root {
         collect_skills(
             &project_root.join(".orca/skills"),
+            SkillSource::Project,
+            Some(&project_root),
+            &mut skills,
+        )?;
+        collect_skills(
+            &project_root.join(".agents/skills"),
             SkillSource::Project,
             Some(&project_root),
             &mut skills,
@@ -85,20 +100,26 @@ pub fn discover(cwd: &Path, orca_home: Option<&Path>) -> Result<Vec<Skill>, Stri
 }
 
 pub fn explicit_skill_prompt_block(cwd: &Path, prompt: &str) -> Result<Option<String>, String> {
-    let mentioned = mentioned_skill_ids(prompt);
+    let mentioned = mentioned_skill_mentions(prompt);
     if mentioned.is_empty() {
         return Ok(None);
     }
     let skills = discover_from_env(cwd)?;
-    let selected = mentioned
+    let selected: Vec<(Skill, Option<String>)> = mentioned
         .into_iter()
-        .filter_map(|id| skills.iter().find(|skill| skill.id == id).cloned())
-        .collect::<Vec<_>>();
-    Ok(format_skills_prompt_block(&selected))
+        .filter_map(|(id, arg)| {
+            skills
+                .iter()
+                .find(|skill| skill.id == id)
+                .map(|skill| (skill.clone(), arg))
+        })
+        .collect();
+    Ok(format_skills_prompt_block_with_args(&selected))
 }
 
-pub fn mentioned_skill_ids(text: &str) -> Vec<String> {
-    let mut ids = Vec::new();
+/// Returns `(id, arg)` pairs for every `$id` or `$id:arg` mention in `text`.
+pub fn mentioned_skill_mentions(text: &str) -> Vec<(String, Option<String>)> {
+    let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -120,20 +141,48 @@ pub fn mentioned_skill_ids(text: &str) -> Vec<String> {
         if index == start {
             continue;
         }
-        let id = &text[start..index];
-        if seen.insert(id.to_string()) {
-            ids.push(id.to_string());
+        let id = text[start..index].to_string();
+        // optional `:arg` suffix
+        let arg = if index < bytes.len() && bytes[index] == b':' {
+            let arg_start = index + 1;
+            let mut arg_end = arg_start;
+            while arg_end < bytes.len() && bytes[arg_end] != b' ' && bytes[arg_end] != b'\n' {
+                arg_end += 1;
+            }
+            index = arg_end;
+            if arg_end > arg_start {
+                Some(text[arg_start..arg_end].to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if seen.insert(id.clone()) {
+            result.push((id, arg));
         }
     }
-    ids
+    result
+}
+
+pub fn mentioned_skill_ids(text: &str) -> Vec<String> {
+    mentioned_skill_mentions(text)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 pub fn format_skills_prompt_block(skills: &[Skill]) -> Option<String> {
+    let pairs: Vec<(Skill, Option<String>)> = skills.iter().map(|s| (s.clone(), None)).collect();
+    format_skills_prompt_block_with_args(&pairs)
+}
+
+pub fn format_skills_prompt_block_with_args(skills: &[(Skill, Option<String>)]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
     let mut block = String::from("<skills>\n");
-    for skill in skills {
+    for (skill, arg) in skills {
         block.push_str(&format!(
             r#"<skill id="{}" name="{}" source="{}" path="{}">"#,
             escape_attr(&skill.id),
@@ -142,8 +191,16 @@ pub fn format_skills_prompt_block(skills: &[Skill]) -> Option<String> {
             escape_attr(&skill.path.display().to_string())
         ));
         block.push('\n');
-        block.push_str(&skill.body);
-        if !skill.body.ends_with('\n') {
+        if let Some(when) = &skill.when_to_use {
+            block.push_str(&format!("When to use: {when}\n"));
+        }
+        let body = if let Some(arg) = arg {
+            skill.body.replace("{{arg}}", arg)
+        } else {
+            skill.body.clone()
+        };
+        block.push_str(&body);
+        if !body.ends_with('\n') {
             block.push('\n');
         }
         block.push_str("</skill>\n");
@@ -188,21 +245,53 @@ fn collect_skills(
             continue;
         }
         if let Ok(skill) = parse_skill(id, source, &skill_path) {
+            if let Some(root) = allowed_root {
+                if !skill.paths.is_empty() && !paths_match(&skill.paths, root) {
+                    continue;
+                }
+            }
             skills.push(skill);
         }
     }
     Ok(())
 }
 
+fn paths_match(patterns: &[String], root: &Path) -> bool {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        if let Ok(glob) = Glob::new(pat) {
+            builder.add(glob);
+        }
+    }
+    let Ok(set) = builder.build() else {
+        return true;
+    };
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_str().unwrap_or("");
+            !matches!(name, "target" | "node_modules" | ".git" | "dist" | ".next" | "build")
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .any(|e| {
+            let rel = e.path().strip_prefix(root).unwrap_or(e.path());
+            set.is_match(rel)
+        })
+}
+
 fn parse_skill(id: &str, source: SkillSource, path: &Path) -> Result<Skill, String> {
     let content = fs::read_to_string(path)
         .map_err(|error| format!("failed to read skill {}: {error}", path.display()))?;
     let (frontmatter, body) = split_frontmatter(&content);
-    let (name, description) = parse_frontmatter(frontmatter);
+    let (name, description, when_to_use, paths) = parse_frontmatter(frontmatter);
     Ok(Skill {
         id: id.to_string(),
         name: name.unwrap_or_else(|| id.to_string()),
         description: description.unwrap_or_default(),
+        when_to_use,
+        paths,
         source,
         path: path.to_path_buf(),
         body: body.trim().to_string(),
@@ -221,13 +310,28 @@ fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
     (Some(frontmatter), body)
 }
 
-fn parse_frontmatter(frontmatter: Option<&str>) -> (Option<String>, Option<String>) {
+fn parse_frontmatter(frontmatter: Option<&str>) -> (Option<String>, Option<String>, Option<String>, Vec<String>) {
     let mut name = None;
     let mut description = None;
+    let mut when_to_use = None;
+    let mut paths = Vec::new();
     let Some(frontmatter) = frontmatter else {
-        return (name, description);
+        return (name, description, when_to_use, paths);
     };
+    let mut in_paths = false;
     for line in frontmatter.lines() {
+        if in_paths {
+            let trimmed = line.trim();
+            if trimmed.starts_with('-') {
+                let pat = trimmed.trim_start_matches('-').trim().trim_matches('"').trim_matches('\'').to_string();
+                if !pat.is_empty() {
+                    paths.push(pat);
+                }
+                continue;
+            } else {
+                in_paths = false;
+            }
+        }
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -235,10 +339,12 @@ fn parse_frontmatter(frontmatter: Option<&str>) -> (Option<String>, Option<Strin
         match key.trim() {
             "name" => name = Some(value),
             "description" => description = Some(value),
+            "when_to_use" => when_to_use = Some(value),
+            "paths" => in_paths = true,
             _ => {}
         }
     }
-    (name, description)
+    (name, description, when_to_use, paths)
 }
 
 fn format_skill_list(skills: &[Skill]) -> String {
@@ -349,7 +455,7 @@ mod tests {
             "Read the diff.",
         );
 
-        let skills = discover(project.path(), Some(home.path())).unwrap();
+        let skills = discover(project.path(), Some(home.path()), None).unwrap();
 
         assert!(skills.iter().any(|skill| skill.id == "debugging"));
         assert!(skills.iter().any(|skill| skill.id == "review"));
@@ -358,6 +464,54 @@ mod tests {
                 .iter()
                 .any(|skill| skill.description == "Review code safely")
         );
+    }
+
+    #[test]
+    fn discovers_skills_from_agents_skills_dir() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
+        write_skill(
+            &project.path().join(".agents/skills/lint"),
+            "Lint",
+            "Run linter",
+            "Run cargo clippy.",
+        );
+
+        let skills = discover(project.path(), None, None).unwrap();
+
+        assert!(skills.iter().any(|s| s.id == "lint"));
+    }
+
+    #[test]
+    fn orca_skills_take_priority_over_agents_skills_on_same_id() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "orca version",
+            "orca body",
+        );
+        write_skill(
+            &project.path().join(".agents/skills/review"),
+            "Review",
+            "agents version",
+            "agents body",
+        );
+
+        let skills = discover(project.path(), None, None).unwrap();
+        let review: Vec<_> = skills.iter().filter(|s| s.id == "review").collect();
+
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].description, "orca version");
     }
 
     #[test]
@@ -371,7 +525,7 @@ mod tests {
             "Use logs first.",
         );
 
-        let skill = discover(project.path(), Some(home.path()))
+        let skill = discover(project.path(), Some(home.path()), None)
             .unwrap()
             .into_iter()
             .find(|skill| skill.id == "debugging")
@@ -396,6 +550,8 @@ mod tests {
             id: "debugging".to_string(),
             name: "Debugging".to_string(),
             description: "Find root causes".to_string(),
+            when_to_use: None,
+            paths: vec![],
             source: SkillSource::User,
             path: PathBuf::from("/tmp/SKILL.md"),
             body: "Use logs first.".to_string(),

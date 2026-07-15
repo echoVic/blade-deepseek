@@ -213,6 +213,49 @@ mod tests {
     }
 
     #[test]
+    fn esc_interrupts_running_without_exiting_or_marking_idle() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let mut config = config();
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let cancel = CancelToken::new();
+        let preloaded = Arc::new(Mutex::new(None));
+        let mut textarea = TextArea::default();
+        let mut vim_state = VimState::new(false);
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let event = Event::Key(key);
+
+        let flow = handle_status_key(
+            &event,
+            &key,
+            &mut state,
+            &mut config,
+            &shared_config,
+            &action_tx,
+            &cancel,
+            &preloaded,
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            None,
+            || Ok(()),
+        )
+        .expect("handle running shortcut");
+
+        assert!(matches!(flow, StatusKeyFlow::Continue));
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(cancel.is_cancelled());
+        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+    }
+
+    #[test]
     fn compacting_status_rejects_background_current_turn_shortcut() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = AppState::new(

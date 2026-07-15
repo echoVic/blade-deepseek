@@ -1376,6 +1376,7 @@ dependencies = [
  "chrono",
  "crossbeam-channel",
  "crossterm",
+ "dirs",
  "orca-approval",
  "orca-core",
  "orca-file-search",

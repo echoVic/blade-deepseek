@@ -12,6 +12,8 @@ pub enum SlashCommand {
     WorkflowRun { name: String, args: Option<String> },
     AgentDashboard,
     Remember(String),
+    SkillList,
+    SkillRun { id: String, args: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,15 +42,32 @@ pub fn parse_with_cwd(input: &str, cwd: &Path) -> Option<SlashCommand> {
     if builtin_command_names().contains(command) {
         return None;
     }
-    let saved_workflow = discover_saved_workflows(cwd)
+    let args = parts.collect::<Vec<_>>().join(" ");
+    let args_opt = if args.is_empty() { None } else { Some(args) };
+
+    // saved workflow takes priority over skill
+    if let Some(saved_workflow) = discover_saved_workflows(cwd)
         .into_iter()
         .map(|(name, _)| name)
-        .find(|name| name == command)?;
-    let args = parts.collect::<Vec<_>>().join(" ");
-    Some(SlashCommand::WorkflowRun {
-        name: saved_workflow,
-        args: if args.is_empty() { None } else { Some(args) },
-    })
+        .find(|name| name == command)
+    {
+        return Some(SlashCommand::WorkflowRun {
+            name: saved_workflow,
+            args: args_opt,
+        });
+    }
+
+    // skill alias: /skill-id [args]
+    if let Ok(skills) = orca_tools::skills::discover_from_env(cwd) {
+        if skills.iter().any(|s| s.id == command) {
+            return Some(SlashCommand::SkillRun {
+                id: command.to_string(),
+                args: args_opt,
+            });
+        }
+    }
+
+    None
 }
 
 fn parse_static(input: &str) -> Option<SlashCommand> {
@@ -83,6 +102,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         }
         "workflows" => Some(SlashCommand::WorkflowList),
         "agents" => Some(SlashCommand::AgentDashboard),
+        "skills" => Some(SlashCommand::SkillList),
         "remember" => {
             let note = parts.collect::<Vec<_>>().join(" ");
             if note.is_empty() {
@@ -107,6 +127,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/workflow:<name>", "Run a saved workflow"),
         ("/workflows", "Show workflow tasks"),
         ("/agents", "Show workflow agent dashboard"),
+        ("/skills", "List available skills"),
         ("/remember", "Save a note to memory"),
         ("/history", "Browse session history"),
     ]
@@ -124,6 +145,18 @@ pub fn available_commands(cwd: &Path) -> Vec<(String, String)> {
         ));
         if !builtin_command_names().contains(name.as_str()) {
             commands.push((format!("/{name}"), format!("Run saved {scope} workflow")));
+        }
+    }
+    if let Ok(skills) = orca_tools::skills::discover_from_env(cwd) {
+        for skill in skills {
+            let desc = if skill.description.is_empty() {
+                skill.name.clone()
+            } else {
+                skill.description.clone()
+            };
+            if !builtin_command_names().contains(skill.id.as_str()) {
+                commands.push((format!("/{}", skill.id), format!("Run skill: {desc}")));
+            }
         }
     }
     commands

@@ -147,7 +147,8 @@ current state:
 - Skills must still match both id and canonical path discovered from an active root;
 - Plugin manifests must remain inside configured plugin roots and retain the bound manifest name;
 - MCP Resources are read through the same registry used for discovery;
-- Resource Templates are injected as typed descriptors.
+- Resource Templates must remain listed by the bound MCP server and are injected as typed
+  descriptors.
 
 The visible prompt is preserved and expanded context is appended in typed blocks. Duplicate targets
 are injected once.

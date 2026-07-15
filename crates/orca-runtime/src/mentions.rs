@@ -781,11 +781,28 @@ fn expand_bound_target(
         MentionTarget::ResourceTemplate {
             server,
             uri_template,
-        } => Ok(format!(
-            "<mcp_resource_template server=\"{}\" uri_template=\"{}\" />",
-            escape_attr(server),
-            escape_attr(uri_template)
-        )),
+        } => {
+            let templates = mcp_registry
+                .list_resource_templates(Some(server))
+                .map_err(|error| {
+                    format!(
+                        "failed to revalidate bound MCP resource template {server} {uri_template}: {error}"
+                    )
+                })?;
+            if !templates
+                .iter()
+                .any(|template| template.uri_template == *uri_template)
+            {
+                return Err(format!(
+                    "bound MCP resource template is no longer available: {server} {uri_template}"
+                ));
+            }
+            Ok(format!(
+                "<mcp_resource_template server=\"{}\" uri_template=\"{}\" />",
+                escape_attr(server),
+                escape_attr(uri_template)
+            ))
+        }
     }
 }
 
@@ -1081,6 +1098,9 @@ mod tests {
             "@oai/sky还能逆向吗",
             "read @README.md",
             "email foo@example.com",
+            "install @oai/sky",
+            "visit https://example.com/@oai/sky",
+            "punctuation (@README.md), [@oai/sky]!",
         ] {
             let expanded = expand_mentions(
                 input,
@@ -1454,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_catalog_and_atomic_expansion_include_mcp_resources() {
+    fn unified_catalog_and_atomic_expansion_include_mcp_resources_and_templates() {
         struct ResourceTransport;
 
         impl orca_mcp::transport::McpTransport for ResourceTransport {
@@ -1485,7 +1505,13 @@ mod tests {
             }
 
             fn list_resource_templates(&self) -> Result<serde_json::Value, String> {
-                Ok(serde_json::json!({"resourceTemplates": []}))
+                Ok(serde_json::json!({
+                    "resourceTemplates": [{
+                        "uriTemplate": "memo://{id}",
+                        "name": "project memo template",
+                        "description": "Parameterized project notes"
+                    }]
+                }))
             }
 
             fn read_resource(&self, uri: &str) -> Result<serde_json::Value, String> {
@@ -1529,5 +1555,53 @@ mod tests {
 
         assert!(expanded.contains("<mcp_resource"));
         assert!(expanded.contains("resource body"));
+
+        let template = catalog
+            .candidates()
+            .iter()
+            .find(|candidate| matches!(candidate.target, MentionTarget::ResourceTemplate { .. }))
+            .expect("resource template candidate");
+        let template_input = "use @template";
+        let template_bindings = MentionBindings::from_bindings(
+            template_input,
+            vec![MentionBinding {
+                start: 4,
+                end: template_input.len(),
+                visible: "@template".to_string(),
+                target: template.target.clone(),
+            }],
+        );
+        let template_expanded = expand_mentions(
+            template_input,
+            &template_bindings,
+            cwd.path(),
+            &[cwd.path().to_path_buf()],
+            &registry,
+        )
+        .unwrap();
+        assert!(template_expanded.contains("<mcp_resource_template"));
+        assert!(template_expanded.contains("memo://{id}"));
+
+        let stale_bindings = MentionBindings::from_bindings(
+            template_input,
+            vec![MentionBinding {
+                start: 4,
+                end: template_input.len(),
+                visible: "@template".to_string(),
+                target: MentionTarget::ResourceTemplate {
+                    server: "notes".to_string(),
+                    uri_template: "memo://missing/{id}".to_string(),
+                },
+            }],
+        );
+        let error = expand_mentions(
+            template_input,
+            &stale_bindings,
+            cwd.path(),
+            &[cwd.path().to_path_buf()],
+            &registry,
+        )
+        .unwrap_err();
+        assert!(error.contains("bound MCP resource template is no longer available"));
     }
 }

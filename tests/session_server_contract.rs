@@ -6788,7 +6788,7 @@ fn server_mode_plain_at_file_remains_literal() {
                 "method": "turn/start",
                 "params": {
                     "threadId": thread_id,
-                    "input": [{"type": "text", "text": "inspect @same.txt"}]
+                    "input": [{"type": "text", "text": "inspect @same.txt and @oai/sky还能逆向吗"}]
                 }
             })
         )
@@ -6822,7 +6822,7 @@ fn server_mode_plain_at_file_remains_literal() {
         .collect::<String>();
 
     assert!(
-        echoed.contains("inspect @same.txt"),
+        echoed.contains("inspect @same.txt and @oai/sky还能逆向吗"),
         "plain at-token should remain literal in model history: {echoed}"
     );
     assert!(
@@ -6833,6 +6833,100 @@ fn server_mode_plain_at_file_remains_literal() {
         !echoed.contains("<file"),
         "plain at-token must not create a file context block: {echoed}"
     );
+
+    child.close_stdin();
+    let output = child.wait_with_output().expect("wait for server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn server_mode_stale_structured_mention_releases_thread_for_next_turn() {
+    let root = tempdir().expect("workspace root");
+    let root_path = root
+        .path()
+        .canonicalize()
+        .expect("canonical workspace root");
+    let mut child = orca_command()
+        .args(["--mode", "server", "--provider", "mock"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orca server");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "thread-req",
+                "method": "thread/start",
+                "params": {"runtimeWorkspaceRoots": [root_path]}
+            })
+        )
+        .expect("write thread/start request");
+        stdin.flush().expect("flush thread/start request");
+    }
+    let thread_started = child.expect_event("thread-req", "thread_started");
+    let thread_id = thread_started["threadId"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "turn-stale",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{
+                        "type": "mention",
+                        "name": "missing.txt",
+                        "target": {
+                            "type": "file",
+                            "root": root_path,
+                            "path": "missing.txt",
+                            "kind": "file"
+                        }
+                    }]
+                }
+            })
+        )
+        .expect("write stale mention turn");
+        stdin.flush().expect("flush stale mention turn");
+    }
+    let rejected = child.expect_event("turn-stale", "error");
+    assert!(
+        rejected["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("failed to resolve bound @missing.txt")),
+        "unexpected rejection: {rejected}"
+    );
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "turn-after-rejection",
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": "thread is still usable"}]
+                }
+            })
+        )
+        .expect("write turn after rejection");
+        stdin.flush().expect("flush turn after rejection");
+    }
+    child.expect_event("turn-after-rejection", "turn_completed");
 
     child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");

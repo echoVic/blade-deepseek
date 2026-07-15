@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved in conversation on 2026-07-15. This document is awaiting final written-spec review before implementation planning.
+Implemented and acceptance-audited on 2026-07-15.
 
 ## Problem
 

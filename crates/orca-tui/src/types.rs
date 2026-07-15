@@ -696,7 +696,7 @@ impl AppState {
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
             show_shortcuts: false,
-            input_history: Vec::new(),
+            input_history: load_input_history(),
             pending_pastes: Vec::new(),
             history_cursor: None,
             draft_before_history: None,
@@ -1177,7 +1177,89 @@ impl AppState {
         });
         true
     }
+}
 
+fn input_history_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".orca").join("history.jsonl"))
+}
+
+fn current_project() -> String {
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+fn load_input_history() -> Vec<String> {
+    let Some(path) = input_history_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let project = current_project();
+    const MAX: usize = 500;
+    // Read all valid entries, newest-first (reverse lines), project entries first
+    let entries: Vec<(String, bool)> = content
+        .lines()
+        .rev()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let display = v["display"].as_str()?.to_string();
+            let is_current = v["project"].as_str().unwrap_or("") == project;
+            Some((display, is_current))
+        })
+        .take(MAX * 2)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    // Current project first
+    for (display, is_current) in &entries {
+        if *is_current && seen.insert(display.clone()) {
+            result.push(display.clone());
+            if result.len() >= MAX {
+                break;
+            }
+        }
+    }
+    // Then other projects
+    for (display, is_current) in &entries {
+        if !is_current && seen.insert(display.clone()) {
+            result.push(display.clone());
+            if result.len() >= MAX {
+                break;
+            }
+        }
+    }
+    result.reverse();
+    result
+}
+
+fn append_input_history(prompt: &str) {
+    let Some(path) = input_history_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = serde_json::json!({
+        "display": prompt,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        "project": current_project(),
+    });
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{}", entry);
+    }
+}
+
+impl AppState {
     pub fn record_prompt(&mut self, prompt: String) {
         if self
             .input_history
@@ -1185,7 +1267,8 @@ impl AppState {
             .map(|last| last != &prompt)
             .unwrap_or(true)
         {
-            self.input_history.push(prompt);
+            self.input_history.push(prompt.clone());
+            append_input_history(&prompt);
         }
         self.history_cursor = None;
         self.draft_before_history = None;
@@ -3031,6 +3114,11 @@ mod tests {
         state.push_message(ChatMessage::Assistant("before".to_string()));
         state.push_message(ChatMessage::User("review @gone.txt".to_string()));
         state.enter_running();
+        state.update(TuiEvent::ToolCallProgress {
+            id: "receiving".to_string(),
+            name: Some("read_file".to_string()),
+            arguments_bytes: 128,
+        });
 
         state.update(TuiEvent::SubmissionRejected {
             prompt: "review @gone.txt".to_string(),
@@ -3044,6 +3132,25 @@ mod tests {
                 if before == "before" && error == "bound file is no longer available"
         ));
         assert!(state.mention_bindings.is_empty());
+        assert_eq!(state.running_started_at, None);
+        assert!(state.messages.iter().all(|message| {
+            !matches!(message, ChatMessage::ToolCall { status, .. } if status == "receiving")
+        }));
+    }
+
+    #[test]
+    fn generic_error_does_not_end_a_running_turn() {
+        let mut state = state();
+        state.enter_running();
+
+        state.update(TuiEvent::Error("recoverable runtime error".to_string()));
+
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(state.running_started_at.is_some());
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message)) if message == "recoverable runtime error"
+        ));
     }
 
     #[test]
