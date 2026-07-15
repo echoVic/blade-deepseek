@@ -1217,6 +1217,43 @@ mod tests {
     }
 
     #[test]
+    fn existing_turn_request_does_not_append_user_prompt_again() {
+        let mut config = config(SubagentConfig::default());
+        config.output_format = OutputFormat::Jsonl;
+        let mut thread = RuntimeThread::start(&config, "existing turn").expect("thread");
+        let initial = ThreadTurnRequest::new("original prompt");
+        thread
+            .run_request(&config, &initial, Vec::new())
+            .expect("run initial generation");
+        let original_count = thread
+            .session()
+            .conversation()
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User { content, .. } if content == "original prompt")
+            })
+            .count();
+
+        let resumed = ThreadTurnRequest::new("original prompt").with_existing_turn_prompt();
+        thread
+            .run_request(&config, &resumed, Vec::new())
+            .expect("run resumed generation");
+        let resumed_count = thread
+            .session()
+            .conversation()
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User { content, .. } if content == "original prompt")
+            })
+            .count();
+
+        assert_eq!(original_count, 1);
+        assert_eq!(resumed_count, 1);
+    }
+
+    #[test]
     fn workflow_ipc_tool_requires_workflow_child_context() {
         let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
         let request = tool_types::ToolRequest {

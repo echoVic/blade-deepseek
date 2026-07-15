@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Debug)]
@@ -32,6 +32,29 @@ impl Default for CancelToken {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OperationId(u64);
 
+#[derive(Debug)]
+pub struct OperationIdAllocator {
+    next_id: AtomicU64,
+}
+
+impl OperationIdAllocator {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    pub fn allocate(&self) -> OperationId {
+        OperationId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for OperationIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OperationScope {
     id: OperationId,
@@ -59,7 +82,7 @@ pub struct OperationCancellation {
 
 #[derive(Debug)]
 struct OperationCancellationState {
-    next_id: std::sync::atomic::AtomicU64,
+    ids: OperationIdAllocator,
     current: Mutex<Option<OperationScope>>,
 }
 
@@ -67,14 +90,14 @@ impl OperationCancellation {
     pub fn new() -> Self {
         Self {
             state: Arc::new(OperationCancellationState {
-                next_id: std::sync::atomic::AtomicU64::new(1),
+                ids: OperationIdAllocator::new(),
                 current: Mutex::new(None),
             }),
         }
     }
 
     pub fn start(&self) -> OperationScope {
-        let id = OperationId(self.state.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = self.state.ids.allocate();
         let scope = OperationScope {
             id,
             token: CancelToken::new(),
@@ -138,6 +161,13 @@ mod tests {
 
         assert_eq!(controller.cancel_current(), Some(second.id()));
         assert!(second.token().is_cancelled());
+    }
+
+    #[test]
+    fn operation_id_allocator_is_independent_of_cancellation_scope() {
+        let ids = OperationIdAllocator::new();
+
+        assert_ne!(ids.allocate(), ids.allocate());
     }
 
     #[test]

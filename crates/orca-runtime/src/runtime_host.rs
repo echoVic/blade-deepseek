@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
-use orca_core::cancel::{CancelToken, OperationCancellation, OperationId, OperationScope};
+use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_core::config::RunConfig;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
@@ -21,7 +21,7 @@ use crate::background_turn::RuntimeTurnContinuation;
 use crate::controller::{ControllerRunOptions, ThreadTurnRequest};
 use crate::hooks::HookContext;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeUserInputHandler, ThreadSteerHandle,
+    RuntimePermissionRequestHandler, RuntimeTaskKind, RuntimeUserInputHandler, ThreadSteerHandle,
 };
 use crate::thread::RuntimeThread;
 
@@ -34,6 +34,7 @@ pub trait ThreadOperationExecutor: Send + Sync + 'static {
         thread: &mut RuntimeThread,
         config: &RunConfig,
         request: &HostedTurnRequest,
+        generation: &GenerationContext,
         events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
@@ -46,7 +47,6 @@ pub struct HostedTurnRequest {
     options: ControllerRunOptions,
     emit_session_completed: bool,
     envelope: HostedOperationEnvelope,
-    steer_handle: Option<ThreadSteerHandle>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
@@ -68,7 +68,6 @@ impl HostedTurnRequest {
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
             envelope: HostedOperationEnvelope::Turn,
-            steer_handle: None,
             permission_handler: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
@@ -102,11 +101,6 @@ impl HostedTurnRequest {
 
     pub fn with_session_completed_event(mut self, emit: bool) -> Self {
         self.emit_session_completed = emit;
-        self
-    }
-
-    pub fn with_steer_handle(mut self, handle: ThreadSteerHandle) -> Self {
-        self.steer_handle = Some(handle);
         self
     }
 
@@ -149,15 +143,13 @@ impl HostedTurnRequest {
         self
     }
 
-    fn legacy_request(&self) -> ThreadTurnRequest {
+    fn legacy_request(&self, generation: &GenerationContext) -> ThreadTurnRequest {
         let mut request = ThreadTurnRequest::new(self.prompt.clone())
             .with_options(self.options)
             .with_session_completed_event(
                 self.envelope == HostedOperationEnvelope::Turn && self.emit_session_completed,
-            );
-        if let Some(handle) = self.steer_handle.clone() {
-            request = request.with_steer_handle(handle);
-        }
+            )
+            .with_steer_handle(generation.steer_handle.clone());
         if let Some(handler) = self.permission_handler.clone() {
             request = request.with_permission_handler(handler);
         }
@@ -173,7 +165,7 @@ impl HostedTurnRequest {
         if let Some(continuation) = self.continuation.clone() {
             request = request.with_continuation(continuation);
         }
-        if self.resumes_existing_turn {
+        if self.resumes_existing_turn || generation.resumes_existing_turn {
             request = request.with_existing_turn_prompt();
         }
         request
@@ -181,6 +173,86 @@ impl HostedTurnRequest {
 
     fn event_observer(&self) -> Option<Arc<dyn EventObserver>> {
         self.event_observer.clone()
+    }
+
+    fn is_resumable(&self) -> bool {
+        self.envelope == HostedOperationEnvelope::Turn
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GenerationId(u64);
+
+impl GenerationId {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GenerationFence {
+    operation_id: OperationId,
+    generation_id: GenerationId,
+}
+
+impl GenerationFence {
+    fn initial(operation_id: OperationId) -> Self {
+        Self {
+            operation_id,
+            generation_id: GenerationId(0),
+        }
+    }
+
+    fn next(self) -> Self {
+        Self {
+            operation_id: self.operation_id,
+            generation_id: self.generation_id.next(),
+        }
+    }
+
+    pub fn operation_id(self) -> OperationId {
+        self.operation_id
+    }
+
+    pub fn generation_id(self) -> GenerationId {
+        self.generation_id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GenerationContext {
+    fence: GenerationFence,
+    steer_handle: ThreadSteerHandle,
+    resumes_existing_turn: bool,
+}
+
+impl GenerationContext {
+    fn new(
+        fence: GenerationFence,
+        steer_handle: ThreadSteerHandle,
+        resumes_existing_turn: bool,
+    ) -> Self {
+        Self {
+            fence,
+            steer_handle,
+            resumes_existing_turn,
+        }
+    }
+
+    pub fn fence(&self) -> GenerationFence {
+        self.fence
+    }
+
+    pub fn resumes_existing_turn(&self) -> bool {
+        self.resumes_existing_turn
+    }
+
+    pub fn drain_steer_inputs(&self) -> Vec<String> {
+        self.steer_handle.drain()
     }
 }
 
@@ -192,13 +264,14 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
         thread: &mut RuntimeThread,
         config: &RunConfig,
         request: &HostedTurnRequest,
+        generation: &GenerationContext,
         events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
     ) -> io::Result<RunStatus> {
         thread.run_request_with_event_factory_and_cancel(
             config,
-            &request.legacy_request(),
+            &request.legacy_request(generation),
             writer,
             events,
             cancel.clone(),
@@ -253,11 +326,14 @@ impl std::error::Error for RuntimeHostError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InterruptOperationResult {
     Requested {
-        operation_id: OperationId,
+        generation: GenerationFence,
+    },
+    AlreadyRequested {
+        generation: GenerationFence,
     },
     Stale {
         requested_operation_id: OperationId,
-        active_operation_id: OperationId,
+        active: GenerationFence,
     },
     Idle {
         requested_operation_id: OperationId,
@@ -265,9 +341,64 @@ pub enum InterruptOperationResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResumeOperationResult {
+    Queued {
+        generation: GenerationFence,
+    },
+    AlreadyQueued {
+        generation: GenerationFence,
+    },
+    NotInterrupted {
+        generation: GenerationFence,
+    },
+    NotResumable {
+        generation: GenerationFence,
+    },
+    Stale {
+        requested_operation_id: OperationId,
+        active: GenerationFence,
+    },
+    Idle {
+        requested_operation_id: OperationId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SteerOperationResult {
+    Accepted {
+        generation: GenerationFence,
+    },
+    Rejected {
+        requested_operation_id: OperationId,
+        active: Option<GenerationFence>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GenerationAdmissionResult {
+    Accepted {
+        generation: GenerationFence,
+    },
+    Rejected {
+        requested: GenerationFence,
+        active: Option<GenerationFence>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationPhase {
+    Running,
+    Interrupted,
+    ResumeQueued,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeThreadState {
     Idle,
-    Running { operation_id: OperationId },
+    Running {
+        generation: GenerationFence,
+        phase: GenerationPhase,
+    },
     Unavailable,
 }
 
@@ -370,6 +501,7 @@ impl OperationCompletion {
 
 pub struct OperationHandle {
     operation_id: OperationId,
+    initial_generation: GenerationFence,
     thread: RuntimeThreadHandle,
     completion: OperationCompletion,
 }
@@ -377,6 +509,10 @@ pub struct OperationHandle {
 impl OperationHandle {
     pub fn id(&self) -> OperationId {
         self.operation_id
+    }
+
+    pub fn initial_generation(&self) -> GenerationFence {
+        self.initial_generation
     }
 
     pub fn thread_id(&self) -> &str {
@@ -389,6 +525,17 @@ impl OperationHandle {
 
     pub fn interrupt(&self) -> Result<InterruptOperationResult, RuntimeHostError> {
         self.thread.interrupt_operation(self.operation_id)
+    }
+
+    pub fn resume(&self) -> Result<ResumeOperationResult, RuntimeHostError> {
+        self.thread.resume_operation(self.operation_id)
+    }
+
+    pub fn steer(
+        &self,
+        input: impl Into<String>,
+    ) -> Result<SteerOperationResult, RuntimeHostError> {
+        self.thread.steer_operation(self.operation_id, input)
     }
 
     pub fn wait(&self) -> OperationTerminal {
@@ -450,6 +597,44 @@ impl RuntimeThreadHandle {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::InterruptOperation {
             operation_id,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub fn resume_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<ResumeOperationResult, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ResumeOperation {
+            operation_id,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub fn steer_operation(
+        &self,
+        operation_id: OperationId,
+        input: impl Into<String>,
+    ) -> Result<SteerOperationResult, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::SteerOperation {
+            operation_id,
+            input: input.into(),
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub fn admit_generation(
+        &self,
+        generation: GenerationFence,
+    ) -> Result<GenerationAdmissionResult, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::AdmitGeneration {
+            generation,
             reply: reply_tx,
         })?;
         receive_reply(reply_rx, "runtime thread")?
@@ -611,6 +796,19 @@ enum ThreadCommand {
         operation_id: OperationId,
         reply: SyncSender<Result<InterruptOperationResult, RuntimeHostError>>,
     },
+    ResumeOperation {
+        operation_id: OperationId,
+        reply: SyncSender<Result<ResumeOperationResult, RuntimeHostError>>,
+    },
+    SteerOperation {
+        operation_id: OperationId,
+        input: String,
+        reply: SyncSender<Result<SteerOperationResult, RuntimeHostError>>,
+    },
+    AdmitGeneration {
+        generation: GenerationFence,
+        reply: SyncSender<Result<GenerationAdmissionResult, RuntimeHostError>>,
+    },
     ReadState {
         reply: SyncSender<Result<RuntimeThreadState, RuntimeHostError>>,
     },
@@ -716,7 +914,7 @@ struct ThreadActor {
     config: RunConfig,
     handle: RuntimeThreadHandle,
     executor: Arc<dyn ThreadOperationExecutor>,
-    cancellation: OperationCancellation,
+    operation_ids: OperationIdAllocator,
     active: Option<ActiveOperation>,
 }
 
@@ -726,13 +924,24 @@ struct ThreadActorState {
 }
 
 struct ActiveOperation {
-    scope: OperationScope,
+    operation_id: OperationId,
+    task_id: Option<String>,
     completion: OperationCompletion,
+    request: HostedTurnRequest,
+    steer_handle: ThreadSteerHandle,
+    resume_queued: bool,
+    generation: ActiveGeneration,
+}
+
+struct ActiveGeneration {
+    context: GenerationContext,
+    cancel: CancelToken,
     join: JoinHandle<OperationTaskResult>,
 }
 
 struct OperationTaskResult {
     state: ThreadActorState,
+    writer: Box<dyn io::Write + Send>,
     outcome: OperationOutcome,
 }
 
@@ -749,7 +958,7 @@ impl ThreadActor {
             config,
             handle,
             executor,
-            cancellation: OperationCancellation::new(),
+            operation_ids: OperationIdAllocator::new(),
             active: None,
         }
     }
@@ -767,31 +976,32 @@ impl ThreadActor {
             };
 
             tokio::select! {
-                result = &mut active.join => {
-                    self.finish_operation(active, result);
-                }
+                biased;
                 command = command_rx.recv() => {
                     match command {
                         Some(ThreadCommand::ShutdownThread { reply }) => {
-                            active.scope.cancel();
-                            let result = (&mut active.join).await;
-                            self.finish_operation(active, result);
+                            active.generation.cancel.cancel();
+                            let result = (&mut active.generation.join).await;
+                            self.finish_generation(active, result, false);
                             if let Some(reply) = reply {
                                 let _ = reply.send(Ok(()));
                             }
                             break;
                         }
                         Some(command) => {
-                            self.handle_running_command(command, &active);
+                            self.handle_running_command(command, &mut active);
                             self.active = Some(active);
                         }
                         None => {
-                            active.scope.cancel();
-                            let result = (&mut active.join).await;
-                            self.finish_operation(active, result);
+                            active.generation.cancel.cancel();
+                            let result = (&mut active.generation.join).await;
+                            self.finish_generation(active, result, false);
                             break;
                         }
                     }
+                }
+                result = &mut active.generation.join => {
+                    self.finish_generation(active, result, true);
                 }
             }
         }
@@ -808,45 +1018,38 @@ impl ThreadActor {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                     return false;
                 };
-                let scope = self.cancellation.start();
-                let operation_id = scope.id();
+                let operation_id = self.operation_ids.allocate();
+                let initial_generation = GenerationFence::initial(operation_id);
                 let completion = OperationCompletion::new();
-                let executor = Arc::clone(&self.executor);
-                let config = self.config.clone();
-                let task_scope = scope.clone();
-                let mut writer = writer;
-                let join = tokio::task::spawn_blocking(move || {
-                    let mut state = state;
-                    let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        run_hosted_operation(
-                            executor.as_ref(),
-                            &mut state.thread,
-                            &mut state.events,
-                            &config,
-                            request.as_ref(),
-                            writer.as_mut(),
-                            task_scope.token(),
-                        )
-                    }));
-                    let outcome = match outcome {
-                        Ok(Ok(status)) => OperationOutcome::Completed(status),
-                        Ok(Err(error)) => OperationOutcome::ExecutionFailed {
-                            kind: error.kind(),
-                            message: error.to_string(),
-                        },
-                        Err(payload) => OperationOutcome::Panicked {
-                            message: panic_message(payload),
-                        },
-                    };
-                    OperationTaskResult { state, outcome }
-                });
+                let request = *request;
+                let task_id = state
+                    .thread
+                    .lifecycle()
+                    .active_task()
+                    .map(|task| task.id().to_string());
+                let steer_handle = ThreadSteerHandle::default();
+                let generation = self.spawn_generation(
+                    state,
+                    &request,
+                    writer,
+                    GenerationContext::new(
+                        initial_generation,
+                        steer_handle.clone(),
+                        request.resumes_existing_turn,
+                    ),
+                );
                 self.active = Some(ActiveOperation {
-                    scope,
+                    operation_id,
+                    task_id,
                     completion: completion.clone(),
-                    join,
+                    request,
+                    steer_handle,
+                    resume_queued: false,
+                    generation,
                 });
                 let _ = reply.send(Ok(OperationHandle {
                     operation_id,
+                    initial_generation,
                     thread: self.handle.clone(),
                     completion,
                 }));
@@ -858,6 +1061,33 @@ impl ThreadActor {
             } => {
                 let _ = reply.send(Ok(InterruptOperationResult::Idle {
                     requested_operation_id: operation_id,
+                }));
+                false
+            }
+            ThreadCommand::ResumeOperation {
+                operation_id,
+                reply,
+            } => {
+                let _ = reply.send(Ok(ResumeOperationResult::Idle {
+                    requested_operation_id: operation_id,
+                }));
+                false
+            }
+            ThreadCommand::SteerOperation {
+                operation_id,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(Ok(SteerOperationResult::Rejected {
+                    requested_operation_id: operation_id,
+                    active: None,
+                }));
+                false
+            }
+            ThreadCommand::AdmitGeneration { generation, reply } => {
+                let _ = reply.send(Ok(GenerationAdmissionResult::Rejected {
+                    requested: generation,
+                    active: None,
                 }));
                 false
             }
@@ -879,44 +1109,186 @@ impl ThreadActor {
         }
     }
 
-    fn handle_running_command(&self, command: ThreadCommand, active: &ActiveOperation) {
+    fn handle_running_command(&self, command: ThreadCommand, active: &mut ActiveOperation) {
+        let generation = active.generation.context.fence();
         match command {
             ThreadCommand::StartTurn { reply, .. } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
-                    operation_id: active.scope.id(),
+                    operation_id: active.operation_id,
                 }));
             }
             ThreadCommand::InterruptOperation {
                 operation_id,
                 reply,
             } => {
-                let result = if operation_id == active.scope.id() {
-                    active.scope.cancel();
-                    InterruptOperationResult::Requested { operation_id }
-                } else {
+                let result = if operation_id != active.operation_id {
                     InterruptOperationResult::Stale {
                         requested_operation_id: operation_id,
-                        active_operation_id: active.scope.id(),
+                        active: generation,
+                    }
+                } else if active.generation.cancel.is_cancelled() {
+                    InterruptOperationResult::AlreadyRequested { generation }
+                } else {
+                    active.generation.cancel.cancel();
+                    InterruptOperationResult::Requested { generation }
+                };
+                let _ = reply.send(Ok(result));
+            }
+            ThreadCommand::ResumeOperation {
+                operation_id,
+                reply,
+            } => {
+                let result = if operation_id != active.operation_id {
+                    ResumeOperationResult::Stale {
+                        requested_operation_id: operation_id,
+                        active: generation,
+                    }
+                } else if !active.request.is_resumable() {
+                    ResumeOperationResult::NotResumable { generation }
+                } else if !active.generation.cancel.is_cancelled() {
+                    ResumeOperationResult::NotInterrupted { generation }
+                } else if active.resume_queued {
+                    ResumeOperationResult::AlreadyQueued { generation }
+                } else {
+                    active.resume_queued = true;
+                    ResumeOperationResult::Queued { generation }
+                };
+                let _ = reply.send(Ok(result));
+            }
+            ThreadCommand::SteerOperation {
+                operation_id,
+                input,
+                reply,
+            } => {
+                let accepts = operation_id == active.operation_id
+                    && !active.generation.join.is_finished()
+                    && !active.generation.cancel.is_cancelled()
+                    && !active.resume_queued;
+                let result = if accepts {
+                    active.steer_handle.push(input);
+                    SteerOperationResult::Accepted { generation }
+                } else {
+                    SteerOperationResult::Rejected {
+                        requested_operation_id: operation_id,
+                        active: Some(generation),
+                    }
+                };
+                let _ = reply.send(Ok(result));
+            }
+            ThreadCommand::AdmitGeneration {
+                generation: requested,
+                reply,
+            } => {
+                let accepts = requested == generation
+                    && !active.generation.join.is_finished()
+                    && !active.generation.cancel.is_cancelled()
+                    && !active.resume_queued;
+                let result = if accepts {
+                    GenerationAdmissionResult::Accepted { generation }
+                } else {
+                    GenerationAdmissionResult::Rejected {
+                        requested,
+                        active: Some(generation),
                     }
                 };
                 let _ = reply.send(Ok(result));
             }
             ThreadCommand::ReadState { reply } => {
-                let _ = reply.send(Ok(RuntimeThreadState::Running {
-                    operation_id: active.scope.id(),
-                }));
+                let phase = if active.resume_queued {
+                    GenerationPhase::ResumeQueued
+                } else if active.generation.cancel.is_cancelled() {
+                    GenerationPhase::Interrupted
+                } else {
+                    GenerationPhase::Running
+                };
+                let _ = reply.send(Ok(RuntimeThreadState::Running { generation, phase }));
             }
             ThreadCommand::ShutdownThread { .. } => unreachable!("shutdown handled by actor loop"),
         }
     }
 
-    fn finish_operation(
+    fn spawn_generation(
+        &self,
+        state: ThreadActorState,
+        request: &HostedTurnRequest,
+        mut writer: Box<dyn io::Write + Send>,
+        context: GenerationContext,
+    ) -> ActiveGeneration {
+        let executor = Arc::clone(&self.executor);
+        let config = self.config.clone();
+        let task_request = request.clone();
+        let task_context = context.clone();
+        let cancel = CancelToken::new();
+        let task_cancel = cancel.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let mut state = state;
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                run_hosted_operation(
+                    executor.as_ref(),
+                    &mut state.thread,
+                    &mut state.events,
+                    &config,
+                    &task_request,
+                    &task_context,
+                    writer.as_mut(),
+                    &task_cancel,
+                )
+            }));
+            let outcome = match outcome {
+                Ok(Ok(status)) => OperationOutcome::Completed(status),
+                Ok(Err(error)) => OperationOutcome::ExecutionFailed {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                },
+                Err(payload) => OperationOutcome::Panicked {
+                    message: panic_message(payload),
+                },
+            };
+            OperationTaskResult {
+                state,
+                writer,
+                outcome,
+            }
+        });
+        ActiveGeneration {
+            context,
+            cancel,
+            join,
+        }
+    }
+
+    fn finish_generation(
         &mut self,
-        active: ActiveOperation,
+        mut active: ActiveOperation,
         result: Result<OperationTaskResult, tokio::task::JoinError>,
+        allow_resume: bool,
     ) {
-        let operation_id = active.scope.id();
         let outcome = match result {
+            Ok(mut result)
+                if allow_resume
+                    && active.resume_queued
+                    && active.request.is_resumable()
+                    && result.outcome == OperationOutcome::Completed(RunStatus::Cancelled) =>
+            {
+                let _ = active.steer_handle.drain();
+                if let Some(task_id) = active.task_id.as_deref() {
+                    result
+                        .state
+                        .thread
+                        .lifecycle_mut()
+                        .start_task_with_id(RuntimeTaskKind::Agent, task_id);
+                }
+                let context = GenerationContext::new(
+                    active.generation.context.fence().next(),
+                    active.steer_handle.clone(),
+                    true,
+                );
+                active.generation =
+                    self.spawn_generation(result.state, &active.request, result.writer, context);
+                active.resume_queued = false;
+                self.active = Some(active);
+                return;
+            }
             Ok(result) => {
                 self.state = Some(result.state);
                 result.outcome
@@ -926,7 +1298,7 @@ impl ThreadActor {
             },
         };
         let completed = active.completion.complete(OperationTerminal {
-            operation_id,
+            operation_id: active.operation_id,
             outcome,
         });
         debug_assert!(completed, "operation terminal must complete exactly once");
@@ -939,16 +1311,17 @@ fn run_hosted_operation(
     events: &mut EventFactory,
     config: &RunConfig,
     request: &HostedTurnRequest,
+    generation: &GenerationContext,
     writer: &mut (dyn io::Write + Send),
     cancel: &CancelToken,
 ) -> io::Result<RunStatus> {
     match request.envelope {
         HostedOperationEnvelope::Turn => {
-            executor.run_turn(thread, config, request, events, writer, cancel)
+            executor.run_turn(thread, config, request, generation, events, writer, cancel)
         }
-        HostedOperationEnvelope::HeadlessSession => {
-            run_headless_session(executor, thread, events, config, request, writer, cancel)
-        }
+        HostedOperationEnvelope::HeadlessSession => run_headless_session(
+            executor, thread, events, config, request, generation, writer, cancel,
+        ),
     }
 }
 
@@ -958,6 +1331,7 @@ fn run_headless_session(
     events: &mut EventFactory,
     config: &RunConfig,
     request: &HostedTurnRequest,
+    generation: &GenerationContext,
     writer: &mut (dyn io::Write + Send),
     cancel: &CancelToken,
 ) -> io::Result<RunStatus> {
@@ -986,7 +1360,15 @@ fn run_headless_session(
         sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
     }
 
-    let status = executor.run_turn(thread, config, request, events, sink.writer_mut(), cancel)?;
+    let status = executor.run_turn(
+        thread,
+        config,
+        request,
+        generation,
+        events,
+        sink.writer_mut(),
+        cancel,
+    )?;
 
     if let Err(error) = thread.session().hooks().run(
         HookEvent::SessionEnd,

@@ -1,6 +1,6 @@
 # ADR 0005: Runtime Host Operation Control Plane
 
-- Status: Accepted; P0.3a and P0.3b implemented but unreleased
+- Status: Accepted; P0.3a through P0.3c implemented but unreleased
 - Date: 2026-07-15
 - Roadmap: P0.3 Runtime Operation Host and canonical turn executor
 
@@ -62,17 +62,17 @@ The host command mailbox is bounded. Thread creation returns a cloneable
 ### ThreadActor
 
 One `ThreadActor` owns one conversation and serializes a bounded typed command
-mailbox. In this slice it accepts:
+mailbox. P0.3a accepts:
 
 - `StartTurn`;
 - `InterruptOperation`;
 - `ReadState`;
 - `ShutdownThread`.
 
-The actor is the sole authority for the current operation id and generation.
-It rejects a second start while an operation is active. Future P0.4 input
-commands will use the same operation id fence instead of creating another
-mailbox owner.
+The actor is the sole authority for the current logical operation id. It
+rejects a second start while an operation is active. P0.3c extends the same
+mailbox with actor-owned generation, resume, steer, and generation-admission
+commands instead of creating another surface control plane.
 
 `StartTurn` carries an owned `HostedTurnRequest`. It accepts only thread-safe,
 owned interaction and event handlers. The legacy `ThreadTurnRequest` can still
@@ -140,10 +140,13 @@ RuntimeHost supervisor
   -> ThreadActor
        -> idle: RuntimeThread
        -> running: ActiveOperation
-            -> OperationScope
-            -> joined task handle
-            -> RuntimeThread (inside task)
             -> terminal completion cell
+            -> actor-owned request and steer queue
+            -> ActiveGeneration
+                 -> GenerationFence
+                 -> fresh cancel token
+                 -> joined task handle
+                 -> RuntimeThread + EventFactory + writer (inside task)
 ```
 
 No external caller owns `RuntimeThread`, the operation join handle, or the
@@ -168,9 +171,10 @@ with new lifecycle state that belongs in the host.
 1. Add the host, actor, typed commands, operation handle, and terminal cell
    behind behavior tests.
 2. Run the existing legacy `ThreadTurnExecutor` through the actor-owned task.
-3. Migrate server active turns to `RuntimeThreadHandle`; delete server-owned
-   generation, cancellation, and reaper state.
-4. Add generation-fenced same-turn and next-turn input admission in P0.4.
+3. Add actor-owned logical-turn generations and typed resume, steer, and
+   generation-fenced input admission.
+4. Migrate server active turns to `RuntimeThreadHandle`; delete server-owned
+   generation, cancellation, resume mailbox, and reaper state.
 5. Move the canonical turn executor under the actor in P0.5.
 6. Move provider awaiting into the runtime and delete the synchronous provider
    compatibility worker in P0.6.
@@ -257,6 +261,183 @@ execution ownership do not migrate in this slice.
 The server and TUI remain temporary legacy surface owners until their own
 vertical migrations. They may use the actor-owned event sequence later, but
 must not add another session envelope around it.
+
+## P0.3c: Actor-Owned Logical Turn Generations And Input Admission
+
+### Structural Problem And Evidence
+
+P0.3b made one host operation joinable, but it still treats every executor run
+as the complete operation. That boundary cannot replace the production server
+control plane:
+
+- `server::ActiveTurnControl` owns a resettable generation record containing
+  the generation id, cancel token, and command-admission flag;
+- `run_thread_submit_async` owns a second loop that waits for one generation,
+  checks a separate resume mailbox, creates the next cancel token, and reruns
+  the same persisted turn;
+- `ActiveTurnManager` separately owns the worker join handle, reclamation,
+  shutdown reaper, generation validation, steer queue, and session permission
+  metadata;
+- permission, user-input, and MCP replies ask that manager whether their
+  captured generation is still active, while turn steer bypasses the host and
+  pushes directly into a shared `ThreadSteerHandle`;
+- the server writer buffers terminal-looking JSONL lines so an interrupted
+  generation cannot publish the logical turn terminal before a queued resume.
+
+Migrating the server before moving those responsibilities would leave
+`ActiveTurnManager` around `RuntimeHost` as a permanent second control plane.
+The actor would own an operation task while the server still decided which
+generation is current, whether input is accepted, and when the turn is really
+terminal. That contradicts the P0 ownership model.
+
+Current Codex keeps expected-turn validation inside the session that owns the
+active task. Its app-server maps `expectedTurnId` into
+`Session::steer_input`, which atomically checks the active task and turn id
+before queuing input. Orca should preserve that ownership property while also
+keeping its explicit interrupted-generation resume semantics.
+
+### Target Ownership And Module Boundary
+
+One `OperationId` identifies the actor-owned logical turn for its complete
+lifetime. Each executor attempt has an opaque monotonically increasing
+`GenerationId`, starting at zero, and a typed `GenerationFence` containing both
+ids.
+
+`ThreadActor` exclusively owns:
+
+- logical-turn admission and the one authoritative `OperationCompletion`;
+- current generation id, fresh cancel token, and joined task handle;
+- interrupt and resume admission, including duplicate-resume coalescing;
+- the steer queue and the rule for when same-turn input is accepted;
+- validation of generation-scoped permission, user-input, and MCP replies;
+- the decision to start a replacement generation only after the previous task
+  has joined and returned thread, event, request, and writer ownership.
+
+The actor command mailbox gains typed operations for resume, steer, generation
+validation, state reads, and shutdown. Every result identifies the logical
+operation and, where relevant, the generation it observed. A stale logical
+operation id or generation fence can never affect the current generation.
+
+Interrupt, resume, and steer are logical-turn commands: an accepted command
+intentionally targets whichever generation is current for the matching
+`OperationId`. Permission, user-input, and MCP replies are generation-scoped
+and must present the exact `GenerationFence` captured when the request was
+created. This distinction lets a user keep controlling one resumed turn while
+preventing an answer produced for generation N from entering generation N+1.
+
+The executor receives its `GenerationFence` and an actor-created steer handle.
+`HostedTurnRequest` no longer accepts an externally supplied steer handle that
+could bypass actor admission. A resumed generation runs the same owned request
+with the existing-turn marker set, so the original user prompt is not appended
+again.
+
+An interrupt cancels only the current generation. Resume is admissible only
+after that interrupt and is queued on the logical turn; the replacement
+generation is not spawned until the cancelled generation has joined. The
+logical operation completion remains empty across that transition and is
+written exactly once after the final generation joins.
+
+### TUI User Value
+
+This slice removes the lifecycle race that would otherwise reach the TUI when
+pause/resume and same-turn input move onto the host:
+
+- Resume cannot start a new provider/tool loop while the previous one still
+  owns the conversation, writer, or resources.
+- A stale turn control cannot mutate a newer logical operation, and a delayed
+  permission, user-input, or MCP answer cannot mutate a newer generation of
+  the same turn.
+- The UI can distinguish "interrupt accepted", "resume queued", and "turn
+  terminal" instead of treating cancellation acknowledgement as cleanup.
+- The eventual TUI migration can delete its outer cancellation owner rather
+  than wrapping the actor in another resettable scope.
+
+P0.3c is still a foundation slice and is not a release point. Its concrete
+product value is eliminating the resume/input race before the server and TUI
+adopt the host.
+
+### External Compatibility
+
+P0.3c does not change CLI arguments, TUI interaction flow, server JSONL request
+or event shapes, persisted session format, or provider/tool behavior. Headless
+sessions remain single-generation and explicitly reject resume while retaining
+the P0.3b session envelope.
+
+The new host command/result types are runtime-internal migration APIs. Existing
+headless callers keep `start_turn`, interrupt, wait, and shutdown behavior.
+
+### Migration Order And Temporary State
+
+1. Add RED runtime-host behavior tests for generation identity, join-before-
+   resume, duplicate resume, stale fences, steer admission, prompt reuse, one
+   logical terminal, and shutdown.
+2. Add typed generation ids, fences, command results, and state snapshots.
+3. Move the steer queue into `ThreadActor` and remove the external host-request
+   steer-handle escape hatch.
+4. Return owned thread/event/request/writer state from each generation task and
+   let the actor either start the joined replacement or publish the final
+   logical terminal.
+5. Keep server production execution on its legacy control plane until its
+   adapter can be replaced vertically in the next slice.
+
+The temporary boundary is explicit: P0.3c makes the host the complete source of
+truth only for host-run logical turns. The legacy server still owns its old
+turns until migration, and its JSONL terminal buffering remains there only
+until the server adapter consumes actor generation outcomes. No new server or
+TUI lifecycle state may be added beside it.
+
+### P0.3c Acceptance Criteria
+
+1. One logical operation id remains stable while generation ids increase from
+   zero and every generation receives a fresh cancellation token.
+2. Resume is rejected before interrupt, duplicate accepted resumes coalesce,
+   and generation N+1 cannot enter the executor until generation N has exited
+   and joined.
+3. A generation fence is accepted only for the current, command-accepting
+   generation; cancellation, replacement, completion, and a newer operation
+   make the old fence stale.
+4. Steer input is accepted only for the matching active logical turn before
+   cancellation, reaches the actor-owned queue once, and cannot be injected by
+   retaining an external handle.
+5. A resumed generation is marked as the existing turn and does not append or
+   execute a duplicate initial user prompt.
+6. Intermediate cancelled generations never complete the logical operation;
+   exactly one authoritative `OperationTerminal` is published after the final
+   generation joins.
+7. Thread or host shutdown cancels and joins the current generation, ignores a
+   queued resume, and publishes one terminal before returning.
+8. Headless session ordering, event sequence, hooks, writer-failure behavior,
+   and existing P0.3a/P0.3b ownership tests remain compatible.
+9. Focused runtime-host and cancellation tests pass, followed by the shared
+   runtime full gate and workspace Clippy with no new warnings.
+
+### P0.3c Deletion Gate
+
+This slice is incomplete if `ThreadActor` delegates generation replacement to
+an external loop, exposes its cancel token or steer queue for direct mutation,
+or completes the logical operation before the final joined generation. The
+server `ActiveTurnManager`, generation writer, and legacy worker loop are not
+deleted in P0.3c because the production server does not migrate in this slice;
+their deletion is the mandatory completion gate of the immediately following
+server migration.
+
+### P0.3c Verification
+
+- Seventeen runtime-host behavior tests cover logical operation and generation
+  identity, fresh cancellation scopes, join-before-resume, duplicate resume,
+  stale generation rejection, actor-owned steer admission, task lifecycle
+  reopening, one logical terminal, headless resume rejection, and shutdown.
+- A focused controller behavior test proves an existing-turn generation does
+  not append the original user prompt again.
+- `cargo test -p orca-runtime --all-targets -- --test-threads=1` passes with
+  780 runtime unit tests, 17 runtime-host tests, and 12 task-output tests.
+- `cargo test --workspace --all-targets -- --test-threads=1` passes, including
+  130 server contracts and 467 TUI tests.
+- `cargo clippy --workspace --all-targets` passes with the repository's
+  existing warnings and no warning in the P0.3c implementation or tests.
+- The real DeepSeek release harness passes provider summary, headless CLI,
+  malformed-history resume and repair, server, server thread memory, active
+  turn resume, turn controls, metadata, list/search, and paginated read gates.
 
 ### P0.3b Acceptance Criteria
 

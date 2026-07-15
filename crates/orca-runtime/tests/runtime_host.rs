@@ -16,9 +16,11 @@ use orca_core::event_sink::EventSink;
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
+use orca_runtime::lifecycle::RuntimeTaskStatus;
 use orca_runtime::runtime_host::{
-    HostedTurnRequest, InterruptOperationResult, OperationOutcome, RuntimeHost, RuntimeHostError,
-    ThreadOperationExecutor,
+    GenerationAdmissionResult, GenerationContext, GenerationFence, HostedTurnRequest,
+    InterruptOperationResult, OperationOutcome, ResumeOperationResult, RuntimeHost,
+    RuntimeHostError, RuntimeThreadState, SteerOperationResult, ThreadOperationExecutor,
 };
 use orca_runtime::thread::RuntimeThread;
 
@@ -33,6 +35,95 @@ struct ManualGate {
 struct GateState {
     entered: bool,
     released: bool,
+}
+
+#[derive(Clone)]
+struct CancelJoinGate {
+    state: Arc<(Mutex<CancelJoinState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct CancelJoinState {
+    entered: bool,
+    cancel_seen: bool,
+    released: bool,
+    exited: bool,
+}
+
+impl CancelJoinGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(CancelJoinState::default()), Condvar::new())),
+        }
+    }
+
+    fn enter_wait_for_cancel_and_release(&self, cancel: &CancelToken) {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.entered = true;
+        changed.notify_all();
+        while !cancel.is_cancelled() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "generation was not cancelled");
+            let (next, _) = changed
+                .wait_timeout(state, remaining.min(Duration::from_millis(5)))
+                .unwrap();
+            state = next;
+        }
+        state.cancel_seen = true;
+        changed.notify_all();
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "cancelled generation was not released"
+            );
+            let (next, timed_out) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                !timed_out.timed_out(),
+                "cancelled generation was not released"
+            );
+        }
+        state.exited = true;
+        changed.notify_all();
+    }
+
+    fn wait_until_entered(&self) {
+        self.wait_until(|state| state.entered, "generation did not enter executor");
+    }
+
+    fn wait_until_cancel_seen(&self) {
+        self.wait_until(
+            |state| state.cancel_seen,
+            "generation did not observe cancellation",
+        );
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.released = true;
+        changed.notify_all();
+    }
+
+    fn exited(&self) -> bool {
+        self.state.0.lock().unwrap().exited
+    }
+
+    fn wait_until(&self, predicate: impl Fn(&CancelJoinState) -> bool, message: &str) {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        while !predicate(&state) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{message}");
+            let (next, timed_out) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(!timed_out.timed_out(), "{message}");
+        }
+    }
 }
 
 impl ManualGate {
@@ -75,6 +166,7 @@ impl ManualGate {
 
 enum TestBehavior {
     WaitForCancel { finished: Arc<AtomicBool> },
+    WaitForCancelAndRelease { gate: CancelJoinGate },
     WaitForRelease { gate: ManualGate, status: RunStatus },
     EmitEvent { message: String, status: RunStatus },
     Panic,
@@ -83,6 +175,10 @@ enum TestBehavior {
 struct ScriptedExecutor {
     behaviors: Mutex<VecDeque<TestBehavior>>,
     calls: AtomicUsize,
+    generations: Mutex<Vec<(GenerationFence, bool)>>,
+    steer_inputs: Mutex<Vec<Vec<String>>>,
+    task_states: Mutex<Vec<(String, RuntimeTaskStatus)>>,
+    cancelled_on_entry: Mutex<Vec<bool>>,
 }
 
 impl ScriptedExecutor {
@@ -90,25 +186,62 @@ impl ScriptedExecutor {
         Self {
             behaviors: Mutex::new(behaviors.into_iter().collect()),
             calls: AtomicUsize::new(0),
+            generations: Mutex::new(Vec::new()),
+            steer_inputs: Mutex::new(Vec::new()),
+            task_states: Mutex::new(Vec::new()),
+            cancelled_on_entry: Mutex::new(Vec::new()),
         }
     }
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::Acquire)
     }
+
+    fn generations(&self) -> Vec<(GenerationFence, bool)> {
+        self.generations.lock().unwrap().clone()
+    }
+
+    fn steer_inputs(&self) -> Vec<Vec<String>> {
+        self.steer_inputs.lock().unwrap().clone()
+    }
+
+    fn task_states(&self) -> Vec<(String, RuntimeTaskStatus)> {
+        self.task_states.lock().unwrap().clone()
+    }
+
+    fn cancelled_on_entry(&self) -> Vec<bool> {
+        self.cancelled_on_entry.lock().unwrap().clone()
+    }
 }
 
 impl ThreadOperationExecutor for ScriptedExecutor {
     fn run_turn(
         &self,
-        _thread: &mut RuntimeThread,
+        thread: &mut RuntimeThread,
         config: &RunConfig,
         _request: &HostedTurnRequest,
+        generation: &GenerationContext,
         events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
     ) -> io::Result<RunStatus> {
         self.calls.fetch_add(1, Ordering::AcqRel);
+        self.cancelled_on_entry
+            .lock()
+            .unwrap()
+            .push(cancel.is_cancelled());
+        self.generations
+            .lock()
+            .unwrap()
+            .push((generation.fence(), generation.resumes_existing_turn()));
+        let task = thread
+            .lifecycle()
+            .active_task()
+            .expect("active generation task");
+        self.task_states
+            .lock()
+            .unwrap()
+            .push((task.id().to_string(), task.status()));
         let behavior = self
             .behaviors
             .lock()
@@ -125,8 +258,21 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                 finished.store(true, Ordering::Release);
                 Ok(RunStatus::Cancelled)
             }
+            TestBehavior::WaitForCancelAndRelease { gate } => {
+                gate.enter_wait_for_cancel_and_release(cancel);
+                self.steer_inputs
+                    .lock()
+                    .unwrap()
+                    .push(generation.drain_steer_inputs());
+                thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+                Ok(RunStatus::Cancelled)
+            }
             TestBehavior::WaitForRelease { gate, status } => {
                 gate.enter_and_wait();
+                self.steer_inputs
+                    .lock()
+                    .unwrap()
+                    .push(generation.drain_steer_inputs());
                 Ok(status)
             }
             TestBehavior::EmitEvent { message, status } => {
@@ -229,6 +375,17 @@ fn start_scripted_thread(
         .start_thread(test_config(cwd.path().to_path_buf()), "runtime host test")
         .expect("start runtime thread");
     (cwd, host, thread)
+}
+
+fn wait_for_call_count(executor: &ScriptedExecutor, expected: usize) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while executor.call_count() != expected {
+        assert!(
+            Instant::now() < deadline,
+            "executor did not reach {expected} calls"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
@@ -511,7 +668,7 @@ fn stale_interrupt_cannot_cancel_a_newer_operation() {
             .interrupt_operation(first.id())
             .expect("interrupt first operation"),
         InterruptOperationResult::Requested {
-            operation_id: first.id(),
+            generation: first.initial_generation(),
         }
     );
     assert_eq!(
@@ -533,7 +690,7 @@ fn stale_interrupt_cannot_cancel_a_newer_operation() {
             .expect("reject stale interrupt"),
         InterruptOperationResult::Stale {
             requested_operation_id: first.id(),
-            active_operation_id: second.id(),
+            active: second.initial_generation(),
         }
     );
     assert!(second.completion().try_terminal().is_none());
@@ -546,6 +703,287 @@ fn stale_interrupt_cannot_cancel_a_newer_operation() {
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
     );
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn logical_turn_resume_waits_for_join_and_publishes_one_terminal() {
+    let first_gate = CancelJoinGate::new();
+    let second_gate = ManualGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::WaitForCancelAndRelease {
+            gate: first_gate.clone(),
+        },
+        TestBehavior::WaitForRelease {
+            gate: second_gate.clone(),
+            status: RunStatus::Success,
+        },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+
+    let operation = thread
+        .start_turn(HostedTurnRequest::new("one logical turn"), io::sink())
+        .expect("start logical turn");
+    first_gate.wait_until_entered();
+    let first_generation = operation.initial_generation();
+    assert_eq!(first_generation.operation_id(), operation.id());
+    assert_eq!(first_generation.generation_id().as_u64(), 0);
+    assert_eq!(
+        thread
+            .admit_generation(first_generation)
+            .expect("admit first generation"),
+        GenerationAdmissionResult::Accepted {
+            generation: first_generation,
+        }
+    );
+    assert_eq!(
+        operation.resume().expect("reject uninterrupted resume"),
+        ResumeOperationResult::NotInterrupted {
+            generation: first_generation,
+        }
+    );
+
+    assert_eq!(
+        operation.interrupt().expect("interrupt first generation"),
+        InterruptOperationResult::Requested {
+            generation: first_generation,
+        }
+    );
+    first_gate.wait_until_cancel_seen();
+    assert_eq!(
+        thread
+            .admit_generation(first_generation)
+            .expect("reject cancelled generation"),
+        GenerationAdmissionResult::Rejected {
+            requested: first_generation,
+            active: Some(first_generation),
+        }
+    );
+    assert_eq!(
+        operation.steer("too late").expect("reject cancelled steer"),
+        SteerOperationResult::Rejected {
+            requested_operation_id: operation.id(),
+            active: Some(first_generation),
+        }
+    );
+    assert_eq!(
+        operation.resume().expect("queue resume"),
+        ResumeOperationResult::Queued {
+            generation: first_generation,
+        }
+    );
+    assert_eq!(
+        operation.resume().expect("coalesce duplicate resume"),
+        ResumeOperationResult::AlreadyQueued {
+            generation: first_generation,
+        }
+    );
+    assert_eq!(executor.call_count(), 1);
+    assert!(operation.completion().try_terminal().is_none());
+
+    first_gate.release();
+    wait_for_call_count(&executor, 2);
+    second_gate.wait_until_entered();
+    assert!(first_gate.exited());
+    let second_generation = match thread.state().expect("read resumed state") {
+        RuntimeThreadState::Running { generation, .. } => generation,
+        state => panic!("expected running generation, got {state:?}"),
+    };
+    assert_eq!(second_generation.operation_id(), operation.id());
+    assert_eq!(second_generation.generation_id().as_u64(), 1);
+    assert_eq!(
+        thread
+            .admit_generation(first_generation)
+            .expect("reject replaced generation"),
+        GenerationAdmissionResult::Rejected {
+            requested: first_generation,
+            active: Some(second_generation),
+        }
+    );
+    assert_eq!(
+        thread
+            .admit_generation(second_generation)
+            .expect("admit resumed generation"),
+        GenerationAdmissionResult::Accepted {
+            generation: second_generation,
+        }
+    );
+    assert_eq!(
+        operation
+            .steer("steer resumed generation")
+            .expect("steer resumed generation"),
+        SteerOperationResult::Accepted {
+            generation: second_generation,
+        }
+    );
+
+    second_gate.release();
+    let terminal = operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("logical turn terminal");
+    assert_eq!(terminal.operation_id(), operation.id());
+    assert_eq!(
+        terminal.outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    assert_eq!(operation.completion().try_terminal(), Some(terminal));
+    assert_eq!(
+        thread
+            .admit_generation(second_generation)
+            .expect("reject completed generation"),
+        GenerationAdmissionResult::Rejected {
+            requested: second_generation,
+            active: None,
+        }
+    );
+    assert_eq!(
+        executor.generations(),
+        vec![(first_generation, false), (second_generation, true)]
+    );
+    let task_states = executor.task_states();
+    assert_eq!(task_states.len(), 2);
+    assert_eq!(task_states[0].0, task_states[1].0);
+    assert_eq!(task_states[0].1, RuntimeTaskStatus::Running);
+    assert_eq!(task_states[1].1, RuntimeTaskStatus::Running);
+    assert_eq!(executor.cancelled_on_entry(), vec![false, false]);
+    assert_eq!(
+        executor.steer_inputs(),
+        vec![
+            Vec::<String>::new(),
+            vec!["steer resumed generation".to_string()]
+        ]
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn actor_owned_steer_is_operation_fenced_and_drained_once() {
+    let first_gate = ManualGate::new();
+    let second_gate = ManualGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::WaitForRelease {
+            gate: first_gate.clone(),
+            status: RunStatus::Success,
+        },
+        TestBehavior::WaitForRelease {
+            gate: second_gate.clone(),
+            status: RunStatus::Success,
+        },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+
+    let first = thread
+        .start_turn(HostedTurnRequest::new("first"), io::sink())
+        .expect("start first turn");
+    first_gate.wait_until_entered();
+    let first_generation = first.initial_generation();
+    assert_eq!(
+        first.steer("steer once").expect("admit steer"),
+        SteerOperationResult::Accepted {
+            generation: first_generation,
+        }
+    );
+    first_gate.release();
+    assert_eq!(
+        first
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("first terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    assert_eq!(
+        executor.steer_inputs(),
+        vec![vec!["steer once".to_string()]]
+    );
+
+    let second = thread
+        .start_turn(HostedTurnRequest::new("second"), io::sink())
+        .expect("start second turn");
+    second_gate.wait_until_entered();
+    let second_generation = second.initial_generation();
+    assert_eq!(
+        first.steer("stale steer").expect("reject stale steer"),
+        SteerOperationResult::Rejected {
+            requested_operation_id: first.id(),
+            active: Some(second_generation),
+        }
+    );
+    second_gate.release();
+    second.wait_timeout(TEST_TIMEOUT).expect("second terminal");
+    assert_eq!(executor.steer_inputs().len(), 2);
+    assert!(executor.steer_inputs()[1].is_empty());
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn shutdown_joins_current_generation_without_starting_queued_resume() {
+    let gate = CancelJoinGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::WaitForCancelAndRelease { gate: gate.clone() },
+        TestBehavior::EmitEvent {
+            message: "queued resume must not run".to_string(),
+            status: RunStatus::Success,
+        },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    let operation = thread
+        .start_turn(HostedTurnRequest::new("shutdown"), io::sink())
+        .expect("start turn");
+    gate.wait_until_entered();
+    operation.interrupt().expect("interrupt generation");
+    gate.wait_until_cancel_seen();
+    assert!(matches!(
+        operation.resume().expect("queue resume"),
+        ResumeOperationResult::Queued { .. }
+    ));
+
+    let release_gate = gate.clone();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        release_gate.release();
+    });
+    thread.shutdown().expect("shutdown thread actor");
+    releaser.join().expect("join generation releaser");
+
+    assert!(gate.exited());
+    assert_eq!(executor.call_count(), 1);
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("shutdown terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Cancelled)
+    );
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn headless_session_rejects_generation_resume() {
+    let gate = CancelJoinGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([
+        TestBehavior::WaitForCancelAndRelease { gate: gate.clone() },
+    ]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    let operation = thread
+        .start_turn(HostedTurnRequest::headless_session("headless"), io::sink())
+        .expect("start headless session");
+    gate.wait_until_entered();
+    let generation = operation.initial_generation();
+    operation
+        .interrupt()
+        .expect("interrupt headless generation");
+    gate.wait_until_cancel_seen();
+    assert_eq!(
+        operation.resume().expect("reject headless resume"),
+        ResumeOperationResult::NotResumable { generation }
+    );
+    gate.release();
+    operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("headless terminal");
+    assert!(gate.exited());
     host.shutdown().expect("shutdown runtime host");
 }
 

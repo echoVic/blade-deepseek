@@ -28,17 +28,16 @@ check, four-platform build, GitHub Release, npm publish, and npm release-asset
 jobs. The public verifier confirmed the GitHub Release,
 `@blade-ai/orca@0.2.28`, and `npm exec` installation.
 
-Current unreleased architecture work starts P0.3a. `orca-runtime` now has a
-process-owned `RuntimeHost`, one bounded-mailbox `ThreadActor` per conversation,
+P0.3a introduced a process-owned `RuntimeHost`, one bounded-mailbox
+`ThreadActor` per conversation,
 an owned and thread-safe `HostedTurnRequest`, and typed `OperationHandle` /
 `OperationCompletion` terminals. An actor owns idle `RuntimeThread` state; one
 joined operation task owns it while running and returns it before another turn
 can start. Explicit interrupt is fenced by `OperationId`, concurrent start is
 rejected, handle or event-subscriber loss is not reported as cancellation, and
 thread/host shutdown cancels and joins active work. The operation task still
-delegates to the existing `RuntimeThread -> ThreadTurnExecutor` path. No TUI,
-headless, or server surface has migrated yet, so this foundation is not a
-release point and the old surface owners remain deletion-gated work.
+delegates to the existing `RuntimeThread -> ThreadTurnExecutor` path. At that
+checkpoint no surface had migrated, so it was not a release point.
 
 P0.3b now moves the persistent event sequence into the thread actor beside
 `RuntimeThread`, gives hosted operations a typed turn-versus-headless-session
@@ -53,6 +52,25 @@ gates, Clippy, and real DeepSeek CLI plus history-resume headless smokes pass.
 This remains unreleased architecture work: it removes the lifecycle ambiguity
 that blocked a safe TUI migration, but it does not yet move the TUI's production
 loop onto the host.
+
+P0.3c now makes one actor-owned `OperationId` span every generation of a
+logical turn. Each executor attempt has a typed `GenerationFence`, fresh cancel
+token, joined task, and generation-aware state snapshot. Interrupt, resume,
+steer, and generation validation are serialized through the actor mailbox;
+resume coalesces and cannot start until the cancelled generation returns its
+thread, event factory, writer, and task lifecycle ownership. The actor creates
+the only steer queue, reopens the same task id as Running for a resumed
+generation, marks the request as an existing turn so the original user prompt
+is not appended again, and publishes one operation terminal after the final
+joined generation. Headless sessions remain single-generation and reject
+resume. The next vertical slice must migrate server active turns onto these
+commands and delete `ActiveTurnManager`, its generation loop, resettable cancel
+record, resume mailbox, generation writer, and reaper ownership. Wrapping those
+owners around `RuntimeHost` is not an accepted migration. Seventeen host
+behavior tests, 780 runtime unit tests, 130 server contracts, 467 TUI tests, the
+full serial workspace gate, workspace Clippy, and the complete real DeepSeek
+release harness pass. This is still unreleased foundation work because no TUI
+task-control flow uses the new generation commands yet.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
