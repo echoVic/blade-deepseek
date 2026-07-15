@@ -1,0 +1,57 @@
+Cargo.lock
+  s_bd921bce96b0c1::t_94cc3434e77937 1379
+README.md
+  s_61c879183fbdff::t_4dfb12c923a6dd 200-202
+crates/orca-runtime/src/mentions.rs
+  s_61c879183fbdff::t_c709f163fe289f 784-805,1101-1103,1477,1508-1514,1558-1605
+crates/orca-tools/src/skills.rs
+  s_bd921bce96b0c1::t_613c79198a15a7 4,7,14-15,28,69-70,73,79-82,90-95,103,108,110-117,120-122,144-162,165-172,176-180,185,194-203,248-252,259-283,288,293-294,313,316-317,319,321,323-334,342-343,347,458,469-516,528,553-554
+crates/orca-tui/Cargo.toml
+  s_bd921bce96b0c1::t_6b55532d8578d1 25
+crates/orca-tui/src/app.rs
+  s_61c879183fbdff::t_55840759d55d93 569-628,3408-3441
+crates/orca-tui/src/commands/mod.rs
+  s_bd921bce96b0c1::t_d31849c77c7e2c 15-16,45-49,52-70,105,130,150-161
+crates/orca-tui/src/slash_command_actions.rs
+  s_bd921bce96b0c1::t_c8576551a8615a 117-126,130-157
+crates/orca-tui/src/slash_menu_actions.rs
+  s_bd921bce96b0c1::t_0345c2e396eb3f 162-176
+crates/orca-tui/src/status_key_actions.rs
+  s_61c879183fbdff::t_c27637e88d6103 215-257
+crates/orca-tui/src/types.rs
+  s_61c879183fbdff::t_94d5f124f93e25 699,1180-1260,1262,1270-1271,3117-3121,3135-3153
+docs/architecture/adr/0002-unified-atomic-mention-system.md
+  s_61c879183fbdff::t_aac7842d65636b 150-151
+docs/superpowers/specs/2026-07-15-mention-binding-only-design.md
+  s_61c879183fbdff::t_d335b052f1a955 5
+tests/history_contract.rs
+  s_61c879183fbdff::t_2d754c63db864c 58,72
+tests/session_server_contract.rs
+  s_61c879183fbdff::t_dbfa1d874eb188 6791,6825,6839-6932
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "033df63cd3da621eae8f699d220f1f8dc2ed42a6",
+  "prompts": {},
+  "sessions": {
+    "s_61c879183fbdff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f63eb-5026-7073-9854-b348079bb9f3",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    },
+    "s_bd921bce96b0c1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c8e9b68-f49e-4bfb-bc7d-ce69192bb225",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
