@@ -229,7 +229,7 @@ mod tests {
     /// An AppState with one transcript message ("hello world") rendered into
     /// a 20x5 transcript area at the screen origin, scrolled to the top.
     fn state_with_transcript() -> AppState {
-        let (tx, _rx) = std::sync::mpsc::channel::<UserAction>();
+        let (tx, _rx) = crossbeam_channel::unbounded::<UserAction>();
         let mut state = AppState::new(
             tx,
             "0.0.0".to_string(),

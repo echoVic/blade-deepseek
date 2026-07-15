@@ -453,7 +453,7 @@ fn lifecycle_status_label(status: orca_runtime::lifecycle::RuntimeTaskStatus) ->
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use crossbeam_channel as mpsc;
     use std::time::Duration;
 
     use super::*;
@@ -516,8 +516,8 @@ mod tests {
             .expect("first budgeted request admitted");
         let waiting_ledger = ledger.clone();
         let waiting_cancel = cancel.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::unbounded();
+        let (result_tx, result_rx) = mpsc::unbounded();
 
         let waiter = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
@@ -559,7 +559,7 @@ mod tests {
         let waiting_ledger = ledger.clone();
         let waiting_cancel = CancelToken::new();
         let cancel_from_test = waiting_cancel.clone();
-        let (result_tx, result_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::unbounded();
 
         let waiter = std::thread::spawn(move || {
             result_tx

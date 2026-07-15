@@ -88,8 +88,8 @@ fn mark_manual_selection(state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
+    use crossbeam_channel as mpsc;
     use std::path::PathBuf;
-    use std::sync::mpsc;
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use orca_core::config::ThemeName;
@@ -100,7 +100,7 @@ mod tests {
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
 
     fn state() -> AppState {
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         AppState::new(
             event_tx,
             "0.0.0-test".to_string(),

@@ -9,6 +9,7 @@ mod approval_mode_actions;
 mod background_approval;
 mod background_tasks;
 pub mod bridge;
+mod channels;
 mod clipboard;
 pub mod commands;
 mod composer_input_actions;

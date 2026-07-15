@@ -1,5 +1,7 @@
 use std::io;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
+
+use crossbeam_channel as mpsc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 

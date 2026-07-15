@@ -1,7 +1,8 @@
+use crossbeam_channel::{self as mpsc, Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{self, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::io;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +10,8 @@ use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::{EVENT_SCHEMA_VERSION, EventEnvelope, EventFactory, EventType};
+use orca_core::event_schema::{EventEnvelope, EventFactory};
+use orca_core::event_sink::EventObserver;
 use orca_core::hook_types::HookEvent;
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
@@ -40,6 +42,7 @@ use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::types::{PendingWorkflowNotification, TuiEvent, UserAction};
 
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
+const PROVIDER_STREAM_CAPACITY: usize = 256;
 
 pub(crate) type PendingWorkflowNotifications = crate::types::PendingWorkflowNotificationQueue;
 
@@ -113,72 +116,27 @@ pub(crate) fn send_runtime_event_as_tui(event_tx: &Sender<TuiEvent>, event: Even
     }
 }
 
-struct TuiRuntimeEventWriter {
+struct TuiRuntimeEventObserver {
     event_tx: Sender<TuiEvent>,
-    buffer: Vec<u8>,
 }
 
-impl TuiRuntimeEventWriter {
+impl TuiRuntimeEventObserver {
     fn new(event_tx: Sender<TuiEvent>) -> Self {
-        Self {
-            event_tx,
-            buffer: Vec::new(),
-        }
+        Self { event_tx }
     }
+}
 
-    fn drain_complete_lines(&mut self) -> io::Result<()> {
-        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line: Vec<u8> = self.buffer.drain(..=newline).collect();
-            if line.ends_with(b"\n") {
-                line.pop();
-            }
-            if line.ends_with(b"\r") {
-                line.pop();
-            }
-            if line.is_empty() {
-                continue;
-            }
-            let parsed: TuiRuntimeEventEnvelope =
-                serde_json::from_slice(&line).map_err(io::Error::other)?;
-            let envelope = parsed.into_event_envelope();
-            send_runtime_event_as_tui(&self.event_tx, envelope);
+impl EventObserver for TuiRuntimeEventObserver {
+    fn observe(&self, event: &EventEnvelope) -> io::Result<()> {
+        if let Some(event) = tui_event_from_runtime_event(event) {
+            self.event_tx.send(event).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TUI runtime event mailbox disconnected",
+                )
+            })?;
         }
         Ok(())
-    }
-}
-
-impl Write for TuiRuntimeEventWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        self.drain_complete_lines()?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct TuiRuntimeEventEnvelope {
-    run_id: String,
-    seq: u64,
-    timestamp_ms: u128,
-    #[serde(rename = "type")]
-    event_type: EventType,
-    payload: serde_json::Value,
-}
-
-impl TuiRuntimeEventEnvelope {
-    fn into_event_envelope(self) -> EventEnvelope {
-        EventEnvelope {
-            version: EVENT_SCHEMA_VERSION,
-            run_id: self.run_id,
-            seq: self.seq,
-            timestamp_ms: self.timestamp_ms,
-            event_type: self.event_type,
-            payload: self.payload,
-        }
     }
 }
 
@@ -269,7 +227,7 @@ fn spawn_provider_stream(
     provider_config: ProviderConfig,
     cancel: CancelToken,
 ) -> Receiver<ProviderStreamEvent> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::bounded(PROVIDER_STREAM_CAPACITY);
     thread::spawn(move || {
         let step_tx = tx.clone();
         let response = orca_provider::call_streaming(
@@ -688,12 +646,12 @@ pub(crate) fn continue_approved_background_turn_for_tui(
     continuation_config.output_format = OutputFormat::Jsonl;
     let request = ThreadTurnRequest::new("")
         .with_continuation(runtime_continuation)
-        .with_session_completed_event(false);
-    let writer = TuiRuntimeEventWriter::new(event_tx.clone());
+        .with_session_completed_event(false)
+        .with_event_observer(Arc::new(TuiRuntimeEventObserver::new(event_tx.clone())));
     let status = match session.run_request_with_cancel_for_tui(
         &continuation_config,
         &request,
-        writer,
+        io::sink(),
         cancel.clone(),
     ) {
         Ok(status) => status,
@@ -1237,7 +1195,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             return TuiAgentTurnResult::new("budget_exhausted");
         }
 
-        let mut runtime_event_writer = TuiRuntimeEventWriter::new(event_tx.clone());
+        let runtime_event_observer = Arc::new(TuiRuntimeEventObserver::new(event_tx.clone()));
+        let mut runtime_event_output = io::sink();
         let context_usage = match orca_runtime::run_tui_agent_turn_compaction(
             session.runtime_session_mut(),
             orca_runtime::TuiAgentTurnCompactionInput {
@@ -1251,7 +1210,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 emit_deltas: true,
                 cancel,
                 events: &mut runtime_events,
-                writer: &mut runtime_event_writer,
+                event_observer: Some(runtime_event_observer),
+                writer: &mut runtime_event_output,
             },
         ) {
             Ok(context_usage) => context_usage,
@@ -1563,7 +1523,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             return TuiAgentTurnResult::new("interrupted");
         }
 
-        let mut runtime_event_writer = TuiRuntimeEventWriter::new(event_tx.clone());
+        let runtime_event_observer = Arc::new(TuiRuntimeEventObserver::new(event_tx.clone()));
+        let mut runtime_event_output = io::sink();
         match orca_runtime::handle_tui_agent_provider_error(
             session.runtime_session_mut(),
             &mut tui_compaction,
@@ -1579,7 +1540,8 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 emit_deltas: true,
                 cancel,
                 events: &mut runtime_events,
-                writer: &mut runtime_event_writer,
+                event_observer: Some(runtime_event_observer),
+                writer: &mut runtime_event_output,
             },
         ) {
             Ok(orca_runtime::TuiAgentProviderErrorAction::NoError) => {}
@@ -2013,13 +1975,13 @@ mod tests {
         run_child_agent_for_tui_silent, should_run_subagent_batch,
     };
     use crate::agent_tool_execution::{canonical_action_for_tool, execute_tool_for_tui};
+    use crossbeam_channel as mpsc;
     use orca_runtime::hooks::HookRunner;
     use orca_runtime::instructions::ProjectInstructions;
     use orca_runtime::memory::MemoryBlock;
     use orca_runtime::tasks::TaskRegistry;
     use std::collections::VecDeque;
     use std::path::Path;
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use orca_core::approval_types::ApprovalMode;
@@ -2084,24 +2046,33 @@ mod tests {
     }
 
     #[test]
-    fn tui_runtime_event_writer_buffers_partial_jsonl_events() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let mut writer = TuiRuntimeEventWriter::new(event_tx);
-        let mut events = EventFactory::new("run-partial".to_string());
-        let line = serde_json::to_string(&events.assistant_message_delta("hello")).unwrap() + "\n";
-        let split_at = line.len() / 2;
+    fn tui_runtime_event_observer_forwards_typed_event() {
+        let (event_tx, event_rx) = mpsc::bounded(1);
+        let observer = TuiRuntimeEventObserver::new(event_tx);
+        let mut events = EventFactory::new("run-observer".to_string());
 
-        std::io::Write::write_all(&mut writer, &line.as_bytes()[..split_at])
-            .expect("partial write");
-        assert!(event_rx.try_recv().is_err());
-
-        std::io::Write::write_all(&mut writer, &line.as_bytes()[split_at..])
-            .expect("complete write");
+        observer
+            .observe(&events.assistant_message_delta("hello"))
+            .expect("event should reach the TUI mailbox");
 
         match event_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             TuiEvent::MessageDelta(text) => assert_eq!(text, "hello"),
             event => panic!("expected message delta, got {event:?}"),
         }
+    }
+
+    #[test]
+    fn tui_runtime_event_observer_reports_disconnected_mailbox() {
+        let (event_tx, event_rx) = mpsc::bounded(1);
+        drop(event_rx);
+        let observer = TuiRuntimeEventObserver::new(event_tx);
+        let mut events = EventFactory::new("run-observer-disconnected".to_string());
+
+        let error = observer
+            .observe(&events.assistant_message_delta("hello"))
+            .expect_err("disconnected mailbox should fail the operation");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     fn full_auto_config() -> RunConfig {
@@ -2120,8 +2091,8 @@ mod tests {
                 TuiConversationSession::new_with_preloaded(&config, "provider failure", None)
                     .expect("session");
             let session_id = session.session_id().expect("session id").to_string();
-            let (event_tx, event_rx) = mpsc::channel();
-            let (_action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (_action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
             let error = "mock provider error: api_key=super-secret";
 
@@ -2180,8 +2151,8 @@ mod tests {
             let task = registry.create_main_session("Provider failure".to_string());
             registry.mark_running(&task.id).unwrap();
             registry.mark_backgrounded(&task.id).unwrap();
-            let (event_tx, event_rx) = mpsc::channel();
-            let (provider_tx, provider_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (provider_tx, provider_rx) = mpsc::unbounded();
             let error = "DeepSeek provider error: api_key=super-secret";
 
             spawn_background_provider_completion(
@@ -2322,8 +2293,8 @@ mod tests {
                 .submit_pending_tool_approval_response(&task.id, true)
                 .unwrap();
 
-            let (event_tx, _event_rx) = mpsc::channel();
-            let (_action_tx, action_rx) = mpsc::channel();
+            let (event_tx, _event_rx) = mpsc::unbounded();
+            let (_action_tx, action_rx) = mpsc::unbounded();
             let pending_actions = RefCell::new(VecDeque::new());
             let result = continue_approved_background_turn_for_tui(
                 &config,
@@ -2424,8 +2395,8 @@ mod tests {
                 .submit_pending_tool_approval_response(&task.id, true)
                 .unwrap();
 
-            let (event_tx, _event_rx) = mpsc::channel();
-            let (_action_tx, action_rx) = mpsc::channel();
+            let (event_tx, _event_rx) = mpsc::unbounded();
+            let (_action_tx, action_rx) = mpsc::unbounded();
             let pending_actions = RefCell::new(VecDeque::new());
             let request = TuiBackgroundTurnContinuationRequest::new(task.id.clone());
             let result = continue_approved_background_turn_for_tui(
@@ -2541,8 +2512,8 @@ mod tests {
     #[test]
     fn tui_session_reuses_conversation_across_submits() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
@@ -2651,8 +2622,8 @@ mod tests {
     #[test]
     fn tui_displays_final_assistant_content_without_stream_delta() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "silent", None).expect("session");
@@ -2680,8 +2651,8 @@ mod tests {
     #[test]
     fn tui_turn_started_events_include_agent_task_lifecycle() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "task lifecycle", None)
@@ -2714,8 +2685,8 @@ mod tests {
     #[test]
     fn tui_turn_started_task_matches_main_session_task_registry() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "task identity", None)
@@ -2764,8 +2735,8 @@ mod tests {
     #[test]
     fn tui_main_turn_updates_main_session_task_registry() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "main session task", None)
@@ -2820,8 +2791,8 @@ mod tests {
     #[test]
     fn tui_background_current_turn_marks_main_session_task() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "background turn", None)
@@ -2865,7 +2836,7 @@ mod tests {
     #[test]
     fn background_poll_preserves_non_background_actions() {
         let config = config();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut runtime_events = EventFactory::new("background-poll".to_string());
         let session = TuiConversationSession::new_with_preloaded(&config, "background poll", None)
             .expect("session");
@@ -2878,7 +2849,7 @@ mod tests {
             .task_registry()
             .mark_running(&task.id)
             .expect("running main session");
-        let (queued_tx, queued_rx) = mpsc::channel();
+        let (queued_tx, queued_rx) = mpsc::unbounded();
         queued_tx
             .send(UserAction::Submit("next prompt".to_string()))
             .expect("send queued submit");
@@ -2905,8 +2876,8 @@ mod tests {
     #[test]
     fn tui_task_stop_can_stop_active_main_session_task() {
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "main session stop", None)
@@ -2958,8 +2929,8 @@ mod tests {
     #[test]
     fn tui_task_stop_can_clear_approval_required_background_main_session() {
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "main session stop", None)
@@ -3077,8 +3048,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
@@ -3141,8 +3112,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
             .expect("session");
@@ -3245,8 +3216,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let pending_notifications = PendingWorkflowNotifications::new();
         assert!(
@@ -3301,8 +3272,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = full_auto_config();
         config.cwd = Some(temp.path().to_path_buf());
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let pending_notifications = PendingWorkflowNotifications::new();
         let mut session = TuiConversationSession::new_with_preloaded(&config, "task_list", None)
@@ -3335,8 +3306,8 @@ mod tests {
         }
 
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "workflow inline", None)
@@ -3444,8 +3415,8 @@ mod tests {
         config.output_format = OutputFormat::Jsonl;
         let temp = tempfile::tempdir().unwrap();
         config.cwd = Some(temp.path().to_path_buf());
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "workflow draft", None)
@@ -3483,8 +3454,8 @@ mod tests {
     #[test]
     fn tui_streaming_bash_observes_turn_cancel() {
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let turn_cancel = cancel.clone();
         let mut session =
@@ -3538,8 +3509,8 @@ mod tests {
     #[test]
     fn tui_main_session_stop_closes_every_sibling_tool_row() {
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "task stop siblings", None)
@@ -3628,8 +3599,8 @@ mod tests {
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
 
-        let (event_tx, event_rx) = mpsc::channel();
-        let (provider_tx, provider_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (provider_tx, provider_rx) = mpsc::unbounded();
         let tool_request = tool_types::ToolRequest {
             id: "mock-tool-1".to_string(),
             name: tool_types::ToolName::TaskList,
@@ -3716,8 +3687,8 @@ mod tests {
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
 
-        let (event_tx, event_rx) = mpsc::channel();
-        let (provider_tx, provider_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (provider_tx, provider_rx) = mpsc::unbounded();
         spawn_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
@@ -3787,8 +3758,8 @@ mod tests {
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
 
-        let (event_tx, event_rx) = mpsc::channel();
-        let (provider_tx, provider_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (provider_tx, provider_rx) = mpsc::unbounded();
         spawn_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
@@ -3843,9 +3814,9 @@ mod tests {
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
 
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (provider_tx, provider_rx) = mpsc::channel();
-        let (completion_tx, completion_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (provider_tx, provider_rx) = mpsc::unbounded();
+        let (completion_tx, completion_rx) = mpsc::unbounded();
         spawn_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
@@ -3899,8 +3870,8 @@ mod tests {
         registry.mark_backgrounded(&task.id).unwrap();
         let usage_ledger = TuiUsageLedger::default();
 
-        let (event_tx, event_rx) = mpsc::channel();
-        let (provider_tx, provider_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (provider_tx, provider_rx) = mpsc::unbounded();
         spawn_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
@@ -3974,8 +3945,8 @@ mod tests {
                 TuiConversationSession::new_with_preloaded(&config, "budgeted child", None)
                     .expect("session");
             let session_id = session.session_id().expect("session id").to_string();
-            let (event_tx, event_rx) = mpsc::channel();
-            let (_action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (_action_tx, action_rx) = mpsc::unbounded();
 
             let status = run_agent_for_tui(
                 &config,
@@ -4067,8 +4038,8 @@ mod tests {
             cache_tokens: 8,
             estimated_cost_usd: 0.25,
         });
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
 
         let status = run_agent_for_tui(
             &config,
@@ -4109,8 +4080,8 @@ mod tests {
                 cache_tokens: 8,
                 estimated_cost_usd: 0.75,
             });
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
 
         let status = run_agent_for_tui(
             &config,
@@ -4155,8 +4126,8 @@ mod tests {
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
 
-        let (event_tx, event_rx) = mpsc::channel();
-        let (provider_tx, provider_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (provider_tx, provider_rx) = mpsc::unbounded();
         spawn_background_provider_completion(
             provider_rx,
             BackgroundProviderCompletionContext {
@@ -4208,8 +4179,8 @@ mod tests {
     #[test]
     fn tui_tool_approval_uses_runtime_handler_before_execution() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::Approve {
                 id: "approval-bash".to_string(),
@@ -4271,8 +4242,8 @@ mod tests {
     #[test]
     fn tui_tool_approval_cancel_returns_denied_result() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx.send(UserAction::Cancel).expect("send cancel");
         let pending_actions = RefCell::new(VecDeque::new());
         let request = tool_types::ToolRequest {
@@ -4320,8 +4291,8 @@ mod tests {
     #[test]
     fn tui_session_backtracks_last_user_before_next_submit() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
@@ -4375,8 +4346,8 @@ mod tests {
     #[test]
     fn tui_workflow_notification_turn_is_not_backtrack_target() {
         let config = config();
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "first", None).expect("session");
@@ -4415,8 +4386,8 @@ mod tests {
     #[test]
     fn tui_request_user_input_waits_for_answer_and_continues() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "ask", None).expect("session");
@@ -4459,8 +4430,8 @@ mod tests {
     #[test]
     fn tui_request_user_input_cancel_stops_turn() {
         let config = config();
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session =
             TuiConversationSession::new_with_preloaded(&config, "ask", None).expect("session");
@@ -4527,8 +4498,8 @@ mod tests {
     #[test]
     fn tui_main_agent_recovers_from_unknown_tool_call() {
         let config = full_auto_config();
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         let mut session = TuiConversationSession::new_with_preloaded(&config, "unknown tool", None)
             .expect("session");
@@ -4576,7 +4547,7 @@ mod tests {
     #[test]
     fn tui_subagent_batch_records_child_failure_without_stopping_batch() {
         let config = full_auto_config();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -4630,7 +4601,7 @@ mod tests {
     #[test]
     fn tui_subagent_batch_rejects_malformed_arguments_before_starting_child() {
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -4681,7 +4652,7 @@ mod tests {
     #[test]
     fn tui_subagent_batch_emits_child_activity_progress() {
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -4729,7 +4700,7 @@ mod tests {
     #[test]
     fn tui_sync_subagent_batch_updates_task_registry_activity() {
         let config = full_auto_config();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
         let hooks = HookRunner::default();
@@ -4869,8 +4840,8 @@ mod tests {
     fn tui_budget_mode_rejects_async_subagent_before_task_launch() {
         let mut config = full_auto_config();
         config.max_budget_usd = Some(1.0);
-        let (event_tx, event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let pending_actions = RefCell::new(VecDeque::new());
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
@@ -4930,8 +4901,8 @@ mod tests {
     #[test]
     fn tui_async_subagent_launches_task_and_status_returns_result() {
         let config = full_auto_config();
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let pending_actions = RefCell::new(VecDeque::new());
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
@@ -5015,8 +4986,8 @@ mod tests {
     #[test]
     fn tui_async_subagent_records_live_activity_for_status() {
         let config = full_auto_config();
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let pending_actions = RefCell::new(VecDeque::new());
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();

@@ -3119,16 +3119,16 @@ mod tests {
     use super::*;
     use crate::types::{SlashMenu, SlashMenuItem, TuiEvent};
     use chrono::Utc;
+    use crossbeam_channel as mpsc;
     use orca_core::config::AdditionalWorkingDirectory;
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_runtime::history::SessionSummary;
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     #[test]
     fn welcome_lines_use_configured_app_version() {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::unbounded();
         let state = AppState::new(
             tx,
             "9.8.7-test".to_string(),
@@ -3189,7 +3189,7 @@ mod tests {
     }
 
     fn test_state() -> AppState {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::unbounded();
         AppState::new(
             tx,
             "0.0.0".to_string(),

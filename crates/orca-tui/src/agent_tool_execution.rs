@@ -1,8 +1,8 @@
+use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ActionKind, ApprovalDecision, ApprovalRequest};
@@ -1196,7 +1196,7 @@ pub(crate) fn canonical_action_for_tool(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use crossbeam_channel as mpsc;
 
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
@@ -1315,8 +1315,8 @@ mod tests {
         fn new() -> Self {
             let workspace = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
             std::fs::create_dir(workspace.path().join(".git")).unwrap();
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             Self {
                 workspace,
                 event_tx,
@@ -1511,8 +1511,8 @@ mod tests {
     #[test]
     fn execute_tool_for_tui_rejects_malformed_subagent_before_task_creation() {
         let workspace = TempDir::new().unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (_action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (_action_tx, action_rx) = mpsc::unbounded();
         let pending_actions = RefCell::new(VecDeque::new());
         let config = config(ApprovalMode::FullAuto);
         let policy = ApprovalPolicy::new(ApprovalMode::FullAuto);
@@ -1570,7 +1570,7 @@ mod tests {
             tool: Some("read_file".to_string()),
         }]);
         let config = config(ApprovalMode::FullAuto);
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let request = tool_types::ToolRequest {
             id: "read-malformed".to_string(),
             name: ToolName::ReadFile,
@@ -1794,8 +1794,8 @@ mod tests {
     fn execute_tool_for_tui_tracks_runtime_pending_user_input_until_answered() {
         let config = config(ApprovalMode::Suggest);
         let cwd = config.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let store = RuntimePendingInteractionStore::default();
         let request = tool_types::ToolRequest {
             id: "ask-1".to_string(),
@@ -1931,8 +1931,8 @@ done
             target: None,
             raw_arguments: Some(serde_json::json!({}).to_string()),
         };
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let store = RuntimePendingInteractionStore::default();
         let worker_store = store.clone();
 

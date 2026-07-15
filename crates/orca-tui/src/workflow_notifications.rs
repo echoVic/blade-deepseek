@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use crossbeam_channel as mpsc;
 
 use crate::bridge;
 use crate::types::{AppState, AppStatus, PendingWorkflowNotification, TuiEvent, UserAction};

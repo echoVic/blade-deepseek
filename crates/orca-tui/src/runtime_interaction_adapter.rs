@@ -1,7 +1,7 @@
+use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::mpsc::{Receiver, Sender};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
@@ -584,9 +584,9 @@ fn mcp_elicitation_event_from_pending_interaction(
 
 #[cfg(test)]
 mod tests {
+    use crossbeam_channel as mpsc;
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::sync::mpsc;
 
     use orca_runtime::lifecycle::RuntimeToolActorContext;
     use orca_runtime::runtime_pending_interaction::{
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn tui_approval_handler_resolves_approve_action_through_runtime_context() {
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::Approve {
                 id: "approval-1".to_string(),
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn tui_approval_handler_preserves_queued_app_actions() {
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::Submit("next prompt".to_string()))
             .expect("send queued submit");
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn tui_approval_handler_resolves_only_matching_runtime_interaction_id() {
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::Approve {
                 id: "approval-other".to_string(),
@@ -731,8 +731,8 @@ mod tests {
 
     #[test]
     fn tui_tool_approval_rejects_duplicate_pending_interaction_id_before_prompting() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::Approve {
                 id: "approval-bash-1".to_string(),
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn tui_approval_handler_maps_cancel_to_runtime_denial() {
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx.send(UserAction::Cancel).expect("send cancel");
         let pending_actions = RefCell::new(VecDeque::new());
         let handler = TuiApprovalHandler::new(&action_rx, &pending_actions);
@@ -824,8 +824,8 @@ mod tests {
 
     #[test]
     fn tui_user_input_handler_routes_answer_through_runtime_context() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::RespondToUserInput {
                 id: "ask".to_string(),
@@ -869,8 +869,8 @@ mod tests {
 
     #[test]
     fn tui_user_input_handler_tracks_runtime_pending_interaction_until_answered() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let store = RuntimePendingInteractionStore::default();
         let request = tool_types::ToolRequest {
             id: "ask".to_string(),
@@ -914,8 +914,8 @@ mod tests {
 
     #[test]
     fn tui_user_input_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx.send(UserAction::Cancel).expect("send cancel");
         let store = RuntimePendingInteractionStore::default();
         let first = RuntimePendingInteractionRecord::from_user_input(&RuntimeUserInputRequest {
@@ -947,8 +947,8 @@ mod tests {
 
     #[test]
     fn tui_user_input_handler_preserves_queued_app_actions() {
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::Submit("next prompt".to_string()))
             .expect("send queued submit");
@@ -982,8 +982,8 @@ mod tests {
 
     #[test]
     fn tui_user_input_handler_resolves_only_matching_runtime_interaction_id() {
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::RespondToUserInput {
                 id: "ask-other".to_string(),
@@ -1021,8 +1021,8 @@ mod tests {
 
     #[test]
     fn tui_user_input_handler_maps_cancel_to_cancelled_terminal() {
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx.send(UserAction::Cancel).expect("send cancel");
         let pending_actions = RefCell::new(VecDeque::new());
         let handler = TuiUserInputHandler::new(&event_tx, &action_rx, &pending_actions);
@@ -1048,8 +1048,8 @@ mod tests {
 
     #[test]
     fn tui_user_input_handler_reports_closed_action_channel() {
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         drop(action_tx);
         let store = RuntimePendingInteractionStore::default();
         let pending_actions = RefCell::new(VecDeque::new());
@@ -1074,8 +1074,8 @@ mod tests {
 
     #[test]
     fn tui_mcp_elicitation_handler_tracks_runtime_pending_interaction_until_resolved() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let store = RuntimePendingInteractionStore::default();
         let request = RuntimeMcpElicitationRequest::new(
             "github",
@@ -1133,8 +1133,8 @@ mod tests {
 
     #[test]
     fn tui_mcp_elicitation_handler_resolves_only_matching_runtime_interaction_id() {
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::RespondToMcpElicitation {
                 id: "mcp_elicitation:github:wrong".to_string(),
@@ -1175,8 +1175,8 @@ mod tests {
 
     #[test]
     fn tui_mcp_elicitation_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx.send(UserAction::Cancel).expect("send cancel");
         let store = RuntimePendingInteractionStore::default();
         let request = RuntimeMcpElicitationRequest::new(
@@ -1204,8 +1204,8 @@ mod tests {
 
     #[test]
     fn tui_mcp_elicitation_handler_reports_closed_action_channel() {
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         drop(action_tx);
         let store = RuntimePendingInteractionStore::default();
         let pending_actions = RefCell::new(VecDeque::new());
@@ -1230,8 +1230,8 @@ mod tests {
 
     #[test]
     fn tui_permission_handler_tracks_runtime_pending_interaction_until_resolved() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let store = RuntimePendingInteractionStore::default();
         let request = RuntimePermissionRequest {
             id: "permission-1".to_string(),
@@ -1272,8 +1272,8 @@ mod tests {
 
     #[test]
     fn tui_permission_handler_projects_runtime_permission_kind() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let store = RuntimePendingInteractionStore::default();
         let mut domains = std::collections::HashMap::new();
         domains.insert(
@@ -1328,8 +1328,8 @@ mod tests {
 
     #[test]
     fn tui_permission_handler_rejects_duplicate_pending_interaction_id_before_waiting() {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx.send(UserAction::Cancel).expect("send cancel");
         let store = RuntimePendingInteractionStore::default();
         let request = RuntimePermissionRequest {
@@ -1359,8 +1359,8 @@ mod tests {
 
     #[test]
     fn tui_permission_handler_resolves_only_matching_runtime_interaction_id() {
-        let (event_tx, _event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         action_tx
             .send(UserAction::Approve {
                 id: "permission-other".to_string(),

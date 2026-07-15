@@ -1,8 +1,8 @@
+use crossbeam_channel as mpsc;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
 };
 use crate::bridge;
+use crate::channels::{tui_event_channel, user_action_channel};
 use crate::clipboard;
 use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
@@ -84,9 +85,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let backend = CrosstermBackend::new(stdout);
 
-    let (event_tx, event_rx) = mpsc::channel::<TuiEvent>();
-    let (action_tx, action_rx) = mpsc::channel::<UserAction>();
-    let (mention_registry_tx, mention_registry_rx) = mpsc::sync_channel(1);
+    let (event_tx, event_rx) = tui_event_channel();
+    let (action_tx, action_rx) = user_action_channel();
+    let (mention_registry_tx, mention_registry_rx) = mpsc::bounded(1);
     let mut mention_search =
         MentionSearchManager::new_roots(mention_search_roots(&config), event_tx.clone());
     let pending_workflow_notifications: bridge::PendingWorkflowNotifications =
@@ -499,7 +500,7 @@ mod tests {
     }
 
     fn test_state() -> (AppState, mpsc::Receiver<UserAction>) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::unbounded();
         (
             AppState::new(
                 tx,
@@ -513,7 +514,7 @@ mod tests {
 
     #[test]
     fn manual_compaction_emits_started_before_running_summary_work() {
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
 
         run_manual_compaction_with_events(&event_tx, &cancel, || {
@@ -536,7 +537,7 @@ mod tests {
 
     #[test]
     fn manual_compaction_starts_with_a_fresh_cancel_state() {
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
         cancel.cancel();
 
@@ -759,7 +760,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
 
         assert_eq!(
             notify_recovered_background_approvals_for_tui(&registry, &event_tx),
@@ -820,8 +821,8 @@ mod tests {
             let transcript =
                 history::load_session(session_id).expect("load resumable approval transcript");
             let preloaded = Arc::new(Mutex::new(Some(transcript)));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -903,7 +904,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
 
         let continuation_request = submit_background_approval_response_for_tui(
             Some(&registry),
@@ -937,7 +938,7 @@ mod tests {
         let task = registry.create_main_session("Running in background".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
 
         assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
 
@@ -976,7 +977,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
 
         assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
 
@@ -1000,7 +1001,7 @@ mod tests {
         let task = registry.create_main_session("Long answer".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
 
         assert!(foreground_task_for_tui(
             Some(&registry),
@@ -1108,8 +1109,8 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let (event_tx, event_rx) = mpsc::channel();
-            let (foreground_token_tx, foreground_token_rx) = mpsc::sync_channel(1);
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (foreground_token_tx, foreground_token_rx) = mpsc::bounded(1);
             let handler = background_goal_completion_handler(
                 session_id.to_string(),
                 Instant::now(),
@@ -1171,7 +1172,7 @@ mod tests {
     #[test]
     fn empty_recorded_session_goal_show_dispatches_agent_action() {
         let (mut state, rx) = test_state();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
 
@@ -1186,8 +1187,8 @@ mod tests {
     fn empty_recorded_agent_loop_goal_show_reports_no_goal() {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
 
         let handle = std::thread::spawn({
@@ -1225,8 +1226,8 @@ mod tests {
         for action in cases {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1267,8 +1268,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1328,8 +1329,8 @@ mod tests {
 
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1409,8 +1410,8 @@ mod tests {
 
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(Some(transcript("untouched-preloaded"))));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (_action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (_action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
             let pending_actions = RefCell::new(VecDeque::new());
             let pending_workflow_notifications = test_pending_workflow_notifications();
@@ -1479,8 +1480,8 @@ mod tests {
             let restored =
                 history::load_session(session_id).expect("load resumable goal transcript");
             let preloaded = Arc::new(Mutex::new(Some(restored)));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1541,8 +1542,8 @@ mod tests {
                 session_id.to_string(),
             ))));
             let preloaded = Arc::new(Mutex::new(Some(transcript(session_id))));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1601,8 +1602,8 @@ mod tests {
                 session_id.to_string(),
             ))));
             let preloaded = Arc::new(Mutex::new(Some(transcript(session_id))));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1641,8 +1642,8 @@ mod tests {
     fn disabled_history_goal_show_still_reports_recorded_history_requirement() {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Disabled)));
         let preloaded = Arc::new(Mutex::new(None));
-        let (event_tx, event_rx) = mpsc::channel();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let cancel = CancelToken::new();
 
         let handle = std::thread::spawn({
@@ -1682,8 +1683,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1756,8 +1757,8 @@ mod tests {
             cfg.cwd = Some(workspace);
             let config = Arc::new(Mutex::new(cfg));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1817,8 +1818,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -1868,8 +1869,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -2024,8 +2025,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -2090,8 +2091,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -2156,8 +2157,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -2227,8 +2228,8 @@ mod tests {
             cfg.cwd = Some(home.to_path_buf());
             let config = Arc::new(Mutex::new(cfg));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -2311,8 +2312,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -2430,8 +2431,8 @@ mod tests {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
-            let (event_tx, event_rx) = mpsc::channel();
-            let (action_tx, action_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
 
             let handle = std::thread::spawn({
@@ -2544,7 +2545,7 @@ mod tests {
     #[test]
     fn idle_app_submits_pending_workflow_notification() {
         let (mut state, _rx) = test_state();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         state
             .pending_workflow_notifications
             .push_back(crate::types::PendingWorkflowNotification {
@@ -2589,7 +2590,7 @@ mod tests {
     #[test]
     fn session_completion_submits_pending_workflow_notification() {
         let (mut state, _rx) = test_state();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         state.status = AppStatus::Running;
         state
             .pending_workflow_notifications
@@ -2617,7 +2618,7 @@ mod tests {
     #[test]
     fn session_completion_drains_batch_boundary_queue_before_submitting_notification() {
         let (mut state, _rx) = test_state();
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let queue = test_pending_workflow_notifications();
         assert!(
             queue.push_unique(crate::types::PendingWorkflowNotification {
@@ -2769,7 +2770,7 @@ mod tests {
     #[test]
     fn settled_messages_remain_in_fullscreen_transcript_after_turn_end() {
         let theme = Theme::named(ThemeName::Dark);
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::unbounded();
         let mut state = AppState::new(
             tx,
             "0.0.0-test".to_string(),
@@ -2825,7 +2826,7 @@ mod tests {
             });
             let mut config = test_config(HistoryMode::Record);
             let shared_config = Arc::new(Mutex::new(config.clone()));
-            let (action_tx, _action_rx) = mpsc::channel();
+            let (action_tx, _action_rx) = mpsc::unbounded();
             let theme = Theme::named(ThemeName::Dark);
             let mut textarea = make_textarea(&VimState::new(false), &theme);
             let vim_state = VimState::new(false);
@@ -2876,7 +2877,7 @@ mod tests {
         });
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let theme = Theme::named(ThemeName::Dark);
         let mut textarea = make_textarea(&VimState::new(false), &theme);
         let vim_state = VimState::new(false);
@@ -2923,7 +2924,7 @@ mod tests {
         let mut config = test_config(HistoryMode::Record);
         config.reasoning_effort = orca_core::config::ReasoningEffort::Max;
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let theme = Theme::named(ThemeName::Dark);
         let mut textarea = make_textarea(&VimState::new(false), &theme);
         let vim_state = VimState::new(false);
@@ -3002,7 +3003,7 @@ mod tests {
         let (mut state, _rx) = test_state();
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
 
         handle_slash_command(
             "/workflow:security-audit target=src maxAgents=8",
@@ -3022,7 +3023,7 @@ mod tests {
     #[test]
     fn bracketed_paste_inserts_multiline_text_without_submitting() {
         let (_state, _rx) = test_state();
-        let (_action_tx, action_rx) = mpsc::channel::<UserAction>();
+        let (_action_tx, action_rx) = mpsc::unbounded::<UserAction>();
         let theme = Theme::named(ThemeName::Dark);
         let mut textarea = make_textarea(&VimState::new(false), &theme);
 
@@ -3047,7 +3048,7 @@ mod tests {
         let (mut state, _rx) = test_state();
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let theme = Theme::named(ThemeName::Dark);
         let mut vim_state = VimState::new(false);
         let mut textarea = make_textarea(&vim_state, &theme);
@@ -3089,7 +3090,7 @@ mod tests {
         let (mut state, _rx) = test_state();
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let theme = Theme::named(ThemeName::Dark);
         let mut vim_state = VimState::new(false);
         let mut textarea = make_textarea(&vim_state, &theme);
@@ -3188,7 +3189,7 @@ mod tests {
         let (mut state, _rx) = test_state();
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let theme = Theme::named(ThemeName::Dark);
         let mut vim_state = VimState::new(false);
         let prompt = "review @same.txt";
@@ -3435,7 +3436,7 @@ fn run_goal_turns_for_tui(
         }
         let before_usage = session.runtime_usage_totals();
         let started_at = std::time::Instant::now();
-        let (foreground_token_tx, foreground_token_rx) = mpsc::sync_channel(1);
+        let (foreground_token_tx, foreground_token_rx) = mpsc::bounded(1);
         let background_completion_handler = background_goal_completion_handler(
             session_id.clone(),
             started_at,

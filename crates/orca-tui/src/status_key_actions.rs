@@ -1,5 +1,5 @@
+use crossbeam_channel as mpsc;
 use std::io;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event, KeyEvent};
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn compacting_status_keeps_running_interrupt_shortcut() {
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
             action_tx.clone(),
             "test".to_string(),
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn compacting_status_rejects_background_current_turn_shortcut() {
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
             action_tx.clone(),
             "test".to_string(),

@@ -1,5 +1,5 @@
+use crossbeam_channel as mpsc;
 use std::io;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use orca_core::cancel::CancelToken;
@@ -62,7 +62,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use crossbeam_channel as mpsc;
 
     use orca_core::cancel::CancelToken;
 
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn cancel_interrupts_while_context_is_compacting() {
-        let (action_tx, action_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
             action_tx.clone(),
             "test".to_string(),
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn clear_screen_atomically_clears_messages_revisions_and_render_cache() {
-        let (action_tx, _action_rx) = mpsc::channel();
+        let (action_tx, _action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
             action_tx.clone(),
             "test".to_string(),

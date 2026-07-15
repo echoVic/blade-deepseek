@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use crossbeam_channel as mpsc;
 
 use crossterm::event::{Event, KeyEvent};
 use tui_textarea::{Input, TextArea};

@@ -1,5 +1,5 @@
+use crossbeam_channel::Sender;
 use std::path::Path;
-use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
@@ -489,7 +489,7 @@ fn parse_workflow_draft_action_input(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use crossbeam_channel as mpsc;
 
     use orca_core::approval_types::{ActionKind, ApprovalMode};
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
@@ -558,7 +558,7 @@ mod tests {
         let config = config();
         let temp = tempfile::tempdir().unwrap();
         let registry = TaskRegistry::new("session-immediate-failure".to_string());
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let script = r#"
 export const meta = {
   name: "bad-workflow",
@@ -620,7 +620,7 @@ throw new Error("startup boom");
         let config = config();
         let temp = tempfile::tempdir().unwrap();
         let registry = TaskRegistry::new("session-workflow-immediate-failure".to_string());
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let script = r#"
 export const meta = {
   name: "bad-workflow",

@@ -1,5 +1,5 @@
+use crossbeam_channel as mpsc;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,7 @@ use orca_runtime::mentions::{MentionCandidate, MentionCatalog};
 use crate::types::{AppState, AppStatus, TuiEvent};
 
 const WARM_IDLE: Duration = Duration::from_secs(30);
+const CATALOG_RESULT_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TokenIdentity {
@@ -73,7 +74,7 @@ impl MentionSearchManager {
         catalog: MentionCatalog,
         catalog_registry: Option<orca_mcp::McpRegistry>,
     ) -> Self {
-        let (catalog_result_tx, catalog_result_rx) = mpsc::channel();
+        let (catalog_result_tx, catalog_result_rx) = mpsc::bounded(CATALOG_RESULT_CAPACITY);
         Self {
             roots: normalize_roots(roots),
             catalog,
@@ -484,9 +485,9 @@ impl Drop for MentionSearchManager {
 
 #[cfg(test)]
 mod tests {
+    use crossbeam_channel as mpsc;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use orca_file_search::{
@@ -499,7 +500,7 @@ mod tests {
     use crate::types::{AppState, TuiEvent};
 
     fn state() -> AppState {
-        let (action_tx, _action_rx) = mpsc::channel();
+        let (action_tx, _action_rx) = mpsc::unbounded();
         AppState::new(
             action_tx,
             "test".to_string(),
@@ -542,7 +543,7 @@ mod tests {
     fn warm_session_expires_after_thirty_seconds() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("main.rs"), "main").unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         let now = Instant::now();
@@ -560,7 +561,7 @@ mod tests {
     fn dismissed_query_stays_hidden_until_query_changes() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("main.rs"), "main").unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         state.mention.dismissed_query = Some("main".to_string());
@@ -577,7 +578,7 @@ mod tests {
     fn stale_mention_generation_is_ignored_before_snapshot_consumption() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("main.rs"), "main").unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@main", true, &mut state, Instant::now());
@@ -592,7 +593,7 @@ mod tests {
     #[test]
     fn stale_mention_token_identity_is_ignored() {
         let root = tempdir().unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@main", true, &mut state, Instant::now());
@@ -611,7 +612,7 @@ mod tests {
     #[test]
     fn stale_mention_pending_query_is_ignored() {
         let root = tempdir().unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@main", true, &mut state, Instant::now());
@@ -631,7 +632,7 @@ mod tests {
     #[test]
     fn mention_selection_stays_anchored_by_path_across_snapshots() {
         let root = tempdir().unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@m", true, &mut state, Instant::now());
@@ -669,7 +670,7 @@ mod tests {
     #[test]
     fn moving_between_same_query_tokens_advances_generation_without_a_second_catalog() {
         let root = tempdir().unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         let text = "@same and @same";
@@ -689,7 +690,7 @@ mod tests {
         for index in 0..2_000 {
             fs::write(root.path().join(format!("file-{index}.rs")), "file").unwrap();
         }
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@file", true, &mut state, Instant::now());
@@ -706,7 +707,7 @@ mod tests {
     fn changing_root_stops_old_generation_before_starting_new_one() {
         let first = tempdir().unwrap();
         let second = tempdir().unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(first.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@main", true, &mut state, Instant::now());
@@ -727,7 +728,7 @@ mod tests {
     fn manager_preserves_all_runtime_workspace_roots() {
         let first = tempdir().unwrap();
         let second = tempdir().unwrap();
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded();
 
         let manager = MentionSearchManager::new_roots(
             vec![first.path().to_path_buf(), second.path().to_path_buf()],
@@ -753,7 +754,7 @@ mod tests {
             r#"{"name":"github","description":"GitHub workflows","interface":{"displayName":"GitHub"}}"#,
         )
         .unwrap();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::unbounded();
         let mut manager = MentionSearchManager::new(root.path().to_path_buf(), event_tx);
         let mut state = state();
         manager.sync("@git", true, &mut state, Instant::now());

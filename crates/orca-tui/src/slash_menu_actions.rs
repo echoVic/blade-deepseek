@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use crossbeam_channel as mpsc;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};

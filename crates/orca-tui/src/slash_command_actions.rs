@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use crossbeam_channel as mpsc;
 use std::sync::{Arc, Mutex};
 
 use orca_core::approval_types::ApprovalMode;

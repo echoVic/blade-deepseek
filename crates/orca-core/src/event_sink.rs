@@ -1,16 +1,45 @@
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use crate::config::OutputFormat;
 use crate::event_schema::{EventEnvelope, EventType};
 
+pub trait EventObserver: Send + Sync {
+    fn observe(&self, event: &EventEnvelope) -> io::Result<()>;
+}
+
+impl<F> EventObserver for F
+where
+    F: Fn(&EventEnvelope) -> io::Result<()> + Send + Sync,
+{
+    fn observe(&self, event: &EventEnvelope) -> io::Result<()> {
+        self(event)
+    }
+}
+
 pub struct EventSink<W: Write> {
     writer: W,
     format: OutputFormat,
+    observer: Option<Arc<dyn EventObserver>>,
 }
 
 impl<W: Write> EventSink<W> {
     pub fn new(writer: W, format: OutputFormat) -> Self {
-        Self { writer, format }
+        Self {
+            writer,
+            format,
+            observer: None,
+        }
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn EventObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    pub fn with_optional_observer(mut self, observer: Option<Arc<dyn EventObserver>>) -> Self {
+        self.observer = observer;
+        self
     }
 
     pub fn writer_mut(&mut self) -> &mut W {
@@ -18,6 +47,9 @@ impl<W: Write> EventSink<W> {
     }
 
     pub fn emit(&mut self, event: &EventEnvelope) -> io::Result<()> {
+        if let Some(observer) = &self.observer {
+            observer.observe(event)?;
+        }
         match self.format {
             OutputFormat::Jsonl => {
                 serde_json::to_writer(&mut self.writer, event)?;
@@ -166,6 +198,7 @@ impl<W: Write> EventSink<W> {
 mod tests {
     use super::*;
     use crate::event_schema::EventFactory;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn jsonl_format_writes_one_line_per_event() {
@@ -201,5 +234,45 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("error: something broke"));
         assert!(output.contains("assistant: hi"));
+    }
+
+    #[test]
+    fn observer_receives_the_same_typed_event_that_is_serialized() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_callback = Arc::clone(&observed);
+        let mut buf = Vec::new();
+        let mut sink = EventSink::new(&mut buf, OutputFormat::Jsonl).with_observer(Arc::new(
+            move |event: &EventEnvelope| {
+                observed_for_callback.lock().unwrap().push(event.clone());
+                Ok(())
+            },
+        ));
+        let mut events = EventFactory::new("typed-observer".to_string());
+        let event = events.assistant_message_delta("hello");
+
+        sink.emit(&event).unwrap();
+
+        let observed = observed.lock().unwrap();
+        let observed = observed.first().expect("one observed event");
+        assert_eq!(observed.run_id, event.run_id);
+        assert_eq!(observed.seq, event.seq);
+        assert_eq!(observed.timestamp_ms, event.timestamp_ms);
+        assert_eq!(observed.event_type, event.event_type);
+        assert_eq!(observed.payload, event.payload);
+        let serialized: serde_json::Value =
+            serde_json::from_str(String::from_utf8(buf).unwrap().trim()).unwrap();
+        assert_eq!(serialized, serde_json::to_value(&event).unwrap());
+    }
+
+    #[test]
+    fn observer_failure_is_returned_to_the_operation() {
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl).with_observer(Arc::new(
+            |_event: &EventEnvelope| Err(io::Error::other("observer rejected event")),
+        ));
+        let mut events = EventFactory::new("typed-observer-error".to_string());
+
+        let error = sink.emit(&events.error("boom")).unwrap_err();
+
+        assert!(error.to_string().contains("observer rejected event"));
     }
 }

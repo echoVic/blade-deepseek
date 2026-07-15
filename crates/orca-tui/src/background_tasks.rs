@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use crossbeam_channel as mpsc;
 
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use orca_runtime::tasks::TaskRegistry;

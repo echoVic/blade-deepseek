@@ -5,7 +5,7 @@ use std::sync::Arc;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::{EventFactory, RunStatus};
-use orca_core::event_sink::EventSink;
+use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::subagent_types::SubagentType;
 #[cfg(test)]
 use orca_core::tool_types;
@@ -102,6 +102,7 @@ pub struct ThreadTurnRequest {
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
+    event_observer: Option<Arc<dyn EventObserver>>,
     continuation: Option<RuntimeTurnContinuation>,
 }
 
@@ -234,23 +235,35 @@ impl<W: io::Write> ThreadTurnExecution<W> {
         output_format: OutputFormat,
         cancel: CancelToken,
     ) -> Self {
+        Self::new_with_cancel_and_observer(lifecycle, writer, output_format, cancel, None)
+    }
+
+    fn new_with_cancel_and_observer(
+        lifecycle: &RuntimeSessionLifecycle,
+        writer: W,
+        output_format: OutputFormat,
+        cancel: CancelToken,
+        event_observer: Option<Arc<dyn EventObserver>>,
+    ) -> Self {
         Self::new_with_events(
             EventFactory::new(lifecycle.run_id().to_string()),
             writer,
             output_format,
             cancel,
+            event_observer,
         )
     }
 
-    pub fn new_with_events(
+    fn new_with_events(
         events: EventFactory,
         writer: W,
         output_format: OutputFormat,
         cancel: CancelToken,
+        event_observer: Option<Arc<dyn EventObserver>>,
     ) -> Self {
         Self {
             events,
-            sink: EventSink::new(writer, output_format),
+            sink: EventSink::new(writer, output_format).with_optional_observer(event_observer),
             cancel,
             background_workflows: Vec::new(),
         }
@@ -275,6 +288,7 @@ impl ThreadTurnRequest {
             permission_handler: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
+            event_observer: None,
             continuation: None,
         }
     }
@@ -340,6 +354,11 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_event_observer(mut self, observer: Arc<dyn EventObserver>) -> Self {
+        self.event_observer = Some(observer);
+        self
+    }
+
     pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
         self.continuation = Some(continuation);
         self
@@ -361,6 +380,10 @@ impl ThreadTurnRequest {
 
     pub fn mcp_elicitation_handler(&self) -> Option<&(dyn McpElicitationHandler + Send + Sync)> {
         self.mcp_elicitation_handler.as_deref()
+    }
+
+    pub fn event_observer(&self) -> Option<&Arc<dyn EventObserver>> {
+        self.event_observer.as_ref()
     }
 
     pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
@@ -543,7 +566,8 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
     let ThreadTurnContext { cwd, prompt, parts } = context;
 
     if let Some(events) = events {
-        let mut sink = EventSink::new(writer, config.output_format);
+        let mut sink = EventSink::new(writer, config.output_format)
+            .with_optional_observer(request.event_observer().cloned());
         let cancel_ref = cancel;
         let mut background_workflows = Vec::new();
         let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
@@ -603,8 +627,13 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         return Ok(status);
     }
 
-    let mut execution =
-        ThreadTurnExecution::new_with_cancel(lifecycle, writer, config.output_format, cancel);
+    let mut execution = ThreadTurnExecution::new_with_cancel_and_observer(
+        lifecycle,
+        writer,
+        config.output_format,
+        cancel,
+        request.event_observer().cloned(),
+    );
     let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
         .with_services(
             parts.instructions,

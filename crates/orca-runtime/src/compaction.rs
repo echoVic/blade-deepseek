@@ -1,10 +1,11 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::OutputFormat;
 use orca_core::event_schema::EventFactory;
-use orca_core::event_sink::EventSink;
+use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::HookEvent;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
@@ -133,6 +134,7 @@ pub struct TuiAgentTurnCompactionInput<'a, W: io::Write> {
     pub emit_deltas: bool,
     pub cancel: &'a CancelToken,
     pub events: &'a mut EventFactory,
+    pub event_observer: Option<Arc<dyn EventObserver>>,
     pub writer: &'a mut W,
 }
 
@@ -272,7 +274,8 @@ pub fn run_tui_agent_turn_compaction<W: io::Write>(
     input: TuiAgentTurnCompactionInput<'_, W>,
 ) -> io::Result<TuiAgentTurnCompactionOutcome> {
     let runtime_parts = session.runtime_parts();
-    let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl);
+    let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl)
+        .with_optional_observer(input.event_observer);
     let turn_context = RuntimeTurnContext::new(
         input.cwd,
         input.prompt,
@@ -321,7 +324,8 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
     match RuntimeCompactionPolicy::decide_for_provider_error(&error, &state.retry) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, .. } => {
             let runtime_parts = session.runtime_parts();
-            let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl);
+            let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl)
+                .with_optional_observer(input.event_observer);
             let turn_context = RuntimeTurnContext::new(
                 input.cwd,
                 input.prompt,

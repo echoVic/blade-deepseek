@@ -1,5 +1,5 @@
+use crossbeam_channel as mpsc;
 use std::collections::VecDeque;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -2059,7 +2059,7 @@ mod tests {
     use orca_core::task_types::{TaskStatus, TaskType};
 
     fn state() -> AppState {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::unbounded();
         AppState::new(
             tx,
             "0.0.0-test".to_string(),

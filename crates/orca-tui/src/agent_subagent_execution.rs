@@ -1,7 +1,7 @@
+use crossbeam_channel::{Receiver, Sender};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
 use orca_core::config::RunConfig;
@@ -841,11 +841,12 @@ pub(crate) fn run_child_agent_for_tui_silent(
     hooks: &HookRunner,
     observer: Option<&ChildAgentActivityObserver<'_>>,
 ) -> (ChildAgentResult, CostTracker) {
-    let (event_tx, _event_rx) = std::sync::mpsc::channel();
-    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = crate::channels::tui_event_channel();
+    let event_drain = thread::spawn(move || while event_rx.recv().is_ok() {});
+    let (action_tx, action_rx) = crate::channels::user_action_channel();
     let pending_actions = RefCell::new(VecDeque::new());
     drop(action_tx);
-    run_child_agent_for_tui_observed(
+    let result = run_child_agent_for_tui_observed(
         config,
         cwd,
         prompt,
@@ -860,5 +861,8 @@ pub(crate) fn run_child_agent_for_tui_silent(
         memory,
         hooks,
         observer,
-    )
+    );
+    drop(event_tx);
+    let _ = event_drain.join();
+    result
 }
