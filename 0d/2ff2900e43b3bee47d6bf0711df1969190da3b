@@ -1,0 +1,21 @@
+docs/superpowers/plans/2026-07-15-binding-only-mentions.md
+  s_61c879183fbdff::t_b1652554df2a7d 21,48,58,140,144,154,167,204,214,230,241,259,288,298,333,348,359,372,411,421,443,453,469,479,490,494,505,519,531,542-544,561-563,573
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0d2ff2900e43b3bee47d6bf0711df1969190da3b",
+  "prompts": {},
+  "sessions": {
+    "s_61c879183fbdff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f63eb-5026-7073-9854-b348079bb9f3",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
