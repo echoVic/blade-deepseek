@@ -286,7 +286,7 @@ impl<W: Write> Write for SharedServerRequestWriter<W> {
 struct GenerationServerRequestWriter<W: Write> {
     inner: SharedServerRequestWriter<W>,
     buffer: Vec<u8>,
-    terminal_lines: Vec<Vec<u8>>,
+    deferred_lines: Vec<Vec<u8>>,
 }
 
 impl<W: Write> GenerationServerRequestWriter<W> {
@@ -294,13 +294,13 @@ impl<W: Write> GenerationServerRequestWriter<W> {
         Self {
             inner: SharedServerRequestWriter::new(id, inner),
             buffer: Vec::new(),
-            terminal_lines: Vec::new(),
+            deferred_lines: Vec::new(),
         }
     }
 
     fn process_line(&mut self, line: Vec<u8>) -> io::Result<()> {
-        if is_runtime_terminal_line(&line) {
-            self.terminal_lines.push(line);
+        if is_runtime_generation_terminal_line(&line) {
+            self.deferred_lines.push(line);
         } else {
             self.inner.write_all(&line)?;
         }
@@ -318,7 +318,7 @@ impl<W: Write> GenerationServerRequestWriter<W> {
     fn finish(mut self, commit_terminal: bool) -> io::Result<()> {
         self.flush_remaining()?;
         if commit_terminal {
-            for line in self.terminal_lines {
+            for line in self.deferred_lines {
                 self.inner.write_all(&line)?;
             }
             self.inner.flush_remaining()?;
@@ -342,11 +342,24 @@ impl<W: Write> Write for GenerationServerRequestWriter<W> {
     }
 }
 
-fn is_runtime_terminal_line(line: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(line)
-        .ok()
-        .and_then(|event| event["type"].as_str().map(str::to_string))
-        .is_some_and(|event_type| event_type == "session.completed")
+#[derive(serde::Deserialize)]
+struct RuntimeGenerationEventLine {
+    #[serde(rename = "type")]
+    event_type: orca_core::event_schema::EventType,
+    payload: Value,
+}
+
+fn is_runtime_generation_terminal_line(line: &[u8]) -> bool {
+    let Ok(event) = serde_json::from_slice::<RuntimeGenerationEventLine>(line) else {
+        return false;
+    };
+    match event.event_type {
+        orca_core::event_schema::EventType::SessionCompleted => true,
+        orca_core::event_schema::EventType::Error => {
+            event.payload["message"].as_str() == Some("turn cancelled")
+        }
+        _ => false,
+    }
 }
 
 fn visible_generation_error<T>(status: &io::Result<T>, replaced: bool) -> Option<String> {
@@ -6672,6 +6685,20 @@ rl.on("line", (line) => {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event"], "turn_completed");
         assert_eq!(events[0]["status"], "success");
+    }
+
+    #[test]
+    fn replaced_generation_drops_runtime_cancellation_error() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = GenerationServerRequestWriter::new(json!("turn"), Arc::clone(&output));
+        writer
+            .write_all(
+                b"{\"version\":\"1\",\"run_id\":\"run\",\"seq\":1,\"timestamp_ms\":1,\"type\":\"error\",\"payload\":{\"message\":\"turn cancelled\"}}\n",
+            )
+            .expect("write cancellation error");
+        writer.finish(false).expect("drop replaced error");
+
+        assert!(output.lock().expect("output").is_empty());
     }
 
     #[test]
