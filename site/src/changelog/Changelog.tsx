@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.25":
+        "Network-restricted TUI bash and server command sessions now own every proxy connection through one managed supervisor. Admission is capped at 32 concurrent connections; excess clients receive a bounded connection-limit response instead of spawning another worker. Request and header framing is bounded before parsing, network-block reports use a fixed-capacity non-blocking queue, and DNS lookup, upstream connect, and socket I/O have explicit deadlines. Stopping a command, cancelling a turn, or dropping the proxy stops admission, aborts and awaits every active connection, closes both ends of CONNECT tunnels, and joins the supervisor thread. CLI flags, permission profiles, proxy environment variables, TUI flows, server/JSONL shapes, and persisted records remain compatible.",
       "v0.2.24":
         "Every accepted tool invocation now reaches one truthful terminal result, including interruption, pre-execution rejection, and siblings that never started. Incomplete legacy history is repaired as indeterminate without replaying old calls. Ordinary process stdout and stderr are capped at 1 MiB per stream, while file reads and exact edits reject non-regular, binary, invalid UTF-8, growing, and oversized inputs before unsafe admission. External tools, MCP servers, workflows, async subagents, verifier commands, server turns, shells, and search managers now have explicit cleanup or reaper ownership; MCP and WorkflowHost transports and shutdown paths are bounded; observed completion wins cancellation and timeout races; and internal worker API keys no longer persist or appear in process arguments. Windows descendant-tree parity, a total WorkflowHost deadline, and a managed-proxy connection ceiling remain follow-up work.",
       "v0.2.23":
@@ -502,6 +504,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.25":
+        "启用网络权限策略的 TUI bash 与 server command 现在由同一个托管 supervisor 拥有全部代理连接。并发连接上限为 32；超过上限的客户端会收到有界的 connection-limit 响应，不再创建额外 worker。请求行与 header 会在解析前执行字节和数量准入，网络阻断报告使用固定容量的非阻塞队列，DNS、上游连接与 socket I/O 都有明确时限。停止命令、取消 turn 或销毁代理时，会先停止准入，再取消并等待全部活动连接，关闭 CONNECT tunnel 两端，最后 join supervisor 线程。CLI 参数、权限 profile、代理环境变量、TUI 流程、server/JSONL 形状和持久化记录保持兼容。",
       "v0.2.24":
         "每个已接受的工具调用现在都会得到一个真实且唯一的终态结果，包括中断、执行前拒绝和未启动的同批调用；旧历史中缺失的终态会修复为 indeterminate，绝不会重放旧调用。普通进程的 stdout 与 stderr 分别限制为 1 MiB，文件读取和精确编辑会在准入前拒绝非普通文件、二进制、非法 UTF-8、持续增长及超限输入。外部工具、MCP server、workflow、异步 subagent、验证命令、server turn、shell 和搜索管理器都有明确的清理或 reaper 所有者；MCP 与 WorkflowHost 传输和关闭路径具备边界；已观察到的完成结果优先于取消和超时竞争；内部 worker API key 不再持久化，也不会出现在进程参数中。Windows 后代进程树清理、WorkflowHost 总时限及托管代理连接上限仍是后续工作。",
       "v0.2.23":
