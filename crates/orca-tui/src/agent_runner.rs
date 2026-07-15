@@ -221,21 +221,36 @@ pub(crate) fn task_summary_for_tui(
     registry.list().into_iter().find(|task| task.id == task_id)
 }
 
+pub(crate) enum TuiMainSessionTaskStart<'a> {
+    Create(&'a str),
+    Adopt(&'a str),
+}
+
 fn start_main_session_task_for_tui(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
-    prompt: &str,
+    task_start: TuiMainSessionTaskStart<'_>,
 ) -> String {
-    let task = session
-        .task_registry()
-        .create_main_session(prompt.to_string());
-    let _ = session.task_registry().mark_running(&task.id);
-    session.start_agent_lifecycle_task_with_id(&task.id);
-    if let Some(task) = task_summary_for_tui(session.task_registry(), &task.id) {
-        send_task_status_updated_for_tui(event_tx, events, &task);
+    match task_start {
+        TuiMainSessionTaskStart::Adopt(task_id) => {
+            if let Some(task) = task_summary_for_tui(session.task_registry(), task_id) {
+                send_task_status_updated_for_tui(event_tx, events, &task);
+            }
+            task_id.to_string()
+        }
+        TuiMainSessionTaskStart::Create(description) => {
+            let task = session
+                .task_registry()
+                .create_main_session(description.to_string());
+            let _ = session.task_registry().mark_running(&task.id);
+            session.start_agent_lifecycle_task_with_id(&task.id);
+            if let Some(task) = task_summary_for_tui(session.task_registry(), &task.id) {
+                send_task_status_updated_for_tui(event_tx, events, &task);
+            }
+            task.id
+        }
     }
-    task.id
 }
 
 fn poll_background_current_turn_for_tui(
@@ -1313,7 +1328,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         control,
         cancel,
         allow_goal_tools,
-        task_description,
+        TuiMainSessionTaskStart::Create(task_description.unwrap_or(prompt)),
         backtrack_target,
         pending_workflow_notifications,
         background_completion_handler,
@@ -1332,7 +1347,7 @@ pub(crate) fn run_agent_for_tui_with_event_factory(
     control: &TuiTurnControl,
     cancel: &CancelToken,
     allow_goal_tools: bool,
-    task_description: Option<&str>,
+    main_session_task: TuiMainSessionTaskStart<'_>,
     backtrack_target: bool,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
     background_completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
@@ -1370,12 +1385,8 @@ pub(crate) fn run_agent_for_tui_with_event_factory(
     let mut turn: u32 = 0;
     let mut tui_compaction = orca_runtime::TuiAgentTurnCompactionState::new();
     let mut runtime_events = runtime_events;
-    let main_session_task_id = start_main_session_task_for_tui(
-        session,
-        event_tx,
-        &mut runtime_events,
-        task_description.unwrap_or(prompt),
-    );
+    let main_session_task_id =
+        start_main_session_task_for_tui(session, event_tx, &mut runtime_events, main_session_task);
     let mut main_session_backgrounded = false;
     let mut background_completion_handler = background_completion_handler;
     let mut provider_budget_admission = None;

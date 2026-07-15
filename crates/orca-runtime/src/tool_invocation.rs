@@ -9,6 +9,7 @@ use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
+    deepseek_goal_tools_schema_with_mcp_and_external,
     deepseek_tools_schema_for_allowed_names_with_mcp_and_external,
     deepseek_tools_schema_for_type_with_mcp_and_external,
     deepseek_tools_schema_with_mcp_and_external,
@@ -28,6 +29,7 @@ pub struct ToolInvocation {
 pub(crate) struct AgentToolPolicyContext<'a> {
     allowed_tools: Option<&'a [String]>,
     label: Option<&'a str>,
+    goal_mode: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -41,11 +43,20 @@ impl<'a> AgentToolPolicyContext<'a> {
         Self {
             allowed_tools,
             label,
+            goal_mode: false,
         }
     }
 
     pub(crate) fn unrestricted() -> Self {
         Self::new(None, None)
+    }
+
+    pub(crate) fn goal_mode() -> Self {
+        Self {
+            allowed_tools: None,
+            label: None,
+            goal_mode: true,
+        }
     }
 
     pub(crate) fn replace_allowed_tools(
@@ -66,6 +77,10 @@ impl<'a> AgentToolPolicyContext<'a> {
 
     pub(crate) fn label(&self) -> Option<&'a str> {
         self.label
+    }
+
+    pub(crate) fn is_goal_mode(&self) -> bool {
+        self.goal_mode
     }
 }
 
@@ -93,6 +108,11 @@ pub(crate) fn provider_tool_schema_override(
     } else if subagent_depth > 0 {
         Some(deepseek_tools_schema_for_type_with_mcp_and_external(
             subagent_type,
+            Some(mcp_registry),
+            external_tools,
+        ))
+    } else if tool_policy.is_goal_mode() {
+        Some(deepseek_goal_tools_schema_with_mcp_and_external(
             Some(mcp_registry),
             external_tools,
         ))
@@ -420,6 +440,27 @@ mod tests {
 
         assert!(names.contains(&"subagent"));
         assert!(names.contains(&"bash"));
+        assert!(!names.contains(&"get_goal"));
+        assert!(!names.contains(&"create_goal"));
+        assert!(!names.contains(&"update_goal"));
+    }
+
+    #[test]
+    fn provider_tool_schema_override_exposes_goal_tools_only_in_goal_mode() {
+        let registry = McpRegistry::default();
+        let tools = provider_tool_schema_override(
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::goal_mode(),
+            &registry,
+            &[],
+        )
+        .expect("goal tool schema");
+        let names = schema_names(&tools);
+
+        assert!(names.contains(&"get_goal"));
+        assert!(names.contains(&"create_goal"));
+        assert!(names.contains(&"update_goal"));
     }
 
     #[test]

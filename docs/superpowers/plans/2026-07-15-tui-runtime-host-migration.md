@@ -1,6 +1,6 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1 through P0.3e4b1 complete; P0.3e4b2 next
+- Status: Active; P0.3e1 through P0.3e4b2 complete; P0.3e4b3 next
 - Date: 2026-07-15
 - Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3c validation)
 - Branch: `codex/tui-runtime-host-migration`
@@ -637,6 +637,70 @@ P0.3e4b1 checkpoint result:
   `orca-runtime` 770/770, runtime-host 27/27, task-output 12/12, and `orca-tui`
   513/513. Focused all-targets Clippy completed successfully with only the
   repository's existing non-deny warning baseline.
+
+P0.3e4b2 slice contract:
+
+- **User value.** User turns remain backtrackable, workflow notifications stay
+  out of user backtrack history, goal turns expose the goal lifecycle tools,
+  and the task panel shows one main-session task with the correct label and
+  terminal state after the canonical foreground switch.
+- **Architecture value.** `ThreadTurnRequest` becomes the single owner of
+  prompt placement and root tool-schema mode. `ThreadActor` allocates an
+  opt-in main-session task from request metadata, assigns the same task id to
+  runtime lifecycle, and the canonical turn emits task projection events. The
+  temporary TUI executor no longer defines these semantics independently.
+- **External compatibility.** Default CLI/server requests retain ordinary user
+  prompt placement, the standard root tool schema, and no additional
+  main-session task projection. TUI request construction explicitly opts into
+  goal tools and main-session task tracking. Persisted message and task formats
+  remain unchanged.
+- **Migration state.** This slice forwards the typed semantics through the
+  default canonical executor and keeps the temporary TUI executor consuming the
+  same `HostedTurnRequest` until P0.3e4b3 switches production foreground turns.
+  The old TUI prompt insertion, tool-schema construction, and task lifecycle
+  helpers remain deletion targets, not parallel long-term authorities.
+- **Acceptance.** Behavior tests first fail because canonical hosted workflow
+  notifications are appended as ordinary user turns, goal requests use the
+  standard schema, and task metadata produces no canonical task lifecycle.
+  After implementation: prompt placement is one typed mutually exclusive mode;
+  a pinned workflow notification cannot replace the preceding user backtrack
+  target; goal mode alone exposes goal tools; an opted-in main-session task uses
+  one actor-assigned id across task registry, lifecycle, running event, and
+  terminal event; default hosted requests do not add task events; focused
+  `orca-provider`, `orca-runtime`, runtime-host, and `orca-tui` tests pass.
+- **Deletion gate.** P0.3e4b3 must remove the production TUI call sites that
+  still insert prompts, construct goal schemas, and start/finish main-session
+  tasks inside `run_agent_for_tui_with_event_factory`.
+
+P0.3e4b2 checkpoint result:
+
+- RED behavior tests proved the three missing canonical semantics: goal mode
+  had no tool-policy constructor, a pinned workflow notification replaced the
+  preceding backtrackable user turn, and task metadata emitted no canonical
+  task lifecycle events;
+- `ThreadTurnRequest` now owns mutually exclusive backtrackable-user,
+  pinned-user, and existing-turn prompt placement plus standard-versus-goal
+  root tool mode;
+- `ThreadActor` creates an opt-in main-session task before execution, assigns
+  its id to runtime lifecycle and the canonical request, and canonical task
+  events use that same registry id through running and terminal settlement;
+- `PreparedThreadTurn` is the shared writer/event-factory execution path, so
+  task settlement, provider execution, verifier behavior, and terminal commit
+  no longer have two canonical implementations;
+- task event delivery failure settles the registry task before returning the
+  canonical I/O error, while terminal task settlement preserves stop-wins
+  semantics through `apply_main_session_terminal_update`;
+- production TUI request construction opts every visible turn into task
+  tracking, exposes and accounts goal tools only while a goal is active, and
+  preserves workflow notifications as pinned rather than backtrackable input;
+- the temporary TUI executor adopts the actor-created task id instead of
+  creating a second main-session task. `TuiMainSessionTaskStart` is an explicit
+  P0.3e4b3 deletion target, not a second long-term lifecycle authority;
+- formatting and diff checks passed, followed by `orca-provider` 164/164,
+  `orca-runtime` 771/771, runtime-host 31/31, task-output 12/12, and `orca-tui`
+  515/515. Focused all-targets Clippy and the combined runtime/TUI all-targets
+  check completed successfully with only the repository's existing non-deny
+  warning baseline.
 
 ## Slice Acceptance Criteria
 

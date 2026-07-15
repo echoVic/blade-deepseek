@@ -15,7 +15,7 @@ use orca_core::config::{
 };
 use orca_core::conversation::Message;
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::event_schema::{EventFactory, EventType, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::mcp_types::McpServerConfig;
@@ -1667,6 +1667,203 @@ fn canonical_hosted_edit_emits_committed_diff() {
     assert_eq!(
         std::fs::read_to_string(cwd.path().join("notes.txt")).unwrap(),
         "committed\nsame\n"
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn canonical_hosted_pinned_prompt_preserves_previous_user_backtrack_target() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "canonical prompt placement",
+        )
+        .expect("start runtime thread");
+
+    let user_turn = thread
+        .start_turn(
+            HostedTurnRequest::new("first user turn").with_backtrack_target(true),
+            io::sink(),
+        )
+        .expect("start user turn");
+    assert_eq!(
+        user_turn
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("user turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    let notification = thread
+        .start_turn(
+            HostedTurnRequest::new("<task-notification>done</task-notification>")
+                .with_backtrack_target(false),
+            io::sink(),
+        )
+        .expect("start pinned notification turn");
+    assert_eq!(
+        notification
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("notification turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    assert_eq!(
+        thread
+            .backtrack_last_user()
+            .expect("backtrack actor-owned session"),
+        Some("first user turn".to_string())
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn canonical_hosted_task_metadata_owns_one_main_session_lifecycle() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "canonical task metadata",
+        )
+        .expect("start runtime thread");
+    let output = SharedWriter::default();
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("reply from mock provider")
+                .with_task_description("Workflow notification task-42"),
+            output.clone(),
+        )
+        .expect("start tracked turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("tracked turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    let task_events = output
+        .json_events()
+        .into_iter()
+        .filter(|event| event["type"] == "task.status.updated")
+        .collect::<Vec<_>>();
+    assert_eq!(task_events.len(), 2);
+    assert_eq!(task_events[0]["payload"]["task"]["status"], "running");
+    assert_eq!(task_events[1]["payload"]["task"]["status"], "completed");
+    assert_eq!(
+        task_events[0]["payload"]["task"]["id"],
+        task_events[1]["payload"]["task"]["id"]
+    );
+    assert_eq!(
+        task_events[0]["payload"]["task"]["description"],
+        "Workflow notification task-42"
+    );
+
+    let tasks = thread.task_registry().list();
+    let task = tasks
+        .iter()
+        .find(|task| task.description == "Workflow notification task-42")
+        .expect("tracked main-session task");
+    assert_eq!(task.task_type, orca_core::task_types::TaskType::MainSession);
+    assert_eq!(task.status, orca_core::task_types::TaskStatus::Completed);
+    assert_eq!(
+        thread
+            .snapshot()
+            .expect("tracked turn snapshot")
+            .active_task_id(),
+        Some(task.id.as_str())
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn canonical_hosted_task_event_failure_closes_registry_task() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "canonical task event failure",
+        )
+        .expect("start runtime thread");
+    let observer = Arc::new(|event: &orca_core::event_schema::EventEnvelope| {
+        if event.event_type == EventType::TaskStatusUpdated {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "task event subscriber disconnected",
+            ));
+        }
+        Ok(())
+    });
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("reply from mock provider")
+                .with_task_description("Tracked task with failed event")
+                .with_event_observer(observer),
+            io::sink(),
+        )
+        .expect("start tracked turn");
+    assert!(matches!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("failed task event terminal")
+            .outcome(),
+        OperationOutcome::ExecutionFailed {
+            kind: io::ErrorKind::BrokenPipe,
+            ..
+        }
+    ));
+
+    let task = thread
+        .task_registry()
+        .list()
+        .into_iter()
+        .find(|task| task.description == "Tracked task with failed event")
+        .expect("failed tracked task");
+    assert_eq!(task.status, orca_core::task_types::TaskStatus::Failed);
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn canonical_hosted_default_turn_does_not_emit_main_session_task_events() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "canonical untracked turn",
+        )
+        .expect("start runtime thread");
+    let output = SharedWriter::default();
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("reply from mock provider"),
+            output.clone(),
+        )
+        .expect("start untracked turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("untracked turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    assert!(
+        output
+            .json_events()
+            .iter()
+            .all(|event| event["type"] != "task.status.updated")
     );
 
     host.shutdown().expect("shutdown runtime host");

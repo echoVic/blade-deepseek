@@ -20,7 +20,9 @@ use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tokio::task::JoinHandle;
 
 use crate::background_turn::RuntimeTurnContinuation;
-use crate::controller::{ControllerRunOptions, ThreadTurnRequest};
+use crate::controller::{
+    ControllerRunOptions, ThreadTurnPromptPlacement, ThreadTurnRequest, ThreadTurnToolMode,
+};
 use crate::hooks::HookContext;
 use crate::lifecycle::{
     RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeTaskKind,
@@ -318,6 +320,10 @@ impl HostedTurnRequest {
         self
     }
 
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
+    }
+
     pub fn with_generation_handlers<F>(mut self, factory: F) -> Self
     where
         F: Fn(GenerationFence, CancelToken) -> HostedGenerationHandlers + Send + Sync + 'static,
@@ -326,8 +332,42 @@ impl HostedTurnRequest {
         self
     }
 
+    fn prepare_main_session_task(&mut self, registry: &TaskRegistry) -> Result<(), String> {
+        let Some(description) = self.task_description.as_ref() else {
+            return Ok(());
+        };
+        if let Some(task_id) = self.task_id.as_deref() {
+            return registry.mark_running(task_id);
+        }
+
+        let task = registry.create_main_session(description.clone());
+        if let Err(error) = registry.mark_running(&task.id) {
+            let _ = registry.fail(
+                &task.id,
+                format!("failed to start main-session task: {error}"),
+            );
+            return Err(error);
+        }
+        self.task_id = Some(task.id);
+        Ok(())
+    }
+
     fn legacy_request(&self, generation: &GenerationContext) -> ThreadTurnRequest {
+        let prompt_placement = if self.resumes_existing_turn || generation.resumes_existing_turn {
+            ThreadTurnPromptPlacement::ExistingTurn
+        } else if self.backtrack_target {
+            ThreadTurnPromptPlacement::BacktrackableUser
+        } else {
+            ThreadTurnPromptPlacement::PinnedUser
+        };
+        let tool_mode = if self.allow_goal_tools {
+            ThreadTurnToolMode::Goal
+        } else {
+            ThreadTurnToolMode::Standard
+        };
         let mut request = ThreadTurnRequest::new(self.prompt.clone())
+            .with_prompt_placement(prompt_placement)
+            .with_tool_mode(tool_mode)
             .with_options(self.options)
             .with_session_completed_event(
                 self.envelope == HostedOperationEnvelope::Turn && self.emit_session_completed,
@@ -371,8 +411,10 @@ impl HostedTurnRequest {
         if let Some(continuation) = self.continuation.clone() {
             request = request.with_continuation(continuation);
         }
-        if self.resumes_existing_turn || generation.resumes_existing_turn {
-            request = request.with_existing_turn_prompt();
+        if self.task_description.is_some()
+            && let Some(task_id) = self.task_id.as_deref()
+        {
+            request = request.with_main_session_task_id(task_id);
         }
         request
     }
@@ -1523,10 +1565,19 @@ impl ThreadActor {
                 let operation_id = self.operation_ids.allocate();
                 let initial_generation = GenerationFence::initial(operation_id);
                 let completion = OperationCompletion::new();
-                let request = *request;
+                let mut request = *request;
                 let config = config
                     .map(|config| *config)
                     .unwrap_or_else(|| self.config.clone());
+                if let Err(error) =
+                    request.prepare_main_session_task(state.thread.session().task_registry())
+                {
+                    self.state = Some(state);
+                    let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                        message: format!("failed to prepare main-session task: {error}"),
+                    }));
+                    return false;
+                }
                 if let Some(task_id) = request.task_id.as_deref() {
                     state
                         .thread

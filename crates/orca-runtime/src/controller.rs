@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::subagent_types::SubagentType;
@@ -41,8 +42,7 @@ use crate::runtime_host::{
 use crate::session::{
     AgentConversationContext, InteractiveSession, InteractiveSessionRuntimeParts,
 };
-#[cfg(test)]
-use crate::tasks::TaskRegistry;
+use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 #[cfg(test)]
 use crate::thread::RuntimeThread;
 #[cfg(test)]
@@ -163,9 +163,37 @@ pub struct ThreadTurnExecution<W: io::Write> {
     background_workflows: Vec<BackgroundWorkflowRun>,
 }
 
+struct ThreadTurnMainSessionTask {
+    registry: TaskRegistry,
+    id: String,
+}
+
+struct PreparedThreadTurn<'a, 'session, W: io::Write> {
+    config: &'a RunConfig,
+    lifecycle: &'a mut RuntimeSessionLifecycle,
+    request: &'a ThreadTurnRequest,
+    context: ThreadTurnContext<'session>,
+    cancel: &'a CancelToken,
+    events: &'a mut EventFactory,
+    sink: &'a mut EventSink<W>,
+    background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+    thread_extensions: Option<Arc<ExtensionData>>,
+    turn_extension_id: Option<String>,
+}
+
+struct ThreadTurnCompletion {
+    status: RunStatus,
+    error: Option<String>,
+    usage: UsageTotals,
+    main_session_task: Option<ThreadTurnMainSessionTask>,
+}
+
 #[derive(Clone)]
 pub struct ThreadTurnRequest {
     prompt: String,
+    prompt_placement: ThreadTurnPromptPlacement,
+    tool_mode: ThreadTurnToolMode,
+    main_session_task_id: Option<String>,
     options: ControllerRunOptions,
     emit_session_completed: bool,
     steer_handle: Option<ThreadSteerHandle>,
@@ -175,7 +203,19 @@ pub struct ThreadTurnRequest {
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     event_observer: Option<Arc<dyn EventObserver>>,
     continuation: Option<RuntimeTurnContinuation>,
-    resumes_existing_turn: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadTurnPromptPlacement {
+    BacktrackableUser,
+    PinnedUser,
+    ExistingTurn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadTurnToolMode {
+    Standard,
+    Goal,
 }
 
 impl<'a> ThreadTurnExecutor<'a> {
@@ -278,11 +318,19 @@ impl<'a> ThreadTurnContext<'a> {
         let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
         let prompt = request.prompt().to_string();
         let mut parts = session.runtime_parts();
-        if request.continuation().is_none() && !request.resumes_existing_turn() {
+        if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             parts
                 .conversation
                 .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
-            parts.conversation.add_user(prompt.clone());
+            match request.prompt_placement() {
+                ThreadTurnPromptPlacement::BacktrackableUser => {
+                    parts.conversation.add_user(prompt.clone());
+                }
+                ThreadTurnPromptPlacement::PinnedUser => {
+                    parts.conversation.add_user_pinned(prompt.clone());
+                }
+                ThreadTurnPromptPlacement::ExistingTurn => unreachable!(),
+            }
             if let Some(writer) = parts.writer.as_deref_mut()
                 && let Some(message) = parts.conversation.messages.last()
             {
@@ -360,10 +408,212 @@ impl<W: io::Write> ThreadTurnExecution<W> {
     }
 }
 
+impl ThreadTurnMainSessionTask {
+    fn from_request(request: &ThreadTurnRequest, registry: &TaskRegistry) -> Option<Self> {
+        request.main_session_task_id().map(|id| Self {
+            registry: registry.clone(),
+            id: id.to_string(),
+        })
+    }
+
+    fn emit_current<W: io::Write>(
+        &self,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+    ) -> io::Result<()> {
+        let task = self
+            .registry
+            .list()
+            .into_iter()
+            .find(|task| task.id == self.id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("main-session task '{}' not found", self.id),
+                )
+            })?;
+        sink.emit(&events.task_status_updated(&task))
+    }
+
+    fn finish(&self, status: RunStatus, error: Option<&str>, usage: UsageTotals) -> io::Result<()> {
+        let result = match status {
+            RunStatus::Success => self
+                .registry
+                .apply_main_session_terminal_update(
+                    &self.id,
+                    MainSessionTerminalUpdate::Completed {
+                        result: status.as_str().to_string(),
+                    },
+                    Some(usage),
+                )
+                .map(|_| ()),
+            RunStatus::Cancelled => {
+                self.registry
+                    .stop_with_usage(&self.id, status.as_str().to_string(), Some(usage))
+            }
+            RunStatus::Failed
+            | RunStatus::ApprovalRequired
+            | RunStatus::BudgetExhausted
+            | RunStatus::VerificationFailed => self
+                .registry
+                .apply_main_session_terminal_update(
+                    &self.id,
+                    MainSessionTerminalUpdate::Failed {
+                        error: error.unwrap_or(status.as_str()).to_string(),
+                    },
+                    Some(usage),
+                )
+                .map(|_| ()),
+        };
+        result.map_err(io::Error::other)
+    }
+
+    fn finish_and_emit<W: io::Write>(
+        &self,
+        status: RunStatus,
+        error: Option<&str>,
+        usage: UsageTotals,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+    ) -> io::Result<()> {
+        self.finish(status, error, usage)?;
+        self.emit_current(events, sink)
+    }
+}
+
+impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
+    fn execute(self) -> io::Result<ThreadTurnCompletion> {
+        let Self {
+            config,
+            lifecycle,
+            request,
+            context,
+            cancel,
+            events,
+            sink,
+            background_workflows,
+            thread_extensions,
+            turn_extension_id,
+        } = self;
+        let ThreadTurnContext { cwd, prompt, parts } = context;
+        let main_session_task =
+            ThreadTurnMainSessionTask::from_request(request, parts.task_registry);
+        if let Some(task) = main_session_task.as_ref()
+            && let Err(error) = task.emit_current(events, sink)
+        {
+            task.finish(
+                RunStatus::Failed,
+                Some(&error.to_string()),
+                parts.cost_tracker.totals(),
+            )?;
+            return Err(error);
+        }
+
+        let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
+            .with_services(
+                parts.instructions,
+                parts.memory,
+                parts.mcp_registry,
+                parts.hooks,
+            );
+        let loop_context = if let (Some(thread_extensions), Some(turn_extension_id)) =
+            (thread_extensions, turn_extension_id)
+        {
+            loop_context.with_runtime_thread_extensions(
+                parts.cost_tracker,
+                cancel,
+                parts.task_registry,
+                thread_extensions,
+                turn_extension_id,
+            )
+        } else {
+            loop_context.with_runtime(parts.cost_tracker, cancel, parts.task_registry)
+        };
+        let loop_context = if let Some(continuation) = request.continuation().cloned() {
+            loop_context.with_turn_continuation(continuation)
+        } else {
+            loop_context
+        };
+        let turn_result = (|| -> io::Result<(RunStatus, Option<String>)> {
+            let result = run_agent_loop(
+                config,
+                loop_context
+                    .with_execution(background_workflows, None, Some(lifecycle))
+                    .with_steer_handle(request.steer_handle())
+                    .with_approval_handler(request.approval_handler())
+                    .with_permission_handler(request.permission_handler())
+                    .with_user_input_handler(request.user_input_handler())
+                    .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
+                events,
+                sink,
+                AgentConversationContext::new()
+                    .with_history_writer(parts.writer)
+                    .with_conversation(Some(parts.conversation)),
+                request.tool_mode().policy(),
+            )?;
+            let status = result.status;
+            lifecycle.finish_task(status);
+            observe_background_workflows(
+                request.options().wait_for_background_workflows,
+                events,
+                sink,
+                background_workflows,
+            )?;
+            let status = run_verifier_if_needed(status, config.verifier.as_deref(), events, sink)?;
+            Ok((status, result.error))
+        })();
+        let usage = parts.cost_tracker.totals();
+        let (status, error) = match turn_result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(task) = main_session_task.as_ref() {
+                    task.finish_and_emit(
+                        RunStatus::Failed,
+                        Some(&error.to_string()),
+                        usage,
+                        events,
+                        sink,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(ThreadTurnCompletion {
+            status,
+            error,
+            usage,
+            main_session_task,
+        })
+    }
+}
+
+impl ThreadTurnCompletion {
+    fn commit<W: io::Write>(
+        self,
+        session: &mut InteractiveSession,
+        request: &ThreadTurnRequest,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+    ) -> io::Result<RunStatus> {
+        session.complete_with_error(self.status.as_str(), self.error.as_deref());
+        if let Some(task) = self.main_session_task.as_ref() {
+            task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
+        }
+        if request.emit_session_completed() {
+            sink.emit(&events.session_completed(self.status))?;
+        }
+        Ok(self.status)
+    }
+}
+
 impl ThreadTurnRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            prompt_placement: ThreadTurnPromptPlacement::BacktrackableUser,
+            tool_mode: ThreadTurnToolMode::Standard,
+            main_session_task_id: None,
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
             steer_handle: None,
@@ -373,7 +623,6 @@ impl ThreadTurnRequest {
             mcp_elicitation_handler: None,
             event_observer: None,
             continuation: None,
-            resumes_existing_turn: false,
         }
     }
 
@@ -388,6 +637,33 @@ impl ThreadTurnRequest {
     pub fn with_options(mut self, options: ControllerRunOptions) -> Self {
         self.options = options;
         self
+    }
+
+    pub fn with_prompt_placement(mut self, placement: ThreadTurnPromptPlacement) -> Self {
+        self.prompt_placement = placement;
+        self
+    }
+
+    pub fn prompt_placement(&self) -> ThreadTurnPromptPlacement {
+        self.prompt_placement
+    }
+
+    pub fn with_tool_mode(mut self, tool_mode: ThreadTurnToolMode) -> Self {
+        self.tool_mode = tool_mode;
+        self
+    }
+
+    pub fn tool_mode(&self) -> ThreadTurnToolMode {
+        self.tool_mode
+    }
+
+    pub fn with_main_session_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.main_session_task_id = Some(task_id.into());
+        self
+    }
+
+    pub fn main_session_task_id(&self) -> Option<&str> {
+        self.main_session_task_id.as_deref()
     }
 
     pub fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
@@ -453,11 +729,12 @@ impl ThreadTurnRequest {
 
     pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
         self.continuation = Some(continuation);
+        self.prompt_placement = ThreadTurnPromptPlacement::ExistingTurn;
         self
     }
 
     pub fn with_existing_turn_prompt(mut self) -> Self {
-        self.resumes_existing_turn = true;
+        self.prompt_placement = ThreadTurnPromptPlacement::ExistingTurn;
         self
     }
 
@@ -490,9 +767,14 @@ impl ThreadTurnRequest {
     pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
         self.continuation.as_ref()
     }
+}
 
-    pub fn resumes_existing_turn(&self) -> bool {
-        self.resumes_existing_turn
+impl ThreadTurnToolMode {
+    fn policy(self) -> AgentToolPolicyContext<'static> {
+        match self {
+            Self::Standard => AgentToolPolicyContext::unrestricted(),
+            Self::Goal => AgentToolPolicyContext::goal_mode(),
+        }
     }
 }
 
@@ -675,69 +957,24 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
     turn_extension_id: Option<String>,
 ) -> io::Result<RunStatus> {
     let context = ThreadTurnContext::prepare(config, session, request)?;
-    let ThreadTurnContext { cwd, prompt, parts } = context;
-
     if let Some(events) = events {
         let mut sink = EventSink::new(writer, config.output_format)
             .with_optional_observer(request.event_observer().cloned());
-        let cancel_ref = cancel;
         let mut background_workflows = Vec::new();
-        let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
-            .with_services(
-                parts.instructions,
-                parts.memory,
-                parts.mcp_registry,
-                parts.hooks,
-            );
-        let loop_context = if let (Some(thread_extensions), Some(turn_extension_id)) =
-            (thread_extensions.clone(), turn_extension_id.clone())
-        {
-            loop_context.with_runtime_thread_extensions(
-                parts.cost_tracker,
-                &cancel_ref,
-                parts.task_registry,
-                thread_extensions,
-                turn_extension_id,
-            )
-        } else {
-            loop_context.with_runtime(parts.cost_tracker, &cancel_ref, parts.task_registry)
-        };
-        let loop_context = if let Some(continuation) = request.continuation().cloned() {
-            loop_context.with_turn_continuation(continuation)
-        } else {
-            loop_context
-        };
-        let result = run_agent_loop(
+        return PreparedThreadTurn {
             config,
-            loop_context
-                .with_execution(&mut background_workflows, None, Some(lifecycle))
-                .with_steer_handle(request.steer_handle())
-                .with_approval_handler(request.approval_handler())
-                .with_permission_handler(request.permission_handler())
-                .with_user_input_handler(request.user_input_handler())
-                .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
+            lifecycle,
+            request,
+            context,
+            cancel: &cancel,
             events,
-            &mut sink,
-            AgentConversationContext::new()
-                .with_history_writer(parts.writer)
-                .with_conversation(Some(parts.conversation)),
-            AgentToolPolicyContext::unrestricted(),
-        )?;
-        let status = result.status;
-        let completion_error = result.error;
-        lifecycle.finish_task(status);
-        observe_background_workflows(
-            request.options().wait_for_background_workflows,
-            events,
-            &mut sink,
-            &mut background_workflows,
-        )?;
-        let status = run_verifier_if_needed(status, config.verifier.as_deref(), events, &mut sink)?;
-        session.complete_with_error(status.as_str(), completion_error.as_deref());
-        if request.emit_session_completed() {
-            sink.emit(&events.session_completed(status))?;
+            sink: &mut sink,
+            background_workflows: &mut background_workflows,
+            thread_extensions,
+            turn_extension_id,
         }
-        return Ok(status);
+        .execute()?
+        .commit(session, request, events, &mut sink);
     }
 
     let mut execution = ThreadTurnExecution::new_with_cancel_and_observer(
@@ -747,69 +984,20 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
         cancel,
         request.event_observer().cloned(),
     );
-    let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
-        .with_services(
-            parts.instructions,
-            parts.memory,
-            parts.mcp_registry,
-            parts.hooks,
-        );
-    let loop_context = if let (Some(thread_extensions), Some(turn_extension_id)) =
-        (thread_extensions, turn_extension_id)
-    {
-        loop_context.with_runtime_thread_extensions(
-            parts.cost_tracker,
-            &execution.cancel,
-            parts.task_registry,
-            thread_extensions,
-            turn_extension_id,
-        )
-    } else {
-        loop_context.with_runtime(parts.cost_tracker, &execution.cancel, parts.task_registry)
-    };
-    let loop_context = if let Some(continuation) = request.continuation().cloned() {
-        loop_context.with_turn_continuation(continuation)
-    } else {
-        loop_context
-    };
-    let result = run_agent_loop(
+    PreparedThreadTurn {
         config,
-        loop_context
-            .with_execution(&mut execution.background_workflows, None, Some(lifecycle))
-            .with_steer_handle(request.steer_handle())
-            .with_approval_handler(request.approval_handler())
-            .with_permission_handler(request.permission_handler())
-            .with_user_input_handler(request.user_input_handler())
-            .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
-        &mut execution.events,
-        &mut execution.sink,
-        AgentConversationContext::new()
-            .with_history_writer(parts.writer)
-            .with_conversation(Some(parts.conversation)),
-        AgentToolPolicyContext::unrestricted(),
-    )?;
-    let status = result.status;
-    let completion_error = result.error;
-    lifecycle.finish_task(status);
-    observe_background_workflows(
-        request.options().wait_for_background_workflows,
-        &mut execution.events,
-        &mut execution.sink,
-        &mut execution.background_workflows,
-    )?;
-    let status = run_verifier_if_needed(
-        status,
-        config.verifier.as_deref(),
-        &mut execution.events,
-        &mut execution.sink,
-    )?;
-    session.complete_with_error(status.as_str(), completion_error.as_deref());
-    if request.emit_session_completed() {
-        execution
-            .sink
-            .emit(&execution.events.session_completed(status))?;
+        lifecycle,
+        request,
+        context,
+        cancel: &execution.cancel,
+        events: &mut execution.events,
+        sink: &mut execution.sink,
+        background_workflows: &mut execution.background_workflows,
+        thread_extensions,
+        turn_extension_id,
     }
-    Ok(status)
+    .execute()?
+    .commit(session, request, &mut execution.events, &mut execution.sink)
 }
 
 #[cfg(test)]

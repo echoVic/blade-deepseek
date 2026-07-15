@@ -15,7 +15,8 @@ use orca_runtime::thread::RuntimeThread;
 use crate::agent_runner::{
     PendingWorkflowNotifications, TuiAgentTurnResult, TuiBackgroundTurnCompletion,
     TuiBackgroundTurnCompletionHandler, TuiBackgroundTurnContinuationRequest,
-    continue_approved_background_turn_for_tui_with_events, run_agent_for_tui_with_event_factory,
+    TuiMainSessionTaskStart, continue_approved_background_turn_for_tui_with_events,
+    run_agent_for_tui_with_event_factory,
 };
 use crate::bridge::TuiSession;
 use crate::operation_controller::TuiOperationController;
@@ -176,6 +177,14 @@ impl TuiThreadOperationExecutor {
         let background_completion_handler = background_goal_accounting
             .as_ref()
             .map(BackgroundGoalAccounting::completion_handler);
+        let main_session_task = request.task_id().map_or_else(
+            || {
+                TuiMainSessionTaskStart::Create(
+                    request.task_description().unwrap_or(request.prompt()),
+                )
+            },
+            TuiMainSessionTaskStart::Adopt,
+        );
         let turn = run_agent_for_tui_with_event_factory(
             config,
             session,
@@ -185,7 +194,7 @@ impl TuiThreadOperationExecutor {
             control,
             cancel,
             request.allows_goal_tools(),
-            request.task_description(),
+            main_session_task,
             request.is_backtrack_target(),
             Some(&self.pending_workflow_notifications),
             background_completion_handler,

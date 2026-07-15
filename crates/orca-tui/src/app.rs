@@ -2442,19 +2442,41 @@ mod tests {
                 ))
                 .unwrap();
 
-            let task = loop {
+            let mut tasks = Vec::new();
+            loop {
                 let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                if let Some(task) = matching_task_update(event, |task| {
-                    task.task_type == orca_core::task_types::TaskType::MainSession
-                }) {
-                    break task;
+                match event {
+                    TuiEvent::WorkflowTaskUpdated { task }
+                        if task.task_type == orca_core::task_types::TaskType::MainSession =>
+                    {
+                        tasks.push(task);
+                    }
+                    TuiEvent::SessionCompleted { .. } => break,
+                    _ => {}
                 }
-            };
+            }
 
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
-            assert_eq!(task.description, "Workflow notification notification-1");
+            assert!(tasks.len() >= 2);
+            assert!(
+                tasks.iter().all(|task| task.id == tasks[0].id),
+                "actor and temporary TUI executor must share one task id"
+            );
+            assert!(
+                tasks
+                    .iter()
+                    .all(|task| { task.description == "Workflow notification notification-1" })
+            );
+            assert_eq!(
+                tasks.first().unwrap().status,
+                orca_core::task_types::TaskStatus::Running
+            );
+            assert_eq!(
+                tasks.last().unwrap().status,
+                orca_core::task_types::TaskStatus::Completed
+            );
         });
     }
 
@@ -2536,6 +2558,37 @@ mod tests {
         assert!(
             !submitted_turn_impl.contains("fn workflow_notification(id: String, prompt: String)"),
             "submitted turns should not split workflow notification id and prompt at construction"
+        );
+    }
+
+    #[test]
+    fn hosted_user_turn_request_opts_into_task_tracking_without_goal_tools() {
+        let submitted = SubmittedTurn::user("inspect the runtime".to_string());
+
+        let request = hosted_turn_request(&submitted, false);
+
+        assert!(!request.allows_goal_tools());
+        assert!(!request.tracks_goal_usage());
+        assert!(request.is_backtrack_target());
+        assert_eq!(request.task_description(), Some("inspect the runtime"));
+    }
+
+    #[test]
+    fn hosted_goal_notification_request_preserves_pinned_task_semantics() {
+        let submitted =
+            SubmittedTurn::workflow_notification(crate::types::PendingWorkflowNotification {
+                id: "notification-42".to_string(),
+                prompt: "<task-notification>done</task-notification>".to_string(),
+            });
+
+        let request = hosted_turn_request(&submitted, true);
+
+        assert!(request.allows_goal_tools());
+        assert!(request.tracks_goal_usage());
+        assert!(!request.is_backtrack_target());
+        assert_eq!(
+            request.task_description(),
+            Some("Workflow notification notification-42")
         );
     }
 
@@ -4510,24 +4563,21 @@ fn run_hosted_goal_turns(
     };
     let mut continuation = starting_continuation;
     loop {
-        if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
-            && goal.status.should_continue()
-        {
+        let active_goal = orca_runtime::goals::GoalStore::load_default()
+            .get(&session_id)
+            .ok()
+            .flatten()
+            .filter(|goal| goal.status.should_continue());
+        if let Some(goal) = active_goal.as_ref() {
             if let Err(error) = thread.mutate(RuntimeThreadMutation::ReplaceGoalContext(
-                orca_runtime::agent_common::format_goal_mode_instructions(&goal),
+                orca_runtime::agent_common::format_goal_mode_instructions(goal),
             )) {
                 let _ = event_tx.send(TuiEvent::Error(error.to_string()));
                 break;
             }
-            let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal)));
+            let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
         }
-        let mut request = HostedTurnRequest::new(submitted_turn.prompt().to_string())
-            .with_goal_tools(true)
-            .with_goal_usage_tracking(true)
-            .with_backtrack_target(submitted_turn.is_backtrack_target());
-        if let Some(description) = submitted_turn.task_label() {
-            request = request.with_task_description(description);
-        }
+        let request = hosted_turn_request(&submitted_turn, active_goal.is_some());
         let result = match run_hosted_operation(
             thread,
             request,
@@ -4609,6 +4659,21 @@ fn run_hosted_goal_turns(
         submitted_turn =
             SubmittedTurn::user(goal_continuation_prompt(&goal.objective, continuation));
     }
+}
+
+fn hosted_turn_request(
+    submitted_turn: &SubmittedTurn,
+    goal_mode_active: bool,
+) -> HostedTurnRequest {
+    HostedTurnRequest::new(submitted_turn.prompt().to_string())
+        .with_goal_tools(goal_mode_active)
+        .with_goal_usage_tracking(goal_mode_active)
+        .with_backtrack_target(submitted_turn.is_backtrack_target())
+        .with_task_description(
+            submitted_turn
+                .task_label()
+                .unwrap_or_else(|| submitted_turn.prompt()),
+        )
 }
 
 fn current_hosted_goal_session_id(
