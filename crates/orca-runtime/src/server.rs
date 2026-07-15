@@ -37,9 +37,7 @@ use crate::thread_store::{
     SessionStore, SortDirection, StoredThreadSummary, ThreadListFilters, ThreadMetadataPatch,
     ThreadSortKey, ThreadStore, TurnItemsView,
 };
-use active_turn_manager::{
-    ActiveTurnControl, ActiveTurnHandle, ActiveTurnManager, ActiveTurnReaper,
-};
+use active_turn_manager::{ActiveTurnControl, ActiveTurnManager, ActiveTurnReaper};
 use command_exec_manager::{
     CommandExecDrainOutcome, CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess,
     CommandExecProcessSnapshot,
@@ -1958,24 +1956,16 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             }
         }
     }
-    state.active_turns.insert_control(
-        active_turn_id.clone(),
-        ActiveTurnControl::new(
-            thread_id.clone(),
-            cancel.clone(),
-            steer_handle.clone(),
-            command_tx,
-        ),
+    let control = ActiveTurnControl::new(
+        thread_id.clone(),
+        cancel.clone(),
+        steer_handle.clone(),
+        command_tx,
     );
 
     let writer_for_thread = Arc::clone(&writer);
-    let thread_id_for_return = thread_id.clone();
-    let active_turn_id_for_return = active_turn_id.clone();
-    let control_for_worker = state
-        .active_turns
-        .get_mut(&active_turn_id)
-        .expect("active turn control inserted")
-        .clone();
+    let active_turn_id_for_worker = active_turn_id.clone();
+    let control_for_worker = control.clone();
     let pending_permissions = state.pending_permissions.clone();
     let pending_user_inputs = state.pending_user_inputs.clone();
     let pending_mcp_elicitations = state.pending_mcp_elicitations.clone();
@@ -1995,7 +1985,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
                 pending_permissions.clone(),
                 id.clone(),
                 thread_id.clone(),
-                active_turn_id.clone(),
+                active_turn_id_for_worker.clone(),
                 generation,
                 generation_cancel.clone(),
                 runtime_workspace_roots_for_worker.clone(),
@@ -2005,7 +1995,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
                 pending_user_inputs.clone(),
                 id.clone(),
                 thread_id.clone(),
-                active_turn_id.clone(),
+                active_turn_id_for_worker.clone(),
                 generation,
                 generation_cancel.clone(),
             ));
@@ -2014,7 +2004,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
                 pending_mcp_elicitations.clone(),
                 id.clone(),
                 thread_id.clone(),
-                active_turn_id.clone(),
+                active_turn_id_for_worker.clone(),
                 generation,
                 generation_cancel.clone(),
             ));
@@ -2025,7 +2015,7 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
                     .run_turn_with_permissions_cancel_and_permission_handler_for_existing_turn(
                         &run_config,
                         &prompt,
-                        &active_turn_id,
+                        &active_turn_id_for_worker,
                         permissions.clone(),
                         &mut generation_writer,
                         generation_cancel,
@@ -2064,15 +2054,11 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             generation = generation.saturating_add(1);
             resume_existing_turn = true;
         }
-        (
-            active_turn_id_for_return,
-            thread_id_for_return,
-            thread_state,
-        )
+        thread_state
     });
     state
         .active_turns
-        .push_running(ActiveTurnHandle::new(handle));
+        .insert_running(active_turn_id, control, handle);
     state.reclaim_finished_threads();
     Ok(())
 }

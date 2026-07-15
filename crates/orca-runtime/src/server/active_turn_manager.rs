@@ -141,20 +141,14 @@ impl ActiveTurnControl {
     }
 }
 
-pub(super) struct ActiveTurnHandle {
-    handle: thread::JoinHandle<(String, String, ServerThread)>,
-}
-
-impl ActiveTurnHandle {
-    pub(super) fn new(handle: thread::JoinHandle<(String, String, ServerThread)>) -> Self {
-        Self { handle }
-    }
+struct ActiveTurnEntry {
+    control: ActiveTurnControl,
+    worker: thread::JoinHandle<ServerThread>,
 }
 
 #[must_use = "active turn cleanup must be joined before server exit"]
 pub(super) struct ActiveTurnReaper {
-    running: Vec<ActiveTurnHandle>,
-    controls: HashMap<String, ActiveTurnControl>,
+    turns: HashMap<String, ActiveTurnEntry>,
 }
 
 impl ActiveTurnReaper {
@@ -163,10 +157,8 @@ impl ActiveTurnReaper {
     }
 
     fn join_all(&mut self) {
-        for active in self.running.drain(..) {
-            if let Ok((turn_id, _thread_id, _thread)) = active.handle.join() {
-                self.controls.remove(&turn_id);
-            }
+        for (_turn_id, active) in self.turns.drain() {
+            let _ = active.worker.join();
         }
     }
 }
@@ -179,27 +171,28 @@ impl Drop for ActiveTurnReaper {
 
 #[derive(Default)]
 pub(super) struct ActiveTurnManager {
-    controls: HashMap<String, ActiveTurnControl>,
-    running: Vec<ActiveTurnHandle>,
+    turns: HashMap<String, ActiveTurnEntry>,
 }
 
 impl ActiveTurnManager {
-    pub(super) fn insert_control(&mut self, turn_id: String, control: ActiveTurnControl) {
-        self.controls.insert(turn_id, control);
-    }
-
-    pub(super) fn push_running(&mut self, handle: ActiveTurnHandle) {
-        self.running.push(handle);
+    pub(super) fn insert_running(
+        &mut self,
+        turn_id: String,
+        control: ActiveTurnControl,
+        worker: thread::JoinHandle<ServerThread>,
+    ) {
+        self.turns
+            .insert(turn_id, ActiveTurnEntry { control, worker });
     }
 
     pub(super) fn get_mut(&mut self, turn_id: &str) -> Option<&mut ActiveTurnControl> {
-        self.controls.get_mut(turn_id)
+        self.turns.get_mut(turn_id).map(|turn| &mut turn.control)
     }
 
     pub(super) fn has_thread(&self, thread_id: &str) -> bool {
-        self.controls
+        self.turns
             .values()
-            .any(|turn| turn.thread_id == thread_id)
+            .any(|turn| turn.control.thread_id == thread_id)
     }
 
     pub(super) fn accepts_generation(
@@ -208,7 +201,8 @@ impl ActiveTurnManager {
         thread_id: &str,
         generation: u64,
     ) -> bool {
-        self.controls.get(turn_id).is_some_and(|control| {
+        self.turns.get(turn_id).is_some_and(|turn| {
+            let control = &turn.control;
             control.thread_id == thread_id
                 && control.generation() == generation
                 && !control.cancel_token().is_cancelled()
@@ -221,7 +215,8 @@ impl ActiveTurnManager {
         additional_working_directories: Vec<AdditionalWorkingDirectory>,
         network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
     ) {
-        for control in self.controls.values_mut() {
+        for turn in self.turns.values_mut() {
+            let control = &mut turn.control;
             if control.thread_id == thread_id {
                 control.session_permission_directories = additional_working_directories.clone();
                 control.session_network_domain_permissions = network_domain_permissions.clone();
@@ -231,18 +226,17 @@ impl ActiveTurnManager {
 
     #[cfg(test)]
     pub(super) fn join_all(&mut self, threads: &mut ServerThreadRuntime) {
-        for active in self.running.drain(..) {
-            if let Ok((turn_id, _thread_id, thread)) = active.handle.join() {
-                let control = self.controls.remove(&turn_id);
-                let thread = merge_completed_turn_metadata(thread, control);
+        for (_turn_id, active) in self.turns.drain() {
+            if let Ok(thread) = active.worker.join() {
+                let thread = merge_completed_turn_metadata(thread, active.control);
                 threads.put_thread(thread);
             }
         }
     }
 
     pub(super) fn cancel_all(&self) {
-        for control in self.controls.values() {
-            control.cancel_current();
+        for turn in self.turns.values() {
+            turn.control.cancel_current();
         }
     }
 
@@ -257,7 +251,7 @@ impl ActiveTurnManager {
             .unwrap_or_else(Instant::now);
         loop {
             self.reclaim_finished(threads);
-            if self.running.is_empty() {
+            if self.turns.is_empty() {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -268,30 +262,27 @@ impl ActiveTurnManager {
     }
 
     pub(super) fn handoff_remaining_to_reaper(&mut self) -> Option<ActiveTurnReaper> {
-        let running = std::mem::take(&mut self.running);
-        if running.is_empty() {
+        let turns = std::mem::take(&mut self.turns);
+        if turns.is_empty() {
             return None;
         }
-        Some(ActiveTurnReaper {
-            running,
-            controls: std::mem::take(&mut self.controls),
-        })
+        Some(ActiveTurnReaper { turns })
     }
 
     pub(super) fn reclaim_finished(&mut self, threads: &mut ServerThreadRuntime) {
-        let mut pending = Vec::new();
-        for active in self.running.drain(..) {
-            if active.handle.is_finished() {
-                if let Ok((turn_id, _thread_id, thread)) = active.handle.join() {
-                    let control = self.controls.remove(&turn_id);
-                    let thread = merge_completed_turn_metadata(thread, control);
-                    threads.put_thread(thread);
-                }
-            } else {
-                pending.push(active);
+        let finished = self
+            .turns
+            .iter()
+            .filter_map(|(turn_id, turn)| turn.worker.is_finished().then_some(turn_id.clone()))
+            .collect::<Vec<_>>();
+        for turn_id in finished {
+            if let Some(active) = self.turns.remove(&turn_id)
+                && let Ok(thread) = active.worker.join()
+            {
+                let thread = merge_completed_turn_metadata(thread, active.control);
+                threads.put_thread(thread);
             }
         }
-        self.running = pending;
     }
 
     pub(super) fn reclaim_finished_thread(
@@ -318,24 +309,22 @@ impl ActiveTurnManager {
 
 fn merge_completed_turn_metadata(
     mut thread: ServerThread,
-    control: Option<ActiveTurnControl>,
+    control: ActiveTurnControl,
 ) -> ServerThread {
-    if let Some(control) = control {
-        let additional_working_directories = (!control.session_permission_directories.is_empty())
-            .then_some(control.session_permission_directories);
-        let network_domain_permissions = (!control.session_network_domain_permissions.is_empty())
-            .then_some(control.session_network_domain_permissions);
-        if additional_working_directories.is_some() || network_domain_permissions.is_some() {
-            thread.update_metadata(ThreadMetadataPatch {
-                title: None,
-                active_permission_profile: None,
-                approval_mode: None,
-                runtime_workspace_roots: None,
-                permission_rules: None,
-                additional_working_directories,
-                network_domain_permissions,
-            });
-        }
+    let additional_working_directories = (!control.session_permission_directories.is_empty())
+        .then_some(control.session_permission_directories);
+    let network_domain_permissions = (!control.session_network_domain_permissions.is_empty())
+        .then_some(control.session_network_domain_permissions);
+    if additional_working_directories.is_some() || network_domain_permissions.is_some() {
+        thread.update_metadata(ThreadMetadataPatch {
+            title: None,
+            active_permission_profile: None,
+            approval_mode: None,
+            runtime_workspace_roots: None,
+            permission_rules: None,
+            additional_working_directories,
+            network_domain_permissions,
+        });
     }
     thread
 }
@@ -380,13 +369,14 @@ mod tests {
     fn handed_off_turn_reaper_remains_joinable_until_cleanup_finishes() {
         let (release_tx, release_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
-        let handle = thread::spawn(move || -> (String, String, ServerThread) {
+        let handle = thread::spawn(move || -> ServerThread {
             release_rx.recv().expect("release turn");
             finished_tx.send(()).expect("report completion");
             panic!("test turn exits without a ServerThread");
         });
+        let (control, _command_rx) = ActiveTurnControl::for_test("thread-1".to_string());
         let mut manager = ActiveTurnManager::default();
-        manager.push_running(ActiveTurnHandle::new(handle));
+        manager.insert_running("turn-1".to_string(), control, handle);
         let reaper = manager
             .handoff_remaining_to_reaper()
             .expect("active turn reaper");

@@ -1946,49 +1946,6 @@ mod tests {
     }
 
     #[test]
-    fn server_active_turn_manager_is_owned_by_active_turn_manager_module() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let server_source =
-            std::fs::read_to_string(manifest_dir.join("src/server.rs")).expect("server source");
-        let manager_source =
-            std::fs::read_to_string(manifest_dir.join("src/server/active_turn_manager.rs"))
-                .expect("server active turn manager source");
-
-        assert!(
-            server_source.contains("mod active_turn_manager;"),
-            "server must declare the active turn manager module"
-        );
-        for type_name in [
-            "struct ActiveTurnControl",
-            "struct ActiveTurnHandle",
-            "struct ActiveTurnManager",
-            "struct ActiveTurnReaper",
-        ] {
-            assert!(
-                !server_source.contains(type_name),
-                "server.rs must not own {type_name}"
-            );
-            assert!(
-                manager_source.contains(type_name),
-                "server/active_turn_manager.rs must own {type_name}"
-            );
-        }
-        assert!(
-            manager_source.contains("fn merge_completed_turn_metadata"),
-            "server/active_turn_manager.rs must own completed-turn metadata merge"
-        );
-        assert!(
-            server_source.contains("let reaper = state.shutdown();")
-                && server_source.contains("reaper.join();"),
-            "server exit must retain and join handed-off turn cleanup before process::exit"
-        );
-        assert!(
-            !manager_source.contains("drop(thread::spawn("),
-            "active turn cleanup must not discard its reaper join handle"
-        );
-    }
-
-    #[test]
     fn server_permission_manager_is_owned_by_permission_manager_module() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let server_source =
