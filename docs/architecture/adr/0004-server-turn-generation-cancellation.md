@@ -45,10 +45,10 @@ therefore rejected instead of reaching a later generation.
 
 Generation output may stream normally, but its raw terminal `session.completed`
 record is held until the generation outcome is known. If the generation is
-replaced by resume, its terminal record and outer cancellation error are
-discarded; the logical turn emits one final terminal event from the current
-generation. A generation that is not resumed commits its cancelled or
-successful terminal event and outer error as before.
+replaced by resume, its terminal record and runtime or outer cancellation
+errors are discarded; the logical turn emits one final terminal event from the
+current generation. A generation that is not resumed commits its cancelled or
+successful terminal event and cancellation errors as before.
 
 ## TUI And Runtime Benefit
 
@@ -121,7 +121,7 @@ boundary, not compatibility layers.
 
 Focused and full local gates passed on the final main-based candidate:
 
-- `orca-runtime` lib: 777 tests; all `server_mode_*` contracts: 107 tests.
+- `orca-runtime` lib: 778 tests; all `server_mode_*` contracts: 107 tests.
 - Serial workspace tests, workspace Clippy, site build/SEO, release helper
   tests, and real DeepSeek provider/CLI/history/server/thread gates passed.
 - The real API server gate interrupts after the first stream delta, resumes the
