@@ -1,0 +1,39 @@
+crates/orca-runtime/src/mentions.rs
+  s_bd921bce96b0c1::t_92af7fd49a7716 639-644
+crates/orca-tui/src/app.rs
+  s_61c879183fbdff::t_597e6b42924954 551-580,586,3806,3823-3827,3850,3875-3889
+crates/orca-tui/src/global_actions.rs
+  s_61c879183fbdff::t_73c131b48cd8e0 36-39,97-131
+crates/orca-tui/src/runtime_event_actions.rs
+  s_61c879183fbdff::t_edec35b14b8394 38-41,56,70-111
+crates/orca-tui/src/submitted_turn.rs
+  s_61c879183fbdff::t_7f08827e6390f2 72-78
+crates/orca-tui/src/types.rs
+  s_61c879183fbdff::t_8b9884a32c8deb 224-227,1734-1740,3028-3048
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "be8d2541951effa1ed33a5d7744bf817624e36f1",
+  "prompts": {},
+  "sessions": {
+    "s_61c879183fbdff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f63eb-5026-7073-9854-b348079bb9f3",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    },
+    "s_bd921bce96b0c1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1c8e9b68-f49e-4bfb-bc7d-ce69192bb225",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
