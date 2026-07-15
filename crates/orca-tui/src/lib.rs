@@ -1,7 +1,9 @@
 mod action_dispatcher;
 mod agent_runner;
 mod agent_runtime;
+#[cfg(test)]
 mod agent_subagent_execution;
+#[cfg(test)]
 mod agent_tool_execution;
 mod agent_workflow_execution;
 pub mod app;

@@ -38,6 +38,7 @@ impl RuntimeModelRouteStep {
             subagent_type,
             continuation: _,
             steer_handle: _,
+            ..
         } = input.turn_context;
 
         let routed_model = input.actor.route_model_turn(

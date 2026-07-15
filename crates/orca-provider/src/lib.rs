@@ -7,6 +7,7 @@ pub mod summary_cache;
 pub mod system_prompt;
 pub mod tool_schema;
 
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -29,6 +30,104 @@ pub struct ProviderConfig {
     pub tools_override: Option<Vec<serde_json::Value>>,
     pub mcp_registry: Option<McpRegistry>,
     pub external_tools: Vec<ExternalToolConfig>,
+}
+
+pub enum ProviderStreamEvent {
+    Step(ProviderStreamDelivery),
+    Completed(ProviderResponse),
+}
+
+pub struct ProviderStreamDelivery {
+    step: ProviderStep,
+    acknowledged: Option<mpsc::SyncSender<()>>,
+}
+
+impl ProviderStreamDelivery {
+    pub fn step(&self) -> &ProviderStep {
+        &self.step
+    }
+}
+
+impl Drop for ProviderStreamDelivery {
+    fn drop(&mut self) {
+        if let Some(acknowledged) = self.acknowledged.take() {
+            let _ = acknowledged.send(());
+        }
+    }
+}
+
+pub struct ProviderStreamingCall {
+    receiver: Option<mpsc::Receiver<ProviderWorkerStep>>,
+    worker: Option<JoinedProviderWorker>,
+    replay_steps: VecDeque<ProviderStep>,
+    completed: Option<ProviderResponse>,
+}
+
+impl ProviderStreamingCall {
+    pub fn recv_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ProviderStreamEvent, mpsc::RecvTimeoutError> {
+        if let Some(step) = self.replay_steps.pop_front() {
+            return Ok(ProviderStreamEvent::Step(ProviderStreamDelivery {
+                step,
+                acknowledged: None,
+            }));
+        }
+        if let Some(response) = self.completed.take() {
+            return Ok(ProviderStreamEvent::Completed(response));
+        }
+
+        let delivery = self
+            .receiver
+            .as_ref()
+            .ok_or(mpsc::RecvTimeoutError::Disconnected)
+            .and_then(|receiver| receiver.recv_timeout(timeout));
+        match delivery {
+            Ok(delivery) => Ok(ProviderStreamEvent::Step(ProviderStreamDelivery {
+                step: delivery.step,
+                acknowledged: Some(delivery.acknowledged),
+            })),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(mpsc::RecvTimeoutError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.receiver.take();
+                let worker = self
+                    .worker
+                    .take()
+                    .ok_or(mpsc::RecvTimeoutError::Disconnected)?;
+                match worker.join() {
+                    Ok(response) => Ok(ProviderStreamEvent::Completed(response)),
+                    Err(_) => {
+                        let response =
+                            provider_worker_error("provider worker panicked".to_string());
+                        self.replay_steps.extend(response.steps.iter().cloned());
+                        self.completed = Some(response);
+                        self.recv_timeout(timeout)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn cancel(&self) {
+        if let Some(worker) = self.worker.as_ref() {
+            worker.cancel();
+        }
+    }
+
+    pub fn cancel_and_join(&mut self) {
+        self.cancel();
+        self.receiver.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for ProviderStreamingCall {
+    fn drop(&mut self) {
+        self.cancel_and_join();
+    }
 }
 
 pub fn call(
@@ -93,10 +192,41 @@ pub fn call_streaming(
     cancel: &CancelToken,
     on_step: &mut dyn FnMut(&ProviderStep),
 ) -> ProviderResponse {
+    let mut stream = start_streaming(kind, conversation, config, cancel.clone());
+    let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            match stream.recv_timeout(Duration::from_secs(1)) {
+                Ok(ProviderStreamEvent::Step(delivery)) => on_step(delivery.step()),
+                Ok(ProviderStreamEvent::Completed(response)) => return response,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let response = provider_worker_error(
+                        "provider stream disconnected before completion".to_string(),
+                    );
+                    send_response_steps_to_callback(&response, on_step);
+                    return response;
+                }
+            }
+        }
+    }));
+    match callback_result {
+        Ok(response) => response,
+        Err(payload) => {
+            stream.cancel_and_join();
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+pub fn start_streaming(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: CancelToken,
+) -> ProviderStreamingCall {
     let conversation = conversation.clone();
     let config = config.clone();
     let worker_cancel = cancel.clone();
-    let guard_cancel = cancel.clone();
     let (step_tx, step_rx) = mpsc::sync_channel(0);
     let worker = match thread::Builder::new()
         .name("orca-provider-stream".to_string())
@@ -129,33 +259,19 @@ pub fn call_streaming(
         Err(error) => {
             let response =
                 provider_worker_error(format!("failed to start provider worker: {error}"));
-            send_response_steps_to_callback(&response, on_step);
-            return response;
+            return ProviderStreamingCall {
+                receiver: None,
+                worker: None,
+                replay_steps: response.steps.iter().cloned().collect(),
+                completed: Some(response),
+            };
         }
     };
-    let worker = JoinedProviderWorker::new(worker, guard_cancel);
-
-    let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        while let Ok(delivery) = step_rx.recv() {
-            on_step(&delivery.step);
-            let _ = delivery.acknowledged.send(());
-        }
-    }));
-    if let Err(payload) = callback_result {
-        drop(step_rx);
-        worker.cancel();
-        let _ = worker.join();
-        std::panic::resume_unwind(payload);
-    }
-    drop(step_rx);
-
-    match worker.join() {
-        Ok(response) => response,
-        Err(_) => {
-            let response = provider_worker_error("provider worker panicked".to_string());
-            send_response_steps_to_callback(&response, on_step);
-            response
-        }
+    ProviderStreamingCall {
+        receiver: Some(step_rx),
+        worker: Some(JoinedProviderWorker::new(worker, cancel)),
+        replay_steps: VecDeque::new(),
+        completed: None,
     }
 }
 
@@ -1693,6 +1809,114 @@ mod tests {
             response.assistant_content.as_deref(),
             Some("Mock slow stream started.Mock slow stream completed.")
         );
+    }
+
+    #[test]
+    fn transferable_stream_call_preserves_in_flight_provider_after_first_delta() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_delay_ms 50".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
+
+        let first = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first provider stream event");
+        assert!(matches!(
+            first,
+            ProviderStreamEvent::Step(ref delivery)
+                if matches!(delivery.step(), ProviderStep::MessageDelta(text)
+                    if text == "Mock slow stream started.")
+        ));
+        drop(first);
+
+        assert!(matches!(
+            stream.recv_timeout(Duration::from_millis(5)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let second = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second provider stream event");
+        assert!(matches!(
+            second,
+            ProviderStreamEvent::Step(ref delivery)
+                if matches!(delivery.step(), ProviderStep::MessageDelta(text)
+                    if text == "Mock slow stream completed.")
+        ));
+        drop(second);
+
+        let completed = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("provider stream completion");
+        assert!(matches!(
+            completed,
+            ProviderStreamEvent::Completed(ref response)
+                if response.assistant_content.as_deref()
+                    == Some("Mock slow stream started.Mock slow stream completed.")
+        ));
+    }
+
+    #[test]
+    fn dropping_transferable_stream_call_cancels_and_joins_worker() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_delay_ms 1000".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let cancel_probe = cancel.clone();
+        let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
+        let first = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first provider stream event");
+        assert!(matches!(first, ProviderStreamEvent::Step(_)));
+        drop(first);
+
+        let started = std::time::Instant::now();
+        drop(stream);
+
+        assert!(cancel_probe.is_cancelled());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "dropping a transferable call must cancel and join without waiting for the full provider delay"
+        );
+    }
+
+    #[test]
+    fn transferable_stream_cancel_and_join_is_idempotent() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_delay_ms 1000".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let cancel_probe = cancel.clone();
+        let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
+
+        stream.cancel_and_join();
+        stream.cancel_and_join();
+
+        assert!(cancel_probe.is_cancelled());
     }
 
     #[test]

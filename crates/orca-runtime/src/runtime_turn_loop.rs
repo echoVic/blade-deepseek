@@ -9,7 +9,7 @@ use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps, RuntimeTurnLoopState,
+    AgentLoopOutcome, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps, RuntimeTurnLoopState,
 };
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
@@ -191,6 +191,7 @@ impl<'a> RuntimeTurnRequestContext<'a> {
             subagent_type: self.turn_context.subagent_type,
             continuation: self.turn_context.continuation.take(),
             steer_handle: self.turn_context.steer_handle,
+            provider_suspension_control: self.turn_context.provider_suspension_control,
         };
         Self { turn_context }
     }
@@ -228,7 +229,7 @@ pub(crate) fn run_agent_turn_loop<W: io::Write>(
     step: &mut RuntimeTurnLoopStep,
     input: RuntimeAgentTurnLoopInput<'_, '_, W>,
     executors: RuntimeTurnLoopExecutors<W>,
-) -> io::Result<AgentLoopResult> {
+) -> io::Result<AgentLoopOutcome> {
     step.run(input.into_turn_loop_input(), executors)
 }
 
@@ -243,7 +244,7 @@ impl RuntimeTurnLoopStep {
         &mut self,
         mut input: RuntimeTurnLoopInput<'_, '_, W>,
         executors: RuntimeTurnLoopExecutors<W>,
-    ) -> io::Result<AgentLoopResult> {
+    ) -> io::Result<AgentLoopOutcome> {
         loop {
             match self.iteration_step.run(
                 input.iteration_input(),
@@ -254,7 +255,12 @@ impl RuntimeTurnLoopStep {
                 RuntimeTurnIterationResult::ContinueLoop => {
                     continue;
                 }
-                RuntimeTurnIterationResult::Return(result) => return Ok(result),
+                RuntimeTurnIterationResult::Return(result) => {
+                    return Ok(AgentLoopOutcome::Completed(result));
+                }
+                RuntimeTurnIterationResult::Suspended(suspension) => {
+                    return Ok(AgentLoopOutcome::ProviderSuspended(suspension));
+                }
             }
         }
     }

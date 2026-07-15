@@ -517,6 +517,19 @@ fn spawn_hosted_tui_test_runtime(
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
 ) -> TuiAgentRuntime {
+    spawn_hosted_tui_test_runtime_with_background_capacity(
+        config, preloaded, event_tx, action_rx, 8,
+    )
+}
+
+#[cfg(test)]
+fn spawn_hosted_tui_test_runtime_with_background_capacity(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    background_capacity: usize,
+) -> TuiAgentRuntime {
     let pending = bridge::PendingWorkflowNotifications::new();
     let registry = orca_mcp::initialize_registry(&[]);
     let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
@@ -532,7 +545,7 @@ fn spawn_hosted_tui_test_runtime(
     TuiAgentRuntime::spawn_hosted(
         action_rx,
         event_tx,
-        8,
+        background_capacity,
         controller,
         move |task_spawner| {
             Arc::new(TuiThreadOperationExecutor::new(
@@ -1364,15 +1377,24 @@ mod tests {
 
     impl HostedTuiHarness {
         fn start(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
+            Self::start_with_background_capacity(config, preloaded, 8)
+        }
+
+        fn start_with_background_capacity(
+            config: RunConfig,
+            preloaded: Option<history::SessionTranscript>,
+            background_capacity: usize,
+        ) -> Self {
             let config = Arc::new(Mutex::new(config));
             let preloaded = Arc::new(Mutex::new(preloaded));
             let (event_tx, event_rx) = mpsc::unbounded();
             let (action_tx, action_rx) = mpsc::unbounded();
-            let runtime = spawn_hosted_tui_test_runtime(
+            let runtime = spawn_hosted_tui_test_runtime_with_background_capacity(
                 Arc::clone(&config),
                 Arc::clone(&preloaded),
                 event_tx,
                 action_rx,
+                background_capacity,
             );
             Self {
                 action_tx,
@@ -1480,6 +1502,267 @@ mod tests {
                 }
             }
             runtime.shutdown().expect("hosted runtime shutdown");
+        });
+    }
+
+    #[test]
+    fn hosted_tui_foreground_turn_uses_canonical_verifier_terminal() {
+        with_orca_home(|_| {
+            let mut config = test_config(HistoryMode::Record);
+            config.verifier = Some("false".to_string());
+            let mut harness = HostedTuiHarness::start(config, None);
+
+            harness.send(UserAction::Submit("verify canonical TUI turn".to_string()));
+            let terminal =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            assert!(matches!(
+                terminal,
+                TuiEvent::SessionCompleted { status } if status == "verification_failed"
+            ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_background_handoff_failure_publishes_terminal_after_operation_join() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start_with_background_capacity(
+                test_config(HistoryMode::Record),
+                None,
+                0,
+            );
+            harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
+            });
+
+            harness.send(UserAction::BackgroundCurrentTurn);
+            let terminal =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            assert!(matches!(
+                terminal,
+                TuiEvent::SessionCompleted { status } if status == "failed"
+            ));
+            assert_eq!(harness.runtime.controller().current_id(), None);
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_backgrounded_canonical_provider_can_be_stopped_once() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
+            });
+
+            harness.send(UserAction::BackgroundCurrentTurn);
+            let task = loop {
+                let event = harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("backgrounded task update");
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.status == orca_core::task_types::TaskStatus::Running
+                        && task.is_backgrounded
+                }) {
+                    break task;
+                }
+            };
+
+            harness.send(UserAction::StopTask {
+                task_id: task.id.clone(),
+            });
+            let stopped = loop {
+                let event = harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("stopped task update");
+                if let Some(task) = matching_task_update(event, |candidate| {
+                    candidate.id == task.id
+                        && candidate.status == orca_core::task_types::TaskStatus::Stopped
+                }) {
+                    break task;
+                }
+            };
+            assert!(stopped.is_backgrounded);
+
+            harness.send(UserAction::StopTask {
+                task_id: task.id.clone(),
+            });
+            let duplicate_stop = harness.recv_until(
+                |event| matches!(event, TuiEvent::Error(message) if message.contains("already stopped")),
+            );
+            assert!(matches!(duplicate_stop, TuiEvent::Error(_)));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_backgrounded_canonical_provider_can_be_foregrounded_once() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
+            });
+
+            harness.send(UserAction::BackgroundCurrentTurn);
+            let task = loop {
+                let event = harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("backgrounded task update");
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.status == orca_core::task_types::TaskStatus::Running
+                        && task.is_backgrounded
+                }) {
+                    break task;
+                }
+            };
+
+            harness.send(UserAction::ForegroundTask {
+                task_id: task.id.clone(),
+            });
+            harness.recv_until(|event| {
+                matching_task_update(event.clone(), |candidate| {
+                    candidate.id == task.id
+                        && candidate.status == orca_core::task_types::TaskStatus::Running
+                        && !candidate.is_backgrounded
+                })
+                .is_some()
+            });
+
+            harness.send(UserAction::ForegroundTask {
+                task_id: task.id.clone(),
+            });
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::Error(message) if message.contains("requires a backgrounded task"))
+            });
+
+            let mut saw_completed_delta = false;
+            loop {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("foregrounded provider completion")
+                {
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow stream completed.") =>
+                    {
+                        saw_completed_delta = true;
+                    }
+                    TuiEvent::SessionCompleted { status } => {
+                        assert_eq!(status, "success");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_completed_delta);
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_canonical_approval_uses_operation_fence_and_resumes_turn() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit(
+                "bash printf canonical-approval".to_string(),
+            ));
+
+            let key = match harness
+                .recv_until(|event| matches!(event, TuiEvent::ApprovalNeeded { .. }))
+            {
+                TuiEvent::ApprovalNeeded { key, .. } => key,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                Some(key.operation_id),
+                harness.runtime.controller().current_id()
+            );
+            harness.send(UserAction::RespondToInteraction {
+                key,
+                response: TuiInteractionResponse::Approval(true),
+            });
+
+            let terminal =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_canonical_permission_uses_operation_fence_and_resumes_turn() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit(
+                "request_network_permissions_then_done example.com".to_string(),
+            ));
+
+            let key = match harness
+                .recv_until(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }))
+            {
+                TuiEvent::PermissionApprovalNeeded { key, .. } => key,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                Some(key.operation_id),
+                harness.runtime.controller().current_id()
+            );
+            harness.send(UserAction::RespondToInteraction {
+                key,
+                response: TuiInteractionResponse::Permission(true),
+            });
+
+            let terminal =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_canonical_user_input_uses_operation_fence_and_resumes_turn() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("ask continue?".to_string()));
+
+            let key = match harness
+                .recv_until(|event| matches!(event, TuiEvent::UserInputRequested { .. }))
+            {
+                TuiEvent::UserInputRequested { key, .. } => key,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                Some(key.operation_id),
+                harness.runtime.controller().current_id()
+            );
+            harness.send(UserAction::RespondToInteraction {
+                key,
+                response: TuiInteractionResponse::UserInput("yes".to_string()),
+            });
+
+            let terminal =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
+            harness.shutdown();
         });
     }
 

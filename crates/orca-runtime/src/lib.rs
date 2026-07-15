@@ -29,6 +29,7 @@ pub mod mentions;
 pub mod network_proxy;
 pub mod notify;
 pub mod protocol;
+pub mod provider_stream;
 pub mod provider_turn;
 pub(crate) mod runtime_approval;
 pub(crate) mod runtime_bash;
@@ -5125,102 +5126,6 @@ mod tests {
                 "runtime_turn_setup must own runtime turn setup detail {marker}"
             );
         }
-    }
-
-    #[test]
-    fn agent_loop_result_is_owned_by_lifecycle_module() {
-        let agent_loop_source = include_str!("agent_loop.rs");
-        let lifecycle_source = include_str!("lifecycle.rs");
-
-        for marker in [
-            "struct AgentLoopResult",
-            "impl AgentLoopResult",
-            "status: RunStatus::Success",
-        ] {
-            assert!(
-                !agent_loop_source.contains(marker),
-                "agent_loop must not own agent-loop result detail {marker}"
-            );
-        }
-        assert!(
-            agent_loop_source.contains("AgentLoopResult"),
-            "agent_loop must use the lifecycle-owned agent-loop result"
-        );
-        assert!(
-            lifecycle_source.contains("struct AgentLoopResult"),
-            "lifecycle must own agent-loop result shape"
-        );
-        assert!(
-            lifecycle_source.contains("impl AgentLoopResult"),
-            "lifecycle must own agent-loop result constructors"
-        );
-    }
-
-    #[test]
-    fn runtime_provider_turn_terminal_folding_is_owned_by_lifecycle_module() {
-        let agent_loop_source = include_str!("agent_loop.rs");
-        let lifecycle_source = include_str!("lifecycle.rs");
-        let provider_turn_source = include_str!("provider_turn.rs");
-
-        for marker in [
-            "provider_turn.response",
-            "provider_turn.terminal_error",
-            "provider_response_or_terminal(",
-            "RunStatus::Cancelled",
-        ] {
-            assert!(
-                !agent_loop_source.contains(marker),
-                "agent_loop must not own provider turn terminal folding detail {marker}"
-            );
-        }
-        assert!(
-            agent_loop_source.contains("RuntimeTurnLoopStep"),
-            "agent_loop must delegate provider turn terminal folding through turn loop"
-        );
-        assert!(
-            !agent_loop_source.contains("RuntimeProviderTurnResultResultStep"),
-            "agent_loop must delegate provider turn result folding through turn loop"
-        );
-        assert!(
-            !agent_loop_source.contains("RuntimeProviderTurnResultOutcome"),
-            "agent_loop must not own provider turn result outcome folding"
-        );
-        for marker in [
-            "struct RuntimeProviderTurnResultStep",
-            "struct RuntimeProviderTurnResultResultStep",
-            "impl RuntimeProviderTurnResultStep",
-            "impl RuntimeProviderTurnResultResultStep",
-            "pub(crate) fn provider_response_or_terminal",
-        ] {
-            assert!(
-                !lifecycle_source.contains(marker),
-                "lifecycle must not own provider turn terminal folding detail {marker}"
-            );
-        }
-        assert!(
-            provider_turn_source.contains("struct RuntimeProviderTurnResultStep"),
-            "provider_turn must own provider turn result step state"
-        );
-        assert!(
-            provider_turn_source.contains("struct RuntimeProviderTurnResultResultStep"),
-            "provider_turn must own provider turn result folding step state"
-        );
-        assert!(
-            provider_turn_source.contains("impl RuntimeProviderTurnResultStep"),
-            "provider_turn must own provider turn result step behavior"
-        );
-        assert!(
-            provider_turn_source.contains("impl RuntimeProviderTurnResultResultStep"),
-            "provider_turn must own provider turn result folding step behavior"
-        );
-        assert!(
-            provider_turn_source.contains("pub(crate) fn provider_response_or_terminal"),
-            "provider_turn must expose provider turn terminal folding"
-        );
-        assert!(
-            provider_turn_source.contains("terminal_error"),
-            "provider_turn must own provider turn terminal error extraction"
-        );
     }
 
     #[test]

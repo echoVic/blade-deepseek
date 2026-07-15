@@ -30,6 +30,7 @@ use crate::goals::install_goal_tool_lifecycle;
 use crate::hooks::{HookContext, HookOutcome, HookRunError, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
+use crate::provider_stream::RuntimeProviderSuspensionControl;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_normal_tool::{
     RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
@@ -82,6 +83,11 @@ pub(crate) struct AgentLoopResult {
     pub(crate) error: Option<String>,
 }
 
+pub(crate) enum AgentLoopOutcome {
+    Completed(AgentLoopResult),
+    ProviderSuspended(crate::provider_stream::RuntimeProviderSuspension),
+}
+
 impl AgentLoopResult {
     pub(crate) fn success(final_message: Option<String>) -> Self {
         Self {
@@ -125,6 +131,7 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) subagent_type: &'a SubagentType,
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
+    pub(crate) provider_suspension_control: Option<&'a dyn RuntimeProviderSuspensionControl>,
 }
 
 #[derive(Clone, Copy)]
@@ -840,6 +847,14 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_provider_suspension_control(
+        mut self,
+        control: Option<&'a dyn RuntimeProviderSuspensionControl>,
+    ) -> Self {
+        self.turn_context = self.turn_context.with_provider_suspension_control(control);
+        self
+    }
+
     #[allow(dead_code)]
     pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
         self.turn_context = self
@@ -956,6 +971,7 @@ impl<'a> RuntimeTurnContext<'a> {
             subagent_type,
             continuation: None,
             steer_handle: None,
+            provider_suspension_control: None,
         }
     }
 
@@ -966,6 +982,14 @@ impl<'a> RuntimeTurnContext<'a> {
 
     pub(crate) fn with_steer_handle(mut self, steer_handle: Option<&'a ThreadSteerHandle>) -> Self {
         self.steer_handle = steer_handle;
+        self
+    }
+
+    pub(crate) fn with_provider_suspension_control(
+        mut self,
+        control: Option<&'a dyn RuntimeProviderSuspensionControl>,
+    ) -> Self {
+        self.provider_suspension_control = control;
         self
     }
 

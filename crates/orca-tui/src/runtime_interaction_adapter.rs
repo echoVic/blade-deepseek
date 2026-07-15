@@ -1,26 +1,30 @@
 use crossbeam_channel::Sender;
 use std::io;
 
+#[cfg(test)]
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::tool_types;
 use orca_mcp::{
     McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,
 };
+#[cfg(test)]
+use orca_runtime::lifecycle::{RuntimeApprovalDecision, RuntimeToolActorContext};
 use orca_runtime::lifecycle::{
-    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimePermissionRequest,
-    RuntimePermissionRequestHandler, RuntimePermissionResponse, RuntimeToolActorContext,
-    RuntimeUserInputHandler, RuntimeUserInputRequest,
+    RuntimeApprovalHandler, RuntimePermissionRequest, RuntimePermissionRequestHandler,
+    RuntimePermissionResponse, RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
 use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
 use orca_runtime::runtime_pending_interaction::{
     RuntimeMcpElicitationRequest, RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
 };
+#[cfg(test)]
 use orca_runtime::tool_invocation::{ToolInvocation, approval_request_for_invocation};
 
 use crate::operation_controller::TuiTurnControl;
 use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 
+#[cfg(test)]
 pub(crate) enum TuiToolApprovalOutcome {
     Continue,
     Denied(tool_types::ToolResult),
@@ -100,6 +104,7 @@ impl RuntimeApprovalHandler for TuiApprovalHandler {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_tui_tool_approval(
     invocation: &ToolInvocation,
     tool_request: &tool_types::ToolRequest,
@@ -154,6 +159,7 @@ pub(crate) fn resolve_tui_tool_approval(
 /// raw JSON arguments. Returns `None` when there is nothing meaningful to show.
 /// This is best-effort: the strings come straight from the pending request, so
 /// the diff/command shown is exactly what would run.
+#[cfg(test)]
 fn build_approval_preview(request: &tool_types::ToolRequest) -> Option<String> {
     use orca_core::tool_types::ToolName;
 
@@ -223,6 +229,7 @@ impl TuiPermissionRequestHandler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_display(
         mut self,
         tool: impl Into<String>,
@@ -303,8 +310,10 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler {
 
 /// Grants whatever was requested without prompting; used when the approval
 /// policy already resolved the escalation to Allow (e.g. full-auto mode).
+#[cfg(test)]
 pub(crate) struct AutoAllowPermissionRequests;
 
+#[cfg(test)]
 impl RuntimePermissionRequestHandler for AutoAllowPermissionRequests {
     fn request_permissions(
         &self,

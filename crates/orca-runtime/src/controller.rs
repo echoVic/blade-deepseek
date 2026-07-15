@@ -32,9 +32,10 @@ use crate::instructions::ProjectInstructions;
 #[cfg(test)]
 use crate::lifecycle::RuntimeTaskKind;
 use crate::lifecycle::{
-    AgentLoopContext, RuntimeApprovalHandler, RuntimePermissionRequestHandler,
+    AgentLoopContext, AgentLoopOutcome, RuntimeApprovalHandler, RuntimePermissionRequestHandler,
     RuntimeSessionLifecycle, RuntimeUserInputHandler, ThreadSteerHandle,
 };
+use crate::provider_stream::{RuntimeProviderSuspension, RuntimeProviderSuspensionControl};
 use crate::runtime_host::{
     HostedTurnRequest, OperationHandle, OperationOutcome, OperationTerminal, RuntimeHost,
     RuntimeHostError,
@@ -188,6 +189,16 @@ struct ThreadTurnCompletion {
     main_session_task: Option<ThreadTurnMainSessionTask>,
 }
 
+enum PreparedThreadTurnOutcome {
+    Completed(ThreadTurnCompletion),
+    ProviderSuspended(RuntimeProviderSuspension),
+}
+
+pub enum ThreadTurnOutcome {
+    Completed(RunStatus),
+    ProviderSuspended(RuntimeProviderSuspension),
+}
+
 #[derive(Clone)]
 pub struct ThreadTurnRequest {
     prompt: String,
@@ -203,6 +214,7 @@ pub struct ThreadTurnRequest {
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     event_observer: Option<Arc<dyn EventObserver>>,
     continuation: Option<RuntimeTurnContinuation>,
+    provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -296,6 +308,26 @@ impl<'a> ThreadTurnExecutor<'a> {
         cancel: CancelToken,
     ) -> io::Result<RunStatus> {
         run_thread_turn_inner_with_events(
+            self.config,
+            self.session,
+            self.lifecycle,
+            request,
+            writer,
+            cancel,
+            Some(events),
+            self.thread_extensions.clone(),
+            self.turn_extension_id.clone(),
+        )
+    }
+
+    pub fn run_request_with_event_factory_and_cancel_outcome<W: io::Write>(
+        &mut self,
+        request: &ThreadTurnRequest,
+        writer: W,
+        events: &mut EventFactory,
+        cancel: CancelToken,
+    ) -> io::Result<ThreadTurnOutcome> {
+        run_thread_turn_inner_with_events_outcome(
             self.config,
             self.session,
             self.lifecycle,
@@ -482,7 +514,7 @@ impl ThreadTurnMainSessionTask {
 }
 
 impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
-    fn execute(self) -> io::Result<ThreadTurnCompletion> {
+    fn execute(self) -> io::Result<PreparedThreadTurnOutcome> {
         let Self {
             config,
             lifecycle,
@@ -533,9 +565,10 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             loop_context.with_turn_continuation(continuation)
         } else {
             loop_context
-        };
-        let turn_result = (|| -> io::Result<(RunStatus, Option<String>)> {
-            let result = run_agent_loop(
+        }
+        .with_provider_suspension_control(request.provider_suspension_control());
+        let turn_result = (|| -> io::Result<AgentLoopOutcome> {
+            run_agent_loop(
                 config,
                 loop_context
                     .with_execution(background_workflows, None, Some(lifecycle))
@@ -550,7 +583,28 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                     .with_history_writer(parts.writer)
                     .with_conversation(Some(parts.conversation)),
                 request.tool_mode().policy(),
-            )?;
+            )
+        })();
+        let usage = parts.cost_tracker.totals();
+        let result = match turn_result {
+            Ok(AgentLoopOutcome::ProviderSuspended(suspension)) => {
+                return Ok(PreparedThreadTurnOutcome::ProviderSuspended(suspension));
+            }
+            Ok(AgentLoopOutcome::Completed(result)) => result,
+            Err(error) => {
+                if let Some(task) = main_session_task.as_ref() {
+                    task.finish_and_emit(
+                        RunStatus::Failed,
+                        Some(&error.to_string()),
+                        usage,
+                        events,
+                        sink,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        let completion = (|| -> io::Result<(RunStatus, Option<String>)> {
             let status = result.status;
             lifecycle.finish_task(status);
             observe_background_workflows(
@@ -562,9 +616,8 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             let status = run_verifier_if_needed(status, config.verifier.as_deref(), events, sink)?;
             Ok((status, result.error))
         })();
-        let usage = parts.cost_tracker.totals();
-        let (status, error) = match turn_result {
-            Ok(result) => result,
+        let (status, error) = match completion {
+            Ok(completion) => completion,
             Err(error) => {
                 if let Some(task) = main_session_task.as_ref() {
                     task.finish_and_emit(
@@ -579,12 +632,12 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             }
         };
 
-        Ok(ThreadTurnCompletion {
+        Ok(PreparedThreadTurnOutcome::Completed(ThreadTurnCompletion {
             status,
             error,
             usage,
             main_session_task,
-        })
+        }))
     }
 }
 
@@ -607,6 +660,36 @@ impl ThreadTurnCompletion {
     }
 }
 
+impl PreparedThreadTurnOutcome {
+    fn commit<W: io::Write>(
+        self,
+        session: &mut InteractiveSession,
+        request: &ThreadTurnRequest,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+    ) -> io::Result<ThreadTurnOutcome> {
+        match self {
+            Self::Completed(completion) => completion
+                .commit(session, request, events, sink)
+                .map(ThreadTurnOutcome::Completed),
+            Self::ProviderSuspended(suspension) => {
+                Ok(ThreadTurnOutcome::ProviderSuspended(suspension))
+            }
+        }
+    }
+}
+
+impl ThreadTurnOutcome {
+    fn into_completed(self) -> io::Result<RunStatus> {
+        match self {
+            Self::Completed(status) => Ok(status),
+            Self::ProviderSuspended(_) => Err(io::Error::other(
+                "provider turn suspended without a suspension-aware caller",
+            )),
+        }
+    }
+}
+
 impl ThreadTurnRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
@@ -623,6 +706,7 @@ impl ThreadTurnRequest {
             mcp_elicitation_handler: None,
             event_observer: None,
             continuation: None,
+            provider_suspension_control: None,
         }
     }
 
@@ -727,6 +811,14 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_provider_suspension_control(
+        mut self,
+        control: Arc<dyn RuntimeProviderSuspensionControl>,
+    ) -> Self {
+        self.provider_suspension_control = Some(control);
+        self
+    }
+
     pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
         self.continuation = Some(continuation);
         self.prompt_placement = ThreadTurnPromptPlacement::ExistingTurn;
@@ -766,6 +858,10 @@ impl ThreadTurnRequest {
 
     pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
         self.continuation.as_ref()
+    }
+
+    pub fn provider_suspension_control(&self) -> Option<&dyn RuntimeProviderSuspensionControl> {
+        self.provider_suspension_control.as_deref()
     }
 }
 
@@ -956,6 +1052,31 @@ fn run_thread_turn_inner_with_events<W: io::Write>(
     thread_extensions: Option<Arc<ExtensionData>>,
     turn_extension_id: Option<String>,
 ) -> io::Result<RunStatus> {
+    run_thread_turn_inner_with_events_outcome(
+        config,
+        session,
+        lifecycle,
+        request,
+        writer,
+        cancel,
+        events,
+        thread_extensions,
+        turn_extension_id,
+    )?
+    .into_completed()
+}
+
+fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
+    config: &RunConfig,
+    session: &mut InteractiveSession,
+    lifecycle: &mut RuntimeSessionLifecycle,
+    request: &ThreadTurnRequest,
+    writer: W,
+    cancel: CancelToken,
+    events: Option<&mut EventFactory>,
+    thread_extensions: Option<Arc<ExtensionData>>,
+    turn_extension_id: Option<String>,
+) -> io::Result<ThreadTurnOutcome> {
     let context = ThreadTurnContext::prepare(config, session, request)?;
     if let Some(events) = events {
         let mut sink = EventSink::new(writer, config.output_format)

@@ -7,19 +7,27 @@ use crossbeam_channel::{Receiver, Sender};
 use orca_core::cancel::{CancelToken, OperationId};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::task_types::TaskStatus;
+use orca_runtime::controller::ThreadTurnOutcome;
 use orca_runtime::runtime_host::{
     GenerationContext, HostedOperationKind, HostedTurnRequest, ThreadOperationExecutor,
 };
+use orca_runtime::tasks::MainSessionTerminalUpdate;
 use orca_runtime::thread::RuntimeThread;
 
 use crate::agent_runner::{
-    PendingWorkflowNotifications, TuiAgentTurnResult, TuiBackgroundTurnCompletion,
-    TuiBackgroundTurnCompletionHandler, TuiBackgroundTurnContinuationRequest,
-    TuiMainSessionTaskStart, continue_approved_background_turn_for_tui_with_events,
-    run_agent_for_tui_with_event_factory,
+    BackgroundProviderCompletionContext, PendingWorkflowNotifications, TuiAgentTurnContinuation,
+    TuiAgentTurnResult, TuiBackgroundTurnCompletion, TuiBackgroundTurnCompletionHandler,
+    TuiBackgroundTurnContinuationRequest, TuiRuntimeEventObserver,
+    continue_approved_background_turn_for_tui_with_events, send_runtime_event_as_tui,
+    send_task_status_updated_for_tui, spawn_background_provider_suspension_completion,
+    take_pending_workflow_notification, task_summary_for_tui,
 };
-use crate::bridge::TuiSession;
+use crate::bridge::{TuiBudgetAdmissionError, TuiSession};
 use crate::operation_controller::TuiOperationController;
+use crate::runtime_interaction_adapter::{
+    TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
+};
 use crate::task_supervisor::TuiTaskSpawner;
 use crate::types::TuiEvent;
 
@@ -76,10 +84,10 @@ impl TuiThreadOperationExecutor {
 
         let result = match request.operation_kind() {
             HostedOperationKind::Turn => {
-                let turn = self.run_turn(
+                let turn = self.run_canonical_turn(
                     &mut session,
                     request,
-                    generation.config(),
+                    generation,
                     &operation_event_tx,
                     &control,
                     cancel,
@@ -155,16 +163,17 @@ impl TuiThreadOperationExecutor {
         Ok(status)
     }
 
-    fn run_turn(
+    fn run_canonical_turn(
         &self,
         session: &mut TuiSession<'_>,
         request: &HostedTurnRequest,
-        config: &orca_core::config::RunConfig,
+        generation: &GenerationContext,
         event_tx: &Sender<TuiEvent>,
         control: &crate::operation_controller::TuiTurnControl,
         cancel: &CancelToken,
         events: &mut EventFactory,
     ) -> TuiAgentTurnResult {
+        let config = generation.config();
         let before_usage = session.runtime_usage_totals();
         let started_at = Instant::now();
         let goal_session_id = request
@@ -177,46 +186,194 @@ impl TuiThreadOperationExecutor {
         let background_completion_handler = background_goal_accounting
             .as_ref()
             .map(BackgroundGoalAccounting::completion_handler);
-        let main_session_task = request.task_id().map_or_else(
-            || {
-                TuiMainSessionTaskStart::Create(
-                    request.task_description().unwrap_or(request.prompt()),
-                )
-            },
-            TuiMainSessionTaskStart::Adopt,
-        );
-        let turn = run_agent_for_tui_with_event_factory(
-            config,
-            session,
-            request.prompt(),
-            event_tx,
-            &self.event_tx,
-            control,
-            cancel,
-            request.allows_goal_tools(),
-            main_session_task,
-            request.is_backtrack_target(),
-            Some(&self.pending_workflow_notifications),
-            background_completion_handler,
-            &self.task_spawner,
-            events,
-        );
-        if let Some(session_id) = goal_session_id {
-            let token_delta = goal_token_delta(before_usage, session.runtime_usage_totals());
-            if turn.status == "backgrounded" {
-                if let Some(accounting) = background_goal_accounting {
-                    accounting.record_foreground(token_delta);
-                }
-            } else {
-                account_goal_usage_for_tui(
-                    &session_id,
-                    token_delta,
-                    elapsed_seconds(started_at),
-                    &self.event_tx,
+        let usage_ledger = session.usage_ledger();
+        let admission = match usage_ledger.admit_budgeted_request(config.max_budget_usd, cancel) {
+            Ok(admission) => admission,
+            Err(TuiBudgetAdmissionError::BudgetExhausted(totals)) => {
+                let error = format!(
+                    "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
+                    totals.estimated_cost_usd,
+                    config.max_budget_usd.unwrap_or_default()
                 );
+                finish_canonical_turn_locally(
+                    session,
+                    event_tx,
+                    events,
+                    request.task_id(),
+                    RunStatus::BudgetExhausted,
+                    Some(&error),
+                );
+                return TuiAgentTurnResult::new(RunStatus::BudgetExhausted.as_str());
+            }
+            Err(TuiBudgetAdmissionError::Cancelled) => {
+                finish_canonical_turn_locally(
+                    session,
+                    event_tx,
+                    events,
+                    request.task_id(),
+                    RunStatus::Cancelled,
+                    None,
+                );
+                return TuiAgentTurnResult::new(RunStatus::Cancelled.as_str());
+            }
+        };
+        let pending_interactions = session.pending_interactions();
+        let canonical_request = request
+            .thread_turn_request(generation)
+            .with_event_observer(Arc::new(TuiRuntimeEventObserver::new(event_tx.clone())))
+            .with_provider_suspension_control(Arc::new(control.clone()))
+            .with_approval_handler(Arc::new(
+                TuiApprovalHandler::new(event_tx.clone(), control.clone())
+                    .with_pending_interactions(pending_interactions.clone()),
+            ))
+            .with_permission_handler(Arc::new(
+                TuiPermissionRequestHandler::new(event_tx.clone(), control.clone())
+                    .with_pending_interactions(pending_interactions.clone()),
+            ))
+            .with_threaded_user_input_handler(Arc::new(
+                TuiUserInputHandler::new(event_tx.clone(), control.clone())
+                    .with_pending_interactions(pending_interactions.clone()),
+            ))
+            .with_mcp_elicitation_handler(Arc::new(
+                TuiMcpElicitationHandler::new(event_tx.clone(), control.clone())
+                    .with_pending_interactions(pending_interactions),
+            ));
+        let mut canonical_config = config.clone();
+        canonical_config.max_budget_usd =
+            effective_runtime_budget(config.max_budget_usd, session.usage_totals(), before_usage);
+        let outcome = session
+            .runtime_mut()
+            .run_request_with_event_factory_and_cancel_outcome(
+                &canonical_config,
+                &canonical_request,
+                io::sink(),
+                events,
+                cancel.clone(),
+            );
+        let after_usage = session.runtime_usage_totals();
+        let shared_totals = usage_ledger.add(usage_delta(before_usage, after_usage));
+        if shared_totals != after_usage {
+            send_runtime_event_as_tui(event_tx, events.usage_updated(shared_totals));
+        }
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                drop(admission);
+                let status = if error.kind() == io::ErrorKind::Interrupted || cancel.is_cancelled()
+                {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::Failed
+                };
+                let error_message = error.to_string();
+                finish_canonical_turn_locally(
+                    session,
+                    event_tx,
+                    events,
+                    request.task_id(),
+                    status,
+                    (status != RunStatus::Cancelled).then_some(error_message.as_str()),
+                );
+                return TuiAgentTurnResult::new(status.as_str());
+            }
+        };
+
+        match outcome {
+            ThreadTurnOutcome::Completed(status) => {
+                drop(admission);
+                if let Some(session_id) = goal_session_id {
+                    account_goal_usage_for_tui(
+                        &session_id,
+                        goal_token_delta(before_usage, after_usage),
+                        elapsed_seconds(started_at),
+                        &self.event_tx,
+                    );
+                }
+                if status == RunStatus::Success
+                    && let Some(notification) = take_pending_workflow_notification(Some(
+                        &self.pending_workflow_notifications,
+                    ))
+                {
+                    return TuiAgentTurnResult::with_continuation(
+                        status.as_str(),
+                        TuiAgentTurnContinuation::WorkflowNotification(notification),
+                    );
+                }
+                TuiAgentTurnResult::new(status.as_str())
+            }
+            ThreadTurnOutcome::ProviderSuspended(suspension) => {
+                let Some(task_id) = request.task_id().map(str::to_string) else {
+                    drop(admission);
+                    finish_canonical_turn_locally(
+                        session,
+                        event_tx,
+                        events,
+                        None,
+                        RunStatus::Failed,
+                        Some("canonical provider suspension requires a main-session task"),
+                    );
+                    return TuiAgentTurnResult::new(RunStatus::Failed.as_str());
+                };
+                if let Err(error) = session.task_registry().mark_backgrounded(&task_id) {
+                    drop(admission);
+                    finish_canonical_turn_locally(
+                        session,
+                        event_tx,
+                        events,
+                        Some(&task_id),
+                        RunStatus::Failed,
+                        Some(&error),
+                    );
+                    return TuiAgentTurnResult::new(RunStatus::Failed.as_str());
+                }
+                if let Some(task) = task_summary_for_tui(session.task_registry(), &task_id) {
+                    send_task_status_updated_for_tui(event_tx, events, &task);
+                }
+                let model = suspension.model().map(str::to_string);
+                let history_writer = session.writer_mut().cloned();
+                let spawn = spawn_background_provider_suspension_completion(
+                    suspension,
+                    BackgroundProviderCompletionContext {
+                        task_registry: session.task_registry().clone(),
+                        history_writer,
+                        model,
+                        usage_ledger,
+                        budget_admission: Some(admission),
+                        max_budget_usd: config.max_budget_usd,
+                        event_tx: self.event_tx.clone(),
+                        run_id: events.run_id().to_string(),
+                        task_id: task_id.clone(),
+                        completion_handler: background_completion_handler,
+                    },
+                    &self.task_spawner,
+                );
+                if let Err(error) = spawn {
+                    let stopped = session
+                        .task_registry()
+                        .get(&task_id)
+                        .is_some_and(|task| task.status == TaskStatus::Stopped);
+                    let status = if stopped {
+                        RunStatus::Cancelled
+                    } else {
+                        RunStatus::Failed
+                    };
+                    let error_message = error.to_string();
+                    finish_canonical_turn_locally(
+                        session,
+                        event_tx,
+                        events,
+                        Some(&task_id),
+                        status,
+                        (status != RunStatus::Cancelled).then_some(error_message.as_str()),
+                    );
+                    return TuiAgentTurnResult::new(status.as_str());
+                }
+                if let Some(accounting) = background_goal_accounting {
+                    accounting.record_foreground(goal_token_delta(before_usage, after_usage));
+                }
+                TuiAgentTurnResult::new("backgrounded")
             }
         }
-        turn
     }
 }
 
@@ -324,6 +481,95 @@ fn run_status_for_tui_status(status: &str) -> RunStatus {
         "verification_failed" => RunStatus::VerificationFailed,
         "budget_exhausted" => RunStatus::BudgetExhausted,
         _ => RunStatus::Failed,
+    }
+}
+
+fn finish_canonical_turn_locally(
+    session: &mut TuiSession<'_>,
+    event_tx: &Sender<TuiEvent>,
+    events: &mut EventFactory,
+    task_id: Option<&str>,
+    status: RunStatus,
+    error: Option<&str>,
+) {
+    if let Some(error) = error {
+        send_runtime_event_as_tui(event_tx, events.error(error));
+    }
+    if let Some(task_id) = task_id {
+        let task_is_terminal = session.task_registry().get(task_id).is_some_and(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Stopped
+                    | TaskStatus::Completed
+                    | TaskStatus::Failed
+                    | TaskStatus::ApprovalRequired
+                    | TaskStatus::Cancelled
+            )
+        });
+        if !task_is_terminal {
+            let usage = Some(session.runtime_usage_totals());
+            match status {
+                RunStatus::Success => {
+                    let _ = session.task_registry().apply_main_session_terminal_update(
+                        task_id,
+                        MainSessionTerminalUpdate::Completed {
+                            result: status.as_str().to_string(),
+                        },
+                        usage,
+                    );
+                }
+                RunStatus::Cancelled => {
+                    let _ = session.task_registry().stop_with_usage(
+                        task_id,
+                        status.as_str().to_string(),
+                        usage,
+                    );
+                }
+                RunStatus::Failed
+                | RunStatus::ApprovalRequired
+                | RunStatus::BudgetExhausted
+                | RunStatus::VerificationFailed => {
+                    let _ = session.task_registry().apply_main_session_terminal_update(
+                        task_id,
+                        MainSessionTerminalUpdate::Failed {
+                            error: error.unwrap_or(status.as_str()).to_string(),
+                        },
+                        usage,
+                    );
+                }
+            }
+            if let Some(task) = task_summary_for_tui(session.task_registry(), task_id) {
+                send_task_status_updated_for_tui(event_tx, events, &task);
+            }
+        }
+    }
+    session.finish_agent_lifecycle_task(status);
+    if let Some(error) = error {
+        session.complete_with_error(status.as_str(), error);
+    } else {
+        session.complete(status.as_str());
+    }
+    send_runtime_event_as_tui(event_tx, events.session_completed(status));
+}
+
+fn effective_runtime_budget(
+    max_budget_usd: Option<f64>,
+    shared_usage: UsageTotals,
+    runtime_usage: UsageTotals,
+) -> Option<f64> {
+    max_budget_usd.map(|max_budget| {
+        let external_usage =
+            (shared_usage.estimated_cost_usd - runtime_usage.estimated_cost_usd).max(0.0);
+        (max_budget - external_usage).max(0.0)
+    })
+}
+
+fn usage_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens),
+        estimated_cost_usd: (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0),
     }
 }
 

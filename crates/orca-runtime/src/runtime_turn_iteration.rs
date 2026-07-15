@@ -4,6 +4,7 @@ use crate::agent_child::ChildAgentExecutor;
 use crate::lifecycle::{
     AgentLoopResult, RuntimeTaskActor, RuntimeTurnDeps, RuntimeTurnLoopIterationState,
 };
+use crate::provider_stream::RuntimeProviderSuspension;
 use crate::provider_turn::{
     RuntimeProviderCycleInput, RuntimeTurnProviderCycleResult, RuntimeTurnProviderCycleStep,
 };
@@ -38,6 +39,7 @@ pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
 pub(crate) enum RuntimeTurnIterationResult {
     ContinueLoop,
     Return(AgentLoopResult),
+    Suspended(RuntimeProviderSuspension),
 }
 
 impl RuntimeTurnIterationStep {
@@ -126,6 +128,9 @@ impl RuntimeTurnIterationStep {
             }
             RuntimeTurnProviderCycleResult::Return(result) => {
                 Ok(RuntimeTurnIterationResult::Return(result))
+            }
+            RuntimeTurnProviderCycleResult::Suspended(suspension) => {
+                Ok(RuntimeTurnIterationResult::Suspended(suspension))
             }
         }
     }

@@ -3,10 +3,14 @@ use orca_core::event_schema::{
     ContextCompactedPayload, ContextCompactionStartedPayload, EventEnvelope, EventType,
 };
 
-use crate::types::TuiEvent;
+use crate::types::{TuiEvent, TuiTaskLifecycle};
 
 pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiEvent> {
     match event.event_type {
+        EventType::TurnStarted => Some(TuiEvent::TurnStarted {
+            turn: event.payload["turn"].as_u64()?.try_into().ok()?,
+            task: event.payload.get("task").and_then(tui_task_lifecycle),
+        }),
         EventType::AssistantReasoningDelta => Some(TuiEvent::ReasoningDelta(
             event.payload["text"].as_str()?.to_string(),
         )),
@@ -252,6 +256,15 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
     }
 }
 
+fn tui_task_lifecycle(value: &serde_json::Value) -> Option<TuiTaskLifecycle> {
+    Some(TuiTaskLifecycle {
+        id: value["task_id"].as_str()?.to_string(),
+        kind: value["kind"].as_str()?.to_string(),
+        status: value["status"].as_str()?.to_string(),
+        turn: value["turn"].as_u64()?.try_into().ok()?,
+    })
+}
+
 fn workflow_name_from_payload(payload: &serde_json::Value) -> String {
     payload
         .get("workflowName")
@@ -306,6 +319,33 @@ mod tests {
     use super::*;
     use orca_core::event_schema::{EventFactory, RunStatus};
     use orca_core::tool_types;
+
+    #[test]
+    fn runtime_turn_started_event_maps_task_lifecycle_to_tui() {
+        let mut events = EventFactory::new("tui-runtime-turn".to_string());
+        let task = orca_runtime::lifecycle::RuntimeTaskLifecycle::new_snapshot(
+            "main-session-1",
+            orca_runtime::lifecycle::RuntimeTaskKind::Agent,
+            orca_runtime::lifecycle::RuntimeTaskStatus::Running,
+            3,
+        );
+        let event = task.attach_to_event(events.turn_started(3, Some("continue")));
+
+        let projected = tui_event_from_runtime_event(&event).expect("turn started event");
+
+        assert!(matches!(
+            projected,
+            TuiEvent::TurnStarted {
+                turn: 3,
+                task: Some(TuiTaskLifecycle {
+                    id,
+                    kind,
+                    status,
+                    turn: 3,
+                }),
+            } if id == "main-session-1" && kind == "agent" && status == "running"
+        ));
+    }
 
     #[test]
     fn runtime_tool_requested_event_maps_to_tui_tool_requested() {

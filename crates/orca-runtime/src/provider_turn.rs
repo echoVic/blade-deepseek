@@ -1,6 +1,8 @@
 use std::io;
 #[cfg(test)]
 use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
@@ -13,7 +15,7 @@ use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 #[cfg(test)]
 use orca_mcp::McpRegistry;
-use orca_provider::{ProviderConfig, context};
+use orca_provider::{ProviderConfig, ProviderStreamEvent, context};
 
 use crate::agent_child::ChildAgentExecutor;
 use crate::background_turn::RuntimeTurnContinuation;
@@ -32,6 +34,7 @@ use crate::lifecycle::{
 use crate::memory;
 #[cfg(test)]
 use crate::memory::MemoryBlock;
+use crate::provider_stream::RuntimeProviderSuspension;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
@@ -129,9 +132,10 @@ pub(crate) struct RuntimeProviderResponseExecutors<W: io::Write> {
     pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
 }
 
-pub(crate) struct RuntimeProviderTurnOutput {
-    pub(crate) response: Option<ProviderResponse>,
-    pub(crate) terminal_error: Option<RuntimeTurnStartError>,
+pub(crate) enum RuntimeProviderTurnOutput {
+    Response(ProviderResponse),
+    Terminal(RuntimeTurnStartError),
+    Suspended(RuntimeProviderSuspension),
 }
 
 pub(crate) enum RuntimeProviderErrorOutcome {
@@ -166,11 +170,13 @@ pub(crate) enum RuntimeProviderErrorResult {
 pub(crate) enum RuntimeProviderTurnResultOutcome {
     Response(ProviderResponse),
     Failed(RuntimeTurnStartError),
+    Suspended(RuntimeProviderSuspension),
 }
 
 pub(crate) enum RuntimeProviderTurnResultResult {
     Response(ProviderResponse),
     Return(AgentLoopResult),
+    Suspended(RuntimeProviderSuspension),
 }
 
 pub(crate) enum RuntimeProviderResponseResult {
@@ -182,6 +188,7 @@ pub(crate) enum RuntimeTurnProviderCycleResult {
     ContinueLoop,
     ContinueTurn,
     Return(AgentLoopResult),
+    Suspended(RuntimeProviderSuspension),
 }
 
 impl RuntimeProviderErrorResultStep {
@@ -267,13 +274,18 @@ impl RuntimeProviderTurnResultStep {
         sink: &mut EventSink<W>,
         emit_deltas: bool,
     ) -> io::Result<RuntimeProviderTurnResultOutcome> {
-        match provider_response_or_terminal(provider_turn) {
-            Ok(response) => Ok(RuntimeProviderTurnResultOutcome::Response(response)),
-            Err(error) => {
+        match provider_turn {
+            RuntimeProviderTurnOutput::Response(response) => {
+                Ok(RuntimeProviderTurnResultOutcome::Response(response))
+            }
+            RuntimeProviderTurnOutput::Terminal(error) => {
                 if emit_deltas && error.status != RunStatus::Cancelled {
                     sink.emit(&events.error(&error.message))?;
                 }
                 Ok(RuntimeProviderTurnResultOutcome::Failed(error))
+            }
+            RuntimeProviderTurnOutput::Suspended(suspension) => {
+                Ok(RuntimeProviderTurnResultOutcome::Suspended(suspension))
             }
         }
     }
@@ -297,6 +309,9 @@ impl RuntimeProviderTurnResultResultStep {
                     error.status,
                     error.message,
                 ))
+            }
+            RuntimeProviderTurnResultOutcome::Suspended(suspension) => {
+                RuntimeProviderTurnResultResult::Suspended(suspension)
             }
         }
     }
@@ -342,13 +357,36 @@ impl RuntimeProviderTurnStep {
             &model_conversation,
             input.runtime_system_messages,
         );
-        let response = input.actor.call_streaming_provider(
+        let mut stream = orca_provider::start_streaming(
             input.provider,
             &model_conversation,
             input.provider_config,
-            input.cancel,
-            &mut |step| emit_provider_delta(step, emit_deltas, events, sink),
+            input.cancel.clone(),
         );
+        let response = loop {
+            match stream.recv_timeout(Duration::from_millis(10)) {
+                Ok(ProviderStreamEvent::Step(delivery)) => {
+                    emit_provider_delta(delivery.step(), emit_deltas, events, sink);
+                }
+                Ok(ProviderStreamEvent::Completed(response)) => break response,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+                        status: RunStatus::Failed,
+                        message: "provider stream disconnected before completion".to_string(),
+                    }));
+                }
+            }
+            if input
+                .turn_context
+                .provider_suspension_control
+                .is_some_and(|control| control.take_suspension_request())
+            {
+                return Ok(RuntimeProviderTurnOutput::Suspended(
+                    RuntimeProviderSuspension::new(stream, input.provider_config.model.clone()),
+                ));
+            }
+        };
 
         let mut usage_error = None;
         if let Some(usage) = response.usage
@@ -590,6 +628,9 @@ impl RuntimeTurnProviderCycleStep {
                 RuntimeProviderTurnResultResult::Return(result) => {
                     return Ok(RuntimeTurnProviderCycleResult::Return(result));
                 }
+                RuntimeProviderTurnResultResult::Suspended(suspension) => {
+                    return Ok(RuntimeTurnProviderCycleResult::Suspended(suspension));
+                }
             }
         };
 
@@ -675,13 +716,10 @@ impl RuntimeTurnProviderCycleStep {
 }
 
 fn cancelled_provider_turn<W: io::Write>(
-    emit_deltas: bool,
-    events: &mut EventFactory,
-    sink: &mut EventSink<W>,
+    _emit_deltas: bool,
+    _events: &mut EventFactory,
+    _sink: &mut EventSink<W>,
 ) -> io::Result<RuntimeProviderTurnOutput> {
-    if emit_deltas {
-        sink.emit(&events.error("turn cancelled"))?;
-    }
     Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
         status: RunStatus::Cancelled,
         message: "turn cancelled".to_string(),
@@ -716,28 +754,11 @@ fn emit_provider_delta<W: io::Write>(
 
 impl RuntimeProviderTurnOutput {
     fn response(response: ProviderResponse) -> Self {
-        Self {
-            response: Some(response),
-            terminal_error: None,
-        }
+        Self::Response(response)
     }
 
     fn terminal(error: RuntimeTurnStartError) -> Self {
-        Self {
-            response: None,
-            terminal_error: Some(error),
-        }
-    }
-}
-
-pub(crate) fn provider_response_or_terminal(
-    provider_turn: RuntimeProviderTurnOutput,
-) -> Result<ProviderResponse, RuntimeTurnStartError> {
-    match provider_turn.response {
-        Some(response) => Ok(response),
-        None => Err(provider_turn
-            .terminal_error
-            .expect("provider turn terminal")),
+        Self::Terminal(error)
     }
 }
 
@@ -943,7 +964,9 @@ mod tests {
             })
             .expect("provider turn");
 
-        let error = response.terminal_error.expect("cancelled turn");
+        let RuntimeProviderTurnOutput::Terminal(error) = response else {
+            panic!("cancelled provider turn must return a terminal error");
+        };
         assert_eq!(error.status, RunStatus::Cancelled);
         assert_eq!(cost_tracker.totals().input_tokens, 120);
         assert_eq!(cost_tracker.totals().output_tokens, 30);
@@ -951,8 +974,7 @@ mod tests {
         drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert_eq!(output.matches("\"type\":\"usage.updated\"").count(), 1);
-        assert!(output.contains("\"type\":\"error\""));
-        assert!(output.contains("turn cancelled"));
+        assert!(!output.contains("\"type\":\"error\""));
     }
 
     #[test]
@@ -1007,7 +1029,9 @@ mod tests {
             })
             .expect("provider turn");
 
-        let response = result.response.expect("provider response");
+        let RuntimeProviderTurnOutput::Response(response) = result else {
+            panic!("provider turn must return a response");
+        };
         assert!(
             response
                 .assistant_content
@@ -1274,6 +1298,9 @@ mod tests {
             | RuntimeTurnProviderCycleResult::ContinueTurn => {
                 panic!("final response should return agent-loop result")
             }
+            RuntimeTurnProviderCycleResult::Suspended(_) => {
+                panic!("response-only test cannot suspend")
+            }
         }
         assert_eq!(conversation.messages.len(), 1);
         assert!(
@@ -1405,6 +1432,9 @@ mod tests {
             | RuntimeTurnProviderCycleResult::ContinueTurn => {
                 panic!("final continuation response should return agent-loop result")
             }
+            RuntimeTurnProviderCycleResult::Suspended(_) => {
+                panic!("continuation-only test cannot suspend")
+            }
         }
         let (conversation, _) = prepared_conversation.parts_mut();
         assert!(
@@ -1414,15 +1444,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_response_or_terminal_returns_terminal_error() {
+    fn provider_turn_output_preserves_terminal_error() {
         let output = RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
             status: RunStatus::Cancelled,
             message: "turn cancelled".to_string(),
         });
 
-        let error = match provider_response_or_terminal(output) {
-            Ok(_) => panic!("expected terminal error"),
-            Err(error) => error,
+        let error = match output {
+            RuntimeProviderTurnOutput::Terminal(error) => error,
+            _ => panic!("expected terminal error"),
         };
 
         assert_eq!(error.status, RunStatus::Cancelled);
@@ -1472,6 +1502,9 @@ mod tests {
             RuntimeProviderTurnResultResult::Return(_) => {
                 panic!("provider response should continue the turn")
             }
+            RuntimeProviderTurnResultResult::Suspended(_) => {
+                panic!("provider response fixture cannot suspend")
+            }
         }
 
         let failed = RuntimeProviderTurnResultResultStep::new().fold(
@@ -1488,6 +1521,9 @@ mod tests {
             }
             RuntimeProviderTurnResultResult::Response(_) => {
                 panic!("provider failure should return loop result")
+            }
+            RuntimeProviderTurnResultResult::Suspended(_) => {
+                panic!("provider failure fixture cannot suspend")
             }
         }
     }

@@ -6,7 +6,9 @@ use orca_core::config::RunConfig;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_mcp::McpRegistry;
 
-use crate::controller::{ControllerRunOptions, ThreadTurnExecutor, ThreadTurnRequest};
+use crate::controller::{
+    ControllerRunOptions, ThreadTurnExecutor, ThreadTurnOutcome, ThreadTurnRequest,
+};
 use crate::extension::ExtensionData;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use crate::session::{InteractiveSession, new_run_id};
@@ -180,6 +182,26 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request_with_event_factory_and_cancel(request, writer, events, cancel)
+    }
+
+    pub fn run_request_with_event_factory_and_cancel_outcome<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        request: &ThreadTurnRequest,
+        writer: W,
+        events: &mut EventFactory,
+        cancel: CancelToken,
+    ) -> io::Result<ThreadTurnOutcome> {
+        let thread_extensions = self.thread_extensions_handle();
+        let turn_extension_id = self.next_turn_extension_id();
+        ThreadTurnExecutor::new_with_thread_extensions(
+            config,
+            &mut self.session,
+            &mut self.lifecycle,
+            thread_extensions,
+            turn_extension_id,
+        )
+        .run_request_with_event_factory_and_cancel_outcome(request, writer, events, cancel)
     }
 
     fn next_turn_extension_id(&mut self) -> String {

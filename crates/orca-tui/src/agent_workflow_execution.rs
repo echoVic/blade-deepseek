@@ -6,12 +6,16 @@ use std::time::Duration;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::EventFactory;
 use orca_core::tool_types;
-use orca_core::workflow_types::{WorkflowDraftActionOutput, WorkflowInput};
+#[cfg(test)]
+use orca_core::workflow_types::WorkflowDraftActionOutput;
+use orca_core::workflow_types::WorkflowInput;
 use orca_runtime::tasks::TaskRegistry;
+#[cfg(test)]
+use orca_runtime::workflow::WorkflowDraftStore;
 use orca_runtime::workflow::{
-    WorkflowBackgroundLaunch, WorkflowDraftStore, WorkflowLaunchRequest, WorkflowLaunchResult,
-    WorkflowRunner,
+    WorkflowBackgroundLaunch, WorkflowLaunchRequest, WorkflowLaunchResult, WorkflowRunner,
 };
+#[cfg(test)]
 use serde::Deserialize;
 
 use crate::agent_runner::{
@@ -34,6 +38,7 @@ fn send_workflow_task_status_for_tui(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn execute_workflow_draft_for_tui(
     config: &RunConfig,
     cwd: &Path,
@@ -85,6 +90,7 @@ pub(crate) fn execute_workflow_draft_action_for_tui(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn execute_workflow_draft_action_for_tui_with_notifications(
     config: &RunConfig,
     cwd: &Path,
@@ -442,6 +448,7 @@ fn wait_for_workflow_startup(launch: WorkflowBackgroundLaunch) -> WorkflowStartu
     }
 }
 
+#[cfg(test)]
 fn completed_workflow_draft_action_result(
     request: &tool_types::ToolRequest,
     draft_id: &str,
@@ -489,10 +496,12 @@ fn parse_workflow_input(request: &tool_types::ToolRequest) -> std::io::Result<Wo
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct WorkflowDraftInput {
     script: String,
 }
 
+#[cfg(test)]
 fn parse_workflow_draft_input(
     request: &tool_types::ToolRequest,
 ) -> std::io::Result<WorkflowDraftInput> {
@@ -503,6 +512,7 @@ fn parse_workflow_draft_input(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct WorkflowDraftActionInput {
     draft_id: String,
     action: String,
@@ -516,6 +526,7 @@ struct WorkflowDraftActionInput {
     args: Option<serde_json::Value>,
 }
 
+#[cfg(test)]
 fn parse_workflow_draft_action_input(
     request: &tool_types::ToolRequest,
 ) -> std::io::Result<WorkflowDraftActionInput> {

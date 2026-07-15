@@ -22,8 +22,12 @@ use orca_core::mcp_types::McpServerConfig;
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
 use orca_mcp::McpRegistry;
+use orca_runtime::controller::{ThreadTurnOutcome, ThreadTurnRequest};
 use orca_runtime::history::{self, SessionTranscript};
 use orca_runtime::lifecycle::{RuntimeApprovalHandler, RuntimeTaskStatus};
+use orca_runtime::provider_stream::{
+    RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
+};
 use orca_runtime::runtime_host::{
     GenerationAdmissionResult, GenerationContext, GenerationFence, HostedGenerationHandlers,
     HostedOperationWriter, HostedTurnRequest, InterruptOperationResult, OperationOutcome,
@@ -33,6 +37,25 @@ use orca_runtime::runtime_host::{
 use orca_runtime::thread::RuntimeThread;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+struct OneShotProviderSuspension {
+    requested: AtomicBool,
+}
+
+impl OneShotProviderSuspension {
+    fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(true),
+        }
+    }
+}
+
+impl RuntimeProviderSuspensionControl for OneShotProviderSuspension {
+    fn take_suspension_request(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
+    }
+}
 
 #[derive(Clone)]
 struct ManualGate {
@@ -2013,4 +2036,46 @@ fn interrupting_generation_scoped_approval_wait_cancels_only_that_operation() {
     assert_eq!(second_calls.load(Ordering::Acquire), 1);
 
     host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn canonical_turn_can_suspend_one_in_flight_provider_without_committing_terminal_state() {
+    let cwd = tempfile::tempdir().unwrap();
+    let config = test_config(cwd.path().to_path_buf());
+    let mut thread = RuntimeThread::start(&config, "canonical provider suspension")
+        .expect("start runtime thread");
+    let request = ThreadTurnRequest::new("mock_stream_delay_ms 100")
+        .with_provider_suspension_control(Arc::new(OneShotProviderSuspension::new()));
+    let mut events = EventFactory::new(thread.thread_id().to_string());
+
+    let outcome = thread
+        .run_request_with_event_factory_and_cancel_outcome(
+            &config,
+            &request,
+            io::sink(),
+            &mut events,
+            CancelToken::new(),
+        )
+        .expect("run canonical turn until provider suspension");
+    let ThreadTurnOutcome::ProviderSuspended(mut suspension) = outcome else {
+        panic!("canonical turn must return the in-flight provider handle");
+    };
+    assert_eq!(thread.session().completion_error(), None);
+
+    let mut completed = None;
+    while completed.is_none() {
+        match suspension
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("suspended provider event")
+        {
+            RuntimeProviderSuspensionEvent::Step(_) => {}
+            RuntimeProviderSuspensionEvent::Completed(response) => completed = Some(response),
+        }
+    }
+    assert_eq!(
+        completed
+            .as_ref()
+            .and_then(|response| response.assistant_content.as_deref()),
+        Some("Mock slow stream started.Mock slow stream completed.")
+    );
 }

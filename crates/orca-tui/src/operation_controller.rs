@@ -3,6 +3,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use orca_core::cancel::{CancelToken, OperationId};
+use orca_runtime::provider_stream::RuntimeProviderSuspensionControl;
 use orca_runtime::runtime_host::{InterruptOperationResult, OperationHandle};
 
 use crate::interaction_broker::TuiInteractionBroker;
@@ -257,6 +258,12 @@ impl TuiTurnControl {
 
     pub(crate) fn take_background_current(&self) -> bool {
         self.controller.take_background_current(self.operation_id)
+    }
+}
+
+impl RuntimeProviderSuspensionControl for TuiTurnControl {
+    fn take_suspension_request(&self) -> bool {
+        TuiTurnControl::take_background_current(self)
     }
 }
 

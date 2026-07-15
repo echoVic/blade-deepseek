@@ -1,31 +1,46 @@
-use crossbeam_channel::{self as mpsc, Receiver, Sender};
+#[cfg(test)]
+use crossbeam_channel::Receiver;
+use crossbeam_channel::{self as mpsc, Sender};
 use std::io;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventFactory};
 use orca_core::event_sink::EventObserver;
+#[cfg(test)]
 use orca_core::hook_types::HookEvent;
+#[cfg(test)]
 use orca_core::model::ModelRouteContext;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
+#[cfg(test)]
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::{BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType};
 use orca_core::tool_types;
 use orca_core::workflow_types::WorkflowInput;
+#[cfg(test)]
 use orca_mcp::McpRegistry;
+#[cfg(test)]
 use orca_provider::ProviderConfig;
+#[cfg(test)]
 use orca_provider::tool_schema::{
     deepseek_goal_tools_schema_with_mcp_and_external, deepseek_tools_schema_with_mcp_and_external,
 };
+#[cfg(test)]
 use orca_runtime::agent_common;
 use orca_runtime::controller::ThreadTurnRequest;
+#[cfg(test)]
 use orca_runtime::hooks::{HookContext, conversation_with_hook_context};
+#[cfg(test)]
 use orca_runtime::memory;
+use orca_runtime::provider_stream::{RuntimeProviderSuspension, RuntimeProviderSuspensionEvent};
+#[cfg(test)]
 use orca_runtime::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
 use orca_runtime::tasks::MainSessionTerminalUpdate;
 #[cfg(test)]
@@ -33,10 +48,12 @@ use orca_runtime::thread::RuntimeThread;
 
 #[cfg(test)]
 use crate::action_dispatcher::TuiActionDispatcher;
+#[cfg(test)]
 use crate::agent_subagent_execution::{
     collect_subagent_batch, config_for_remaining_subagent_budget, execute_subagent_batch_for_tui,
     should_run_subagent_batch,
 };
+#[cfg(test)]
 use crate::agent_tool_execution::{
     execute_readonly_batch_for_tui, execute_tool_for_tui_with_background_events,
 };
@@ -44,6 +61,7 @@ use crate::agent_workflow_execution::execute_workflow_for_tui;
 use crate::bridge::{TuiBudgetAdmission, TuiSession, TuiUsageLedger};
 #[cfg(test)]
 use crate::operation_controller::TuiOperationController;
+#[cfg(test)]
 use crate::operation_controller::TuiTurnControl;
 use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::task_supervisor::TuiTaskSpawner;
@@ -53,7 +71,9 @@ use crate::task_supervisor::TuiTaskSupervisor;
 use crate::types::UserAction;
 use crate::types::{PendingWorkflowNotification, TuiEvent};
 
+#[cfg(test)]
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
+#[cfg(test)]
 const PROVIDER_STREAM_CAPACITY: usize = 256;
 
 pub(crate) type PendingWorkflowNotifications = crate::types::PendingWorkflowNotificationQueue;
@@ -63,12 +83,14 @@ enum ProviderStreamEvent {
     Done(ProviderResponse),
 }
 
+#[cfg(test)]
 struct ProviderStreamTask {
     receiver: Option<Receiver<ProviderStreamEvent>>,
     cancel: CancelToken,
     handle: Option<JoinHandle<()>>,
 }
 
+#[cfg(test)]
 impl ProviderStreamTask {
     fn recv_timeout(
         &self,
@@ -103,9 +125,64 @@ impl ProviderStreamTask {
     }
 }
 
+#[cfg(test)]
 impl Drop for ProviderStreamTask {
     fn drop(&mut self) {
         let _ = self.cancel_and_join();
+    }
+}
+
+enum BackgroundProviderTask {
+    #[cfg(test)]
+    Legacy(ProviderStreamTask),
+    Canonical(RuntimeProviderSuspension),
+}
+
+impl BackgroundProviderTask {
+    fn recv_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ProviderStreamEvent, mpsc::RecvTimeoutError> {
+        match self {
+            #[cfg(test)]
+            Self::Legacy(task) => task.recv_timeout(timeout),
+            Self::Canonical(suspension) => {
+                let event = suspension
+                    .recv_timeout(timeout)
+                    .map_err(|error| match error {
+                        std::sync::mpsc::RecvTimeoutError::Timeout => {
+                            mpsc::RecvTimeoutError::Timeout
+                        }
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                            mpsc::RecvTimeoutError::Disconnected
+                        }
+                    })?;
+                match event {
+                    RuntimeProviderSuspensionEvent::Step(step) => {
+                        Ok(ProviderStreamEvent::Step(step))
+                    }
+                    RuntimeProviderSuspensionEvent::Completed(response) => {
+                        Ok(ProviderStreamEvent::Done(response))
+                    }
+                }
+            }
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            #[cfg(test)]
+            Self::Legacy(task) => task.cancel(),
+            Self::Canonical(suspension) => suspension.cancel(),
+        }
+    }
+
+    fn join(&mut self) -> io::Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::Legacy(task) => task.join(),
+            Self::Canonical(_) => Ok(()),
+        }
     }
 }
 
@@ -121,14 +198,14 @@ pub(crate) struct TuiAgentTurnResult {
 }
 
 impl TuiAgentTurnResult {
-    fn new(status: impl Into<String>) -> Self {
+    pub(crate) fn new(status: impl Into<String>) -> Self {
         Self {
             status: status.into(),
             continuation: None,
         }
     }
 
-    fn with_continuation(
+    pub(crate) fn with_continuation(
         status: impl Into<String>,
         continuation: TuiAgentTurnContinuation,
     ) -> Self {
@@ -174,12 +251,12 @@ pub(crate) fn send_runtime_event_as_tui(event_tx: &Sender<TuiEvent>, event: Even
     }
 }
 
-struct TuiRuntimeEventObserver {
+pub(crate) struct TuiRuntimeEventObserver {
     event_tx: Sender<TuiEvent>,
 }
 
 impl TuiRuntimeEventObserver {
-    fn new(event_tx: Sender<TuiEvent>) -> Self {
+    pub(crate) fn new(event_tx: Sender<TuiEvent>) -> Self {
         Self { event_tx }
     }
 }
@@ -221,38 +298,25 @@ pub(crate) fn task_summary_for_tui(
     registry.list().into_iter().find(|task| task.id == task_id)
 }
 
-pub(crate) enum TuiMainSessionTaskStart<'a> {
-    Create(&'a str),
-    Adopt(&'a str),
-}
-
+#[cfg(test)]
 fn start_main_session_task_for_tui(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
-    task_start: TuiMainSessionTaskStart<'_>,
+    description: &str,
 ) -> String {
-    match task_start {
-        TuiMainSessionTaskStart::Adopt(task_id) => {
-            if let Some(task) = task_summary_for_tui(session.task_registry(), task_id) {
-                send_task_status_updated_for_tui(event_tx, events, &task);
-            }
-            task_id.to_string()
-        }
-        TuiMainSessionTaskStart::Create(description) => {
-            let task = session
-                .task_registry()
-                .create_main_session(description.to_string());
-            let _ = session.task_registry().mark_running(&task.id);
-            session.start_agent_lifecycle_task_with_id(&task.id);
-            if let Some(task) = task_summary_for_tui(session.task_registry(), &task.id) {
-                send_task_status_updated_for_tui(event_tx, events, &task);
-            }
-            task.id
-        }
+    let task = session
+        .task_registry()
+        .create_main_session(description.to_string());
+    let _ = session.task_registry().mark_running(&task.id);
+    session.start_agent_lifecycle_task_with_id(&task.id);
+    if let Some(task) = task_summary_for_tui(session.task_registry(), &task.id) {
+        send_task_status_updated_for_tui(event_tx, events, &task);
     }
+    task.id
 }
 
+#[cfg(test)]
 fn poll_background_current_turn_for_tui(
     session: &TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
@@ -275,6 +339,7 @@ fn poll_background_current_turn_for_tui(
     }
 }
 
+#[cfg(test)]
 fn spawn_provider_stream(
     provider: orca_core::config::ProviderKind,
     conversation: orca_core::conversation::Conversation,
@@ -354,6 +419,7 @@ fn usage_budget_error(
     })
 }
 
+#[cfg(test)]
 fn persist_merged_usage(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
@@ -369,6 +435,7 @@ fn persist_merged_usage(
     totals
 }
 
+#[cfg(test)]
 fn finish_budget_exhausted_after_usage(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
@@ -447,17 +514,17 @@ fn provider_response_pending_tool_call(
         })
 }
 
-struct BackgroundProviderCompletionContext {
-    task_registry: orca_runtime::tasks::TaskRegistry,
-    history_writer: Option<orca_runtime::history::SessionWriter>,
-    model: Option<String>,
-    usage_ledger: TuiUsageLedger,
-    budget_admission: Option<TuiBudgetAdmission>,
-    max_budget_usd: Option<f64>,
-    event_tx: Sender<TuiEvent>,
-    run_id: String,
-    task_id: String,
-    completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
+pub(crate) struct BackgroundProviderCompletionContext {
+    pub(crate) task_registry: orca_runtime::tasks::TaskRegistry,
+    pub(crate) history_writer: Option<orca_runtime::history::SessionWriter>,
+    pub(crate) model: Option<String>,
+    pub(crate) usage_ledger: TuiUsageLedger,
+    pub(crate) budget_admission: Option<TuiBudgetAdmission>,
+    pub(crate) max_budget_usd: Option<f64>,
+    pub(crate) event_tx: Sender<TuiEvent>,
+    pub(crate) run_id: String,
+    pub(crate) task_id: String,
+    pub(crate) completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -468,10 +535,38 @@ pub(crate) struct TuiBackgroundTurnCompletion {
 pub(crate) type TuiBackgroundTurnCompletionHandler =
     Box<dyn FnOnce(TuiBackgroundTurnCompletion) + Send>;
 
+#[cfg(test)]
 fn spawn_background_provider_completion(
-    mut provider_task: ProviderStreamTask,
+    provider_task: ProviderStreamTask,
     context: BackgroundProviderCompletionContext,
     task_spawner: &TuiTaskSpawner,
+) -> io::Result<()> {
+    spawn_background_provider_task_completion(
+        BackgroundProviderTask::Legacy(provider_task),
+        context,
+        task_spawner,
+        true,
+    )
+}
+
+pub(crate) fn spawn_background_provider_suspension_completion(
+    suspension: RuntimeProviderSuspension,
+    context: BackgroundProviderCompletionContext,
+    task_spawner: &TuiTaskSpawner,
+) -> io::Result<()> {
+    spawn_background_provider_task_completion(
+        BackgroundProviderTask::Canonical(suspension),
+        context,
+        task_spawner,
+        false,
+    )
+}
+
+fn spawn_background_provider_task_completion(
+    mut provider_task: BackgroundProviderTask,
+    context: BackgroundProviderCompletionContext,
+    task_spawner: &TuiTaskSpawner,
+    publish_handoff_failure_terminal: bool,
 ) -> io::Result<()> {
     let BackgroundProviderCompletionContext {
         task_registry,
@@ -679,10 +774,12 @@ fn spawn_background_provider_completion(
         if let Some(updated_task) = task_summary_for_tui(&fallback_registry, &fallback_task_id) {
             send_task_status_updated_for_tui(&fallback_event_tx, &mut events, &updated_task);
         }
-        if let Some(error) = terminal_error {
-            send_error_for_tui(&fallback_event_tx, &mut events, error);
+        if publish_handoff_failure_terminal {
+            if let Some(error) = terminal_error {
+                send_error_for_tui(&fallback_event_tx, &mut events, error);
+            }
+            send_session_completed_status_for_tui(&fallback_event_tx, &mut events, status);
         }
-        send_session_completed_status_for_tui(&fallback_event_tx, &mut events, status);
         return Err(error);
     }
     Ok(())
@@ -941,6 +1038,7 @@ pub(crate) fn continue_approved_background_turn_for_tui_with_events(
     TuiAgentTurnResult::new(status)
 }
 
+#[cfg(test)]
 fn finish_main_session_task_for_tui(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
@@ -951,6 +1049,7 @@ fn finish_main_session_task_for_tui(
     finish_main_session_task_with_error_for_tui(session, event_tx, events, task_id, status, None);
 }
 
+#[cfg(test)]
 fn finish_main_session_task_with_error_for_tui(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
@@ -1012,6 +1111,7 @@ fn run_status_for_tui_status(status: &str) -> orca_core::event_schema::RunStatus
     }
 }
 
+#[cfg(test)]
 fn maybe_stop_cancelled_main_session_for_tui(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
@@ -1039,6 +1139,7 @@ fn maybe_stop_cancelled_main_session_for_tui(
     Some(TuiAgentTurnResult::new("interrupted"))
 }
 
+#[cfg(test)]
 fn close_unstarted_tool_requests_for_tui(
     session: &mut TuiSession<'_>,
     event_tx: &Sender<TuiEvent>,
@@ -1094,6 +1195,7 @@ pub(crate) fn send_tool_completed_for_tui(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn send_subagent_started_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
@@ -1103,6 +1205,7 @@ pub(crate) fn send_subagent_started_for_tui(
     send_runtime_event_as_tui(event_tx, events.subagent_started(id, description));
 }
 
+#[cfg(test)]
 pub(crate) fn send_subagent_completed_for_tui(
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
@@ -1233,6 +1336,7 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn tui_tools_schema(
     mcp_registry: &McpRegistry,
     external_tools: &[orca_core::external_config::ExternalToolConfig],
@@ -1328,7 +1432,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
         control,
         cancel,
         allow_goal_tools,
-        TuiMainSessionTaskStart::Create(task_description.unwrap_or(prompt)),
+        task_description.unwrap_or(prompt),
         backtrack_target,
         pending_workflow_notifications,
         background_completion_handler,
@@ -1337,6 +1441,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_agent_for_tui_with_event_factory(
     config: &RunConfig,
@@ -1347,7 +1452,7 @@ pub(crate) fn run_agent_for_tui_with_event_factory(
     control: &TuiTurnControl,
     cancel: &CancelToken,
     allow_goal_tools: bool,
-    main_session_task: TuiMainSessionTaskStart<'_>,
+    main_session_task_description: &str,
     backtrack_target: bool,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
     background_completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
@@ -1385,8 +1490,12 @@ pub(crate) fn run_agent_for_tui_with_event_factory(
     let mut turn: u32 = 0;
     let mut tui_compaction = orca_runtime::TuiAgentTurnCompactionState::new();
     let mut runtime_events = runtime_events;
-    let main_session_task_id =
-        start_main_session_task_for_tui(session, event_tx, &mut runtime_events, main_session_task);
+    let main_session_task_id = start_main_session_task_for_tui(
+        session,
+        event_tx,
+        &mut runtime_events,
+        main_session_task_description,
+    );
     let mut main_session_backgrounded = false;
     let mut background_completion_handler = background_completion_handler;
     let mut provider_budget_admission = None;
@@ -2248,12 +2357,13 @@ pub(crate) fn run_agent_for_tui_with_event_factory(
     }
 }
 
-fn take_pending_workflow_notification(
+pub(crate) fn take_pending_workflow_notification(
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> Option<PendingWorkflowNotification> {
     pending_workflow_notifications.and_then(PendingWorkflowNotifications::pop_notification)
 }
 
+#[cfg(test)]
 fn record_tui_goal_tool_finish(
     session: &TuiSession<'_>,
     turn_extension_id: &str,

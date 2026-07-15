@@ -9,18 +9,26 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::RunStatus;
+#[cfg(test)]
 use orca_core::provider_types::Usage;
+#[cfg(test)]
 use orca_mcp::McpRegistry;
 use orca_runtime::controller::ThreadTurnRequest;
+#[cfg(test)]
 use orca_runtime::cost::CostTracker;
+#[cfg(test)]
 use orca_runtime::hooks::HookRunner;
+#[cfg(test)]
 use orca_runtime::instructions::ProjectInstructions;
+#[cfg(test)]
 use orca_runtime::lifecycle::{RuntimeTaskKind, RuntimeTurnRunner};
+#[cfg(test)]
 use orca_runtime::memory::MemoryBlock;
 use orca_runtime::runtime_pending_interaction::RuntimePendingInteractionStore;
 use orca_runtime::tasks::TaskRegistry;
 use orca_runtime::thread::RuntimeThread;
 
+#[cfg(test)]
 use crate::types::TuiTaskLifecycle;
 
 pub(crate) struct TuiSession<'a> {
@@ -187,18 +195,22 @@ impl<'a> TuiSession<'a> {
         self.usage_ledger.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
         self.runtime().session()
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_session_mut(&mut self) -> &mut orca_runtime::session::InteractiveSession {
         self.runtime_mut().session_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn conversation(&self) -> &orca_core::conversation::Conversation {
         self.runtime().session().conversation()
     }
 
+    #[cfg(test)]
     pub(crate) fn conversation_mut(&mut self) -> &mut orca_core::conversation::Conversation {
         self.runtime_mut().session_mut().conversation_mut()
     }
@@ -207,14 +219,17 @@ impl<'a> TuiSession<'a> {
         self.runtime_mut().session_mut().writer_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn instructions(&self) -> &ProjectInstructions {
         self.runtime().session().instructions()
     }
 
+    #[cfg(test)]
     pub(crate) fn cost_tracker_mut(&mut self) -> &mut CostTracker {
         self.runtime_mut().session_mut().cost_tracker_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn record_provider_usage(&mut self, usage: Usage) -> UsageTotals {
         let before = self.runtime().session().usage_totals();
         let after = self
@@ -225,6 +240,7 @@ impl<'a> TuiSession<'a> {
         self.shared_usage_ledger().add(usage_delta(before, after))
     }
 
+    #[cfg(test)]
     pub(crate) fn record_external_usage(&mut self, usage: UsageTotals) -> UsageTotals {
         self.runtime_mut()
             .session_mut()
@@ -237,14 +253,17 @@ impl<'a> TuiSession<'a> {
         self.shared_usage_ledger()
     }
 
+    #[cfg(test)]
     pub(crate) fn mcp_registry(&self) -> &McpRegistry {
         self.runtime().session().mcp_registry()
     }
 
+    #[cfg(test)]
     pub(crate) fn hooks(&self) -> &HookRunner {
         self.runtime().session().hooks()
     }
 
+    #[cfg(test)]
     pub(crate) fn memory(&self) -> &MemoryBlock {
         self.runtime().session().memory()
     }
@@ -257,6 +276,7 @@ impl<'a> TuiSession<'a> {
         self.pending_interaction_store()
     }
 
+    #[cfg(test)]
     pub(crate) fn append_message(&mut self, message: &orca_core::conversation::Message) {
         self.runtime_mut().session_mut().append_message(message);
     }
@@ -271,6 +291,7 @@ impl<'a> TuiSession<'a> {
             .complete_with_error(status, Some(error));
     }
 
+    #[cfg(test)]
     pub(crate) fn start_agent_lifecycle_task_with_id(&mut self, task_id: &str) {
         self.runtime_mut()
             .lifecycle_mut()
@@ -289,10 +310,12 @@ impl<'a> TuiSession<'a> {
         self.runtime().session().completion_error()
     }
 
+    #[cfg(test)]
     pub(crate) fn thread_extensions(&self) -> &orca_runtime::extension::ExtensionData {
         self.runtime().thread_extensions()
     }
 
+    #[cfg(test)]
     pub(crate) fn thread_extensions_handle(
         &self,
     ) -> std::sync::Arc<orca_runtime::extension::ExtensionData> {
@@ -371,6 +394,7 @@ impl<'a> TuiSession<'a> {
             .replace_goal_context(content);
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_skill_context(&mut self, content: Option<String>) {
         self.runtime_mut()
             .session_mut()
@@ -388,6 +412,7 @@ impl<'a> TuiSession<'a> {
             .compact(config, cwd, cancel)
     }
 
+    #[cfg(test)]
     pub(crate) fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
         if self.runtime().lifecycle().active_task().is_none() {
             self.runtime_mut()
@@ -414,6 +439,7 @@ fn usage_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
     }
 }
 
+#[cfg(test)]
 fn lifecycle_kind_label(kind: orca_runtime::lifecycle::RuntimeTaskKind) -> &'static str {
     match kind {
         orca_runtime::lifecycle::RuntimeTaskKind::Agent => "agent",
@@ -423,6 +449,7 @@ fn lifecycle_kind_label(kind: orca_runtime::lifecycle::RuntimeTaskKind) -> &'sta
     }
 }
 
+#[cfg(test)]
 fn lifecycle_status_label(status: orca_runtime::lifecycle::RuntimeTaskStatus) -> &'static str {
     match status {
         orca_runtime::lifecycle::RuntimeTaskStatus::Running => "running",

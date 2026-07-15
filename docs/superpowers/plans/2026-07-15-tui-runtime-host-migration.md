@@ -1,6 +1,6 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1 through P0.3e4b2 complete; P0.3e4b3 next
+- Status: Active; P0.3e1 through P0.3e4b3 complete; P0.3e4b full gate next
 - Date: 2026-07-15
 - Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3c validation)
 - Branch: `codex/tui-runtime-host-migration`
@@ -701,6 +701,82 @@ P0.3e4b2 checkpoint result:
   515/515. Focused all-targets Clippy and the combined runtime/TUI all-targets
   check completed successfully with only the repository's existing non-deny
   warning baseline.
+
+P0.3e4b3 slice contract:
+
+- **User value.** Foreground TUI turns use the same DeepSeek streaming,
+  compaction, retry, hooks, tools, subagents, permissions, persistence, usage,
+  and terminal semantics as server/headless turns. `Ctrl-B` still releases the
+  TUI while the exact in-flight provider request continues, and `Ctrl-C` still
+  cancels and joins the addressed foreground generation.
+- **Architecture value.** `orca-provider` owns one transferable streaming-call
+  handle whose drop path cancels and joins the provider worker. Canonical
+  runtime propagates one typed completed-or-provider-suspended outcome from the
+  provider step through the turn kernel. The TUI executor installs fenced
+  canonical interaction handlers and projects canonical events; it no longer
+  runs a second foreground provider/tool/compaction loop.
+- **External compatibility.** CLI/server/headless callers keep blocking turn
+  behavior and existing event/persistence shapes. TUI keys, interaction UI,
+  task panel, goal accounting, workflow notification ordering, background
+  approval continuation, and aggregate budget behavior remain unchanged.
+- **Migration state.** A suspended provider handle is temporarily transferred
+  to the existing bounded `TuiTaskSupervisor`, which retains current background
+  task settlement and foregrounding behavior. P0.3e4c moves that owner into the
+  runtime host and deletes the supervisor-facing provider completion path.
+- **Acceptance.** RED tests first prove the provider API cannot transfer an
+  in-flight stream, canonical turns cannot return suspension, and production
+  TUI foreground turns still enter `run_agent_for_tui_with_event_factory`.
+  After implementation: the provider stream handle preserves ordered delivery,
+  cancellation, and exactly-once join; a canonical hosted slow provider turn
+  returns a typed suspension without committing session/task terminal state;
+  the suspended request can finish, be stopped, or be foregrounded once; TUI
+  approvals, permission requests, user input, and MCP elicitation use the
+  operation fence; normal foreground turns publish canonical context, stream,
+  tool, task, usage, and terminal events; focused provider/runtime/TUI tests
+  pass.
+- **Deletion gate.** Production `HostedOperationKind::Turn` contains no call to
+  `run_agent_for_tui_with_event_factory`, and `TuiMainSessionTaskStart` is
+  deleted. `ProviderStreamTask` and the duplicate TUI foreground loop remain
+  only as test/legacy deletion targets until P0.3e4c removes their final
+  background consumers.
+
+P0.3e4b3 checkpoint result:
+
+- `orca-provider` now owns one transferable `ProviderStreamingCall`. Ordered
+  deliveries acknowledge consumption before the worker advances, normal
+  completion joins exactly once, and explicit cancellation, callback panic, or
+  drop cancels and joins the provider worker. The blocking streaming facade now
+  consumes the same transferable implementation instead of owning a second
+  worker lifecycle.
+- canonical runtime propagates `ThreadTurnOutcome::ProviderSuspended` from the
+  provider step through the turn kernel, controller, and `RuntimeThread`
+  without committing task, lifecycle, verifier, or session terminal state.
+  Production `HostedOperationKind::Turn` runs this canonical executor and
+  installs operation-fenced approval, permission, user-input, and MCP
+  elicitation handlers after hosted activation.
+- `Ctrl-B` transfers the exact in-flight provider request into the bounded TUI
+  supervisor. Behavior tests prove the canonical request can complete in the
+  background, be stopped and joined once, or return to the foreground once;
+  cancellation does not emit a misleading error and does not poison the next
+  generation.
+- operation-scoped event relay holds canonical terminal events until the actor
+  operation is joined. Runtime errors, host admission failures, and background
+  handoff failures therefore publish one fenced terminal after operation
+  cleanup, while shutdown cancels and joins the active operation.
+- production no longer calls `run_agent_for_tui_with_event_factory`,
+  `TuiMainSessionTaskStart` is deleted, and the old TUI foreground
+  provider/tool/compaction loop is test-only. `ProviderStreamTask`, that
+  duplicate test loop, and `TuiTaskSupervisor` remain explicit P0.3e4c deletion
+  targets rather than long-term parallel owners.
+- a fresh `git fetch origin` confirmed `origin/main` remained `35c6361c1`, so
+  the branch was already based on current main and rebase was a no-op. Formatting
+  and diff checks passed, targeted all-targets Clippy completed with only the
+  repository's existing non-deny warning baseline, and the serial all-targets
+  gate passed: `orca-provider` 167/167, `orca-runtime` 769/769, runtime-host
+  32/32, task-output 12/12, and `orca-tui` 523/523.
+- the complete P0.3e4b workspace gate, workspace Clippy, real DeepSeek harness,
+  and production PTY TUI smoke remain the next checkpoint before P0.3e4c or any
+  push/release decision.
 
 ## Slice Acceptance Criteria
 

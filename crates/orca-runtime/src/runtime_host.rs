@@ -352,7 +352,7 @@ impl HostedTurnRequest {
         Ok(())
     }
 
-    fn legacy_request(&self, generation: &GenerationContext) -> ThreadTurnRequest {
+    pub fn thread_turn_request(&self, generation: &GenerationContext) -> ThreadTurnRequest {
         let prompt_placement = if self.resumes_existing_turn || generation.resumes_existing_turn {
             ThreadTurnPromptPlacement::ExistingTurn
         } else if self.backtrack_target {
@@ -542,7 +542,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
         }
         thread.run_request_with_event_factory_and_cancel(
             generation.config(),
-            &request.legacy_request(generation),
+            &request.thread_turn_request(generation),
             writer,
             events,
             cancel.clone(),

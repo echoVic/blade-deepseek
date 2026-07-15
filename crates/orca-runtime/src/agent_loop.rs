@@ -3,7 +3,7 @@ use std::io;
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
 use crate::cost::CostTracker;
 use crate::lifecycle::{
-    AgentLoopContext, AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor,
+    AgentLoopContext, AgentLoopOutcome, RuntimeSessionLifecycle, RuntimeTaskActor,
     RuntimeTurnContext, RuntimeTurnExecution,
 };
 use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
@@ -36,7 +36,7 @@ pub(crate) fn run_agent_loop(
     sink: &mut EventSink<impl io::Write>,
     conversation_context: AgentConversationContext<'_>,
     tool_policy: AgentToolPolicyContext<'_>,
-) -> io::Result<AgentLoopResult> {
+) -> io::Result<AgentLoopOutcome> {
     let AgentLoopContext {
         turn_context,
         turn_deps,
@@ -152,6 +152,11 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
             request.tool_policy_label.as_deref(),
         ),
     )?;
+    let AgentLoopOutcome::Completed(child) = child else {
+        return Err(io::Error::other(
+            "child agent provider suspension is not supported",
+        ));
+    };
     observe_background_workflows(
         config.output_format == OutputFormat::Jsonl,
         runtime.events,

@@ -43,6 +43,7 @@ impl RuntimeTurnStartStep {
             subagent_type: _,
             continuation: _,
             steer_handle: _,
+            ..
         } = input.turn_context;
 
         let turn_prompt = if input
