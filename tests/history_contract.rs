@@ -40,7 +40,7 @@ fn exec_saves_history_and_history_commands_can_read_it() {
 }
 
 #[test]
-fn exec_expands_file_mentions_before_saving_history() {
+fn exec_preserves_unbound_at_tokens_as_literal_history() {
     let home = TempDir::new().expect("temp home");
     let project = TempDir::new().expect("temp project");
     std::fs::write(project.path().join("notes.txt"), "alpha\nbeta\ngamma\n")
@@ -69,9 +69,8 @@ fn exec_expands_file_mentions_before_saving_history() {
     assert_eq!(show.status.code(), Some(0));
     let show_stdout = String::from_utf8_lossy(&show.stdout);
     assert!(show_stdout.contains("summarize @notes.txt#L2"));
-    assert!(show_stdout.contains(r#"<file path="notes.txt" range="L2">"#));
-    assert!(show_stdout.contains("beta</file>"));
-    assert!(!show_stdout.contains("alpha\nbeta"));
+    assert!(!show_stdout.contains("<file"));
+    assert!(!show_stdout.contains("beta</file>"));
 }
 
 #[test]

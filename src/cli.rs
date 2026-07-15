@@ -739,12 +739,12 @@ fn run_exec(args: ExecArgs) -> i32 {
             return 1;
         }
     };
-    let cwd_for_mentions = args
+    let config_cwd = args
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let file_config = match load_effective_file_config(
-        &cwd_for_mentions,
+        &config_cwd,
         ConfigOverrides {
             model: args.model,
             mode: args.approval_mode,
@@ -759,14 +759,6 @@ fn run_exec(args: ExecArgs) -> i32 {
             return 1;
         }
     };
-    let prompt = match crate::mentions::expand_file_mentions(&prompt, &cwd_for_mentions) {
-        Ok(prompt) => prompt,
-        Err(error) => {
-            eprintln!("orca: {error}");
-            return 1;
-        }
-    };
-
     let api_key = file_config.api_key;
     let base_url = file_config.base_url;
 

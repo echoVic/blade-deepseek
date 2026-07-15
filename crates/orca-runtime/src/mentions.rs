@@ -629,15 +629,6 @@ fn changed_range(previous: &str, next: &str) -> (usize, usize, usize) {
     (prefix, old_end, new_end)
 }
 
-pub fn expand_file_mentions(input: &str, cwd: &Path) -> Result<String, String> {
-    let mentions = find_mentions(input);
-    if mentions.is_empty() {
-        return Ok(input.to_string());
-    }
-
-    append_mention_blocks(input, file_mention_blocks(&mentions, cwd)?)
-}
-
 pub fn expand_mentions(
     input: &str,
     bindings: &MentionBindings,
@@ -653,11 +644,10 @@ pub fn expand_mentions(
                 && input.is_char_boundary(binding.start)
                 && input.is_char_boundary(binding.end)
                 && input[binding.start..binding.end] == binding.visible
-        })
-        .collect::<Vec<_>>();
+        });
     let mut blocks = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
-    for binding in &valid_bindings {
+    for binding in valid_bindings {
         if seen_targets.insert(binding.target.stable_id()) {
             blocks.push(expand_bound_target(
                 &binding.target,
@@ -667,22 +657,6 @@ pub fn expand_mentions(
             )?);
         }
     }
-
-    let mut seen_legacy = std::collections::HashSet::new();
-    let legacy_mentions = extract_mention_occurrences(input)
-        .into_iter()
-        .filter(|occurrence| {
-            !valid_bindings
-                .iter()
-                .any(|binding| occurrence.start < binding.end && occurrence.end > binding.start)
-        })
-        .filter_map(|occurrence| {
-            seen_legacy
-                .insert(occurrence.value.clone())
-                .then_some(occurrence.value)
-        })
-        .collect::<Vec<_>>();
-    blocks.extend(file_mention_blocks(&legacy_mentions, cwd)?);
     append_mention_blocks(input, blocks)
 }
 
@@ -691,20 +665,6 @@ fn append_mention_blocks(input: &str, blocks: Vec<String>) -> Result<String, Str
         return Ok(input.to_string());
     }
     Ok(format!("{}\n\n{}", input, blocks.join("\n\n")))
-}
-
-fn file_mention_blocks(mentions: &[String], cwd: &Path) -> Result<Vec<String>, String> {
-    let mut blocks = Vec::new();
-    for mention in mentions {
-        let target = LegacyMentionTarget::parse(mention)?;
-        let path = match resolve_mention_path(cwd, target.path) {
-            Ok(path) => path,
-            Err(_) if is_plain_at_word(target.path) => continue,
-            Err(error) => return Err(error),
-        };
-        blocks.push(file_block(target.path, &path, target.range, mention, None)?);
-    }
-    Ok(blocks)
 }
 
 fn expand_bound_target(
@@ -735,7 +695,7 @@ fn expand_bound_target(
             if !resolved.starts_with(&root) || !resolved.is_file() {
                 return Err(format!("bound @{path} is not a file inside its workspace"));
             }
-            file_block(path, &resolved, None, path, Some(&root))
+            file_block(path, &resolved, path, Some(&root))
         }
         MentionTarget::Skill { id, path } => {
             let path = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -875,7 +835,6 @@ fn plugin_manifest_allowed(path: &Path, cwd: &Path, workspace_roots: &[PathBuf])
 fn file_block(
     display_path: &str,
     resolved: &Path,
-    range: Option<LineRange>,
     mention: &str,
     root: Option<&Path>,
 ) -> Result<String, String> {
@@ -893,25 +852,20 @@ fn file_block(
     if content.as_bytes().contains(&0) {
         return Err(format!("@{mention} appears to be a binary file"));
     }
-    let content = select_lines(&content, range, mention)?;
-    let (content, truncated) = truncate_content(content);
+    let (content, truncated) = truncate_content(&content);
     let marker = if truncated {
         "\n[... truncated ...]"
     } else {
         ""
     };
-    let line_attr = range
-        .map(|range| format!(r#" range="{}""#, escape_attr(&range.display())))
-        .unwrap_or_default();
     let root_attr = root
         .map(|root| format!(r#" root="{}""#, escape_attr(&root.display().to_string())))
         .unwrap_or_default();
     Ok(format!(
-        r#"<file path="{}"{}{}>
+        r#"<file path="{}"{}>
 {}{}</file>"#,
         escape_attr(display_path),
         root_attr,
-        line_attr,
         content,
         marker
     ))
@@ -1081,100 +1035,6 @@ pub fn apply_mention_selection_at_cursor(
     })
 }
 
-fn find_mentions(input: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    let tokens = extract_mention_tokens(input);
-    for mention in tokens {
-        if !seen.contains(&mention) {
-            seen.push(mention);
-        }
-    }
-    seen
-}
-
-fn extract_mention_tokens(input: &str) -> Vec<String> {
-    extract_mention_occurrences(input)
-        .into_iter()
-        .map(|occurrence| occurrence.value)
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MentionOccurrence {
-    start: usize,
-    end: usize,
-    value: String,
-}
-
-fn extract_mention_occurrences(input: &str) -> Vec<MentionOccurrence> {
-    let mut tokens = Vec::new();
-
-    let mut chars = input.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c != '@' {
-            continue;
-        }
-        if i > 0 && !input[..i].ends_with(char::is_whitespace) {
-            continue;
-        }
-        if chars.peek().map(|(_, c)| *c) == Some('"') {
-            chars.next();
-            let start = chars.peek().map(|(i, _)| *i).unwrap_or(input.len());
-            let mut end = start;
-            for (j, ch) in chars.by_ref() {
-                if ch == '"' {
-                    break;
-                }
-                end = j + ch.len_utf8();
-            }
-            let path = &input[start..end];
-            if !path.is_empty() {
-                let occurrence_end = input[end..]
-                    .chars()
-                    .next()
-                    .filter(|ch| *ch == '"')
-                    .map_or(end, |ch| end + ch.len_utf8());
-                tokens.push(MentionOccurrence {
-                    start: i,
-                    end: occurrence_end,
-                    value: path.to_string(),
-                });
-            }
-        } else {
-            let start = i + 1;
-            let end = input[start..]
-                .find(char::is_whitespace)
-                .map(|j| start + j)
-                .unwrap_or(input.len());
-            let raw = &input[start..end];
-            let mention = raw.trim_end_matches(|c: char| {
-                matches!(c, ',' | '.' | ':' | ';' | ')' | ']' | '}' | '"' | '\'')
-            });
-            if mention.is_empty()
-                || mention.starts_with('@')
-                || mention.starts_with("http://")
-                || mention.starts_with("https://")
-            {
-                continue;
-            }
-            tokens.push(MentionOccurrence {
-                start: i,
-                end: start + mention.len(),
-                value: mention.to_string(),
-            });
-        }
-    }
-    tokens
-}
-
-fn is_plain_at_word(value: &str) -> bool {
-    !value.contains('/')
-        && !value.contains('\\')
-        && !value.contains('.')
-        && !value.contains('#')
-        && !value.starts_with('~')
-}
-
 fn common_prefix(values: &[String]) -> Option<String> {
     let first = values.first()?.as_str();
     let mut end = first.len();
@@ -1188,125 +1048,6 @@ fn common_prefix(values: &[String]) -> Option<String> {
         }
     }
     Some(first[..end].to_string())
-}
-
-fn resolve_mention_path(cwd: &Path, mention: &str) -> Result<PathBuf, String> {
-    let cwd = cwd
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve cwd: {error}"))?;
-    let candidate = cwd.join(mention);
-    let path = candidate
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve @{mention}: {error}"))?;
-    if !path.starts_with(&cwd) {
-        return Err(format!("@{mention} is outside the workspace"));
-    }
-    if !path.is_file() {
-        return Err(format!("@{mention} is not a file"));
-    }
-    Ok(path)
-}
-
-#[derive(Clone, Copy)]
-struct LegacyMentionTarget<'a> {
-    path: &'a str,
-    range: Option<LineRange>,
-}
-
-impl<'a> LegacyMentionTarget<'a> {
-    fn parse(mention: &'a str) -> Result<Self, String> {
-        let Some((path, suffix)) = mention.rsplit_once("#L") else {
-            return Ok(Self {
-                path: mention,
-                range: None,
-            });
-        };
-        if path.is_empty() {
-            return Err(format!("@{mention} is missing a file path"));
-        }
-        let range = LineRange::parse(suffix).ok_or_else(|| {
-            format!("@{mention} has an invalid line reference; use #L10 or #L10-L20")
-        })?;
-        Ok(Self {
-            path,
-            range: Some(range),
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LineRange {
-    start: usize,
-    end: usize,
-}
-
-impl LineRange {
-    fn parse(value: &str) -> Option<Self> {
-        let (start, end) = value.split_once('-').unwrap_or((value, value));
-        let start = start.parse::<usize>().ok()?;
-        let end = end.strip_prefix('L').unwrap_or(end);
-        let end = end.parse::<usize>().ok()?;
-        if start == 0 || end == 0 || end < start {
-            return None;
-        }
-        Some(Self { start, end })
-    }
-
-    fn display(self) -> String {
-        if self.start == self.end {
-            format!("L{}", self.start)
-        } else {
-            format!("L{}-L{}", self.start, self.end)
-        }
-    }
-}
-
-fn select_lines<'a>(
-    content: &'a str,
-    range: Option<LineRange>,
-    mention: &str,
-) -> Result<&'a str, String> {
-    let Some(range) = range else {
-        return Ok(content);
-    };
-
-    let line_spans = line_spans(content);
-    let total = line_spans.len();
-    if range.start > total {
-        return Err(format!(
-            "@{mention} starts past the end of the file (only {total} lines)"
-        ));
-    }
-    if range.end > total {
-        return Err(format!(
-            "@{mention} ends past the end of the file (only {total} lines)"
-        ));
-    }
-
-    let start = line_spans[range.start - 1].0;
-    let end = line_spans[range.end - 1].1;
-    Ok(&content[start..end])
-}
-
-fn line_spans(content: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut start = 0;
-    for segment in content.split_inclusive('\n') {
-        let raw_end = start + segment.len();
-        let end = if segment.ends_with('\n') {
-            let before_lf = raw_end - 1;
-            if before_lf > start && content.as_bytes()[before_lf - 1] == b'\r' {
-                before_lf - 1
-            } else {
-                before_lf
-            }
-        } else {
-            raw_end
-        };
-        spans.push((start, end));
-        start = raw_end;
-    }
-    spans
 }
 
 fn truncate_content(content: &str) -> (&str, bool) {
@@ -1333,50 +1074,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expands_relative_file_mentions() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+    fn unbound_at_tokens_remain_literal_even_when_they_look_like_paths() {
+        let cwd = tempfile::tempdir().unwrap();
+        fs::write(cwd.path().join("README.md"), "do not inject").unwrap();
+        let roots = vec![cwd.path().to_path_buf()];
+        let registry = orca_mcp::McpRegistry::default();
 
-        let expanded = expand_file_mentions("read @notes.txt", dir.path()).unwrap();
+        for input in [
+            "@oai/sky还能逆向吗",
+            "read @README.md",
+            "email foo@example.com",
+        ] {
+            let expanded = expand_mentions(
+                input,
+                &MentionBindings::new(input),
+                cwd.path(),
+                &roots,
+                &registry,
+            )
+            .unwrap();
 
-        assert!(expanded.contains("read @notes.txt"));
-        assert!(expanded.contains(r#"<file path="notes.txt">"#));
-        assert!(expanded.contains("hello</file>"));
-    }
-
-    #[test]
-    fn expands_line_mentions() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("notes.txt"), "one\ntwo\nthree\n").unwrap();
-
-        let expanded = expand_file_mentions("read @notes.txt#L2-L3", dir.path()).unwrap();
-
-        assert!(expanded.contains(r#"<file path="notes.txt" range="L2-L3">"#));
-        assert!(expanded.contains("two\nthree</file>"));
-        assert!(!expanded.contains("\none\ntwo"));
-    }
-
-    #[test]
-    fn ignores_urls_and_plain_at_words_without_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let expanded =
-            expand_file_mentions("see @https://example.com and @alice", dir.path()).unwrap();
-        assert_eq!(expanded, "see @https://example.com and @alice");
-    }
-
-    #[test]
-    fn rejects_mentions_outside_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        fs::create_dir(&workspace).unwrap();
-        let outside_path = dir.path().join("orca-outside-mention.txt");
-        fs::write(&outside_path, "outside").unwrap();
-
-        let err =
-            expand_file_mentions("read @../orca-outside-mention.txt", &workspace).unwrap_err();
-
-        let _ = fs::remove_file(outside_path);
-        assert!(err.contains("outside the workspace"));
+            assert_eq!(expanded, input);
+        }
     }
 
     #[test]
@@ -1399,22 +1118,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_crlf_line_endings() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("win.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
-
-        let expanded = expand_file_mentions("read @win.txt#L2", dir.path()).unwrap();
-
-        assert!(expanded.contains("two</file>"));
-        assert!(!expanded.contains("\r"));
-    }
-
-    #[test]
     fn rejects_binary_files() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("image.png"), b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
+        let image = dir.path().join("image.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
 
-        let err = expand_file_mentions("read @image.png", dir.path()).unwrap_err();
+        let err = file_block("image.png", &image, "image.png", None).unwrap_err();
 
         assert!(err.contains("binary file"));
     }
@@ -1429,47 +1138,11 @@ mod tests {
             .unwrap();
 
         let oversized_error =
-            file_block("oversized.txt", &oversized, None, "oversized.txt", None).unwrap_err();
+            file_block("oversized.txt", &oversized, "oversized.txt", None).unwrap_err();
         assert!(oversized_error.contains("file is too large"));
 
-        let directory_error = file_block("folder", dir.path(), None, "folder", None).unwrap_err();
+        let directory_error = file_block("folder", dir.path(), "folder", None).unwrap_err();
         assert!(directory_error.contains("not a regular file"));
-    }
-
-    #[test]
-    fn preserves_mention_appearance_order() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("b.txt"), "beta").unwrap();
-        fs::write(dir.path().join("a.txt"), "alpha").unwrap();
-
-        let expanded = expand_file_mentions("see @b.txt and @a.txt", dir.path()).unwrap();
-
-        let b_pos = expanded.find(r#"<file path="b.txt">"#).unwrap();
-        let a_pos = expanded.find(r#"<file path="a.txt">"#).unwrap();
-        assert!(b_pos < a_pos);
-    }
-
-    #[test]
-    fn expands_quoted_path_with_spaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("my dir");
-        fs::create_dir(&sub).unwrap();
-        fs::write(sub.join("file.txt"), "content").unwrap();
-
-        let expanded = expand_file_mentions(r#"read @"my dir/file.txt""#, dir.path()).unwrap();
-
-        assert!(expanded.contains(r#"<file path="my dir/file.txt">"#));
-        assert!(expanded.contains("content</file>"));
-    }
-
-    #[test]
-    fn line_range_error_includes_line_count() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("short.txt"), "one\ntwo\n").unwrap();
-
-        let err = expand_file_mentions("read @short.txt#L5", dir.path()).unwrap_err();
-
-        assert!(err.contains("only 2 lines"));
     }
 
     #[test]
