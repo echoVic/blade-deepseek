@@ -13,12 +13,13 @@ for that generation to return, starts a fresh scope on the same logical turn,
 and does not append the original user prompt again. Permission, user-input, and
 MCP waiters are cancellation-aware and generation-fenced, stale responses and
 steer input are rejected, and replaced generations cannot publish stale
-`session.completed` output. The first generation keeps its request-id shape;
-resumed interaction ids carry an internal generation suffix. CLI arguments, TUI
+`session.completed` output or outer cancellation errors. The first generation
+keeps its request-id shape; resumed interaction ids carry an internal generation
+suffix. CLI arguments, TUI
 keys and flows, server/JSONL methods and event names, persistence, and DeepSeek
 request behavior remain compatible.
 
-Focused cancellation tests, 776 `orca-runtime` tests, and 107 `server_mode_*`
+Focused cancellation tests, 777 `orca-runtime` tests, and 107 `server_mode_*`
 contracts pass. The full serial workspace gate, workspace Clippy, site build and
 SEO, release-helper tests, and the real DeepSeek provider/CLI/history/server,
 active turn-control, thread-memory, metadata, list/search, and paginated-read
