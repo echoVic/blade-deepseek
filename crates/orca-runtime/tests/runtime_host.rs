@@ -1525,6 +1525,154 @@ fn default_executor_delegates_to_runtime_thread_turn_executor() {
 }
 
 #[test]
+fn canonical_hosted_turn_emits_context_budget_before_turn_start() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(test_config(cwd.path().to_path_buf()), "canonical context")
+        .expect("start runtime thread");
+    let output = SharedWriter::default();
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("reply from mock provider"),
+            output.clone(),
+        )
+        .expect("start canonical context turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("canonical context terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    let events = output.json_events();
+    let context_index = events
+        .iter()
+        .position(|event| event["type"] == "context.updated")
+        .expect("context budget event");
+    let turn_index = events
+        .iter()
+        .position(|event| event["type"] == "turn.started")
+        .expect("turn started event");
+    assert!(context_index < turn_index);
+    assert!(
+        events[context_index]["payload"]["limit_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn canonical_hosted_bash_streams_output_before_tool_terminal() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "canonical shell output")
+        .expect("start runtime thread");
+    let output = SharedWriter::default();
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("bash printf before; sleep 0.1; printf after"),
+            output.clone(),
+        )
+        .expect("start canonical shell turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("canonical shell terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    let events = output.json_events();
+    let turn_indices = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| (event["type"] == "turn.started").then_some(index))
+        .collect::<Vec<_>>();
+    assert!(
+        turn_indices.len() >= 2,
+        "tool execution must require a follow-up provider turn"
+    );
+    assert!(turn_indices.iter().all(|index| {
+        index
+            .checked_sub(1)
+            .is_some_and(|previous| events[previous]["type"] == "context.updated")
+    }));
+    let deltas = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "tool.output.delta")
+        .collect::<Vec<_>>();
+    assert!(!deltas.is_empty(), "canonical bash must stream output");
+    let streamed = deltas
+        .iter()
+        .filter_map(|(_, event)| event["payload"]["chunk"].as_str())
+        .collect::<String>();
+    assert!(streamed.contains("before"));
+    assert!(streamed.contains("after"));
+    let terminal_index = events
+        .iter()
+        .position(|event| event["type"] == "tool.call.completed")
+        .expect("tool terminal");
+    assert!(deltas.iter().all(|(index, _)| *index < terminal_index));
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn canonical_hosted_edit_emits_committed_diff() {
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(cwd.path().join("notes.txt"), "old\nsame\n").unwrap();
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "canonical committed diff")
+        .expect("start runtime thread");
+    let output = SharedWriter::default();
+
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("edit notes.txt :: old => committed"),
+            output.clone(),
+        )
+        .expect("start canonical edit turn");
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("canonical edit terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+
+    let completed = output
+        .json_events()
+        .into_iter()
+        .find(|event| event["type"] == "tool.call.completed" && event["payload"]["name"] == "edit")
+        .expect("edit terminal");
+    let diff = completed["payload"]["diff"]
+        .as_str()
+        .expect("committed diff");
+    assert!(diff.contains("-old"));
+    assert!(diff.contains("+committed"));
+    assert_eq!(
+        std::fs::read_to_string(cwd.path().join("notes.txt")).unwrap(),
+        "committed\nsame\n"
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
 fn generation_scoped_approval_handler_controls_canonical_tool_execution() {
     let cwd = tempfile::tempdir().unwrap();
     let host = RuntimeHost::start().expect("start runtime host");

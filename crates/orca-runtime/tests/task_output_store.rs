@@ -25,12 +25,18 @@ fn task_output_store_reads_delta_and_tail_without_splitting_utf8() {
 
     assert_eq!(store.size(task_id), 18);
 
+    let snapshot = store.read_delta(task_id, 0, 64).expect("read snapshot");
+    assert_eq!(snapshot.stdout, "first\nlast\n");
+    assert_eq!(snapshot.stderr, "错误\n");
+    assert_eq!(snapshot.combined, "first\n错误\nlast\n");
+
     let delta = store.read_delta(task_id, 6, 7).expect("read delta");
     assert_eq!(
         delta,
         TaskOutputRead {
             stdout: String::new(),
             stderr: "错误\n".to_string(),
+            combined: "错误\n".to_string(),
             next_offset: 13,
             bytes_read: 7,
             bytes_total: 18,
@@ -43,6 +49,7 @@ fn task_output_store_reads_delta_and_tail_without_splitting_utf8() {
     let tail = store.tail(task_id, 6).expect("read tail");
     assert_eq!(tail.stdout, "last\n");
     assert_eq!(tail.stderr, "");
+    assert_eq!(tail.combined, "last\n");
     assert_eq!(tail.next_offset, 18);
     assert_eq!(tail.bytes_read, 5);
     assert_eq!(tail.bytes_total, 18);
@@ -66,6 +73,7 @@ fn task_output_store_skips_partial_utf8_at_delta_start() {
 
     assert_eq!(delta.stdout, "误b");
     assert_eq!(delta.stderr, "");
+    assert_eq!(delta.combined, "误b");
     assert_eq!(delta.next_offset, store.size(task_id));
     assert_eq!(delta.bytes_read, store.size(task_id) - 2);
 }
@@ -83,6 +91,7 @@ fn task_output_store_advances_when_delta_cap_splits_first_utf8_codepoint() {
 
     assert_eq!(delta.stdout, "错");
     assert_eq!(delta.stderr, "");
+    assert_eq!(delta.combined, "错");
     assert_eq!(delta.next_offset, 3);
     assert_eq!(delta.bytes_read, 3);
     assert_eq!(delta.bytes_total, store.size(task_id));
@@ -106,6 +115,7 @@ fn task_output_store_retains_bounded_tail_and_reports_omitted_prefix() {
     let snapshot = store.read_delta(task_id, 0, 64).expect("read snapshot");
     assert_eq!(snapshot.stdout, "last\n");
     assert_eq!(snapshot.stderr, "");
+    assert_eq!(snapshot.combined, "last\n");
     assert_eq!(snapshot.next_offset, 18);
     assert_eq!(snapshot.bytes_read, 5);
     assert_eq!(snapshot.bytes_total, 18);
@@ -116,6 +126,7 @@ fn task_output_store_retains_bounded_tail_and_reports_omitted_prefix() {
     let tail = store.tail(task_id, 64).expect("read tail");
     assert_eq!(tail.stdout, "last\n");
     assert_eq!(tail.stderr, "");
+    assert_eq!(tail.combined, "last\n");
     assert_eq!(tail.omitted_prefix_bytes, 13);
     assert_eq!(tail.stdout_prefix_bytes, 6);
     assert_eq!(tail.stderr_prefix_bytes, 7);
@@ -133,6 +144,7 @@ fn task_output_store_trims_to_utf8_boundary_when_cap_splits_multibyte_character(
     let snapshot = store.read_delta(task_id, 0, 64).expect("read snapshot");
     assert_eq!(snapshot.stdout, "误b");
     assert_eq!(snapshot.stderr, "");
+    assert_eq!(snapshot.combined, "误b");
     assert_eq!(snapshot.next_offset, store.size(task_id));
     assert_eq!(snapshot.bytes_total, 8);
     assert_eq!(snapshot.omitted_prefix_bytes, 4);

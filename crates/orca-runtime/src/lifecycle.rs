@@ -646,13 +646,14 @@ impl<'a> RuntimeTaskActor<'a> {
             cancel,
             permission_handler,
             mcp_elicitation_handler: None,
+            output_handler: None,
             extension_stores: None,
         })
     }
 
     pub(crate) fn execute_normal_tool_invocation(
         &mut self,
-        invocation: RuntimeNormalToolInvocation<'_>,
+        invocation: RuntimeNormalToolInvocation<'_, '_>,
     ) -> ToolResult {
         execute_runtime_normal_tool_invocation(invocation, None)
     }

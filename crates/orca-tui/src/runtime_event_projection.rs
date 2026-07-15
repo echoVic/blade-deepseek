@@ -19,6 +19,10 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
             cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
             estimated_cost_usd: event.payload["estimated_cost_usd"].as_f64()?,
         })),
+        EventType::ContextUpdated => Some(TuiEvent::ContextUpdated {
+            used_tokens: event.payload["used_tokens"].as_u64()? as usize,
+            limit_tokens: event.payload["limit_tokens"].as_u64()? as usize,
+        }),
         EventType::ContextCompactionStarted => {
             let _: ContextCompactionStartedPayload =
                 serde_json::from_value(event.payload.clone()).ok()?;
@@ -59,6 +63,10 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
                 .map(str::to_string),
             arguments_bytes: event.payload["arguments_bytes"].as_u64()? as usize,
         }),
+        EventType::ToolOutputDelta => Some(TuiEvent::ToolOutputDelta {
+            id: event.payload["id"].as_str()?.to_string(),
+            chunk: event.payload["chunk"].as_str()?.to_string(),
+        }),
         EventType::ToolCallCompleted => {
             let output = event
                 .payload
@@ -72,7 +80,11 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
                 name: event.payload["name"].as_str()?.to_string(),
                 status: event.payload["status"].as_str()?.to_string(),
                 output,
-                diff: None,
+                diff: event
+                    .payload
+                    .get("diff")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
                 kind: event
                     .payload
                     .get("kind")
@@ -352,6 +364,65 @@ mod tests {
             }
             other => panic!("expected tool completed event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_context_updated_event_maps_to_tui_context_budget() {
+        let mut events = EventFactory::new("tui-context-budget".to_string());
+
+        let event = tui_event_from_runtime_event(&events.context_updated(4_096, 96_000))
+            .expect("context event");
+
+        assert!(matches!(
+            event,
+            TuiEvent::ContextUpdated {
+                used_tokens: 4_096,
+                limit_tokens: 96_000
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_tool_output_delta_maps_to_tui_live_output() {
+        let mut events = EventFactory::new("tui-tool-output".to_string());
+
+        let event = tui_event_from_runtime_event(
+            &events.tool_output_delta("shell-call", "streamed output\n"),
+        )
+        .expect("tool output event");
+
+        assert!(matches!(
+            event,
+            TuiEvent::ToolOutputDelta { id, chunk }
+                if id == "shell-call" && chunk == "streamed output\n"
+        ));
+    }
+
+    #[test]
+    fn runtime_tool_completed_event_maps_committed_diff() {
+        let request = tool_types::ToolRequest {
+            id: "tool-call-diff".to_string(),
+            name: tool_types::ToolName::Edit,
+            action: orca_core::approval_types::ActionKind::Write,
+            target: Some("notes.txt".to_string()),
+            raw_arguments: None,
+        };
+        let result =
+            tool_types::ToolResult::completed(&request, "edited notes.txt".to_string(), false)
+                .with_file_change_preview(tool_types::FileChangePreview::UnifiedDiff {
+                    text: "--- a/notes.txt\n+++ b/notes.txt\n-old\n+new\n".to_string(),
+                    truncated: false,
+                });
+        let mut events = EventFactory::new("tui-tool-diff".to_string());
+
+        let event = tui_event_from_runtime_event(&events.tool_call_completed(&result))
+            .expect("tool completion event");
+
+        assert!(matches!(
+            event,
+            TuiEvent::ToolCompleted { diff: Some(diff), .. }
+                if diff.contains("-old") && diff.contains("+new")
+        ));
     }
 
     #[test]

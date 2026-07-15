@@ -28,7 +28,7 @@ use crate::shell_session::{
 };
 use crate::tasks::TaskRegistry;
 
-pub(crate) struct RuntimeBashInvocationContext<'a> {
+pub(crate) struct RuntimeBashInvocationContext<'a, 'output> {
     pub(crate) config: Option<&'a RunConfig>,
     pub(crate) request: &'a ToolRequest,
     pub(crate) cwd: &'a Path,
@@ -39,11 +39,12 @@ pub(crate) struct RuntimeBashInvocationContext<'a> {
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
+    pub(crate) output_handler: Option<&'output mut dyn FnMut(&str)>,
     pub(crate) extension_stores: RuntimeExtensionStores<'a>,
 }
 
 pub(crate) fn execute_bash_with_shell_session(
-    context: RuntimeBashInvocationContext<'_>,
+    context: RuntimeBashInvocationContext<'_, '_>,
 ) -> ToolResult {
     let RuntimeBashInvocationContext {
         config,
@@ -56,6 +57,7 @@ pub(crate) fn execute_bash_with_shell_session(
         cancel,
         permission_handler,
         permission_overlay,
+        mut output_handler,
         extension_stores,
     } = context;
     let Some(command) = request
@@ -79,6 +81,7 @@ pub(crate) fn execute_bash_with_shell_session(
             shell_timeout_secs,
             task_registry,
             cancel,
+            output_handler: reborrow_output_handler(&mut output_handler),
         })
         .into_tool_result(request, output_truncation, shell_timeout_secs);
     };
@@ -109,6 +112,7 @@ pub(crate) fn execute_bash_with_shell_session(
         shell_timeout_secs,
         task_registry,
         cancel,
+        output_handler: reborrow_output_handler(&mut output_handler),
     });
     let BashExecutionResult {
         output,
@@ -146,6 +150,7 @@ pub(crate) fn execute_bash_with_shell_session(
             shell_timeout_secs,
             task_registry,
             cancel,
+            output_handler: reborrow_output_handler(&mut output_handler),
         })
         .output
         .into_tool_result(request, output_truncation, shell_timeout_secs);
@@ -193,6 +198,7 @@ pub(crate) fn execute_bash_with_shell_session(
                 shell_timeout_secs,
                 task_registry,
                 cancel,
+                output_handler: reborrow_output_handler(&mut output_handler),
             })
             .output
             .with_sandbox_diagnostic(cwd)
@@ -228,6 +234,7 @@ pub(crate) fn execute_bash_with_shell_session(
                 shell_timeout_secs,
                 task_registry,
                 cancel,
+                output_handler: reborrow_output_handler(&mut output_handler),
             })
             .with_sandbox_diagnostic(cwd)
             .into_tool_result(request, output_truncation, shell_timeout_secs);
@@ -257,7 +264,7 @@ struct BashShellOutput {
     output: Result<crate::shell_session::ShellSessionOutput, String>,
 }
 
-struct RuntimeBashSandboxContext<'a> {
+struct RuntimeBashSandboxContext<'a, 'output> {
     command: &'a str,
     cwd: &'a Path,
     additional_roots: &'a [PathBuf],
@@ -265,9 +272,10 @@ struct RuntimeBashSandboxContext<'a> {
     shell_timeout_secs: u64,
     task_registry: &'a TaskRegistry,
     cancel: Option<&'a CancelToken>,
+    output_handler: Option<&'output mut dyn FnMut(&str)>,
 }
 
-struct RuntimeBashOnceContext<'a> {
+struct RuntimeBashOnceContext<'a, 'output> {
     command: &'a str,
     cwd: &'a Path,
     additional_readable_directories: Vec<PathBuf>,
@@ -279,6 +287,7 @@ struct RuntimeBashOnceContext<'a> {
     shell_timeout_secs: u64,
     task_registry: &'a TaskRegistry,
     cancel: Option<&'a CancelToken>,
+    output_handler: Option<&'output mut dyn FnMut(&str)>,
 }
 
 struct RuntimeBashPermissionPrompt {
@@ -450,7 +459,7 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_>) -> BashExecutionResult {
+fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_, '_>) -> BashExecutionResult {
     let RuntimeBashSandboxContext {
         command,
         cwd,
@@ -459,6 +468,7 @@ fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_>) -> BashExec
         shell_timeout_secs,
         task_registry,
         cancel,
+        output_handler,
     } = context;
     let mut additional_working_directories = additional_roots.to_vec();
     additional_working_directories.extend(sandbox.additional_writable_roots.clone());
@@ -511,6 +521,7 @@ fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_>) -> BashExec
         shell_timeout_secs,
         task_registry,
         cancel,
+        output_handler,
     });
     let network_block = block_receiver.and_then(|receiver| {
         receiver
@@ -523,7 +534,7 @@ fn execute_bash_with_sandbox(context: RuntimeBashSandboxContext<'_>) -> BashExec
     }
 }
 
-fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
+fn execute_bash_once(context: RuntimeBashOnceContext<'_, '_>) -> BashShellOutput {
     let RuntimeBashOnceContext {
         command,
         cwd,
@@ -536,6 +547,7 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
         shell_timeout_secs,
         task_registry,
         cancel,
+        output_handler,
     } = context;
     let mut manager = RuntimeShellSessionManager::new(task_registry.clone());
     let handle = match manager.spawn(ShellSessionCommand {
@@ -558,18 +570,31 @@ fn execute_bash_once(context: RuntimeBashOnceContext<'_>) -> BashShellOutput {
         }
     };
     let _ = manager.close_stdin(&handle.id);
-    let output = match manager.wait_or_cancel(
+    fn discard_output(_: &str) {}
+    let mut discard_output = discard_output;
+    let output_handler = output_handler.unwrap_or(&mut discard_output);
+    let output = match manager.wait_or_cancel_with_output(
         &handle.id,
         std::time::Duration::from_secs(shell_timeout_secs.max(1)),
         || {
             cancel.is_some_and(CancelToken::is_cancelled)
                 || task_registry.is_cancelled(&handle.task_id)
         },
+        output_handler,
     ) {
         Ok(output) => Ok(output),
         Err(error) => Err(format!("failed to wait for shell command: {error}")),
     };
     BashShellOutput { output }
+}
+
+fn reborrow_output_handler<'borrow, 'handler>(
+    handler: &'borrow mut Option<&'handler mut dyn FnMut(&str)>,
+) -> Option<&'borrow mut dyn FnMut(&str)> {
+    match handler {
+        Some(handler) => Some(&mut **handler),
+        None => None,
+    }
 }
 
 #[cfg(test)]

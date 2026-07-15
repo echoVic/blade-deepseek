@@ -13,6 +13,7 @@ pub struct TaskOutputStore {
 pub struct TaskOutputRead {
     pub stdout: String,
     pub stderr: String,
+    pub combined: String,
     pub next_offset: usize,
     pub bytes_read: usize,
     pub bytes_total: usize,
@@ -140,6 +141,7 @@ impl TaskOutputRead {
         Self {
             stdout: String::new(),
             stderr: String::new(),
+            combined: String::new(),
             next_offset: offset,
             bytes_read: 0,
             bytes_total: offset,
@@ -182,6 +184,7 @@ impl TaskOutputBuffer {
     fn read_range(&self, start: usize, end: usize, omitted_prefix_bytes: usize) -> TaskOutputRead {
         let mut stdout = String::new();
         let mut stderr = String::new();
+        let mut combined = String::new();
         let (stdout_prefix_bytes, stderr_prefix_bytes) = self.stream_prefix_bytes(start);
         let mut next_offset = start;
         for chunk in &self.chunks {
@@ -203,11 +206,13 @@ impl TaskOutputBuffer {
                 TaskOutputStream::Stdout => stdout.push_str(text),
                 TaskOutputStream::Stderr => stderr.push_str(text),
             }
+            combined.push_str(text);
             next_offset = chunk_start + local_end;
         }
         TaskOutputRead {
             stdout,
             stderr,
+            combined,
             next_offset,
             bytes_read: next_offset.saturating_sub(start),
             bytes_total: self.bytes_total,
@@ -321,4 +326,23 @@ fn utf8_ceil(text: &str, mut index: usize) -> usize {
         index += 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_delta_preserves_observed_chunk_order() {
+        let store = TaskOutputStore::new();
+        store.append_stdout("task-1", "first").unwrap();
+        store.append_stderr("task-1", "-second").unwrap();
+        store.append_stdout("task-1", "-third").unwrap();
+
+        let output = store.read_delta("task-1", 0, usize::MAX).unwrap();
+
+        assert_eq!(output.stdout, "first-third");
+        assert_eq!(output.stderr, "-second");
+        assert_eq!(output.combined, "first-second-third");
+    }
 }

@@ -200,25 +200,41 @@ impl<'a> RuntimeToolRouter<'a> {
                             .cloned(),
                     )
                     .collect::<Vec<_>>();
-                Ok(self
-                    .runtime
-                    .execute_normal_tool_invocation(RuntimeNormalToolInvocation {
-                        config: Some(config),
-                        request: execution_request,
-                        cwd,
-                        additional_roots: &additional_roots,
-                        mcp_registry,
-                        external_tools: &config.external_tools,
-                        output_truncation: config.tools.output_truncation,
-                        shell_timeout_secs: config.tools.shell_timeout_secs,
-                        task_registry: Some(task_registry),
-                        cancel: Some(cancel),
-                        permission_handler: permission_handler
-                            .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
-                        mcp_elicitation_handler: mcp_elicitation_handler
-                            .map(|handler| handler as &dyn McpElicitationHandler),
-                        extension_stores,
-                    }))
+                let mut event_error = None;
+                let mut output_handler = |chunk: &str| {
+                    if emit_deltas
+                        && event_error.is_none()
+                        && let Err(error) =
+                            sink.emit(&events.tool_output_delta(&execution_request.id, chunk))
+                    {
+                        event_error = Some(error);
+                    }
+                };
+                let result =
+                    self.runtime
+                        .execute_normal_tool_invocation(RuntimeNormalToolInvocation {
+                            config: Some(config),
+                            request: execution_request,
+                            cwd,
+                            additional_roots: &additional_roots,
+                            mcp_registry,
+                            external_tools: &config.external_tools,
+                            output_truncation: config.tools.output_truncation,
+                            shell_timeout_secs: config.tools.shell_timeout_secs,
+                            task_registry: Some(task_registry),
+                            cancel: Some(cancel),
+                            permission_handler: permission_handler
+                                .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
+                            mcp_elicitation_handler: mcp_elicitation_handler
+                                .map(|handler| handler as &dyn McpElicitationHandler),
+                            output_handler: Some(&mut output_handler),
+                            extension_stores,
+                        });
+                drop(output_handler);
+                match event_error {
+                    Some(error) => Err(error),
+                    None => Ok(result),
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1 through P0.3e4a complete; P0.3e4b next
+- Status: Active; P0.3e1 through P0.3e4b1 complete; P0.3e4b2 next
 - Date: 2026-07-15
 - Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3c validation)
 - Branch: `codex/tui-runtime-host-migration`
@@ -568,6 +568,75 @@ and complete real DeepSeek E2E passed within the `$0.02` budget, including
 provider summary, CLI, history replay and repair, server/thread memory,
 active-turn resume/control, metadata, list filters/search, and turn/item
 pagination.
+
+P0.3e4b slice contract:
+
+- **Current structural problem and evidence.** The canonical runtime emits
+  compaction, usage, and tool terminal events, but it does not emit the current
+  context budget or live shell output, and its tool terminal drops the
+  committed `FileChangePreview`. `HostedTurnRequest` stores goal-tool,
+  task-description, and backtrack metadata without forwarding those semantics
+  into `ThreadTurnRequest`. Finally, provider execution is synchronous, so a
+  background-current-turn request cannot release the actor-owned thread without
+  being mislabeled as a completed operation.
+- **Target ownership and boundary.** `ThreadTurnRequest` owns prompt placement
+  and tool-schema policy; canonical runtime events own every presentation fact
+  needed by the TUI; provider execution returns a typed completed-or-suspended
+  result; the runtime host owns operation terminal publication. The TUI only
+  projects events and requests a typed background handoff.
+- **TUI user value.** The canonical path keeps the context meter accurate,
+  preserves committed file diffs, streams shell output before completion,
+  keeps workflow notifications out of backtrack history, exposes goal tools
+  only during goal mode, and retains non-blocking background-current-turn
+  behavior without orphaning provider work.
+- **External compatibility.** CLI arguments, TUI keys and transcript behavior,
+  server/JSONL event consumers, persisted messages/tasks, and provider request
+  semantics remain compatible. `context.updated` and `tool.output.delta` are
+  additive event types; `tool.call.completed.diff` is an additive payload
+  field.
+- **Migration and temporary state.** P0.3e4b1 adds canonical event fidelity;
+  P0.3e4b2 moves prompt/tool/task metadata into typed canonical requests;
+  P0.3e4b3 adds the typed provider suspension result and switches production
+  foreground execution. The existing TUI background completion supervisor is
+  the only intentional temporary owner until P0.3e4c moves it into the host.
+- **Acceptance.** Each checkpoint starts with behavior RED tests and passes its
+  focused crates before commit. P0.3e4b as a whole additionally passes the
+  serial workspace gate, workspace Clippy, the real DeepSeek harness, and a
+  production PTY TUI smoke covering streamed output, context/usage, interrupt,
+  and normal terminal restoration.
+- **Deletion gate.** P0.3e4b3 removes production foreground calls to
+  `run_agent_for_tui_with_event_factory`. P0.3e4c then deletes
+  `TuiThreadOperationExecutor`, `ProviderStreamTask`, the duplicated TUI
+  provider/tool/compaction loop, and `TuiTaskSupervisor` after the host owns the
+  final background handoff.
+
+P0.3e4b1 acceptance:
+
+- canonical execution emits one `context.updated` before each provider turn
+  with the same wire-token budget used for compaction;
+- canonical bash execution emits ordered `tool.output.delta` chunks before its
+  `tool.call.completed` terminal and preserves cancellation/join behavior;
+- canonical edit/write terminals carry the committed preview captured by the
+  tool result rather than rereading later workspace state;
+- the TUI runtime projection maps all three typed facts without TUI-side tool
+  execution or filesystem reads;
+- `orca-core`, `orca-runtime`, runtime-host, and `orca-tui` focused tests pass.
+
+P0.3e4b1 checkpoint result:
+
+- canonical context pressure now emits `context.updated` before `turn.started`,
+  using the same wire-token calculation and soft limit as compaction;
+- canonical bash execution projects observed stdout/stderr chunks in order as
+  `tool.output.delta` while retaining the shell session's existing
+  cancel/wait/join owner;
+- edit and write completion events project the committed `FileChangePreview`
+  already captured by the tool result, with no post-execution filesystem read;
+- the TUI runtime adapter maps context budget, live tool output, and committed
+  diff directly from typed runtime events;
+- formatting and diff checks passed, followed by `orca-core` 147/147,
+  `orca-runtime` 770/770, runtime-host 27/27, task-output 12/12, and `orca-tui`
+  513/513. Focused all-targets Clippy completed successfully with only the
+  repository's existing non-deny warning baseline.
 
 ## Slice Acceptance Criteria
 

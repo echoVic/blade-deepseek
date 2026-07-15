@@ -64,6 +64,19 @@ impl RuntimeTurnOpeningStep {
         )
         .compact_if_needed(input.conversation)?;
 
+        if turn_context.emit_deltas {
+            let pressure = context::context_pressure(
+                input.conversation,
+                input.context_config,
+                input.provider_config,
+            );
+            input.sink.emit(
+                &input
+                    .events
+                    .context_updated(pressure.wire_tokens, pressure.soft_limit),
+            )?;
+        }
+
         match RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStep::new().start(
             RuntimeTurnStartInput {
                 actor: input.actor,

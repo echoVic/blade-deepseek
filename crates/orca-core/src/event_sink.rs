@@ -90,6 +90,11 @@ impl<W: Write> EventSink<W> {
                 let cost = event.payload["estimated_cost_usd"].as_f64().unwrap_or(0.0);
                 writeln!(self.writer, "usage: {total} tokens (${cost:.6})")
             }
+            EventType::ContextUpdated => {
+                let used = event.payload["used_tokens"].as_u64().unwrap_or_default();
+                let limit = event.payload["limit_tokens"].as_u64().unwrap_or_default();
+                writeln!(self.writer, "context: {used}/{limit} tokens")
+            }
             EventType::ContextCompactionStarted => {
                 writeln!(self.writer, "context compaction started")
             }
@@ -111,6 +116,11 @@ impl<W: Write> EventSink<W> {
                     "tool receiving arguments: {name} ({bytes} bytes)"
                 )
             }
+            EventType::ToolOutputDelta => write!(
+                self.writer,
+                "{}",
+                event.payload["chunk"].as_str().unwrap_or_default()
+            ),
             EventType::ToolCallRequested => {
                 let name = event.payload["name"].as_str().unwrap_or("tool");
                 writeln!(self.writer, "tool requested: {name}")

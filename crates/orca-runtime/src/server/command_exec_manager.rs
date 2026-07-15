@@ -479,6 +479,7 @@ impl CommandExecManager {
                         .unwrap_or_else(|_| crate::task_output::TaskOutputRead {
                             stdout: String::new(),
                             stderr: String::new(),
+                            combined: String::new(),
                             next_offset: process.output_offset,
                             bytes_read: 0,
                             bytes_total: process.output_offset,

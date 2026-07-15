@@ -11,7 +11,7 @@ use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::runtime_bash::{RuntimeBashInvocationContext, execute_bash_with_shell_session};
 use crate::tasks::TaskRegistry;
 
-pub(crate) struct RuntimeNormalToolExecutionContext<'a> {
+pub(crate) struct RuntimeNormalToolExecutionContext<'a, 'output> {
     pub(crate) config: Option<&'a RunConfig>,
     pub(crate) request: &'a ToolRequest,
     pub(crate) cwd: &'a Path,
@@ -24,11 +24,12 @@ pub(crate) struct RuntimeNormalToolExecutionContext<'a> {
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
+    pub(crate) output_handler: Option<&'output mut dyn FnMut(&str)>,
     pub(crate) permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
 
-pub(crate) struct RuntimeNormalToolInvocation<'a> {
+pub(crate) struct RuntimeNormalToolInvocation<'a, 'output> {
     pub(crate) config: Option<&'a RunConfig>,
     pub(crate) request: &'a ToolRequest,
     pub(crate) cwd: &'a Path,
@@ -41,10 +42,11 @@ pub(crate) struct RuntimeNormalToolInvocation<'a> {
     pub(crate) cancel: Option<&'a CancelToken>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
+    pub(crate) output_handler: Option<&'output mut dyn FnMut(&str)>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
 }
 
-impl<'a> RuntimeNormalToolInvocation<'a> {
+impl<'a, 'output> RuntimeNormalToolInvocation<'a, 'output> {
     pub(crate) fn with_extension_stores(
         mut self,
         extension_stores: RuntimeExtensionStores<'a>,
@@ -56,7 +58,7 @@ impl<'a> RuntimeNormalToolInvocation<'a> {
     fn into_execution_context(
         self,
         permission_overlay: Option<&'a mut TurnPermissionOverlay>,
-    ) -> RuntimeNormalToolExecutionContext<'a> {
+    ) -> RuntimeNormalToolExecutionContext<'a, 'output> {
         RuntimeNormalToolExecutionContext {
             config: self.config,
             request: self.request,
@@ -70,6 +72,7 @@ impl<'a> RuntimeNormalToolInvocation<'a> {
             cancel: self.cancel,
             permission_handler: self.permission_handler,
             mcp_elicitation_handler: self.mcp_elicitation_handler,
+            output_handler: self.output_handler,
             permission_overlay,
             extension_stores: self.extension_stores,
         }
@@ -120,14 +123,14 @@ static DEFAULT_NORMAL_TOOL_FALLBACK: DefaultRuntimeNormalToolFallbackExecutor =
     DefaultRuntimeNormalToolFallbackExecutor;
 
 pub(crate) fn execute_runtime_normal_tool(
-    context: RuntimeNormalToolExecutionContext<'_>,
+    context: RuntimeNormalToolExecutionContext<'_, '_>,
 ) -> ToolResult {
     RuntimeNormalToolExecutor::new().execute(context)
 }
 
-pub(crate) fn execute_runtime_normal_tool_invocation(
-    invocation: RuntimeNormalToolInvocation<'_>,
-    permission_overlay: Option<&mut TurnPermissionOverlay>,
+pub(crate) fn execute_runtime_normal_tool_invocation<'a>(
+    invocation: RuntimeNormalToolInvocation<'a, '_>,
+    permission_overlay: Option<&'a mut TurnPermissionOverlay>,
 ) -> ToolResult {
     execute_runtime_normal_tool(invocation.into_execution_context(permission_overlay))
 }
@@ -148,7 +151,10 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
         Self { fallback }
     }
 
-    pub(crate) fn execute(&mut self, context: RuntimeNormalToolExecutionContext<'_>) -> ToolResult {
+    pub(crate) fn execute(
+        &mut self,
+        context: RuntimeNormalToolExecutionContext<'_, '_>,
+    ) -> ToolResult {
         let RuntimeNormalToolExecutionContext {
             config,
             request,
@@ -162,6 +168,7 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
             cancel,
             permission_handler,
             mcp_elicitation_handler,
+            output_handler,
             permission_overlay,
             extension_stores,
         } = context;
@@ -182,6 +189,7 @@ impl<'a> RuntimeNormalToolExecutor<'a> {
                 cancel,
                 permission_handler,
                 permission_overlay,
+                output_handler,
                 extension_stores,
             });
         }
@@ -271,6 +279,7 @@ mod tests {
             cancel: Some(&cancel),
             permission_handler: None,
             mcp_elicitation_handler: None,
+            output_handler: None,
             permission_overlay: None,
             extension_stores: None,
         });

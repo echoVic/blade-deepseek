@@ -518,12 +518,25 @@ impl RuntimeShellSessionManager {
         timeout: Duration,
         should_cancel: impl Fn() -> bool,
     ) -> io::Result<ShellSessionOutput> {
+        self.wait_or_cancel_with_output(id, timeout, should_cancel, &mut |_| {})
+    }
+
+    pub(crate) fn wait_or_cancel_with_output(
+        &mut self,
+        id: &str,
+        timeout: Duration,
+        should_cancel: impl Fn() -> bool,
+        on_output: &mut dyn FnMut(&str),
+    ) -> io::Result<ShellSessionOutput> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
+        let task_id = self.session_mut(id)?.task_id.clone();
+        let mut output_offset = 0;
         loop {
-            let session = self.session_mut(id)?;
-            if session.child.try_wait()?.is_some() {
+            let completed = self.session_mut(id)?.child.try_wait()?.is_some();
+            output_offset = self.emit_available_output(&task_id, output_offset, on_output)?;
+            if completed {
                 break;
             }
             if should_cancel() {
@@ -538,6 +551,7 @@ impl RuntimeShellSessionManager {
         let mut session = self.take_session(id)?;
         let status = session.child.wait()?;
         session.join_readers();
+        self.emit_available_output(&task_id, output_offset, on_output)?;
         let tasks = session.tasks.clone();
         let output = session.output(
             id,
@@ -552,6 +566,21 @@ impl RuntimeShellSessionManager {
         Self::record_terminal_output(&tasks, &output)?;
         self.output_store.remove(&output.task_id);
         Ok(output)
+    }
+
+    fn emit_available_output(
+        &self,
+        task_id: &str,
+        from_offset: usize,
+        on_output: &mut dyn FnMut(&str),
+    ) -> io::Result<usize> {
+        let output = self
+            .output_store
+            .read_delta(task_id, from_offset, usize::MAX)?;
+        if !output.combined.is_empty() {
+            on_output(&output.combined);
+        }
+        Ok(output.next_offset)
     }
 
     pub fn kill(&mut self, id: &str) -> io::Result<ShellSessionOutput> {
@@ -697,6 +726,7 @@ impl ShellSession {
             .unwrap_or_else(|_| TaskOutputRead {
                 stdout: String::new(),
                 stderr: String::new(),
+                combined: String::new(),
                 next_offset: 0,
                 bytes_read: 0,
                 bytes_total: self.output_size(),

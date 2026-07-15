@@ -9,7 +9,7 @@ use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
 use crate::provider_types::{ProviderReplayState, ToolCallProgress};
 use crate::task_types::BackgroundTaskSummary;
-use crate::tool_types::{ToolRequest, ToolResult, ToolTerminalSource};
+use crate::tool_types::{FileChangePreview, ToolRequest, ToolResult, ToolTerminalSource};
 use crate::verification::VerificationResult;
 
 pub const EVENT_SCHEMA_VERSION: &str = "1";
@@ -39,6 +39,8 @@ pub enum EventType {
     ProviderReplayUpdated,
     #[serde(rename = "usage.updated")]
     UsageUpdated,
+    #[serde(rename = "context.updated")]
+    ContextUpdated,
     #[serde(rename = "context.compaction.started")]
     ContextCompactionStarted,
     #[serde(rename = "context.compacted")]
@@ -51,6 +53,8 @@ pub enum EventType {
     ApprovalResolved,
     #[serde(rename = "tool.call.progress")]
     ToolCallProgress,
+    #[serde(rename = "tool.output.delta")]
+    ToolOutputDelta,
     #[serde(rename = "tool.call.requested")]
     ToolCallRequested,
     #[serde(rename = "tool.call.completed")]
@@ -240,6 +244,16 @@ impl EventFactory {
         )
     }
 
+    pub fn context_updated(&mut self, used_tokens: usize, limit_tokens: usize) -> EventEnvelope {
+        self.make(
+            EventType::ContextUpdated,
+            json!({
+                "used_tokens": used_tokens,
+                "limit_tokens": limit_tokens
+            }),
+        )
+    }
+
     pub fn context_compaction_started(
         &mut self,
         reason: &str,
@@ -323,6 +337,16 @@ impl EventFactory {
         )
     }
 
+    pub fn tool_output_delta(&mut self, id: &str, chunk: &str) -> EventEnvelope {
+        self.make(
+            EventType::ToolOutputDelta,
+            json!({
+                "id": id,
+                "chunk": chunk
+            }),
+        )
+    }
+
     pub fn tool_call_requested(&mut self, request: &ToolRequest) -> EventEnvelope {
         self.make(
             EventType::ToolCallRequested,
@@ -349,6 +373,17 @@ impl EventFactory {
         });
         if result.terminal().source != ToolTerminalSource::Observed {
             payload["terminal_source"] = json!(result.terminal().source);
+        }
+        if let Some(preview) = result.file_change_preview.as_deref() {
+            payload["diff"] = json!(match preview {
+                FileChangePreview::UnifiedDiff { text, .. } => text.clone(),
+                FileChangePreview::Omitted {
+                    path,
+                    max_input_bytes,
+                } => format!(
+                    "[Diff preview omitted for {path}: input exceeds {max_input_bytes} bytes]"
+                ),
+            });
         }
         self.make(EventType::ToolCallCompleted, payload)
     }
@@ -1099,6 +1134,52 @@ mod tests {
         assert_eq!(event.event_type, EventType::ContextCompactionStarted);
         assert_eq!(event.payload["reason"], "prompt_too_long_recovery");
         assert_eq!(event.payload["before_messages"], 12);
+    }
+
+    #[test]
+    fn context_updated_payload_carries_wire_budget() {
+        let mut events = EventFactory::new("context-budget-test".to_string());
+
+        let event = events.context_updated(12_345, 96_000);
+
+        assert_eq!(event.event_type, EventType::ContextUpdated);
+        assert_eq!(event.payload["used_tokens"], 12_345);
+        assert_eq!(event.payload["limit_tokens"], 96_000);
+    }
+
+    #[test]
+    fn tool_output_delta_payload_carries_call_identity_and_chunk() {
+        let mut events = EventFactory::new("tool-output-test".to_string());
+
+        let event = events.tool_output_delta("call-1", "before\n");
+
+        assert_eq!(event.event_type, EventType::ToolOutputDelta);
+        assert_eq!(event.payload["id"], "call-1");
+        assert_eq!(event.payload["chunk"], "before\n");
+    }
+
+    #[test]
+    fn tool_completed_payload_carries_committed_file_preview() {
+        let request = ToolRequest {
+            id: "edit-1".to_string(),
+            name: crate::tool_types::ToolName::Edit,
+            action: crate::approval_types::ActionKind::Write,
+            target: Some("notes.txt".to_string()),
+            raw_arguments: None,
+        };
+        let result = ToolResult::completed(&request, "edited notes.txt".to_string(), false)
+            .with_file_change_preview(crate::tool_types::FileChangePreview::UnifiedDiff {
+                text: "--- a/notes.txt\n+++ b/notes.txt\n-old\n+new\n".to_string(),
+                truncated: false,
+            });
+        let mut events = EventFactory::new("tool-preview-test".to_string());
+
+        let event = events.tool_call_completed(&result);
+
+        assert_eq!(
+            event.payload["diff"],
+            "--- a/notes.txt\n+++ b/notes.txt\n-old\n+new\n"
+        );
     }
 
     #[test]
