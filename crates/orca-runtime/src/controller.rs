@@ -104,6 +104,7 @@ pub struct ThreadTurnRequest {
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     event_observer: Option<Arc<dyn EventObserver>>,
     continuation: Option<RuntimeTurnContinuation>,
+    resumes_existing_turn: bool,
 }
 
 impl<'a> ThreadTurnExecutor<'a> {
@@ -196,7 +197,7 @@ impl<'a> ThreadTurnContext<'a> {
         let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
         let prompt = request.prompt().to_string();
         let mut parts = session.runtime_parts();
-        if request.continuation().is_none() {
+        if request.continuation().is_none() && !request.resumes_existing_turn() {
             parts
                 .conversation
                 .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
@@ -290,6 +291,7 @@ impl ThreadTurnRequest {
             mcp_elicitation_handler: None,
             event_observer: None,
             continuation: None,
+            resumes_existing_turn: false,
         }
     }
 
@@ -364,6 +366,11 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_existing_turn_prompt(mut self) -> Self {
+        self.resumes_existing_turn = true;
+        self
+    }
+
     pub fn steer_handle(&self) -> Option<&ThreadSteerHandle> {
         self.steer_handle.as_ref()
     }
@@ -388,6 +395,10 @@ impl ThreadTurnRequest {
 
     pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {
         self.continuation.as_ref()
+    }
+
+    pub fn resumes_existing_turn(&self) -> bool {
+        self.resumes_existing_turn
     }
 }
 

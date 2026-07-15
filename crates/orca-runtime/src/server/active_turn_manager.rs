@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,13 +10,25 @@ use crate::lifecycle::ThreadSteerHandle;
 use crate::server_runtime::{ServerThread, ServerThreadRuntime};
 use crate::thread_store::ThreadMetadataPatch;
 
+#[derive(Debug)]
+pub(super) enum ActiveTurnCommand {
+    Resume,
+}
+
 #[derive(Clone)]
 pub(super) struct ActiveTurnControl {
     pub(super) thread_id: String,
-    pub(super) cancel: CancelToken,
     pub(super) steer_handle: ThreadSteerHandle,
+    generation: Arc<Mutex<ActiveTurnGeneration>>,
+    command_tx: mpsc::SyncSender<ActiveTurnCommand>,
     session_permission_directories: Vec<AdditionalWorkingDirectory>,
     session_network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+}
+
+struct ActiveTurnGeneration {
+    id: u64,
+    cancel: CancelToken,
+    accepts_commands: bool,
 }
 
 impl ActiveTurnControl {
@@ -23,14 +36,108 @@ impl ActiveTurnControl {
         thread_id: String,
         cancel: CancelToken,
         steer_handle: ThreadSteerHandle,
+        command_tx: mpsc::SyncSender<ActiveTurnCommand>,
     ) -> Self {
         Self {
             thread_id,
-            cancel,
             steer_handle,
+            generation: Arc::new(Mutex::new(ActiveTurnGeneration {
+                id: 0,
+                cancel,
+                accepts_commands: true,
+            })),
+            command_tx,
             session_permission_directories: Vec::new(),
             session_network_domain_permissions: HashMap::new(),
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .id
+    }
+
+    pub(super) fn cancel_token(&self) -> CancelToken {
+        self.generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancel
+            .clone()
+    }
+
+    pub(super) fn cancel_current(&self) {
+        self.generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancel
+            .cancel();
+    }
+
+    pub(super) fn start_generation(&self) -> CancelToken {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation.id = generation.id.saturating_add(1);
+        generation.cancel = CancelToken::new();
+        generation.accepts_commands = true;
+        generation.cancel.clone()
+    }
+
+    pub(super) fn request_resume(&self) -> bool {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !generation.accepts_commands || !generation.cancel.is_cancelled() {
+            return false;
+        }
+        matches!(
+            self.command_tx.try_send(ActiveTurnCommand::Resume),
+            Ok(()) | Err(mpsc::TrySendError::Full(_))
+        )
+    }
+
+    pub(super) fn close_generation_and_take_resume(
+        &self,
+        command_rx: &mpsc::Receiver<ActiveTurnCommand>,
+    ) -> bool {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation.accepts_commands = false;
+        command_rx
+            .try_iter()
+            .any(|command| matches!(command, ActiveTurnCommand::Resume))
+    }
+
+    pub(super) fn steer(&self, input: String) -> bool {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !generation.accepts_commands || generation.cancel.is_cancelled() {
+            return false;
+        }
+        self.steer_handle.push(input);
+        true
+    }
+
+    #[cfg(test)]
+    fn for_test(thread_id: String) -> (Self, mpsc::Receiver<ActiveTurnCommand>) {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        (
+            Self::new(
+                thread_id,
+                CancelToken::new(),
+                ThreadSteerHandle::default(),
+                command_tx,
+            ),
+            command_rx,
+        )
     }
 }
 
@@ -95,6 +202,19 @@ impl ActiveTurnManager {
             .any(|turn| turn.thread_id == thread_id)
     }
 
+    pub(super) fn accepts_generation(
+        &self,
+        turn_id: &str,
+        thread_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.controls.get(turn_id).is_some_and(|control| {
+            control.thread_id == thread_id
+                && control.generation() == generation
+                && !control.cancel_token().is_cancelled()
+        })
+    }
+
     pub(super) fn apply_session_permission_grant(
         &mut self,
         thread_id: &str,
@@ -122,7 +242,7 @@ impl ActiveTurnManager {
 
     pub(super) fn cancel_all(&self) {
         for control in self.controls.values() {
-            control.cancel.cancel();
+            control.cancel_current();
         }
     }
 
@@ -224,6 +344,37 @@ fn merge_completed_turn_metadata(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn resumed_generation_uses_a_fresh_permanent_cancellation_scope() {
+        let (control, command_rx) = ActiveTurnControl::for_test("thread-1".to_string());
+        let first_generation = control.generation();
+        let first_cancel = control.cancel_token();
+
+        assert!(!control.request_resume());
+        control.cancel_current();
+        assert!(control.request_resume());
+        assert!(control.close_generation_and_take_resume(&command_rx));
+        assert!(!control.request_resume());
+        let second_cancel = control.start_generation();
+
+        assert_eq!(first_generation, 0);
+        assert_eq!(control.generation(), 1);
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
+    }
+
+    #[test]
+    fn duplicate_resume_commands_coalesce_to_one_generation_restart() {
+        let (control, command_rx) = ActiveTurnControl::for_test("thread-1".to_string());
+
+        control.cancel_current();
+        assert!(control.request_resume());
+        assert!(control.request_resume());
+
+        assert!(control.close_generation_and_take_resume(&command_rx));
+        assert!(!control.close_generation_and_take_resume(&command_rx));
+    }
 
     #[test]
     fn handed_off_turn_reaper_remains_joinable_until_cleanup_finishes() {

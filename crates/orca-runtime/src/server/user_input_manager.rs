@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
+use orca_core::cancel::CancelToken;
 use serde_json::{Value, json};
 
 use crate::lifecycle::{RuntimeUserInputHandler, RuntimeUserInputRequest};
@@ -11,6 +13,15 @@ use super::{lock_error, write_locked_event};
 
 pub(super) struct PendingUserInputRequest {
     pub(super) sender: mpsc::Sender<Option<String>>,
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) generation: u64,
+}
+
+impl PendingUserInputRequest {
+    pub(super) fn generation_scope(&self) -> (&str, &str, u64) {
+        (&self.thread_id, &self.turn_id, self.generation)
+    }
 }
 
 #[derive(Default)]
@@ -71,6 +82,8 @@ pub(super) struct ServerUserInputRequestHandler<W: Write + Send + 'static> {
     event_id: Value,
     thread_id: String,
     turn_id: String,
+    generation: u64,
+    cancel: CancelToken,
 }
 
 impl<W: Write + Send + 'static> ServerUserInputRequestHandler<W> {
@@ -80,6 +93,8 @@ impl<W: Write + Send + 'static> ServerUserInputRequestHandler<W> {
         event_id: Value,
         thread_id: String,
         turn_id: String,
+        generation: u64,
+        cancel: CancelToken,
     ) -> Self {
         Self {
             writer,
@@ -87,16 +102,28 @@ impl<W: Write + Send + 'static> ServerUserInputRequestHandler<W> {
             event_id,
             thread_id,
             turn_id,
+            generation,
+            cancel,
         }
     }
 }
 
 impl<W: Write + Send + 'static> RuntimeUserInputHandler for ServerUserInputRequestHandler<W> {
     fn request_user_input(&self, request: &RuntimeUserInputRequest) -> io::Result<Option<String>> {
-        let request_id = format!("user-input-{}-{}", self.turn_id, request.id);
+        let request_id = super::generation_scoped_id(
+            format!("user-input-{}-{}", self.turn_id, request.id),
+            self.generation,
+        );
         let (sender, receiver) = mpsc::channel();
-        self.pending
-            .insert(request_id.clone(), PendingUserInputRequest { sender })?;
+        self.pending.insert(
+            request_id.clone(),
+            PendingUserInputRequest {
+                sender,
+                thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                generation: self.generation,
+            },
+        )?;
         if let Err(error) = write_locked_event(
             &self.writer,
             &self.event_id,
@@ -111,15 +138,29 @@ impl<W: Write + Send + 'static> RuntimeUserInputHandler for ServerUserInputReque
             let _ = self.pending.remove(&request_id);
             return Err(error);
         }
-        receiver
-            .recv()
-            .map_err(|_| io::Error::other("user input response channel closed"))
+        loop {
+            if self.cancel.is_cancelled() {
+                let _ = self.pending.remove(&request_id);
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "user input request cancelled",
+                ));
+            }
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(answer) => return Ok(answer),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("user input response channel closed"));
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn pending_user_input_manager_rejects_duplicate_request_id_without_overwriting() {
@@ -132,6 +173,9 @@ mod tests {
                 "user-input-turn-1-ask".to_string(),
                 PendingUserInputRequest {
                     sender: first_sender,
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    generation: 0,
                 },
             )
             .expect("insert first request");
@@ -141,6 +185,9 @@ mod tests {
                     "user-input-turn-1-ask".to_string(),
                     PendingUserInputRequest {
                         sender: second_sender,
+                        thread_id: "thread-2".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        generation: 0,
                     },
                 )
                 .is_err(),
@@ -168,7 +215,12 @@ mod tests {
         manager
             .insert(
                 "user-input-turn-1-ask".to_string(),
-                PendingUserInputRequest { sender },
+                PendingUserInputRequest {
+                    sender,
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    generation: 0,
+                },
             )
             .expect("insert pending request");
 
@@ -186,9 +238,61 @@ mod tests {
                 "user-input-turn-2-ask".to_string(),
                 PendingUserInputRequest {
                     sender: late_sender,
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    generation: 0,
                 },
             )
             .expect_err("closed manager must reject late requests");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn cancelled_generation_releases_user_input_waiter_and_removes_request() {
+        let writer = Arc::new(Mutex::new(Vec::new()));
+        let manager = PendingUserInputManager::default();
+        let cancel = CancelToken::new();
+        let handler = ServerUserInputRequestHandler::new(
+            Arc::clone(&writer),
+            manager.clone(),
+            json!("turn"),
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            1,
+            cancel.clone(),
+        );
+        let worker = std::thread::spawn(move || {
+            handler.request_user_input(&RuntimeUserInputRequest {
+                id: "ask".to_string(),
+                question: "Continue?".to_string(),
+                choices: vec!["yes".to_string(), "no".to_string()],
+            })
+        });
+
+        wait_for_output(&writer);
+        cancel.cancel();
+
+        let error = worker
+            .join()
+            .expect("user input worker")
+            .expect_err("cancelled generation must release waiter");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            manager
+                .remove("user-input-turn-1-ask-generation-1")
+                .expect("remove pending")
+                .is_none()
+        );
+    }
+
+    fn wait_for_output(writer: &Arc<Mutex<Vec<u8>>>) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !writer.lock().expect("writer").is_empty() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for event");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

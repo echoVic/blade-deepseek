@@ -79,17 +79,26 @@ fn run_turn_control<W: Write + Send + 'static>(
         }
         match action {
             "interrupt" => {
-                control.cancel.cancel();
+                control.cancel_current();
                 "interrupted"
             }
             "resume" => {
-                control.cancel.reset();
+                if !control.request_resume() {
+                    return write_locked_event(
+                        &writer,
+                        &id,
+                        ServerEvent::error(format!(
+                            "turn is not interrupted or no longer accepts resume: {turn_id}"
+                        )),
+                    );
+                }
                 "resumed"
             }
             "steer" => {
                 if let Some(input) = input {
-                    control.steer_handle.push(input.clone());
-                    steered_item = Some((control.thread_id.clone(), input.clone()));
+                    if control.steer(input.clone()) {
+                        steered_item = Some((control.thread_id.clone(), input.clone()));
+                    }
                 }
                 "steered"
             }

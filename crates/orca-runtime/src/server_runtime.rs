@@ -336,11 +336,57 @@ impl ServerThread {
             .run_request_with_cancel(&run_config, &request, writer, cancel)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_turn_with_permissions_cancel_and_permission_handler_for_existing_turn<W: Write>(
+        &mut self,
+        config: &RunConfig,
+        prompt: &str,
+        turn_id: &str,
+        permissions: PermissionProfileOverride,
+        writer: W,
+        cancel: CancelToken,
+        steer_handle: ThreadSteerHandle,
+        permission_handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
+        user_input_handler: Arc<dyn RuntimeUserInputHandler + Send + Sync>,
+        mcp_elicitation_handler: Arc<dyn McpElicitationHandler + Send + Sync>,
+    ) -> io::Result<RunStatus> {
+        let mut run_config = thread_run_config(config);
+        run_config.prompt = prompt.to_string();
+        run_config.additional_working_directories = self.additional_working_directories.clone();
+        if run_config.runtime_workspace_roots.is_none() {
+            run_config.runtime_workspace_roots = Some(self.runtime_workspace_roots.clone());
+        }
+        if !permissions.is_empty() {
+            apply_permission_override(&mut run_config, permissions);
+            persist_permission_profile(&run_config, self.thread.thread_id())?;
+        }
+        self.active_permission_profile = run_config.active_permission_profile.clone();
+        self.runtime_workspace_roots = run_config
+            .runtime_workspace_roots
+            .clone()
+            .unwrap_or_else(|| vec![std::path::PathBuf::from(&self.cwd)]);
+        self.additional_working_directories = run_config.additional_working_directories.clone();
+        self.start_persisted_turn_task_with_id(turn_id);
+        let request = ThreadTurnRequest::new(prompt)
+            .with_existing_turn_prompt()
+            .with_wait_for_background_workflows(false)
+            .with_steer_handle(steer_handle)
+            .with_permission_handler(permission_handler)
+            .with_threaded_user_input_handler(user_input_handler)
+            .with_mcp_elicitation_handler(mcp_elicitation_handler);
+        self.thread
+            .run_request_with_cancel(&run_config, &request, writer, cancel)
+    }
+
     fn start_persisted_turn_task(&mut self) {
         let turn_id = self.next_persisted_turn_id();
+        self.start_persisted_turn_task_with_id(&turn_id);
+    }
+
+    fn start_persisted_turn_task_with_id(&mut self, turn_id: &str) {
         self.thread
             .lifecycle_mut()
-            .start_task_with_id(RuntimeTaskKind::Agent, turn_id);
+            .start_task_with_id(RuntimeTaskKind::Agent, turn_id.to_string());
     }
 
     pub fn read_projection(

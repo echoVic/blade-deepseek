@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
+use orca_core::cancel::CancelToken;
 use serde_json::{Value, json};
 
 use crate::lifecycle::{
@@ -29,6 +31,8 @@ pub(super) enum PendingPermissionRequest {
     Runtime {
         sender: mpsc::Sender<RuntimePermissionResponse>,
         thread_id: String,
+        turn_id: String,
+        generation: u64,
         runtime_workspace_roots: Vec<PathBuf>,
     },
     CommandExec {
@@ -51,6 +55,18 @@ impl PendingPermissionRequest {
                 ..
             } => runtime_workspace_roots,
             Self::CommandExec { request } => &request.runtime_workspace_roots,
+        }
+    }
+
+    pub(super) fn runtime_generation(&self) -> Option<(&str, &str, u64)> {
+        match self {
+            Self::Runtime {
+                thread_id,
+                turn_id,
+                generation,
+                ..
+            } => Some((thread_id, turn_id, *generation)),
+            Self::CommandExec { .. } => None,
         }
     }
 }
@@ -136,6 +152,8 @@ pub(super) struct ServerPermissionRequestHandler<W: Write + Send + 'static> {
     event_id: Value,
     thread_id: String,
     turn_id: String,
+    generation: u64,
+    cancel: CancelToken,
     runtime_workspace_roots: Vec<PathBuf>,
 }
 
@@ -146,6 +164,8 @@ impl<W: Write + Send + 'static> ServerPermissionRequestHandler<W> {
         event_id: Value,
         thread_id: String,
         turn_id: String,
+        generation: u64,
+        cancel: CancelToken,
         runtime_workspace_roots: Vec<PathBuf>,
     ) -> Self {
         Self {
@@ -154,6 +174,8 @@ impl<W: Write + Send + 'static> ServerPermissionRequestHandler<W> {
             event_id,
             thread_id,
             turn_id,
+            generation,
+            cancel,
             runtime_workspace_roots,
         }
     }
@@ -166,13 +188,18 @@ impl<W: Write + Send + 'static> RuntimePermissionRequestHandler
         &self,
         request: &RuntimePermissionRequest,
     ) -> io::Result<RuntimePermissionResponse> {
-        let request_id = format!("permission-{}-{}", self.turn_id, request.id);
+        let request_id = super::generation_scoped_id(
+            format!("permission-{}-{}", self.turn_id, request.id),
+            self.generation,
+        );
         let (sender, receiver) = mpsc::channel();
         self.pending.insert_runtime(
             request_id.clone(),
             PendingPermissionRequest::Runtime {
                 sender,
                 thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                generation: self.generation,
                 runtime_workspace_roots: self.runtime_workspace_roots.clone(),
             },
         )?;
@@ -194,15 +221,29 @@ impl<W: Write + Send + 'static> RuntimePermissionRequestHandler
             let _ = self.pending.remove(&request_id);
             return Err(error);
         }
-        receiver
-            .recv()
-            .map_err(|_| io::Error::other("permission response channel closed"))
+        loop {
+            if self.cancel.is_cancelled() {
+                let _ = self.pending.remove(&request_id);
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "permission request cancelled",
+                ));
+            }
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(response) => return Ok(response),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("permission response channel closed"));
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn pending_permission_manager_rejects_duplicate_runtime_request_id_without_overwriting() {
@@ -216,6 +257,8 @@ mod tests {
                 PendingPermissionRequest::Runtime {
                     sender: first_sender,
                     thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    generation: 0,
                     runtime_workspace_roots: vec![PathBuf::from("/repo")],
                 },
             )
@@ -227,6 +270,8 @@ mod tests {
                     PendingPermissionRequest::Runtime {
                         sender: second_sender,
                         thread_id: "thread-2".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        generation: 0,
                         runtime_workspace_roots: vec![PathBuf::from("/other")],
                     },
                 )
@@ -252,6 +297,8 @@ mod tests {
                 PendingPermissionRequest::Runtime {
                     sender,
                     thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    generation: 0,
                     runtime_workspace_roots: Vec::new(),
                 },
             )
@@ -270,10 +317,62 @@ mod tests {
                 PendingPermissionRequest::Runtime {
                     sender: late_sender,
                     thread_id: "thread-1".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    generation: 0,
                     runtime_workspace_roots: Vec::new(),
                 },
             )
             .expect_err("closed manager must reject late requests");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn cancelled_generation_releases_permission_waiter_and_removes_request() {
+        let writer = Arc::new(Mutex::new(Vec::new()));
+        let manager = PendingPermissionManager::default();
+        let cancel = CancelToken::new();
+        let handler = ServerPermissionRequestHandler::new(
+            Arc::clone(&writer),
+            manager.clone(),
+            json!("turn"),
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            1,
+            cancel.clone(),
+            Vec::new(),
+        );
+        let worker = std::thread::spawn(move || {
+            handler.request_permissions(&RuntimePermissionRequest {
+                id: "ask".to_string(),
+                reason: Some("need permission".to_string()),
+                permissions: Default::default(),
+            })
+        });
+
+        wait_for_output(&writer);
+        cancel.cancel();
+
+        let error = worker
+            .join()
+            .expect("permission worker")
+            .expect_err("cancelled generation must release waiter");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            manager
+                .remove("permission-turn-1-ask-generation-1")
+                .expect("remove pending")
+                .is_none()
+        );
+    }
+
+    fn wait_for_output(writer: &Arc<Mutex<Vec<u8>>>) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !writer.lock().expect("writer").is_empty() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for event");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
