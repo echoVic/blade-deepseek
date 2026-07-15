@@ -4,18 +4,7 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-15
-Current baseline: v0.2.24 closes every accepted tool call with one truthful
-terminal, repairs incomplete historical calls without replay, bounds process
-output and tool-facing file admission, and gives ordinary tools, MCP servers,
-workflows, async subagents, verifier commands, and server shells an explicit
-cleanup or reaper owner. Recovered workers are identity-checked before
-signaling, server shutdown is bounded and two-phase, and internal worker API
-keys use a bounded anonymous stdin pipe instead of argv or workflow records.
-The release passed local workspace, Clippy, site, release-script, and live
-provider gates. Known follow-up areas include Windows descendant-tree parity,
-a total WorkflowHost deadline, and runtime-owned file-input admission.
-
-Current v0.2.25 candidate: the managed network proxy now has one explicit
+Current baseline: v0.2.25 gives the managed network proxy one explicit
 supervisor owner. It admits at most 32 concurrent connections, bounds request
 and header framing before parsing, sends permission-block reports through a
 fixed-capacity channel, resolves and connects with deadlines, and keeps every
@@ -24,9 +13,21 @@ server `command/exec` proxy stops admission, aborts and awaits all active
 connections, closes CONNECT tunnel endpoints, and joins the supervisor thread.
 CLI, TUI, permission-profile, proxy environment, server/JSONL, and persistence
 contracts remain unchanged; overload and framing violations now receive
-bounded HTTP diagnostics. The candidate passed the complete serial workspace,
-Clippy, site, release-script, and real DeepSeek provider gates after rebasing
-onto the latest published main; remote publication verification is pending.
+bounded HTTP diagnostics. The release passed the complete serial workspace,
+Clippy, site, release-script, and real DeepSeek provider gates. Release workflow
+`29385203632` then passed the complete test, four-platform build, GitHub
+Release, npm publish, and npm release-asset graph; the public verifier confirmed
+the GitHub Release, `@blade-ai/orca@0.2.25`, and `npm exec` installation.
+
+Earlier v0.2.24 closes every accepted tool call with one truthful terminal,
+repairs incomplete historical calls without replay, bounds process output and
+tool-facing file admission, and gives ordinary tools, MCP servers, workflows,
+async subagents, verifier commands, and server shells an explicit cleanup or
+reaper owner. Recovered workers are identity-checked before signaling, server
+shutdown is bounded and two-phase, and internal worker API keys use a bounded
+anonymous stdin pipe instead of argv or workflow records. Known follow-up areas
+include Windows descendant-tree parity, a total WorkflowHost deadline, and
+runtime-owned file-input admission.
 
 Earlier v0.2.23 gives the TUI native-feeling mouse text
 interaction. Left-drag selects transcript text with a theme-aware,

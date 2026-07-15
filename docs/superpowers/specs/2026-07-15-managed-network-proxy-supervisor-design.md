@@ -134,7 +134,7 @@ the proxy without awaiting its connection tasks. It is also incomplete while
 runtime bash, TUI bash, or server command execution creates an unbounded
 network-block report channel.
 
-## Candidate Implementation Evidence
+## Released Implementation Evidence
 
 The feature branch replaces the old connection path rather than wrapping it:
 
@@ -149,7 +149,7 @@ The feature branch replaces the old connection path rather than wrapping it:
 - the production module contains no per-connection `std::thread::spawn` and no
   `BufRead::read_line` request path.
 
-Focused candidate verification:
+Focused verification:
 
 ```bash
 cargo test -p orca-runtime network_proxy::tests --locked --offline -- --test-threads=1
@@ -160,8 +160,11 @@ cargo check --workspace --all-targets --locked --offline
 cargo clippy -p orca-runtime -p orca-tui --all-targets --locked --offline
 ```
 
-After rebasing onto the latest `main`, the candidate also passed the complete
+After rebasing onto the latest `main`, the release also passed the complete
 serial workspace suite, all-target Clippy with the repository's existing
 warnings, site build and SEO checks, all release-script tests, and the real
-DeepSeek provider/CLI/history/server/thread gate. Remote Actions and published
-artifact verification remain release gates rather than implementation gates.
+DeepSeek provider/CLI/history/server/thread gate. Release workflow
+[`29385203632`](https://github.com/echoVic/blade-deepseek/actions/runs/29385203632)
+then passed its complete test, four-platform build, GitHub Release, npm publish,
+and npm release-asset graph. The post-publish verifier confirmed the public
+GitHub Release, `@blade-ai/orca@0.2.25`, and `npm exec` installation.
