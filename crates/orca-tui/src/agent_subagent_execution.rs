@@ -255,11 +255,43 @@ pub(crate) fn execute_subagent_batch_for_tui(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn execute_subagent_for_tui(
     config: &RunConfig,
     cwd: &Path,
     tool_request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
+    control: &TuiTurnControl,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
+    subagent_depth: u32,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    hooks: &HookRunner,
+    task_registry: Option<&TaskRegistry>,
+) -> (tool_types::ToolResult, CostTracker) {
+    execute_subagent_for_tui_with_background_events(
+        config,
+        cwd,
+        tool_request,
+        event_tx,
+        event_tx,
+        control,
+        pending_interactions,
+        subagent_depth,
+        instructions,
+        memory,
+        hooks,
+        task_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_subagent_for_tui_with_background_events(
+    config: &RunConfig,
+    cwd: &Path,
+    tool_request: &tool_types::ToolRequest,
+    event_tx: &Sender<TuiEvent>,
+    background_event_tx: &Sender<TuiEvent>,
     control: &TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
@@ -324,7 +356,7 @@ pub(crate) fn execute_subagent_for_tui(
             cwd,
             tool_request,
             request,
-            event_tx,
+            background_event_tx,
             subagent_depth,
             instructions,
             memory,

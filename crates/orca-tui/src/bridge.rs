@@ -1,6 +1,9 @@
 pub(crate) use crate::agent_runner::{
-    PendingWorkflowNotifications, TuiAgentTurnContinuation, TuiBackgroundTurnCompletion,
-    TuiBackgroundTurnCompletionHandler, TuiBackgroundTurnContinuationRequest,
+    PendingWorkflowNotifications, TuiAgentTurnContinuation, TuiBackgroundTurnContinuationRequest,
+};
+#[allow(unused_imports)]
+pub(crate) use crate::agent_runner::{
+    TuiBackgroundTurnCompletion, TuiBackgroundTurnCompletionHandler,
     continue_approved_background_turn_for_tui, run_agent_for_tui_with_notification_queue,
 };
 pub use crate::agent_runner::{launch_saved_workflow_for_tui, run_agent_for_tui};
@@ -30,6 +33,18 @@ use crate::types::TuiTaskLifecycle;
 
 pub struct TuiConversationSession {
     runtime: RuntimeThread,
+    pending_interactions: RuntimePendingInteractionStore,
+    usage_ledger: TuiUsageLedger,
+}
+
+pub(crate) struct TuiHostedConversationSession<'a> {
+    runtime: &'a mut RuntimeThread,
+    pending_interactions: RuntimePendingInteractionStore,
+    usage_ledger: TuiUsageLedger,
+}
+
+#[derive(Clone)]
+struct TuiSessionAuxiliaryState {
     pending_interactions: RuntimePendingInteractionStore,
     usage_ledger: TuiUsageLedger,
 }
@@ -202,138 +217,159 @@ impl TuiConversationSession {
             usage_ledger: TuiUsageLedger::from_totals(usage_baseline),
         })
     }
+}
 
-    pub fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
-        self.runtime.session()
+impl<'a> TuiHostedConversationSession<'a> {
+    pub(crate) fn new(runtime: &'a mut RuntimeThread) -> Self {
+        let aggregate_usage = runtime.session().aggregate_usage_totals();
+        let auxiliary = runtime
+            .thread_extensions()
+            .get_or_init(|| TuiSessionAuxiliaryState {
+                pending_interactions: RuntimePendingInteractionStore::default(),
+                usage_ledger: TuiUsageLedger::from_totals(aggregate_usage),
+            });
+        Self {
+            runtime,
+            pending_interactions: auxiliary.pending_interactions.clone(),
+            usage_ledger: auxiliary.usage_ledger.clone(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) trait TuiSession {
+    fn runtime(&self) -> &RuntimeThread;
+    fn runtime_mut(&mut self) -> &mut RuntimeThread;
+    fn pending_interaction_store(&self) -> RuntimePendingInteractionStore;
+    fn shared_usage_ledger(&self) -> TuiUsageLedger;
+
+    fn runtime_session(&self) -> &orca_runtime::session::InteractiveSession {
+        self.runtime().session()
     }
 
-    pub(crate) fn runtime_session_mut(&mut self) -> &mut orca_runtime::session::InteractiveSession {
-        self.runtime.session_mut()
+    fn runtime_session_mut(&mut self) -> &mut orca_runtime::session::InteractiveSession {
+        self.runtime_mut().session_mut()
     }
 
-    pub(crate) fn conversation(&self) -> &orca_core::conversation::Conversation {
-        self.runtime.session().conversation()
+    fn conversation(&self) -> &orca_core::conversation::Conversation {
+        self.runtime().session().conversation()
     }
 
-    pub(crate) fn conversation_mut(&mut self) -> &mut orca_core::conversation::Conversation {
-        self.runtime.session_mut().conversation_mut()
+    fn conversation_mut(&mut self) -> &mut orca_core::conversation::Conversation {
+        self.runtime_mut().session_mut().conversation_mut()
     }
 
-    pub(crate) fn writer_mut(&mut self) -> Option<&mut orca_runtime::history::SessionWriter> {
-        self.runtime.session_mut().writer_mut()
+    fn writer_mut(&mut self) -> Option<&mut orca_runtime::history::SessionWriter> {
+        self.runtime_mut().session_mut().writer_mut()
     }
 
-    pub(crate) fn instructions(&self) -> &ProjectInstructions {
-        self.runtime.session().instructions()
+    fn instructions(&self) -> &ProjectInstructions {
+        self.runtime().session().instructions()
     }
 
-    pub(crate) fn cost_tracker_mut(&mut self) -> &mut CostTracker {
-        self.runtime.session_mut().cost_tracker_mut()
+    fn cost_tracker_mut(&mut self) -> &mut CostTracker {
+        self.runtime_mut().session_mut().cost_tracker_mut()
     }
 
-    pub(crate) fn record_provider_usage(&mut self, usage: Usage) -> UsageTotals {
-        let before = self.runtime.session().usage_totals();
+    fn record_provider_usage(&mut self, usage: Usage) -> UsageTotals {
+        let before = self.runtime().session().usage_totals();
         let after = self
-            .runtime
+            .runtime_mut()
             .session_mut()
             .cost_tracker_mut()
             .add_usage(usage);
-        self.usage_ledger.add(usage_delta(before, after))
+        self.shared_usage_ledger().add(usage_delta(before, after))
     }
 
-    pub(crate) fn record_external_usage(&mut self, usage: UsageTotals) -> UsageTotals {
-        self.runtime
+    fn record_external_usage(&mut self, usage: UsageTotals) -> UsageTotals {
+        self.runtime_mut()
             .session_mut()
             .cost_tracker_mut()
             .merge_totals(usage);
-        self.usage_ledger.add(usage)
+        self.shared_usage_ledger().add(usage)
     }
 
-    pub(crate) fn usage_ledger(&self) -> TuiUsageLedger {
-        self.usage_ledger.clone()
+    fn usage_ledger(&self) -> TuiUsageLedger {
+        self.shared_usage_ledger()
     }
 
-    pub(crate) fn mcp_registry(&self) -> &McpRegistry {
-        self.runtime.session().mcp_registry()
+    fn mcp_registry(&self) -> &McpRegistry {
+        self.runtime().session().mcp_registry()
     }
 
-    pub(crate) fn hooks(&self) -> &HookRunner {
-        self.runtime.session().hooks()
+    fn hooks(&self) -> &HookRunner {
+        self.runtime().session().hooks()
     }
 
-    pub(crate) fn memory(&self) -> &MemoryBlock {
-        self.runtime.session().memory()
+    fn memory(&self) -> &MemoryBlock {
+        self.runtime().session().memory()
     }
 
-    pub(crate) fn task_registry(&self) -> &TaskRegistry {
-        self.runtime.session().task_registry()
+    fn task_registry(&self) -> &TaskRegistry {
+        self.runtime().session().task_registry()
     }
 
-    pub(crate) fn pending_interactions(&self) -> RuntimePendingInteractionStore {
-        self.pending_interactions.clone()
+    fn pending_interactions(&self) -> RuntimePendingInteractionStore {
+        self.pending_interaction_store()
     }
 
-    pub(crate) fn append_message(&mut self, message: &orca_core::conversation::Message) {
-        self.runtime.session_mut().append_message(message);
+    fn append_message(&mut self, message: &orca_core::conversation::Message) {
+        self.runtime_mut().session_mut().append_message(message);
     }
 
-    pub(crate) fn complete(&mut self, status: &str) {
-        self.runtime.session_mut().complete(status);
+    fn complete(&mut self, status: &str) {
+        self.runtime_mut().session_mut().complete(status);
     }
 
-    pub(crate) fn complete_with_error(&mut self, status: &str, error: &str) {
-        self.runtime
+    fn complete_with_error(&mut self, status: &str, error: &str) {
+        self.runtime_mut()
             .session_mut()
             .complete_with_error(status, Some(error));
     }
 
-    pub(crate) fn start_agent_lifecycle_task_with_id(&mut self, task_id: &str) {
-        self.runtime
+    fn start_agent_lifecycle_task_with_id(&mut self, task_id: &str) {
+        self.runtime_mut()
             .lifecycle_mut()
             .start_task_with_id(RuntimeTaskKind::Agent, task_id.to_string());
     }
 
-    pub(crate) fn finish_agent_lifecycle_task(&mut self, status: RunStatus) {
-        let _ = self.runtime.lifecycle_mut().finish_task(status);
+    fn finish_agent_lifecycle_task(&mut self, status: RunStatus) {
+        let _ = self.runtime_mut().lifecycle_mut().finish_task(status);
     }
 
-    pub fn session_id(&self) -> Option<&str> {
-        self.runtime.session().session_id()
+    fn session_id(&self) -> Option<&str> {
+        self.runtime().session().session_id()
     }
 
-    pub(crate) fn completion_error(&self) -> Option<&str> {
-        self.runtime.session().completion_error()
+    fn completion_error(&self) -> Option<&str> {
+        self.runtime().session().completion_error()
     }
 
-    pub(crate) fn thread_extensions(&self) -> &orca_runtime::extension::ExtensionData {
-        self.runtime.thread_extensions()
+    fn thread_extensions(&self) -> &orca_runtime::extension::ExtensionData {
+        self.runtime().thread_extensions()
     }
 
-    pub(crate) fn thread_extensions_handle(
-        &self,
-    ) -> std::sync::Arc<orca_runtime::extension::ExtensionData> {
-        self.runtime.thread_extensions_handle()
+    fn thread_extensions_handle(&self) -> std::sync::Arc<orca_runtime::extension::ExtensionData> {
+        self.runtime().thread_extensions_handle()
     }
 
-    pub fn usage_totals(&self) -> UsageTotals {
-        self.usage_ledger.totals()
+    fn usage_totals(&self) -> UsageTotals {
+        self.shared_usage_ledger().totals()
     }
 
-    pub(crate) fn runtime_usage_totals(&self) -> UsageTotals {
-        self.runtime.session().usage_totals()
+    fn runtime_usage_totals(&self) -> UsageTotals {
+        self.runtime().session().usage_totals()
     }
 
-    pub(crate) fn run_request_with_cancel_for_tui<W: std::io::Write>(
+    fn run_request_with_cancel_for_tui(
         &mut self,
         config: &RunConfig,
         request: &ThreadTurnRequest,
-        writer: W,
+        writer: &mut dyn std::io::Write,
         cancel: CancelToken,
     ) -> std::io::Result<RunStatus> {
-        let admission = match self
-            .usage_ledger
-            .admit_budgeted_request(config.max_budget_usd, &cancel)
-        {
+        let usage_ledger = self.shared_usage_ledger();
+        let admission = match usage_ledger.admit_budgeted_request(config.max_budget_usd, &cancel) {
             Ok(admission) => admission,
             Err(TuiBudgetAdmissionError::BudgetExhausted(current_totals)) => {
                 let error = format!(
@@ -341,19 +377,19 @@ impl TuiConversationSession {
                     current_totals.estimated_cost_usd,
                     config.max_budget_usd.unwrap_or_default()
                 );
-                self.runtime
+                self.runtime_mut()
                     .session_mut()
                     .complete_with_error(RunStatus::BudgetExhausted.as_str(), Some(&error));
                 return Ok(RunStatus::BudgetExhausted);
             }
             Err(TuiBudgetAdmissionError::Cancelled) => return Ok(RunStatus::Cancelled),
         };
-        let before = self.runtime.session().usage_totals();
+        let before = self.runtime().session().usage_totals();
         let result = self
-            .runtime
+            .runtime_mut()
             .run_request_with_cancel(config, request, writer, cancel);
-        let after = self.runtime.session().usage_totals();
-        let totals = self.usage_ledger.add(usage_delta(before, after));
+        let after = self.runtime().session().usage_totals();
+        let totals = usage_ledger.add(usage_delta(before, after));
         drop(admission);
         let status = result?;
         if status != RunStatus::BudgetExhausted
@@ -364,7 +400,7 @@ impl TuiConversationSession {
                 "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
                 totals.estimated_cost_usd, max_budget
             );
-            self.runtime
+            self.runtime_mut()
                 .session_mut()
                 .complete_with_error(RunStatus::BudgetExhausted.as_str(), Some(&error));
             return Ok(RunStatus::BudgetExhausted);
@@ -372,46 +408,52 @@ impl TuiConversationSession {
         Ok(status)
     }
 
-    pub fn has_active_workflows(&self) -> bool {
-        self.runtime.session().has_active_workflows()
+    fn has_active_workflows(&self) -> bool {
+        self.runtime().session().has_active_workflows()
     }
 
-    pub fn backtrack_last_user(&mut self) -> Option<String> {
-        self.runtime.session_mut().backtrack_last_user()
+    fn backtrack_last_user(&mut self) -> Option<String> {
+        self.runtime_mut().session_mut().backtrack_last_user()
     }
 
-    pub fn set_model(&mut self, model: Option<&str>) {
-        self.runtime.session_mut().set_model(model);
+    fn set_model(&mut self, model: Option<&str>) {
+        self.runtime_mut().session_mut().set_model(model);
     }
 
-    pub fn add_pinned_context(&mut self, content: String) {
-        self.runtime.session_mut().add_pinned_context(content);
+    fn add_pinned_context(&mut self, content: String) {
+        self.runtime_mut().session_mut().add_pinned_context(content);
     }
 
-    pub fn replace_goal_context(&mut self, content: String) {
-        self.runtime.session_mut().replace_goal_context(content);
+    fn replace_goal_context(&mut self, content: String) {
+        self.runtime_mut()
+            .session_mut()
+            .replace_goal_context(content);
     }
 
-    pub(crate) fn replace_skill_context(&mut self, content: Option<String>) {
-        self.runtime.session_mut().replace_skill_context(content);
+    fn replace_skill_context(&mut self, content: Option<String>) {
+        self.runtime_mut()
+            .session_mut()
+            .replace_skill_context(content);
     }
 
-    pub fn compact(
+    fn compact(
         &mut self,
         config: &RunConfig,
         cwd: &Path,
         cancel: &orca_core::cancel::CancelToken,
     ) -> (usize, usize) {
-        self.runtime.session_mut().compact(config, cwd, cancel)
+        self.runtime_mut()
+            .session_mut()
+            .compact(config, cwd, cancel)
     }
 
-    pub(crate) fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
-        if self.runtime.lifecycle().active_task().is_none() {
-            self.runtime
+    fn next_turn_lifecycle(&mut self) -> (u32, Option<TuiTaskLifecycle>) {
+        if self.runtime().lifecycle().active_task().is_none() {
+            self.runtime_mut()
                 .lifecycle_mut()
                 .start_task(RuntimeTaskKind::Agent);
         }
-        let started = RuntimeTurnRunner::new(self.runtime.lifecycle_mut()).advance_turn();
+        let started = RuntimeTurnRunner::new(self.runtime_mut().lifecycle_mut()).advance_turn();
         let task = started.task().map(|task| TuiTaskLifecycle {
             id: task.id().to_string(),
             kind: lifecycle_kind_label(task.kind()).to_string(),
@@ -419,6 +461,42 @@ impl TuiConversationSession {
             turn: task.current_turn(),
         });
         (started.turn(), task)
+    }
+}
+
+impl TuiSession for TuiConversationSession {
+    fn runtime(&self) -> &RuntimeThread {
+        &self.runtime
+    }
+
+    fn runtime_mut(&mut self) -> &mut RuntimeThread {
+        &mut self.runtime
+    }
+
+    fn pending_interaction_store(&self) -> RuntimePendingInteractionStore {
+        self.pending_interactions.clone()
+    }
+
+    fn shared_usage_ledger(&self) -> TuiUsageLedger {
+        self.usage_ledger.clone()
+    }
+}
+
+impl TuiSession for TuiHostedConversationSession<'_> {
+    fn runtime(&self) -> &RuntimeThread {
+        self.runtime
+    }
+
+    fn runtime_mut(&mut self) -> &mut RuntimeThread {
+        self.runtime
+    }
+
+    fn pending_interaction_store(&self) -> RuntimePendingInteractionStore {
+        self.pending_interactions.clone()
+    }
+
+    fn shared_usage_ledger(&self) -> TuiUsageLedger {
+        self.usage_ledger.clone()
     }
 }
 

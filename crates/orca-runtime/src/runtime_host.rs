@@ -128,6 +128,11 @@ pub trait ThreadOperationExecutor: Send + Sync + 'static {
 pub struct HostedTurnRequest {
     prompt: String,
     options: ControllerRunOptions,
+    operation_kind: HostedOperationKind,
+    task_description: Option<String>,
+    backtrack_target: bool,
+    allow_goal_tools: bool,
+    track_goal_usage: bool,
     emit_session_completed: bool,
     envelope: HostedOperationEnvelope,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
@@ -138,6 +143,13 @@ pub struct HostedTurnRequest {
     resumes_existing_turn: bool,
     task_id: Option<String>,
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostedOperationKind {
+    Turn,
+    ManualCompaction,
+    BackgroundContinuation { task_id: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +163,11 @@ impl HostedTurnRequest {
         Self {
             prompt: prompt.into(),
             options: ControllerRunOptions::default(),
+            operation_kind: HostedOperationKind::Turn,
+            task_description: None,
+            backtrack_target: false,
+            allow_goal_tools: false,
+            track_goal_usage: false,
             emit_session_completed: true,
             envelope: HostedOperationEnvelope::Turn,
             permission_handler: None,
@@ -179,6 +196,51 @@ impl HostedTurnRequest {
     pub fn with_options(mut self, options: ControllerRunOptions) -> Self {
         self.options = options;
         self
+    }
+
+    pub fn with_operation_kind(mut self, operation_kind: HostedOperationKind) -> Self {
+        self.operation_kind = operation_kind;
+        self
+    }
+
+    pub fn operation_kind(&self) -> &HostedOperationKind {
+        &self.operation_kind
+    }
+
+    pub fn with_task_description(mut self, description: impl Into<String>) -> Self {
+        self.task_description = Some(description.into());
+        self
+    }
+
+    pub fn task_description(&self) -> Option<&str> {
+        self.task_description.as_deref()
+    }
+
+    pub fn with_backtrack_target(mut self, backtrack_target: bool) -> Self {
+        self.backtrack_target = backtrack_target;
+        self
+    }
+
+    pub fn is_backtrack_target(&self) -> bool {
+        self.backtrack_target
+    }
+
+    pub fn with_goal_tools(mut self, allow_goal_tools: bool) -> Self {
+        self.allow_goal_tools = allow_goal_tools;
+        self
+    }
+
+    pub fn allows_goal_tools(&self) -> bool {
+        self.allow_goal_tools
+    }
+
+    pub fn with_goal_usage_tracking(mut self, track_goal_usage: bool) -> Self {
+        self.track_goal_usage = track_goal_usage;
+        self
+    }
+
+    pub fn tracks_goal_usage(&self) -> bool {
+        self.track_goal_usage
     }
 
     pub fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
@@ -401,6 +463,12 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
         writer: &mut (dyn io::Write + Send),
         cancel: &CancelToken,
     ) -> io::Result<RunStatus> {
+        if request.operation_kind() != &HostedOperationKind::Turn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "legacy runtime executor only supports turn operations",
+            ));
+        }
         thread.run_request_with_event_factory_and_cancel(
             generation.config(),
             &request.legacy_request(generation),
@@ -600,6 +668,7 @@ impl RuntimeThreadMutation {
 #[derive(Clone, Debug)]
 pub struct RuntimeThreadSnapshot {
     thread_id: String,
+    session_id: Option<String>,
     conversation: Conversation,
     usage_totals: UsageTotals,
     completion_error: Option<String>,
@@ -611,6 +680,7 @@ impl RuntimeThreadSnapshot {
     fn from_thread(thread: &RuntimeThread) -> Self {
         Self {
             thread_id: thread.thread_id().to_string(),
+            session_id: thread.session().session_id().map(str::to_string),
             conversation: thread.session().conversation().clone(),
             usage_totals: thread.session().aggregate_usage_totals(),
             completion_error: thread.session().completion_error().map(str::to_string),
@@ -624,6 +694,10 @@ impl RuntimeThreadSnapshot {
 
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -816,6 +890,7 @@ impl fmt::Debug for OperationHandle {
 #[derive(Clone)]
 pub struct RuntimeThreadHandle {
     thread_id: String,
+    session_id: Option<String>,
     startup_warnings: Arc<Vec<String>>,
     task_registry: TaskRegistry,
     mcp_registry: McpRegistry,
@@ -825,6 +900,10 @@ pub struct RuntimeThreadHandle {
 impl RuntimeThreadHandle {
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     pub fn startup_warnings(&self) -> &[String] {
@@ -1022,6 +1101,28 @@ pub struct RuntimeHost {
     supervisor: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub struct RuntimeHostHandle {
+    command_tx: tokio_mpsc::Sender<HostCommand>,
+}
+
+impl RuntimeHostHandle {
+    pub fn start_thread(
+        &self,
+        config: RunConfig,
+        title: impl Into<String>,
+    ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
+        self.start_thread_with_request(RuntimeThreadStartRequest::new(config, title))
+    }
+
+    pub fn start_thread_with_request(
+        &self,
+        request: RuntimeThreadStartRequest,
+    ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
+        start_thread_with_sender(&self.command_tx, request)
+    }
+}
+
 impl RuntimeHost {
     pub fn start() -> Result<Self, RuntimeHostError> {
         Self::start_with_executor(Arc::new(LegacyThreadOperationExecutor))
@@ -1080,16 +1181,12 @@ impl RuntimeHost {
         &self,
         request: RuntimeThreadStartRequest,
     ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        match self.command_tx.try_send(HostCommand::StartThread {
-            request: Box::new(request),
-            reply: reply_tx,
-        }) {
-            Ok(()) => receive_reply(reply_rx, "runtime host")?,
-            Err(TrySendError::Full(_)) => Err(RuntimeHostError::MailboxFull {
-                owner: "runtime host",
-            }),
-            Err(TrySendError::Closed(_)) => Err(RuntimeHostError::HostUnavailable),
+        start_thread_with_sender(&self.command_tx, request)
+    }
+
+    pub fn handle(&self) -> RuntimeHostHandle {
+        RuntimeHostHandle {
+            command_tx: self.command_tx.clone(),
         }
     }
 
@@ -1204,6 +1301,7 @@ async fn run_host_supervisor(
                     }
                 };
                 let thread_id = thread.thread_id().to_string();
+                let session_id = thread.session().session_id().map(str::to_string);
                 let task_registry = thread.session().task_registry().clone();
                 let mcp_registry = thread.session().mcp_registry().clone();
                 let startup_warnings = Arc::new(
@@ -1224,6 +1322,7 @@ async fn run_host_supervisor(
                 let (command_tx, actor_rx) = tokio_mpsc::channel(THREAD_COMMAND_CAPACITY);
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
+                    session_id,
                     startup_warnings,
                     task_registry,
                     mcp_registry,
@@ -1261,6 +1360,23 @@ async fn run_host_supervisor(
                 break;
             }
         }
+    }
+}
+
+fn start_thread_with_sender(
+    command_tx: &tokio_mpsc::Sender<HostCommand>,
+    request: RuntimeThreadStartRequest,
+) -> Result<RuntimeThreadHandle, RuntimeHostError> {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    match command_tx.try_send(HostCommand::StartThread {
+        request: Box::new(request),
+        reply: reply_tx,
+    }) {
+        Ok(()) => receive_reply(reply_rx, "runtime host")?,
+        Err(TrySendError::Full(_)) => Err(RuntimeHostError::MailboxFull {
+            owner: "runtime host",
+        }),
+        Err(TrySendError::Closed(_)) => Err(RuntimeHostError::HostUnavailable),
     }
 }
 

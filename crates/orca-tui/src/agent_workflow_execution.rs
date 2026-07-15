@@ -67,11 +67,30 @@ pub(crate) fn execute_workflow_draft_for_tui(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn execute_workflow_draft_action_for_tui(
     config: &RunConfig,
     cwd: &Path,
     request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
+    execute_workflow_draft_action_for_tui_with_notifications(
+        config,
+        cwd,
+        request,
+        event_tx,
+        event_tx,
+        task_registry,
+    )
+}
+
+pub(crate) fn execute_workflow_draft_action_for_tui_with_notifications(
+    config: &RunConfig,
+    cwd: &Path,
+    request: &tool_types::ToolRequest,
+    event_tx: &Sender<TuiEvent>,
+    notification_event_tx: &Sender<TuiEvent>,
     task_registry: &TaskRegistry,
 ) -> tool_types::ToolResult {
     if !config.workflows.enabled {
@@ -141,7 +160,7 @@ pub(crate) fn execute_workflow_draft_action_for_tui(
             let run_id_for_notification = run_id.clone();
             let tool_use_id_for_notification = tool_use_id.clone();
             let workflow_name_for_notification = workflow_name.clone();
-            let notify_tx = event_tx.clone();
+            let notify_tx = notification_event_tx.clone();
             let notify_registry = task_registry.clone();
             thread::spawn(move || {
                 let mut events = EventFactory::new(run_id_for_notification.clone());
@@ -296,6 +315,24 @@ pub(crate) fn execute_workflow_for_tui(
     event_tx: &Sender<TuiEvent>,
     task_registry: &TaskRegistry,
 ) -> tool_types::ToolResult {
+    execute_workflow_for_tui_with_notifications(
+        config,
+        cwd,
+        request,
+        event_tx,
+        event_tx,
+        task_registry,
+    )
+}
+
+pub(crate) fn execute_workflow_for_tui_with_notifications(
+    config: &RunConfig,
+    cwd: &Path,
+    request: &tool_types::ToolRequest,
+    event_tx: &Sender<TuiEvent>,
+    notification_event_tx: &Sender<TuiEvent>,
+    task_registry: &TaskRegistry,
+) -> tool_types::ToolResult {
     if !config.workflows.enabled {
         return tool_types::ToolResult::failed(request, "workflows are disabled", None);
     }
@@ -336,7 +373,7 @@ pub(crate) fn execute_workflow_for_tui(
         }
     };
 
-    let notify_tx = event_tx.clone();
+    let notify_tx = notification_event_tx.clone();
     let notify_registry = task_registry.clone();
     thread::spawn(move || {
         let mut events = EventFactory::new(run_id.clone());

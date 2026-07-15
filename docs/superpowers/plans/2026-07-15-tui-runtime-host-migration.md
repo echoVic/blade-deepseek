@@ -1,6 +1,6 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1, P0.3e2, and P0.3e3a complete; P0.3e3b next
+- Status: Active; P0.3e1, P0.3e2, P0.3e3a, and P0.3e3b complete; P0.3e3c next
 - Date: 2026-07-15
 - Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3a validation)
 - Branch: `codex/tui-runtime-host-migration`
@@ -318,6 +318,57 @@ with only pre-existing warnings. The release harness checks and live DeepSeek
 E2E passed within the `$0.02` budget, including provider summary, CLI, history
 replay and repair, server/thread memory, active-turn resume/control, metadata,
 list filters/search, and turn/item pagination.
+
+P0.3e3b implementation checkpoint:
+
+- production `TuiAgentRuntime` now starts and owns one `RuntimeHost`; the TUI
+  command loop retains only a cloneable `RuntimeHostHandle` and at most one
+  `RuntimeThreadHandle`, while the actor permanently owns the live
+  `RuntimeThread`;
+- submit, manual compaction, and approved background continuation start typed
+  `HostedOperationKind` requests and are controlled through `OperationHandle`;
+  model, pinned context, goal context, backtrack, snapshots, task registry, and
+  session identity use typed actor commands or immutable handles;
+- `TuiOperationController` production mode owns only the current
+  `Arc<OperationHandle>`. Interrupt and background-current-turn requests that
+  arrive during activation are retained and applied after installation, while
+  shutdown interrupts the installed handle and wakes activation waiters;
+- `TuiThreadOperationExecutor` borrows the actor-owned thread through
+  `TuiHostedConversationSession`. TUI pending-interaction projection and the
+  shared usage ledger live in thread `ExtensionData`, so they survive turns
+  without becoming a second thread owner;
+- each operation has a fenced result and joined event relay. Nonterminal events
+  stream immediately, but `SessionCompleted` and `Compacted` are held until
+  `OperationCompletion` has joined and the controller has cleared the matching
+  operation; provider/background/workflow events that outlive the foreground
+  operation route directly to the UI channel instead of retaining the relay;
+- background goal usage uses shared exactly-once accounting, including the
+  completion-before-foreground race. Hosted admission failures publish a
+  terminal UI event, failed session startup rejects and restores the submitted
+  prompt, preloaded history is retained on startup failure, and command-mailbox
+  overflow rejects user submissions with their original prompt;
+- TUI shutdown now has a combined behavior test proving an active hosted
+  operation is cancelled and joined before runtime teardown completes.
+
+The remaining P0.3e3c deletion targets are explicit: remove the test-only
+`TuiConversationSession` and local `OperationCancellation` path, collapse the
+dual hosted/legacy `TuiSession` adapter into the actor-borrowed boundary, delete
+the legacy agent-loop helpers, and replace the remaining source-shape ownership
+tests with behavior tests. `TuiThreadOperationExecutor` and the TUI turn kernel
+remain temporary until P0.3e4 replaces them with the canonical runtime turn.
+
+Verification ran after a fresh fetch confirmed `origin/main` was still
+`35c6361c1`, so the branch was already rebased on the current main. Clean
+`cargo check -p orca-tui`, hosted/action-dispatcher focused tests, TUI 518/518,
+`orca-runtime` 769/769 plus runtime-host 21/21 and task-output 12/12, the serial
+workspace all-targets gate, and workspace Clippy all passed; Clippy reported
+only the repository's pre-existing warning set. The release harness contract
+and complete real DeepSeek E2E passed within the `$0.02` budget, covering
+provider summary, CLI/history replay and repair, server/thread memory,
+active-turn resume/control, metadata, list filters/search, and turn/item
+pagination. A real 120x40 PTY TUI run through the production hosted path
+returned `ORCA_TUI_HOSTED_OK`, displayed live usage/context state, and exited
+cleanly through the normal double-`Ctrl-C` flow.
 
 P0.3e3 is incomplete until production TUI code contains no directly owned
 `RuntimeThread`, `InteractiveSession`, `OperationCancellation`, operation cancel

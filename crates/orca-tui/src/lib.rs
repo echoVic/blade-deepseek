@@ -20,6 +20,7 @@ pub mod diff;
 mod display_text;
 mod frame_scheduler;
 mod global_actions;
+mod hosted_runtime;
 mod idle_key_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;

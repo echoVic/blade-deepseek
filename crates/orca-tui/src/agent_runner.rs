@@ -34,9 +34,11 @@ use crate::agent_subagent_execution::{
     collect_subagent_batch, config_for_remaining_subagent_budget, execute_subagent_batch_for_tui,
     should_run_subagent_batch,
 };
-use crate::agent_tool_execution::{execute_readonly_batch_for_tui, execute_tool_for_tui};
+use crate::agent_tool_execution::{
+    execute_readonly_batch_for_tui, execute_tool_for_tui_with_background_events,
+};
 use crate::agent_workflow_execution::execute_workflow_for_tui;
-use crate::bridge::{TuiBudgetAdmission, TuiConversationSession, TuiUsageLedger};
+use crate::bridge::{TuiBudgetAdmission, TuiConversationSession, TuiSession, TuiUsageLedger};
 use crate::operation_controller::{TuiOperationController, TuiTurnControl};
 use crate::runtime_event_projection::tui_event_from_runtime_event;
 use crate::task_supervisor::{TuiTaskSpawner, TuiTaskSupervisor};
@@ -211,7 +213,7 @@ pub(crate) fn task_summary_for_tui(
 }
 
 fn start_main_session_task_for_tui(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     prompt: &str,
@@ -228,7 +230,7 @@ fn start_main_session_task_for_tui(
 }
 
 fn poll_background_current_turn_for_tui(
-    session: &TuiConversationSession,
+    session: &dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     control: &TuiTurnControl,
@@ -329,7 +331,7 @@ fn usage_budget_error(
 }
 
 fn persist_merged_usage(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     usage: orca_core::cost_types::UsageTotals,
@@ -344,7 +346,7 @@ fn persist_merged_usage(
 }
 
 fn finish_budget_exhausted_after_usage(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -746,19 +748,47 @@ impl TuiBackgroundTurnContinuationRequest {
         Self { task_id }
     }
 
-    fn task_id(&self) -> &str {
+    pub(crate) fn task_id(&self) -> &str {
         &self.task_id
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn continue_approved_background_turn_for_tui(
     config: &RunConfig,
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     continuation: &TuiBackgroundTurnContinuationRequest,
     event_tx: &Sender<TuiEvent>,
     cancel: &CancelToken,
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
 ) -> TuiAgentTurnResult {
+    let mut runtime_events = EventFactory::new(
+        session
+            .session_id()
+            .unwrap_or("tui-agent-session")
+            .to_string(),
+    );
+    continue_approved_background_turn_for_tui_with_events(
+        config,
+        session,
+        continuation,
+        event_tx,
+        cancel,
+        pending_workflow_notifications,
+        &mut runtime_events,
+    )
+}
+
+pub(crate) fn continue_approved_background_turn_for_tui_with_events(
+    config: &RunConfig,
+    session: &mut dyn TuiSession,
+    continuation: &TuiBackgroundTurnContinuationRequest,
+    event_tx: &Sender<TuiEvent>,
+    cancel: &CancelToken,
+    pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
+    runtime_events: &mut EventFactory,
+) -> TuiAgentTurnResult {
+    let mut runtime_events = runtime_events;
     let task_id = continuation.task_id();
     let task_usage_before = session
         .task_registry()
@@ -784,12 +814,6 @@ pub(crate) fn continue_approved_background_turn_for_tui(
             }
         };
 
-    let mut runtime_events = EventFactory::new(
-        session
-            .session_id()
-            .unwrap_or("tui-agent-session")
-            .to_string(),
-    );
     if let Some(continued_task) = task_summary_for_tui(session.task_registry(), task_id) {
         send_task_status_updated_for_tui(event_tx, &mut runtime_events, &continued_task);
     }
@@ -800,10 +824,11 @@ pub(crate) fn continue_approved_background_turn_for_tui(
         .with_continuation(runtime_continuation)
         .with_session_completed_event(false)
         .with_event_observer(Arc::new(TuiRuntimeEventObserver::new(event_tx.clone())));
+    let mut continuation_output = io::sink();
     let status = match session.run_request_with_cancel_for_tui(
         &continuation_config,
         &request,
-        io::sink(),
+        &mut continuation_output,
         cancel.clone(),
     ) {
         Ok(status) => status,
@@ -893,7 +918,7 @@ pub(crate) fn continue_approved_background_turn_for_tui(
 }
 
 fn finish_main_session_task_for_tui(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -903,7 +928,7 @@ fn finish_main_session_task_for_tui(
 }
 
 fn finish_main_session_task_with_error_for_tui(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -923,7 +948,7 @@ fn finish_main_session_task_with_error_for_tui(
 }
 
 fn finish_main_session_task_with_error_and_usage_for_tui(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -964,7 +989,7 @@ fn run_status_for_tui_status(status: &str) -> orca_core::event_schema::RunStatus
 }
 
 fn maybe_stop_cancelled_main_session_for_tui(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     task_id: &str,
@@ -991,7 +1016,7 @@ fn maybe_stop_cancelled_main_session_for_tui(
 }
 
 fn close_unstarted_tool_requests_for_tui(
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     event_tx: &Sender<TuiEvent>,
     events: &mut EventFactory,
     pending_tool_requests: &[tool_types::ToolRequest],
@@ -1111,6 +1136,24 @@ pub fn launch_saved_workflow_for_tui(
     raw_args: Option<&str>,
     event_tx: &Sender<TuiEvent>,
 ) {
+    launch_saved_workflow_for_tui_with_registry(
+        config,
+        session.session_id(),
+        session.task_registry(),
+        name,
+        raw_args,
+        event_tx,
+    );
+}
+
+pub(crate) fn launch_saved_workflow_for_tui_with_registry(
+    config: &RunConfig,
+    session_id: Option<&str>,
+    task_registry: &orca_runtime::tasks::TaskRegistry,
+    name: &str,
+    raw_args: Option<&str>,
+    event_tx: &Sender<TuiEvent>,
+) {
     let cwd = config
         .cwd
         .clone()
@@ -1141,15 +1184,9 @@ pub fn launch_saved_workflow_for_tui(
         target: Some(name.to_string()),
         raw_arguments: Some(raw_arguments),
     };
-    let mut events = EventFactory::new(
-        session
-            .session_id()
-            .unwrap_or("tui-workflow-session")
-            .to_string(),
-    );
+    let mut events = EventFactory::new(session_id.unwrap_or("tui-workflow-session").to_string());
     send_tool_requested_for_tui(event_tx, &mut events, &request);
-    let result =
-        execute_workflow_for_tui(config, &cwd, &request, event_tx, session.task_registry());
+    let result = execute_workflow_for_tui(config, &cwd, &request, event_tx, task_registry);
     send_tool_completed_for_tui(event_tx, &mut events, &result, None);
 }
 
@@ -1257,7 +1294,7 @@ pub fn run_agent_for_tui(
 
 pub(crate) fn run_agent_for_tui_with_notification_queue(
     config: &RunConfig,
-    session: &mut TuiConversationSession,
+    session: &mut dyn TuiSession,
     prompt: &str,
     event_tx: &Sender<TuiEvent>,
     control: &TuiTurnControl,
@@ -1268,6 +1305,47 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
     background_completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
     task_spawner: &TuiTaskSpawner,
+) -> TuiAgentTurnResult {
+    let mut runtime_events = EventFactory::new(
+        session
+            .session_id()
+            .unwrap_or("tui-agent-session")
+            .to_string(),
+    );
+    run_agent_for_tui_with_event_factory(
+        config,
+        session,
+        prompt,
+        event_tx,
+        event_tx,
+        control,
+        cancel,
+        allow_goal_tools,
+        task_description,
+        backtrack_target,
+        pending_workflow_notifications,
+        background_completion_handler,
+        task_spawner,
+        &mut runtime_events,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_agent_for_tui_with_event_factory(
+    config: &RunConfig,
+    session: &mut dyn TuiSession,
+    prompt: &str,
+    event_tx: &Sender<TuiEvent>,
+    background_event_tx: &Sender<TuiEvent>,
+    control: &TuiTurnControl,
+    cancel: &CancelToken,
+    allow_goal_tools: bool,
+    task_description: Option<&str>,
+    backtrack_target: bool,
+    pending_workflow_notifications: Option<&PendingWorkflowNotifications>,
+    background_completion_handler: Option<TuiBackgroundTurnCompletionHandler>,
+    task_spawner: &TuiTaskSpawner,
+    runtime_events: &mut EventFactory,
 ) -> TuiAgentTurnResult {
     let cwd = config
         .cwd
@@ -1299,12 +1377,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
     let mut permission_overlay = orca_runtime::lifecycle::TurnPermissionOverlay::default();
     let mut turn: u32 = 0;
     let mut tui_compaction = orca_runtime::TuiAgentTurnCompactionState::new();
-    let mut runtime_events = EventFactory::new(
-        session
-            .session_id()
-            .unwrap_or("tui-agent-session")
-            .to_string(),
-    );
+    let mut runtime_events = runtime_events;
     let main_session_task_id = start_main_session_task_for_tui(
         session,
         event_tx,
@@ -1665,7 +1738,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                         usage_ledger,
                         budget_admission: provider_budget_admission.take(),
                         max_budget_usd: config.max_budget_usd,
-                        event_tx: event_tx.clone(),
+                        event_tx: background_event_tx.clone(),
                         run_id: runtime_events.run_id().to_string(),
                         task_id: main_session_task_id.clone(),
                         completion_handler: background_completion_handler.take(),
@@ -1841,7 +1914,7 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
                 };
                 let memory_cwd = cwd.clone();
                 let messages = session.conversation().messages.clone();
-                let memory_tx = event_tx.clone();
+                let memory_tx = background_event_tx.clone();
                 let run_id = runtime_events.run_id().to_string();
                 if let Err(error) = task_spawner.spawn("auto-memory", move |memory_cancel| {
                     if let Err(error) = memory::extract_project_memory_with_cancel(
@@ -2037,11 +2110,12 @@ pub(crate) fn run_agent_for_tui_with_notification_queue(
             let child_budget_config = (tool_request.name == tool_types::ToolName::Subagent)
                 .then(|| config_for_remaining_subagent_budget(config, session.usage_totals()));
             let tool_config = child_budget_config.as_ref().unwrap_or(config);
-            let (should_stop, result, child_cost) = execute_tool_for_tui(
+            let (should_stop, result, child_cost) = execute_tool_for_tui_with_background_events(
                 tool_config,
                 &cwd,
                 tool_request,
                 event_tx,
+                background_event_tx,
                 control,
                 Some(session.pending_interactions()),
                 0,
@@ -2177,7 +2251,7 @@ fn take_pending_workflow_notification(
 }
 
 fn record_tui_goal_tool_finish(
-    session: &TuiConversationSession,
+    session: &dyn TuiSession,
     turn_extension_id: &str,
     result: &tool_types::ToolResult,
 ) {

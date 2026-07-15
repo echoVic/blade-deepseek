@@ -5,12 +5,14 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{Event, KeyEvent};
 use tui_textarea::TextArea;
 
+#[cfg(test)]
 use orca_core::cancel::OperationCancellation;
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
 
 use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::idle_key_actions::handle_idle_key;
+use crate::operation_controller::TuiOperationInterrupt;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
@@ -32,7 +34,7 @@ pub(crate) fn handle_status_key<F>(
     config: &mut RunConfig,
     shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
-    cancellation: &OperationCancellation,
+    operation: &impl TuiOperationInterrupt,
     preloaded_transcript: &Arc<Mutex<Option<SessionTranscript>>>,
     textarea: &mut TextArea,
     vim_state: &mut VimState,
@@ -97,7 +99,7 @@ where
         && let Some(ShortcutAction::Running(shortcut)) =
             resolve_shortcut(ShortcutContext::Running, *key)
     {
-        handle_running_shortcut(shortcut, state, action_tx, cancellation);
+        handle_running_shortcut(shortcut, state, action_tx, operation);
     }
 
     if state.status == AppStatus::Compacting
@@ -105,7 +107,7 @@ where
             resolve_shortcut(ShortcutContext::Running, *key)
         && compacting_shortcut_allowed(shortcut)
     {
-        handle_running_shortcut(shortcut, state, action_tx, cancellation);
+        handle_running_shortcut(shortcut, state, action_tx, operation);
     }
 
     Ok(StatusKeyFlow::Continue)

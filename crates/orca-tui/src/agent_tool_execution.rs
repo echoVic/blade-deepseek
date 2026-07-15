@@ -31,9 +31,12 @@ use crate::agent_runner::{
     DEFAULT_MAX_TURNS, send_runtime_event_as_tui, send_task_status_updated_for_tui,
     send_tool_completed_for_tui, send_tool_requested_for_tui, task_summary_for_tui,
 };
-use crate::agent_subagent_execution::{execute_subagent_for_tui, execute_subagent_status_for_tui};
+use crate::agent_subagent_execution::{
+    execute_subagent_for_tui_with_background_events, execute_subagent_status_for_tui,
+};
 use crate::agent_workflow_execution::{
-    execute_workflow_draft_action_for_tui, execute_workflow_draft_for_tui, execute_workflow_for_tui,
+    execute_workflow_draft_action_for_tui_with_notifications, execute_workflow_draft_for_tui,
+    execute_workflow_for_tui_with_notifications,
 };
 use crate::diff;
 use crate::operation_controller::TuiTurnControl;
@@ -188,11 +191,55 @@ pub(crate) fn execute_tool_for_tui(
     permission_overlay: &mut TurnPermissionOverlay,
     cancel: &CancelToken,
 ) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
+    execute_tool_for_tui_with_background_events(
+        config,
+        cwd,
+        tool_request,
+        event_tx,
+        event_tx,
+        control,
+        pending_interactions,
+        subagent_depth,
+        session_id,
+        thread_extensions,
+        policy,
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+        task_registry,
+        permission_overlay,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_tool_for_tui_with_background_events(
+    config: &RunConfig,
+    cwd: &Path,
+    tool_request: &tool_types::ToolRequest,
+    event_tx: &Sender<TuiEvent>,
+    background_event_tx: &Sender<TuiEvent>,
+    control: &TuiTurnControl,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
+    subagent_depth: u32,
+    session_id: Option<&str>,
+    thread_extensions: Option<Arc<orca_runtime::extension::ExtensionData>>,
+    policy: &ApprovalPolicy,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    task_registry: Option<&TaskRegistry>,
+    permission_overlay: &mut TurnPermissionOverlay,
+    cancel: &CancelToken,
+) -> (bool, tool_types::ToolResult, Option<CostTracker>) {
     execute_tool_for_tui_inner(
         config,
         cwd,
         tool_request,
         event_tx,
+        background_event_tx,
         control,
         pending_interactions,
         subagent_depth,
@@ -215,6 +262,7 @@ fn execute_tool_for_tui_inner(
     cwd: &Path,
     tool_request: &tool_types::ToolRequest,
     event_tx: &Sender<TuiEvent>,
+    background_event_tx: &Sender<TuiEvent>,
     control: &TuiTurnControl,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     subagent_depth: u32,
@@ -266,11 +314,12 @@ fn execute_tool_for_tui_inner(
 
     let mut rendered_diff = None;
     let (result, child_cost) = if tool_request.name == tool_types::ToolName::Subagent {
-        let (r, c) = execute_subagent_for_tui(
+        let (r, c) = execute_subagent_for_tui_with_background_events(
             config,
             cwd,
             tool_request,
             event_tx,
+            background_event_tx,
             control,
             pending_interactions.clone(),
             subagent_depth,
@@ -405,11 +454,12 @@ fn execute_tool_for_tui_inner(
                     None,
                 );
             };
-            execute_workflow_draft_action_for_tui(
+            execute_workflow_draft_action_for_tui_with_notifications(
                 config,
                 cwd,
                 execution_request,
                 event_tx,
+                background_event_tx,
                 task_registry,
             )
         } else if execution_request.name == tool_types::ToolName::Workflow {
@@ -424,7 +474,14 @@ fn execute_tool_for_tui_inner(
                     None,
                 );
             };
-            execute_workflow_for_tui(config, cwd, execution_request, event_tx, task_registry)
+            execute_workflow_for_tui_with_notifications(
+                config,
+                cwd,
+                execution_request,
+                event_tx,
+                background_event_tx,
+                task_registry,
+            )
         } else if execution_request.name == tool_types::ToolName::SubagentStatus {
             let Some(task_registry) = task_registry else {
                 return (

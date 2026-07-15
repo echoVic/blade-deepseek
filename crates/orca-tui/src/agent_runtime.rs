@@ -1,12 +1,12 @@
 use std::io;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
-use orca_core::cancel::OperationCancellation;
+use orca_runtime::runtime_host::{RuntimeHost, RuntimeHostHandle, ThreadOperationExecutor};
 
 use crate::action_dispatcher::TuiActionDispatcher;
 use crate::channels::USER_ACTION_CAPACITY;
-use crate::interaction_broker::TuiInteractionBroker;
 use crate::operation_controller::TuiOperationController;
 use crate::task_supervisor::{TuiTaskSpawner, TuiTaskSupervisor};
 use crate::types::{TuiEvent, UserAction};
@@ -16,21 +16,57 @@ pub(crate) struct TuiAgentRuntime {
     dispatcher: TuiActionDispatcher,
     agent: Option<JoinHandle<()>>,
     tasks: TuiTaskSupervisor,
+    host: Option<RuntimeHost>,
 }
 
 impl TuiAgentRuntime {
+    #[cfg(test)]
     pub(crate) fn spawn(
         action_rx: Receiver<UserAction>,
         event_tx: Sender<TuiEvent>,
         task_capacity: usize,
         run: impl FnOnce(TuiOperationController, Receiver<UserAction>, TuiTaskSpawner) + Send + 'static,
     ) -> io::Result<Self> {
+        let controller = TuiOperationController::default();
+        let host = RuntimeHost::start().map_err(runtime_host_error)?;
+        let tasks = TuiTaskSupervisor::new(task_capacity);
         Self::spawn_with_dispatch_capacities(
             action_rx,
             event_tx,
             USER_ACTION_CAPACITY,
             USER_ACTION_CAPACITY,
-            task_capacity,
+            controller,
+            host,
+            tasks,
+            move |controller, commands, tasks, _host| run(controller, commands, tasks),
+        )
+    }
+
+    pub(crate) fn spawn_hosted(
+        action_rx: Receiver<UserAction>,
+        event_tx: Sender<TuiEvent>,
+        task_capacity: usize,
+        controller: TuiOperationController,
+        build_executor: impl FnOnce(TuiTaskSpawner) -> Arc<dyn ThreadOperationExecutor>,
+        run: impl FnOnce(
+            TuiOperationController,
+            Receiver<UserAction>,
+            TuiTaskSpawner,
+            RuntimeHostHandle,
+        ) + Send
+        + 'static,
+    ) -> io::Result<Self> {
+        let tasks = TuiTaskSupervisor::new(task_capacity);
+        let executor = build_executor(tasks.spawner());
+        let host = RuntimeHost::start_with_executor(executor).map_err(runtime_host_error)?;
+        Self::spawn_with_dispatch_capacities(
+            action_rx,
+            event_tx,
+            USER_ACTION_CAPACITY,
+            USER_ACTION_CAPACITY,
+            controller,
+            host,
+            tasks,
             run,
         )
     }
@@ -40,15 +76,19 @@ impl TuiAgentRuntime {
         event_tx: Sender<TuiEvent>,
         command_capacity: usize,
         backlog_capacity: usize,
-        task_capacity: usize,
-        run: impl FnOnce(TuiOperationController, Receiver<UserAction>, TuiTaskSpawner) + Send + 'static,
+        controller: TuiOperationController,
+        host: RuntimeHost,
+        tasks: TuiTaskSupervisor,
+        run: impl FnOnce(
+            TuiOperationController,
+            Receiver<UserAction>,
+            TuiTaskSpawner,
+            RuntimeHostHandle,
+        ) + Send
+        + 'static,
     ) -> io::Result<Self> {
-        let tasks = TuiTaskSupervisor::new(task_capacity);
         let task_spawner = tasks.spawner();
-        let controller = TuiOperationController::new(
-            OperationCancellation::new(),
-            TuiInteractionBroker::default(),
-        );
+        let host_handle = host.handle();
         let (mut dispatcher, command_rx) = TuiActionDispatcher::spawn(
             action_rx,
             event_tx,
@@ -59,7 +99,7 @@ impl TuiAgentRuntime {
         let agent_controller = controller.clone();
         let agent = thread::Builder::new()
             .name("orca-tui-agent".to_string())
-            .spawn(move || run(agent_controller, command_rx, task_spawner));
+            .spawn(move || run(agent_controller, command_rx, task_spawner, host_handle));
         let agent = match agent {
             Ok(agent) => agent,
             Err(error) => {
@@ -72,17 +112,24 @@ impl TuiAgentRuntime {
             dispatcher,
             agent: Some(agent),
             tasks,
+            host: Some(host),
         })
     }
 
-    pub(crate) fn cancellation(&self) -> &OperationCancellation {
-        self.controller.cancellation()
+    pub(crate) fn controller(&self) -> &TuiOperationController {
+        &self.controller
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {
         let Some(agent) = self.agent.take() else {
             let dispatcher_result = self.dispatcher.shutdown();
-            return dispatcher_result.and_then(|()| self.tasks.shutdown());
+            let tasks_result = self.tasks.shutdown();
+            let host_result = self
+                .host
+                .take()
+                .map_or(Ok(()), RuntimeHost::shutdown)
+                .map_err(runtime_host_error);
+            return dispatcher_result.and(tasks_result).and(host_result);
         };
         self.controller.shutdown();
         self.tasks.begin_shutdown();
@@ -92,8 +139,20 @@ impl TuiAgentRuntime {
             .join()
             .map_err(|_| io::Error::other("TUI agent controller panicked during shutdown"));
         let tasks_result = self.tasks.shutdown();
-        dispatcher_result.and(agent_result).and(tasks_result)
+        let host_result = self
+            .host
+            .take()
+            .map_or(Ok(()), RuntimeHost::shutdown)
+            .map_err(runtime_host_error);
+        dispatcher_result
+            .and(agent_result)
+            .and(tasks_result)
+            .and(host_result)
     }
+}
+
+fn runtime_host_error(error: orca_runtime::runtime_host::RuntimeHostError) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 impl Drop for TuiAgentRuntime {
@@ -176,14 +235,19 @@ mod tests {
             .send(UserAction::Submit("fill command mailbox".to_string()))
             .expect("fill action mailbox");
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let controller = TuiOperationController::default();
+        let host = RuntimeHost::start().expect("runtime host");
+        let tasks = TuiTaskSupervisor::new(1);
 
         let mut runtime = TuiAgentRuntime::spawn_with_dispatch_capacities(
             action_rx,
             event_tx,
             1,
             1,
-            1,
-            move |controller, _commands, _tasks| {
+            controller,
+            host,
+            tasks,
+            move |controller, _commands, _tasks, _host| {
                 let operation = controller.start().expect("operation started");
                 ready_tx.send(()).expect("ready signal");
                 while !operation.token().is_cancelled() {

@@ -157,13 +157,34 @@ fn route_action(
             } else if backlog.len() < backlog_capacity {
                 backlog.push_back(action);
             } else {
-                let _ = event_tx.try_send(TuiEvent::Error(
-                    "TUI command queue is full; command rejected".to_string(),
-                ));
+                reject_overflowed_action(event_tx, action);
             }
         }
     }
     true
+}
+
+fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
+    let message = "TUI command queue is full; command rejected".to_string();
+    match action {
+        UserAction::Submit(prompt) | UserAction::SubmitWithMentions { prompt, .. } => {
+            let _ = event_tx.try_send(TuiEvent::SubmissionRejected { prompt, message });
+        }
+        UserAction::SubmitWorkflowNotification(_)
+        | UserAction::RunWorkflow { .. }
+        | UserAction::Compact
+        | UserAction::GoalShow
+        | UserAction::GoalSet(_)
+        | UserAction::GoalEdit(_)
+        | UserAction::GoalClear
+        | UserAction::GoalPause
+        | UserAction::GoalResume => {
+            let _ = event_tx.try_send(TuiEvent::OperationRejected(message));
+        }
+        _ => {
+            let _ = event_tx.try_send(TuiEvent::Error(message));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +312,32 @@ mod tests {
                 ),
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe
         ));
+    }
+
+    #[test]
+    fn overflowed_submit_is_rejected_with_its_prompt() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let controller = TuiOperationController::default();
+        let (mut dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, controller, 1, 1)
+                .expect("spawn dispatcher");
+
+        raw_tx
+            .send(UserAction::Submit("first".to_string()))
+            .unwrap();
+        raw_tx
+            .send(UserAction::Submit("second".to_string()))
+            .unwrap();
+        raw_tx
+            .send(UserAction::Submit("third".to_string()))
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::SubmissionRejected { prompt, message })
+                if prompt == "third" && message.contains("queue is full")
+        ));
+        dispatcher.shutdown().expect("shutdown dispatcher");
     }
 }

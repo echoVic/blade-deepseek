@@ -2,8 +2,7 @@ use crossbeam_channel as mpsc;
 use std::io;
 use std::time::{Duration, Instant};
 
-use orca_core::cancel::OperationCancellation;
-
+use crate::operation_controller::TuiOperationInterrupt;
 use crate::shortcuts::GlobalShortcut;
 use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
 
@@ -16,7 +15,7 @@ pub(crate) fn handle_global_shortcut<F>(
     shortcut: GlobalShortcut,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
-    cancellation: &OperationCancellation,
+    operation: &impl TuiOperationInterrupt,
     clear_terminal: F,
 ) -> io::Result<GlobalShortcutFlow>
 where
@@ -31,7 +30,7 @@ where
                     | AppStatus::WaitingApproval
                     | AppStatus::WaitingUserInput
             ) {
-                cancellation.cancel_current();
+                operation.interrupt_current();
                 let _ = action_tx.send(UserAction::Interrupt);
                 return Ok(GlobalShortcutFlow::Continue);
             }

@@ -291,6 +291,7 @@ pub enum TuiEvent {
         prompt: String,
         message: String,
     },
+    OperationRejected(String),
     Error(String),
     UsageUpdated(UsageTotals),
     ContextUpdated {
@@ -1890,6 +1891,11 @@ impl AppState {
                 self.push_message(ChatMessage::Error(message));
                 self.set_status(AppStatus::Idle);
             }
+            TuiEvent::OperationRejected(message) => {
+                self.clear_receiving_tool_progress();
+                self.push_message(ChatMessage::Error(message));
+                self.set_status(AppStatus::Idle);
+            }
             TuiEvent::Error(msg) => {
                 self.clear_receiving_tool_progress();
                 self.push_message(ChatMessage::Error(msg));
@@ -3270,6 +3276,23 @@ mod tests {
         assert!(matches!(
             state.messages.last(),
             Some(ChatMessage::Error(message)) if message == "recoverable runtime error"
+        ));
+    }
+
+    #[test]
+    fn operation_rejection_reports_error_and_returns_idle() {
+        let mut state = state();
+        state.enter_running();
+
+        state.update(TuiEvent::OperationRejected(
+            "operation could not start".to_string(),
+        ));
+
+        assert_eq!(state.status, AppStatus::Idle);
+        assert_eq!(state.running_started_at, None);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message)) if message == "operation could not start"
         ));
     }
 
