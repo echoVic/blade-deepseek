@@ -1,8 +1,8 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: Active; P0.3e1 and P0.3e2 complete, P0.3e3 next
+- Status: Active; P0.3e1, P0.3e2, and P0.3e3a complete; P0.3e3b next
 - Date: 2026-07-15
-- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e2 validation)
+- Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e3a validation)
 - Branch: `codex/tui-runtime-host-migration`
 - ADR: `docs/architecture/adr/0005-runtime-host-operation-control-plane.md`
 
@@ -231,12 +231,98 @@ list filters and search, and turn/item pagination within the `$0.02` budget.
 
 ### P0.3e3: Actor-Owned TUI Session And Operation Control
 
-1. Create/resume/fork the TUI conversation inside one `RuntimeHost`.
-2. Route TUI turns, manual compaction, idle mutations, task queries, and
-   terminal waits through typed handles.
-3. Delete `TuiConversationSession` ownership of `RuntimeThread` and delete UI
-   `OperationCancellation`.
-4. Preserve goal and background continuation task identity and usage.
+Structural problem and evidence:
+
+- `bridge::TuiConversationSession` still stores `runtime: RuntimeThread` and
+  exposes mutable conversation, history writer, lifecycle, cost, extension,
+  and compaction access to the surface loop;
+- `agent_loop_thread_with_registry` owns `Option<TuiConversationSession>` and
+  performs create/resume, idle mutation, turn execution, and terminal handling
+  synchronously beside the runtime actor used by server and headless;
+- the UI shortcut path receives `OperationCancellation` directly, so UI state
+  can acknowledge cancellation without an actor-fenced `OperationId` or joined
+  `OperationCompletion` terminal;
+- resume/fork startup and goal/background continuation rely on direct session
+  mutation, so merely wrapping submit in `RuntimeHost` would leave two owners.
+
+Target ownership and module boundary:
+
+- `TuiAgentRuntime` owns one `RuntimeHost`, one joined TUI command controller,
+  and at most one `RuntimeThreadHandle`; the handle is command authority, not a
+  mutable session lease;
+- one `ThreadActor` permanently owns the TUI `RuntimeThread`, including resumed
+  history, MCP registry, conversation, writer, lifecycle, usage, task registry,
+  and thread extensions;
+- the TUI controller retains only the current `OperationHandle` identity and
+  completion cell. Interrupt sends the handle's typed operation command, then
+  UI terminal state follows the joined completion rather than acknowledgement;
+- session startup, idle reads/mutations, manual compaction, and turns use typed
+  host commands. No closure command or type-erased mutable session escape is
+  accepted as the final boundary;
+- during P0.3e3 only, a `TuiThreadOperationExecutor` may invoke the existing TUI
+  turn kernel while borrowing `&mut RuntimeThread` inside the actor-owned task.
+  It may not store the thread, cancel token, join handle, or a second operation
+  state. P0.3e4 deletes this executor when the canonical runtime turn and
+  background handoff replace the old TUI kernel.
+
+TUI user value:
+
+- `Ctrl-C` targets the exact actor operation shown as active and the next turn
+  cannot start until cancelled work has returned the thread to the actor;
+- resume/fork, goals, manual compaction, task controls, and model changes keep
+  one conversation and usage fact instead of racing a surface-owned session;
+- TUI shutdown joins the host-owned operation and thread actor before terminal
+  restoration completes.
+
+External compatibility remains unchanged for CLI arguments, TUI keys and
+status transitions, transcript/history format, goals/tasks/workflows,
+server/JSONL protocol, MCP behavior, model selection, provider semantics, and
+background-current-turn behavior.
+
+Migration checkpoints:
+
+1. **P0.3e3a - actor session capabilities.** Add behavior-first runtime-host
+   support for preloaded/resumed startup with an injected MCP registry and the
+   typed idle session reads/mutations required by the TUI. Prove commands are
+   rejected while an operation owns the thread and preserve session identity,
+   conversation, task registry, and usage.
+2. **P0.3e3b - production TUI host controller.** Start the TUI thread in one
+   host, route submits and manual compaction through `OperationHandle`, wait on
+   `OperationCompletion`, and keep the dispatcher responsive while the actor
+   operation runs. Preserve goal and background continuation behavior.
+3. **P0.3e3c - delete surface owners.** Replace `TuiConversationSession` with a
+   handle/projection boundary, delete UI/controller `OperationCancellation`,
+   and replace source-shape ownership assertions with actor behavior tests.
+
+P0.3e3a implementation checkpoint:
+
+- `RuntimeThreadStartRequest` moves the config, title, optional preloaded
+  transcript, and optional initialized MCP registry into host startup, so
+  resume/fork construction occurs before the actor becomes externally visible;
+- `RuntimeThreadMutation` provides typed model, pinned-context, goal-context,
+  and skill-context mutation, while backtrack remains a typed result command;
+- idle snapshots expose an immutable cloned conversation plus aggregate usage,
+  completion error, active workflow state, and lifecycle task identity without
+  leaking mutable session ownership;
+- `InteractiveSession` now retains resumed usage as a separate baseline from
+  the current foreground `CostTracker`. Actor projections return baseline plus
+  current usage, while history `Usage` records remain post-resume foreground
+  snapshots and therefore cannot double-count the persisted `UsageBaseline`;
+- mutations, backtrack, and snapshots are rejected with the active
+  `OperationId` while the operation task owns the thread.
+
+Final verification followed a fresh fetch and no-op rebase onto the current
+`origin/main`. Runtime-host 21/21 and `orca-runtime` 769/769 passed after the
+rebase, followed by the serial workspace all-targets gate and workspace Clippy
+with only pre-existing warnings. The release harness checks and live DeepSeek
+E2E passed within the `$0.02` budget, including provider summary, CLI, history
+replay and repair, server/thread memory, active-turn resume/control, metadata,
+list filters/search, and turn/item pagination.
+
+P0.3e3 is incomplete until production TUI code contains no directly owned
+`RuntimeThread`, `InteractiveSession`, `OperationCancellation`, operation cancel
+token, or operation join handle outside `RuntimeHost`; every terminal UI
+transition must be attributable to a matching `OperationCompletion`.
 
 ### P0.3e4: Canonical Turn And Background Handoff
 

@@ -11,17 +11,22 @@ use orca_core::config::{
     HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig,
     WorkflowConfig,
 };
+use orca_core::conversation::Message;
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::{HookConfig, HookEvent};
+use orca_core::mcp_types::McpServerConfig;
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
+use orca_mcp::McpRegistry;
+use orca_runtime::history::{self, SessionTranscript};
 use orca_runtime::lifecycle::RuntimeTaskStatus;
 use orca_runtime::runtime_host::{
     GenerationAdmissionResult, GenerationContext, GenerationFence, HostedGenerationHandlers,
     HostedOperationWriter, HostedTurnRequest, InterruptOperationResult, OperationOutcome,
-    ResumeOperationResult, RuntimeHost, RuntimeHostError, RuntimeThreadState, SteerOperationResult,
-    ThreadOperationExecutor,
+    ResumeOperationResult, RuntimeHost, RuntimeHostError, RuntimeThreadMutation,
+    RuntimeThreadStartRequest, RuntimeThreadState, SteerOperationResult, ThreadOperationExecutor,
 };
 use orca_runtime::thread::RuntimeThread;
 
@@ -797,6 +802,181 @@ fn hosted_turn_uses_per_turn_config_task_id_and_idle_snapshot() {
         Some("turn-42")
     );
 
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry() {
+    let cwd = tempfile::tempdir().unwrap();
+    let transcript_path = cwd.path().join("resume.jsonl");
+    let mut meta = history::create_meta(cwd.path(), "mock", None, "resumed thread");
+    meta.session_id = "actor-resume-session".to_string();
+    let mut meta_json = serde_json::to_value(&meta).expect("serialize session meta");
+    meta_json
+        .as_object_mut()
+        .expect("session meta object")
+        .insert(
+            "type".to_string(),
+            serde_json::Value::String("session.meta".to_string()),
+        );
+    std::fs::write(
+        &transcript_path,
+        format!("{}\n", serde_json::to_string(&meta_json).unwrap()),
+    )
+    .expect("write resume transcript");
+    let baseline = UsageTotals {
+        input_tokens: 120,
+        output_tokens: 30,
+        cache_tokens: 40,
+        estimated_cost_usd: 0.25,
+    };
+    let transcript = SessionTranscript {
+        meta,
+        messages: vec![
+            Message::system("original system".to_string()),
+            Message::user("resumed prompt".to_string()),
+        ],
+        compactions: Vec::new(),
+        summaries: Vec::new(),
+        usage: Some(baseline),
+        plan: None,
+        completion_status: Some("success".to_string()),
+        completion_error: None,
+        path: transcript_path,
+    };
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.history_mode = HistoryMode::Resume("actor-resume-session".to_string());
+    config.mcp_servers.push(McpServerConfig {
+        name: "must-not-start".to_string(),
+        command: Some("orca-missing-mcp-command".to_string()),
+        ..Default::default()
+    });
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread_with_request(
+            RuntimeThreadStartRequest::new(config, "ignored title")
+                .with_preloaded(transcript)
+                .with_mcp_registry(McpRegistry::default()),
+        )
+        .expect("start resumed actor thread");
+
+    assert_eq!(thread.thread_id(), "actor-resume-session");
+    assert!(
+        thread.startup_warnings().is_empty(),
+        "the injected registry must bypass config-time MCP startup"
+    );
+    let snapshot = thread.snapshot().expect("read resumed snapshot");
+    assert_eq!(snapshot.usage_totals(), baseline);
+    assert!(snapshot.messages().iter().any(
+        |message| matches!(message, Message::User { content, .. } if content == "resumed prompt")
+    ));
+    assert_eq!(
+        thread
+            .backtrack_last_user()
+            .expect("backtrack actor-owned session"),
+        Some("resumed prompt".to_string())
+    );
+    assert!(
+        !thread
+            .snapshot()
+            .expect("read backtracked snapshot")
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::User { .. }))
+    );
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn typed_idle_session_commands_mutate_only_actor_owned_state() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(test_config(cwd.path().to_path_buf()), "idle mutation")
+        .expect("start runtime thread");
+
+    thread
+        .mutate(RuntimeThreadMutation::SetModel(Some(
+            "deepseek-v4-pro".to_string(),
+        )))
+        .expect("set actor model");
+    thread
+        .mutate(RuntimeThreadMutation::AddPinnedContext(
+            "remember this".to_string(),
+        ))
+        .expect("add pinned context");
+    thread
+        .mutate(RuntimeThreadMutation::ReplaceGoalContext(
+            "goal context".to_string(),
+        ))
+        .expect("replace goal context");
+    thread
+        .mutate(RuntimeThreadMutation::ReplaceSkillContext(Some(
+            "skill context".to_string(),
+        )))
+        .expect("replace skill context");
+
+    let snapshot = thread.snapshot().expect("read mutated snapshot");
+    assert!(
+        snapshot
+            .conversation()
+            .volatile
+            .goal
+            .as_deref()
+            .is_some_and(|context| context.contains("goal context"))
+    );
+    assert!(
+        snapshot
+            .conversation()
+            .volatile
+            .skill
+            .as_deref()
+            .is_some_and(|context| context.contains("skill context"))
+    );
+    assert!(snapshot.messages().iter().any(|message| {
+        matches!(message, Message::User { content, pinned: true } if content == "remember this")
+    }));
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn idle_session_commands_are_rejected_while_operation_owns_thread() {
+    let gate = ManualGate::new();
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::WaitForRelease {
+        gate: gate.clone(),
+        status: RunStatus::Success,
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(executor);
+    let operation = thread
+        .start_turn(HostedTurnRequest::new("active turn"), io::sink())
+        .expect("start active turn");
+    gate.wait_until_entered();
+
+    assert_eq!(
+        thread
+            .mutate(RuntimeThreadMutation::AddPinnedContext(
+                "must not race".to_string(),
+            ))
+            .expect_err("running mutation must be rejected"),
+        RuntimeHostError::OperationActive {
+            operation_id: operation.id(),
+        }
+    );
+    assert_eq!(
+        thread
+            .backtrack_last_user()
+            .expect_err("running backtrack must be rejected"),
+        RuntimeHostError::OperationActive {
+            operation_id: operation.id(),
+        }
+    );
+
+    gate.release();
+    operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("active turn terminal");
     host.shutdown().expect("shutdown runtime host");
 }
 

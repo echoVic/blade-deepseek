@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_core::config::RunConfig;
-use orca_core::conversation::Message;
+use orca_core::conversation::{Conversation, Message};
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::HookEvent;
@@ -26,6 +27,7 @@ use crate::lifecycle::{
 };
 use crate::tasks::TaskRegistry;
 use crate::thread::RuntimeThread;
+use crate::thread_store::SessionTranscript;
 
 pub const HOST_COMMAND_CAPACITY: usize = 16;
 pub const THREAD_COMMAND_CAPACITY: usize = 16;
@@ -532,10 +534,76 @@ pub enum RuntimeThreadState {
     Unavailable,
 }
 
+pub struct RuntimeThreadStartRequest {
+    config: RunConfig,
+    title: String,
+    preloaded: Option<SessionTranscript>,
+    mcp_registry: Option<McpRegistry>,
+}
+
+impl RuntimeThreadStartRequest {
+    pub fn new(config: RunConfig, title: impl Into<String>) -> Self {
+        Self {
+            config,
+            title: title.into(),
+            preloaded: None,
+            mcp_registry: None,
+        }
+    }
+
+    pub fn with_preloaded(mut self, preloaded: SessionTranscript) -> Self {
+        self.preloaded = Some(preloaded);
+        self
+    }
+
+    pub fn with_mcp_registry(mut self, mcp_registry: McpRegistry) -> Self {
+        self.mcp_registry = Some(mcp_registry);
+        self
+    }
+
+    fn start(self) -> io::Result<RuntimeThread> {
+        match self.mcp_registry {
+            Some(mcp_registry) => RuntimeThread::start_with_preloaded_and_mcp_registry(
+                &self.config,
+                self.title,
+                self.preloaded,
+                mcp_registry,
+            ),
+            None => RuntimeThread::start_with_preloaded(&self.config, self.title, self.preloaded),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeThreadMutation {
+    SetModel(Option<String>),
+    AddPinnedContext(String),
+    ReplaceGoalContext(String),
+    ReplaceSkillContext(Option<String>),
+}
+
+impl RuntimeThreadMutation {
+    fn apply(self, thread: &mut RuntimeThread) {
+        match self {
+            Self::SetModel(model) => thread.session_mut().set_model(model.as_deref()),
+            Self::AddPinnedContext(content) => thread.session_mut().add_pinned_context(content),
+            Self::ReplaceGoalContext(content) => {
+                thread.session_mut().replace_goal_context(content);
+            }
+            Self::ReplaceSkillContext(content) => {
+                thread.session_mut().replace_skill_context(content);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeThreadSnapshot {
     thread_id: String,
-    messages: Vec<Message>,
+    conversation: Conversation,
+    usage_totals: UsageTotals,
+    completion_error: Option<String>,
+    has_active_workflows: bool,
     active_task_id: Option<String>,
 }
 
@@ -543,7 +611,10 @@ impl RuntimeThreadSnapshot {
     fn from_thread(thread: &RuntimeThread) -> Self {
         Self {
             thread_id: thread.thread_id().to_string(),
-            messages: thread.session().conversation().messages.clone(),
+            conversation: thread.session().conversation().clone(),
+            usage_totals: thread.session().aggregate_usage_totals(),
+            completion_error: thread.session().completion_error().map(str::to_string),
+            has_active_workflows: thread.session().has_active_workflows(),
             active_task_id: thread
                 .lifecycle()
                 .active_task()
@@ -556,7 +627,23 @@ impl RuntimeThreadSnapshot {
     }
 
     pub fn messages(&self) -> &[Message] {
-        &self.messages
+        &self.conversation.messages
+    }
+
+    pub fn conversation(&self) -> &Conversation {
+        &self.conversation
+    }
+
+    pub fn usage_totals(&self) -> UsageTotals {
+        self.usage_totals
+    }
+
+    pub fn completion_error(&self) -> Option<&str> {
+        self.completion_error.as_deref()
+    }
+
+    pub fn has_active_workflows(&self) -> bool {
+        self.has_active_workflows
     }
 
     pub fn active_task_id(&self) -> Option<&str> {
@@ -884,6 +971,21 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    pub fn mutate(&self, mutation: RuntimeThreadMutation) -> Result<(), RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::MutateIdle {
+            mutation,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub fn backtrack_last_user(&self) -> Result<Option<String>, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::BacktrackLastUser { reply: reply_tx })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     pub fn shutdown(&self) -> Result<(), RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         send_thread_shutdown(
@@ -971,10 +1073,16 @@ impl RuntimeHost {
         config: RunConfig,
         title: impl Into<String>,
     ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
+        self.start_thread_with_request(RuntimeThreadStartRequest::new(config, title))
+    }
+
+    pub fn start_thread_with_request(
+        &self,
+        request: RuntimeThreadStartRequest,
+    ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         match self.command_tx.try_send(HostCommand::StartThread {
-            config: Box::new(config),
-            title: title.into(),
+            request: Box::new(request),
             reply: reply_tx,
         }) {
             Ok(()) => receive_reply(reply_rx, "runtime host")?,
@@ -1015,8 +1123,7 @@ impl Drop for RuntimeHost {
 
 enum HostCommand {
     StartThread {
-        config: Box<RunConfig>,
-        title: String,
+        request: Box<RuntimeThreadStartRequest>,
         reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
     },
     Shutdown {
@@ -1054,6 +1161,13 @@ enum ThreadCommand {
     ReadSnapshot {
         reply: SyncSender<Result<RuntimeThreadSnapshot, RuntimeHostError>>,
     },
+    MutateIdle {
+        mutation: RuntimeThreadMutation,
+        reply: SyncSender<Result<(), RuntimeHostError>>,
+    },
+    BacktrackLastUser {
+        reply: SyncSender<Result<Option<String>, RuntimeHostError>>,
+    },
     ShutdownThread {
         reply: Option<SyncSender<Result<(), RuntimeHostError>>>,
     },
@@ -1071,14 +1185,9 @@ async fn run_host_supervisor(
     let mut actors = HashMap::<String, ThreadActorEntry>::new();
     while let Some(command) = command_rx.recv().await {
         match command {
-            HostCommand::StartThread {
-                config,
-                title,
-                reply,
-            } => {
-                let actor_config = (*config).clone();
-                let started =
-                    tokio::task::spawn_blocking(move || RuntimeThread::start(&config, title)).await;
+            HostCommand::StartThread { request, reply } => {
+                let actor_config = request.config.clone();
+                let started = tokio::task::spawn_blocking(move || request.start()).await;
                 let thread = match started {
                     Ok(Ok(thread)) => thread,
                     Ok(Err(error)) => {
@@ -1369,6 +1478,24 @@ impl ThreadActor {
                 let _ = reply.send(result);
                 false
             }
+            ThreadCommand::MutateIdle { mutation, reply } => {
+                let result = self
+                    .state
+                    .as_mut()
+                    .ok_or(RuntimeHostError::ThreadUnavailable)
+                    .map(|state| mutation.apply(&mut state.thread));
+                let _ = reply.send(result);
+                false
+            }
+            ThreadCommand::BacktrackLastUser { reply } => {
+                let result = self
+                    .state
+                    .as_mut()
+                    .ok_or(RuntimeHostError::ThreadUnavailable)
+                    .map(|state| state.thread.session_mut().backtrack_last_user());
+                let _ = reply.send(result);
+                false
+            }
             ThreadCommand::ShutdownThread { reply } => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Ok(()));
@@ -1473,6 +1600,16 @@ impl ThreadActor {
                 let _ = reply.send(Ok(RuntimeThreadState::Running { generation, phase }));
             }
             ThreadCommand::ReadSnapshot { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::MutateIdle { reply, .. } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::BacktrackLastUser { reply } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));

@@ -41,6 +41,7 @@ pub struct InteractiveSession {
     completion_error: Option<String>,
     instructions: ProjectInstructions,
     cost_tracker: CostTracker,
+    usage_baseline: UsageTotals,
     mcp_registry: McpRegistry,
     hooks: HookRunner,
     memory: MemoryBlock,
@@ -301,6 +302,14 @@ impl InteractiveSession {
                 (conversation, None)
             }
         };
+        let usage_baseline = if matches!(config.history_mode, HistoryMode::Resume(_)) {
+            loaded_transcript
+                .as_ref()
+                .and_then(|transcript| transcript.usage)
+                .unwrap_or_default()
+        } else {
+            UsageTotals::default()
+        };
 
         let mut session_id = None;
         let writer = match &config.history_mode {
@@ -382,6 +391,7 @@ impl InteractiveSession {
             completion_error: None,
             instructions,
             cost_tracker: CostTracker::new(None),
+            usage_baseline,
             mcp_registry,
             hooks,
             memory,
@@ -427,6 +437,25 @@ impl InteractiveSession {
 
     pub fn usage_totals(&self) -> UsageTotals {
         self.cost_tracker.totals()
+    }
+
+    pub fn aggregate_usage_totals(&self) -> UsageTotals {
+        let current = self.cost_tracker.totals();
+        UsageTotals {
+            input_tokens: self
+                .usage_baseline
+                .input_tokens
+                .saturating_add(current.input_tokens),
+            output_tokens: self
+                .usage_baseline
+                .output_tokens
+                .saturating_add(current.output_tokens),
+            cache_tokens: self
+                .usage_baseline
+                .cache_tokens
+                .saturating_add(current.cache_tokens),
+            estimated_cost_usd: self.usage_baseline.estimated_cost_usd + current.estimated_cost_usd,
+        }
     }
 
     pub fn mcp_registry(&self) -> &McpRegistry {
