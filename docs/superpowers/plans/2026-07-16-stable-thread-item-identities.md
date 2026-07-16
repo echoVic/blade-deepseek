@@ -1,6 +1,6 @@
 # P1.1f Stable Thread And Item Identity Plan
 
-- Status: in progress
+- Status: complete; release target `v0.2.31`
 - Base: `a9aec6ab3ca5aeaa733cc8ebb587ab185058f22c`
 - Branch: `codex/stable-thread-item-ids-p11f`
 
@@ -205,3 +205,39 @@ are not allowed to become a second durable identity source. A later canonical
 completed-model-item reducer must either make live and cold text item shapes
 identical or delete the remaining live-only ids; P1.1f documents that gate and
 does not claim replay equivalence before it exists.
+
+## Completion Evidence
+
+The implementation landed as four independently reviewable slices:
+
+- `9857c4c05` records the structural problem, target ownership, migration, and
+  deletion gates before implementation.
+- `9c99f5e7c` introduces typed UUIDv7 turn/item ids and separates logical turn
+  identity from operation, runtime task, and TaskRegistry identity.
+- `849c15a16` persists writer-scoped conversation identity and replaces current
+  ThreadStore projection with record-owned ids while isolating legacy fallback.
+- `b201ff496` fixes the release harness to control turns by logical `turnId` and
+  adds the two-process stable-identity DeepSeek gate.
+
+Deletion audit confirms `next_persisted_turn_id`, the old
+`stored_messages_to_thread_*` projectors, and server `with_task_id` identity
+reuse are gone. The only numeric fallbacks are the two named legacy helpers in
+`thread_store/projection.rs`.
+
+Focused validation covers core identity parsing, identified transcript IO,
+RuntimeHost generation ownership, live and cold server projections,
+ThreadStore pagination and mutations, resume, fork, compaction, compatibility
+repair, redaction, zstd restore, malformed identity, tool result merging, file
+change ids, and workflow run ids. The final serial
+`cargo test --workspace --all-targets -- --test-threads=1` gate and
+`cargo clippy --workspace --all-targets` pass; Clippy reports only the existing
+non-deny warning baseline.
+
+`node scripts/release/real-api-e2e.mjs --skip-build --max-budget 0.02
+--timeout-ms 300000` passes against the configured DeepSeek API. Its isolated
+identity case records one turn, reads typed ids from a cold server process,
+resumes the same thread from a second `orca exec` process, recalls the unique
+first-process sentinel, and verifies the old turn/item id prefix remains exact
+while the new turn and items receive fresh typed ids. The complete provider,
+CLI, compatibility-repair, server memory, active interrupt/resume, metadata,
+search, pagination, and cold-read gates pass in the same run.

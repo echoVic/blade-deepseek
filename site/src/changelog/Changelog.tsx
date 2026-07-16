@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.31":
+        "Recorded conversations now keep opaque turn and item identities across reload, resume, compaction, repair, pagination, rename, archive, and compression. Logical turn ids are separate from runtime task ids, so concurrent first turns cannot collide in server control routing. New records use typed UUIDv7 identities, tool and workflow items retain their domain ids, and legacy histories remain readable through one isolated fallback. A real DeepSeek gate now records a turn, restarts the process, resumes the same thread, and proves both context continuity and stable prior ids.",
       "v0.2.30":
         "The production TUI now runs foreground turns, interrupted streams, approvals, user input, MCP elicitation, background providers, and saved workflows through one process-owned RuntimeHost. RuntimeHost owns cancellation, joins, terminal events, usage commits, and shutdown cleanup; the duplicate TUI provider/tool/workflow loops and TaskSupervisor are removed. A cancelled live DeepSeek stream releases the foreground operation and the next submit starts cleanly, while repeated idle Goal refreshes no longer duplicate the same notice.",
       "v0.2.29":
@@ -514,6 +516,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.31":
+        "已记录会话的 turn 与 item 现在使用不透明稳定身份，在重新加载、resume、compaction、兼容修复、分页、重命名、归档和压缩后都不会改变。逻辑 turn id 与 runtime task id 已彻底分离，并发 thread 即使都处于第一轮，也不会在 server 控制路由中发生碰撞。新记录使用类型化 UUIDv7 身份，tool 与 workflow item 保留各自领域 id；旧历史通过唯一隔离的 fallback 继续可读。真实 DeepSeek gate 会先记录一轮、重启进程、resume 同一 thread，再同时验证上下文连续与旧 id 稳定。",
       "v0.2.30":
         "生产 TUI 现在通过同一个进程级 RuntimeHost 执行前台 turn、流式中断、审批、用户输入、MCP elicitation、后台 provider 与已保存 workflow。RuntimeHost 统一拥有取消、join、终态事件、usage 提交和 shutdown 清理；重复的 TUI provider/tool/workflow loop 与 TaskSupervisor 已删除。真实 DeepSeek 长流被取消后会释放前台 operation，下一次提交可以干净启动；空闲状态下重复的 Goal 刷新也不会重复显示同一条通知。",
       "v0.2.29":

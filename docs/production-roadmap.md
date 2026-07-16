@@ -4,31 +4,33 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-16
-Current baseline: v0.2.30 completes the production TUI migration onto the
-process-owned `RuntimeHost`. Foreground turns, DeepSeek stream interruption,
-interactive waits, background providers, and saved workflows now share the
-canonical runtime turn and host-owned cancellation/join boundary. The duplicate
-TUI provider/tool/workflow/subagent loops, local operation cancellation owner,
-and `TuiTaskSupervisor` are deleted. RuntimeHost is the single owner of active
-and background operation terminals, usage commits, and shutdown cleanup. Idle
-Goal refreshes also collapse duplicate status notices.
-The first P1.1 follow-ups now give a thread-owned event stream one shared
-publication boundary across foreground turns plus host-adopted provider and
-workflow background work. `EventFactory` creates unpublished typed drafts;
-only publication assigns the final sequence and timestamp while serializing
-observer, writer, and flush side effects. Handoff progress and terminal events
-therefore cannot restart at `seq=0` or arrive in a different order from their
-sequence values. Recorded threads now also reserve bounded sequence ranges in
-typed session JSONL before publication. Process restart resumes at the prior
-exclusive high-water mark, while forked identities start independently; token
-deltas do not incur one disk write each. Workflow identity remains in the typed
-payload `taskId` and `runId`; the host-projected envelope consistently belongs
-to the parent thread. Selected lifecycle and terminal envelopes are now also
-appended and flushed as typed `event.semantic` records before observer or output
-visibility, while DeepSeek reasoning, message, tool-progress, and tool-output
-deltas remain transient. These are unreleased architecture slices; stable
-conversation turn and item ids remain the explicit next follow-up rather than
-being hidden behind renderer-side deduplication fixes.
+Current baseline: v0.2.31 gives every new recorded logical turn and ordinary
+conversation item an opaque UUIDv7-backed identity. The owning turn id is
+allocated before runtime admission, persisted on each conversation record, and
+kept separate from operation, runtime task, and TaskRegistry ids. Cold history,
+live server reads, resume, pagination, compaction, compatibility repair,
+redaction, rename, archive, and zstd restoration therefore keep the same ids
+for every surviving row. Tool calls and workflows retain their domain ids,
+tool results merge into the request item, and only explicitly legacy spans use
+the isolated `turn-N` / `item-N` fallback.
+
+The release also completes the first P1.1 identity chain. Foreground and
+host-adopted background work share one publication boundary; sequence ranges
+are reserved durably before use; selected semantic events are appended before
+observer or output visibility; and `turn.started` carries the same logical
+turn id that owns its persisted conversation records. Server active-turn
+routing now keys by that typed id, so two threads on their first turn cannot
+replace each other's interrupt, resume, steer, permission, or user-input route.
+A real DeepSeek gate records one turn, exits, reloads cold projections, resumes
+the same thread in a second process, and proves both context continuity and
+stable prior turn/item ids.
+
+Earlier v0.2.30 completes the production TUI migration onto the process-owned
+`RuntimeHost`. Foreground turns, DeepSeek stream interruption, interactive
+waits, background providers, and saved workflows share the canonical runtime
+turn and host-owned cancellation/join boundary. The duplicate TUI
+provider/tool/workflow/subagent loops, local operation cancellation owner, and
+`TuiTaskSupervisor` are deleted.
 Earlier v0.2.29 extends the runtime ownership model into the
 process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
 operation handles and completion terminals now give headless and TUI turns one
@@ -273,10 +275,33 @@ DeepSeek CLI/history-repair gate also passes. An isolated two-process smoke
 journaled four exact semantic envelopes at `seq=0..56`, then resumed the same
 thread id and journaled four at `seq=256..300`; reservations advanced from
 `256` to `512`, while 51 first-process and 39 resumed-process stream deltas
-produced no journal records. P1.1e remains an unreleased reliability
-prerequisite. P1.1f is next: replace index-derived `turn-N`/`item-N` projection
-ids with durable journal identity while retaining an explicit legacy-history
-fallback and unchanged conversation replay ownership.
+produced no journal records.
+
+P1.1f now replaces position-derived public history identity with typed logical
+turn and conversation-item ownership. `HostedTurnRequest` allocates one
+`TurnId` before actor admission and retains it across resumed generations;
+`SessionWriter` clones share one ordered record ledger but keep independent
+turn scopes, updating the ledger only after the JSONL append succeeds. New
+`conversation.message` records persist both `id` and `turn_id`, and
+`SessionTranscript` exposes identified records as the single projection source
+while retaining messages as a derived model-replay view.
+
+`ThreadStore` groups identified records by their persisted turn id. Ordinary
+messages use their persisted item id; tool calls keep the DeepSeek call id,
+file changes add the existing `:file-change` suffix, workflows keep their run
+id, and tool results update the request item instead of minting another public
+wrapper. Malformed partial identity fails closed. One named legacy projector
+keeps old histories readable, but no current writer, RuntimeHost path, or
+server route can mint `turn-N` / `item-N` identity.
+
+Focused core, RuntimeHost, server-runtime, ThreadStore, persistence, TUI, and
+compatibility tests pass, followed by the serial workspace all-targets gate and
+workspace Clippy with the existing warning baseline. The real DeepSeek release
+harness records and cold-reads one turn, starts a second `orca exec` process,
+resumes the same thread, recalls the first-process sentinel, and proves that the
+old turn/item id prefix is unchanged while the resumed turn receives new typed
+ids. P1.1f is complete and released in v0.2.31; canonical completed-model-item
+replay remains the next reducer boundary rather than a second identity source.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
@@ -1884,7 +1909,7 @@ instruction and capability system.
 | P0 | Real API e2e release gate | Prevents local-only tests from being mistaken for provider/CLI/server readiness. Done in v0.1.34 | Low |
 | P1 | Runtime protocol commands/events | Gives TUI/headless surfaces a shared contract | Medium |
 | P1 | Runtime Task/Turn actor | Turn-start, model routing, pre/post model hooks, provider streaming, shell tool event shaping, pre/post tool hooks, non-interactive and interactive approval resolution, request-user-input handling, normal tool execution fallback, one tool actor context, runtime-special dispatch classification including `request_permissions`, workflow IPC execution, SubagentStatus execution, package-3-style `task_list` / `task_stop`, WorkflowDraft preview creation, workflow/subagent execution modules, active server-turn interrupt/resume, active steer item streaming/context injection including multi-text inputs, shell session/list/update controls, package-3-style incremental permission updates including additional directory roots, usage accounting, immutable turn-entry snapshotting through `RuntimeTurnContext`, read-only service grouping through `RuntimeTurnDeps`, mutable runtime handle grouping through `RuntimeTurnState`, execution/lifecycle grouping through `RuntimeTurnExecution`, lifecycle-owned agent-loop result shape and terminal constructors, runtime-lifecycle-owned task/turn state machine types, runtime-conversation-bootstrap-owned step composing session-owned bootstrap and initial history recording, lifecycle-owned runtime turn setup step composing context config, tool approval policy, and provider config construction, lifecycle-owned runtime turn opening step composing compaction, turn start, turn-start result folding, model routing, and steer application, lifecycle-owned runtime provider cycle step composing provider turn, provider turn result folding, provider error handling/result folding, and provider response/result folding, lifecycle-owned runtime turn iteration step composing turn opening, provider cycle execution, and provider-cycle result folding, runtime-turn-loop-owned iteration retry/return folding plus grouped input/executor objects to shrink the agent-loop call surface, lifecycle-owned runtime compaction step handling budget warning hooks, pre/post compact hooks, prompt-too-long reactive compaction, and history persistence, lifecycle-owned turn-start step handling first-turn prompt selection, turn start errors, and started event emission, lifecycle-owned turn-start result folding into continuation or agent-loop results, lifecycle-owned model-route step handling model routing, cost model updates, per-turn provider config selection, and `model.routed` event emission, lifecycle-owned provider-error step handling reactive prompt-too-long retry state, compaction retry decisions, and provider error failures, lifecycle-owned provider-error result folding into turn continuation, loop continuation, or agent-loop results, lifecycle-owned provider-turn result step handling response/terminal folding and cancelled-error event suppression, lifecycle-owned provider-turn result folding from response/failure outcomes into response continuation or agent-loop results, lifecycle-owned provider-turn step handling pre/post model hooks, provider streaming deltas, provider replay updates, provider error handling including prompt-too-long retry decisions, cancellation checks, usage accounting, and usage history persistence, lifecycle-owned provider-response step handling assistant response recording, final-response memory extraction, provider turn terminal folding, provider tool request extraction, and tool-turn dispatch, lifecycle-owned provider-response result step folding continue/success/terminal outcomes into agent-loop results, runtime-steer-owned step draining multi-text inputs into conversation/history through grouped `RuntimeSteerInput`, tool-execution-owned approval policy construction, tool-execution-owned normal tool execution entrypoint, tool-invocation-owned provider tool schema override, tool-invocation-owned provider config construction, tool-invocation-owned provider tool request extraction, tool-invocation-owned child tool policy gate, tool-turn-owned cursor state, tool-turn outcome state, dispatch runner, normal/readonly tool-turn runners, read-only batch planning/execution/result recording, and normal result recording/status folding, subagent-execution-owned batch result recording and status folding, subagent-execution-owned batch tool-turn runner, memory-owned final response auto-memory extraction, session-owned system prompt construction for agent conversation bootstrap, session-owned conversation bootstrap, session-owned initial history recording, session-owned assistant response recording, session-owned tool result recording for model content plus history persistence, and session-owned plan-state recording for conversation plus history persistence are seeded; next continue shrinking lifecycle/tool-turn call surfaces against the Codex/package 3 priority list | Medium/High |
-| P1 | Storage-neutral ThreadStore | Codex keeps thread persistence behind a dedicated `thread-store` crate; Orca now exposes a `thread_store` module that owns the storage-neutral `ThreadStore` trait, the `JsonlThreadStore` backend type, the `ThreadStore` implementation, live thread handle, session metadata, summary, transcript, and writer API/behavior, JSONL record shape and stored-message conversion, append writing/redaction/locking, JSONL record reading/rewrite helpers, session metadata/transcript read models, thread-record lookup/path helpers, session list/load/read-summary/search/mutation operations, storage-neutral thread projection/page/filter types, message/turn/item projections, next-turn id calculation, pagination, filters, and protocol-visible thread types, with `SessionStore` retained as a compatibility alias; live server message/turn/item/search projection, next persisted turn id calculation, protocol thread shapes, session production wiring, agent-loop resume wiring, pagination, thread-record materialization, session list/load materialization, session search, delete/archive/rename/compress session mutations, and metadata/read/list/search/turn/item trait paths now go through the boundary without bridging projection helpers back through `history`; next consider a storage backend split only after the runtime/session protocol boundaries settle | Medium |
+| P1 | Storage-neutral ThreadStore | Codex keeps thread persistence behind a dedicated `thread-store` crate; Orca now exposes a `thread_store` module that owns the storage-neutral `ThreadStore` trait, the `JsonlThreadStore` backend type, the `ThreadStore` implementation, live thread handle, session metadata, summary, transcript, and writer API/behavior, JSONL record shape and stored-message conversion, append writing/redaction/locking, JSONL record reading/rewrite helpers, session metadata/transcript read models, thread-record lookup/path helpers, session list/load/read-summary/search/mutation operations, storage-neutral thread projection/page/filter types, message/turn/item projections, identified-record grouping with one isolated legacy id fallback, pagination, filters, and protocol-visible thread types, with `SessionStore` retained as a compatibility alias; live server message/turn/item/search projection, typed persisted turn/item identity, protocol thread shapes, session production wiring, agent-loop resume wiring, pagination, thread-record materialization, session list/load materialization, session search, delete/archive/rename/compress session mutations, and metadata/read/list/search/turn/item trait paths now go through the boundary without bridging projection helpers back through `history`; next consider a storage backend split only after the runtime/session protocol boundaries settle | Medium |
 | P1 | Permission profiles and directory scope | Codex app-server has named active permission profiles, request-permissions approval round trips, `turn` / `session` grant scopes, filesystem entry semantics, special workspace-root labels, runtime workspace-root rebinding, and strict auto-review, while package 3 tracks update destinations, sources, and additional directories; Orca now has thread-scoped mode/rule snapshots, active permission profile metadata, built-in `permissionProfile` execution semantics for `command/exec`, configured profile `extends` chains plus filesystem `read` roots enforced as strict read allow-lists for custom read-only command sandbox profiles, filesystem `write` / `read-write` roots, filesystem `deny` read/write overrides, startup-time expansion of bounded configured filesystem globs for read/write/read-write/deny access, configurable glob scan depth with inherited profile defaults and child-profile overrides, `[network].enabled` command sandbox resolution, command/exec domain allow/deny policy enforcement through a managed loopback HTTP proxy with Codex-style denylist/allowlist block reasons plus normalized blocked-host attribution, default local/private literal blocking unless explicitly allowlisted, and DNS-resolved non-public target blocking before connect, session-scoped `request_permissions` network domain grants persisted on server threads and inherited by later thread-bound `command/exec` calls, session-scoped network deny overlays that override permission-profile allows while session allows cannot bypass existing profile denies, configured Unix socket allowlists materialized into macOS command/exec Seatbelt rules while non-macOS builds accept the config without path-level enforcement, configured `:workspace_roots` / `:workspace_roots/<subpath>` materialization against thread runtime roots, TOML scoped filesystem table normalization, trailing `/**` subtree normalization, configured `:tmpdir` / `:slash_tmp` materialization for command sandbox roots, configured `:root` materialization, configured `:minimal` platform-default read-root materialization, inherited thread active profiles for thread-bound command execution, incremental rule updates with destination metadata, persisted additional working directories with source-aware replacement/removal, protocol projections, bash sandbox roots, turn-scoped `request_permissions` write-root overlays, server-mediated permission approvals, session-scope grant persistence, Codex-style `fileSystem.entries` normalization including `project_roots` / `:workspace_roots` special paths, explicit `runtimeWorkspaceRoots` thread/turn overrides, TUI session-picker labels for workspace-root-scoped directory grants, `strictAutoReview` propagation that re-prompts later same-turn tools, and thread-bound shell tasks that can be stopped through model-visible `task_stop`; next expand toward automatic ask-on-network-block flows while reducing remaining TUI/runtime protocol drift | Medium |
 | P1 | TUI event and interaction adapters | Assistant deltas, usage, model routing notices, errors, session completion, tool requested/completed, plan updated, subagent started/completed, approval prompts/resolution notices, request-user-input prompts/results, verification started/completed notices, workflow terminal notifications, workflow lifecycle notices, and workflow task-list/progress refreshes now flow through runtime `EventFactory`/handler boundaries; TUI runtime approval and request-user-input handlers now live in a dedicated interaction adapter module; TUI tool approval request construction, preview generation, interactive wait handling, pending interaction storage, and id-carrying approval/user-input action routing are now delegated to runtime-backed adapter boundaries instead of `bridge`; next extract the remaining renderer-owned orchestration on the prioritized path | Medium |
 | P2 | Unified tool invocation records | First-class MCP and external/dynamic app-server stream and history items are seeded, including failed/denied/not-implemented status plus error/exit-code/truncation restoration in history projections and legacy realtime `tool_completed` exit-code/result-kind preservation; MCP resource list/read/template tools now share the registry path, all-server resource/template discovery surfaces registry startup failures plus per-server list failures, and resource-capability caching avoids probing tools-only servers during all-server discovery; next reduce remaining TUI/runtime protocol drift | Medium |
