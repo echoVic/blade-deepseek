@@ -12,12 +12,15 @@ TUI provider/tool/workflow/subagent loops, local operation cancellation owner,
 and `TuiTaskSupervisor` are deleted. RuntimeHost is the single owner of active
 and background operation terminals, usage commits, and shutdown cleanup. Idle
 Goal refreshes also collapse duplicate status notices.
-The first P1.1 follow-up now gives a thread-owned event stream one shared
-sequence allocator across foreground turns and host-adopted provider
-background work, so provider handoff terminal events cannot restart at
-`seq=0`. This is an unreleased architecture slice; workflow event streams,
-durable semantic journaling, and stable conversation item ids remain explicit
-follow-ups rather than being hidden behind a renderer-side deduplication fix.
+The first P1.1 follow-ups now give a thread-owned event stream one shared
+sequence allocator across foreground turns plus host-adopted provider and
+workflow background work, so handoff progress and terminal events cannot
+restart at `seq=0`. Workflow identity remains in the typed payload `taskId` and
+`runId`; the host-projected envelope now consistently belongs to the parent
+thread. These are unreleased architecture slices; ordered multi-producer
+publication, durable semantic journaling, and stable conversation item ids
+remain explicit follow-ups rather than being hidden behind renderer-side
+deduplication fixes.
 Earlier v0.2.29 extends the runtime ownership model into the
 process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
 operation handles and completion terminals now give headless and TUI turns one
@@ -179,10 +182,18 @@ allocator, preserving one unique contiguous `(run_id, seq)` stream across the
 foreground-to-background handoff without changing the event schema or wire
 payloads. The RED handoff test, core event-schema tests, all 40 runtime-host
 tests, the serial workspace all-targets gate, and workspace Clippy pass. This
-slice deliberately stops before workflow stream unification, ordered
-multi-producer publication, durable semantic journal records, and replacement
-of index-derived `turn-N`/`item-N` projection ids; those are the next P1.1
-vertical slices.
+slice deliberately stopped before workflow stream unification.
+
+P1.1b now removes the independent workflow worker and panic-path factories.
+Turn-launched workflows, saved workflows, capacity cleanup, shutdown failure,
+and the concurrent next foreground turn all consume forks of the parent
+thread's allocator. Workflow payload `runId` remains the workflow run id while
+the envelope `run_id` consistently identifies the parent thread, preserving
+the existing server/TUI payload contract. RED/green lifecycle coverage, all 41
+runtime-host tests, the serial workspace all-targets gate, and workspace Clippy
+pass. Ordered multi-producer publication, durable semantic journal records,
+and replacement of index-derived `turn-N`/`item-N` projection ids remain the
+next P1.1 vertical slices.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or

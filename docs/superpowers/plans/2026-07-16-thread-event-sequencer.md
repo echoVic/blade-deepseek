@@ -1,6 +1,6 @@
 # P1.1 Thread Event Sequencer Plan
 
-- Status: P1.1a complete; P1.1b in progress
+- Status: P1.1a and P1.1b complete; later P1.1 slices pending
 - P1.1a base: `3c6eb902c2c4ad7a4f4cf12a506f5811716d541b`
 - P1.1b base: `5db402c11f50ace252f5d52e5e190fb6faf0ee65`
 - P1.1b branch: `codex/workflow-event-sequencer-p11b`
@@ -146,6 +146,16 @@ blocks reliable TUI reattach and the later durable semantic journal.
 P1.1b is not the ordered publisher or durable journal. Multi-producer delivery
 serialization, semantic persistence, replay, and stable turn/item ids remain
 explicit later P1.1 slices.
+
+P1.1b implementation is complete in `a92211d8b`.
+
+Validation completed on the feature worktree:
+
+- `cargo fmt --all -- --check`
+- all five workflow-filtered `orca-runtime` runtime-host lifecycle tests
+- all 41 `orca-runtime` `runtime_host` tests
+- `cargo test --workspace --all-targets -- --test-threads=1`
+- `cargo clippy --workspace --all-targets` (exit 0; existing warning baseline)
 
 ## Final Deletion Targets
 
