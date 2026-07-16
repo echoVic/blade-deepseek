@@ -1363,6 +1363,115 @@ fn stale_interrupt_cannot_cancel_a_newer_operation() {
 }
 
 #[test]
+fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "sync subagent interrupt",
+        )
+        .expect("start runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("subagent mock_stream_delay_ms 5000")
+                .with_event_observer(observer.clone()),
+            io::sink(),
+        )
+        .expect("start sync subagent turn");
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while observer.count(EventType::SubagentStarted) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "sync subagent did not publish its started lifecycle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        operation.interrupt().expect("interrupt sync subagent"),
+        InterruptOperationResult::Requested {
+            generation: operation.initial_generation(),
+        }
+    );
+    assert_eq!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("cancelled sync subagent terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Cancelled)
+    );
+    let events = observer.events();
+    let started = events
+        .iter()
+        .position(|event| event.event_type == EventType::SubagentStarted)
+        .expect("started event");
+    let completed = events
+        .iter()
+        .position(|event| event.event_type == EventType::SubagentCompleted)
+        .expect("completed event before operation terminal");
+    assert!(started < completed);
+    assert_eq!(events[completed].payload["status"], "cancelled");
+
+    let next = thread
+        .start_turn(HostedTurnRequest::new("mock_usage"), io::sink())
+        .expect("accept next turn after sync child join");
+    assert_eq!(
+        next.wait_timeout(TEST_TIMEOUT)
+            .expect("next turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
+    );
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_interrupt_does_not_stop_registered_async_subagent_worker() {
+    let finished = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::WaitForCancel {
+        finished: Arc::clone(&finished),
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    let registry = thread.task_registry();
+    let task = registry.create_subagent("durable async child".to_string(), None);
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 5")
+        .spawn()
+        .expect("spawn async worker fixture");
+    let pid = child.id();
+    registry.mark_worker_spawned(&task.id, pid).unwrap();
+    registry.mark_running(&task.id).unwrap();
+
+    let foreground = thread
+        .start_turn(HostedTurnRequest::new("foreground"), io::sink())
+        .expect("start foreground turn");
+    wait_for_call_count(&executor, 1);
+    foreground.interrupt().expect("interrupt foreground turn");
+    assert_eq!(
+        foreground
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("foreground terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Cancelled)
+    );
+    assert!(finished.load(Ordering::Acquire));
+    let background = registry.get(&task.id).expect("async task survives");
+    assert_eq!(background.status, TaskStatus::Running);
+    assert_eq!(background.worker_pid, Some(pid));
+    assert!(child.try_wait().expect("inspect async worker").is_none());
+
+    child.kill().expect("stop async worker fixture");
+    child.wait().expect("reap async worker fixture");
+    registry
+        .fail(&task.id, "test cleanup".to_string())
+        .expect("mark fixture terminal");
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
 fn hosted_turn_uses_per_turn_config_task_id_and_idle_snapshot() {
     let gate = ManualGate::new();
     let executor = Arc::new(ScriptedExecutor::new([TestBehavior::WaitForRelease {

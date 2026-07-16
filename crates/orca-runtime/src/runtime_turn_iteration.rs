@@ -53,7 +53,6 @@ impl RuntimeTurnIterationStep {
     pub(crate) fn run<W: io::Write>(
         &mut self,
         input: RuntimeTurnIterationInput<'_, '_, W>,
-        child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnIterationResult> {
@@ -118,7 +117,6 @@ impl RuntimeTurnIterationStep {
                 extensions: input.loop_state.extensions,
                 background_workflows: input.workflow.background_workflows,
             },
-            child_executor,
             workflow_child_executor,
             batch_child_executor,
         )? {

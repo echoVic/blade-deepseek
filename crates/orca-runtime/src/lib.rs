@@ -48,6 +48,7 @@ pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
 pub mod runtime_state;
 mod runtime_steer;
+mod runtime_subagent_call;
 mod runtime_tool_actor;
 mod runtime_tool_call;
 pub(crate) mod runtime_tool_scheduler;
@@ -1040,7 +1041,7 @@ mod tests {
         );
         assert!(
             provider_turn_runtime_source.contains(
-                "pub(crate) fn handle<W: io::Write>(\n        &mut self,\n        response: RuntimeModelResponse,\n        input: RuntimeProviderResponseInput<'_, W>,\n        executors: RuntimeProviderResponseExecutors<W>,"
+                "pub(crate) fn handle<W: io::Write>(\n        &mut self,\n        response: RuntimeModelResponse,\n        input: RuntimeProviderResponseInput<'_, W>,\n        executors: RuntimeProviderResponseExecutors,"
             ),
             "RuntimeProviderResponseStep::handle must take RuntimeProviderResponseInput instead of a flat provider-response parameter list"
         );
@@ -3221,7 +3222,7 @@ mod tests {
             "tool_turn must group normal tool-turn executors into RuntimeNormalToolTurnExecutors"
         );
         assert!(
-            tool_turn_source.contains("executors: RuntimeNormalToolTurnExecutors<W>"),
+            tool_turn_source.contains("executors: RuntimeNormalToolTurnExecutors"),
             "RuntimeNormalToolTurnContext must carry normal tool-turn executors through one named field"
         );
         assert!(
@@ -3282,7 +3283,7 @@ mod tests {
             "history_writer:",
             "cost_tracker:",
             "background_workflows:",
-            "child_executor:",
+            "subagent_child_executor:",
             "workflow_child_executor:",
             "instructions:",
             "memory:",
@@ -3444,7 +3445,7 @@ mod tests {
             "tool_turn must group child-agent dispatch executors into RuntimeToolTurnsExecutors"
         );
         assert!(
-            tool_turn_source.contains("executors: RuntimeToolTurnsExecutors<W>"),
+            tool_turn_source.contains("executors: RuntimeToolTurnsExecutors"),
             "RuntimeToolTurnsContext must carry child-agent dispatch executors through one named field"
         );
         assert!(
@@ -3469,7 +3470,6 @@ mod tests {
             "history_writer:",
             "cost_tracker:",
             "background_workflows:",
-            "child_executor:",
             "workflow_child_executor:",
             "batch_child_executor:",
         ] {
@@ -5313,7 +5313,7 @@ mod tests {
             "lifecycle must not own runtime turn loop input behavior"
         );
         assert!(
-            !lifecycle_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
+            !lifecycle_source.contains("impl RuntimeTurnLoopExecutors"),
             "lifecycle must not own runtime turn loop executor behavior"
         );
         assert!(
@@ -5330,7 +5330,7 @@ mod tests {
             "runtime_turn_loop must own runtime turn loop input behavior"
         );
         assert!(
-            runtime_turn_loop_source.contains("impl<W: io::Write> RuntimeTurnLoopExecutors<W>"),
+            runtime_turn_loop_source.contains("impl RuntimeTurnLoopExecutors"),
             "runtime_turn_loop must own runtime turn loop executor behavior"
         );
         assert!(
@@ -5340,10 +5340,6 @@ mod tests {
         assert!(
             runtime_turn_loop_source.contains("pub(crate) fn run_agent_turn_loop"),
             "runtime_turn_loop must expose a focused entrypoint that owns turn-loop input construction"
-        );
-        assert!(
-            !agent_loop_source.contains("execute_child_agent_loop,\n        execute_child_agent_loop,\n        execute_child_agent_loop"),
-            "agent_loop must not pass child executors as a raw repeated argument list"
         );
     }
 

@@ -128,8 +128,7 @@ pub(crate) struct RuntimeProviderResponseIo<'a, W: io::Write> {
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
 }
 
-pub(crate) struct RuntimeProviderResponseExecutors<W: io::Write> {
-    pub(crate) child_executor: ChildAgentExecutor<W>,
+pub(crate) struct RuntimeProviderResponseExecutors {
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
     pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
 }
@@ -486,7 +485,7 @@ impl RuntimeProviderResponseStep {
         &mut self,
         response: RuntimeModelResponse,
         input: RuntimeProviderResponseInput<'_, W>,
-        executors: RuntimeProviderResponseExecutors<W>,
+        executors: RuntimeProviderResponseExecutors,
     ) -> io::Result<RuntimeProviderResponseOutcome> {
         let RuntimeProviderResponseInput {
             step_context,
@@ -502,7 +501,6 @@ impl RuntimeProviderResponseStep {
             background_workflows,
         } = io;
         let RuntimeProviderResponseExecutors {
-            child_executor,
             workflow_child_executor,
             batch_child_executor,
         } = executors;
@@ -552,7 +550,6 @@ impl RuntimeProviderResponseStep {
             },
             tool_requests: &tool_requests,
             executors: RuntimeToolTurnsExecutors {
-                child_executor,
                 workflow_child_executor,
                 batch_child_executor,
             },
@@ -596,7 +593,6 @@ impl RuntimeTurnProviderCycleStep {
     pub(crate) fn run<W: io::Write>(
         &mut self,
         mut input: RuntimeProviderCycleInput<'_, '_, W>,
-        child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
@@ -701,7 +697,6 @@ impl RuntimeTurnProviderCycleStep {
             response,
             response_input,
             RuntimeProviderResponseExecutors {
-                child_executor,
                 workflow_child_executor,
                 batch_child_executor,
             },
@@ -712,7 +707,7 @@ impl RuntimeTurnProviderCycleStep {
         &mut self,
         response: RuntimeModelResponse,
         input: RuntimeProviderResponseInput<'_, W>,
-        executors: RuntimeProviderResponseExecutors<W>,
+        executors: RuntimeProviderResponseExecutors,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
         let provider_response_outcome =
             RuntimeProviderResponseStep::new().handle(response, input, executors)?;
@@ -1223,7 +1218,6 @@ mod tests {
                     },
                 },
                 RuntimeProviderResponseExecutors {
-                    child_executor: unused_child_executor::<Vec<u8>>,
                     workflow_child_executor: unused_child_executor::<
                         crate::workflow::runner::SharedEventBuffer,
                     >,
@@ -1305,7 +1299,6 @@ mod tests {
                     },
                 },
                 RuntimeProviderResponseExecutors {
-                    child_executor: unused_child_executor::<Vec<u8>>,
                     workflow_child_executor: unused_child_executor::<
                         crate::workflow::runner::SharedEventBuffer,
                     >,
@@ -1444,7 +1437,6 @@ mod tests {
                     extensions: extension_state.extension_context(),
                     background_workflows: &mut background_workflows,
                 },
-                unused_child_executor::<Vec<u8>>,
                 unused_child_executor::<crate::workflow::runner::SharedEventBuffer>,
                 unused_child_executor::<io::Sink>,
             )

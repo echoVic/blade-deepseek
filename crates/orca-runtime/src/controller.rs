@@ -2290,7 +2290,7 @@ mod tests {
                 mcp_elicitation_handler: None,
                 extension_stores: None,
                 event_error: &mut event_error,
-                child_executor: execute_child_agent_loop,
+                subagent_child_executor: execute_child_agent_loop,
                 workflow_child_executor: execute_child_agent_loop,
             })
             .unwrap();
@@ -2356,7 +2356,7 @@ mod tests {
                     mcp_elicitation_handler: None,
                     extension_stores: None,
                     event_error: &mut event_error,
-                    child_executor: execute_child_agent_loop,
+                    subagent_child_executor: execute_child_agent_loop,
                     workflow_child_executor: execute_child_agent_loop,
                 })
                 .expect("dispatch normal call");

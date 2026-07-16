@@ -77,8 +77,7 @@ pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) workflow: RuntimeTurnWorkflowContext<'a, 'a>,
 }
 
-pub(crate) struct RuntimeTurnLoopExecutors<W: io::Write> {
-    pub(crate) child_executor: ChildAgentExecutor<W>,
+pub(crate) struct RuntimeTurnLoopExecutors {
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
     pub(crate) batch_child_executor: ChildAgentExecutor<io::Sink>,
 }
@@ -212,14 +211,12 @@ impl<'a> RuntimeTurnPolicyContext<'a> {
     }
 }
 
-impl<W: io::Write> RuntimeTurnLoopExecutors<W> {
+impl RuntimeTurnLoopExecutors {
     pub(crate) fn new(
-        child_executor: ChildAgentExecutor<W>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
         batch_child_executor: ChildAgentExecutor<io::Sink>,
     ) -> Self {
         Self {
-            child_executor,
             workflow_child_executor,
             batch_child_executor,
         }
@@ -229,7 +226,7 @@ impl<W: io::Write> RuntimeTurnLoopExecutors<W> {
 pub(crate) fn run_agent_turn_loop<W: io::Write>(
     step: &mut RuntimeTurnLoopStep,
     input: RuntimeAgentTurnLoopInput<'_, '_, W>,
-    executors: RuntimeTurnLoopExecutors<W>,
+    executors: RuntimeTurnLoopExecutors,
 ) -> io::Result<AgentLoopOutcome> {
     step.run(input.into_turn_loop_input(), executors)
 }
@@ -244,12 +241,11 @@ impl RuntimeTurnLoopStep {
     pub(crate) fn run<W: io::Write>(
         &mut self,
         mut input: RuntimeTurnLoopInput<'_, '_, W>,
-        executors: RuntimeTurnLoopExecutors<W>,
+        executors: RuntimeTurnLoopExecutors,
     ) -> io::Result<AgentLoopOutcome> {
         loop {
             match self.iteration_step.run(
                 input.iteration_input(),
-                executors.child_executor,
                 executors.workflow_child_executor,
                 executors.batch_child_executor,
             )? {

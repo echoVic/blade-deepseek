@@ -106,11 +106,7 @@ pub(crate) fn run_agent_loop(
             policy: RuntimeTurnPolicyContext::new(config, tool_policy, &policy),
             workflow: RuntimeTurnWorkflowContext::new(background_workflows, workflow_ipc),
         },
-        RuntimeTurnLoopExecutors::new(
-            execute_child_agent_loop,
-            execute_child_agent_loop,
-            execute_child_agent_loop,
-        ),
+        RuntimeTurnLoopExecutors::new(execute_child_agent_loop, execute_child_agent_loop),
     )
 }
 

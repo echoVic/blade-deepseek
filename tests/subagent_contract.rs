@@ -96,6 +96,12 @@ fn async_subagent_launches_without_blocking_parent_tool() {
     assert_eq!(output.status.code(), Some(0));
 
     let events = parse_jsonl(&output.stdout);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "subagent.started"),
+        "async launch must not create an unpaired foreground subagent lifecycle"
+    );
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "subagent");
     assert_eq!(completed["payload"]["status"], "completed");
@@ -106,6 +112,10 @@ fn async_subagent_launches_without_blocking_parent_tool() {
     let agent_id = payload["agent_id"].as_str().unwrap();
     assert!(agent_id.starts_with("task-"));
     assert_eq!(payload["description"], "inspect repo");
+    let task_update = find_event(&events, "task.status.updated");
+    assert_eq!(task_update["payload"]["task"]["id"], agent_id);
+    assert_eq!(task_update["payload"]["task"]["type"], "subagent");
+    assert_eq!(task_update["payload"]["task"]["status"], "running");
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 
     assert!(

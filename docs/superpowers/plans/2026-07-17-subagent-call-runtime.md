@@ -1,6 +1,6 @@
 # P1.2c Runtime-Owned Subagent Calls Plan
 
-- Status: planned
+- Status: implemented and focused-verified; full release gate pending
 - Base: `354ec9668297d184cec702569a7a9de170656bb0` (`v0.2.35`)
 - Branch: `codex/subagent-call-runtime-p12c`
 
@@ -284,9 +284,33 @@ outputs, not wrapped in a foreground worker owner.
 - main, tag, GitHub Release, npm package, executable smoke, release assets, and
   public changelog are verified before worktree cleanup.
 
-## Final Deletion Targets
+Focused implementation validation completed on 2026-07-17:
 
-P1.2c is not complete until all of the following are deleted or made non-owning:
+- `cargo check -p orca-runtime --tests` passes after removing the generic
+  foreground `child_executor` from tool-turn, provider-cycle, iteration, and
+  turn-loop ownership;
+- synchronous pre-admission cancellation starts no child or lifecycle, and a
+  child executor panic becomes one indeterminate tool terminal plus one failed
+  subagent lifecycle terminal;
+- RuntimeHost interruption observes `subagent.completed`, waits for the owned
+  worker and child cleanup, and then accepts the next prompt;
+- clean worktree isolation is finished after a child panic and leaves only the
+  parent worktree registered;
+- all 14 subagent batch tests preserve cancellation, provider order, joined
+  cleanup, event-error behavior, and panic isolation;
+- async adoption atomically persists the real PID and Running state, rejects a
+  late adoption over a terminal task, and lets the parent reaper refresh the
+  worker's persisted terminal state;
+- foreground interruption leaves a registered async subagent task and worker
+  running, while explicit task stop remains the durable cancellation owner;
+- all 50 RuntimeHost tests, 12 JSONL subagent contracts, task-status server wire
+  projection, and TUI task/subagent projection tests pass;
+- async launch emits `task.status.updated` for the durable task and no unmatched
+  foreground `subagent.started` event.
+
+## Completed Deletion Targets
+
+P1.2c deleted or made non-owning all of the following:
 
 - `thread::scope` and child `JoinHandle` ownership in `subagent_execution.rs`;
 - the inline synchronous `run_child_agent` path in `execute_subagent_tool`;

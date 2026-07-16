@@ -305,7 +305,7 @@ pub(crate) fn execute_tool_with_approval<W: io::Write>(
     sink: &mut EventSink<W>,
     tool_request: &tool_types::ToolRequest,
     context: ToolExecutionContext<'_>,
-    child_executor: ChildAgentExecutor<W>,
+    subagent_child_executor: ChildAgentExecutor<io::Sink>,
     workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 ) -> io::Result<ToolExecutionCompletion> {
     let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_TOOL_MAX_TURNS);
@@ -315,7 +315,7 @@ pub(crate) fn execute_tool_with_approval<W: io::Write>(
         sink,
         tool_request,
         context,
-        child_executor,
+        subagent_child_executor,
         workflow_child_executor,
     )
 }
@@ -363,7 +363,7 @@ impl ToolExecutionActor {
         sink: &mut EventSink<W>,
         tool_request: &tool_types::ToolRequest,
         context: ToolExecutionContext<'_>,
-        child_executor: ChildAgentExecutor<W>,
+        subagent_child_executor: ChildAgentExecutor<io::Sink>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
     ) -> io::Result<(RunStatus, tool_types::ToolResult)> {
         let completion = self.execute_with_event_error(
@@ -372,7 +372,7 @@ impl ToolExecutionActor {
             sink,
             tool_request,
             context,
-            child_executor,
+            subagent_child_executor,
             workflow_child_executor,
         )?;
         match completion.event_error {
@@ -388,7 +388,7 @@ impl ToolExecutionActor {
         sink: &mut EventSink<W>,
         tool_request: &tool_types::ToolRequest,
         context: ToolExecutionContext<'_>,
-        child_executor: ChildAgentExecutor<W>,
+        subagent_child_executor: ChildAgentExecutor<io::Sink>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
     ) -> io::Result<ToolExecutionCompletion> {
         let ToolExecutionContext {
@@ -571,7 +571,7 @@ impl ToolExecutionActor {
                 mcp_elicitation_handler,
                 extension_stores,
                 event_error: &mut dispatch_event_error,
-                child_executor,
+                subagent_child_executor,
                 workflow_child_executor,
             },
         ) {

@@ -463,45 +463,14 @@ impl TaskRegistry {
 
     pub fn list(&self) -> Vec<BackgroundTaskSummary> {
         let mut summaries = self
-            .with_tasks(|tasks| {
-                tasks
-                    .values()
-                    .map(|record| BackgroundTaskSummary {
-                        id: record.id.clone(),
-                        task_type: record.task_type,
-                        status: record.status,
-                        is_backgrounded: record.is_backgrounded,
-                        description: record.description.clone(),
-                        created_at_ms: record.created_at_ms,
-                        started_at_ms: record.started_at_ms,
-                        completed_at_ms: record.completed_at_ms,
-                        command: record.command.clone(),
-                        agent_type: record.agent_type.clone(),
-                        server: None,
-                        tool: record.tool.clone(),
-                        pending_tool_call: record.pending_tool_call.clone(),
-                        name: record.name.clone(),
-                        workflow_run_id: record.workflow_run_id.clone(),
-                        phase_count: record.phase_count,
-                        workflow_progress: record.workflow_progress,
-                        workflow_phases: record.workflow_phases.clone(),
-                        workflow_agents: record.workflow_agents.clone(),
-                        workflow_script_path: record.workflow_script_path.clone(),
-                        workflow_launch_input: record.workflow_launch_input.clone(),
-                        workflow_final_summary: record.workflow_final_summary.clone(),
-                        workflow_failure_count: record.workflow_failure_count,
-                        usage: record.usage,
-                        subagent_current_activity: record.subagent_current_activity.clone(),
-                        subagent_turn: record.subagent_turn,
-                        last_activity_at_ms: record.last_activity_at_ms,
-                        result: record.result.clone(),
-                        error: record.error.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .with_tasks(|tasks| tasks.values().map(task_summary).collect::<Vec<_>>())
             .expect("task registry lock poisoned");
         summaries.sort_by(|left, right| left.id.cmp(&right.id));
         summaries
+    }
+
+    pub fn summary(&self, id: &str) -> Option<BackgroundTaskSummary> {
+        self.get(id).map(|record| task_summary(&record))
     }
 
     pub fn get(&self, id: &str) -> Option<TaskRecord> {
@@ -769,9 +738,26 @@ impl TaskRegistry {
                     return Err(format!("task '{id}' already owns a worker process"));
                 }
                 let previous_pid = tasks.get(id).and_then(|record| record.worker_pid);
-                tasks.get_mut(id).expect("validated task record").worker_pid = Some(pid);
+                let previous_status = tasks.get(id).expect("validated task record").status;
+                let previous_started_at =
+                    tasks.get(id).expect("validated task record").started_at_ms;
+                let previous_completed_at = tasks
+                    .get(id)
+                    .expect("validated task record")
+                    .completed_at_ms;
+                let record = tasks.get_mut(id).expect("validated task record");
+                record.worker_pid = Some(pid);
+                record.status = TaskStatus::Running;
+                if record.started_at_ms.is_none() {
+                    record.started_at_ms = Some(now_ms());
+                }
+                record.completed_at_ms = None;
                 if let Err(error) = self.persist_current_session(tasks) {
-                    tasks.get_mut(id).expect("validated task record").worker_pid = previous_pid;
+                    let record = tasks.get_mut(id).expect("validated task record");
+                    record.worker_pid = previous_pid;
+                    record.status = previous_status;
+                    record.started_at_ms = previous_started_at;
+                    record.completed_at_ms = previous_completed_at;
                     return Err(error);
                 }
                 *slot = child.take();
@@ -782,7 +768,7 @@ impl TaskRegistry {
 
         match worker {
             Ok(worker) => {
-                spawn_worker_reaper(worker);
+                spawn_worker_reaper(self.clone(), id.to_string(), worker);
                 Ok(())
             }
             Err(error) => {
@@ -1263,6 +1249,26 @@ impl TaskRegistry {
         .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
+    fn refresh_task_from_persistence(&self, id: &str) -> Result<Option<TaskRecord>, String> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(self.get(id));
+        };
+        let Some(mut record) = persistence
+            .load_record_by_id(id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        self.with_tasks(|tasks| {
+            if let Some(current) = tasks.get(id) {
+                record.control = current.control.clone();
+            }
+            tasks.insert(id.to_string(), record.clone());
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())?;
+        Ok(Some(record))
+    }
+
     fn persist_current_session(&self, tasks: &HashMap<String, TaskRecord>) -> Result<(), String> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
@@ -1590,7 +1596,7 @@ fn new_task_control() -> TaskControl {
     }
 }
 
-fn spawn_worker_reaper(worker: Arc<Mutex<Option<Child>>>) {
+fn spawn_worker_reaper(registry: TaskRegistry, task_id: String, worker: Arc<Mutex<Option<Child>>>) {
     thread::spawn(move || {
         loop {
             let finished = {
@@ -1615,11 +1621,60 @@ fn spawn_worker_reaper(worker: Arc<Mutex<Option<Child>>>) {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 slot.take();
+                drop(slot);
+                let refreshed = registry
+                    .refresh_task_from_persistence(&task_id)
+                    .ok()
+                    .flatten();
+                if refreshed
+                    .as_ref()
+                    .is_some_and(|record| is_terminal(record.status))
+                {
+                    return;
+                }
+                let _ = registry.fail(
+                    &task_id,
+                    "async subagent worker exited without a terminal task update".to_string(),
+                );
                 return;
             }
             thread::sleep(Duration::from_millis(50));
         }
     });
+}
+
+fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
+    BackgroundTaskSummary {
+        id: record.id.clone(),
+        task_type: record.task_type,
+        status: record.status,
+        is_backgrounded: record.is_backgrounded,
+        description: record.description.clone(),
+        created_at_ms: record.created_at_ms,
+        started_at_ms: record.started_at_ms,
+        completed_at_ms: record.completed_at_ms,
+        command: record.command.clone(),
+        agent_type: record.agent_type.clone(),
+        server: None,
+        tool: record.tool.clone(),
+        pending_tool_call: record.pending_tool_call.clone(),
+        name: record.name.clone(),
+        workflow_run_id: record.workflow_run_id.clone(),
+        phase_count: record.phase_count,
+        workflow_progress: record.workflow_progress,
+        workflow_phases: record.workflow_phases.clone(),
+        workflow_agents: record.workflow_agents.clone(),
+        workflow_script_path: record.workflow_script_path.clone(),
+        workflow_launch_input: record.workflow_launch_input.clone(),
+        workflow_final_summary: record.workflow_final_summary.clone(),
+        workflow_failure_count: record.workflow_failure_count,
+        usage: record.usage,
+        subagent_current_activity: record.subagent_current_activity.clone(),
+        subagent_turn: record.subagent_turn,
+        last_activity_at_ms: record.last_activity_at_ms,
+        result: record.result.clone(),
+        error: record.error.clone(),
+    }
 }
 
 fn terminate_worker(child: &mut Child) {
@@ -2878,6 +2933,106 @@ wait
             assert!(
                 std::time::Instant::now() < deadline,
                 "worker Child was not reaped after exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopting_subagent_worker_persists_running_state_with_real_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let registry = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = registry.create_subagent("quick async work".to_string(), None);
+        registry.mark_worker_spawned(&task.id, 0).unwrap();
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.2")
+            .spawn()
+            .expect("spawn adopted worker");
+        let pid = child.id();
+
+        registry.adopt_subagent_worker(&task.id, child).unwrap();
+
+        let local = registry.get(&task.id).expect("local adopted task");
+        assert_eq!(local.status, TaskStatus::Running);
+        assert_eq!(local.worker_pid, Some(pid));
+        assert!(local.started_at_ms.is_some());
+
+        let reloaded = TaskRegistry::new_persistent("session-1".to_string(), root).unwrap();
+        let persisted = reloaded.get(&task.id).expect("persisted adopted task");
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert_eq!(persisted.worker_pid, Some(pid));
+        assert!(persisted.started_at_ms.is_some());
+
+        registry.request_stop(&task.id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopting_worker_cannot_overwrite_fast_terminal_state() {
+        let registry = TaskRegistry::new("session-fast-terminal".to_string());
+        let task = registry.create_subagent("fast async work".to_string(), None);
+        registry
+            .complete(&task.id, "finished before adoption".to_string())
+            .unwrap();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .spawn()
+            .expect("spawn late worker");
+
+        let error = registry
+            .adopt_subagent_worker(&task.id, child)
+            .expect_err("terminal task must reject late adoption");
+
+        assert!(
+            error.contains("cannot adopt_subagent_worker task in Completed state"),
+            "unexpected adoption error: {error}"
+        );
+        let completed = registry.get(&task.id).expect("terminal task");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(
+            completed.result.as_deref(),
+            Some("finished before adoption")
+        );
+        assert_eq!(completed.worker_pid, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_reaper_refreshes_async_terminal_state_from_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let parent =
+            TaskRegistry::new_persistent("session-reaper".to_string(), root.clone()).unwrap();
+        let task = parent.create_subagent("persisted terminal".to_string(), None);
+        parent.mark_worker_spawned(&task.id, 0).unwrap();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.2")
+            .spawn()
+            .expect("spawn adopted worker");
+        parent.adopt_subagent_worker(&task.id, child).unwrap();
+
+        let worker = TaskRegistry::new_persistent("session-reaper".to_string(), root).unwrap();
+        worker
+            .complete(&task.id, "worker persisted terminal".to_string())
+            .unwrap();
+        assert_eq!(parent.get(&task.id).unwrap().status, TaskStatus::Running);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let record = parent.get(&task.id).expect("parent task");
+            if record.status == TaskStatus::Completed {
+                assert_eq!(record.result.as_deref(), Some("worker persisted terminal"));
+                assert_eq!(record.worker_pid, None);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent reaper did not observe persisted terminal state"
             );
             thread::sleep(Duration::from_millis(10));
         }

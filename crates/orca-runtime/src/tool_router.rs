@@ -54,7 +54,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
     pub(crate) event_error: &'a mut Option<io::Error>,
-    pub(crate) child_executor: ChildAgentExecutor<W>,
+    pub(crate) subagent_child_executor: ChildAgentExecutor<io::Sink>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 }
 
@@ -109,7 +109,7 @@ impl<'a> RuntimeToolRouter<'a> {
             mcp_elicitation_handler,
             extension_stores,
             event_error,
-            child_executor,
+            subagent_child_executor,
             workflow_child_executor,
         } = context;
 
@@ -161,7 +161,8 @@ impl<'a> RuntimeToolRouter<'a> {
                 cancel,
                 task_registry,
                 workflow_ipc,
-                child_executor,
+                subagent_child_executor,
+                event_error,
             ),
             RuntimeSpecialToolDispatch::SubagentStatus => Ok(self
                 .runtime

@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -10,6 +11,7 @@ use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
+use orca_core::task_types::BackgroundTaskSummary;
 use orca_core::tool_types;
 
 use crate::agent_child::{
@@ -20,8 +22,8 @@ use crate::hooks::HookRunner;
 use crate::instructions;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
 use crate::memory;
+use crate::runtime_subagent_call::{append_worktree_outcome, validate_subagent_output_schema};
 use crate::subagent::{self, SubagentIsolation};
-use crate::subagent_execution::{append_worktree_outcome, validate_subagent_output_schema};
 use crate::tasks::TaskRegistry;
 use crate::worktree::WorktreeGuard;
 
@@ -54,6 +56,11 @@ pub(crate) struct AsyncSubagentLaunchContext<'a> {
     pub request: subagent::SubagentRequest,
     pub subagent_depth: u32,
     pub task_registry: &'a TaskRegistry,
+}
+
+pub(crate) struct AsyncSubagentLaunchOutput {
+    pub(crate) result: tool_types::ToolResult,
+    pub(crate) task: Option<BackgroundTaskSummary>,
 }
 
 struct AsyncSubagentWorkerSpawnContext<'a> {
@@ -89,7 +96,10 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         child_depth,
         worktree,
     } = input;
-    let task_registry = TaskRegistry::new_for_cwd(task_session_id, &cwd);
+    let task_registry = match wait_for_async_subagent_adoption(&task_session_id, &cwd, &agent_id) {
+        Ok(registry) => registry,
+        Err(_) => return 1,
+    };
     let _ = task_registry.mark_running(&agent_id);
     let instructions = instructions::load_for_cwd_or_default(&cwd);
     let memory = memory::load_for_cwd(&cwd);
@@ -184,7 +194,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
 
 pub(crate) fn launch_async_subagent(
     context: AsyncSubagentLaunchContext<'_>,
-) -> tool_types::ToolResult {
+) -> AsyncSubagentLaunchOutput {
     let AsyncSubagentLaunchContext {
         config,
         cwd,
@@ -204,7 +214,11 @@ pub(crate) fn launch_async_subagent(
             Err(error) => {
                 let error = format!("failed to create subagent worktree: {error}");
                 let _ = task_registry.fail(&agent_id, error.clone());
-                return tool_types::ToolResult::failed(tool_request, error, None);
+                return async_launch_output(
+                    task_registry,
+                    &agent_id,
+                    tool_types::ToolResult::failed(tool_request, error, None),
+                );
             }
         }
     } else {
@@ -220,7 +234,11 @@ pub(crate) fn launch_async_subagent(
     });
     if let Err(error) = task_registry.mark_worker_spawned(&agent_id, 0) {
         let _ = task_registry.fail(&agent_id, error.clone());
-        return tool_types::ToolResult::failed(tool_request, error, None);
+        return async_launch_output(
+            task_registry,
+            &agent_id,
+            tool_types::ToolResult::failed(tool_request, error, None),
+        );
     }
     match spawn_async_subagent_worker(AsyncSubagentWorkerSpawnContext {
         config,
@@ -238,7 +256,11 @@ pub(crate) fn launch_async_subagent(
                 let mut error = format!("failed to own async subagent worker: {error}");
                 append_worktree_outcome(&mut error, worktree.as_ref());
                 let _ = task_registry.fail(&agent_id, error.clone());
-                return tool_types::ToolResult::failed(tool_request, error, None);
+                return async_launch_output(
+                    task_registry,
+                    &agent_id,
+                    tool_types::ToolResult::failed(tool_request, error, None),
+                );
             }
             std::mem::forget(worktree_guard);
         }
@@ -247,7 +269,11 @@ pub(crate) fn launch_async_subagent(
             let mut error = format!("failed to start async subagent worker: {error}");
             append_worktree_outcome(&mut error, worktree.as_ref());
             let _ = task_registry.fail(&agent_id, error.clone());
-            return tool_types::ToolResult::failed(tool_request, error, None);
+            return async_launch_output(
+                task_registry,
+                &agent_id,
+                tool_types::ToolResult::failed(tool_request, error, None),
+            );
         }
     }
 
@@ -257,7 +283,57 @@ pub(crate) fn launch_async_subagent(
         "description": request.description,
     })
     .to_string();
-    tool_types::ToolResult::completed(tool_request, output, false)
+    async_launch_output(
+        task_registry,
+        &agent_id,
+        tool_types::ToolResult::completed(tool_request, output, false),
+    )
+}
+
+fn async_launch_output(
+    task_registry: &TaskRegistry,
+    agent_id: &str,
+    result: tool_types::ToolResult,
+) -> AsyncSubagentLaunchOutput {
+    AsyncSubagentLaunchOutput {
+        result,
+        task: task_registry.summary(agent_id),
+    }
+}
+
+fn wait_for_async_subagent_adoption(
+    task_session_id: &str,
+    cwd: &Path,
+    agent_id: &str,
+) -> Result<TaskRegistry, String> {
+    let pid = std::process::id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let registry = TaskRegistry::new_for_cwd(task_session_id.to_string(), cwd);
+        let record = registry.get(agent_id).ok_or_else(|| {
+            format!("async subagent task '{agent_id}' disappeared before adoption")
+        })?;
+        if record.worker_pid == Some(pid) {
+            return Ok(registry);
+        }
+        if matches!(
+            record.status,
+            orca_core::task_types::TaskStatus::Stopped
+                | orca_core::task_types::TaskStatus::Completed
+                | orca_core::task_types::TaskStatus::Failed
+                | orca_core::task_types::TaskStatus::Cancelled
+        ) {
+            return Err(format!(
+                "async subagent task '{agent_id}' became terminal before worker adoption"
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "async subagent worker was not adopted before the startup deadline"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn spawn_async_subagent_worker(
