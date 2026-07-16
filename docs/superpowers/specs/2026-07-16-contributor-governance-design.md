@@ -62,7 +62,8 @@ Create three YAML Issue forms under `.github/ISSUE_TEMPLATE/`:
   and architecture, execution mode, reproduction steps, expected and actual
   behavior, regression information, and redacted diagnostics;
 - `feature_request.yml` requests the user problem, use case, proposed behavior,
-  alternatives, affected surfaces, and compatibility or security concerns;
+  alternatives, a required primary affected surface, optional additional
+  affected surfaces, and compatibility or security concerns;
 - `documentation.yml` requires the affected page or section and the problem;
   a proposed correction is optional.
 

@@ -27,21 +27,34 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-  - type: checkboxes
+  - type: dropdown
     id: affected_surfaces
     attributes:
-      label: Affected surfaces
-      description: Select every surface this proposal may affect.
+      label: Primary affected surface
+      description: Select the main surface this proposal would affect.
+      options:
+        - TUI
+        - orca exec
+        - embedded server
+        - tools/MCP
+        - subagents/workflows
+        - history/persistence
+        - other
+    validations:
+      required: true
+  - type: checkboxes
+    id: additional_surfaces
+    attributes:
+      label: Additional affected surfaces
+      description: Select any other surfaces this proposal may affect.
       options:
         - label: TUI
         - label: orca exec
-        - label: Embedded server
+        - label: embedded server
         - label: tools/MCP
         - label: subagents/workflows
         - label: history/persistence
         - label: other
-    validations:
-      required: true
   - type: textarea
     id: compatibility
     attributes:

@@ -245,8 +245,10 @@ Create `.github/ISSUE_TEMPLATE/feature_request.yml` with:
 
 - required `problem`, `use_case`, and `proposal` textareas;
 - optional `alternatives` textarea;
-- an `affected_surfaces` checkbox group containing TUI, `orca exec`, embedded
-  server, tools/MCP, subagents/workflows, history/persistence, and other;
+- a required `affected_surfaces` primary-surface dropdown containing TUI,
+  `orca exec`, embedded server, tools/MCP, subagents/workflows,
+  history/persistence, and other;
+- an optional `additional_surfaces` checkbox group containing the same options;
 - optional `compatibility` textarea for protocol, persistence, security, and
   dependency impact;
 - a required `terms` checkbox confirming sensitive data was removed and large
@@ -282,7 +284,7 @@ contact_links:
 Run:
 
 ```sh
-ruby -e 'require "yaml"; Dir[".github/ISSUE_TEMPLATE/*.{yml,yaml}"].sort.each { |path| doc = YAML.safe_load(File.read(path), [], [], false); abort("#{path}: expected mapping") unless doc.is_a?(Hash); next if File.basename(path) == "config.yml"; %w[name description body].each { |key| abort("#{path}: missing #{key}") unless doc[key] }; ids = doc["body"].map { |item| item["id"] }.compact; abort("#{path}: duplicate ids") unless ids == ids.uniq; puts "ok #{path}" }'
+ruby -e 'require "yaml"; types = %w[markdown input textarea dropdown checkboxes]; Dir[".github/ISSUE_TEMPLATE/*.{yml,yaml}"].sort.each { |path| doc = YAML.safe_load(File.read(path), [], [], false); abort("#{path}: expected mapping") unless doc.is_a?(Hash); next if File.basename(path) == "config.yml"; %w[name description body].each { |key| abort("#{path}: missing #{key}") unless doc[key] }; abort("#{path}: body must be an array") unless doc["body"].is_a?(Array); ids = doc["body"].map { |item| item["id"] }.compact; abort("#{path}: duplicate ids") unless ids == ids.uniq; doc["body"].each { |item| type = item["type"]; abort("#{path}: unsupported type #{type.inspect}") unless types.include?(type); validations = item["validations"]; abort("#{path}: validations unsupported for #{type}") if validations && !%w[input textarea dropdown].include?(type); if validations; abort("#{path}: invalid validations") unless validations.is_a?(Hash) && (validations.keys - ["required"]).empty? && [true, false].include?(validations["required"]); end; options = item.dig("attributes", "options"); if type == "checkboxes" && options; abort("#{path}: invalid checkbox options") unless options.is_a?(Array) && options.all? { |option| option.is_a?(Hash) && option["label"] && (option.keys - %w[label required]).empty? && (!option.key?("required") || [true, false].include?(option["required"])) }; end }; puts "ok #{path}" }'
 ```
 
 Expected: one `ok` line for each of the three Issue Forms and exit code `0`.
@@ -463,7 +465,7 @@ Expected: exit code `0`.
 Run:
 
 ```sh
-ruby -e 'require "yaml"; Dir[".github/ISSUE_TEMPLATE/*.{yml,yaml}"].sort.each { |path| doc = YAML.safe_load(File.read(path), [], [], false); abort("#{path}: invalid") unless doc.is_a?(Hash); next if File.basename(path) == "config.yml"; abort("#{path}: empty body") unless doc["body"].is_a?(Array) && !doc["body"].empty?; ids = doc["body"].map { |item| item["id"] }.compact; abort("#{path}: duplicate ids") unless ids == ids.uniq; puts "ok #{path}" }'
+ruby -e 'require "yaml"; types = %w[markdown input textarea dropdown checkboxes]; Dir[".github/ISSUE_TEMPLATE/*.{yml,yaml}"].sort.each { |path| doc = YAML.safe_load(File.read(path), [], [], false); abort("#{path}: invalid") unless doc.is_a?(Hash); next if File.basename(path) == "config.yml"; abort("#{path}: empty body") unless doc["body"].is_a?(Array) && !doc["body"].empty?; ids = doc["body"].map { |item| item["id"] }.compact; abort("#{path}: duplicate ids") unless ids == ids.uniq; doc["body"].each { |item| type = item["type"]; abort("#{path}: unsupported type #{type.inspect}") unless types.include?(type); validations = item["validations"]; abort("#{path}: validations unsupported for #{type}") if validations && !%w[input textarea dropdown].include?(type); if validations; abort("#{path}: invalid validations") unless validations.is_a?(Hash) && (validations.keys - ["required"]).empty? && [true, false].include?(validations["required"]); end; options = item.dig("attributes", "options"); if type == "checkboxes" && options; abort("#{path}: invalid checkbox options") unless options.is_a?(Array) && options.all? { |option| option.is_a?(Hash) && option["label"] && (option.keys - %w[label required]).empty? && (!option.key?("required") || [true, false].include?(option["required"])) }; end }; puts "ok #{path}" }'
 git diff --check
 ```
 
