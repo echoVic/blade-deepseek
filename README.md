@@ -45,6 +45,14 @@ Download the archive for your platform from the latest GitHub Release, extract i
 - QQ group: `472309526`
 - Telegram: https://t.me/+11No1w5ZbTMyZTQ1
 
+## Contributing and Support
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing. Open an issue first for large or compatibility-sensitive changes.
+- Report bugs with the [bug report form](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml).
+- Propose features with the [feature request form](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml).
+- Use [SUPPORT.md](SUPPORT.md) for questions and help.
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
 ## Quick Start
 
 ```sh
