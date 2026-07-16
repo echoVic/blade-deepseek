@@ -1807,6 +1807,7 @@ struct ProviderBackgroundTaskContext {
 struct WorkflowBackgroundTaskContext {
     task_registry: TaskRegistry,
     observer: Option<Arc<dyn EventObserver>>,
+    events: EventFactory,
 }
 
 #[derive(Clone, Debug)]
@@ -2285,6 +2286,7 @@ impl ThreadActor {
                             let workflows = outcome.take_background_workflows();
                             cancel_and_join_background_workflows(
                                 result.state.thread.session().task_registry(),
+                                &result.state.events,
                                 active.request.event_observer(),
                                 workflows,
                             );
@@ -2293,6 +2295,7 @@ impl ThreadActor {
                             let workflows = outcome.take_background_workflows();
                             self.spawn_workflow_background_tasks(
                                 result.state.thread.session().task_registry().clone(),
+                                &result.state.events,
                                 active.request.event_observer(),
                                 workflows,
                             );
@@ -2541,6 +2544,7 @@ impl ThreadActor {
 
         self.spawn_workflow_background_tasks(
             task_registry,
+            &state.events,
             event_observer,
             RuntimeBackgroundWorkflows::from_vec(vec![BackgroundWorkflowRun::new(
                 launch,
@@ -2566,6 +2570,7 @@ impl ThreadActor {
     fn spawn_workflow_background_tasks(
         &mut self,
         task_registry: TaskRegistry,
+        events: &EventFactory,
         observer: Option<Arc<dyn EventObserver>>,
         workflows: RuntimeBackgroundWorkflows,
     ) {
@@ -2578,10 +2583,12 @@ impl ThreadActor {
             let context = WorkflowBackgroundTaskContext {
                 task_registry: task_registry.clone(),
                 observer: observer.clone(),
+                events: events.fork(),
             };
             let join = tokio::task::spawn_blocking(move || {
                 let panic_registry = context.task_registry.clone();
                 let panic_observer = context.observer.clone();
+                let mut panic_events = context.events.fork();
                 let panic_task_id = workflow.task_id.clone();
                 let panic_run_id = workflow.run_id.clone();
                 let panic_workflow_name = workflow.workflow_name.clone();
@@ -2591,16 +2598,15 @@ impl ThreadActor {
                 if let Err(payload) = outcome {
                     let message = panic_message(payload);
                     let _ = panic_registry.fail(&panic_task_id, message.clone());
-                    let mut events = EventFactory::new(panic_run_id.clone());
                     emit_workflow_task_status(
                         panic_observer.as_deref(),
-                        &mut events,
+                        &mut panic_events,
                         &panic_registry,
                         &panic_task_id,
                     );
                     observe_runtime_event(
                         panic_observer.as_deref(),
-                        &events.workflow_failed(
+                        &panic_events.workflow_failed(
                             &panic_task_id,
                             &panic_run_id,
                             &panic_workflow_name,
@@ -2701,6 +2707,7 @@ impl ThreadActor {
 
 fn cancel_and_join_background_workflows(
     task_registry: &TaskRegistry,
+    events: &EventFactory,
     observer: Option<Arc<dyn EventObserver>>,
     workflows: RuntimeBackgroundWorkflows,
 ) {
@@ -2712,6 +2719,7 @@ fn cancel_and_join_background_workflows(
             WorkflowBackgroundTaskContext {
                 task_registry: task_registry.clone(),
                 observer: observer.clone(),
+                events: events.fork(),
             },
             &cancel,
         );
@@ -2759,7 +2767,7 @@ fn run_workflow_background_task(
         tool_use_id,
         ..
     } = workflow;
-    let mut events = EventFactory::new(run_id.clone());
+    let mut events = context.events;
     let mut stop_requested = false;
     while !handle.is_finished() {
         if cancel.is_cancelled() && !stop_requested {

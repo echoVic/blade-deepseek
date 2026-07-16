@@ -360,6 +360,25 @@ impl EventObserver for RecordingEventObserver {
     }
 }
 
+fn assert_one_thread_event_sequence(
+    observer: &RecordingEventObserver,
+    thread_id: &str,
+) -> Vec<EventEnvelope> {
+    let events = observer.events();
+    assert!(
+        events.iter().all(|event| event.run_id == thread_id),
+        "observer must receive events on the owning thread stream"
+    );
+    let mut sequences = events.iter().map(|event| event.seq).collect::<Vec<_>>();
+    sequences.sort_unstable();
+    assert_eq!(
+        sequences,
+        (0..sequences.len() as u64).collect::<Vec<_>>(),
+        "thread event sequence must be unique and contiguous"
+    );
+    events
+}
+
 impl SharedWriter {
     fn json_events(&self) -> Vec<serde_json::Value> {
         let output = self.output.lock().unwrap();
@@ -2209,18 +2228,7 @@ fn provider_background_handoff_keeps_one_thread_event_sequence() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let mut sequences = observer
-        .events()
-        .into_iter()
-        .filter(|event| event.run_id == thread.thread_id())
-        .map(|event| event.seq)
-        .collect::<Vec<_>>();
-    sequences.sort_unstable();
-    assert_eq!(
-        sequences,
-        (0..sequences.len() as u64).collect::<Vec<_>>(),
-        "foreground and background provider events must share one sequence"
-    );
+    assert_one_thread_event_sequence(&observer, thread.thread_id());
 
     host.shutdown().expect("shutdown runtime host");
 }
@@ -2359,7 +2367,10 @@ fn runtime_host_owns_turn_launched_workflow_until_shutdown() {
     assert_eq!(workflow_task.status, TaskStatus::Running);
 
     let next = thread
-        .start_turn(HostedTurnRequest::new("next foreground turn"), io::sink())
+        .start_turn(
+            HostedTurnRequest::new("next foreground turn").with_event_observer(observer.clone()),
+            io::sink(),
+        )
         .expect("actor accepts next turn while workflow is running");
     assert_eq!(
         next.wait_timeout(TEST_TIMEOUT)
@@ -2378,6 +2389,15 @@ fn runtime_host_owns_turn_launched_workflow_until_shutdown() {
         TaskStatus::Stopped
     );
     assert_eq!(observer.count(EventType::WorkflowFailed), 1);
+    let events = assert_one_thread_event_sequence(&observer, thread.thread_id());
+    let failed = events
+        .iter()
+        .find(|event| event.event_type == EventType::WorkflowFailed)
+        .expect("workflow failure event");
+    assert_eq!(
+        failed.payload["runId"].as_str(),
+        workflow_task.workflow_run_id.as_deref()
+    );
 }
 
 #[test]
@@ -2410,7 +2430,10 @@ fn runtime_host_launches_saved_workflow_without_blocking_the_next_turn() {
     );
 
     let next = thread
-        .start_turn(HostedTurnRequest::new("next foreground turn"), io::sink())
+        .start_turn(
+            HostedTurnRequest::new("next foreground turn").with_event_observer(observer.clone()),
+            io::sink(),
+        )
         .expect("actor accepts next turn");
     assert_eq!(
         next.wait_timeout(TEST_TIMEOUT)
@@ -2428,6 +2451,57 @@ fn runtime_host_launches_saved_workflow_without_blocking_the_next_turn() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(observer.count(EventType::WorkflowResultAvailable), 1);
+
+    let events = assert_one_thread_event_sequence(&observer, thread.thread_id());
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.event_type,
+            EventType::WorkflowStarted
+                | EventType::WorkflowCompleted
+                | EventType::WorkflowResultAvailable
+                | EventType::WorkflowFailed
+        )
+    }) {
+        assert_eq!(event.payload["runId"], launched.run_id());
+    }
+
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn workflow_capacity_cleanup_keeps_the_thread_event_sequence() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let cwd = tempfile::tempdir().unwrap();
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start_with_background_capacity(0).expect("start runtime host");
+    let thread = host
+        .start_thread(config, "workflow capacity cleanup")
+        .expect("start hosted runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("workflow inline")
+                .with_wait_for_background_workflows(false)
+                .with_event_observer(observer.clone()),
+            io::sink(),
+        )
+        .expect("start workflow turn");
+
+    assert!(matches!(
+        operation
+            .wait_timeout(TEST_TIMEOUT)
+            .expect("capacity failure terminal")
+            .outcome(),
+        OperationOutcome::ExecutionFailed {
+            kind: io::ErrorKind::WouldBlock,
+            message,
+        } if message.contains("capacity exhausted (0)")
+    ));
+    assert_one_thread_event_sequence(&observer, thread.thread_id());
 
     host.shutdown().expect("shutdown runtime host");
 }
