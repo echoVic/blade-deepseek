@@ -4,26 +4,25 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-16
-Current baseline: v0.2.31 gives every new recorded logical turn and ordinary
-conversation item an opaque UUIDv7-backed identity. The owning turn id is
-allocated before runtime admission, persisted on each conversation record, and
-kept separate from operation, runtime task, and TaskRegistry ids. Cold history,
-live server reads, resume, pagination, compaction, compatibility repair,
-redaction, rename, archive, and zstd restoration therefore keep the same ids
-for every surviving row. Tool calls and workflows retain their domain ids,
-tool results merge into the request item, and only explicitly legacy spans use
-the isolated `turn-N` / `item-N` fallback.
+Current baseline: v0.2.32 gives every completed DeepSeek response one durable,
+typed `model.response.completed` fact. Runtime allocates the response's agent
+message, reasoning, and proposed-plan ids before streaming, preserves them
+through provider suspension and background approval continuation, and uses the
+same completed objects for live server/TUI projection, cold ThreadStore reads,
+pagination, restart, and resume. New assistant responses no longer create a
+second `conversation.message` record, and terminal session events no longer
+invent completion from transient text deltas.
 
-The release also completes the first P1.1 identity chain. Foreground and
-host-adopted background work share one publication boundary; sequence ranges
-are reserved durably before use; selected semantic events are appended before
-observer or output visibility; and `turn.started` carries the same logical
-turn id that owns its persisted conversation records. Server active-turn
-routing now keys by that typed id, so two threads on their first turn cannot
-replace each other's interrupt, resume, steer, permission, or user-input route.
-A real DeepSeek gate records one turn, exits, reloads cold projections, resumes
-the same thread in a second process, and proves both context continuity and
-stable prior turn/item ids.
+The release completes the first P1.1 identity chain. Foreground and host-adopted
+background work share one publication boundary; sequence ranges are reserved
+durably before use; selected semantic events are appended before observer or
+output visibility; logical turn and conversation-item ids are allocated at
+their ownership boundaries; and model replay plus public history reduce the
+same canonical completion event. Tool calls and workflows retain their domain
+ids, malformed current completions fail closed, and only explicitly legacy
+assistant records use the isolated combined-message reducer. A real DeepSeek
+gate records, cold-reads, exits, resumes in a second process, and compares the
+complete prior item-object prefix plus internal/external ids.
 
 Earlier v0.2.30 completes the production TUI migration onto the process-owned
 `RuntimeHost`. Foreground turns, DeepSeek stream interruption, interactive
@@ -300,8 +299,32 @@ workspace Clippy with the existing warning baseline. The real DeepSeek release
 harness records and cold-reads one turn, starts a second `orca exec` process,
 resumes the same thread, recalls the first-process sentinel, and proves that the
 old turn/item id prefix is unchanged while the resumed turn receives new typed
-ids. P1.1f is complete and released in v0.2.31; canonical completed-model-item
-replay remains the next reducer boundary rather than a second identity source.
+ids. P1.1f is complete and released in v0.2.31.
+
+P1.1g now makes completed model output canonical across live and cold paths.
+`ModelResponseIdentity` reserves agent-message, reasoning, and proposed-plan
+ids before the first provider delta and travels with the response through
+suspension, host adoption, persisted approval state, and continuation. After
+runtime validation, one typed `CompletedModelResponse` is published and
+persisted as `model.response.completed`; new assistant responses are no longer
+double-written as `conversation.message` records.
+
+`SessionWriter`, `SessionTranscript`, `JsonlThreadStore`, and
+`RuntimeEventProjector` reduce that same fact. Live `item_started`, delta, and
+`item_completed` events use the ids that cold `thread/turns/list` and
+`thread/items/list` return after restart. The projector no longer owns static
+text ids, completed-text accumulation, or terminal completion synthesis. The
+combined assistant projection remains only in the named legacy-record branch,
+and malformed canonical events cannot fall back to it.
+
+Focused core, runtime, RuntimeHost, TUI, session-server, server-runtime,
+ThreadStore, JSONL, and history tests pass, followed by the serial workspace
+all-targets gate and workspace Clippy with the existing warning baseline. The
+real DeepSeek release gate verifies CLI output, legacy repair without tool
+re-execution, cross-process record/reload/resume, complete canonical item-object
+prefixes, matching internal/external ids, server thread memory, active-turn
+resume, and paginated turn/item projections. P1.1g is complete and released in
+v0.2.32.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or

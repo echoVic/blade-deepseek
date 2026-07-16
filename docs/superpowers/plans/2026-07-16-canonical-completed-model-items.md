@@ -1,6 +1,6 @@
 # P1.1g Canonical Completed Model Item Plan
 
-- Status: implemented on the feature branch; rebase, full-gate, real-API, and release validation pending for `v0.2.32`
+- Status: complete; release target `v0.2.32`
 - Base: `84062f9b1c73d6db974f99d7db1196dbde713d30`
 - Branch: `codex/canonical-completed-model-items-p11g`
 

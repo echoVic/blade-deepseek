@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.32":
+        "Completed DeepSeek responses now have one durable canonical fact. Agent-message, reasoning, and proposed-plan ids are allocated before streaming and stay identical through live projection, approval suspension and continuation, restart, pagination, and resume. Runtime persists one typed model.response.completed event instead of a second assistant record, and model replay plus ThreadStore history reduce that same event. Legacy combined assistant records remain readable through one isolated reducer, while malformed current completions fail closed. The real DeepSeek gate now compares complete persisted item objects and internal/external ids across processes.",
       "v0.2.31":
         "Recorded conversations now keep opaque turn and item identities across reload, resume, compaction, repair, pagination, rename, archive, and compression. Logical turn ids are separate from runtime task ids, so concurrent first turns cannot collide in server control routing. New records use typed UUIDv7 identities, tool and workflow items retain their domain ids, and legacy histories remain readable through one isolated fallback. A real DeepSeek gate now records a turn, restarts the process, resumes the same thread, and proves both context continuity and stable prior ids.",
       "v0.2.30":
@@ -516,6 +518,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.32":
+        "每个已完成的 DeepSeek 响应现在只有一个可持久化的 canonical 事实。Agent message、reasoning 与 proposed plan 的 id 会在流式输出前分配，并在实时投影、审批暂停与续接、进程重启、分页和 resume 后保持不变。Runtime 只持久化一个类型化 model.response.completed 事件，不再额外写入第二份 assistant 记录；模型 replay 与 ThreadStore 历史都归约同一事件。旧版合并 assistant 记录继续通过唯一隔离的 reducer 读取，格式错误的当前 completion 则 fail closed。真实 DeepSeek gate 会跨进程比较完整持久化 item 对象及内外部 id。",
       "v0.2.31":
         "已记录会话的 turn 与 item 现在使用不透明稳定身份，在重新加载、resume、compaction、兼容修复、分页、重命名、归档和压缩后都不会改变。逻辑 turn id 与 runtime task id 已彻底分离，并发 thread 即使都处于第一轮，也不会在 server 控制路由中发生碰撞。新记录使用类型化 UUIDv7 身份，tool 与 workflow item 保留各自领域 id；旧历史通过唯一隔离的 fallback 继续可读。真实 DeepSeek gate 会先记录一轮、重启进程、resume 同一 thread，再同时验证上下文连续与旧 id 稳定。",
       "v0.2.30":

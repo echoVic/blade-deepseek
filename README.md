@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.31 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.32 sh
 ```
 
 ### GitHub Releases
@@ -86,6 +86,10 @@ content sent to the model:
   Plugins, and MCP Resources. The visible token stays editable while Orca keeps
   a hidden atomic target binding, so equal names from different roots or
   providers expand to the object the user actually selected.
+- Completed agent-message, reasoning, and proposed-plan rows keep the same
+  opaque ids while streaming, after approval continuation, and when a saved
+  thread is reopened or resumed. Live and cold history reduce one durable model
+  response instead of replacing the streamed rows with another assistant shape.
 - If DeepSeek ends a turn without visible content or a tool call, Orca performs
   one bounded corrective retry without persisting the incomplete response or
   repeating already displayed reasoning. Terminal provider failures retain a
