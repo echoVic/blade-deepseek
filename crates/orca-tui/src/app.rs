@@ -2183,6 +2183,64 @@ mod tests {
     }
 
     #[test]
+    fn goal_auto_continuation_stalls_after_three_no_progress_turns() {
+        with_orca_home(|_home| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let cancel = CancelToken::new();
+
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    run_hosted_tui_controller_for_test(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::GoalSet("stall detection goal".to_string()))
+                .unwrap();
+
+            // mock provider 不产生 usage，goal 一直 active：
+            // 用户 turn 后应跑满 3 个零增量续跑 turn，然后置 Stalled 并停。
+            let mut stalled_notice = false;
+            let mut stalled_status = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline && !(stalled_notice && stalled_status) {
+                match event_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(TuiEvent::Notice(message))
+                        if message.contains("no measurable progress") =>
+                    {
+                        stalled_notice = true;
+                    }
+                    Ok(TuiEvent::GoalUpdated(goal))
+                        if goal.status == orca_core::goal_types::ThreadGoalStatus::Stalled =>
+                    {
+                        stalled_status = true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert!(stalled_notice, "missing stall notice");
+            assert!(stalled_status, "missing Stalled goal update");
+        });
+    }
+
+    #[test]
     fn goal_resume_store_failure_preserves_shared_loop_state() {
         with_orca_home(|home| {
             let mut writer =
@@ -4253,7 +4311,8 @@ fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     )
 }
 
-const MAX_GOAL_CONTINUATIONS: usize = 64;
+const STALL_TOKEN_DELTA_THRESHOLD: i64 = 500;
+const STALL_TURN_LIMIT: u32 = 3;
 
 fn send_submission_error(
     event_tx: &mpsc::Sender<TuiEvent>,
@@ -4849,12 +4908,18 @@ fn run_hosted_goal_turns(
         return;
     };
     let mut continuation = starting_continuation;
+    let mut stall_streak: u32 = 0;
+    let mut turn_was_continuation = starting_continuation > 0;
     loop {
         let active_goal = orca_runtime::goals::GoalStore::load_default()
             .get(&session_id)
             .ok()
             .flatten()
             .filter(|goal| goal.status.should_continue());
+        let tokens_before = active_goal
+            .as_ref()
+            .map(|goal| goal.tokens_used)
+            .unwrap_or(0);
         if let Some(goal) = active_goal.as_ref() {
             if let Err(error) = thread.mutate(RuntimeThreadMutation::ReplaceGoalContext(
                 orca_runtime::agent_common::format_goal_mode_instructions(goal),
@@ -4891,6 +4956,7 @@ fn run_hosted_goal_turns(
         }
         if let Some(notification) = pending_workflow_notifications.pop_notification() {
             submitted_turn = SubmittedTurn::workflow_notification(notification);
+            turn_was_continuation = false;
             continue;
         }
         match thread.snapshot() {
@@ -4922,20 +4988,29 @@ fn run_hosted_goal_turns(
             )));
             break;
         }
-        continuation += 1;
-        if continuation > MAX_GOAL_CONTINUATIONS {
-            update_goal_status_for_session(
-                Some(&session_id),
-                orca_core::goal_types::ThreadGoalStatus::UsageLimited,
-                event_tx,
-            );
-            let _ = event_tx.send(TuiEvent::Notice(
-                "Goal auto-continuation stopped after reaching the continuation limit.".to_string(),
-            ));
-            break;
+        if turn_was_continuation {
+            let delta = goal.tokens_used.saturating_sub(tokens_before);
+            if delta < STALL_TOKEN_DELTA_THRESHOLD {
+                stall_streak += 1;
+            } else {
+                stall_streak = 0;
+            }
+            if stall_streak >= STALL_TURN_LIMIT {
+                update_goal_status_for_session(
+                    Some(&session_id),
+                    orca_core::goal_types::ThreadGoalStatus::Stalled,
+                    event_tx,
+                );
+                let _ = event_tx.send(TuiEvent::Notice(format!(
+                    "Goal auto-continuation stopped because the last {STALL_TURN_LIMIT} turns made no measurable progress. Use /goal resume to continue."
+                )));
+                break;
+            }
         }
+        continuation += 1;
         submitted_turn =
             SubmittedTurn::user(goal_continuation_prompt(&goal.objective, continuation));
+        turn_was_continuation = true;
     }
 }
 
