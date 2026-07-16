@@ -6,7 +6,6 @@ use orca_core::config::{PermissionProfileNetworkAccess, RunConfig};
 use orca_core::task_types::TaskStatus;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult};
 
-use crate::extension::RuntimeExtensionStores;
 use crate::lifecycle::{RuntimePermissionRequestHandler, TurnPermissionOverlay};
 use crate::network_proxy::{
     RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy,
@@ -17,7 +16,7 @@ use crate::runtime_permission::{
     RuntimePermissionDecision, RuntimePermissionOrigin, RuntimePermissionPolicy,
     RuntimePermissionRequest, RuntimePermissionRequestKind,
 };
-use crate::runtime_state::RuntimeTurnReducer;
+use crate::runtime_state::PermissionRuntimeState;
 use crate::sandbox_denial::{
     SandboxDenialDiagnostic, diagnose_sandbox_denial,
     should_request_filesystem_permission_with_denied_roots,
@@ -40,7 +39,6 @@ pub(crate) struct RuntimeBashInvocationContext<'a, 'output> {
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) output_handler: Option<&'output mut dyn FnMut(&str)>,
-    pub(crate) extension_stores: RuntimeExtensionStores<'a>,
 }
 
 pub(crate) fn execute_bash_with_shell_session(
@@ -58,7 +56,6 @@ pub(crate) fn execute_bash_with_shell_session(
         permission_handler,
         permission_overlay,
         mut output_handler,
-        extension_stores,
     } = context;
     let Some(command) = request
         .target
@@ -124,8 +121,7 @@ pub(crate) fn execute_bash_with_shell_session(
         && let Some(permission_handler) = permission_handler
     {
         let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
-        let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
-        let response = match reducer.request_permission(
+        let response = match PermissionRuntimeState.request_permission(
             permission_overlay,
             permission_handler,
             permission_request,
@@ -165,8 +161,7 @@ pub(crate) fn execute_bash_with_shell_session(
             && let Some(permission_handler) = permission_handler
         {
             let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
-            let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
-            let response = match reducer.request_permission(
+            let response = match PermissionRuntimeState.request_permission(
                 permission_overlay,
                 permission_handler,
                 permission_request,
@@ -209,8 +204,7 @@ pub(crate) fn execute_bash_with_shell_session(
             && let Some(permission_handler) = permission_handler
         {
             let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
-            let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
-            let response = match reducer.request_permission(
+            let response = match PermissionRuntimeState.request_permission(
                 permission_overlay,
                 permission_handler,
                 permission_request,

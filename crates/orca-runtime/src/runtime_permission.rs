@@ -264,6 +264,30 @@ pub struct TurnPermissionOverlay {
     preapproved_tool_call_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TurnPermissionOverlayDelta {
+    additional_working_directories: Vec<PathBuf>,
+    network_domain_permissions:
+        std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+    strict_auto_review: bool,
+}
+
+impl TurnPermissionOverlayDelta {
+    pub fn additional_working_directories(&self) -> &[PathBuf] {
+        &self.additional_working_directories
+    }
+
+    pub fn network_domain_permissions(
+        &self,
+    ) -> &std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess> {
+        &self.network_domain_permissions
+    }
+
+    pub fn strict_auto_review(&self) -> bool {
+        self.strict_auto_review
+    }
+}
+
 impl TurnPermissionOverlay {
     pub fn additional_working_directories(&self) -> &[PathBuf] {
         &self.additional_working_directories
@@ -302,6 +326,41 @@ impl TurnPermissionOverlay {
                 .insert(domain.clone(), *access);
         }
         self.strict_auto_review |= other.strict_auto_review;
+    }
+
+    pub(crate) fn delta_from(&self, baseline: &Self) -> TurnPermissionOverlayDelta {
+        let additional_working_directories = self
+            .additional_working_directories
+            .iter()
+            .filter(|root| !baseline.additional_working_directories.contains(root))
+            .cloned()
+            .collect();
+        let network_domain_permissions = self
+            .network_domain_permissions
+            .iter()
+            .filter(|(domain, access)| {
+                baseline.network_domain_permissions.get(*domain) != Some(access)
+            })
+            .map(|(domain, access)| (domain.clone(), *access))
+            .collect();
+        TurnPermissionOverlayDelta {
+            additional_working_directories,
+            network_domain_permissions,
+            strict_auto_review: self.strict_auto_review && !baseline.strict_auto_review,
+        }
+    }
+
+    pub(crate) fn apply_delta(&mut self, delta: &TurnPermissionOverlayDelta) {
+        for root in &delta.additional_working_directories {
+            if !self.additional_working_directories.contains(root) {
+                self.additional_working_directories.push(root.clone());
+            }
+        }
+        for (domain, access) in &delta.network_domain_permissions {
+            self.network_domain_permissions
+                .insert(domain.clone(), *access);
+        }
+        self.strict_auto_review |= delta.strict_auto_review;
     }
 
     pub(crate) fn merge_network_permissions(&mut self, permissions: &RequestPermissionProfile) {
@@ -348,9 +407,11 @@ impl TurnPermissionOverlay {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use orca_core::approval_types::ApprovalMode;
+    use orca_core::config::PermissionProfileNetworkAccess;
 
     use crate::network_proxy::RuntimeNetworkBlockReport;
     use crate::sandbox_denial::SandboxDenialDiagnostic;
@@ -368,6 +429,66 @@ mod tests {
         assert!(!overlay.consume_preapproved_tool_call_id("tool-2"));
         assert!(overlay.consume_preapproved_tool_call_id("tool-1"));
         assert!(!overlay.consume_preapproved_tool_call_id("tool-1"));
+    }
+
+    #[test]
+    fn permission_overlay_delta_carries_only_worker_changes() {
+        let baseline = TurnPermissionOverlay {
+            additional_working_directories: vec![PathBuf::from("/existing")],
+            network_domain_permissions: HashMap::from([(
+                "api.example.com".to_string(),
+                PermissionProfileNetworkAccess::Allow,
+            )]),
+            strict_auto_review: false,
+            preapproved_tool_call_id: Some("approval-only".to_string()),
+        };
+        let current = TurnPermissionOverlay {
+            additional_working_directories: vec![PathBuf::from("/existing"), PathBuf::from("/new")],
+            network_domain_permissions: HashMap::from([
+                (
+                    "api.example.com".to_string(),
+                    PermissionProfileNetworkAccess::Allow,
+                ),
+                (
+                    "blocked.example.com".to_string(),
+                    PermissionProfileNetworkAccess::Deny,
+                ),
+            ]),
+            strict_auto_review: true,
+            preapproved_tool_call_id: None,
+        };
+
+        let delta = current.delta_from(&baseline);
+        assert_eq!(
+            delta.additional_working_directories(),
+            &[PathBuf::from("/new")]
+        );
+        assert_eq!(
+            delta
+                .network_domain_permissions()
+                .get("blocked.example.com"),
+            Some(&PermissionProfileNetworkAccess::Deny)
+        );
+        assert!(delta.strict_auto_review());
+
+        let mut canonical = baseline.clone();
+        canonical.apply_delta(&delta);
+        assert_eq!(
+            canonical.additional_working_directories(),
+            &[PathBuf::from("/existing"), PathBuf::from("/new")]
+        );
+        assert_eq!(
+            canonical
+                .network_domain_permissions()
+                .get("blocked.example.com"),
+            Some(&PermissionProfileNetworkAccess::Deny)
+        );
+        assert!(canonical.strict_auto_review());
+        assert_eq!(
+            canonical.preapproved_tool_call_id.as_deref(),
+            Some("approval-only"),
+            "worker delta must not mutate approval-only canonical state"
+        );
     }
 
     #[test]

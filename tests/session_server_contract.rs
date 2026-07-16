@@ -1718,7 +1718,7 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
 }
 
 #[test]
-fn server_mode_interrupt_cancels_active_bash_tool_wait() {
+fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
     let workspace = tempdir().expect("workspace");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
@@ -1822,6 +1822,20 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
     assert_eq!(command["item"]["status"], "cancelled");
     assert_eq!(command["item"]["kind"], "cancelled");
     assert_eq!(command["item"]["invocationStarted"], "yes");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"turn-after-interrupt","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"respond after interrupt"}}]}}}}"#,
+            thread_id
+        )
+        .expect("write turn after interrupt");
+        stdin.flush().expect("flush turn after interrupt");
+    }
+    child.expect_event("turn-after-interrupt", "turn_started");
+    let next_completed = child.expect_event("turn-after-interrupt", "turn_completed");
+    assert_eq!(next_completed["status"], "success");
 
     child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");

@@ -6,7 +6,7 @@ use crate::runtime_capability::{RuntimeCapabilityPatch, RuntimeCapabilitySnapsho
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_permission::{
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
-    TurnPermissionOverlay,
+    TurnPermissionOverlay, TurnPermissionOverlayDelta,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +80,14 @@ impl<'a> RuntimeTurnReducer<'a> {
             .merge_permission_overlay(overlay, other);
     }
 
+    pub fn merge_permission_delta(
+        &self,
+        overlay: &mut TurnPermissionOverlay,
+        delta: &TurnPermissionOverlayDelta,
+    ) {
+        self.permission_state.merge_permission_delta(overlay, delta);
+    }
+
     pub fn record_tool_finish(&self, finish: RuntimeToolFinish<'_>) {
         self.tool_state.record_finish(finish);
     }
@@ -121,6 +129,14 @@ impl PermissionRuntimeState {
         other: &TurnPermissionOverlay,
     ) {
         overlay.merge(other);
+    }
+
+    pub fn merge_permission_delta(
+        &self,
+        overlay: &mut TurnPermissionOverlay,
+        delta: &TurnPermissionOverlayDelta,
+    ) {
+        overlay.apply_delta(delta);
     }
 }
 

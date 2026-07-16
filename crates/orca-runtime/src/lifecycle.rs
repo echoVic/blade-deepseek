@@ -33,10 +33,10 @@ use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 use crate::provider_stream::RuntimeProviderSuspensionControl;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
-use crate::runtime_normal_tool::{
-    RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
-};
 use crate::runtime_state::RuntimeTurnReducer;
+use crate::runtime_tool_call::{
+    RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
+};
 use crate::runtime_turn_kernel::RuntimeTurnKernel;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
@@ -644,7 +644,7 @@ impl<'a> RuntimeTaskActor<'a> {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        self.execute_normal_tool_invocation(RuntimeNormalToolInvocation {
+        let invocation = RuntimeNormalToolInvocation::snapshot(
             config,
             request,
             cwd,
@@ -654,19 +654,27 @@ impl<'a> RuntimeTaskActor<'a> {
             output_truncation,
             shell_timeout_secs,
             task_registry,
-            cancel,
-            permission_handler,
-            mcp_elicitation_handler: None,
-            output_handler: None,
-            extension_stores: None,
-        })
-    }
-
-    pub(crate) fn execute_normal_tool_invocation(
-        &mut self,
-        invocation: RuntimeNormalToolInvocation<'_, '_>,
-    ) -> ToolResult {
-        execute_runtime_normal_tool_invocation(invocation, None)
+            TurnPermissionOverlay::default(),
+        );
+        let fallback_cancel = CancelToken::new();
+        let parent_cancel = cancel.unwrap_or(&fallback_cancel);
+        let runtime = RuntimeToolCallRuntime::for_normal_execution();
+        match runtime.execute_normal(
+            invocation,
+            parent_cancel,
+            RuntimeNormalToolInteractions {
+                output_handler: None,
+                permission_handler,
+                mcp_elicitation_handler: None,
+            },
+        ) {
+            Ok(output) => output.result,
+            Err(error) => ToolResult::failed_before_start(
+                request,
+                format!("failed to execute normal tool: {error}"),
+                None,
+            ),
+        }
     }
 
     pub fn execute_user_input_tool(

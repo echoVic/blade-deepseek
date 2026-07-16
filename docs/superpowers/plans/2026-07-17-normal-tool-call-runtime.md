@@ -1,6 +1,6 @@
 # P1.2b Runtime-Owned Sequential Normal Tool Calls Plan
 
-- Status: planned; release target `v0.2.35`
+- Status: implemented; full and release validation pending for `v0.2.35`
 - Base: `edefa9e86f78be4727118a3b993b83fcc704a835`
 - Branch: `codex/normal-tool-call-runtime-p12b`
 
@@ -273,6 +273,22 @@ not compatibility fallbacks from the normal owner.
   public changelog are verified before worktree cleanup.
 
 The established three-file rustfmt baseline must remain unchanged.
+
+Focused implementation validation completed on 2026-07-17:
+
+- owned normal-runtime cancellation, wait-for-terminal, completion-race,
+  panic, output failure, parent-callback panic, detach rejection, and
+  permission-delta tests pass;
+- the router multi-call test proves a turn permission grant is merged before
+  the next normal invocation snapshot;
+- all 794 `orca-runtime` library tests pass;
+- runtime lifecycle contracts pass with cancel-before-admission now proving no
+  shell task is created;
+- server bash interruption joins cleanup and accepts the next turn, while MCP
+  call and elicitation interruption regressions pass;
+- standard `orca-runtime` Clippy adds no warning beyond the existing baseline;
+- `cargo fmt --all -- --check` remains limited to the established
+  `runtime_host.rs`, runtime-host test, and TUI `app.rs` baseline.
 
 ## Final Deletion Targets
 

@@ -546,6 +546,7 @@ impl ToolExecutionActor {
                 call_id: &execution_request.id,
             });
         }
+        let mut dispatch_event_error = None;
         let result = match RuntimeToolRouter::new(&mut self.runtime).dispatch(
             RuntimeToolInvocationContext {
                 config,
@@ -569,6 +570,7 @@ impl ToolExecutionActor {
                 user_input_handler,
                 mcp_elicitation_handler,
                 extension_stores,
+                event_error: &mut dispatch_event_error,
                 child_executor,
                 workflow_child_executor,
             },
@@ -590,7 +592,7 @@ impl ToolExecutionActor {
                 outcome: tool_call_outcome_for_result(&result),
             });
         }
-        Ok(self.finish_tool_result(
+        let mut completion = self.finish_tool_result(
             events,
             sink,
             execution_request,
@@ -599,7 +601,11 @@ impl ToolExecutionActor {
             &cwd_display,
             emit_deltas,
             Some(cancel),
-        ))
+        );
+        if dispatch_event_error.is_some() {
+            completion.event_error = dispatch_event_error;
+        }
+        Ok(completion)
     }
 
     pub(crate) fn handle_approval<W: io::Write>(

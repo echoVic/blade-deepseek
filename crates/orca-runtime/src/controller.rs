@@ -1265,6 +1265,8 @@ fn run_verifier_if_needed(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::agent_loop::execute_child_agent_loop;
     use crate::hooks::HookOutcome;
@@ -1274,6 +1276,15 @@ mod tests {
         RuntimeUserInputRequest,
     };
     use crate::memory::MemoryBlock;
+    use crate::protocol::{
+        PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
+        RequestPermissionProfile,
+    };
+    use crate::runtime_permission::{RuntimePermissionRequest, RuntimePermissionResponse};
+    use crate::runtime_tool_call::{
+        RuntimeNormalToolHandler, RuntimeNormalToolInvocation, RuntimeNormalToolWorkerContext,
+        RuntimeToolCallRuntime,
+    };
     use crate::subagent_execution::{collect_subagent_batch, should_run_subagent_batch};
     use crate::tool_execution::{
         ToolApprovalGateContext, ToolExecutionActor, ToolExecutionContext,
@@ -1287,6 +1298,75 @@ mod tests {
     use orca_core::conversation::Message;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
+
+    struct PermissionCarryNormalHandler {
+        calls: AtomicUsize,
+    }
+
+    impl RuntimeNormalToolHandler for PermissionCarryNormalHandler {
+        fn execute(
+            &self,
+            invocation: &RuntimeNormalToolInvocation,
+            context: &mut RuntimeNormalToolWorkerContext<'_>,
+        ) -> tool_types::ToolResult {
+            match self.calls.fetch_add(1, Ordering::AcqRel) {
+                0 => {
+                    context
+                        .request_permissions(RuntimePermissionRequest {
+                            id: invocation.request.id.clone(),
+                            reason: Some("grant sibling access".to_string()),
+                            permissions: RequestPermissionProfile {
+                                file_system: Some(RequestFileSystemPermissions {
+                                    read: None,
+                                    write: Some(vec![PathBuf::from("/sibling-grant")]),
+                                    entries: None,
+                                }),
+                                network: None,
+                                shell: None,
+                            },
+                        })
+                        .expect("grant first normal call");
+                    tool_types::ToolResult::completed(
+                        &invocation.request,
+                        "granted".to_string(),
+                        false,
+                    )
+                }
+                1 if invocation
+                    .permission_overlay
+                    .additional_working_directories()
+                    .contains(&PathBuf::from("/sibling-grant")) =>
+                {
+                    tool_types::ToolResult::completed(
+                        &invocation.request,
+                        "observed sibling grant".to_string(),
+                        false,
+                    )
+                }
+                _ => tool_types::ToolResult::failed(
+                    &invocation.request,
+                    "next normal call did not observe the turn grant",
+                    None,
+                ),
+            }
+        }
+    }
+
+    struct AllowTurnPermission;
+
+    impl RuntimePermissionRequestHandler for AllowTurnPermission {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> io::Result<RuntimePermissionResponse> {
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: false,
+            })
+        }
+    }
 
     fn config(subagents: SubagentConfig) -> RunConfig {
         RunConfig {
@@ -2182,6 +2262,7 @@ mod tests {
         let task_registry = TaskRegistry::new("tool-actor-dispatch".to_string());
         let mut background_workflows = Vec::new();
         let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
+        let mut event_error = None;
 
         let mut runtime =
             RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
@@ -2208,11 +2289,86 @@ mod tests {
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
                 extension_stores: None,
+                event_error: &mut event_error,
                 child_executor: execute_child_agent_loop,
                 workflow_child_executor: execute_child_agent_loop,
             })
             .unwrap();
 
         assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert!(event_error.is_none());
+    }
+
+    #[test]
+    fn runtime_tool_router_merges_normal_permission_delta_before_next_call() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("normal-permission-carry".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let requests = ["grant", "observe"].map(|id| tool_types::ToolRequest {
+            id: id.to_string(),
+            name: tool_types::ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("printf unused".to_string()),
+            raw_arguments: None,
+        });
+        let registry = McpRegistry::default();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("normal-permission-carry".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
+        let permission_handler = AllowTurnPermission;
+        let normal_handler = Arc::new(PermissionCarryNormalHandler {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runtime =
+            RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+
+        for request in &requests {
+            let tool_calls = RuntimeToolCallRuntime::with_normal_handler(normal_handler.clone())
+                .expect("normal tool runtime");
+            let mut event_error = None;
+            let result = RuntimeToolRouter::with_tool_call_runtime(&mut runtime, tool_calls)
+                .dispatch(RuntimeToolInvocationContext {
+                    config: &config,
+                    cwd: cwd.path(),
+                    events: &mut events,
+                    sink: &mut sink,
+                    execution_request: request,
+                    subagent_depth: 0,
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &registry,
+                    hooks: &hooks,
+                    emit_deltas: false,
+                    cost_tracker: &mut cost_tracker,
+                    cancel: &cancel,
+                    task_registry: &task_registry,
+                    background_workflows: &mut background_workflows,
+                    workflow_ipc: None,
+                    permission_overlay: &mut permission_overlay,
+                    permission_handler: Some(&permission_handler),
+                    user_input_handler: None,
+                    mcp_elicitation_handler: None,
+                    extension_stores: None,
+                    event_error: &mut event_error,
+                    child_executor: execute_child_agent_loop,
+                    workflow_child_executor: execute_child_agent_loop,
+                })
+                .expect("dispatch normal call");
+
+            assert_eq!(result.status, tool_types::ToolStatus::Completed);
+            assert!(event_error.is_none());
+        }
+
+        assert_eq!(
+            permission_overlay.additional_working_directories(),
+            &[PathBuf::from("/sibling-grant")]
+        );
+        assert_eq!(normal_handler.calls.load(Ordering::Acquire), 2);
     }
 }

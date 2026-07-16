@@ -308,11 +308,6 @@ fn runtime_tool_router_owns_tool_invocation_dispatch_boundary() {
         "tool_router should classify runtime special tool dispatch"
     );
     assert!(
-        tool_router.contains("RuntimeNormalToolInvocation")
-            && tool_router.contains("execute_normal_tool_invocation"),
-        "tool_router should route normal tool execution through the invocation-object entrypoint"
-    );
-    assert!(
         tool_execution.contains("RuntimeToolRouter::new"),
         "tool execution actor should delegate dispatch through RuntimeToolRouter"
     );
@@ -320,89 +315,6 @@ fn runtime_tool_router_owns_tool_invocation_dispatch_boundary() {
         !tool_execution.contains("pub(crate) fn dispatch_tool"),
         "tool execution actor should not own the large runtime tool dispatch method"
     );
-}
-
-#[test]
-fn runtime_normal_tool_executor_owns_normal_tool_execution_boundary() {
-    let lib =
-        std::fs::read_to_string("crates/orca-runtime/src/lib.rs").expect("runtime lib source");
-    let lifecycle =
-        std::fs::read_to_string("crates/orca-runtime/src/lifecycle.rs").expect("lifecycle source");
-    let normal_tool = std::fs::read_to_string("crates/orca-runtime/src/runtime_normal_tool.rs")
-        .expect("runtime normal tool source");
-
-    assert!(
-        lib.contains("mod runtime_normal_tool;"),
-        "orca-runtime should register a focused normal-tool execution module"
-    );
-    assert!(
-        normal_tool.contains("pub(crate) struct RuntimeNormalToolExecutor"),
-        "runtime_normal_tool should own the normal tool executor boundary"
-    );
-    assert!(
-        normal_tool.contains("pub(crate) struct RuntimeNormalToolExecutionContext"),
-        "runtime_normal_tool should group normal tool execution state"
-    );
-    assert!(
-        normal_tool.contains("pub(crate) struct RuntimeNormalToolInvocation"),
-        "runtime_normal_tool should expose a smaller invocation object for lifecycle/router callers"
-    );
-    assert!(
-        normal_tool.contains("pub(crate) trait RuntimeNormalToolFallbackExecutor"),
-        "runtime_normal_tool should expose a focused fallback executor boundary"
-    );
-    assert!(
-        normal_tool.contains("pub(crate) struct RuntimeNormalToolFallbackContext"),
-        "runtime_normal_tool should group fallback executor state"
-    );
-    assert!(
-        normal_tool.contains("DefaultRuntimeNormalToolFallbackExecutor"),
-        "runtime_normal_tool should keep the orca-tools fallback behind a default executor"
-    );
-    assert!(
-        normal_tool.contains("pub(crate) fn execute_runtime_normal_tool"),
-        "runtime_normal_tool should expose one helper for normal tool invocations"
-    );
-    assert!(
-        normal_tool.contains("execute_bash_with_shell_session"),
-        "runtime_normal_tool should own the shell-session bash execution branch"
-    );
-    assert!(
-        normal_tool.contains("execute_with_mcp_external_roots_policy_or_cancel"),
-        "runtime_normal_tool should own the fallback to the orca-tools executor"
-    );
-    assert!(
-        lifecycle.contains("execute_runtime_normal_tool"),
-        "lifecycle should delegate normal tool execution through the runtime_normal_tool invocation helper"
-    );
-    assert!(
-        lifecycle.contains("pub(crate) fn execute_normal_tool_invocation"),
-        "lifecycle actors should expose one invocation-object entrypoint for normal tools"
-    );
-    assert!(
-        tool_router_uses_normal_tool_invocation(),
-        "tool_router should route normal tools through RuntimeNormalToolInvocation instead of the long roots/cancel method"
-    );
-    assert!(
-        !lifecycle.contains("RuntimeNormalToolExecutor::new"),
-        "lifecycle should not instantiate the normal tool executor directly"
-    );
-    assert!(
-        !lifecycle.contains("execute_bash_with_shell_session("),
-        "lifecycle should not directly own the shell-session bash execution branch"
-    );
-    assert!(
-        !lifecycle.contains("orca_tools::execute_with_mcp_external_roots_policy_or_cancel"),
-        "lifecycle should not directly invoke the normal tool fallback executor"
-    );
-}
-
-fn tool_router_uses_normal_tool_invocation() -> bool {
-    let tool_router = std::fs::read_to_string("crates/orca-runtime/src/tool_router.rs")
-        .expect("runtime tool router source");
-    tool_router.contains("RuntimeNormalToolInvocation")
-        && tool_router.contains("execute_normal_tool_invocation")
-        && !tool_router.contains("execute_normal_tool_with_roots_and_cancel")
 }
 
 #[test]
@@ -1761,7 +1673,7 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
 }
 
 #[test]
-fn tool_actor_context_cancels_shell_session_tool_wait() {
+fn tool_actor_context_cancels_normal_tool_before_admission_without_shell_task() {
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
     let cancel = orca_core::cancel::CancelToken::new();
@@ -1802,7 +1714,7 @@ fn tool_actor_context_cancels_shell_session_tool_wait() {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("shell command cancelled"),
+            .contains("normal invocation was cancelled before dispatch"),
         "unexpected error: {:?}",
         result.error
     );
@@ -1810,8 +1722,12 @@ fn tool_actor_context_cancels_shell_session_tool_wait() {
         task_registry
             .list()
             .iter()
-            .any(|task| task.task_type == TaskType::Shell && task.status == TaskStatus::Stopped),
-        "cancelled shell execution should stop its shell task record"
+            .all(|task| task.task_type != TaskType::Shell),
+        "cancel-before-admission must not create a shell task record"
+    );
+    assert_eq!(
+        result.terminal().started,
+        orca_core::tool_types::ToolInvocationStarted::No
     );
 }
 

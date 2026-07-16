@@ -409,80 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_permission_overlay_mutations_route_through_runtime_reducer() {
-        let runtime_state_source = include_str!("runtime_state.rs");
-        let extension_source = include_str!("extension.rs");
-        let runtime_special_source = include_str!("runtime_special.rs");
-        let runtime_bash_source = include_str!("runtime_bash.rs");
-        let runtime_normal_tool_source = include_str!("runtime_normal_tool.rs");
-        let tool_router_source = include_str!("tool_router.rs");
-
-        assert!(
-            extension_source.contains("struct RuntimeExtensionStores"),
-            "extension module must own the grouped thread/turn extension store refs"
-        );
-        assert!(
-            runtime_state_source.contains("struct PermissionRuntimeState"),
-            "runtime_state must own the permission reducer branch"
-        );
-        assert!(
-            !runtime_state_source.contains("pub fn permission()"),
-            "permission reduction must be owned by RuntimeTurnReducer instances"
-        );
-        assert!(
-            runtime_state_source.contains("pub fn request_permission("),
-            "RuntimeTurnReducer must expose permission request reduction"
-        );
-        assert!(
-            runtime_state_source.contains("pub fn merge_permission_overlay("),
-            "RuntimeTurnReducer must expose permission overlay merge reduction"
-        );
-
-        for (module_name, source) in [
-            ("runtime_special", runtime_special_source),
-            ("runtime_bash", runtime_bash_source),
-            ("tool_router", tool_router_source),
-        ] {
-            assert!(
-                source.contains("RuntimeTurnReducer::from_extension_stores("),
-                "{module_name} must create a RuntimeTurnReducer from grouped extension stores"
-            );
-            assert!(
-                !source.contains("RuntimeTurnReducer::permission()"),
-                "{module_name} must not bypass RuntimeTurnReducer instance state for permission overlay mutation"
-            );
-            assert!(
-                !source.contains(".request_and_merge("),
-                "{module_name} must not request and merge permission overlay directly"
-            );
-        }
-
-        for (module_name, source) in [
-            ("runtime_bash", runtime_bash_source),
-            ("runtime_normal_tool", runtime_normal_tool_source),
-            ("tool_router", tool_router_source),
-        ] {
-            assert!(
-                source.contains("extension_stores"),
-                "{module_name} must pass grouped extension stores through permission-sensitive tool contexts"
-            );
-            assert!(
-                !source.contains("pub(crate) thread_extensions:"),
-                "{module_name} must not expose thread extension refs as a parallel context field"
-            );
-            assert!(
-                !source.contains("pub(crate) turn_extensions:"),
-                "{module_name} must not expose turn extension refs as a parallel context field"
-            );
-        }
-
-        assert!(
-            !tool_router_source.contains("permission_overlay.merge("),
-            "tool_router must not merge permission overlay directly"
-        );
-    }
-
-    #[test]
     fn tool_execution_context_groups_extension_store_refs() {
         let tool_execution_source = include_str!("tool_execution.rs");
 
@@ -2374,7 +2300,6 @@ mod tests {
         for marker in [
             "pub fn new(run_id: impl Into<String>, max_turns: u32) -> Self",
             "pub fn resolve_tool_approval(",
-            "pub(crate) fn execute_normal_tool_invocation(",
             "pub fn execute_user_input_tool(",
         ] {
             assert!(

@@ -18,9 +18,11 @@ use crate::lifecycle::{
     RuntimeWorkflowIpc, TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
-use crate::runtime_normal_tool::RuntimeNormalToolInvocation;
 use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
 use crate::runtime_state::RuntimeTurnReducer;
+use crate::runtime_tool_call::{
+    RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
+};
 use crate::subagent_execution::execute_subagent_tool;
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -51,17 +53,33 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
+    pub(crate) event_error: &'a mut Option<io::Error>,
     pub(crate) child_executor: ChildAgentExecutor<W>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 }
 
 pub(crate) struct RuntimeToolRouter<'a> {
     runtime: &'a mut RuntimeToolActorContext,
+    tool_calls: RuntimeToolCallRuntime,
 }
 
 impl<'a> RuntimeToolRouter<'a> {
     pub(crate) fn new(runtime: &'a mut RuntimeToolActorContext) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            tool_calls: RuntimeToolCallRuntime::for_normal_execution(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tool_call_runtime(
+        runtime: &'a mut RuntimeToolActorContext,
+        tool_calls: RuntimeToolCallRuntime,
+    ) -> Self {
+        Self {
+            runtime,
+            tool_calls,
+        }
     }
 
     pub(crate) fn dispatch<W: io::Write>(
@@ -90,6 +108,7 @@ impl<'a> RuntimeToolRouter<'a> {
             user_input_handler,
             mcp_elicitation_handler,
             extension_stores,
+            event_error,
             child_executor,
             workflow_child_executor,
         } = context;
@@ -200,41 +219,46 @@ impl<'a> RuntimeToolRouter<'a> {
                             .cloned(),
                     )
                     .collect::<Vec<_>>();
-                let mut event_error = None;
-                let mut output_handler = |chunk: &str| {
-                    if emit_deltas
-                        && event_error.is_none()
-                        && let Err(error) =
-                            sink.emit(events.tool_output_delta(&execution_request.id, chunk))
-                    {
-                        event_error = Some(error);
-                    }
-                };
-                let result =
-                    self.runtime
-                        .execute_normal_tool_invocation(RuntimeNormalToolInvocation {
-                            config: Some(config),
-                            request: execution_request,
-                            cwd,
-                            additional_roots: &additional_roots,
-                            mcp_registry,
-                            external_tools: &config.external_tools,
-                            output_truncation: config.tools.output_truncation,
-                            shell_timeout_secs: config.tools.shell_timeout_secs,
-                            task_registry: Some(task_registry),
-                            cancel: Some(cancel),
+                let invocation = RuntimeNormalToolInvocation::snapshot(
+                    Some(config),
+                    execution_request,
+                    cwd,
+                    &additional_roots,
+                    mcp_registry,
+                    &config.external_tools,
+                    config.tools.output_truncation,
+                    config.tools.shell_timeout_secs,
+                    Some(task_registry),
+                    permission_overlay.clone(),
+                );
+                let output = {
+                    let mut output_handler = |chunk: &str| {
+                        sink.emit(events.tool_output_delta(&execution_request.id, chunk))
+                    };
+                    self.tool_calls.execute_normal(
+                        invocation,
+                        cancel,
+                        RuntimeNormalToolInteractions {
+                            output_handler: emit_deltas.then_some(&mut output_handler),
                             permission_handler: permission_handler
                                 .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
                             mcp_elicitation_handler: mcp_elicitation_handler
                                 .map(|handler| handler as &dyn McpElicitationHandler),
-                            output_handler: Some(&mut output_handler),
-                            extension_stores,
-                        });
-                drop(output_handler);
-                match event_error {
-                    Some(error) => Err(error),
-                    None => Ok(result),
+                        },
+                    )?
+                };
+                let extension_stores = extension_stores.unwrap_or_else(|| {
+                    RuntimeExtensionStores::new(
+                        &self.runtime.thread_extensions,
+                        &self.runtime.turn_extensions,
+                    )
+                });
+                RuntimeTurnReducer::from_extension_stores(extension_stores)
+                    .merge_permission_delta(permission_overlay, &output.permission_delta);
+                if event_error.is_none() {
+                    *event_error = output.event_error;
                 }
+                Ok(output.result)
             }
         }
     }

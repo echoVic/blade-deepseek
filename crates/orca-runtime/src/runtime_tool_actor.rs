@@ -9,14 +9,15 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 
-use crate::extension::{ExtensionData, RuntimeExtensionStores};
+use crate::extension::ExtensionData;
 use crate::lifecycle::{
     RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimePermissionRequestHandler,
     RuntimeSessionLifecycle, RuntimeTaskActor, RuntimeTaskKind, RuntimeTaskLifecycle,
     RuntimeUserInputHandler, TurnPermissionOverlay,
 };
-use crate::runtime_normal_tool::{
-    RuntimeNormalToolInvocation, execute_runtime_normal_tool_invocation,
+use crate::runtime_state::PermissionRuntimeState;
+use crate::runtime_tool_call::{
+    RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
 };
 use crate::tasks::TaskRegistry;
 
@@ -191,7 +192,7 @@ impl RuntimeToolActorContext {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
-        self.execute_normal_tool_invocation(RuntimeNormalToolInvocation {
+        let invocation = RuntimeNormalToolInvocation::snapshot(
             config,
             request,
             cwd,
@@ -201,23 +202,31 @@ impl RuntimeToolActorContext {
             output_truncation,
             shell_timeout_secs,
             task_registry,
-            cancel,
-            permission_handler,
-            mcp_elicitation_handler: None,
-            output_handler: None,
-            extension_stores: None,
-        })
-    }
-
-    pub(crate) fn execute_normal_tool_invocation(
-        &mut self,
-        invocation: RuntimeNormalToolInvocation<'_, '_>,
-    ) -> ToolResult {
-        let extension_stores = invocation.extension_stores.unwrap_or_else(|| {
-            RuntimeExtensionStores::new(&self.thread_extensions, &self.turn_extensions)
-        });
-        let invocation = invocation.with_extension_stores(extension_stores);
-        execute_runtime_normal_tool_invocation(invocation, Some(&mut self.permission_overlay))
+            self.permission_overlay.clone(),
+        );
+        let fallback_cancel = CancelToken::new();
+        let parent_cancel = cancel.unwrap_or(&fallback_cancel);
+        let runtime = RuntimeToolCallRuntime::for_normal_execution();
+        match runtime.execute_normal(
+            invocation,
+            parent_cancel,
+            RuntimeNormalToolInteractions {
+                output_handler: None,
+                permission_handler,
+                mcp_elicitation_handler: None,
+            },
+        ) {
+            Ok(output) => {
+                PermissionRuntimeState
+                    .merge_permission_delta(&mut self.permission_overlay, &output.permission_delta);
+                output.result
+            }
+            Err(error) => ToolResult::failed_before_start(
+                request,
+                format!("failed to execute normal tool: {error}"),
+                None,
+            ),
+        }
     }
 
     pub fn execute_user_input_tool(
