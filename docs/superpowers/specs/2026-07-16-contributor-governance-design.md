@@ -120,6 +120,14 @@ Add a short `Contributing and Support` section near the existing Community
 section. It will link to the contributor guide, Issue forms, support guide, and
 security policy without duplicating their contents.
 
+### Repository Security Setting
+
+Enable GitHub Private Vulnerability Reporting for
+`echoVic/blade-deepseek`. This is required for the Security Advisory links in
+the policy and Issue chooser to accept private reports. Apply the setting only
+after the repository files are ready, then read the dedicated GitHub API
+endpoint and require `enabled: true` as completion evidence.
+
 ## Exclusions
 
 This change will not add:
@@ -127,7 +135,8 @@ This change will not add:
 - a CLA, DCO, or sign-off requirement;
 - `CODEOWNERS` or automatic reviewer assignment;
 - a code of conduct without a private conduct-reporting channel;
-- new GitHub labels, branch protections, Discussions, or repository settings;
+- new GitHub labels, branch protections, Discussions, or repository settings
+  beyond enabling Private Vulnerability Reporting;
 - new CI workflows or changes to runtime behavior.
 
 These require separate maintainer and repository-setting decisions.
@@ -143,7 +152,9 @@ These require separate maintainer and repository-setting decisions.
    valid for the current checkout.
 6. Review all templates for accidental requests for secrets or public security
    disclosures.
-7. Confirm that no production source or release configuration changed.
+7. Enable Private Vulnerability Reporting through the dedicated GitHub API and
+   verify that the endpoint returns `enabled: true`.
+8. Confirm that no production source or release configuration changed.
 
 ## Acceptance Criteria
 
@@ -158,3 +169,5 @@ These require separate maintainer and repository-setting decisions.
 6. GitHub templates are syntactically valid and contain no references to
    nonexistent repository-managed labels.
 7. README exposes the governance entry points without duplicating policy text.
+8. The repository accepts private vulnerability reports through GitHub Security
+   Advisories.
