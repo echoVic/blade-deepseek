@@ -168,7 +168,9 @@ fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         ThreadGoalStatus::Active => theme.success,
         ThreadGoalStatus::Paused => theme.warning,
         ThreadGoalStatus::Blocked => theme.error,
-        ThreadGoalStatus::UsageLimited | ThreadGoalStatus::BudgetLimited => theme.warning,
+        ThreadGoalStatus::UsageLimited
+        | ThreadGoalStatus::BudgetLimited
+        | ThreadGoalStatus::Stalled => theme.warning,
         ThreadGoalStatus::Complete => theme.success,
     };
 

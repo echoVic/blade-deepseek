@@ -236,6 +236,7 @@ fn goal_status_word(status: ThreadGoalStatus) -> &'static str {
         ThreadGoalStatus::Active => "active",
         ThreadGoalStatus::Paused => "paused",
         ThreadGoalStatus::Blocked => "blocked",
+        ThreadGoalStatus::Stalled => "stalled",
         ThreadGoalStatus::UsageLimited => "usage limited",
         ThreadGoalStatus::BudgetLimited => "budget limited",
         ThreadGoalStatus::Complete => "complete",

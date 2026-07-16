@@ -8,6 +8,7 @@ pub enum ThreadGoalStatus {
     Active,
     Paused,
     Blocked,
+    Stalled,
     UsageLimited,
     BudgetLimited,
     Complete,
@@ -63,6 +64,7 @@ pub fn goal_status_label(status: ThreadGoalStatus) -> &'static str {
         ThreadGoalStatus::Active => "active",
         ThreadGoalStatus::Paused => "paused",
         ThreadGoalStatus::Blocked => "blocked",
+        ThreadGoalStatus::Stalled => "stalled",
         ThreadGoalStatus::UsageLimited => "usage limited",
         ThreadGoalStatus::BudgetLimited => "limited by budget",
         ThreadGoalStatus::Complete => "complete",
@@ -204,5 +206,16 @@ mod tests {
             goal_usage_summary(&goal),
             "Objective: Complete persistent goal mode Time: 2m. Tokens: 63.9K/50K."
         );
+    }
+
+    #[test]
+    fn stalled_status_is_recoverable_and_stops_continuation() {
+        assert!(!ThreadGoalStatus::Stalled.is_terminal());
+        assert!(!ThreadGoalStatus::Stalled.should_continue());
+        assert_eq!(goal_status_label(ThreadGoalStatus::Stalled), "stalled");
+        let json = serde_json::to_string(&ThreadGoalStatus::Stalled).unwrap();
+        assert_eq!(json, "\"stalled\"");
+        let parsed: ThreadGoalStatus = serde_json::from_str("\"stalled\"").unwrap();
+        assert_eq!(parsed, ThreadGoalStatus::Stalled);
     }
 }
