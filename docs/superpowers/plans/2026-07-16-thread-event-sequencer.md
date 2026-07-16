@@ -1,8 +1,9 @@
 # P1.1 Thread Event Sequencer Plan
 
-- Status: P1.1a complete
-- Base: `3c6eb902c2c4ad7a4f4cf12a506f5811716d541b`
-- Branch: `codex/thread-event-sequencer-p11a`
+- Status: P1.1a complete; P1.1b in progress
+- P1.1a base: `3c6eb902c2c4ad7a4f4cf12a506f5811716d541b`
+- P1.1b base: `5db402c11f50ace252f5d52e5e190fb6faf0ee65`
+- P1.1b branch: `codex/workflow-event-sequencer-p11b`
 
 ## Structural Problem And Evidence
 
@@ -91,6 +92,60 @@ Validation completed on the feature worktree:
 - all 40 `orca-runtime` `runtime_host` tests
 - `cargo test --workspace --all-targets -- --test-threads=1`
 - `cargo clippy --workspace --all-targets` (exit 0; existing warning baseline)
+
+## P1.1b Workflow Event Stream Contract
+
+### Structural Problem And Evidence
+
+Workflow launch events are allocated by the actor-owned thread factory, but
+`run_workflow_background_task` creates a new factory with the workflow run id.
+The same observer therefore receives launch events on the thread stream and
+progress/terminal events on a second stream starting at `seq = 0`. The panic
+fallback creates a third factory with the same independent behavior.
+
+The workflow run id is already a typed payload field on every workflow
+lifecycle terminal. Using the envelope `run_id` as another workflow identity is
+both redundant and inconsistent with the launch event. Renderer-side merging
+would retain the duplicate sequence owners.
+
+### Target Ownership And User Value
+
+Every workflow semantic event projected to the parent TUI/server observer uses
+a fork of the owning thread's event allocator. The workflow worker owns only
+that fork for its joined lifetime. `taskId` and payload `runId` remain the
+stable workflow identities.
+
+This makes `/workflow` launch, progress, completion/failure, and a concurrent
+next turn one deduplicable thread stream. It removes an ordering ambiguity that
+blocks reliable TUI reattach and the later durable semantic journal.
+
+### External Compatibility
+
+- Keep event schema version, event names, payloads, TUI actions, server methods,
+  and persistence records unchanged.
+- Keep payload `runId` byte-for-byte stable for workflow consumers.
+- The envelope `run_id` for host-projected background workflow events becomes
+  the parent thread id, matching the existing workflow launch event. Public
+  server mappings already source workflow identity from payload `runId`.
+- Keep workflow cancellation, task settlement, capacity rejection, and host
+  shutdown semantics unchanged.
+
+### Migration And Acceptance
+
+1. Add a RED saved-workflow behavior test that observes launch, a concurrent
+   foreground turn, progress, and terminal events.
+2. Assert every observed envelope belongs to the parent thread and has one
+   unique contiguous sequence while workflow payload `runId` stays unchanged.
+3. Transfer a thread factory fork into each admitted workflow worker and its
+   panic path; delete worker-local `EventFactory::new` calls.
+4. Transfer the same sequence ownership through capacity cleanup so rejected
+   background work cannot open a hidden event stream.
+5. Run all event-schema/runtime-host tests, the full serial workspace gate, and
+   workspace Clippy before integration.
+
+P1.1b is not the ordered publisher or durable journal. Multi-producer delivery
+serialization, semantic persistence, replay, and stable turn/item ids remain
+explicit later P1.1 slices.
 
 ## Final Deletion Targets
 
