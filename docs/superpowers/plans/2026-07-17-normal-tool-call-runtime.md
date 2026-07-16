@@ -1,6 +1,6 @@
 # P1.2b Runtime-Owned Sequential Normal Tool Calls Plan
 
-- Status: implemented; full and release validation pending for `v0.2.35`
+- Status: implemented and release-gated; public `v0.2.35` release pending
 - Base: `edefa9e86f78be4727118a3b993b83fcc704a835`
 - Branch: `codex/normal-tool-call-runtime-p12b`
 
@@ -290,9 +290,20 @@ Focused implementation validation completed on 2026-07-17:
 - `cargo fmt --all -- --check` remains limited to the established
   `runtime_host.rs`, runtime-host test, and TUI `app.rs` baseline.
 
-## Final Deletion Targets
+Full release validation completed on 2026-07-17:
 
-P1.2b is incomplete until it deletes or makes non-owning:
+- the serial workspace all-targets gate passes;
+- workspace Clippy passes with only the established warning baseline;
+- site build, SEO, npm staging, public-verifier, and real-API helper tests pass;
+- the real DeepSeek provider summary, CLI, history repair without replay,
+  cross-process stable identity resume, server active-turn resume, thread
+  memory, metadata, list/search, and turn/item pagination regressions pass;
+- CLI, TUI, server/JSONL, persisted record, provider request, tool identity,
+  permission, and MCP elicitation compatibility remains unchanged.
+
+## Completed Deletion Targets
+
+P1.2b deleted or made non-owning all of the following:
 
 - borrowed `RuntimeNormalToolInvocation` and
   `RuntimeNormalToolExecutionContext`;

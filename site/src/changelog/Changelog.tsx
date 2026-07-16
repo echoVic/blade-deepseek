@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.35":
+        "Sequential normal tools now run as runtime-owned child lifetimes. RuntimeToolCallRuntime owns admission, started state, cancellation policy, the worker, join, panic classification, permission deltas, and the exactly-once terminal while bounded typed bridges carry output, approval, and MCP elicitation. Interrupting bash, external tools, or MCP calls waits for cleanup before the turn settles or the next prompt starts; WaitForTerminal preserves an observed mutation, and a worker panic after start becomes indeterminate. Turn permission grants are merged before later sibling calls. The borrowed normal executor, fallback owner, inline path, and source-shape tests are removed; subagents remain the explicit P1.2c boundary.",
       "v0.2.34":
         "Interrupting a TUI or server turn now reaches parallel read-only tool calls that have already started, waits for every worker and transport to clean up, and only then publishes the operation terminal or admits the next prompt. RuntimeToolCallRuntime owns each invocation's concurrency permit, cancellation, started state, blocking task, join, panic classification, and exactly-once terminal while preserving provider order. MCP resource list, template, and read requests are cancellable; stdio reconnects after cancellation and SSE remains reusable. The old orca-tools batch scheduler is removed. Normal tools and subagents remain explicit P1.2 follow-ups.",
       "v0.2.33":
@@ -522,6 +524,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.35":
+        "顺序执行的普通工具现在由 runtime 作为子生命周期统一拥有。RuntimeToolCallRuntime 负责准入、started 状态、取消策略、worker、join、panic 分类、权限增量和 exactly-once terminal；输出、审批与 MCP elicitation 通过有界类型化桥接传递。中断 bash、外部工具或 MCP 调用时，会先等待进程和 transport 完成清理，再结束 turn 或接收下一次提交；WaitForTerminal 会保留已经观察到的变更结果，启动后的 worker panic 会标记为 indeterminate。同一 turn 内获得的权限会在后续 sibling 调用前合并。旧的借用式 normal executor、fallback owner、inline 路径和源码形状测试已删除；subagent 仍是明确的 P1.2c 后续边界。",
       "v0.2.34":
         "中断 TUI 或 server turn 现在会传递到已经启动的并行只读工具调用，等待所有 worker 和 transport 完成清理后，才发布 operation terminal 或接收下一次提交。RuntimeToolCallRuntime 统一拥有每次调用的并发 permit、取消、started 状态、blocking task、join、panic 分类和 exactly-once terminal，同时保持 provider 顺序。MCP resource list、template 和 read 请求均可取消；stdio 会在取消后重连，SSE transport 可继续复用。旧的 orca-tools batch scheduler 已删除；普通工具和 subagent 仍是明确的 P1.2 后续切片。",
       "v0.2.33":

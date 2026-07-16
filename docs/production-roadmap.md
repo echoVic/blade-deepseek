@@ -4,7 +4,22 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-17
-Current baseline: v0.2.34 moves parallel read-only invocation lifetime into
+Current baseline: v0.2.35 gives each sequential normal tool call one
+runtime-owned child lifetime. `RuntimeToolCallRuntime` owns admission, started
+state, the invocation cancel token, registered interrupt semantics, the worker,
+join, panic classification, permission deltas, and exactly-once terminal.
+Bounded typed bridges carry output, permission requests, and MCP elicitation
+without moving borrowed TUI or server handlers into the worker.
+
+Interrupting bash, an external tool, or an MCP call waits for process and
+transport cleanup before the turn settles or the next prompt starts.
+`WaitForTerminal` preserves an observed result, a panic after execution starts
+becomes indeterminate, and turn permission grants merge before later sibling
+calls. The borrowed normal executor, fallback owner, direct inline path, and
+source-shape ownership tests are deleted. P1.2b is complete; subagent execution
+remains the explicit P1.2c boundary.
+
+Earlier v0.2.34 moves parallel read-only invocation lifetime into
 `RuntimeToolCallRuntime`. Each admitted call has one owner for its concurrency
 permit, cancellation view, started state, blocking task, join, panic
 classification, and exactly-once terminal. Interrupt reaches calls that have
@@ -12,12 +27,11 @@ already started, waits for every worker and transport to clean up, and only
 then publishes the RuntimeHost terminal or admits the next prompt. Results are
 persisted in provider order even when execution completes out of order.
 
-MCP resource list, template, and read operations now accept typed cancellation.
+MCP resource list, template, and read operations accept typed cancellation.
 The stdio transport performs a bounded reconnect before returning from a
 cancelled request, while SSE closes the request and remains reusable. Direct
 CLI and workflow callers without an ambient Tokio runtime use a batch-owned
-runtime that is dropped after all workers join. P1.2a is complete; sequential
-normal tools and subagents remain the explicit P1.2b and P1.2c boundaries.
+runtime that is dropped after all workers join. P1.2a is complete.
 
 Earlier v0.2.33 closes the remaining duplicate-write gap in the first P1.1
 identity chain. Every submitted hosted prompt has one admission owner and one
@@ -382,6 +396,33 @@ warning baseline, site and release-helper gates, and the full real DeepSeek
 provider/CLI/history/server harness. CLI arguments, TUI flows, server/JSONL,
 persistence, and provider request ordering remain compatible. P1.2a is complete
 and released in v0.2.34; normal tools and subagents remain P1.2b and P1.2c.
+
+P1.2b now gives every sequential normal tool call one runtime-owned child
+lifetime. `RuntimeToolCallRuntime` owns pre-start admission, the started marker,
+registered `CooperativeCancel` or `WaitForTerminal` behavior, a child cancel
+token, the blocking worker, join, panic classification, and exactly-once
+terminal selection. Output chunks, permission requests, and MCP elicitation use
+bounded typed bridges; permission changes return as a typed overlay delta and
+merge into canonical turn state before later sibling calls.
+
+Interrupting bash, external tools, or MCP calls now waits for process,
+managed-proxy, and transport cleanup before the RuntimeHost terminal is
+published or another turn starts. `WaitForTerminal` keeps the observed result,
+natural completion wins a cancellation race, a panic after start is
+indeterminate, and output publication failure cannot detach the invocation or
+replace an already observed tool result. Parent callback panics are isolated so
+worker ownership remains joined during unwind.
+
+The borrowed normal execution context, fallback executor owner, direct inline
+router path, and associated source-shape tests are deleted. Runtime-special
+tools, workflows, and subagents retain their explicit owners rather than being
+wrapped in a second scheduler. Sixteen normal-runtime ownership tests, all 794
+runtime library tests, 59 lifecycle contracts, four server interrupt
+regressions, the serial workspace gate, workspace Clippy, site and release
+helpers, and the complete real DeepSeek provider/CLI/history/server harness
+pass. CLI arguments, TUI flows, server/JSONL, persistence, tool identities, and
+permission payloads remain compatible. P1.2b is complete and released in
+v0.2.35; subagent execution remains P1.2c.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
