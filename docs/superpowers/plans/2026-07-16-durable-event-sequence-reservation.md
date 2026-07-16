@@ -1,6 +1,6 @@
 # P1.1d Durable Event Sequence Reservation Plan
 
-- Status: in progress
+- Status: completed
 - Base: `d7d613f2cdf397197664ea457c14d01b6a3f951b`
 - Branch: `codex/durable-event-sequence-p11d`
 
@@ -131,3 +131,19 @@ process ownership behind file-lock conflict repair.
   message indexes;
 - any proposed per-delta high-water write path;
 - tests that assume a resumed recorded thread restarts at `seq=0`.
+
+## Completion Evidence
+
+- Implementation commit: `71bbebecb refactor(runtime): reserve durable event sequences`.
+- Core publication, reservation failure, block crossing, resume, legacy,
+  RuntimeHost record/resume/fork, rewrite, compression, server, and TUI resume
+  behavior tests pass.
+- The serial workspace all-targets gate passes, including 156 core tests, 772
+  runtime tests, 46 RuntimeHost integration tests, and 390 TUI tests. Workspace
+  Clippy passes with the repository's existing warning baseline.
+- The existing real DeepSeek CLI and malformed-history replay smoke passes.
+  A dedicated two-process recorded-thread smoke emitted `seq=0..47` after
+  reserving through `256`, then resumed the same thread id at `seq=256..287`
+  after reserving through `512`.
+- `ThreadActor::new` no longer constructs `EventFactory::new` directly. No
+  per-delta persistence path or resumed-`seq=0` compatibility branch remains.

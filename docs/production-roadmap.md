@@ -18,11 +18,14 @@ workflow background work. `EventFactory` creates unpublished typed drafts;
 only publication assigns the final sequence and timestamp while serializing
 observer, writer, and flush side effects. Handoff progress and terminal events
 therefore cannot restart at `seq=0` or arrive in a different order from their
-sequence values. Workflow identity remains in the typed payload `taskId` and
-`runId`; the host-projected envelope consistently belongs to the parent
-thread. These are unreleased architecture slices; durable semantic journaling
-and stable conversation item ids remain explicit follow-ups rather than being
-hidden behind renderer-side deduplication fixes.
+sequence values. Recorded threads now also reserve bounded sequence ranges in
+typed session JSONL before publication. Process restart resumes at the prior
+exclusive high-water mark, while forked identities start independently; token
+deltas do not incur one disk write each. Workflow identity remains in the typed
+payload `taskId` and `runId`; the host-projected envelope consistently belongs
+to the parent thread. These are unreleased architecture slices; durable
+semantic event records and stable conversation item ids remain explicit
+follow-ups rather than being hidden behind renderer-side deduplication fixes.
 Earlier v0.2.29 extends the runtime ownership model into the
 process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
 operation handles and completion terminals now give headless and TUI turns one
@@ -214,6 +217,29 @@ also passes through the new JSONL publication path, including compatibility
 repair without re-executing an incomplete legacy tool call. Durable semantic
 journal records and replacement of index-derived `turn-N`/`item-N` projection
 ids remain the next P1.1 vertical slices.
+
+P1.1d now makes that thread event identity non-repeating across process
+recovery. The publication boundary owns both the next sequence and an optional
+typed `EventSequenceStore`; before the first event in each block of 256 it
+persists an exclusive `event.sequence.reserved` high-water record under the
+same lock that assigns publication order. `SessionTranscript` reduces those
+records to their maximum, `RuntimeThread` restores that value only for resume,
+and `ThreadActor` obtains its factory through the thread boundary. A crash may
+leave a bounded gap, but the same `(run_id, seq)` cannot be reused. Fresh and
+legacy histories begin at zero, forks reset because they mint a new thread id,
+and rename rewrite plus zstd compression preserve the reservation. Event
+schema, envelopes, payloads, CLI/TUI/server flows, and existing history records
+remain compatible.
+
+All 156 core tests, 772 runtime tests, 46 RuntimeHost integration tests, 390 TUI
+tests, the serial workspace all-targets gate, and workspace Clippy with the
+existing warning baseline pass. The real DeepSeek CLI/history-repair gate also
+passes. A dedicated two-process smoke emitted `seq=0..47` after reserving
+through `256`, then resumed the same thread id at `seq=256..287` after reserving
+through `512`. P1.1d remains an unreleased reliability prerequisite. P1.1e can
+now persist selected semantic lifecycle and terminal envelopes without using
+token deltas as a journal; P1.1f can then replace index-derived
+`turn-N`/`item-N` ids with the durable event identity.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
