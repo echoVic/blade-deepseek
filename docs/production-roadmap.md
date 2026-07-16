@@ -4,25 +4,28 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-16
-Current baseline: v0.2.32 gives every completed DeepSeek response one durable,
-typed `model.response.completed` fact. Runtime allocates the response's agent
-message, reasoning, and proposed-plan ids before streaming, preserves them
-through provider suspension and background approval continuation, and uses the
-same completed objects for live server/TUI projection, cold ThreadStore reads,
-pagination, restart, and resume. New assistant responses no longer create a
-second `conversation.message` record, and terminal session events no longer
-invent completion from transient text deltas.
+Current baseline: v0.2.33 gives every submitted hosted prompt one admission
+owner and one durable user item. `ThreadTurnContext` persists the identified
+user message before committing it to model conversation state. Agent-loop
+bootstrap now uses an explicit owned-or-borrowed provenance type: independent
+child agents construct their own conversation, while a borrowed runtime
+session never bootstraps or persists the already-admitted prompt again. Live
+thread reads, turn and item pagination, cold ThreadStore reads, restart, and
+resume therefore expose one user row per logical turn with stable identities.
 
-The release completes the first P1.1 identity chain. Foreground and host-adopted
+The release closes the remaining duplicate-write gap in the first P1.1
+identity chain. Foreground and host-adopted
 background work share one publication boundary; sequence ranges are reserved
 durably before use; selected semantic events are appended before observer or
 output visibility; logical turn and conversation-item ids are allocated at
 their ownership boundaries; and model replay plus public history reduce the
 same canonical completion event. Tool calls and workflows retain their domain
 ids, malformed current completions fail closed, and only explicitly legacy
-assistant records use the isolated combined-message reducer. A real DeepSeek
-gate records, cold-reads, exits, resumes in a second process, and compares the
-complete prior item-object prefix plus internal/external ids.
+records use isolated compatibility reducers. No current hosted path can append
+the same user prompt twice, and no read-time deduplicator hides conflicting
+facts. A real DeepSeek gate records, cold-reads, exits, resumes in a second
+process, and verifies exact user counts plus complete prior item-object
+prefixes and internal/external ids.
 
 Earlier v0.2.30 completes the production TUI migration onto the process-owned
 `RuntimeHost`. Foreground turns, DeepSeek stream interruption, interactive
@@ -325,6 +328,28 @@ re-execution, cross-process record/reload/resume, complete canonical item-object
 prefixes, matching internal/external ids, server thread memory, active-turn
 resume, and paginated turn/item projections. P1.1g is complete and released in
 v0.2.32.
+
+P1.1h now makes user-turn admission canonical. `ThreadTurnContext::prepare`
+remains the sole hosted owner: it binds the logical turn, appends one identified
+`conversation.message` record, and only then commits the prompt to the model
+conversation. A failed durable append therefore prevents an unrecorded prompt
+from reaching DeepSeek or the public projection ledger.
+
+`AgentConversationContext` is now an explicit `Owned` / `Borrowed` provenance
+boundary. Owned child-agent bootstrap creates independent model context and has
+no session writer. Borrowed bootstrap uses the runtime session's conversation
+and writer for later tool and completed-model records, but never bootstraps the
+already-admitted user prompt. The obsolete initial-history helper and its
+source-shape ownership tests are deleted; no read-time duplicate filter or
+compatibility branch replaces them.
+
+Focused runtime, RuntimeHost, server, ThreadStore, real-harness, and persistence
+tests prove one user item per logical turn, transactional admission failure,
+and matching live/cold identities. The serial workspace all-targets gate,
+workspace Clippy with the existing warning baseline, site and release-helper
+gates, and the real DeepSeek cross-process server harness pass. Existing
+duplicate histories remain readable without mutation. P1.1h is complete and
+released in v0.2.33.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or

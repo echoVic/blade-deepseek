@@ -1,6 +1,6 @@
 # P1.1h Canonical User Turn Input Plan
 
-- Status: planned; release target `v0.2.33`
+- Status: complete; release target `v0.2.33`
 - Base: `095c164b15547ec51b0323b7d2744c02528ac287`
 - Branch: `codex/canonical-user-turn-input-p11h`
 

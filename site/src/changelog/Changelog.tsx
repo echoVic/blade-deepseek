@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.33":
+        "A submitted prompt now has one admission owner and one durable user row. Hosted turn preparation persists the identified user message before committing it to model context, while agent-loop bootstrap explicitly distinguishes owned child-agent conversations from borrowed hosted sessions and never replays borrowed initial history. Live thread reads, turn pagination, item pagination, cold ThreadStore reads, restart, and resume now expose one user item per logical turn with stable turn and item ids. Existing duplicate history remains readable without a projection-time deduplication layer.",
       "v0.2.32":
         "Completed DeepSeek responses now have one durable canonical fact. Agent-message, reasoning, and proposed-plan ids are allocated before streaming and stay identical through live projection, approval suspension and continuation, restart, pagination, and resume. Runtime persists one typed model.response.completed event instead of a second assistant record, and model replay plus ThreadStore history reduce that same event. Legacy combined assistant records remain readable through one isolated reducer, while malformed current completions fail closed. The real DeepSeek gate now compares complete persisted item objects and internal/external ids across processes.",
       "v0.2.31":
@@ -518,6 +520,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.33":
+        "每次提交的 prompt 现在只有一个准入所有者和一条持久化 user 记录。Hosted turn preparation 会先持久化带身份的 user message，再把它提交到模型上下文；agent loop bootstrap 则显式区分独立 child-agent conversation 与借用的 hosted session，借用路径不会再重复写入初始历史。实时 thread read、turn 分页、item 分页、冷启动 ThreadStore、重启与 resume 都只会为每个逻辑 turn 返回一个 user item，并保持 turn/item id 稳定。已有重复历史继续可读，不增加投影时去重层。",
       "v0.2.32":
         "每个已完成的 DeepSeek 响应现在只有一个可持久化的 canonical 事实。Agent message、reasoning 与 proposed plan 的 id 会在流式输出前分配，并在实时投影、审批暂停与续接、进程重启、分页和 resume 后保持不变。Runtime 只持久化一个类型化 model.response.completed 事件，不再额外写入第二份 assistant 记录；模型 replay 与 ThreadStore 历史都归约同一事件。旧版合并 assistant 记录继续通过唯一隔离的 reducer 读取，格式错误的当前 completion 则 fail closed。真实 DeepSeek gate 会跨进程比较完整持久化 item 对象及内外部 id。",
       "v0.2.31":
