@@ -22,6 +22,7 @@ pub use orca_core::config::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
 };
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
+use orca_core::thread_identity::TurnId;
 use orca_mcp::McpRegistry;
 
 pub struct ServerThreadRuntime {
@@ -134,7 +135,7 @@ pub(crate) struct ServerThreadSubmissionContext {
 
 pub(crate) struct PreparedServerTurn {
     thread_id: String,
-    turn_id: String,
+    turn_id: TurnId,
     config: RunConfig,
     handle: RuntimeThreadHandle,
 }
@@ -217,14 +218,6 @@ impl ServerThread {
             .and_then(|snapshot| snapshot.active_task_id().map(ToString::to_string))
     }
 
-    pub fn next_persisted_turn_id(&self) -> Option<String> {
-        let snapshot = self.handle.snapshot().ok()?;
-        Some(crate::thread_store::next_turn_id_for_messages(
-            self.thread_id(),
-            snapshot.messages(),
-        ))
-    }
-
     pub fn run_turn<W: Write>(
         &mut self,
         config: &RunConfig,
@@ -258,9 +251,15 @@ impl ServerThread {
         prompt: &str,
         permissions: PermissionProfileOverride,
     ) -> io::Result<PreparedServerTurn> {
-        let turn_id = self
-            .next_persisted_turn_id()
-            .ok_or_else(|| io::Error::other(format!("thread is not idle: {}", self.thread_id())))?;
+        if self.handle.state().map_err(runtime_host_error)?
+            != crate::runtime_host::RuntimeThreadState::Idle
+        {
+            return Err(io::Error::other(format!(
+                "thread is not idle: {}",
+                self.thread_id()
+            )));
+        }
+        let turn_id = TurnId::new();
         let mut run_config = thread_run_config(config);
         run_config.prompt = prompt.to_string();
         run_config.additional_working_directories = self.additional_working_directories.clone();
@@ -432,7 +431,7 @@ impl PreparedServerTurn {
         &self.thread_id
     }
 
-    pub(crate) fn turn_id(&self) -> &str {
+    pub(crate) fn turn_id(&self) -> &TurnId {
         &self.turn_id
     }
 
@@ -445,7 +444,7 @@ impl PreparedServerTurn {
         W: Write + Send + 'static,
     {
         self.handle
-            .start_turn_with_config(request.with_task_id(self.turn_id), writer, self.config)
+            .start_turn_with_config(request.with_turn_id(self.turn_id), writer, self.config)
             .map_err(runtime_host_error)
     }
 
@@ -459,7 +458,7 @@ impl PreparedServerTurn {
     {
         self.handle
             .start_turn_with_config_and_output(
-                request.with_task_id(self.turn_id),
+                request.with_turn_id(self.turn_id),
                 writer,
                 self.config,
             )
@@ -718,12 +717,6 @@ impl ServerThreadRuntime {
                 .find(|turn| turn.turn_id == turn_id)
                 .map(|turn| turn.thread_id)
         })
-    }
-
-    pub fn next_persisted_turn_id(&self, thread_id: &str) -> Option<String> {
-        self.threads
-            .get(thread_id)
-            .and_then(ServerThread::next_persisted_turn_id)
     }
 
     pub(crate) fn submission_context(

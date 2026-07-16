@@ -13,6 +13,7 @@ use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
 use crate::provider_types::{ProviderReplayState, ToolCallProgress};
 use crate::task_types::BackgroundTaskSummary;
+use crate::thread_identity::TurnId;
 use crate::tool_types::{FileChangePreview, ToolRequest, ToolResult, ToolTerminalSource};
 use crate::verification::VerificationResult;
 
@@ -379,8 +380,16 @@ impl EventFactory {
         )
     }
 
-    pub fn turn_started(&mut self, turn: u32, prompt: Option<&str>) -> EventDraft {
-        let mut payload = json!({ "turn": turn });
+    pub fn turn_started(
+        &mut self,
+        turn_id: &TurnId,
+        turn: u32,
+        prompt: Option<&str>,
+    ) -> EventDraft {
+        let mut payload = json!({
+            "turn_id": turn_id,
+            "turn": turn
+        });
         if let Some(p) = prompt {
             payload["prompt"] = json!(p);
         }
@@ -1092,12 +1101,15 @@ mod tests {
     #[test]
     fn turn_started_with_and_without_prompt() {
         let mut f = EventFactory::new("run-1".to_string());
+        let turn_id = TurnId::new();
 
-        let e = f.turn_started(1, Some("hello"));
+        let e = f.turn_started(&turn_id, 1, Some("hello"));
+        assert_eq!(e.payload["turn_id"], turn_id.as_str());
         assert_eq!(e.payload["turn"], 1);
         assert_eq!(e.payload["prompt"], "hello");
 
-        let e = f.turn_started(2, None);
+        let e = f.turn_started(&turn_id, 2, None);
+        assert_eq!(e.payload["turn_id"], turn_id.as_str());
         assert_eq!(e.payload["turn"], 2);
         assert!(e.payload.get("prompt").is_none());
     }

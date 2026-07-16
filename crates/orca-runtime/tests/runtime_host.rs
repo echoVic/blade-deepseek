@@ -26,6 +26,7 @@ use orca_core::mcp_types::McpServerConfig;
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::task_types::TaskStatus;
+use orca_core::thread_identity::TurnId;
 use orca_mcp::McpRegistry;
 use orca_runtime::controller::{ThreadTurnOutcome, ThreadTurnRequest};
 use orca_runtime::history::{self, SessionTranscript};
@@ -232,6 +233,7 @@ struct ScriptedExecutor {
     behaviors: Mutex<VecDeque<TestBehavior>>,
     calls: AtomicUsize,
     generations: Mutex<Vec<(GenerationFence, bool)>>,
+    turn_ids: Mutex<Vec<TurnId>>,
     steer_inputs: Mutex<Vec<Vec<String>>>,
     task_states: Mutex<Vec<(String, RuntimeTaskStatus)>>,
     cancelled_on_entry: Mutex<Vec<bool>>,
@@ -244,6 +246,7 @@ impl ScriptedExecutor {
             behaviors: Mutex::new(behaviors.into_iter().collect()),
             calls: AtomicUsize::new(0),
             generations: Mutex::new(Vec::new()),
+            turn_ids: Mutex::new(Vec::new()),
             steer_inputs: Mutex::new(Vec::new()),
             task_states: Mutex::new(Vec::new()),
             cancelled_on_entry: Mutex::new(Vec::new()),
@@ -257,6 +260,10 @@ impl ScriptedExecutor {
 
     fn generations(&self) -> Vec<(GenerationFence, bool)> {
         self.generations.lock().unwrap().clone()
+    }
+
+    fn turn_ids(&self) -> Vec<TurnId> {
+        self.turn_ids.lock().unwrap().clone()
     }
 
     fn steer_inputs(&self) -> Vec<Vec<String>> {
@@ -280,7 +287,7 @@ impl ThreadOperationExecutor for ScriptedExecutor {
     fn run_turn(
         &self,
         thread: &mut RuntimeThread,
-        _request: &HostedTurnRequest,
+        request: &HostedTurnRequest,
         generation: &GenerationContext,
         events: &mut EventFactory,
         writer: &mut (dyn io::Write + Send),
@@ -299,6 +306,10 @@ impl ThreadOperationExecutor for ScriptedExecutor {
             .lock()
             .unwrap()
             .push((generation.fence(), generation.resumes_existing_turn()));
+        self.turn_ids
+            .lock()
+            .unwrap()
+            .push(request.turn_id().clone());
         let task = thread
             .lifecycle()
             .active_task()
@@ -1594,17 +1605,18 @@ fn logical_turn_resume_waits_for_join_and_publishes_one_terminal() {
     let factory_generations = Arc::new(Mutex::new(Vec::new()));
     let observed_generations = Arc::clone(&factory_generations);
     let output = RecordingOutput::default();
+    let turn_id = TurnId::new();
     let operation = thread
         .start_turn_with_output(
-            HostedTurnRequest::new("one logical turn").with_generation_handlers(
-                move |generation, cancel| {
+            HostedTurnRequest::new("one logical turn")
+                .with_turn_id(turn_id.clone())
+                .with_generation_handlers(move |generation, cancel| {
                     observed_generations
                         .lock()
                         .unwrap()
                         .push((generation, cancel.is_cancelled()));
                     HostedGenerationHandlers::default()
-                },
-            ),
+                }),
             output.clone(),
         )
         .expect("start logical turn");
@@ -1724,6 +1736,7 @@ fn logical_turn_resume_waits_for_join_and_publishes_one_terminal() {
         executor.generations(),
         vec![(first_generation, false), (second_generation, true)]
     );
+    assert_eq!(executor.turn_ids(), vec![turn_id.clone(), turn_id]);
     let task_states = executor.task_states();
     assert_eq!(task_states.len(), 2);
     assert_eq!(task_states[0].0, task_states[1].0);

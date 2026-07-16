@@ -36,6 +36,7 @@ impl RuntimeTurnStartStep {
         input: RuntimeTurnStartInput<'_, '_, W>,
     ) -> io::Result<RuntimeTurnStartStepOutput> {
         let RuntimeTurnContext {
+            turn_id,
             cwd: _,
             prompt,
             subagent_depth: _,
@@ -57,18 +58,19 @@ impl RuntimeTurnStartStep {
         } else {
             None
         };
-        let started_turn = match input
-            .actor
-            .start_turn(input.events, turn_prompt, emit_deltas)
-        {
-            Ok(started_turn) => started_turn,
-            Err(error) => {
-                if emit_deltas {
-                    input.sink.emit(input.events.error(&error.message))?;
+        let started_turn =
+            match input
+                .actor
+                .start_turn(input.events, &turn_id, turn_prompt, emit_deltas)
+            {
+                Ok(started_turn) => started_turn,
+                Err(error) => {
+                    if emit_deltas {
+                        input.sink.emit(input.events.error(&error.message))?;
+                    }
+                    return Ok(RuntimeTurnStartStepOutput { error: Some(error) });
                 }
-                return Ok(RuntimeTurnStartStepOutput { error: Some(error) });
-            }
-        };
+            };
         if let Some(event) = started_turn.into_event() {
             input.sink.emit(event)?;
         }

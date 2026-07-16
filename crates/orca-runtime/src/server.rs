@@ -1979,12 +1979,12 @@ fn run_thread_submit_async<W: Write + Send + 'static>(
             return write_locked_event(&writer, &id, ServerEvent::error(error.to_string()));
         }
     };
-    let active_turn_id = prepared.turn_id().to_string();
+    let active_turn_id = prepared.turn_id().clone();
     let active_thread_id = prepared.thread_id().to_string();
     let writer_for_handlers = Arc::clone(&writer);
     let event_id_for_handlers = id.clone();
     let thread_id_for_handlers = active_thread_id.clone();
-    let turn_id_for_handlers = active_turn_id.clone();
+    let turn_id_for_handlers = active_turn_id.to_string();
     let pending_permissions = state.pending_permissions.clone();
     let pending_user_inputs = state.pending_user_inputs.clone();
     let pending_mcp_elicitations = state.pending_mcp_elicitations.clone();
@@ -5290,9 +5290,12 @@ enabled = true
             .expect("turn started event");
 
         assert_eq!(turn_started["turn"], 1);
+        let turn_id = turn_started["turnId"].as_str().expect("logical turn id");
+        assert!(turn_id.starts_with("turn_"));
         assert_eq!(turn_started["task"]["kind"], "agent");
         assert_eq!(turn_started["task"]["status"], "running");
         assert_eq!(turn_started["task"]["turn"], 1);
+        assert_ne!(turn_started["task"]["task_id"], turn_id);
         assert!(
             turn_started["task"]["task_id"]
                 .as_str()
@@ -5630,6 +5633,84 @@ enabled = true
     }
 
     #[test]
+    fn concurrent_threads_receive_distinct_active_turn_routes() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Disabled;
+            let run_config = thread_run_config(&config);
+            let mut state = ServerState::default();
+            let first_thread = state
+                .threads
+                .start_thread(&config)
+                .expect("start first thread");
+            let second_thread = state
+                .threads
+                .start_thread(&config)
+                .expect("start second thread");
+
+            let first = state
+                .threads
+                .prepare_turn(
+                    &run_config,
+                    &first_thread,
+                    "mock_stream_delay_ms 500",
+                    PermissionProfileOverride::default(),
+                )
+                .expect("prepare first thread turn");
+            let second = state
+                .threads
+                .prepare_turn(
+                    &run_config,
+                    &second_thread,
+                    "mock_stream_delay_ms 500",
+                    PermissionProfileOverride::default(),
+                )
+                .expect("prepare second thread turn");
+            let first_turn_id = first.turn_id().clone();
+            let second_turn_id = second.turn_id().clone();
+
+            assert_ne!(
+                first_turn_id,
+                second_turn_id,
+                "process-level active-turn routing must not reuse a per-thread message index"
+            );
+            let first_operation = first
+                .start(HostedTurnRequest::new("mock_stream_delay_ms 500"), Vec::new())
+                .expect("start first thread turn");
+            let second_operation = second
+                .start(HostedTurnRequest::new("mock_stream_delay_ms 500"), Vec::new())
+                .expect("start second thread turn");
+            state.active_turns.insert(
+                first_turn_id.clone(),
+                first_thread.clone(),
+                first_operation,
+            );
+            state.active_turns.insert(
+                second_turn_id.clone(),
+                second_thread.clone(),
+                second_operation,
+            );
+
+            assert_eq!(
+                state
+                    .active_turns
+                    .get(first_turn_id.as_str())
+                    .map(|turn| turn.thread_id()),
+                Some(first_thread.as_str())
+            );
+            assert_eq!(
+                state
+                    .active_turns
+                    .get(second_turn_id.as_str())
+                    .map(|turn| turn.thread_id()),
+                Some(second_thread.as_str())
+            );
+            state.join_active_turns();
+        });
+    }
+
+    #[test]
     fn completed_hosted_turn_allows_next_thread_turn() {
         with_orca_home(|home| {
             let mut config = test_run_config();
@@ -5653,15 +5734,16 @@ enabled = true
                 .expect("thread id");
 
             let writer = Arc::new(Mutex::new(Vec::new()));
-            let first_turn_id = state
-                .threads
-                .next_persisted_turn_id(&thread_id)
-                .expect("first turn id");
             let first = format!(
                 r#"{{"id":"turn-1","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"first prompt"}}]}}}}"#
             );
             handle_line(&server_config, &mut state, &first, Arc::clone(&writer))
                 .expect("first turn");
+            let first_turn_id = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["id"] == "turn-1" && event["event"] == "turn_started"
+            })
+            .and_then(|event| event["turnId"].as_str().map(ToString::to_string))
+            .expect("first logical turn id");
             let completion = wait_for_event(&writer, Duration::from_secs(2), |event| {
                 event["id"] == "turn-1" && event["event"] == "turn_completed"
             });
@@ -6402,7 +6484,10 @@ rl.on("line", (line) => {
                 .expect("request id")
                 .to_string();
             assert_eq!(request["threadId"], thread_id);
-            assert_eq!(request["turnId"], "turn-1");
+            orca_core::thread_identity::TurnId::parse(
+                request["turnId"].as_str().expect("logical turn id"),
+            )
+            .expect("typed logical turn id");
             assert_eq!(request["serverName"], "slow");
             assert_eq!(request["mode"], "url");
             assert_eq!(request["message"], "Authorize slow wait");

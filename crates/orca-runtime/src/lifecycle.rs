@@ -10,6 +10,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::model::{ModelRouteContext, ModelRouteDecision, ModelSelection};
 use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
 use orca_core::subagent_types::SubagentType;
+use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult, ToolStatus};
 use orca_core::{
     cancel::CancelToken,
@@ -124,6 +125,7 @@ pub(crate) struct AgentLoopContext<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeTurnContext<'a> {
+    pub(crate) turn_id: TurnId,
     pub(crate) cwd: &'a Path,
     pub(crate) prompt: &'a str,
     pub(crate) subagent_depth: u32,
@@ -280,6 +282,7 @@ impl<'a> RuntimeTaskActor<'a> {
     pub fn start_turn(
         &mut self,
         events: &mut EventFactory,
+        turn_id: &TurnId,
         prompt: Option<&str>,
         emit_event: bool,
     ) -> Result<RuntimeActorStartedTurn, RuntimeTurnStartError> {
@@ -291,7 +294,8 @@ impl<'a> RuntimeTaskActor<'a> {
         }
         self.turns_started = self.turns_started.saturating_add(1);
         let started = if emit_event {
-            let started = RuntimeTurnRunner::new(self.lifecycle).start_turn(events, prompt);
+            let started =
+                RuntimeTurnRunner::new(self.lifecycle).start_turn(events, turn_id, prompt);
             RuntimeActorStartedTurn {
                 turn: started.turn,
                 task: started.task,
@@ -755,6 +759,11 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub fn with_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_context = self.turn_context.with_turn_id(turn_id);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn turn_deps(&self) -> RuntimeTurnDeps<'a> {
         self.turn_deps.expect("agent loop turn deps")
@@ -964,6 +973,7 @@ impl<'a> RuntimeTurnContext<'a> {
         subagent_type: &'a SubagentType,
     ) -> Self {
         Self {
+            turn_id: TurnId::new(),
             cwd,
             prompt,
             subagent_depth,
@@ -973,6 +983,11 @@ impl<'a> RuntimeTurnContext<'a> {
             steer_handle: None,
             provider_suspension_control: None,
         }
+    }
+
+    pub(crate) fn with_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_id = turn_id;
+        self
     }
 
     pub(crate) fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {

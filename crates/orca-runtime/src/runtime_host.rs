@@ -16,6 +16,7 @@ use orca_core::event_sink::{EventObserver, EventSink, observe_event};
 use orca_core::hook_types::HookEvent;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::task_types::TaskStatus;
+use orca_core::thread_identity::TurnId;
 use orca_core::workflow_types::{WorkflowInput, WorkflowOutput};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 use serde_json::Value;
@@ -216,6 +217,7 @@ impl ThreadOperationOutcome {
 
 #[derive(Clone)]
 pub struct HostedTurnRequest {
+    turn_id: TurnId,
     prompt: String,
     options: ControllerRunOptions,
     operation_kind: HostedOperationKind,
@@ -254,6 +256,7 @@ enum HostedOperationEnvelope {
 impl HostedTurnRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
+            turn_id: TurnId::new(),
             prompt: prompt.into(),
             options: ControllerRunOptions::default(),
             operation_kind: HostedOperationKind::Turn,
@@ -287,6 +290,15 @@ impl HostedTurnRequest {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn turn_id(&self) -> &TurnId {
+        &self.turn_id
+    }
+
+    pub fn with_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_id = turn_id;
+        self
     }
 
     pub fn with_options(mut self, options: ControllerRunOptions) -> Self {
@@ -472,6 +484,7 @@ impl HostedTurnRequest {
             ThreadTurnToolMode::Standard
         };
         let mut request = ThreadTurnRequest::new(self.prompt.clone())
+            .with_turn_id(self.turn_id.clone())
             .with_prompt_placement(prompt_placement)
             .with_tool_mode(tool_mode)
             .with_options(self.options)

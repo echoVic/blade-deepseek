@@ -184,6 +184,7 @@ impl<'a> RuntimeTurnRequestContext<'a> {
 
     fn for_iteration(&mut self) -> Self {
         let turn_context = RuntimeTurnContext {
+            turn_id: self.turn_context.turn_id.clone(),
             cwd: self.turn_context.cwd,
             prompt: self.turn_context.prompt,
             subagent_depth: self.turn_context.subagent_depth,

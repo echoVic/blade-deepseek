@@ -13,6 +13,7 @@ use orca_core::provider_types::{ProviderStep, Usage};
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::{TaskStatus, TaskType};
+use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
@@ -428,9 +429,11 @@ fn turn_started_event_carries_task_lifecycle_payload() {
     let turn = lifecycle.next_turn();
     let task = lifecycle.active_task().unwrap();
     let mut events = EventFactory::new(lifecycle.run_id().to_string());
+    let turn_id = TurnId::new();
 
-    let event = turn.started_event(&mut events, Some("hello"), task);
+    let event = turn.started_event(&mut events, &turn_id, Some("hello"), task);
 
+    assert_eq!(event.payload["turn_id"], turn_id.as_str());
     assert_eq!(event.payload["turn"], 1);
     assert_eq!(event.payload["prompt"], "hello");
     assert_eq!(event.payload["task"]["task_id"], "run-test:task-1");
@@ -444,10 +447,12 @@ fn turn_runner_advances_lifecycle_and_builds_started_event() {
     lifecycle.start_task(RuntimeTaskKind::Agent);
     let mut events = EventFactory::new(lifecycle.run_id().to_string());
     let mut runner = RuntimeTurnRunner::new(&mut lifecycle);
+    let turn_id = TurnId::new();
 
-    let started = runner.start_turn(&mut events, Some("hello"));
+    let started = runner.start_turn(&mut events, &turn_id, Some("hello"));
 
     assert_eq!(started.turn(), 1);
+    assert_eq!(started.event.payload["turn_id"], turn_id.as_str());
     assert_eq!(started.event.payload["turn"], 1);
     assert_eq!(started.event.payload["prompt"], "hello");
     assert_eq!(started.event.payload["task"]["kind"], "agent");
@@ -501,9 +506,10 @@ fn task_actor_starts_turns_and_enforces_turn_budget() {
     lifecycle.start_task(RuntimeTaskKind::Agent);
     let mut actor = RuntimeTaskActor::new(&mut lifecycle, 1);
     let mut events = EventFactory::new("run-actor".to_string());
+    let turn_id = TurnId::new();
 
     let first = actor
-        .start_turn(&mut events, Some("hello"), true)
+        .start_turn(&mut events, &turn_id, Some("hello"), true)
         .expect("first turn");
 
     assert_eq!(first.turn(), 1);
@@ -513,7 +519,7 @@ fn task_actor_starts_turns_and_enforces_turn_budget() {
     assert_eq!(event.payload["task"]["kind"], "agent");
 
     let exhausted = actor
-        .start_turn(&mut events, None, true)
+        .start_turn(&mut events, &turn_id, None, true)
         .expect_err("turn budget exhausted");
     assert_eq!(exhausted.status, RunStatus::BudgetExhausted);
     assert_eq!(exhausted.message, "max turns exhausted");
@@ -526,9 +532,10 @@ fn task_actor_enforces_turn_budget_from_existing_lifecycle_state() {
     lifecycle.next_turn();
     let mut actor = RuntimeTaskActor::new(&mut lifecycle, 1);
     let mut events = EventFactory::new("run-actor".to_string());
+    let turn_id = TurnId::new();
 
     let exhausted = actor
-        .start_turn(&mut events, Some("second turn"), true)
+        .start_turn(&mut events, &turn_id, Some("second turn"), true)
         .expect_err("turn budget exhausted");
 
     assert_eq!(exhausted.status, RunStatus::BudgetExhausted);
@@ -542,9 +549,10 @@ fn task_actor_advances_turn_without_emitting_event() {
     lifecycle.start_task(RuntimeTaskKind::Agent);
     let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
     let mut events = EventFactory::new("run-actor".to_string());
+    let turn_id = TurnId::new();
 
     let first = actor
-        .start_turn(&mut events, Some("hello"), false)
+        .start_turn(&mut events, &turn_id, Some("hello"), false)
         .expect("first turn");
 
     assert_eq!(first.turn(), 1);

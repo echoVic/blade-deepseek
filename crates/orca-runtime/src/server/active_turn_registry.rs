@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use orca_core::thread_identity::TurnId;
+
 use crate::runtime_host::{GenerationAdmissionResult, GenerationFence, OperationHandle};
 
 pub(super) struct ServerActiveTurn {
@@ -19,13 +21,13 @@ impl ServerActiveTurn {
 
 #[derive(Default)]
 pub(super) struct ServerActiveTurnRegistry {
-    turns: HashMap<String, ServerActiveTurn>,
+    turns: HashMap<TurnId, ServerActiveTurn>,
 }
 
 impl ServerActiveTurnRegistry {
     pub(super) fn insert(
         &mut self,
-        turn_id: String,
+        turn_id: TurnId,
         thread_id: String,
         operation: OperationHandle,
     ) {

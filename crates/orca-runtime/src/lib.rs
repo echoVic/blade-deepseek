@@ -4672,7 +4672,6 @@ mod tests {
             "messages_to_thread_items",
             "stored_messages_to_thread_turns",
             "stored_messages_to_thread_items",
-            "next_turn_id_for_messages",
         ] {
             let signature = format!("fn {function_name}(");
             assert!(

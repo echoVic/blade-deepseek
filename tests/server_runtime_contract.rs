@@ -5,8 +5,10 @@ use orca_core::approval_types::{ApprovalMode, Decision};
 use orca_core::config::{
     HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
 };
+use orca_core::event_schema::EventType;
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
+use orca_core::thread_identity::TurnId;
 use orca_runtime::controller::{
     ControllerRunOptions, ThreadTurnContext, ThreadTurnExecution, ThreadTurnExecutor,
     ThreadTurnRequest, run_thread_turn_to_writer,
@@ -158,23 +160,85 @@ fn server_thread_runtime_resolves_completed_turn_owner() {
 }
 
 #[test]
-fn server_thread_runtime_predicts_next_persisted_turn_id() {
+fn server_thread_runtime_emits_opaque_unique_turn_ids() {
     with_orca_home(|home| {
         let config = test_run_config(home);
         let mut runtime = start_server_runtime();
-        let thread_id = runtime.start_thread(&config).expect("start thread");
-        assert_eq!(
-            runtime.next_persisted_turn_id(&thread_id).as_deref(),
-            Some("turn-1")
-        );
+        let first_thread_id = runtime.start_thread(&config).expect("start first thread");
+        let second_thread_id = runtime.start_thread(&config).expect("start second thread");
+
+        let mut first_output = Vec::new();
+        runtime
+            .run_turn(
+                &config,
+                &first_thread_id,
+                "first logical turn",
+                request_writer(&mut first_output),
+            )
+            .expect("run first thread");
+        let mut second_output = Vec::new();
+        runtime
+            .run_turn(
+                &config,
+                &second_thread_id,
+                "second logical turn",
+                request_writer(&mut second_output),
+            )
+            .expect("run second thread");
+
+        let turn_id = |output: &[u8]| {
+            parse_jsonl(output)
+                .into_iter()
+                .find(|event| event["event"] == "turn_started")
+                .and_then(|event| event["turnId"].as_str().map(ToString::to_string))
+                .expect("turn started identity")
+        };
+        let first_turn_id = turn_id(&first_output);
+        let second_turn_id = turn_id(&second_output);
+
+        assert!(first_turn_id.starts_with("turn_"));
+        assert!(second_turn_id.starts_with("turn_"));
+        assert_ne!(first_turn_id, second_turn_id);
+    });
+}
+
+#[test]
+fn recorded_server_turn_journals_the_emitted_turn_id() {
+    with_orca_home(|home| {
+        let mut config = test_run_config(home);
+        config.history_mode = HistoryMode::Record;
+        let mut runtime = start_server_runtime();
+        let thread_id = runtime
+            .start_thread(&config)
+            .expect("start recorded thread");
+        let mut output = Vec::new();
 
         runtime
-            .run_turn(&config, &thread_id, "first persisted turn", Vec::new())
-            .expect("run turn");
-        assert_eq!(
-            runtime.next_persisted_turn_id(&thread_id).as_deref(),
-            Some("turn-2")
-        );
+            .run_turn(
+                &config,
+                &thread_id,
+                "record logical identity",
+                request_writer(&mut output),
+            )
+            .expect("run recorded turn");
+
+        let emitted_turn_id = parse_jsonl(&output)
+            .into_iter()
+            .find(|event| event["event"] == "turn_started")
+            .and_then(|event| event["turnId"].as_str().map(ToString::to_string))
+            .expect("emitted turn identity");
+        TurnId::parse(emitted_turn_id.clone()).expect("typed emitted turn identity");
+
+        let transcript = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load recorded transcript");
+        let journaled = transcript
+            .semantic_events
+            .iter()
+            .find(|event| event.event_type == EventType::TurnStarted)
+            .expect("journaled turn start");
+
+        assert_eq!(journaled.payload["turn_id"], emitted_turn_id);
     });
 }
 

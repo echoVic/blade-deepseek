@@ -354,7 +354,8 @@ mod tests {
             orca_runtime::lifecycle::RuntimeTaskStatus::Running,
             3,
         );
-        let event = task.attach_to_event(events.turn_started(3, Some("continue")));
+        let turn_id = orca_core::thread_identity::TurnId::new();
+        let event = task.attach_to_event(events.turn_started(&turn_id, 3, Some("continue")));
 
         let projected = project(event).expect("turn started event");
 

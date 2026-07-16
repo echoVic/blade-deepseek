@@ -9,6 +9,7 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::subagent_types::SubagentType;
+use orca_core::thread_identity::TurnId;
 #[cfg(test)]
 use orca_core::tool_types;
 use orca_mcp::McpElicitationHandler;
@@ -240,6 +241,7 @@ impl RuntimeBackgroundWorkflows {
 
 #[derive(Clone)]
 pub struct ThreadTurnRequest {
+    turn_id: TurnId,
     prompt: String,
     prompt_placement: ThreadTurnPromptPlacement,
     tool_mode: ThreadTurnToolMode,
@@ -615,6 +617,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         }
 
         let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
+            .with_turn_id(request.turn_id().clone())
             .with_services(
                 parts.instructions,
                 parts.memory,
@@ -794,6 +797,7 @@ impl ThreadTurnOutcome {
 impl ThreadTurnRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
+            turn_id: TurnId::new(),
             prompt: prompt.into(),
             prompt_placement: ThreadTurnPromptPlacement::BacktrackableUser,
             tool_mode: ThreadTurnToolMode::Standard,
@@ -813,6 +817,15 @@ impl ThreadTurnRequest {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn turn_id(&self) -> &TurnId {
+        &self.turn_id
+    }
+
+    pub fn with_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_id = turn_id;
+        self
     }
 
     pub fn options(&self) -> ControllerRunOptions {

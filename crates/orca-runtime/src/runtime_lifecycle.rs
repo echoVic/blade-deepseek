@@ -1,4 +1,5 @@
 use orca_core::event_schema::{EventDraft, EventFactory, RunStatus};
+use orca_core::thread_identity::TurnId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -123,6 +124,7 @@ impl<'a> RuntimeTurnRunner<'a> {
     pub fn start_turn(
         &mut self,
         events: &mut EventFactory,
+        turn_id: &TurnId,
         prompt: Option<&str>,
     ) -> RuntimeStartedTurn {
         let advanced = self.advance_turn();
@@ -133,9 +135,9 @@ impl<'a> RuntimeTurnRunner<'a> {
                 RuntimeTurnLifecycle {
                     number: advanced.turn,
                 }
-                .started_event(events, prompt, task)
+                .started_event(events, turn_id, prompt, task)
             })
-            .unwrap_or_else(|| events.turn_started(advanced.turn, prompt));
+            .unwrap_or_else(|| events.turn_started(turn_id, advanced.turn, prompt));
         RuntimeStartedTurn {
             turn: advanced.turn,
             task: advanced.task,
@@ -245,10 +247,11 @@ impl RuntimeTurnLifecycle {
     pub fn started_event(
         self,
         events: &mut EventFactory,
+        turn_id: &TurnId,
         prompt: Option<&str>,
         task: &RuntimeTaskLifecycle,
     ) -> EventDraft {
-        let mut event = events.turn_started(self.number, prompt);
+        let mut event = events.turn_started(turn_id, self.number, prompt);
         event.payload["task"] = task.payload();
         event
     }

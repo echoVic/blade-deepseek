@@ -128,6 +128,8 @@ pub enum ServerEvent {
         thread_id: Value,
     },
     TurnStarted {
+        #[serde(rename = "turnId")]
+        turn_id: Value,
         turn: Value,
         task: Value,
     },
@@ -573,6 +575,7 @@ pub fn map_runtime_event_line(line: &str) -> Option<ServerEvent> {
     let payload = &event["payload"];
     match event["type"].as_str()? {
         "turn.started" => Some(ServerEvent::TurnStarted {
+            turn_id: payload["turn_id"].clone(),
             turn: payload["turn"].clone(),
             task: payload["task"].clone(),
         }),

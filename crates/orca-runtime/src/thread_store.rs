@@ -18,7 +18,6 @@ pub use local::{
 pub(crate) use pagination::{page_thread_items, page_thread_turns};
 pub(crate) use projection::{
     message_to_thread_json, messages_to_thread_items, messages_to_thread_turns,
-    next_turn_id_for_messages,
 };
 pub use types::{
     SessionMeta, SessionSummary, SessionTranscript, SortDirection, StoredThreadItem,
@@ -124,24 +123,6 @@ mod tests {
 
         assert_eq!(item["role"], "user");
         assert_eq!(item["content"], "hello");
-    }
-
-    #[test]
-    fn thread_store_projects_next_turn_id() {
-        let messages = vec![
-            Message::User {
-                content: "hello".to_string(),
-                pinned: false,
-            },
-            Message::Assistant {
-                content: Some("hi".to_string()),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                pinned: false,
-            },
-        ];
-
-        assert_eq!(next_turn_id_for_messages("thread-a", &messages), "turn-2");
     }
 
     #[test]

@@ -408,12 +408,6 @@ fn turn_id_for_index(index: usize) -> String {
     format!("turn-{}", index + 1)
 }
 
-pub(crate) fn next_turn_id_for_messages(thread_id: &str, messages: &[Message]) -> String {
-    let turn_count =
-        group_messages_into_thread_turns(thread_id, messages, TurnItemsView::NotLoaded).len();
-    turn_id_for_index(turn_count)
-}
-
 fn item_id_for_index(index: usize) -> String {
     format!("item-{}", index + 1)
 }
