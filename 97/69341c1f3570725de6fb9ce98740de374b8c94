@@ -1,0 +1,23 @@
+.github/PULL_REQUEST_TEMPLATE.md
+  s_ccc9f6a61a1e71::t_ad4b1f21a0286c 1-38
+README.md
+  s_ccc9f6a61a1e71::t_aea9439075f1db 48-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9769341c1f3570725de6fb9ce98740de374b8c94",
+  "prompts": {},
+  "sessions": {
+    "s_ccc9f6a61a1e71": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f693f-d3f9-7f42-bc9b-62aa61f5f8e8",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

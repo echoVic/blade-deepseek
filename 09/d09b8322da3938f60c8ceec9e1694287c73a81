@@ -1,0 +1,25 @@
+CONTRIBUTING.md
+  s_9b1a19e8abfd2d::t_cb46a245ffe83e 1-73
+SECURITY.md
+  s_9b1a19e8abfd2d::t_232275f297a0d7 1-32
+SUPPORT.md
+  s_9b1a19e8abfd2d::t_9bd543d3e8c0c6 1-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "09d09b8322da3938f60c8ceec9e1694287c73a81",
+  "prompts": {},
+  "sessions": {
+    "s_9b1a19e8abfd2d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69c1-a5ed-7e62-9dd8-f0047da2f57e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
