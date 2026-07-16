@@ -17,6 +17,8 @@ const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const cliSentinel = "ORCA_REAL_E2E_OK";
 const historyReplaySentinel = "ORCA_HISTORY_REPLAY_OK";
 const historyReplayCallId = "legacy-missing-tool-call";
+const stableThreadIdentitySentinel = `ORCA_STABLE_THREAD_IDENTITY_OK_${Date.now()}_${process.pid}`;
+const stableThreadIdentityReadySentinel = "ORCA_STABLE_THREAD_IDENTITY_READY";
 const serverSentinel = "ORCA_SERVER_REAL_OK";
 const serverThreadSentinel = `ORCA_SERVER_THREAD_MEMORY_OK_${Date.now()}_${process.pid}`;
 const serverThreadReadySentinel = "READY";
@@ -321,6 +323,208 @@ function runHistoryReplay(args) {
   }
 }
 
+function readStableThreadProjection(args, home, threadId, label) {
+  const requests = [
+    {
+      id: "stable-identity-turns",
+      method: "thread/turns/list",
+      params: { threadId, limit: 100 },
+    },
+    {
+      id: "stable-identity-items",
+      method: "thread/items/list",
+      params: { threadId, limit: 100 },
+    },
+  ];
+  const output = run(args.orcaBin, ["--mode", "server"], {
+    env: { ...process.env, ORCA_HOME: home },
+    input: `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
+    stdio: ["pipe", "pipe", "pipe"],
+    timeoutMs: args.timeoutMs,
+  });
+  const events = parseJsonLines(output, label);
+  const turnsEvent = events.find(
+    (event) => event.id === "stable-identity-turns" && event.event === "thread_turns_list",
+  );
+  const itemsEvent = events.find(
+    (event) => event.id === "stable-identity-items" && event.event === "thread_items_list",
+  );
+  if (!turnsEvent || !itemsEvent) {
+    throw new Error(`${label} did not return turn and item projections:\n${output}`);
+  }
+
+  const turnIds = (Array.isArray(turnsEvent.data) ? turnsEvent.data : []).map(
+    (turn) => turn.turnId,
+  );
+  const itemIds = (Array.isArray(itemsEvent.data) ? itemsEvent.data : []).map(
+    (entry) => entry.itemId,
+  );
+  if (
+    turnIds.length === 0 ||
+    itemIds.length === 0 ||
+    turnIds.some((id) => typeof id !== "string" || !id.startsWith("turn_")) ||
+    itemIds.some((id) => typeof id !== "string" || !id.startsWith("item_")) ||
+    new Set(turnIds).size !== turnIds.length ||
+    new Set(itemIds).size !== itemIds.length
+  ) {
+    throw new Error(
+      `${label} did not expose unique typed turn/item ids: ${JSON.stringify({ turnIds, itemIds })}`,
+    );
+  }
+  return { turnIds, itemIds };
+}
+
+function assertStablePrefix(before, after, label) {
+  if (
+    after.length <= before.length ||
+    before.some((value, index) => after[index] !== value)
+  ) {
+    throw new Error(
+      `${label} did not preserve the prior identity prefix: ${JSON.stringify({ before, after })}`,
+    );
+  }
+}
+
+function runStableThreadIdentityResume(args) {
+  if (args.skipCli || args.skipServer) {
+    console.log("Stable thread identity resume real API e2e skipped");
+    return;
+  }
+
+  const home = mkdtempSync(path.join(os.tmpdir(), "orca-stable-thread-identity-e2e-"));
+  const sourceHome = process.env.ORCA_HOME ?? path.join(os.homedir(), ".orca");
+  const sourceAuthPath = path.join(sourceHome, "auth.json");
+  if (existsSync(sourceAuthPath)) {
+    copyFileSync(sourceAuthPath, path.join(home, "auth.json"));
+  }
+  const env = { ...process.env, ORCA_HOME: home };
+
+  try {
+    const firstOutput = run(
+      args.orcaBin,
+      [
+        "exec",
+        "--output-format",
+        "jsonl",
+        "--save-history",
+        "--mode",
+        "suggest",
+        "--max-budget",
+        args.maxBudget,
+        `Remember this exact token for the next process: ${stableThreadIdentitySentinel}. Reply with exactly: ${stableThreadIdentityReadySentinel}`,
+      ],
+      { env, timeoutMs: args.timeoutMs },
+    );
+    const firstEvents = parseJsonLines(firstOutput, "stable identity first process");
+    const firstText = firstEvents
+      .filter((event) => event.type === "assistant.message.delta")
+      .map((event) => event.payload?.text ?? "")
+      .join("");
+    if (!firstText.includes(stableThreadIdentityReadySentinel)) {
+      throw new Error(`Stable identity first process missing ready sentinel:\n${firstOutput}`);
+    }
+    assertStatus(
+      firstEvents,
+      "type",
+      "session.completed",
+      ["payload", "status"],
+      "Stable identity first process",
+    );
+
+    const threadId = firstEvents.find((event) => event.type === "session.started")?.run_id;
+    const firstTurnId = firstEvents.find((event) => event.type === "turn.started")?.payload
+      ?.turn_id;
+    if (
+      typeof threadId !== "string" ||
+      threadId.length === 0 ||
+      typeof firstTurnId !== "string" ||
+      !firstTurnId.startsWith("turn_")
+    ) {
+      throw new Error(`Stable identity first process did not expose typed identity:\n${firstOutput}`);
+    }
+    const firstProjection = readStableThreadProjection(
+      args,
+      home,
+      threadId,
+      "stable identity first cold projection",
+    );
+    if (!firstProjection.turnIds.includes(firstTurnId)) {
+      throw new Error(
+        `Stable identity first turn event was not persisted: ${JSON.stringify({ firstTurnId, firstProjection })}`,
+      );
+    }
+
+    const resumedOutput = run(
+      args.orcaBin,
+      [
+        "exec",
+        "--output-format",
+        "jsonl",
+        "--save-history",
+        "--mode",
+        "suggest",
+        "--max-budget",
+        args.maxBudget,
+        "--resume",
+        threadId,
+        "Reply with exactly the token I asked you to remember in the previous process.",
+      ],
+      { env, timeoutMs: args.timeoutMs },
+    );
+    const resumedEvents = parseJsonLines(resumedOutput, "stable identity resumed process");
+    const resumedText = resumedEvents
+      .filter((event) => event.type === "assistant.message.delta")
+      .map((event) => event.payload?.text ?? "")
+      .join("");
+    if (!resumedText.includes(stableThreadIdentitySentinel)) {
+      throw new Error(
+        `Stable identity resumed process lost DeepSeek context ${stableThreadIdentitySentinel}:\n${resumedOutput}`,
+      );
+    }
+    assertStatus(
+      resumedEvents,
+      "type",
+      "session.completed",
+      ["payload", "status"],
+      "Stable identity resumed process",
+    );
+    if (
+      resumedEvents.find((event) => event.type === "session.started")?.run_id !== threadId
+    ) {
+      throw new Error(`Stable identity resumed process changed thread id:\n${resumedOutput}`);
+    }
+    const resumedTurnId = resumedEvents.find((event) => event.type === "turn.started")
+      ?.payload?.turn_id;
+    if (
+      typeof resumedTurnId !== "string" ||
+      !resumedTurnId.startsWith("turn_") ||
+      resumedTurnId === firstTurnId
+    ) {
+      throw new Error(`Stable identity resumed process did not mint a new typed turn id:\n${resumedOutput}`);
+    }
+
+    const resumedProjection = readStableThreadProjection(
+      args,
+      home,
+      threadId,
+      "stable identity resumed cold projection",
+    );
+    assertStablePrefix(firstProjection.turnIds, resumedProjection.turnIds, "Stable turn ids");
+    assertStablePrefix(firstProjection.itemIds, resumedProjection.itemIds, "Stable item ids");
+    if (!resumedProjection.turnIds.includes(resumedTurnId)) {
+      throw new Error(
+        `Stable identity resumed turn event was not persisted: ${JSON.stringify({ resumedTurnId, resumedProjection })}`,
+      );
+    }
+
+    console.log(
+      `Stable thread identity resume real API e2e verified: ${stableThreadIdentitySentinel}`,
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
 function runServerSubmit(args) {
   if (args.skipServer) {
     console.log("Server real API e2e skipped");
@@ -525,9 +729,15 @@ async function runServerThread(args) {
       }
       return event.event === "turn_started";
     });
-    const resumeTurnId = resumeTurnStarted.task?.task_id;
+    const resumeTurnId = resumeTurnStarted.turnId;
     if (typeof resumeTurnId !== "string" || resumeTurnId.length === 0) {
       throw new Error(`Server active-resume turn/start did not expose a turnId: ${JSON.stringify(resumeTurnStarted)}`);
+    }
+    const resumeTaskId = resumeTurnStarted.task?.task_id;
+    if (typeof resumeTaskId !== "string" || resumeTaskId.length === 0 || resumeTaskId === resumeTurnId) {
+      throw new Error(
+        `Server active-resume turn/start did not separate logical turn and runtime task identity: ${JSON.stringify(resumeTurnStarted)}`,
+      );
     }
     await readUntil("server active-resume first stream delta", (event) => {
       if (event.id !== "server-resume-turn") {
@@ -1242,6 +1452,7 @@ async function main() {
   runProviderSummary(args);
   runCli(args);
   runHistoryReplay(args);
+  runStableThreadIdentityResume(args);
   await runServer(args);
 }
 
