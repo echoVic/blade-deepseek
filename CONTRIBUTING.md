@@ -65,7 +65,8 @@ test(tools): cover sandbox denial
 
 ## Pull Requests
 
-Describe the problem and solution, link the relevant Issue, list verification
+Describe the problem and solution, link any relevant Issue when one exists
+(especially for changes that required prior discussion), list verification
 performed, and call out compatibility, security, or migration risks. Keep review
 feedback in scope and ensure the branch is ready for maintainers to reproduce.
 
