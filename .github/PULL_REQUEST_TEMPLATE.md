@@ -8,7 +8,7 @@
 
 ## Related Issue
 
-Link the related issue when prior discussion is required.
+<!-- Write `Closes #...` or `Not required`. -->
 
 ## Verification
 
@@ -31,8 +31,10 @@ Link the related issue when prior discussion is required.
 - [ ] The change is focused and contains no unrelated refactors.
 - [ ] Tests cover the change where appropriate.
 - [ ] `cargo fmt --all -- --check` passes.
-- [ ] Relevant tests pass; any full-gate gap is documented above.
-- [ ] `cargo clippy --workspace --all-targets` passes, or the gap is documented above.
+- [ ] `cargo test --workspace --all-targets -- --test-threads=1` passes.
+- [ ] If credentials, platform limits, or external services block the full test gate, the Verification section lists the largest relevant test subset run and explains the blocker.
+- [ ] `cargo clippy --workspace --all-targets` passes.
+- [ ] If credentials, platform limits, or external services block the full clippy gate, the Verification section lists the largest relevant subset run and explains the blocker.
 - [ ] Public behavior changes are reflected in documentation.
 - [ ] No secrets or sensitive data are included.
-- [ ] No version or release artifacts are included unless explicitly requested.
+- [ ] No version or release artifacts are included unless explicitly requested by a maintainer.

@@ -50,6 +50,7 @@ Download the archive for your platform from the latest GitHub Release, extract i
 - Read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing. Open an issue first for large or compatibility-sensitive changes.
 - Report bugs with the [bug report form](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml).
 - Propose features with the [feature request form](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml).
+- Suggest documentation improvements with the [documentation form](https://github.com/echoVic/blade-deepseek/issues/new?template=documentation.yml).
 - Use [SUPPORT.md](SUPPORT.md) for questions and help.
 - Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
