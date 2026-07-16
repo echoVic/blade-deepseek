@@ -19,16 +19,17 @@ use crate::verification::VerificationResult;
 pub const EVENT_SCHEMA_VERSION: &str = "1";
 pub const EVENT_SEQUENCE_RESERVATION_SIZE: u64 = 256;
 
-pub trait EventSequenceStore: Send + Sync {
+pub trait EventPublicationStore: Send + Sync {
     fn reserve_through(&self, next_seq_exclusive: u64) -> io::Result<()>;
+    fn append_semantic_event(&self, event: &EventEnvelope) -> io::Result<()>;
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EventEnvelope {
-    pub version: &'static str,
+    pub version: String,
     pub run_id: String,
     pub seq: u64,
-    pub timestamp_ms: u128,
+    pub timestamp_ms: u64,
     #[serde(rename = "type")]
     pub event_type: EventType,
     pub payload: Value,
@@ -44,7 +45,7 @@ pub struct EventDraft {
 
 struct EventPublication {
     state: Mutex<EventPublicationState>,
-    sequence_store: Option<Arc<dyn EventSequenceStore>>,
+    store: Option<Arc<dyn EventPublicationStore>>,
 }
 
 #[derive(Debug, Default)]
@@ -57,7 +58,7 @@ impl Default for EventPublication {
     fn default() -> Self {
         Self {
             state: Mutex::new(EventPublicationState::default()),
-            sequence_store: None,
+            store: None,
         }
     }
 }
@@ -71,7 +72,7 @@ impl fmt::Debug for EventPublication {
         formatter
             .debug_struct("EventPublication")
             .field("state", &*state)
-            .field("has_sequence_store", &self.sequence_store.is_some())
+            .field("has_store", &self.store.is_some())
             .finish()
     }
 }
@@ -99,18 +100,18 @@ impl EventDraft {
         if state.next_seq == u64::MAX {
             return Err(io::Error::other("event sequence exhausted"));
         }
-        if let Some(sequence_store) = self.publication.sequence_store.as_deref()
+        if let Some(store) = self.publication.store.as_deref()
             && state.next_seq >= state.reserved_until
         {
             let reserved_until = state
                 .next_seq
                 .checked_add(EVENT_SEQUENCE_RESERVATION_SIZE)
                 .ok_or_else(|| io::Error::other("event sequence reservation exhausted"))?;
-            sequence_store.reserve_through(reserved_until)?;
+            store.reserve_through(reserved_until)?;
             state.reserved_until = reserved_until;
         }
         let event = EventEnvelope {
-            version: EVENT_SCHEMA_VERSION,
+            version: EVENT_SCHEMA_VERSION.to_string(),
             run_id: self.run_id,
             seq: state.next_seq,
             timestamp_ms: timestamp_ms(),
@@ -118,9 +119,20 @@ impl EventDraft {
             payload: self.payload,
         };
         let publication = EventPublicationGuard { state };
-        let result = publish(&event);
+        let result = (|| {
+            if event.event_type.is_semantic()
+                && let Some(store) = self.publication.store.as_deref()
+            {
+                store.append_semantic_event(&event)?;
+            }
+            publish(&event)
+        })();
         drop(publication);
         result
+    }
+
+    pub(crate) fn requires_publication_without_observer(&self) -> bool {
+        self.event_type.is_semantic() && self.publication.store.is_some()
     }
 }
 
@@ -206,6 +218,52 @@ pub enum EventType {
     SessionCompleted,
 }
 
+impl EventType {
+    pub const fn is_semantic(self) -> bool {
+        match self {
+            Self::SessionStarted
+            | Self::TurnStarted
+            | Self::ContextCompactionStarted
+            | Self::ContextCompacted
+            | Self::ModelRouted
+            | Self::ApprovalRequested
+            | Self::ApprovalResolved
+            | Self::ToolCallRequested
+            | Self::ToolCallCompleted
+            | Self::PlanUpdated
+            | Self::SubagentStarted
+            | Self::SubagentCompleted
+            | Self::WorkflowStarted
+            | Self::WorkflowResumed
+            | Self::WorkflowPhaseStarted
+            | Self::WorkflowPhaseCompleted
+            | Self::WorkflowAgentStarted
+            | Self::WorkflowAgentCached
+            | Self::WorkflowAgentCompleted
+            | Self::WorkflowAgentFailed
+            | Self::WorkflowPaused
+            | Self::WorkflowStopped
+            | Self::WorkflowCompleted
+            | Self::WorkflowFailed
+            | Self::WorkflowResultAvailable
+            | Self::VerificationStarted
+            | Self::VerificationCompleted
+            | Self::Error
+            | Self::SessionCompleted => true,
+            Self::AssistantReasoningDelta
+            | Self::AssistantMessageDelta
+            | Self::ProviderReplayUpdated
+            | Self::UsageUpdated
+            | Self::ContextUpdated
+            | Self::ToolCallProgress
+            | Self::ToolOutputDelta
+            | Self::SubagentProgress
+            | Self::WorkflowTasksUpdated
+            | Self::TaskStatusUpdated => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -274,10 +332,10 @@ impl EventFactory {
         }
     }
 
-    pub fn with_sequence_store(
+    pub fn with_publication_store(
         run_id: String,
         next_seq: u64,
-        sequence_store: Arc<dyn EventSequenceStore>,
+        store: Arc<dyn EventPublicationStore>,
     ) -> Self {
         Self {
             run_id,
@@ -286,7 +344,7 @@ impl EventFactory {
                     next_seq,
                     reserved_until: next_seq,
                 }),
-                sequence_store: Some(sequence_store),
+                store: Some(store),
             }),
         }
     }
@@ -893,10 +951,10 @@ impl EventFactory {
     }
 }
 
-fn timestamp_ms() -> u128 {
+fn timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
 }
 

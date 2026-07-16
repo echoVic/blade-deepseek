@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn legacy_context_compacted_event_keeps_tui_projection_compatible() {
         let event = EventEnvelope {
-            version: orca_core::event_schema::EVENT_SCHEMA_VERSION,
+            version: orca_core::event_schema::EVENT_SCHEMA_VERSION.to_string(),
             run_id: "legacy-compaction".to_string(),
             seq: 1,
             timestamp_ms: 1,

@@ -425,7 +425,7 @@ impl InteractiveSession {
         self.session_id.as_deref()
     }
 
-    pub(crate) fn event_sequence_store(&self) -> Option<(u64, SessionWriter)> {
+    pub(crate) fn event_publication_store(&self) -> Option<(u64, SessionWriter)> {
         self.writer
             .as_ref()
             .cloned()

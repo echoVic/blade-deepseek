@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use orca_core::conversation::{Message, SummaryState};
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::EventSequenceStore;
+use orca_core::event_schema::{EventEnvelope, EventPublicationStore};
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::tool_types::ToolResult;
 use uuid::Uuid;
@@ -42,6 +42,16 @@ pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
         }
         match serde_json::from_str::<SessionRecord>(line) {
             Ok(record) => records.push(record),
+            Err(error) if line_has_record_type(line, "event.semantic") => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid semantic event record at {} line {}: {error}",
+                        path.display(),
+                        i + 1
+                    ),
+                ));
+            }
             Err(error) if line_has_invalid_tool_terminal(line) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -57,6 +67,10 @@ pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
         }
     }
     Ok(records)
+}
+
+fn line_has_record_type(line: &str, record_type: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| value["type"] == record_type)
 }
 
 fn line_has_invalid_tool_terminal(line: &str) -> bool {
@@ -167,6 +181,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     let mut completion_status = None;
     let mut completion_error = None;
     let mut next_event_seq = 0;
+    let mut semantic_events = Vec::new();
 
     for record in records {
         match record {
@@ -206,6 +221,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
             SessionRecord::EventSequenceReserved { next_seq } => {
                 next_event_seq = next_event_seq.max(next_seq);
             }
+            SessionRecord::SemanticEvent { event } => semantic_events.push(event),
             SessionRecord::PlanState { explanation, plan } => {
                 let all_done = !plan.is_empty()
                     && plan.iter().all(|item| item.status == PlanStatus::Completed);
@@ -241,6 +257,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         completion_status,
         completion_error,
         next_event_seq,
+        semantic_events,
         path: path.to_path_buf(),
     })
 }
@@ -293,6 +310,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         SessionRecord::Usage(_)
         | SessionRecord::UsageBaseline(_)
         | SessionRecord::EventSequenceReserved { .. } => {}
+        SessionRecord::SemanticEvent { event } => redact_json_value(&mut event.payload),
         SessionRecord::PlanState { explanation, plan } => {
             if let Some(explanation) = explanation {
                 redact_string_in_place(explanation);
@@ -341,6 +359,23 @@ fn redact_stored_message(message: &mut StoredMessage) {
                 redact_string_in_place(&mut tool_call.arguments);
             }
         }
+    }
+}
+
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => redact_string_in_place(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_value(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_json_value(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -747,6 +782,15 @@ impl SessionWriter {
         )
     }
 
+    fn append_semantic_event_record(&self, event: &EventEnvelope) -> io::Result<()> {
+        write_record(
+            &self.path,
+            &SessionRecord::SemanticEvent {
+                event: event.clone(),
+            },
+        )
+    }
+
     pub fn append_plan_state(
         &mut self,
         explanation: Option<String>,
@@ -756,9 +800,13 @@ impl SessionWriter {
     }
 }
 
-impl EventSequenceStore for SessionWriter {
+impl EventPublicationStore for SessionWriter {
     fn reserve_through(&self, next_seq_exclusive: u64) -> io::Result<()> {
         self.reserve_event_sequence(next_seq_exclusive)
+    }
+
+    fn append_semantic_event(&self, event: &EventEnvelope) -> io::Result<()> {
+        self.append_semantic_event_record(event)
     }
 }
 
@@ -857,12 +905,87 @@ mod tests {
     }
 
     #[test]
+    fn semantic_event_round_trips_as_the_original_typed_envelope() {
+        let (_directory, path, writer) = new_transcript();
+        let event = EventEnvelope {
+            version: orca_core::event_schema::EVENT_SCHEMA_VERSION.to_string(),
+            run_id: "semantic-round-trip".to_string(),
+            seq: 37,
+            timestamp_ms: 1_234_567,
+            event_type: orca_core::event_schema::EventType::ToolCallCompleted,
+            payload: serde_json::json!({
+                "id": "tool-1",
+                "name": "shell",
+                "status": "completed",
+                "nested": { "preserved": true }
+            }),
+        };
+
+        writer
+            .append_semantic_event(&event)
+            .expect("append semantic event");
+
+        let raw = fs::read_to_string(&path).expect("read semantic JSONL");
+        let semantic_line = raw
+            .lines()
+            .find(|line| line.contains("\"type\":\"event.semantic\""))
+            .expect("semantic JSONL line");
+        serde_json::from_str::<SessionRecord>(semantic_line).expect("parse typed semantic record");
+        let transcript = read_transcript(&path).expect("read semantic transcript");
+        assert_eq!(
+            transcript.semantic_events.as_slice(),
+            std::slice::from_ref(&event)
+        );
+        let records = read_records(&path).expect("read typed semantic record");
+        assert!(records.iter().any(|record| {
+            matches!(record, SessionRecord::SemanticEvent { event: stored } if stored == &event)
+        }));
+        let record = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["type"] == "event.semantic")
+            .expect("semantic JSONL record");
+        assert_eq!(record["event"], serde_json::to_value(event).unwrap());
+    }
+
+    #[test]
+    fn semantic_event_payload_uses_recursive_history_redaction() {
+        let (_directory, path, writer) = new_transcript();
+        let event = EventEnvelope {
+            version: orca_core::event_schema::EVENT_SCHEMA_VERSION.to_string(),
+            run_id: "semantic-redaction".to_string(),
+            seq: 0,
+            timestamp_ms: 42,
+            event_type: orca_core::event_schema::EventType::ToolCallRequested,
+            payload: serde_json::json!({
+                "raw_arguments": {
+                    "authorization": "token=secret-test-value",
+                    "nested": ["api_key=secret-test-key"]
+                }
+            }),
+        };
+
+        writer
+            .append_semantic_event(&event)
+            .expect("append redacted semantic event");
+
+        let transcript = read_transcript(&path).expect("read redacted semantic transcript");
+        let payload = &transcript.semantic_events[0].payload;
+        assert_eq!(
+            payload["raw_arguments"]["authorization"],
+            "token=<redacted>"
+        );
+        assert_eq!(payload["raw_arguments"]["nested"][0], "api_key=<redacted>");
+    }
+
+    #[test]
     fn legacy_transcript_without_event_sequence_reservation_starts_at_zero() {
         let (_directory, path, _writer) = new_transcript();
 
         let transcript = read_transcript(&path).expect("read legacy transcript");
 
         assert_eq!(transcript.next_event_seq, 0);
+        assert!(transcript.semantic_events.is_empty());
     }
 
     fn seed_foreground_and_background(writer: &mut SessionWriter) {
@@ -972,6 +1095,37 @@ mod tests {
 
         let error = read_records(path.path()).expect_err("terminal conflict must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"));
+    }
+
+    #[test]
+    fn read_records_rejects_complete_invalid_semantic_event_record() {
+        let (_directory, path, _writer) = new_transcript();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open semantic transcript");
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "event.semantic",
+                "event": {
+                    "version": "1",
+                    "run_id": "invalid-semantic",
+                    "seq": 0,
+                    "timestamp_ms": "not-a-number",
+                    "type": "error",
+                    "payload": { "message": "invalid" }
+                }
+            })
+        )
+        .expect("write invalid semantic event");
+
+        let error =
+            read_records(&path).expect_err("known invalid semantic record must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid semantic event record"));
         assert!(error.to_string().contains("line 2"));
     }
 

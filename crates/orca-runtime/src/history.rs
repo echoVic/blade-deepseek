@@ -301,7 +301,9 @@ mod tests {
     use crate::thread_store::ORCA_HOME_ENV;
     use orca_core::approval_types::ActionKind;
     use orca_core::conversation::RawToolCall;
-    use orca_core::event_schema::{EVENT_SEQUENCE_RESERVATION_SIZE, EventSequenceStore};
+    use orca_core::event_schema::{
+        EVENT_SEQUENCE_RESERVATION_SIZE, EventEnvelope, EventPublicationStore, EventType,
+    };
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_core::tool_types::{
         ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminalSource,
@@ -362,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn event_sequence_reservation_survives_rewrite_and_compression() {
+    fn event_publication_state_survives_rewrite_compression_and_restore() {
         let _guard = lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let previous = std::env::var_os(ORCA_HOME_ENV);
@@ -375,10 +377,23 @@ mod tests {
             let writer = SessionWriter::start(&cwd, "mock", None, "durable sequence")?;
             let session_id = load_session("latest")?.meta.session_id;
             writer.reserve_through(EVENT_SEQUENCE_RESERVATION_SIZE)?;
+            let semantic_event = EventEnvelope {
+                version: orca_core::event_schema::EVENT_SCHEMA_VERSION.to_string(),
+                run_id: session_id.clone(),
+                seq: 7,
+                timestamp_ms: 77,
+                event_type: EventType::Error,
+                payload: serde_json::json!({ "message": "durable semantic event" }),
+            };
+            writer.append_semantic_event(&semantic_event)?;
 
             rename_session(&session_id, "rewritten durable sequence")?;
             let rewritten = load_session(&session_id)?;
             assert_eq!(rewritten.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
+            assert_eq!(
+                rewritten.semantic_events.as_slice(),
+                std::slice::from_ref(&semantic_event)
+            );
 
             let compressed_path = compress_session(&session_id)?;
             assert_eq!(
@@ -390,6 +405,22 @@ mod tests {
             let compressed = load_session(&session_id)?;
             assert_eq!(compressed.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
             assert_eq!(compressed.meta.title, "rewritten durable sequence");
+            assert_eq!(
+                compressed.semantic_events.as_slice(),
+                std::slice::from_ref(&semantic_event)
+            );
+
+            SessionWriter::append_to_existing(compressed.path.clone())?;
+            let restored = load_session(&session_id)?;
+            assert_eq!(
+                restored
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("jsonl")
+            );
+            assert_eq!(restored.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
+            assert_eq!(restored.semantic_events, [semantic_event]);
             Ok::<(), io::Error>(())
         })();
 
@@ -400,7 +431,7 @@ mod tests {
                 std::env::remove_var(ORCA_HOME_ENV);
             }
         }
-        result.expect("event sequence reservation survived rewrite and compression");
+        result.expect("event publication state survived rewrite, compression, and restore");
     }
 
     #[test]
@@ -968,6 +999,7 @@ mod tests {
             completion_status: None,
             completion_error: None,
             next_event_seq: 0,
+            semantic_events: Vec::new(),
             path: cwd.join("reasoning-only.jsonl"),
         };
 

@@ -17,7 +17,7 @@ use orca_core::config::{
 use orca_core::conversation::Message;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{
-    EVENT_SEQUENCE_RESERVATION_SIZE, EventEnvelope, EventFactory, EventSequenceStore, EventType,
+    EVENT_SEQUENCE_RESERVATION_SIZE, EventEnvelope, EventFactory, EventPublicationStore, EventType,
     RunStatus,
 };
 use orca_core::event_sink::{EventObserver, EventSink};
@@ -202,10 +202,24 @@ impl ManualGate {
 }
 
 enum TestBehavior {
-    WaitForCancel { finished: Arc<AtomicBool> },
-    WaitForCancelAndRelease { gate: CancelJoinGate },
-    WaitForRelease { gate: ManualGate, status: RunStatus },
-    EmitEvent { message: String, status: RunStatus },
+    WaitForCancel {
+        finished: Arc<AtomicBool>,
+    },
+    WaitForCancelAndRelease {
+        gate: CancelJoinGate,
+    },
+    WaitForRelease {
+        gate: ManualGate,
+        status: RunStatus,
+    },
+    EmitEvent {
+        message: String,
+        status: RunStatus,
+    },
+    EmitSemanticAndTransient {
+        message: String,
+        status: RunStatus,
+    },
     RecordUsage {
         input_tokens: u64,
         output_tokens: u64,
@@ -331,6 +345,14 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                     .emit(events.error(&message))?;
                 Ok(status.into())
             }
+            TestBehavior::EmitSemanticAndTransient { message, status } => {
+                let mut sink = EventSink::new(writer, generation.config().output_format);
+                sink.emit(events.assistant_reasoning_delta("transient reasoning"))?;
+                sink.emit(events.assistant_message_delta("transient message"))?;
+                sink.emit(events.tool_output_delta("tool-1", "transient output"))?;
+                sink.emit(events.error(&message))?;
+                Ok(status.into())
+            }
             TestBehavior::RecordUsage {
                 input_tokens,
                 output_tokens,
@@ -419,6 +441,30 @@ struct ReservationCheckingWriter {
     expected_next_seq: u64,
 }
 
+#[derive(Clone)]
+struct SemanticJournalCheckingWriter {
+    output: SharedWriter,
+    thread_id: String,
+    expected_seq: u64,
+    expected_message: String,
+}
+
+impl SemanticJournalCheckingWriter {
+    fn new(
+        output: SharedWriter,
+        thread_id: impl Into<String>,
+        expected_seq: u64,
+        expected_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            output,
+            thread_id: thread_id.into(),
+            expected_seq,
+            expected_message: expected_message.into(),
+        }
+    }
+}
+
 impl ReservationCheckingWriter {
     fn new(output: SharedWriter, thread_id: impl Into<String>, expected_next_seq: u64) -> Self {
         Self {
@@ -444,6 +490,26 @@ impl Write for ReservationCheckingWriter {
     }
 }
 
+impl Write for SemanticJournalCheckingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let transcript = history::load_session(&self.thread_id)?;
+        let semantic_events = semantic_event_records(&transcript);
+        assert!(
+            semantic_events.iter().any(|event| {
+                event["seq"] == self.expected_seq
+                    && event["type"] == "error"
+                    && event["payload"]["message"] == self.expected_message
+            }),
+            "semantic envelope must be durable before output delivery"
+        );
+        self.output.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
 fn event_sequence_reservation_count(transcript: &SessionTranscript) -> usize {
     fs::read_to_string(&transcript.path)
         .expect("read plaintext transcript")
@@ -453,6 +519,16 @@ fn event_sequence_reservation_count(transcript: &SessionTranscript) -> usize {
                 .is_ok_and(|record| record["type"] == "event.sequence.reserved")
         })
         .count()
+}
+
+fn semantic_event_records(transcript: &SessionTranscript) -> Vec<serde_json::Value> {
+    fs::read_to_string(&transcript.path)
+        .expect("read plaintext transcript")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["type"] == "event.semantic")
+        .filter_map(|record| record.get("event").cloned())
+        .collect()
 }
 
 impl Write for SharedWriter {
@@ -737,6 +813,7 @@ fn recorded_event_sequence_is_reserved_once_and_restored_across_resume() {
         let transcript = history::load_session(&thread_id).expect("load recorded transcript");
         assert_eq!(transcript.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
         assert_eq!(event_sequence_reservation_count(&transcript), 1);
+        assert_eq!(semantic_event_records(&transcript), events);
         host.shutdown().expect("shutdown first runtime host");
 
         let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
@@ -779,8 +856,110 @@ fn recorded_event_sequence_is_reserved_once_and_restored_across_resume() {
             EVENT_SEQUENCE_RESERVATION_SIZE * 2
         );
         assert_eq!(event_sequence_reservation_count(&transcript), 2);
+        let journal = semantic_event_records(&transcript);
+        assert_eq!(journal.len(), 3);
+        assert_eq!(journal[2], events[0]);
 
         host.shutdown().expect("shutdown resumed runtime host");
+    });
+}
+
+#[test]
+fn recorded_semantic_envelope_is_durable_before_output_delivery() {
+    with_orca_home(|_home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+            message: "durable before visible".to_string(),
+            status: RunStatus::Success,
+        }]));
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "semantic event durability")
+            .expect("start recorded thread");
+        let thread_id = thread
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let output = SharedWriter::default();
+
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("journal this event"),
+                SemanticJournalCheckingWriter::new(
+                    output.clone(),
+                    thread_id.clone(),
+                    0,
+                    "durable before visible",
+                ),
+            )
+            .expect("start recorded turn");
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("recorded terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+
+        let output_events = output.json_events();
+        assert_eq!(output_events.len(), 1);
+        let transcript = history::load_session(&thread_id).expect("load recorded transcript");
+        let semantic_events = semantic_event_records(&transcript);
+        assert_eq!(semantic_events.len(), 1);
+        assert_eq!(semantic_events[0], output_events[0]);
+
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn recorded_transient_deltas_do_not_enter_the_semantic_journal() {
+    with_orca_home(|_home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::EmitSemanticAndTransient {
+                message: "only semantic terminal".to_string(),
+                status: RunStatus::Success,
+            },
+        ]));
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "transient journal exclusion")
+            .expect("start recorded thread");
+        let thread_id = thread
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let output = SharedWriter::default();
+
+        let operation = thread
+            .start_turn(HostedTurnRequest::new("stream then finish"), output.clone())
+            .expect("start recorded turn");
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("recorded terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+
+        let output_events = output.json_events();
+        assert_eq!(output_events.len(), 4);
+        assert_eq!(output_events[0]["type"], "assistant.reasoning.delta");
+        assert_eq!(output_events[1]["type"], "assistant.message.delta");
+        assert_eq!(output_events[2]["type"], "tool.output.delta");
+        assert_eq!(output_events[3]["type"], "error");
+        let transcript = history::load_session(&thread_id).expect("load recorded transcript");
+        assert_eq!(
+            semantic_event_records(&transcript),
+            [output_events[3].clone()]
+        );
+
+        host.shutdown().expect("shutdown runtime host");
     });
 }
 
@@ -842,6 +1021,7 @@ fn forked_event_sequence_resets_for_the_new_thread_identity() {
             EVENT_SEQUENCE_RESERVATION_SIZE
         );
         assert_eq!(event_sequence_reservation_count(&fork_transcript), 1);
+        assert_eq!(semantic_event_records(&fork_transcript), events);
         assert_eq!(
             history::load_session(&parent_id)
                 .expect("reload parent transcript")
@@ -861,8 +1041,9 @@ fn legacy_recorded_thread_without_reservation_starts_at_zero() {
             history::SessionWriter::start(cwd.path(), "mock", None, "legacy transcript")
                 .expect("start legacy transcript");
         let legacy = history::load_session("latest").expect("load legacy transcript");
-        let thread_id = legacy.meta.session_id;
         assert_eq!(legacy.next_event_seq, 0);
+        assert!(semantic_event_records(&legacy).is_empty());
+        let thread_id = legacy.meta.session_id;
 
         let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
             message: "first legacy event".to_string(),
@@ -893,6 +1074,7 @@ fn legacy_recorded_thread_without_reservation_starts_at_zero() {
         let transcript = history::load_session(&thread_id).expect("reload legacy transcript");
         assert_eq!(transcript.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
         assert_eq!(event_sequence_reservation_count(&transcript), 1);
+        assert_eq!(semantic_event_records(&transcript), events);
 
         host.shutdown().expect("shutdown runtime host");
     });
@@ -1255,6 +1437,7 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
         completion_status: Some("success".to_string()),
         completion_error: None,
         next_event_seq: 0,
+        semantic_events: Vec::new(),
         path: transcript_path,
     };
     let mut config = test_config(cwd.path().to_path_buf());

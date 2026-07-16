@@ -10,6 +10,7 @@ use orca_core::config::{
 };
 use orca_core::conversation::{Message, RawToolCall};
 use orca_core::cost_types::UsageTotals;
+use orca_core::event_schema::EventEnvelope;
 use orca_core::plan_types::PlanItem;
 use orca_core::tool_types::{
     ToolInvocationStarted, ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource,
@@ -79,6 +80,7 @@ pub struct SessionTranscript {
     pub completion_status: Option<String>,
     pub completion_error: Option<String>,
     pub next_event_seq: u64,
+    pub semantic_events: Vec<EventEnvelope>,
     pub path: PathBuf,
 }
 
@@ -116,6 +118,8 @@ pub(crate) enum SessionRecord {
     UsageBaseline(UsageTotals),
     #[serde(rename = "event.sequence.reserved")]
     EventSequenceReserved { next_seq: u64 },
+    #[serde(rename = "event.semantic")]
+    SemanticEvent { event: EventEnvelope },
     #[serde(rename = "plan.state")]
     PlanState {
         explanation: Option<String>,

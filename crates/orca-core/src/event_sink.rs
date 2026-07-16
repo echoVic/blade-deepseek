@@ -207,31 +207,46 @@ impl<W: Write> EventSink<W> {
 }
 
 pub fn observe_event(observer: Option<&dyn EventObserver>, event: EventDraft) -> io::Result<()> {
-    let Some(observer) = observer else {
+    if observer.is_none() && !event.requires_publication_without_observer() {
         return Ok(());
-    };
-    event.publish(|event| observer.observe(event))
+    }
+    event.publish(|event| match observer {
+        Some(observer) => observer.observe(event),
+        None => Ok(()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_schema::{EVENT_SEQUENCE_RESERVATION_SIZE, EventFactory, EventSequenceStore};
+    use crate::event_schema::{
+        EVENT_SEQUENCE_RESERVATION_SIZE, EventFactory, EventPublicationStore,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]
-    struct RecordingSequenceStore {
-        fail: AtomicBool,
+    struct RecordingPublicationStore {
+        fail_reservation: AtomicBool,
+        fail_journal: AtomicBool,
         reservations: Mutex<Vec<u64>>,
+        semantic_events: Mutex<Vec<EventEnvelope>>,
     }
 
-    impl EventSequenceStore for RecordingSequenceStore {
+    impl EventPublicationStore for RecordingPublicationStore {
         fn reserve_through(&self, next_seq_exclusive: u64) -> io::Result<()> {
-            if self.fail.load(Ordering::SeqCst) {
+            if self.fail_reservation.load(Ordering::SeqCst) {
                 return Err(io::Error::other("sequence reservation failed"));
             }
             self.reservations.lock().unwrap().push(next_seq_exclusive);
+            Ok(())
+        }
+
+        fn append_semantic_event(&self, event: &EventEnvelope) -> io::Result<()> {
+            if self.fail_journal.load(Ordering::SeqCst) {
+                return Err(io::Error::other("semantic journal failed"));
+            }
+            self.semantic_events.lock().unwrap().push(event.clone());
             Ok(())
         }
     }
@@ -301,6 +316,144 @@ mod tests {
         let serialized: serde_json::Value =
             serde_json::from_str(String::from_utf8(buf).unwrap().trim()).unwrap();
         assert_eq!(serialized, serde_json::to_value(observed).unwrap());
+    }
+
+    #[test]
+    fn semantic_event_is_journaled_before_observer_with_exact_envelope() {
+        let store = Arc::new(RecordingPublicationStore::default());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let store = Arc::clone(&store);
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                let journal = store.semantic_events.lock().unwrap();
+                assert_eq!(journal.as_slice(), std::slice::from_ref(event));
+                drop(journal);
+                observed.lock().unwrap().push(event.clone());
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events = EventFactory::with_publication_store(
+            "journal-before-observer".to_string(),
+            0,
+            publication_store,
+        );
+
+        EventSink::new(io::sink(), OutputFormat::Jsonl)
+            .with_observer(observer)
+            .emit(events.error("durable failure"))
+            .unwrap();
+
+        let journal = store.semantic_events.lock().unwrap();
+        let observed = observed.lock().unwrap();
+        assert_eq!(journal.as_slice(), observed.as_slice());
+        let event = journal.first().expect("journaled semantic event");
+        assert_eq!(event.version, crate::event_schema::EVENT_SCHEMA_VERSION);
+        assert_eq!(event.run_id, "journal-before-observer");
+        assert_eq!(event.seq, 0);
+        assert!(event.timestamp_ms > 0);
+        assert_eq!(event.event_type, EventType::Error);
+        assert_eq!(event.payload["message"], "durable failure");
+    }
+
+    #[test]
+    fn transient_events_are_explicitly_excluded_from_the_semantic_journal() {
+        let store = Arc::new(RecordingPublicationStore::default());
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events = EventFactory::with_publication_store(
+            "transient-exclusion".to_string(),
+            0,
+            publication_store,
+        );
+        let mut sink = EventSink::new(io::sink(), OutputFormat::Jsonl);
+
+        sink.emit(events.assistant_reasoning_delta("reasoning"))
+            .unwrap();
+        sink.emit(events.assistant_message_delta("message"))
+            .unwrap();
+        sink.emit(events.tool_output_delta("tool-1", "chunk"))
+            .unwrap();
+        sink.emit(events.error("terminal")).unwrap();
+
+        let journal = store.semantic_events.lock().unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].event_type, EventType::Error);
+        assert_eq!(journal[0].seq, 3);
+    }
+
+    #[test]
+    fn semantic_event_without_observer_is_still_journaled_but_transient_is_unpublished() {
+        let store = Arc::new(RecordingPublicationStore::default());
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events = EventFactory::with_publication_store(
+            "journal-only-publication".to_string(),
+            0,
+            publication_store,
+        );
+
+        observe_event(None, events.assistant_message_delta("not published")).unwrap();
+        observe_event(None, events.error("journal only")).unwrap();
+
+        let journal = store.semantic_events.lock().unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].seq, 0);
+        assert_eq!(journal[0].event_type, EventType::Error);
+        assert_eq!(journal[0].payload["message"], "journal only");
+        assert_eq!(
+            store.reservations.lock().unwrap().as_slice(),
+            [EVENT_SEQUENCE_RESERVATION_SIZE]
+        );
+    }
+
+    #[test]
+    fn event_types_have_a_closed_semantic_journal_policy() {
+        let transient = [
+            EventType::AssistantReasoningDelta,
+            EventType::AssistantMessageDelta,
+            EventType::ProviderReplayUpdated,
+            EventType::UsageUpdated,
+            EventType::ContextUpdated,
+            EventType::ToolCallProgress,
+            EventType::ToolOutputDelta,
+            EventType::SubagentProgress,
+            EventType::WorkflowTasksUpdated,
+            EventType::TaskStatusUpdated,
+        ];
+        assert!(transient.iter().all(|event_type| !event_type.is_semantic()));
+
+        let semantic = [
+            EventType::SessionStarted,
+            EventType::TurnStarted,
+            EventType::ContextCompactionStarted,
+            EventType::ContextCompacted,
+            EventType::ModelRouted,
+            EventType::ApprovalRequested,
+            EventType::ApprovalResolved,
+            EventType::ToolCallRequested,
+            EventType::ToolCallCompleted,
+            EventType::PlanUpdated,
+            EventType::SubagentStarted,
+            EventType::SubagentCompleted,
+            EventType::WorkflowStarted,
+            EventType::WorkflowResumed,
+            EventType::WorkflowPhaseStarted,
+            EventType::WorkflowPhaseCompleted,
+            EventType::WorkflowAgentStarted,
+            EventType::WorkflowAgentCached,
+            EventType::WorkflowAgentCompleted,
+            EventType::WorkflowAgentFailed,
+            EventType::WorkflowPaused,
+            EventType::WorkflowStopped,
+            EventType::WorkflowCompleted,
+            EventType::WorkflowFailed,
+            EventType::WorkflowResultAvailable,
+            EventType::VerificationStarted,
+            EventType::VerificationCompleted,
+            EventType::Error,
+            EventType::SessionCompleted,
+        ];
+        assert!(semantic.iter().all(|event_type| event_type.is_semantic()));
     }
 
     #[test]
@@ -405,7 +558,7 @@ mod tests {
 
     #[test]
     fn sequence_block_is_reserved_before_delivery_and_shared_by_events() {
-        let store = Arc::new(RecordingSequenceStore::default());
+        let store = Arc::new(RecordingPublicationStore::default());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observer = {
             let store = Arc::clone(&store);
@@ -419,9 +572,9 @@ mod tests {
                 Ok(())
             }) as Arc<dyn EventObserver>
         };
-        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
         let mut events =
-            EventFactory::with_sequence_store("reserved".to_string(), 0, sequence_store);
+            EventFactory::with_publication_store("reserved".to_string(), 0, publication_store);
         let mut sink = EventSink::new(io::sink(), OutputFormat::Jsonl).with_observer(observer);
 
         sink.emit(events.error("first")).unwrap();
@@ -436,10 +589,13 @@ mod tests {
 
     #[test]
     fn crossing_sequence_block_reserves_before_first_event_in_next_block() {
-        let store = Arc::new(RecordingSequenceStore::default());
-        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
-        let mut events =
-            EventFactory::with_sequence_store("block-crossing".to_string(), 0, sequence_store);
+        let store = Arc::new(RecordingPublicationStore::default());
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events = EventFactory::with_publication_store(
+            "block-crossing".to_string(),
+            0,
+            publication_store,
+        );
         let mut sink = EventSink::new(io::sink(), OutputFormat::Jsonl);
 
         for index in 0..=EVENT_SEQUENCE_RESERVATION_SIZE {
@@ -457,7 +613,7 @@ mod tests {
 
     #[test]
     fn resumed_factory_starts_after_prior_exclusive_reservation() {
-        let store = Arc::new(RecordingSequenceStore::default());
+        let store = Arc::new(RecordingPublicationStore::default());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observer = {
             let observed = Arc::clone(&observed);
@@ -466,11 +622,11 @@ mod tests {
                 Ok(())
             }) as Arc<dyn EventObserver>
         };
-        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
-        let mut events = EventFactory::with_sequence_store(
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events = EventFactory::with_publication_store(
             "resumed".to_string(),
             EVENT_SEQUENCE_RESERVATION_SIZE,
-            sequence_store,
+            publication_store,
         );
 
         EventSink::new(io::sink(), OutputFormat::Jsonl)
@@ -490,8 +646,8 @@ mod tests {
 
     #[test]
     fn reservation_failure_prevents_delivery_without_consuming_sequence() {
-        let store = Arc::new(RecordingSequenceStore::default());
-        store.fail.store(true, Ordering::SeqCst);
+        let store = Arc::new(RecordingPublicationStore::default());
+        store.fail_reservation.store(true, Ordering::SeqCst);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observer = {
             let observed = Arc::clone(&observed);
@@ -500,9 +656,12 @@ mod tests {
                 Ok(())
             }) as Arc<dyn EventObserver>
         };
-        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
-        let mut events =
-            EventFactory::with_sequence_store("reservation-error".to_string(), 0, sequence_store);
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events = EventFactory::with_publication_store(
+            "reservation-error".to_string(),
+            0,
+            publication_store,
+        );
         let mut sink =
             EventSink::new(Vec::new(), OutputFormat::Jsonl).with_observer(Arc::clone(&observer));
 
@@ -511,8 +670,42 @@ mod tests {
         assert!(observed.lock().unwrap().is_empty());
         assert!(sink.writer_mut().is_empty());
 
-        store.fail.store(false, Ordering::SeqCst);
+        store.fail_reservation.store(false, Ordering::SeqCst);
         sink.emit(events.error("delivered after retry")).unwrap();
         assert_eq!(observed.lock().unwrap().as_slice(), [0]);
+    }
+
+    #[test]
+    fn journal_failure_prevents_delivery_and_consumes_the_ambiguous_sequence() {
+        let store = Arc::new(RecordingPublicationStore::default());
+        store.fail_journal.store(true, Ordering::SeqCst);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                observed.lock().unwrap().push(event.clone());
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let publication_store: Arc<dyn EventPublicationStore> = store.clone();
+        let mut events =
+            EventFactory::with_publication_store("journal-error".to_string(), 0, publication_store);
+        let mut sink =
+            EventSink::new(Vec::new(), OutputFormat::Jsonl).with_observer(Arc::clone(&observer));
+
+        let error = sink.emit(events.error("ambiguous append")).unwrap_err();
+        assert!(error.to_string().contains("semantic journal failed"));
+        assert!(observed.lock().unwrap().is_empty());
+        assert!(sink.writer_mut().is_empty());
+
+        store.fail_journal.store(false, Ordering::SeqCst);
+        sink.emit(events.error("cleanup delivery")).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].seq, 1);
+        assert_eq!(observed[0].payload["message"], "cleanup delivery");
+        let journal = store.semantic_events.lock().unwrap();
+        assert_eq!(journal.as_slice(), observed.as_slice());
     }
 }
