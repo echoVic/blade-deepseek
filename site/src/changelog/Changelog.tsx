@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.34":
+        "Interrupting a TUI or server turn now reaches parallel read-only tool calls that have already started, waits for every worker and transport to clean up, and only then publishes the operation terminal or admits the next prompt. RuntimeToolCallRuntime owns each invocation's concurrency permit, cancellation, started state, blocking task, join, panic classification, and exactly-once terminal while preserving provider order. MCP resource list, template, and read requests are cancellable; stdio reconnects after cancellation and SSE remains reusable. The old orca-tools batch scheduler is removed. Normal tools and subagents remain explicit P1.2 follow-ups.",
       "v0.2.33":
         "A submitted prompt now has one admission owner and one durable user row. Hosted turn preparation persists the identified user message before committing it to model context, while agent-loop bootstrap explicitly distinguishes owned child-agent conversations from borrowed hosted sessions and never replays borrowed initial history. Live thread reads, turn pagination, item pagination, cold ThreadStore reads, restart, and resume now expose one user item per logical turn with stable turn and item ids. Existing duplicate history remains readable without a projection-time deduplication layer.",
       "v0.2.32":
@@ -520,6 +522,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.34":
+        "中断 TUI 或 server turn 现在会传递到已经启动的并行只读工具调用，等待所有 worker 和 transport 完成清理后，才发布 operation terminal 或接收下一次提交。RuntimeToolCallRuntime 统一拥有每次调用的并发 permit、取消、started 状态、blocking task、join、panic 分类和 exactly-once terminal，同时保持 provider 顺序。MCP resource list、template 和 read 请求均可取消；stdio 会在取消后重连，SSE transport 可继续复用。旧的 orca-tools batch scheduler 已删除；普通工具和 subagent 仍是明确的 P1.2 后续切片。",
       "v0.2.33":
         "每次提交的 prompt 现在只有一个准入所有者和一条持久化 user 记录。Hosted turn preparation 会先持久化带身份的 user message，再把它提交到模型上下文；agent loop bootstrap 则显式区分独立 child-agent conversation 与借用的 hosted session，借用路径不会再重复写入初始历史。实时 thread read、turn 分页、item 分页、冷启动 ThreadStore、重启与 resume 都只会为每个逻辑 turn 返回一个 user item，并保持 turn/item id 稳定。已有重复历史继续可读，不增加投影时去重层。",
       "v0.2.32":

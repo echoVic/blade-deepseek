@@ -3,18 +3,25 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-16
-Current baseline: v0.2.33 gives every submitted hosted prompt one admission
-owner and one durable user item. `ThreadTurnContext` persists the identified
-user message before committing it to model conversation state. Agent-loop
-bootstrap now uses an explicit owned-or-borrowed provenance type: independent
-child agents construct their own conversation, while a borrowed runtime
-session never bootstraps or persists the already-admitted prompt again. Live
-thread reads, turn and item pagination, cold ThreadStore reads, restart, and
-resume therefore expose one user row per logical turn with stable identities.
+Last updated: 2026-07-17
+Current baseline: v0.2.34 moves parallel read-only invocation lifetime into
+`RuntimeToolCallRuntime`. Each admitted call has one owner for its concurrency
+permit, cancellation view, started state, blocking task, join, panic
+classification, and exactly-once terminal. Interrupt reaches calls that have
+already started, waits for every worker and transport to clean up, and only
+then publishes the RuntimeHost terminal or admits the next prompt. Results are
+persisted in provider order even when execution completes out of order.
 
-The release closes the remaining duplicate-write gap in the first P1.1
-identity chain. Foreground and host-adopted
+MCP resource list, template, and read operations now accept typed cancellation.
+The stdio transport performs a bounded reconnect before returning from a
+cancelled request, while SSE closes the request and remains reusable. Direct
+CLI and workflow callers without an ambient Tokio runtime use a batch-owned
+runtime that is dropped after all workers join. P1.2a is complete; sequential
+normal tools and subagents remain the explicit P1.2b and P1.2c boundaries.
+
+Earlier v0.2.33 closes the remaining duplicate-write gap in the first P1.1
+identity chain. Every submitted hosted prompt has one admission owner and one
+durable user item. Foreground and host-adopted
 background work share one publication boundary; sequence ranges are reserved
 durably before use; selected semantic events are appended before observer or
 output visibility; logical turn and conversation-item ids are allocated at
@@ -350,6 +357,31 @@ workspace Clippy with the existing warning baseline, site and release-helper
 gates, and the real DeepSeek cross-process server harness pass. Existing
 duplicate histories remain readable without mutation. P1.1h is complete and
 released in v0.2.33.
+
+P1.2a now gives parallel read-only tool calls one runtime-owned lifecycle.
+`RuntimeToolCallRuntime` owns admission permits, cancellation observation,
+execution-start state, blocking workers, joins, panic classification, and the
+exactly-once terminal for every invocation. RuntimeHost interrupt therefore
+reaches already-started calls and waits for all cleanup before publishing the
+operation terminal or admitting the next turn. Natural completion wins a
+cancellation race, a panic after dispatch is indeterminate, and batch results
+retain provider request order even when workers finish out of order.
+
+MCP resource list, template, and read paths now carry typed cancellation through
+the registry, client, and transport. Cancelled stdio requests perform a bounded
+reconnect before returning, while SSE requests close and leave the transport
+reusable. Direct CLI and workflow child-agent paths without an ambient Tokio
+runtime create a batch-owned runtime whose lifetime ends only after every
+worker joins. The `orca-tools` scoped-thread batch helpers, their pre-spawn-only
+cancellation test, the top-level shim export, and source-shape ownership tests
+are deleted.
+
+Runtime, RuntimeHost, MCP, tools, workflow, and TUI behavior tests pass, followed
+by the serial workspace all-targets gate, workspace Clippy with the established
+warning baseline, site and release-helper gates, and the full real DeepSeek
+provider/CLI/history/server harness. CLI arguments, TUI flows, server/JSONL,
+persistence, and provider request ordering remain compatible. P1.2a is complete
+and released in v0.2.34; normal tools and subagents remain P1.2b and P1.2c.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or

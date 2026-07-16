@@ -1,6 +1,6 @@
 # P1.2a Runtime-Owned Read-Only Tool Calls Plan
 
-- Status: planned; release target `v0.2.34`
+- Status: complete; release target `v0.2.34`
 - Base: `30e8e92f68342e63c19523847f6dad51652305ed`
 - Branch: `codex/readonly-tool-call-runtime-p12a`
 
@@ -93,7 +93,9 @@ state must not become the tool scheduler, cancellation owner, or result ledger.
 Add `runtime_tool_call.rs` with these responsibilities:
 
 - `RuntimeToolCallRuntime` owns the Tokio runtime handle used by the current
-  RuntimeHost generation and a bounded parallel-admission gate;
+  RuntimeHost generation and a bounded parallel-admission gate. Direct CLI and
+  workflow callers without an ambient Tokio runtime create a batch-owned
+  runtime that is dropped only after every invocation has joined;
 - an owned read-only invocation value carries the provider call id, effective
   request, cwd, MCP registry, output policy, and one-shot cancellation view;
 - one invocation task acquires its permit, marks execution started once, calls
