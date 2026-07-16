@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible problem in Orca
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security vulnerabilities must be reported privately through GitHub Security Advisories, not public Issues.
+  - type: input
+    id: version
+    attributes:
+      label: Orca version
+      description: Provide the exact Orca version or commit.
+    validations:
+      required: true
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Installation method
+      options:
+        - Prebuilt release
+        - Built from source
+        - Package manager
+        - Other
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Include the operating system, architecture, and terminal when relevant.
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - TUI
+        - orca exec
+        - Embedded server
+        - Other
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide a minimal, repeatable sequence that demonstrates the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression details
+      description: If this worked before, identify the last known working version or commit.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: Paste relevant, redacted logs or diagnostics.
+      render: shell
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Sensitive data check
+      options:
+        - label: I have removed secrets and sensitive data from this report and its attachments.
+          required: true

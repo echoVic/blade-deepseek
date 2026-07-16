@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose an improvement or new capability for Orca
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the problem or limitation this feature would address.
+    validations:
+      required: true
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: Explain the concrete workflow and who benefits from it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the behavior or interface you are proposing.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: affected_surfaces
+    attributes:
+      label: Affected surfaces
+      description: Select every surface this proposal may affect.
+      options:
+        - label: TUI
+        - label: orca exec
+        - label: Embedded server
+        - label: tools/MCP
+        - label: subagents/workflows
+        - label: history/persistence
+        - label: other
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Note any protocol, persistence, security, or dependency impact.
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Contribution expectations
+      options:
+        - label: I have removed secrets and sensitive data from this request.
+          required: true
+        - label: I will wait for maintainer alignment before implementing large or compatibility-sensitive changes.
+          required: true

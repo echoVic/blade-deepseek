@@ -1,0 +1,36 @@
+name: Documentation improvement
+description: Report missing, unclear, or incorrect Orca documentation
+title: "[Docs]: "
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Documentation location
+      description: Link to or name the page, file, command, or section.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Explain what is missing, unclear, or incorrect.
+    validations:
+      required: true
+  - type: textarea
+    id: suggested_change
+    attributes:
+      label: Suggested change
+      description: Describe the correction or improvement you recommend.
+    validations:
+      required: true
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Sensitive data check
+      options:
+        - label: I have removed secrets and sensitive data from this report and its attachments.
+          required: true
