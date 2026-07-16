@@ -347,6 +347,10 @@ impl RecordingEventObserver {
             .filter(|event| event.event_type == event_type)
             .count()
     }
+
+    fn events(&self) -> Vec<EventEnvelope> {
+        self.events.lock().unwrap().clone()
+    }
 }
 
 impl EventObserver for RecordingEventObserver {
@@ -2155,6 +2159,69 @@ fn runtime_host_owns_suspended_provider_and_releases_actor_for_the_next_turn() {
     );
 
     wait_until_task_status(&thread, &task_id, TaskStatus::Completed);
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn provider_background_handoff_keeps_one_thread_event_sequence() {
+    let cwd = tempfile::tempdir().unwrap();
+    let config = test_config(cwd.path().to_path_buf());
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(config, "provider event sequence")
+        .expect("start hosted runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let request = HostedTurnRequest::new("mock_stream_delay_ms 100")
+        .with_task_description("sequenced background provider")
+        .with_event_observer(observer.clone())
+        .with_generation_handlers(|_fence, _cancel| {
+            HostedGenerationHandlers::default()
+                .with_provider_suspension_control(Arc::new(OneShotProviderSuspension::new()))
+        });
+
+    let operation = thread
+        .start_turn(request, io::sink())
+        .expect("start suspendable turn");
+    let task_id = match operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("background handoff terminal")
+        .outcome()
+    {
+        OperationOutcome::Backgrounded { task_id } => task_id.clone(),
+        other => panic!("expected host-owned background handoff, got {other:?}"),
+    };
+    wait_until_task_status(&thread, &task_id, TaskStatus::Completed);
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let terminal_observed = observer.events().iter().any(|event| {
+            event.event_type == EventType::TaskStatusUpdated
+                && event.payload["task"]["id"] == task_id
+                && event.payload["task"]["status"] == "completed"
+        });
+        if terminal_observed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background provider terminal event was not observed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut sequences = observer
+        .events()
+        .into_iter()
+        .filter(|event| event.run_id == thread.thread_id())
+        .map(|event| event.seq)
+        .collect::<Vec<_>>();
+    sequences.sort_unstable();
+    assert_eq!(
+        sequences,
+        (0..sequences.len() as u64).collect::<Vec<_>>(),
+        "foreground and background provider events must share one sequence"
+    );
+
     host.shutdown().expect("shutdown runtime host");
 }
 

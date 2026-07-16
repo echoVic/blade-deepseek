@@ -1798,8 +1798,8 @@ struct ProviderBackgroundTaskContext {
     task_registry: TaskRegistry,
     history_writer: Option<crate::history::SessionWriter>,
     observer: Option<Arc<dyn EventObserver>>,
+    events: EventFactory,
     model: Option<String>,
-    run_id: String,
     task_id: String,
     usage_ledger: RuntimeUsageLedger,
 }
@@ -2652,8 +2652,8 @@ impl ThreadActor {
             task_registry,
             history_writer,
             observer: active.request.event_observer(),
+            events: state.events.fork(),
             model: suspension.model().map(str::to_string),
-            run_id: state.events.run_id().to_string(),
             task_id: task_id.clone(),
             usage_ledger: self.usage_ledger.clone(),
         };
@@ -2952,7 +2952,7 @@ fn run_provider_background_task(
     mut context: ProviderBackgroundTaskContext,
     cancel: &CancelToken,
 ) {
-    let mut events = EventFactory::new(context.run_id.clone());
+    let mut events = context.events;
     let mut buffered_steps = Vec::new();
     let mut cancelled = false;
     let mut response = None;

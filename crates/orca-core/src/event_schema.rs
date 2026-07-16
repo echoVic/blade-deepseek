@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -164,16 +166,27 @@ impl RunStatus {
 
 pub struct EventFactory {
     run_id: String,
-    seq: u64,
+    next_seq: Arc<AtomicU64>,
 }
 
 impl EventFactory {
     pub fn new(run_id: String) -> Self {
-        Self { run_id, seq: 0 }
+        Self {
+            run_id,
+            next_seq: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Fork an event producer without creating a second sequence authority.
+    pub fn fork(&self) -> Self {
+        Self {
+            run_id: self.run_id.clone(),
+            next_seq: Arc::clone(&self.next_seq),
+        }
     }
 
     pub fn session_started(
@@ -750,16 +763,14 @@ impl EventFactory {
     }
 
     fn make(&mut self, event_type: EventType, payload: Value) -> EventEnvelope {
-        let envelope = EventEnvelope {
+        EventEnvelope {
             version: EVENT_SCHEMA_VERSION,
             run_id: self.run_id.clone(),
-            seq: self.seq,
+            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
             timestamp_ms: timestamp_ms(),
             event_type,
             payload,
-        };
-        self.seq += 1;
-        envelope
+        }
     }
 
     fn make_serialized(&mut self, event_type: EventType, payload: impl Serialize) -> EventEnvelope {
@@ -1192,5 +1203,19 @@ mod tests {
         assert_eq!(parsed["payload"]["text"], "test text");
         assert_eq!(parsed["seq"], 0);
         assert_eq!(parsed["version"], "1");
+    }
+
+    #[test]
+    fn forked_event_factories_share_one_sequence() {
+        let mut foreground = EventFactory::new("thread-1".to_string());
+        let mut background = foreground.fork();
+
+        let first = foreground.error("foreground");
+        let second = background.error("background");
+        let third = foreground.error("foreground again");
+
+        assert_eq!([first.seq, second.seq, third.seq], [0, 1, 2]);
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(second.run_id, third.run_id);
     }
 }
