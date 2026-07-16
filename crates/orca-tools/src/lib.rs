@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::thread;
 
 use orca_core::approval_types::ActionKind;
 use orca_core::external_config::ExternalToolConfig;
@@ -236,94 +235,6 @@ pub fn collect_readonly_batch(
     end
 }
 
-pub fn run_readonly_batch_parallel(
-    tool_requests: &[ToolRequest],
-    runnable: Vec<(usize, ToolRequest)>,
-    cwd: &Path,
-    mcp_registry: &McpRegistry,
-) -> Vec<ToolResult> {
-    run_readonly_batch_parallel_with_policy(
-        tool_requests,
-        runnable,
-        cwd,
-        mcp_registry,
-        ToolOutputTruncation::default(),
-    )
-}
-
-pub fn run_readonly_batch_parallel_with_policy(
-    tool_requests: &[ToolRequest],
-    runnable: Vec<(usize, ToolRequest)>,
-    cwd: &Path,
-    mcp_registry: &McpRegistry,
-    output_truncation: ToolOutputTruncation,
-) -> Vec<ToolResult> {
-    run_readonly_batch_parallel_with_policy_or_cancel(
-        tool_requests,
-        runnable,
-        cwd,
-        mcp_registry,
-        output_truncation,
-        || false,
-    )
-}
-
-pub fn run_readonly_batch_parallel_with_policy_or_cancel(
-    tool_requests: &[ToolRequest],
-    runnable: Vec<(usize, ToolRequest)>,
-    cwd: &Path,
-    mcp_registry: &McpRegistry,
-    output_truncation: ToolOutputTruncation,
-    should_cancel: impl Fn() -> bool,
-) -> Vec<ToolResult> {
-    let mut results: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
-    let cwd = cwd.to_path_buf();
-    let mcp_registry = mcp_registry.clone();
-
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (idx, tool_request) in runnable {
-            if should_cancel() {
-                results[idx] = Some(ToolResult::cancelled_before_start(
-                    &tool_request,
-                    "the read-only batch was cancelled before dispatch",
-                ));
-                continue;
-            }
-            let cwd = cwd.clone();
-            let mcp_registry = mcp_registry.clone();
-            let output_truncation = output_truncation.normalized();
-            handles.push((
-                idx,
-                scope.spawn(move || {
-                    execute_with_mcp_external_and_policy(
-                        &tool_request,
-                        &cwd,
-                        &mcp_registry,
-                        &[],
-                        output_truncation,
-                        120,
-                    )
-                }),
-            ));
-        }
-
-        for (idx, handle) in handles {
-            results[idx] = Some(match handle.join() {
-                Ok(result) => result,
-                Err(_) => {
-                    ToolResult::failed(&tool_requests[idx], "read-only tool thread panicked", None)
-                }
-            });
-        }
-    });
-
-    results
-        .into_iter()
-        .map(|result| result.expect("each read-only batch item has a result"))
-        .collect()
-}
-
 pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBuf, String> {
     let target = target.unwrap_or(".");
     let candidate = PathBuf::from(target);
@@ -369,10 +280,8 @@ mod tests {
     use orca_core::approval_types::ActionKind;
     use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
     use orca_core::tool_types::{
-        InterruptSemantics, ReplaySemantics, ToolControlSemantics, ToolInvocationStarted,
-        ToolStatus, truncate_output,
+        InterruptSemantics, ReplaySemantics, ToolControlSemantics, ToolStatus, truncate_output,
     };
-    use std::cell::Cell;
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -887,46 +796,6 @@ done
         };
 
         assert!(should_run_readonly_batch(2, &request));
-    }
-
-    #[test]
-    fn readonly_batch_cancels_only_requests_not_spawned_yet() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        for name in ["one.txt", "two.txt", "three.txt"] {
-            fs::write(temp_dir.path().join(name), name).expect("write fixture");
-        }
-        let requests = ["one.txt", "two.txt", "three.txt"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, path)| ToolRequest {
-                id: format!("read-{}", index + 1),
-                name: ToolName::ReadFile,
-                action: ActionKind::Read,
-                target: Some(path.to_string()),
-                raw_arguments: Some(serde_json::json!({ "path": path }).to_string()),
-            })
-            .collect::<Vec<_>>();
-        let runnable = requests.iter().cloned().enumerate().collect();
-        let cancel_checks = Cell::new(0);
-
-        let results = run_readonly_batch_parallel_with_policy_or_cancel(
-            &requests,
-            runnable,
-            temp_dir.path(),
-            &McpRegistry::default(),
-            ToolOutputTruncation::default(),
-            || {
-                let next = cancel_checks.get() + 1;
-                cancel_checks.set(next);
-                next > 1
-            },
-        );
-
-        assert_eq!(results[0].status, ToolStatus::Completed);
-        for result in &results[1..] {
-            assert_eq!(result.status, ToolStatus::Cancelled);
-            assert_eq!(result.terminal().started, ToolInvocationStarted::No);
-        }
     }
 
     #[test]

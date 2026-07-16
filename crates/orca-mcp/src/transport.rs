@@ -83,8 +83,33 @@ pub trait McpTransport: Send + Sync {
         self.call_tool_with_elicitation_handler(name, arguments, handler)
     }
     fn list_resources(&self) -> Result<Value, String>;
+    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.list_resources()
+    }
     fn list_resource_templates(&self) -> Result<Value, String>;
+    fn list_resource_templates_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.list_resource_templates()
+    }
     fn read_resource(&self, uri: &str) -> Result<Value, String>;
+    fn read_resource_or_cancel(
+        &self,
+        uri: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        if should_cancel() {
+            return Err("MCP tool call cancelled".to_string());
+        }
+        self.read_resource(uri)
+    }
 }
 
 pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String> {
@@ -299,6 +324,16 @@ impl McpTransport for StdioTransport {
         )
     }
 
+    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+        self.request_with_timeout(
+            "resources/list",
+            json!({}),
+            self.startup_timeout,
+            None,
+            Some(should_cancel),
+        )
+    }
+
     fn list_resource_templates(&self) -> Result<Value, String> {
         self.request_with_timeout(
             "resources/templates/list",
@@ -306,6 +341,19 @@ impl McpTransport for StdioTransport {
             self.startup_timeout,
             None,
             None,
+        )
+    }
+
+    fn list_resource_templates_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.request_with_timeout(
+            "resources/templates/list",
+            json!({}),
+            self.startup_timeout,
+            None,
+            Some(should_cancel),
         )
     }
 
@@ -318,6 +366,22 @@ impl McpTransport for StdioTransport {
             self.tool_timeout,
             None,
             None,
+        )
+    }
+
+    fn read_resource_or_cancel(
+        &self,
+        uri: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.request_with_timeout(
+            "resources/read",
+            json!({
+                "uri": uri
+            }),
+            self.tool_timeout,
+            None,
+            Some(should_cancel),
         )
     }
 }
@@ -719,8 +783,29 @@ impl McpTransport for SseTransport {
         self.request_with_timeout("resources/list", json!({}), self.startup_timeout)
     }
 
+    fn list_resources_or_cancel(&self, should_cancel: &dyn Fn() -> bool) -> Result<Value, String> {
+        self.request_with_timeout_or_cancel(
+            "resources/list",
+            json!({}),
+            self.startup_timeout,
+            should_cancel,
+        )
+    }
+
     fn list_resource_templates(&self) -> Result<Value, String> {
         self.request_with_timeout("resources/templates/list", json!({}), self.startup_timeout)
+    }
+
+    fn list_resource_templates_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.request_with_timeout_or_cancel(
+            "resources/templates/list",
+            json!({}),
+            self.startup_timeout,
+            should_cancel,
+        )
     }
 
     fn read_resource(&self, uri: &str) -> Result<Value, String> {
@@ -730,6 +815,21 @@ impl McpTransport for SseTransport {
                 "uri": uri
             }),
             self.tool_timeout,
+        )
+    }
+
+    fn read_resource_or_cancel(
+        &self,
+        uri: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, String> {
+        self.request_with_timeout_or_cancel(
+            "resources/read",
+            json!({
+                "uri": uri
+            }),
+            self.tool_timeout,
+            should_cancel,
         )
     }
 }
@@ -1922,10 +2022,49 @@ done
             "SSE transport was not reusable promptly after cancellation: {reuse_elapsed:?}"
         );
         assert!(
-            server.first_tool_call_finished(),
+            server.first_request_finished(),
             "cancelled SSE request connection remained active"
         );
         assert_eq!(second["content"][0]["text"], "reconnected");
+    }
+
+    #[test]
+    fn sse_resource_cancel_drops_stalled_request_before_reuse() {
+        let server = CancellableSseServer::start();
+        let transport = connect(&McpServerConfig {
+            name: "cancellable_resources".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(server.url()),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(5000),
+            tool_timeout_ms: Some(5000),
+        })
+        .expect("connect SSE MCP");
+        transport.initialize().expect("initialize SSE MCP");
+        transport.list_tools().expect("list SSE tools");
+        let started = Instant::now();
+
+        let result =
+            transport.list_resources_or_cancel(&|| started.elapsed() >= Duration::from_millis(50));
+        let cancellation_elapsed = started.elapsed();
+        let second = transport
+            .list_resources()
+            .expect("SSE resource transport remains usable after cancellation cleanup");
+
+        assert!(
+            cancellation_elapsed < Duration::from_millis(750),
+            "resource listing took {cancellation_elapsed:?}"
+        );
+        assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert!(
+            server.first_request_finished(),
+            "cancelled SSE resource request remained active"
+        );
+        assert_eq!(second, json!({"resources": []}));
     }
 
     struct CancellableSseServer {
@@ -1940,14 +2079,16 @@ done
             let first_finished = Arc::new(AtomicBool::new(false));
             let finished_for_server = Arc::clone(&first_finished);
             std::thread::spawn(move || {
-                let tool_calls = AtomicUsize::new(0);
+                let cancellable_calls = AtomicUsize::new(0);
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else {
                         break;
                     };
                     let request = read_http_request(&mut stream);
-                    if request.contains(r#""method":"tools/call""#) {
-                        let call = tool_calls.fetch_add(1, Ordering::SeqCst);
+                    if request.contains(r#""method":"tools/call""#)
+                        || request.contains(r#""method":"resources/list""#)
+                    {
+                        let call = cancellable_calls.fetch_add(1, Ordering::SeqCst);
                         if call == 0 {
                             stream
                                 .set_read_timeout(None)
@@ -1956,10 +2097,17 @@ done
                             while stream.read(&mut probe).is_ok_and(|read| read != 0) {}
                             finished_for_server.store(true, Ordering::SeqCst);
                         } else {
-                            write_json_response(
-                                &mut stream,
-                                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"reconnected"}],"isError":false}}"#,
-                            );
+                            if request.contains(r#""method":"resources/list""#) {
+                                write_json_response(
+                                    &mut stream,
+                                    r#"{"jsonrpc":"2.0","id":4,"result":{"resources":[]}}"#,
+                                );
+                            } else {
+                                write_json_response(
+                                    &mut stream,
+                                    r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"reconnected"}],"isError":false}}"#,
+                                );
+                            }
                         }
                     } else if request.contains(r#""method":"tools/list""#) {
                         write_json_response(
@@ -1986,7 +2134,7 @@ done
             format!("http://{}", self.addr)
         }
 
-        fn first_tool_call_finished(&self) -> bool {
+        fn first_request_finished(&self) -> bool {
             self.first_finished.load(Ordering::SeqCst)
         }
     }

@@ -345,6 +345,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     emit_deltas,
                     cancel,
                     output_truncation: config.tools.output_truncation,
+                    max_parallel: config.tools.max_read_parallel,
                 },
                 io: RuntimeReadonlyToolTurnIo {
                     events,
@@ -1343,6 +1344,7 @@ mod tests {
                 emit_deltas: false,
                 cancel: &CancelToken::new(),
                 output_truncation: ToolConfig::default().output_truncation,
+                max_parallel: 2,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -1410,6 +1412,7 @@ mod tests {
                 emit_deltas: false,
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
+                max_parallel: 2,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -1476,6 +1479,7 @@ mod tests {
                 emit_deltas: false,
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
+                max_parallel: 2,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -1537,6 +1541,7 @@ mod tests {
                 emit_deltas: false,
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
+                max_parallel: 2,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,

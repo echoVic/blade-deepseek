@@ -14,7 +14,7 @@ use orca_core::tool_types::{
     ResultSemantics, ToolCapability, ToolControlSemantics, ToolExposure, ToolName,
     ToolOutputTruncation, ToolRequest, ToolResult, ToolSpec,
 };
-use orca_mcp::{McpElicitationHandler, McpRegistry, client::McpCallOutput};
+use orca_mcp::{McpElicitationHandler, McpRegistry, McpRequestError, client::McpCallOutput};
 
 use crate::{
     bash, edit, external, git, glob, grep, list_files, read_file, skills, update_goal, update_plan,
@@ -1728,9 +1728,23 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
         Err(error) => return ToolResult::failed(request, error, None),
     };
     let server = args.get("server").and_then(Value::as_str);
+    let should_cancel = || ctx.is_cancelled();
 
     if server.is_none() {
-        let listing = registry.list_resources_with_errors(None);
+        let listing = if ctx.should_cancel.is_some() {
+            registry.list_resources_with_errors_or_cancel(None, &should_cancel)
+        } else {
+            Ok(registry.list_resources_with_errors(None))
+        };
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(McpRequestError::Cancelled) => {
+                return ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None);
+            }
+            Err(McpRequestError::Failed(error)) => {
+                return ToolResult::failed(request, error, None);
+            }
+        };
         let output = json!({
             "resources": listing.resources,
             "errors": listing.errors,
@@ -1745,7 +1759,14 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
         };
     }
 
-    match registry.list_resources(server) {
+    let result = if ctx.should_cancel.is_some() {
+        registry.list_resources_or_cancel(server, &should_cancel)
+    } else {
+        registry
+            .list_resources(server)
+            .map_err(McpRequestError::Failed)
+    };
+    match result {
         Ok(resources) => match serde_json::to_string(&resources) {
             Ok(output) => ToolResult::completed(request, output, false),
             Err(error) => ToolResult::failed(
@@ -1754,7 +1775,10 @@ fn execute_list_mcp_resources(request: &ToolRequest, ctx: &ToolContext<'_>) -> T
                 None,
             ),
         },
-        Err(error) => ToolResult::failed(request, error, None),
+        Err(McpRequestError::Cancelled) => {
+            ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None)
+        }
+        Err(McpRequestError::Failed(error)) => ToolResult::failed(request, error, None),
     }
 }
 
@@ -1767,9 +1791,23 @@ fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<
         Err(error) => return ToolResult::failed(request, error, None),
     };
     let server = args.get("server").and_then(Value::as_str);
+    let should_cancel = || ctx.is_cancelled();
 
     if server.is_none() {
-        let listing = registry.list_resource_templates_with_errors(None);
+        let listing = if ctx.should_cancel.is_some() {
+            registry.list_resource_templates_with_errors_or_cancel(None, &should_cancel)
+        } else {
+            Ok(registry.list_resource_templates_with_errors(None))
+        };
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(McpRequestError::Cancelled) => {
+                return ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None);
+            }
+            Err(McpRequestError::Failed(error)) => {
+                return ToolResult::failed(request, error, None);
+            }
+        };
         let output = json!({
             "resourceTemplates": listing.resource_templates,
             "errors": listing.errors,
@@ -1784,7 +1822,14 @@ fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<
         };
     }
 
-    match registry.list_resource_templates(server) {
+    let result = if ctx.should_cancel.is_some() {
+        registry.list_resource_templates_or_cancel(server, &should_cancel)
+    } else {
+        registry
+            .list_resource_templates(server)
+            .map_err(McpRequestError::Failed)
+    };
+    match result {
         Ok(resource_templates) => match serde_json::to_string(&resource_templates) {
             Ok(output) => ToolResult::completed(request, output, false),
             Err(error) => ToolResult::failed(
@@ -1793,7 +1838,10 @@ fn execute_list_mcp_resource_templates(request: &ToolRequest, ctx: &ToolContext<
                 None,
             ),
         },
-        Err(error) => ToolResult::failed(request, error, None),
+        Err(McpRequestError::Cancelled) => {
+            ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None)
+        }
+        Err(McpRequestError::Failed(error)) => ToolResult::failed(request, error, None),
     }
 }
 
@@ -1814,8 +1862,16 @@ fn execute_read_mcp_resource(request: &ToolRequest, ctx: &ToolContext<'_>) -> To
     let Some(uri) = args.get("uri").and_then(Value::as_str) else {
         return ToolResult::invalid_input(request, "read_mcp_resource requires string field 'uri'");
     };
+    let should_cancel = || ctx.is_cancelled();
 
-    match registry.read_resource(server, uri) {
+    let result = if ctx.should_cancel.is_some() {
+        registry.read_resource_or_cancel(server, uri, &should_cancel)
+    } else {
+        registry
+            .read_resource(server, uri)
+            .map_err(McpRequestError::Failed)
+    };
+    match result {
         Ok(result) => match serde_json::to_string(&result) {
             Ok(output) => ToolResult::completed(request, output, false),
             Err(error) => ToolResult::failed(
@@ -1824,7 +1880,10 @@ fn execute_read_mcp_resource(request: &ToolRequest, ctx: &ToolContext<'_>) -> To
                 None,
             ),
         },
-        Err(error) => ToolResult::failed(request, error, None),
+        Err(McpRequestError::Cancelled) => {
+            ToolResult::cancelled(request, MCP_TOOL_CALL_CANCELLED, None)
+        }
+        Err(McpRequestError::Failed(error)) => ToolResult::failed(request, error, None),
     }
 }
 

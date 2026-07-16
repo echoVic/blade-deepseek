@@ -26,8 +26,6 @@ use crate::background_turn::RuntimeTurnContinuation;
 use crate::cost::CostTracker;
 use crate::extension::ExtensionData;
 #[cfg(test)]
-use crate::hooks::HookContext;
-#[cfg(test)]
 use crate::hooks::HookRunner;
 #[cfg(test)]
 use crate::instructions::ProjectInstructions;
@@ -48,13 +46,7 @@ use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 #[cfg(test)]
 use crate::thread::RuntimeThread;
 use crate::tool_invocation::AgentToolPolicyContext;
-#[cfg(test)]
-use crate::tool_invocation::{
-    apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
-};
 use crate::workflow_execution::{BackgroundWorkflowRun, observe_background_workflows};
-#[cfg(test)]
-use orca_core::hook_types::HookEvent;
 
 #[cfg(test)]
 const DEFAULT_MAX_TURNS: u32 = 128;
@@ -1245,92 +1237,6 @@ fn canonical_action_for_tool(
     )
 }
 
-#[cfg(test)]
-fn execute_readonly_batch(
-    cwd: &Path,
-    events: &mut EventFactory,
-    sink: &mut EventSink<impl io::Write>,
-    tool_requests: &[tool_types::ToolRequest],
-    emit_deltas: bool,
-    mcp_registry: &McpRegistry,
-    hooks: &HookRunner,
-    output_truncation: tool_types::ToolOutputTruncation,
-) -> io::Result<Vec<tool_types::ToolResult>> {
-    let mut hook_failed: Vec<Option<tool_types::ToolResult>> = vec![None; tool_requests.len()];
-    let mut runnable = Vec::new();
-
-    for (idx, tool_request) in tool_requests.iter().enumerate() {
-        let invocation =
-            prepare_tool_invocation_with_external(tool_request, 0, u32::MAX, mcp_registry, &[]);
-        if emit_deltas {
-            sink.emit(events.tool_call_requested(tool_request))?;
-        }
-        match hooks.run(
-            HookEvent::PreToolUse,
-            HookContext {
-                cwd: &cwd.display().to_string(),
-                session_status: None,
-                tool_request: Some(tool_request),
-                tool_result: None,
-                before_messages: None,
-                after_messages: None,
-                usage: None,
-            },
-        ) {
-            Ok(outcome) => {
-                match apply_pre_tool_outcome_with_external(invocation, &outcome, mcp_registry, &[])
-                {
-                    Ok(invocation) => runnable.push((idx, invocation.effective)),
-                    Err(error) => hook_failed[idx] = Some(error.into_result()),
-                }
-            }
-            Err(error) => {
-                hook_failed[idx] = Some(tool_types::ToolResult::failed(
-                    tool_request,
-                    format!("pre_tool_use hook blocked tool: {error}"),
-                    None,
-                ));
-            }
-        }
-    }
-
-    let mut results = orca_tools::run_readonly_batch_parallel_with_policy(
-        tool_requests,
-        runnable,
-        cwd,
-        mcp_registry,
-        output_truncation,
-    );
-
-    for (idx, failed) in hook_failed.into_iter().enumerate() {
-        if let Some(result) = failed {
-            results[idx] = result;
-        }
-    }
-
-    for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
-        if emit_deltas {
-            sink.emit(events.tool_call_completed(result))?;
-            if let Err(error) = hooks.run(
-                HookEvent::PostToolUse,
-                HookContext {
-                    cwd: &cwd.display().to_string(),
-                    session_status: None,
-                    tool_request: Some(tool_request),
-                    tool_result: Some(result),
-                    before_messages: None,
-                    after_messages: None,
-                    usage: None,
-                },
-            ) {
-                sink.emit(events.error(&format!("post_tool_use hook failed: {error}")))?;
-            }
-        }
-    }
-
-    Ok(results)
-}
-
 fn run_verifier_if_needed(
     status: RunStatus,
     verifier: Option<&str>,
@@ -2045,17 +1951,23 @@ mod tests {
         let registry = McpRegistry::default();
         let hooks = HookRunner::default();
 
-        let results = execute_readonly_batch(
-            dir.path(),
-            &mut events,
-            &mut sink,
-            &requests,
-            true,
-            &registry,
-            &hooks,
-            tool_types::ToolOutputTruncation::default(),
+        let cancel = CancelToken::new();
+        let results = crate::runtime_readonly_tool_turn::execute_readonly_batch(
+            crate::runtime_readonly_tool_turn::RuntimeReadonlyBatchContext {
+                cwd: dir.path(),
+                events: &mut events,
+                sink: &mut sink,
+                tool_requests: &requests,
+                emit_deltas: true,
+                mcp_registry: &registry,
+                hooks: &hooks,
+                cancel: &cancel,
+                output_truncation: tool_types::ToolOutputTruncation::default(),
+                max_parallel: 2,
+            },
         )
-        .unwrap();
+        .unwrap()
+        .results;
 
         assert_eq!(
             results

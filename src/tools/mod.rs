@@ -1,8 +1,7 @@
 pub use orca_core::tool_types::*;
 pub use orca_tools::{
     Tool, ToolContext, ToolRegistry, collect_readonly_batch, execute_with_mcp,
-    execute_with_mcp_and_external, resolve_workspace_path, run_readonly_batch_parallel,
-    should_run_readonly_batch,
+    execute_with_mcp_and_external, resolve_workspace_path, should_run_readonly_batch,
 };
 
 pub mod bash {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -62,6 +63,39 @@ pub struct McpResourceListing {
 pub struct McpResourceTemplateListing {
     pub resource_templates: Vec<McpResourceTemplate>,
     pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpRequestError {
+    Cancelled,
+    Failed(String),
+}
+
+impl McpRequestError {
+    fn from_message(message: String) -> Self {
+        if message == MCP_TOOL_CALL_CANCELLED {
+            Self::Cancelled
+        } else {
+            Self::Failed(message)
+        }
+    }
+}
+
+impl fmt::Display for McpRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str(MCP_TOOL_CALL_CANCELLED),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for McpRequestError {}
+
+impl From<String> for McpRequestError {
+    fn from(message: String) -> Self {
+        Self::from_message(message)
+    }
 }
 
 pub fn initialize_registry(configs: &[McpServerConfig]) -> McpRegistry {
@@ -638,14 +672,21 @@ impl McpRegistry {
     }
 
     pub fn list_resources(&self, server: Option<&str>) -> Result<Vec<McpResource>, String> {
+        self.list_resources_or_cancel(server, &|| false)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_resources_or_cancel(
+        &self,
+        server: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<McpResource>, McpRequestError> {
         let clients = match server {
             Some(server) => vec![(
                 server.to_string(),
-                self.inner
-                    .clients
-                    .get(server)
-                    .cloned()
-                    .ok_or_else(|| format!("MCP server '{server}' is not connected"))?,
+                self.inner.clients.get(server).cloned().ok_or_else(|| {
+                    McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
+                })?,
             )],
             None => self
                 .inner
@@ -658,9 +699,10 @@ impl McpRegistry {
 
         let mut resources = Vec::new();
         for (server, client) in clients {
-            let result = client.list_resources()?;
-            let result: ResourcesListResult = serde_json::from_value(result)
-                .map_err(|error| format!("invalid MCP resources/list result: {error}"))?;
+            let result = client.list_resources_or_cancel(should_cancel)?;
+            let result: ResourcesListResult = serde_json::from_value(result).map_err(|error| {
+                McpRequestError::Failed(format!("invalid MCP resources/list result: {error}"))
+            })?;
             resources.extend(result.resources.into_iter().map(|resource| McpResource {
                 server: server.clone(),
                 uri: resource.uri,
@@ -674,14 +716,26 @@ impl McpRegistry {
     }
 
     pub fn list_resources_with_errors(&self, server: Option<&str>) -> McpResourceListing {
+        self.list_resources_with_errors_or_cancel(server, &|| false)
+            .unwrap_or_else(|error| McpResourceListing {
+                resources: Vec::new(),
+                errors: vec![error.to_string()],
+            })
+    }
+
+    pub fn list_resources_with_errors_or_cancel(
+        &self,
+        server: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<McpResourceListing, McpRequestError> {
         let clients = match server {
             Some(server) => match self.inner.clients.get(server).cloned() {
                 Some(client) => vec![(server.to_string(), client)],
                 None => {
-                    return McpResourceListing {
+                    return Ok(McpResourceListing {
                         resources: Vec::new(),
                         errors: vec![format!("MCP server '{server}' is not connected")],
-                    };
+                    });
                 }
             },
             None => self
@@ -702,7 +756,7 @@ impl McpRegistry {
             },
         };
         for (server, client) in clients {
-            match client.list_resources() {
+            match client.list_resources_or_cancel(should_cancel) {
                 Ok(result) => match serde_json::from_value::<ResourcesListResult>(result) {
                     Ok(result) => {
                         listing
@@ -719,25 +773,35 @@ impl McpRegistry {
                         "{server}: invalid MCP resources/list result: {error}"
                     )),
                 },
-                Err(error) => listing.errors.push(format!("{server}: {error}")),
+                Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),
+                Err(McpRequestError::Failed(error)) => {
+                    listing.errors.push(format!("{server}: {error}"));
+                }
             }
         }
 
-        listing
+        Ok(listing)
     }
 
     pub fn list_resource_templates(
         &self,
         server: Option<&str>,
     ) -> Result<Vec<McpResourceTemplate>, String> {
+        self.list_resource_templates_or_cancel(server, &|| false)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_resource_templates_or_cancel(
+        &self,
+        server: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<McpResourceTemplate>, McpRequestError> {
         let clients = match server {
             Some(server) => vec![(
                 server.to_string(),
-                self.inner
-                    .clients
-                    .get(server)
-                    .cloned()
-                    .ok_or_else(|| format!("MCP server '{server}' is not connected"))?,
+                self.inner.clients.get(server).cloned().ok_or_else(|| {
+                    McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
+                })?,
             )],
             None => self
                 .inner
@@ -750,9 +814,13 @@ impl McpRegistry {
 
         let mut resource_templates = Vec::new();
         for (server, client) in clients {
-            let result = client.list_resource_templates()?;
-            let result: ResourceTemplatesListResult = serde_json::from_value(result)
-                .map_err(|error| format!("invalid MCP resources/templates/list result: {error}"))?;
+            let result = client.list_resource_templates_or_cancel(should_cancel)?;
+            let result: ResourceTemplatesListResult =
+                serde_json::from_value(result).map_err(|error| {
+                    McpRequestError::Failed(format!(
+                        "invalid MCP resources/templates/list result: {error}"
+                    ))
+                })?;
             resource_templates.extend(result.resource_templates.into_iter().map(|template| {
                 McpResourceTemplate {
                     server: server.clone(),
@@ -771,14 +839,26 @@ impl McpRegistry {
         &self,
         server: Option<&str>,
     ) -> McpResourceTemplateListing {
+        self.list_resource_templates_with_errors_or_cancel(server, &|| false)
+            .unwrap_or_else(|error| McpResourceTemplateListing {
+                resource_templates: Vec::new(),
+                errors: vec![error.to_string()],
+            })
+    }
+
+    pub fn list_resource_templates_with_errors_or_cancel(
+        &self,
+        server: Option<&str>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<McpResourceTemplateListing, McpRequestError> {
         let clients = match server {
             Some(server) => match self.inner.clients.get(server).cloned() {
                 Some(client) => vec![(server.to_string(), client)],
                 None => {
-                    return McpResourceTemplateListing {
+                    return Ok(McpResourceTemplateListing {
                         resource_templates: Vec::new(),
                         errors: vec![format!("MCP server '{server}' is not connected")],
-                    };
+                    });
                 }
             },
             None => self
@@ -799,7 +879,7 @@ impl McpRegistry {
             },
         };
         for (server, client) in clients {
-            match client.list_resource_templates() {
+            match client.list_resource_templates_or_cancel(should_cancel) {
                 Ok(result) => match serde_json::from_value::<ResourceTemplatesListResult>(result) {
                     Ok(result) => {
                         listing.resource_templates.extend(
@@ -818,22 +898,34 @@ impl McpRegistry {
                         "{server}: invalid MCP resources/templates/list result: {error}"
                     )),
                 },
-                Err(error) => listing.errors.push(format!("{server}: {error}")),
+                Err(McpRequestError::Cancelled) => return Err(McpRequestError::Cancelled),
+                Err(McpRequestError::Failed(error)) => {
+                    listing.errors.push(format!("{server}: {error}"));
+                }
             }
         }
 
-        listing
+        Ok(listing)
     }
 
     pub fn read_resource(&self, server: &str, uri: &str) -> Result<ReadResourceResult, String> {
-        let client = self
-            .inner
-            .clients
-            .get(server)
-            .ok_or_else(|| format!("MCP server '{server}' is not connected"))?;
-        let result = client.read_resource(uri)?;
-        serde_json::from_value(result)
-            .map_err(|error| format!("invalid MCP resources/read result: {error}"))
+        self.read_resource_or_cancel(server, uri, &|| false)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn read_resource_or_cancel(
+        &self,
+        server: &str,
+        uri: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<ReadResourceResult, McpRequestError> {
+        let client = self.inner.clients.get(server).ok_or_else(|| {
+            McpRequestError::Failed(format!("MCP server '{server}' is not connected"))
+        })?;
+        let result = client.read_resource_or_cancel(uri, should_cancel)?;
+        serde_json::from_value(result).map_err(|error| {
+            McpRequestError::Failed(format!("invalid MCP resources/read result: {error}"))
+        })
     }
 }
 
@@ -881,28 +973,58 @@ impl McpClient {
         }
     }
 
-    fn list_resources(&self) -> Result<Value, String> {
-        let transport = self
-            .transport
-            .lock()
-            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
-        transport.list_resources()
+    fn list_resources_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, McpRequestError> {
+        self.resource_request_or_cancel(|transport| {
+            transport.list_resources_or_cancel(should_cancel)
+        })
     }
 
-    fn list_resource_templates(&self) -> Result<Value, String> {
-        let transport = self
-            .transport
-            .lock()
-            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
-        transport.list_resource_templates()
+    fn list_resource_templates_or_cancel(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, McpRequestError> {
+        self.resource_request_or_cancel(|transport| {
+            transport.list_resource_templates_or_cancel(should_cancel)
+        })
     }
 
-    fn read_resource(&self, uri: &str) -> Result<Value, String> {
-        let transport = self
-            .transport
-            .lock()
-            .map_err(|_| format!("MCP server '{}' transport lock poisoned", self.server_name))?;
-        transport.read_resource(uri)
+    fn read_resource_or_cancel(
+        &self,
+        uri: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Value, McpRequestError> {
+        self.resource_request_or_cancel(|transport| {
+            transport.read_resource_or_cancel(uri, should_cancel)
+        })
+    }
+
+    fn resource_request_or_cancel(
+        &self,
+        request: impl FnOnce(&dyn McpTransport) -> Result<Value, String>,
+    ) -> Result<Value, McpRequestError> {
+        let result = {
+            let transport = self.transport.lock().map_err(|_| {
+                McpRequestError::Failed(format!(
+                    "MCP server '{}' transport lock poisoned",
+                    self.server_name
+                ))
+            })?;
+            request(transport.as_ref())
+        };
+        match result {
+            Err(error) if should_reconnect_after_mcp_error(&self.config.transport, &error) => {
+                let startup_timeout_cap_ms = (self.config.transport == McpTransportKind::Stdio
+                    && error == MCP_TOOL_CALL_CANCELLED)
+                    .then_some(CANCELLED_STDIO_RECONNECT_TIMEOUT_MS);
+                let _ = self.reconnect(startup_timeout_cap_ms);
+                Err(McpRequestError::from_message(error))
+            }
+            Ok(result) => Ok(result),
+            Err(error) => Err(McpRequestError::from_message(error)),
+        }
     }
 
     fn reconnect(&self, startup_timeout_cap_ms: Option<u64>) -> Result<(), String> {
@@ -1257,6 +1379,90 @@ done
             "cancelled stdio server must be reaped before return"
         );
         assert_eq!(second.output, "generation 2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_stdio_resource_listing_reconnects_before_returning() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server = temp_dir.path().join("reconnecting_resource_server.sh");
+        let generation_file = temp_dir.path().join("resource-generation");
+        let pid_prefix = temp_dir.path().join("resource-pid");
+        let started_file = temp_dir.path().join("resource-started");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+generation=0
+if [ -f "$GENERATION_FILE" ]; then
+  IFS= read -r generation < "$GENERATION_FILE"
+fi
+generation=$((generation + 1))
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s' "$$" > "$PID_PREFIX.$generation"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"resources":{}},"serverInfo":{"name":"resource-reconnect","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+    *'"method":"resources/list"'*)
+      printf started > "$STARTED_FILE"
+      if [ "$generation" -eq 1 ]; then
+        IFS= read -r ignored
+      else
+        printf '{"jsonrpc":"2.0","id":3,"result":{"resources":[{"uri":"memo://generation-2","name":"generation 2"}]}}\n'
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write MCP fixture");
+        let mut config = stdio_fixture_config("resource_reconnect", &server);
+        config.env = HashMap::from([
+            (
+                "GENERATION_FILE".to_string(),
+                generation_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "PID_PREFIX".to_string(),
+                pid_prefix.to_string_lossy().into_owned(),
+            ),
+            (
+                "STARTED_FILE".to_string(),
+                started_file.to_string_lossy().into_owned(),
+            ),
+        ]);
+        config.tool_timeout_ms = Some(5_000);
+        let registry = initialize_registry(&[config]);
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+
+        let result = registry.list_resources_with_errors_or_cancel(None, &|| started_file.exists());
+
+        let generation_at_return =
+            std::fs::read_to_string(&generation_file).expect("generation at cancellation return");
+        let first_pid =
+            std::fs::read_to_string(pid_prefix.with_extension("1")).expect("first server pid");
+        let first_pid_alive_at_return = process_is_alive(first_pid.trim());
+        let second = registry
+            .list_resources(Some("resource_reconnect"))
+            .expect("resource listing after reconnect");
+
+        assert_eq!(result.unwrap_err(), McpRequestError::Cancelled);
+        assert_eq!(
+            generation_at_return, "2",
+            "resource reconnect must finish before return"
+        );
+        assert!(
+            !first_pid_alive_at_return,
+            "cancelled resource server must be reaped before return"
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].uri, "memo://generation-2");
     }
 
     #[cfg(unix)]
