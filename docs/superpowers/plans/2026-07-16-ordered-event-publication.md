@@ -122,6 +122,10 @@ provable order.
   tests, and 390 TUI tests passed. The serial workspace all-targets gate and
   workspace Clippy also passed with the repository's existing warning
   baseline.
+- A targeted real DeepSeek gate passed through the new publication boundary:
+  CLI JSONL produced `ORCA_REAL_E2E_OK`, history replay produced
+  `ORCA_HISTORY_REPLAY_OK`, and the legacy incomplete tool call remained a
+  non-reexecuted `indeterminate` compatibility repair.
 
 ## Final Deletion Targets
 

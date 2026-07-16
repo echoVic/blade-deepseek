@@ -209,9 +209,11 @@ verify arrival order without sorting, and the allocation-time event
 flows, persistence, cancellation, and shutdown behavior remain compatible.
 After rebasing onto the goal continuation redesign, 152 core tests, 43
 RuntimeHost tests, 390 TUI tests, the serial workspace all-targets gate, and
-workspace Clippy pass. Durable semantic journal records and replacement of
-index-derived `turn-N`/`item-N` projection ids remain the next P1.1 vertical
-slices.
+workspace Clippy pass. A targeted real DeepSeek CLI and history-replay gate
+also passes through the new JSONL publication path, including compatibility
+repair without re-executing an incomplete legacy tool call. Durable semantic
+journal records and replacement of index-derived `turn-N`/`item-N` projection
+ids remain the next P1.1 vertical slices.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
