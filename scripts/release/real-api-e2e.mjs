@@ -12,6 +12,7 @@ import {
 import os from "node:os";
 import readline from "node:readline";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const cliSentinel = "ORCA_REAL_E2E_OK";
@@ -353,11 +354,13 @@ function readStableThreadProjection(args, home, threadId, label) {
     throw new Error(`${label} did not return turn and item projections:\n${output}`);
   }
 
-  const turnIds = (Array.isArray(turnsEvent.data) ? turnsEvent.data : []).map(
-    (turn) => turn.turnId,
-  );
-  const itemIds = (Array.isArray(itemsEvent.data) ? itemsEvent.data : []).map(
-    (entry) => entry.itemId,
+  const turns = Array.isArray(turnsEvent.data) ? turnsEvent.data : [];
+  const itemEntries = Array.isArray(itemsEvent.data) ? itemsEvent.data : [];
+  const turnIds = turns.map((turn) => turn.turnId);
+  const itemIds = itemEntries.map((entry) => entry.itemId);
+  const itemObjects = itemEntries.map((entry) => entry.item);
+  const canonicalItems = itemEntries.filter((entry) =>
+    ["agent_message", "reasoning", "plan"].includes(entry.item?.type),
   );
   if (
     turnIds.length === 0 ||
@@ -371,7 +374,15 @@ function readStableThreadProjection(args, home, threadId, label) {
       `${label} did not expose unique typed turn/item ids: ${JSON.stringify({ turnIds, itemIds })}`,
     );
   }
-  return { turnIds, itemIds };
+  if (
+    !canonicalItems.some((entry) => entry.item?.type === "agent_message") ||
+    canonicalItems.some((entry) => entry.item?.id !== entry.itemId)
+  ) {
+    throw new Error(
+      `${label} did not expose canonical completed model item objects: ${JSON.stringify(itemEntries)}`,
+    );
+  }
+  return { turnIds, itemIds, itemObjects };
 }
 
 function assertStablePrefix(before, after, label) {
@@ -383,6 +394,34 @@ function assertStablePrefix(before, after, label) {
       `${label} did not preserve the prior identity prefix: ${JSON.stringify({ before, after })}`,
     );
   }
+}
+
+function assertStableObjectPrefix(before, after, label) {
+  if (
+    after.length <= before.length ||
+    before.some((value, index) => !isDeepStrictEqual(after[index], value))
+  ) {
+    throw new Error(
+      `${label} did not preserve the prior object prefix: ${JSON.stringify({ before, after })}`,
+    );
+  }
+}
+
+function canonicalAgentMessageIncludes(item, expectedText) {
+  return (
+    item?.type === "agent_message" &&
+    typeof item.id === "string" &&
+    item.id.startsWith("item_") &&
+    String(item.text ?? "").includes(expectedText)
+  );
+}
+
+function canonicalAgentMessageEntryIncludes(entry, expectedText) {
+  return (
+    typeof entry?.itemId === "string" &&
+    entry.itemId === entry.item?.id &&
+    canonicalAgentMessageIncludes(entry.item, expectedText)
+  );
 }
 
 function runStableThreadIdentityResume(args) {
@@ -511,6 +550,11 @@ function runStableThreadIdentityResume(args) {
     );
     assertStablePrefix(firstProjection.turnIds, resumedProjection.turnIds, "Stable turn ids");
     assertStablePrefix(firstProjection.itemIds, resumedProjection.itemIds, "Stable item ids");
+    assertStableObjectPrefix(
+      firstProjection.itemObjects,
+      resumedProjection.itemObjects,
+      "Stable completed model items",
+    );
     if (!resumedProjection.turnIds.includes(resumedTurnId)) {
       throw new Error(
         `Stable identity resumed turn event was not persisted: ${JSON.stringify({ resumedTurnId, resumedProjection })}`,
@@ -519,6 +563,9 @@ function runStableThreadIdentityResume(args) {
 
     console.log(
       `Stable thread identity resume real API e2e verified: ${stableThreadIdentitySentinel}`,
+    );
+    console.log(
+      `Stable completed model item objects preserved: ${firstProjection.itemObjects.length}`,
     );
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -1201,7 +1248,7 @@ async function runServerThread(args) {
             item.role === "user" &&
             String(item.content ?? "").includes("Reply with exactly the token I asked you to remember."),
         ) &&
-        items.some((item) => item.role === "assistant" && String(item.content ?? "").includes(serverThreadSentinel))
+        items.some((item) => canonicalAgentMessageIncludes(item, serverThreadSentinel))
       );
     });
     if (
@@ -1236,7 +1283,7 @@ async function runServerThread(args) {
     const firstDescTurnItems = Array.isArray(descTurns[0]?.items) ? descTurns[0].items : [];
     if (
       descTurns.length !== 1 ||
-      !firstDescTurnItems.some((item) => item.role === "assistant" && String(item.content ?? "").includes(serverThreadSentinel))
+      !firstDescTurnItems.some((item) => canonicalAgentMessageIncludes(item, serverThreadSentinel))
     ) {
       throw new Error(`Server thread/turns/list desc did not return latest turn first: ${JSON.stringify(threadTurnsDesc)}`);
     }
@@ -1310,11 +1357,11 @@ async function runServerThread(args) {
     });
     const itemsPage2 = Array.isArray(threadItemsPage2.data) ? threadItemsPage2.data : [];
     const allItems = [...items, ...itemsPage2];
-    const itemText = allItems.map((entry) => entry.item?.content ?? "").join("\n");
+    const itemText = allItems.map((entry) => entry.item?.content ?? entry.item?.text ?? "").join("\n");
     if (
       !allItems.some((entry) => entry.threadId === threadId && typeof entry.itemId === "string") ||
       !itemText.includes(`Remember this exact token for the next turn: ${serverThreadSentinel}`) ||
-      !itemText.includes(serverThreadSentinel)
+      !allItems.some((entry) => canonicalAgentMessageEntryIncludes(entry, serverThreadSentinel))
     ) {
       throw new Error(
         `Server thread/items/list missing expected projection: ${JSON.stringify({ threadItems, threadItemsPage2 })}`,
@@ -1342,8 +1389,8 @@ async function runServerThread(args) {
     const descItems = Array.isArray(threadItemsDesc.data) ? threadItemsDesc.data : [];
     if (
       descItems.length !== 1 ||
-      descItems[0]?.item?.role !== "assistant" ||
-      !String(descItems[0]?.item?.content ?? "").includes(serverThreadSentinel)
+      allItems.length === 0 ||
+      !isDeepStrictEqual(descItems[0], allItems.at(-1))
     ) {
       throw new Error(`Server thread/items/list desc did not return latest item first: ${JSON.stringify(threadItemsDesc)}`);
     }
@@ -1400,7 +1447,7 @@ async function runServerThread(args) {
             item.role === "user" &&
             String(item.content ?? "").includes("Reply with exactly the token I asked you to remember."),
         ) &&
-        items.some((item) => item.role === "assistant" && String(item.content ?? "").includes(serverThreadSentinel))
+        items.some((item) => canonicalAgentMessageIncludes(item, serverThreadSentinel))
       );
     });
     if (!readTurnWithRecallAndAssistant) {

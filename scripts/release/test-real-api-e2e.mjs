@@ -346,28 +346,76 @@ if (args[0] === "--mode" && args[1] === "server") {
     }
     if (request.method === "thread/items/list" && request.params.threadId === "run-stable-thread-test") {
       const state = JSON.parse(readFileSync(process.env.ORCA_HOME + "/stable-identity-state.json", "utf8"));
-      const ids = [
-        "item_00000000000000000000000001",
-        "item_00000000000000000000000002"
+      const data = [
+        {
+          threadId: "run-stable-thread-test",
+          turnId: "turn_00000000000000000000000001",
+          itemId: "item_00000000000000000000000001",
+          index: 0,
+          item: { role: "user", content: "remember " + state.sentinel }
+        },
+        {
+          threadId: "run-stable-thread-test",
+          turnId: "turn_00000000000000000000000001",
+          itemId: "item_00000000000000000000000002",
+          index: 1,
+          item: {
+            id: "item_00000000000000000000000002",
+            type: "agent_message",
+            text: "ORCA_STABLE_THREAD_IDENTITY_READY"
+          }
+        },
+        {
+          threadId: "run-stable-thread-test",
+          turnId: "turn_00000000000000000000000001",
+          itemId: "item_00000000000000000000000003",
+          index: 2,
+          item: {
+            id: "item_00000000000000000000000003",
+            type: "reasoning",
+            summary: "remembering the requested token",
+            content: ""
+          }
+        }
       ];
       if (state.phase === 2) {
-        ids.push(
-          "item_00000000000000000000000003",
-          "item_00000000000000000000000004"
+        data.push(
+          {
+            threadId: "run-stable-thread-test",
+            turnId: "turn_00000000000000000000000002",
+            itemId: "item_00000000000000000000000004",
+            index: 3,
+            item: { role: "user", content: "recall the prior token" }
+          },
+          {
+            threadId: "run-stable-thread-test",
+            turnId: "turn_00000000000000000000000002",
+            itemId: "item_00000000000000000000000005",
+            index: 4,
+            item: {
+              id: "item_00000000000000000000000005",
+              type: "agent_message",
+              text: state.sentinel
+            }
+          },
+          {
+            threadId: "run-stable-thread-test",
+            turnId: "turn_00000000000000000000000002",
+            itemId: "item_00000000000000000000000006",
+            index: 5,
+            item: {
+              id: "item_00000000000000000000000006",
+              type: "reasoning",
+              summary: "recalling the requested token",
+              content: ""
+            }
+          }
         );
       }
       process.stdout.write(JSON.stringify({
         id: request.id,
         event: "thread_items_list",
-        data: ids.map((itemId, index) => ({
-          threadId: "run-stable-thread-test",
-          turnId: index < 2
-            ? "turn_00000000000000000000000001"
-            : "turn_00000000000000000000000002",
-          itemId,
-          index,
-          item: { id: itemId, role: index % 2 === 0 ? "user" : "assistant" }
-        })),
+        data,
         nextCursor: null,
         backwardsCursor: "0"
       }) + "\\n");
@@ -397,7 +445,7 @@ if (args[0] === "--mode" && args[1] === "server") {
             itemsView: "full",
             items: [
               { role: "user", content: "Reply with exactly the token I asked you to remember." },
-              { role: "assistant", content: serverThreadSentinel }
+              { id: "item_00000000000000000000000012", type: "agent_message", text: serverThreadSentinel }
             ]
           }
         ] : request.params.cursor ? [
@@ -409,7 +457,7 @@ if (args[0] === "--mode" && args[1] === "server") {
               itemsView: "full",
               items: [
                 { role: "user", content: "Reply with exactly the token I asked you to remember." },
-                { role: "assistant", content: serverThreadSentinel }
+                { id: "item_00000000000000000000000012", type: "agent_message", text: serverThreadSentinel }
               ]
             }
           ] : [
@@ -421,7 +469,7 @@ if (args[0] === "--mode" && args[1] === "server") {
             itemsView: "full",
             items: [
               { role: "user", content: \`Remember this exact token for the next turn: \${serverThreadSentinel}. Reply with exactly: READY.\` },
-              { role: "assistant", content: "READY" }
+              { id: "item_00000000000000000000000011", type: "agent_message", text: "READY" }
             ]
           },
         ],
@@ -463,17 +511,17 @@ if (args[0] === "--mode" && args[1] === "server") {
           {
             threadId: "thread-test",
             turnId: "turn-2",
-            itemId: "item-5",
+            itemId: "item_00000000000000000000000012",
             index: 4,
-            item: { role: "assistant", content: serverThreadSentinel }
+            item: { id: "item_00000000000000000000000012", type: "agent_message", text: serverThreadSentinel }
           }
         ] : request.params.cursor ? [
           {
             threadId: "thread-test",
             turnId: "turn-2",
-            itemId: "item-5",
+            itemId: "item_00000000000000000000000012",
             index: 4,
-            item: { role: "assistant", content: serverThreadSentinel }
+            item: { id: "item_00000000000000000000000012", type: "agent_message", text: serverThreadSentinel }
           }
         ] : [
           {
@@ -512,7 +560,7 @@ if (args[0] === "--mode" && args[1] === "server") {
             role: "user",
             items: [
               { role: "user", content: \`Remember this exact token for the next turn: \${serverThreadSentinel}. Reply with exactly: READY.\` },
-              { role: "assistant", content: "READY" }
+              { id: "item_00000000000000000000000011", type: "agent_message", text: "READY" }
             ]
           },
           {
@@ -522,7 +570,7 @@ if (args[0] === "--mode" && args[1] === "server") {
             role: "user",
             items: [
               { role: "user", content: "Reply with exactly the token I asked you to remember." },
-              { role: "assistant", content: serverThreadSentinel }
+              { id: "item_00000000000000000000000012", type: "agent_message", text: serverThreadSentinel }
             ]
           }
         ]
@@ -565,6 +613,7 @@ if (args[0] === "--mode" && args[1] === "server") {
     "History replay repair verified: legacy-missing-tool-call status=indeterminate terminalSource=compatibility_repair",
     "History replay invocation not re-executed: legacy-missing-tool-call",
     "Stable thread identity resume real API e2e verified: ORCA_STABLE_THREAD_IDENTITY_OK_",
+    "Stable completed model item objects preserved: 3",
     "Server real API e2e verified: ORCA_SERVER_REAL_OK",
     "Server thread real API e2e verified: ORCA_SERVER_THREAD_MEMORY_OK_",
     "Server active turn resume e2e verified: ORCA_SERVER_RESUME_OK_",

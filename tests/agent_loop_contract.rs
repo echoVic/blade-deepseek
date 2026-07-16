@@ -108,14 +108,19 @@ fn failed_multi_call_turn_has_one_terminal_per_assistant_call() {
     let records = parse_jsonl(&fs::read(only_session_file(home.path())).expect("read session"));
     let assistant_call_ids = records
         .iter()
-        .filter(|record| {
-            record["type"] == "conversation.message" && record["message"]["role"] == "assistant"
-        })
         .flat_map(|record| {
-            record["message"]["tool_calls"]
-                .as_array()
-                .into_iter()
-                .flatten()
+            if record["type"] == "conversation.message" && record["message"]["role"] == "assistant"
+            {
+                record["message"]["tool_calls"].as_array()
+            } else if record["type"] == "event.semantic"
+                && record["event"]["type"] == "model.response.completed"
+            {
+                record["event"]["payload"]["tool_calls"].as_array()
+            } else {
+                None
+            }
+            .into_iter()
+            .flatten()
         })
         .filter_map(|call| call["id"].as_str())
         .collect::<Vec<_>>();
