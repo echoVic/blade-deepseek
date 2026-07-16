@@ -256,9 +256,9 @@ Do not set labels or assignees.
 
 - [ ] **Step 3: Create the Documentation form**
 
-Create `.github/ISSUE_TEMPLATE/documentation.yml` with required `location`,
-`problem`, and `suggested_change` fields, optional `additional_context`, and a
-required `terms` checkbox confirming sensitive data was removed.
+Create `.github/ISSUE_TEMPLATE/documentation.yml` with required `location` and
+`problem` fields, optional `suggested_change` and `additional_context` fields,
+and a required `terms` checkbox confirming sensitive data was removed.
 
 Do not set labels or assignees.
 

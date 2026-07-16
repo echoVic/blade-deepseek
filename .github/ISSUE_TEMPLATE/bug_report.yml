@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Security vulnerabilities must be reported privately through GitHub Security Advisories, not public Issues.
+        Security vulnerabilities must be reported privately through [GitHub Security Advisories](https://github.com/echoVic/blade-deepseek/security/advisories/new), not public Issues.
   - type: input
     id: version
     attributes:
@@ -71,7 +71,6 @@ body:
     attributes:
       label: Logs and diagnostics
       description: Paste relevant, redacted logs or diagnostics.
-      render: shell
   - type: checkboxes
     id: terms
     attributes:

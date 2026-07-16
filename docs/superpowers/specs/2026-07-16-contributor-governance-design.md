@@ -63,8 +63,8 @@ Create three YAML Issue forms under `.github/ISSUE_TEMPLATE/`:
   behavior, regression information, and redacted diagnostics;
 - `feature_request.yml` requests the user problem, use case, proposed behavior,
   alternatives, affected surfaces, and compatibility or security concerns;
-- `documentation.yml` requests the affected page or section, the problem, and
-  the proposed correction.
+- `documentation.yml` requires the affected page or section and the problem;
+  a proposed correction is optional.
 
 All forms require a confirmation that secrets and sensitive data have been
 removed. They will not auto-assign labels because repository label availability

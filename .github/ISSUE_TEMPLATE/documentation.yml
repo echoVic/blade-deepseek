@@ -21,8 +21,6 @@ body:
     attributes:
       label: Suggested change
       description: Describe the correction or improvement you recommend.
-    validations:
-      required: true
   - type: textarea
     id: additional_context
     attributes:
