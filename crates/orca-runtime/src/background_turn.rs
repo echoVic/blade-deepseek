@@ -1,16 +1,18 @@
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::thread_identity::TurnId;
 
+use crate::model_response::RuntimeModelResponse;
 use crate::tasks::TaskRegistry;
 
 #[derive(Clone, Debug)]
 pub struct ApprovedBackgroundTurnContinuation {
-    pub response: ProviderResponse,
+    pub response: RuntimeModelResponse,
     pub preapproved_tool_call_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeTurnContinuation {
-    pub response: ProviderResponse,
+    pub response: RuntimeModelResponse,
     pub preapproved_tool_call_id: Option<String>,
 }
 
@@ -24,9 +26,9 @@ impl ApprovedBackgroundTurnContinuation {
 }
 
 impl RuntimeTurnContinuation {
-    pub fn from_response(response: ProviderResponse) -> Self {
+    pub fn from_response(response: ProviderResponse, turn_id: TurnId) -> Self {
         Self {
-            response,
+            response: RuntimeModelResponse::new(response, turn_id),
             preapproved_tool_call_id: None,
         }
     }
@@ -43,7 +45,7 @@ pub fn take_approved_background_turn_continuation(
     let Some(response) = task_registry.take_approved_pending_provider_response(task_id)? else {
         return Ok(None);
     };
-    let preapproved_tool_call_id = provider_response_first_tool_call_id(&response);
+    let preapproved_tool_call_id = provider_response_first_tool_call_id(&response.response);
     Ok(Some(ApprovedBackgroundTurnContinuation {
         response,
         preapproved_tool_call_id,
@@ -70,9 +72,11 @@ fn provider_response_first_tool_call_id(response: &ProviderResponse) -> Option<S
 mod tests {
     use orca_core::approval_types::ActionKind;
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
+    use orca_core::thread_identity::TurnId;
     use orca_core::tool_types::{ToolName, ToolRequest};
 
     use super::ApprovedBackgroundTurnContinuation;
+    use crate::model_response::RuntimeModelResponse;
 
     #[test]
     fn approved_background_continuation_converts_to_runtime_turn_continuation() {
@@ -91,7 +95,7 @@ mod tests {
         };
 
         let continuation = ApprovedBackgroundTurnContinuation {
-            response,
+            response: RuntimeModelResponse::new(response, TurnId::new()),
             preapproved_tool_call_id: Some("shell-1".to_string()),
         }
         .into_runtime_turn_continuation();

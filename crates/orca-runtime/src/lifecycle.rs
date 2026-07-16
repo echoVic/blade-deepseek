@@ -866,9 +866,10 @@ impl<'a> AgentLoopContext<'a> {
 
     #[allow(dead_code)]
     pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
+        let turn_id = self.turn_context.turn_id.clone();
         self.turn_context = self
             .turn_context
-            .with_continuation(RuntimeTurnContinuation::from_response(response));
+            .with_continuation(RuntimeTurnContinuation::from_response(response, turn_id));
         self
     }
 
@@ -1023,7 +1024,7 @@ impl<'a> RuntimeTurnContext<'a> {
     pub(crate) fn initial_response(&self) -> Option<&ProviderResponse> {
         self.continuation
             .as_ref()
-            .map(|continuation| &continuation.response)
+            .map(|continuation| &continuation.response.response)
     }
 
     #[cfg(test)]

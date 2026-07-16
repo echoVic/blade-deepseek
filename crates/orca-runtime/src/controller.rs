@@ -1635,7 +1635,10 @@ mod tests {
             usage: None,
         };
         let request = ThreadTurnRequest::new("resume marker").with_continuation(
-            crate::background_turn::RuntimeTurnContinuation::from_response(response),
+            crate::background_turn::RuntimeTurnContinuation::from_response(
+                response,
+                orca_core::thread_identity::TurnId::new(),
+            ),
         );
 
         let status = thread

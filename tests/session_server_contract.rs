@@ -1289,6 +1289,189 @@ fn server_mode_streams_proposed_plan_item_lifecycle() {
 }
 
 #[test]
+fn server_mode_replays_completed_message_and_reasoning_items_after_restart() {
+    assert_completed_model_items_replay_after_restart(
+        "mock_usage",
+        &["agent_message", "reasoning"],
+    );
+}
+
+#[test]
+fn server_mode_replays_completed_proposed_plan_items_after_restart() {
+    assert_completed_model_items_replay_after_restart(
+        "mock_proposed_plan",
+        &["agent_message", "plan"],
+    );
+}
+
+fn assert_completed_model_items_replay_after_restart(prompt: &str, expected_types: &[&str]) {
+    let workspace = tempdir().expect("workspace");
+    let home = workspace.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let mut child = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().expect("workspace path"),
+        ])
+        .env("ORCA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn live orca server");
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"thread","method":"thread/start","params":{{}}}}"#
+        )
+        .expect("write thread/start");
+        stdin.flush().expect("flush thread/start");
+    }
+    let thread = child.expect_event("thread", "thread_started");
+    let thread_id = thread["threadId"].as_str().expect("thread id").to_string();
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"{}"}}]}}}}"#,
+            thread_id, prompt
+        )
+        .expect("write turn/start");
+        stdin.flush().expect("flush turn/start");
+    }
+    let mut saw_turn_completed = false;
+    let mut completed_types = Vec::new();
+    let turn_events =
+        child.drain_events_until_matching("completed model item lifecycle", |event| {
+            if event["id"] != "turn" {
+                return false;
+            }
+            if event["event"] == "turn_completed" {
+                saw_turn_completed = true;
+            }
+            if event["event"] == "item_completed"
+                && let Some(item_type) = event["item"]["type"].as_str()
+                && expected_types.contains(&item_type)
+            {
+                completed_types.push(item_type.to_string());
+            }
+            saw_turn_completed
+                && expected_types
+                    .iter()
+                    .all(|expected| completed_types.iter().any(|actual| actual == expected))
+        });
+    let completed_items = expected_types
+        .iter()
+        .map(|expected_type| {
+            let completed = turn_events
+                .iter()
+                .find(|event| {
+                    event["event"] == "item_completed" && event["item"]["type"] == *expected_type
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing live {expected_type} completion: {turn_events:?}")
+                });
+            let item = completed["item"].clone();
+            let item_id = item["id"].as_str().expect("completed item id");
+            assert!(
+                !matches!(
+                    item_id,
+                    "item-agent-message-1" | "item-reasoning-1" | "item-plan-1"
+                ),
+                "completed model item retained a static live id: {item}"
+            );
+            assert!(turn_events.iter().any(|event| {
+                event["event"] == "item_started"
+                    && event["item"]["type"] == *expected_type
+                    && event["item"]["id"] == item_id
+            }));
+            item
+        })
+        .collect::<Vec<_>>();
+
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"live-items","method":"thread/items/list","params":{{"threadId":"{}","limit":20}}}}"#,
+            thread_id
+        )
+        .expect("write live thread/items/list");
+        stdin.flush().expect("flush live thread/items/list");
+    }
+    let live = child.expect_event("live-items", "thread_items_list");
+    assert_completed_items_match_projection(&completed_items, &live);
+
+    child.close_stdin();
+    let output = child.wait_with_output().expect("wait for live server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "live server stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut cold = orca_command()
+        .args([
+            "--mode",
+            "server",
+            "--provider",
+            "mock",
+            "--cwd",
+            workspace.path().to_str().expect("workspace path"),
+        ])
+        .env("ORCA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cold orca server");
+    {
+        let stdin = cold.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"cold-items","method":"thread/items/list","params":{{"threadId":"{}","limit":20}}}}"#,
+            thread_id
+        )
+        .expect("write cold thread/items/list");
+    }
+    cold.close_stdin();
+    let cold_items = cold.expect_event("cold-items", "thread_items_list");
+    assert_completed_items_match_projection(&completed_items, &cold_items);
+
+    let output = cold.wait_with_output().expect("wait for cold server");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "cold server stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_completed_items_match_projection(completed_items: &[Value], projection: &Value) {
+    let projected = projection["data"]
+        .as_array()
+        .expect("thread item projection data");
+    for completed in completed_items {
+        let item_id = completed["id"].as_str().expect("completed item id");
+        let item_type = completed["type"].as_str().expect("completed item type");
+        let stored = projected
+            .iter()
+            .find(|entry| entry["item"]["type"] == item_type)
+            .unwrap_or_else(|| panic!("missing projected {item_type} item: {projection}"));
+        assert_eq!(stored["itemId"], item_id);
+        assert_eq!(&stored["item"], completed);
+    }
+}
+
+#[test]
 fn server_mode_accepts_thread_start_method_and_returns_thread_event() {
     let mut child = orca_command()
         .args(["--mode", "server", "--provider", "mock"])
@@ -8111,7 +8294,7 @@ fn server_mode_lists_and_searches_threads() {
                         && item["content"]
                             .as_str()
                             .is_some_and(|content| content.contains("needle"))
-                }) && items.iter().any(|item| item["role"] == "assistant")
+                }) && items.iter().any(|item| item["type"] == "agent_message")
             })
     }));
 
@@ -8135,7 +8318,7 @@ fn server_mode_lists_and_searches_threads() {
                         && item["content"]
                             .as_str()
                             .is_some_and(|content| content.contains("needle"))
-                }) && items.iter().any(|item| item["role"] == "assistant")
+                }) && items.iter().any(|item| item["type"] == "agent_message")
             })
     }));
 

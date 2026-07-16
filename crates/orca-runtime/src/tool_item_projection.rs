@@ -1,6 +1,5 @@
 pub(crate) use orca_core::thread_item_projection::{
-    ProjectedPersistedMessageThreadItem, ProjectedTextItem, ProjectedTextItemKind,
-    ProjectedTextThreadItem, ProjectedUserMessageThreadItem,
+    ProjectedPersistedMessageThreadItem, ProjectedUserMessageThreadItem,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -104,7 +103,6 @@ pub(crate) fn dynamic_tool_completed_item(
 pub(crate) enum ProjectedThreadItem {
     UserMessage(ProjectedUserMessageThreadItem),
     PersistedMessage(ProjectedPersistedMessageThreadItem),
-    Text(ProjectedTextThreadItem),
     CommandExecution(ProjectedCommandExecutionThreadItem),
     McpTool(ProjectedMcpToolThreadItem),
     DynamicTool(ProjectedDynamicToolThreadItem),
@@ -127,12 +125,6 @@ impl From<ProjectedUserMessageThreadItem> for ProjectedThreadItem {
 impl From<ProjectedPersistedMessageThreadItem> for ProjectedThreadItem {
     fn from(item: ProjectedPersistedMessageThreadItem) -> Self {
         Self::PersistedMessage(item)
-    }
-}
-
-impl From<ProjectedTextThreadItem> for ProjectedThreadItem {
-    fn from(item: ProjectedTextThreadItem) -> Self {
-        Self::Text(item)
     }
 }
 
@@ -1709,14 +1701,6 @@ mod tests {
             user_message_item("hello")
         );
         assert_eq!(
-            ProjectedThreadItem::from(ProjectedTextThreadItem::agent_message(
-                "item-agent-message-1",
-                "hello",
-            ))
-            .into_value(),
-            ProjectedTextThreadItem::agent_message("item-agent-message-1", "hello").into_value()
-        );
-        assert_eq!(
             ProjectedThreadItem::from(ProjectedCommandExecutionThreadItem::started(
                 "tool-1",
                 "bash",
@@ -1872,113 +1856,6 @@ mod tests {
                 Value::Null,
             )
         );
-    }
-
-    #[test]
-    fn agent_message_item_projects_text_lifecycle_shape() {
-        let started =
-            ProjectedTextThreadItem::agent_message("item-agent-message-1", "").into_value();
-        let completed =
-            ProjectedTextThreadItem::agent_message("item-agent-message-1", "hello").into_value();
-
-        assert_eq!(started["id"], "item-agent-message-1");
-        assert_eq!(started["type"], "agent_message");
-        assert_eq!(started["text"], "");
-        assert_eq!(completed["id"], "item-agent-message-1");
-        assert_eq!(completed["type"], "agent_message");
-        assert_eq!(completed["text"], "hello");
-    }
-
-    #[test]
-    fn plan_item_projects_text_lifecycle_shape() {
-        let started = ProjectedTextThreadItem::plan("item-plan-1", "").into_value();
-        let completed = ProjectedTextThreadItem::plan("item-plan-1", "# Plan\n").into_value();
-
-        assert_eq!(started["id"], "item-plan-1");
-        assert_eq!(started["type"], "plan");
-        assert_eq!(started["text"], "");
-        assert_eq!(completed["id"], "item-plan-1");
-        assert_eq!(completed["type"], "plan");
-        assert_eq!(completed["text"], "# Plan\n");
-    }
-
-    #[test]
-    fn reasoning_item_projects_summary_lifecycle_shape() {
-        let started = ProjectedTextThreadItem::reasoning("item-reasoning-1", "").into_value();
-        let completed =
-            ProjectedTextThreadItem::reasoning("item-reasoning-1", "thinking").into_value();
-
-        assert_eq!(started["id"], "item-reasoning-1");
-        assert_eq!(started["type"], "reasoning");
-        assert_eq!(started["summary"], "");
-        assert_eq!(started["content"], "");
-        assert_eq!(completed["id"], "item-reasoning-1");
-        assert_eq!(completed["type"], "reasoning");
-        assert_eq!(completed["summary"], "thinking");
-        assert_eq!(completed["content"], "");
-    }
-
-    #[test]
-    fn projected_text_thread_item_serializes_current_wire_shapes() {
-        assert_eq!(
-            ProjectedTextThreadItem::agent_message("item-agent-message-1", "hello").into_value(),
-            json!({
-                "type": "agent_message",
-                "id": "item-agent-message-1",
-                "text": "hello",
-            })
-        );
-        assert_eq!(
-            ProjectedTextThreadItem::plan("item-plan-1", "1. inspect").into_value(),
-            json!({
-                "type": "plan",
-                "id": "item-plan-1",
-                "text": "1. inspect",
-            })
-        );
-        assert_eq!(
-            ProjectedTextThreadItem::reasoning("item-reasoning-1", "thinking").into_value(),
-            json!({
-                "type": "reasoning",
-                "id": "item-reasoning-1",
-                "summary": "thinking",
-                "content": "",
-            })
-        );
-    }
-
-    #[test]
-    fn projected_text_item_accumulates_agent_message_lifecycle_shape() {
-        let mut item = ProjectedTextItem::new(ProjectedTextItemKind::AgentMessage);
-
-        assert_eq!(item.id(), "item-agent-message-1");
-        assert_eq!(item.started_item()["type"], "agent_message");
-        assert_eq!(item.started_item()["text"], "");
-
-        item.push_delta("hello ");
-        item.push_delta("world");
-        let completed = item.completed_item();
-
-        assert_eq!(completed["id"], "item-agent-message-1");
-        assert_eq!(completed["type"], "agent_message");
-        assert_eq!(completed["text"], "hello world");
-    }
-
-    #[test]
-    fn projected_text_item_accumulates_plan_and_reasoning_lifecycle_shapes() {
-        let mut plan = ProjectedTextItem::new(ProjectedTextItemKind::Plan);
-        plan.push_delta("1. inspect\n");
-        assert_eq!(plan.id(), "item-plan-1");
-        assert_eq!(plan.started_item()["type"], "plan");
-        assert_eq!(plan.completed_item()["text"], "1. inspect\n");
-
-        let mut reasoning = ProjectedTextItem::new(ProjectedTextItemKind::Reasoning);
-        reasoning.push_delta("thinking");
-        assert_eq!(reasoning.id(), "item-reasoning-1");
-        assert_eq!(reasoning.started_item()["type"], "reasoning");
-        let completed = reasoning.completed_item();
-        assert_eq!(completed["summary"], "thinking");
-        assert_eq!(completed["content"], "");
     }
 
     #[test]

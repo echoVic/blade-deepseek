@@ -403,7 +403,10 @@ mod tests {
             usage: None,
         };
         let continuation = crate::background_turn::RuntimeTurnContinuation {
-            response,
+            response: crate::model_response::RuntimeModelResponse::new(
+                response,
+                orca_core::thread_identity::TurnId::new(),
+            ),
             preapproved_tool_call_id: Some("tool-1".to_string()),
         };
         let mut input = RuntimeTurnLoopInput {
@@ -439,7 +442,9 @@ mod tests {
                     .turn_context
                     .continuation
                     .as_ref()
-                    .and_then(|continuation| continuation.response.assistant_content.as_deref()),
+                    .and_then(|continuation| {
+                        continuation.response.response.assistant_content.as_deref()
+                    }),
                 Some("continued")
             );
             assert_eq!(

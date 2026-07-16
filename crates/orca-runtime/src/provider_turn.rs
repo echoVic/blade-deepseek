@@ -13,6 +13,7 @@ use orca_core::event_sink::EventSink;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 #[cfg(test)]
 use orca_core::subagent_types::SubagentType;
+use orca_core::thread_item_projection::ModelResponseIdentity;
 #[cfg(test)]
 use orca_mcp::McpRegistry;
 use orca_provider::{ProviderConfig, ProviderStreamEvent, context};
@@ -34,6 +35,7 @@ use crate::lifecycle::{
 use crate::memory;
 #[cfg(test)]
 use crate::memory::MemoryBlock;
+use crate::model_response::RuntimeModelResponse;
 use crate::provider_stream::RuntimeProviderSuspension;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
@@ -133,7 +135,7 @@ pub(crate) struct RuntimeProviderResponseExecutors<W: io::Write> {
 }
 
 pub(crate) enum RuntimeProviderTurnOutput {
-    Response(ProviderResponse),
+    Response(RuntimeModelResponse),
     Terminal(RuntimeTurnStartError),
     Suspended(RuntimeProviderSuspension),
 }
@@ -168,13 +170,13 @@ pub(crate) enum RuntimeProviderErrorResult {
 }
 
 pub(crate) enum RuntimeProviderTurnResultOutcome {
-    Response(ProviderResponse),
+    Response(RuntimeModelResponse),
     Failed(RuntimeTurnStartError),
     Suspended(RuntimeProviderSuspension),
 }
 
 pub(crate) enum RuntimeProviderTurnResultResult {
-    Response(ProviderResponse),
+    Response(RuntimeModelResponse),
     Return(AgentLoopResult),
     Suspended(RuntimeProviderSuspension),
 }
@@ -357,6 +359,7 @@ impl RuntimeProviderTurnStep {
             &model_conversation,
             input.runtime_system_messages,
         );
+        let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
         let mut stream = orca_provider::start_streaming(
             input.provider,
             &model_conversation,
@@ -366,7 +369,13 @@ impl RuntimeProviderTurnStep {
         let response = loop {
             match stream.recv_timeout(Duration::from_millis(10)) {
                 Ok(ProviderStreamEvent::Step(delivery)) => {
-                    emit_provider_delta(delivery.step(), emit_deltas, events, sink);
+                    emit_provider_delta(
+                        delivery.step(),
+                        &response_identity,
+                        emit_deltas,
+                        events,
+                        sink,
+                    );
                 }
                 Ok(ProviderStreamEvent::Completed(response)) => break response,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -383,7 +392,11 @@ impl RuntimeProviderTurnStep {
                 .is_some_and(|control| control.take_suspension_request())
             {
                 return Ok(RuntimeProviderTurnOutput::Suspended(
-                    RuntimeProviderSuspension::new(stream, input.provider_config.model.clone()),
+                    RuntimeProviderSuspension::new(
+                        stream,
+                        input.provider_config.model.clone(),
+                        response_identity,
+                    ),
                 ));
             }
         };
@@ -430,7 +443,9 @@ impl RuntimeProviderTurnStep {
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
 
-        Ok(RuntimeProviderTurnOutput::response(response))
+        Ok(RuntimeProviderTurnOutput::response(
+            RuntimeModelResponse::from_parts(response, response_identity),
+        ))
     }
 
     pub(crate) fn handle_provider_error<W: io::Write>(
@@ -469,7 +484,7 @@ impl RuntimeProviderResponseStep {
 
     pub(crate) fn handle<W: io::Write>(
         &mut self,
-        response: ProviderResponse,
+        response: RuntimeModelResponse,
         input: RuntimeProviderResponseInput<'_, W>,
         executors: RuntimeProviderResponseExecutors<W>,
     ) -> io::Result<RuntimeProviderResponseOutcome> {
@@ -492,15 +507,16 @@ impl RuntimeProviderResponseStep {
             batch_child_executor,
         } = executors;
         let step_snapshot = step_context.snapshot();
+        let completed_response = response.completed();
+        let response = response.response;
         if response.tool_calls.is_empty() {
             let final_message = response.assistant_content.clone();
             record_assistant_response_for_agent(
                 conversation,
-                history_writer.as_deref_mut(),
-                response.assistant_content,
-                response.assistant_reasoning,
-                vec![],
+                &completed_response,
                 step_snapshot.turn_context.emit_deltas,
+                events,
+                sink,
             )?;
             if step_snapshot.turn_context.emit_deltas && step_snapshot.config.auto_memory {
                 memory::extract_project_memory_after_final_response(
@@ -516,11 +532,10 @@ impl RuntimeProviderResponseStep {
 
         record_assistant_response_for_agent(
             conversation,
-            history_writer.as_deref_mut(),
-            response.assistant_content,
-            response.assistant_reasoning,
-            response.tool_calls.clone(),
+            &completed_response,
             step_snapshot.turn_context.emit_deltas,
+            events,
+            sink,
         )?;
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
@@ -637,7 +652,7 @@ impl RuntimeTurnProviderCycleStep {
         let provider_error_outcome = {
             let (conversation, history_writer) = input.conversation.parts_mut();
             self.provider_error_step.handle(
-                &response,
+                &response.response,
                 &mut RuntimeCompactionStep::new(
                     input.provider,
                     input.context_config,
@@ -695,7 +710,7 @@ impl RuntimeTurnProviderCycleStep {
 
     pub(crate) fn handle_response<W: io::Write>(
         &mut self,
-        response: ProviderResponse,
+        response: RuntimeModelResponse,
         input: RuntimeProviderResponseInput<'_, W>,
         executors: RuntimeProviderResponseExecutors<W>,
     ) -> io::Result<RuntimeTurnProviderCycleResult> {
@@ -728,6 +743,7 @@ fn cancelled_provider_turn<W: io::Write>(
 
 fn emit_provider_delta<W: io::Write>(
     step: &ProviderStep,
+    identity: &ModelResponseIdentity,
     emit_deltas: bool,
     events: &mut EventFactory,
     sink: &mut EventSink<W>,
@@ -737,10 +753,10 @@ fn emit_provider_delta<W: io::Write>(
     }
     match step {
         ProviderStep::ReasoningDelta(text) => {
-            let _ = sink.emit(events.assistant_reasoning_delta(text));
+            let _ = sink.emit(events.assistant_reasoning_delta(identity, text));
         }
         ProviderStep::MessageDelta(text) => {
-            let _ = sink.emit(events.assistant_message_delta(text));
+            let _ = sink.emit(events.assistant_message_delta(identity, text));
         }
         ProviderStep::ToolCallProgress(progress) => {
             let _ = sink.emit(events.tool_call_progress(progress));
@@ -753,7 +769,7 @@ fn emit_provider_delta<W: io::Write>(
 }
 
 impl RuntimeProviderTurnOutput {
-    fn response(response: ProviderResponse) -> Self {
+    fn response(response: RuntimeModelResponse) -> Self {
         Self::Response(response)
     }
 
@@ -780,6 +796,14 @@ mod tests {
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::tool_execution::policy_for_tool_execution;
+
+    fn runtime_response(response: ProviderResponse) -> RuntimeModelResponse {
+        RuntimeModelResponse::new(response, orca_core::thread_identity::TurnId::new())
+    }
+
+    fn response_identity() -> ModelResponseIdentity {
+        ModelResponseIdentity::new(orca_core::thread_identity::TurnId::new())
+    }
 
     fn config() -> RunConfig {
         RunConfig {
@@ -902,6 +926,7 @@ mod tests {
 
         emit_provider_delta(
             &ProviderStep::ToolCallProgress(progress),
+            &response_identity(),
             true,
             &mut events,
             &mut sink,
@@ -1034,6 +1059,7 @@ mod tests {
         };
         assert!(
             response
+                .response
                 .assistant_content
                 .as_deref()
                 .unwrap_or_default()
@@ -1183,7 +1209,7 @@ mod tests {
 
         let outcome = RuntimeProviderResponseStep::new()
             .handle(
-                response,
+                runtime_response(response),
                 RuntimeProviderResponseInput {
                     step_context,
                     sampling_state: &mut sampling_state,
@@ -1265,7 +1291,7 @@ mod tests {
 
         let result = RuntimeTurnProviderCycleStep::new()
             .handle_response(
-                response,
+                runtime_response(response),
                 RuntimeProviderResponseInput {
                     step_context,
                     sampling_state: &mut sampling_state,
@@ -1381,7 +1407,10 @@ mod tests {
                 RuntimeProviderCycleInput {
                     actor: &mut actor,
                     provider: ProviderKind::DeepSeek,
-                    continuation: Some(RuntimeTurnContinuation::from_response(response)),
+                    continuation: Some(RuntimeTurnContinuation::from_response(
+                        response,
+                        orca_core::thread_identity::TurnId::new(),
+                    )),
                     turn_context: RuntimeTurnContext::new(
                         cwd.path(),
                         "continue",
@@ -1494,11 +1523,15 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
         };
-        let success = RuntimeProviderTurnResultResultStep::new()
-            .fold(RuntimeProviderTurnResultOutcome::Response(response));
+        let success = RuntimeProviderTurnResultResultStep::new().fold(
+            RuntimeProviderTurnResultOutcome::Response(runtime_response(response)),
+        );
         match success {
             RuntimeProviderTurnResultResult::Response(response) => {
-                assert_eq!(response.assistant_content.as_deref(), Some("hello"));
+                assert_eq!(
+                    response.response.assistant_content.as_deref(),
+                    Some("hello")
+                );
             }
             RuntimeProviderTurnResultResult::Return(_) => {
                 panic!("provider response should continue the turn")

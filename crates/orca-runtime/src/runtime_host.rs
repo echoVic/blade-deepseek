@@ -17,6 +17,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::task_types::TaskStatus;
 use orca_core::thread_identity::TurnId;
+use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::workflow_types::{WorkflowInput, WorkflowOutput};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 use serde_json::Value;
@@ -459,6 +460,7 @@ impl HostedTurnRequest {
                         "background task {task_id} has no approved provider response to continue"
                     )
                 })?;
+        self.turn_id = continuation.response.identity.turn_id.clone();
         self.usage_credit = registry
             .get(task_id)
             .and_then(|task| task.usage)
@@ -1823,6 +1825,7 @@ struct ProviderBackgroundTaskContext {
     model: Option<String>,
     task_id: String,
     usage_ledger: RuntimeUsageLedger,
+    response_identity: ModelResponseIdentity,
 }
 
 struct WorkflowBackgroundTaskContext {
@@ -2691,6 +2694,7 @@ impl ThreadActor {
             model: suspension.model().map(str::to_string),
             task_id: task_id.clone(),
             usage_ledger: self.usage_ledger.clone(),
+            response_identity: suspension.identity().clone(),
         };
         let cancel = CancelToken::new();
         let worker_cancel = cancel.clone();
@@ -3011,11 +3015,13 @@ fn run_provider_background_task(
                     emit_provider_steps(
                         context.observer.as_deref(),
                         &mut events,
+                        &context.response_identity,
                         buffered_steps.drain(..),
                     );
                     emit_provider_steps(
                         context.observer.as_deref(),
                         &mut events,
+                        &context.response_identity,
                         std::iter::once(step),
                     );
                 } else if background_step_is_visible(&step) {
@@ -3034,9 +3040,9 @@ fn run_provider_background_task(
         }
     }
 
-    let usage = response
-        .as_ref()
-        .and_then(|response| provider_response_usage_totals(response, context.model.as_deref()));
+    let usage = response.as_ref().and_then(|response| {
+        provider_response_usage_totals(&response.response, context.model.as_deref())
+    });
     if let Some(usage) = usage {
         let totals = context.usage_ledger.add(usage);
         observe_runtime_event(context.observer.as_deref(), events.usage_updated(totals));
@@ -3065,7 +3071,7 @@ fn run_provider_background_task(
             usage,
         );
     } else if let Some(response) = response {
-        if provider_response_requires_approval(&response) {
+        if provider_response_requires_approval(&response.response) {
             status = RunStatus::ApprovalRequired;
             let _ = context
                 .task_registry
@@ -3075,7 +3081,7 @@ fn run_provider_background_task(
                     response,
                     usage,
                 );
-        } else if let Some(provider_error) = provider_response_error(&response) {
+        } else if let Some(provider_error) = provider_response_error(&response.response) {
             error = Some(provider_error);
             let _ = context.task_registry.apply_main_session_terminal_update(
                 &context.task_id,
@@ -3112,7 +3118,12 @@ fn run_provider_background_task(
     )
     .ok();
     if !was_backgrounded {
-        emit_provider_steps(context.observer.as_deref(), &mut events, buffered_steps);
+        emit_provider_steps(
+            context.observer.as_deref(),
+            &mut events,
+            &context.response_identity,
+            buffered_steps,
+        );
         if let Some(error) = error.as_deref() {
             observe_runtime_event(context.observer.as_deref(), events.error(error));
         }
@@ -3155,15 +3166,16 @@ fn background_step_is_visible(step: &ProviderStep) -> bool {
 fn emit_provider_steps(
     observer: Option<&dyn EventObserver>,
     events: &mut EventFactory,
+    identity: &ModelResponseIdentity,
     steps: impl IntoIterator<Item = ProviderStep>,
 ) {
     for step in steps {
         match step {
             ProviderStep::ReasoningDelta(text) => {
-                observe_runtime_event(observer, events.assistant_reasoning_delta(&text));
+                observe_runtime_event(observer, events.assistant_reasoning_delta(identity, &text));
             }
             ProviderStep::MessageDelta(text) => {
-                observe_runtime_event(observer, events.assistant_message_delta(&text));
+                observe_runtime_event(observer, events.assistant_message_delta(identity, &text));
             }
             ProviderStep::ToolCallProgress(progress) => {
                 observe_runtime_event(observer, events.tool_call_progress(&progress));
@@ -3297,5 +3309,76 @@ fn send_thread_shutdown(
             }
             Err(TrySendError::Closed(_)) => return Err(RuntimeHostError::ThreadUnavailable),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_core::approval_types::ActionKind;
+    use orca_core::provider_types::{ProviderResponse, ProviderStep};
+    use orca_core::tool_types::{ToolName, ToolRequest};
+
+    use crate::model_response::RuntimeModelResponse;
+
+    #[test]
+    fn background_continuation_reuses_pending_response_turn_identity() {
+        let registry = TaskRegistry::new("background-continuation-identity".to_string());
+        let task = registry.create_main_session("continue after approval".to_string());
+        registry.mark_running(&task.id).expect("mark task running");
+        registry
+            .mark_backgrounded(&task.id)
+            .expect("mark task backgrounded");
+
+        let response_turn_id = TurnId::new();
+        let response = RuntimeModelResponse::new(
+            ProviderResponse {
+                steps: vec![ProviderStep::ToolCall(ToolRequest {
+                    id: "tool-1".to_string(),
+                    name: ToolName::TaskList,
+                    action: ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some("{}".to_string()),
+                })],
+                assistant_content: Some("I need approval.".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+            response_turn_id.clone(),
+        );
+        registry
+            .approval_required_for_pending_provider_response(
+                &task.id,
+                "approval_required".to_string(),
+                response,
+            )
+            .expect("persist pending response");
+        registry
+            .submit_pending_tool_approval_response(&task.id, true)
+            .expect("approve pending tool");
+
+        let mut request = HostedTurnRequest::new("").with_operation_kind(
+            HostedOperationKind::BackgroundContinuation {
+                task_id: task.id.clone(),
+            },
+        );
+        assert_ne!(request.turn_id(), &response_turn_id);
+
+        request
+            .prepare_background_continuation(&registry)
+            .expect("prepare continuation");
+
+        assert_eq!(request.turn_id(), &response_turn_id);
+        assert_eq!(
+            request
+                .continuation
+                .as_ref()
+                .expect("runtime continuation")
+                .response
+                .identity
+                .turn_id,
+            response_turn_id
+        );
     }
 }

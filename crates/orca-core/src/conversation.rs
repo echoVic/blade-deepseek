@@ -6,7 +6,7 @@ use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTer
 
 pub const MISSING_TOOL_TERMINAL_ERROR: &str = "Tool invocation outcome is indeterminate because its terminal result was missing from recovered history. Inspect external state before retrying.";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RawToolCall {
     pub id: String,
     pub function_name: String,

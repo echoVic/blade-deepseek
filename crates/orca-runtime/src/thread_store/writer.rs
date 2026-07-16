@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use orca_core::conversation::{Message, SummaryState};
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::{EventEnvelope, EventPublicationStore};
+use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::thread_identity::{ConversationItemId, TurnId};
+use orca_core::thread_item_projection::CompletedModelResponse;
 use orca_core::tool_types::ToolResult;
 use uuid::Uuid;
 
@@ -55,6 +56,19 @@ pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
                     ),
                 ));
             }
+            Ok(SessionRecord::SemanticEvent { event }) => {
+                conversation_record_from_semantic_event(&event).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid semantic event record at {} line {}: {error}",
+                            path.display(),
+                            i + 1
+                        ),
+                    )
+                })?;
+                records.push(SessionRecord::SemanticEvent { event });
+            }
             Ok(record) => records.push(record),
             Err(error) if line_has_record_type(line, "event.semantic") => {
                 return Err(io::Error::new(
@@ -91,6 +105,19 @@ pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
         }
     }
     Ok(records)
+}
+
+pub(crate) fn conversation_record_from_semantic_event(
+    event: &EventEnvelope,
+) -> io::Result<Option<StoredConversationRecord>> {
+    if event.event_type != EventType::ModelResponseCompleted {
+        return Ok(None);
+    }
+    let response = serde_json::from_value::<CompletedModelResponse>(event.payload.clone())
+        .map_err(io::Error::other)?;
+    Ok(Some(StoredConversationRecord::completed_model_response(
+        &response,
+    )))
 }
 
 fn line_has_conversation_identity(line: &str) -> bool {
@@ -254,7 +281,12 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
             SessionRecord::EventSequenceReserved { next_seq } => {
                 next_event_seq = next_event_seq.max(next_seq);
             }
-            SessionRecord::SemanticEvent { event } => semantic_events.push(event),
+            SessionRecord::SemanticEvent { event } => {
+                if let Some(record) = conversation_record_from_semantic_event(&event)? {
+                    messages.push(record.message.into());
+                }
+                semantic_events.push(event);
+            }
             SessionRecord::PlanState { explanation, plan } => {
                 let all_done = !plan.is_empty()
                     && plan.iter().all(|item| item.status == PlanStatus::Completed);
@@ -691,21 +723,27 @@ impl SessionWriter {
         // be restored to plaintext before it can be continued.
         let path = restore_plaintext_transcript(path)?;
         append_usage_baseline(&path)?;
-        let conversation_records = read_records(&path)?
-            .into_iter()
-            .filter_map(|record| match record {
+        let mut conversation_records = Vec::new();
+        for record in read_records(&path)? {
+            match record {
                 SessionRecord::Message {
                     id,
                     turn_id,
                     message,
-                } => Some(StoredConversationRecord {
+                } => conversation_records.push(StoredConversationRecord {
                     item_id: id,
                     turn_id,
                     message,
+                    completed_model_items: None,
                 }),
-                _ => None,
-            })
-            .collect();
+                SessionRecord::SemanticEvent { event } => {
+                    if let Some(record) = conversation_record_from_semantic_event(&event)? {
+                        conversation_records.push(record);
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(Self {
             path,
             conversation_records: Arc::new(Mutex::new(conversation_records)),
@@ -891,6 +929,21 @@ impl SessionWriter {
     }
 
     fn append_semantic_event_record(&self, event: &EventEnvelope) -> io::Result<()> {
+        let record = conversation_record_from_semantic_event(event)?;
+        if let Some(record) = record {
+            let mut records = self
+                .conversation_records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            write_record(
+                &self.path,
+                &SessionRecord::SemanticEvent {
+                    event: event.clone(),
+                },
+            )?;
+            records.push(record);
+            return Ok(());
+        }
         write_record(
             &self.path,
             &SessionRecord::SemanticEvent {
@@ -936,6 +989,8 @@ fn append_usage_baseline(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use orca_core::approval_rules::PermissionRules;
+    use orca_core::event_schema::{EVENT_SCHEMA_VERSION, EventType};
+    use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
 
     fn usage(input_tokens: u64, output_tokens: u64, cache_tokens: u64, cost: f64) -> UsageTotals {
         UsageTotals {
@@ -1025,6 +1080,68 @@ mod tests {
                 .map(|record| (record.item_id.clone(), record.turn_id.clone()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn completed_model_response_is_one_semantic_record_and_one_derived_ledger_entry() {
+        let (_directory, path, writer) = new_transcript();
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let response = CompletedModelResponse::new(
+            identity.clone(),
+            Some("completed answer".to_string()),
+            Some("completed reasoning".to_string()),
+            Vec::new(),
+        );
+        let event = EventEnvelope {
+            version: EVENT_SCHEMA_VERSION.to_string(),
+            run_id: "resume-usage".to_string(),
+            seq: 0,
+            timestamp_ms: 1,
+            event_type: EventType::ModelResponseCompleted,
+            payload: serde_json::to_value(&response).expect("serialize completed response"),
+        };
+
+        writer
+            .append_semantic_event(&event)
+            .expect("append completed response");
+
+        let records = read_records(&path).expect("read completed response records");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, SessionRecord::SemanticEvent { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, SessionRecord::Message { .. }))
+                .count(),
+            0
+        );
+        let ledger = writer.conversation_records();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger[0].item_id.as_ref(),
+            Some(&identity.item_ids.conversation_item_id)
+        );
+        assert_eq!(ledger[0].turn_id.as_ref(), Some(&identity.turn_id));
+        assert_eq!(
+            ledger[0]
+                .completed_model_items
+                .as_ref()
+                .expect("canonical model items"),
+            &response.completed_items()
+        );
+        assert!(matches!(
+            read_transcript(&path)
+                .expect("read completed response transcript")
+                .messages
+                .as_slice(),
+            [Message::Assistant { content: Some(content), reasoning_content: Some(reasoning), .. }]
+                if content == "completed answer" && reasoning == "completed reasoning"
+        ));
     }
 
     #[test]

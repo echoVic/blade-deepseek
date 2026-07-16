@@ -4,11 +4,14 @@ use std::io;
 use std::path::Path;
 
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_core::conversation::{Conversation, Message, RawToolCall, assistant_message_has_payload};
+use orca_core::conversation::{Conversation, Message, assistant_message_has_payload};
 use orca_core::cost_types::UsageTotals;
+use orca_core::event_schema::EventFactory;
+use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskStatus;
+use orca_core::thread_item_projection::CompletedModelResponse;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
@@ -128,27 +131,23 @@ pub(crate) fn record_tool_result_for_agent(
     Ok(result_content)
 }
 
-pub(crate) fn record_assistant_response_for_agent(
+pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
     conversation: &mut Conversation,
-    history_writer: Option<&mut SessionWriter>,
-    assistant_content: Option<String>,
-    assistant_reasoning: Option<String>,
-    tool_calls: Vec<RawToolCall>,
+    response: &CompletedModelResponse,
     emit_deltas: bool,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
 ) -> io::Result<()> {
-    if !assistant_message_has_payload(assistant_content.as_deref(), &tool_calls) {
+    if !assistant_message_has_payload(response.assistant_content.as_deref(), &response.tool_calls) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "assistant response did not contain content or tool calls",
         ));
     }
-    conversation.add_assistant(assistant_content, assistant_reasoning, tool_calls);
-    if emit_deltas
-        && let Some(writer) = history_writer
-        && let Some(message) = conversation.messages.last()
-    {
-        writer.append_message(message)?;
+    if emit_deltas {
+        sink.emit(events.model_response_completed(response))?;
     }
+    conversation.messages.push(response.assistant_message());
     Ok(())
 }
 
@@ -805,14 +804,23 @@ mod tests {
     fn record_assistant_response_rejects_empty_payload() {
         let mut conversation = Conversation::new();
         conversation.add_user("hello".to_string());
-
-        let error = record_assistant_response_for_agent(
-            &mut conversation,
-            None,
+        let response = CompletedModelResponse::new(
+            orca_core::thread_item_projection::ModelResponseIdentity::new(
+                orca_core::thread_identity::TurnId::new(),
+            ),
             None,
             Some("private thinking".to_string()),
             vec![],
+        );
+        let mut events = EventFactory::new("empty-assistant-response".to_string());
+        let mut sink = EventSink::new(Vec::new(), orca_core::config::OutputFormat::Jsonl);
+
+        let error = record_assistant_response_for_agent(
+            &mut conversation,
+            &response,
             false,
+            &mut events,
+            &mut sink,
         )
         .expect_err("reasoning-only assistant must not enter history");
 

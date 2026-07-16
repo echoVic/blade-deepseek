@@ -1,8 +1,11 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::provider_types::ProviderStep;
+use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_provider::{ProviderStreamEvent, ProviderStreamingCall};
+
+use crate::model_response::RuntimeModelResponse;
 
 pub trait RuntimeProviderSuspensionControl: std::fmt::Debug + Send + Sync {
     fn take_suspension_request(&self) -> bool;
@@ -10,17 +13,26 @@ pub trait RuntimeProviderSuspensionControl: std::fmt::Debug + Send + Sync {
 
 pub enum RuntimeProviderSuspensionEvent {
     Step(ProviderStep),
-    Completed(ProviderResponse),
+    Completed(RuntimeModelResponse),
 }
 
 pub struct RuntimeProviderSuspension {
     stream: ProviderStreamingCall,
     model: Option<String>,
+    identity: ModelResponseIdentity,
 }
 
 impl RuntimeProviderSuspension {
-    pub(crate) fn new(stream: ProviderStreamingCall, model: Option<String>) -> Self {
-        Self { stream, model }
+    pub(crate) fn new(
+        stream: ProviderStreamingCall,
+        model: Option<String>,
+        identity: ModelResponseIdentity,
+    ) -> Self {
+        Self {
+            stream,
+            model,
+            identity,
+        }
     }
 
     pub fn recv_timeout(
@@ -32,7 +44,9 @@ impl RuntimeProviderSuspension {
                 delivery.step().clone(),
             )),
             ProviderStreamEvent::Completed(response) => {
-                Ok(RuntimeProviderSuspensionEvent::Completed(response))
+                Ok(RuntimeProviderSuspensionEvent::Completed(
+                    RuntimeModelResponse::from_parts(response, self.identity.clone()),
+                ))
             }
         }
     }
@@ -43,5 +57,9 @@ impl RuntimeProviderSuspension {
 
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    pub fn identity(&self) -> &ModelResponseIdentity {
+        &self.identity
     }
 }

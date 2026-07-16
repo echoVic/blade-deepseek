@@ -14,6 +14,7 @@ use crate::plan_types::UpdatePlanArgs;
 use crate::provider_types::{ProviderReplayState, ToolCallProgress};
 use crate::task_types::BackgroundTaskSummary;
 use crate::thread_identity::TurnId;
+use crate::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
 use crate::tool_types::{FileChangePreview, ToolRequest, ToolResult, ToolTerminalSource};
 use crate::verification::VerificationResult;
 
@@ -147,6 +148,8 @@ pub enum EventType {
     AssistantReasoningDelta,
     #[serde(rename = "assistant.message.delta")]
     AssistantMessageDelta,
+    #[serde(rename = "model.response.completed")]
+    ModelResponseCompleted,
     #[serde(rename = "provider.replay.updated")]
     ProviderReplayUpdated,
     #[serde(rename = "usage.updated")]
@@ -231,6 +234,7 @@ impl EventType {
             | Self::ApprovalResolved
             | Self::ToolCallRequested
             | Self::ToolCallCompleted
+            | Self::ModelResponseCompleted
             | Self::PlanUpdated
             | Self::SubagentStarted
             | Self::SubagentCompleted
@@ -396,22 +400,39 @@ impl EventFactory {
         self.make(EventType::TurnStarted, payload)
     }
 
-    pub fn assistant_reasoning_delta(&mut self, text: &str) -> EventDraft {
+    pub fn assistant_reasoning_delta(
+        &mut self,
+        identity: &ModelResponseIdentity,
+        text: &str,
+    ) -> EventDraft {
         self.make(
             EventType::AssistantReasoningDelta,
             json!({
+                "turn_id": identity.turn_id,
+                "item_id": identity.item_ids.reasoning_item_id,
                 "text": text
             }),
         )
     }
 
-    pub fn assistant_message_delta(&mut self, text: &str) -> EventDraft {
+    pub fn assistant_message_delta(
+        &mut self,
+        identity: &ModelResponseIdentity,
+        text: &str,
+    ) -> EventDraft {
         self.make(
             EventType::AssistantMessageDelta,
             json!({
+                "turn_id": identity.turn_id,
+                "agent_message_item_id": identity.item_ids.agent_message_item_id(),
+                "plan_item_id": identity.item_ids.plan_item_id,
                 "text": text
             }),
         )
+    }
+
+    pub fn model_response_completed(&mut self, response: &CompletedModelResponse) -> EventDraft {
+        self.make_serialized(EventType::ModelResponseCompleted, response)
     }
 
     pub fn provider_replay_updated(&mut self, replay: &ProviderReplayState) -> EventDraft {
@@ -1396,9 +1417,10 @@ mod tests {
     #[test]
     fn event_envelope_serializes_to_valid_json() {
         let mut f = EventFactory::new("run-1".to_string());
+        let identity = ModelResponseIdentity::new(TurnId::new());
         let mut output = Vec::new();
         EventSink::new(&mut output, OutputFormat::Jsonl)
-            .emit(f.assistant_message_delta("test text"))
+            .emit(f.assistant_message_delta(&identity, "test text"))
             .unwrap();
         let json = String::from_utf8(output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -13,6 +13,7 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventEnvelope;
 use orca_core::plan_types::PlanItem;
 use orca_core::thread_identity::{ConversationItemId, TurnId};
+use orca_core::thread_item_projection::{CompletedModelItem, CompletedModelResponse};
 use orca_core::tool_types::{
     ToolInvocationStarted, ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource,
 };
@@ -139,6 +140,7 @@ pub(crate) struct StoredConversationRecord {
     pub(crate) item_id: Option<ConversationItemId>,
     pub(crate) turn_id: Option<TurnId>,
     pub(crate) message: StoredMessage,
+    pub(crate) completed_model_items: Option<Vec<CompletedModelItem>>,
 }
 
 impl StoredConversationRecord {
@@ -147,6 +149,7 @@ impl StoredConversationRecord {
             item_id: None,
             turn_id: None,
             message,
+            completed_model_items: None,
         }
     }
 
@@ -159,6 +162,16 @@ impl StoredConversationRecord {
             item_id: Some(item_id),
             turn_id: Some(turn_id),
             message,
+            completed_model_items: None,
+        }
+    }
+
+    pub(crate) fn completed_model_response(response: &CompletedModelResponse) -> Self {
+        Self {
+            item_id: Some(response.conversation_item_id().clone()),
+            turn_id: Some(response.turn_id().clone()),
+            message: StoredMessage::from(&response.assistant_message()),
+            completed_model_items: Some(response.completed_items()),
         }
     }
 

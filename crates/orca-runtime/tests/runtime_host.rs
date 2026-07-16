@@ -358,8 +358,11 @@ impl ThreadOperationExecutor for ScriptedExecutor {
             }
             TestBehavior::EmitSemanticAndTransient { message, status } => {
                 let mut sink = EventSink::new(writer, generation.config().output_format);
-                sink.emit(events.assistant_reasoning_delta("transient reasoning"))?;
-                sink.emit(events.assistant_message_delta("transient message"))?;
+                let identity = orca_core::thread_item_projection::ModelResponseIdentity::new(
+                    orca_core::thread_identity::TurnId::new(),
+                );
+                sink.emit(events.assistant_reasoning_delta(&identity, "transient reasoning"))?;
+                sink.emit(events.assistant_message_delta(&identity, "transient message"))?;
                 sink.emit(events.tool_output_delta("tool-1", "transient output"))?;
                 sink.emit(events.error(&message))?;
                 Ok(status.into())
@@ -2606,7 +2609,7 @@ fn canonical_turn_can_suspend_one_in_flight_provider_without_committing_terminal
     assert_eq!(
         completed
             .as_ref()
-            .and_then(|response| response.assistant_content.as_deref()),
+            .and_then(|response| response.response.assistant_content.as_deref()),
         Some("Mock slow stream started.Mock slow stream completed.")
     );
 }

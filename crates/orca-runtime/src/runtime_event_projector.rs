@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 
 use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
+use orca_core::thread_item_projection::{CompletedModelItem, CompletedModelResponse};
 use serde_json::{Value, json};
 
 use crate::protocol::{self, ServerEvent};
 use crate::tool_item_projection::{
-    ProjectedFileChangeItem, ProjectedTextItem, ProjectedTextItemKind, ProjectedToolCallCompletion,
-    ProjectedToolCallItem, ProjectedWorkflowItem, mcp_result_from_content, mcp_tool_parts,
-    parse_json_or_null, tool_error_object_from_value, tool_status_is_completed,
+    ProjectedFileChangeItem, ProjectedToolCallCompletion, ProjectedToolCallItem,
+    ProjectedWorkflowItem, mcp_result_from_content, mcp_tool_parts, parse_json_or_null,
+    tool_error_object_from_value, tool_status_is_completed,
 };
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RuntimeEventProjector {
-    agent_message: Option<ProjectedTextItem>,
-    plan: Option<ProjectedTextItem>,
+    agent_message_id: Option<String>,
+    plan_item_id: Option<String>,
     plan_parser: ProposedPlanStreamParser,
-    reasoning: Option<ProjectedTextItem>,
+    reasoning_item_id: Option<String>,
     tool_items: HashMap<String, ProjectedToolCallItem>,
     file_change_items: HashMap<String, ProjectedFileChangeItem>,
     workflow_items: HashMap<String, ProjectedWorkflowItem>,
@@ -29,16 +30,13 @@ impl RuntimeEventProjector {
 
         match event_type {
             "assistant.message.delta" => {
-                let delta = runtime_event["payload"]["text"]
-                    .as_str()
-                    .unwrap_or_default();
-                self.project_assistant_message_delta(delta, &mut events);
+                self.project_assistant_message_delta(&runtime_event, &mut events);
             }
             "assistant.reasoning.delta" => {
-                let delta = runtime_event["payload"]["text"]
-                    .as_str()
-                    .unwrap_or_default();
-                self.project_reasoning_delta(delta, &mut events);
+                self.project_reasoning_delta(&runtime_event, &mut events);
+            }
+            "model.response.completed" => {
+                self.project_completed_model_response(&runtime_event, &mut events);
             }
             "tool.call.requested" => {
                 self.project_tool_item_started(&runtime_event, &mut events);
@@ -70,8 +68,7 @@ impl RuntimeEventProjector {
                 self.project_workflow_item_completed(&runtime_event, "failed", &mut events);
             }
             "session.completed" => {
-                self.flush_assistant_message_parser(&mut events);
-                self.project_terminal_items(&mut events);
+                self.clear_transient_text_items();
             }
             _ => {}
         }
@@ -79,114 +76,195 @@ impl RuntimeEventProjector {
         events
     }
 
-    fn project_reasoning_delta(&mut self, delta: &str, events: &mut Vec<ServerEvent>) {
-        if self.reasoning.is_none() {
-            self.reasoning = Some(ProjectedTextItem::new(ProjectedTextItemKind::Reasoning));
+    fn project_reasoning_delta(&mut self, runtime_event: &Value, events: &mut Vec<ServerEvent>) {
+        let payload = &runtime_event["payload"];
+        let Some(item_id) = payload["item_id"].as_str() else {
+            return;
+        };
+        let delta = payload["text"].as_str().unwrap_or_default();
+        if self.reasoning_item_id.as_deref() != Some(item_id) {
+            self.reasoning_item_id = Some(item_id.to_string());
             events.push(ServerEvent::ItemStarted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: self
-                    .reasoning
-                    .as_ref()
-                    .expect("reasoning item")
-                    .started_item(),
+                thread_id: runtime_event["run_id"].clone(),
+                turn_id: payload["turn_id"].clone(),
+                item: json!({
+                    "type": "reasoning",
+                    "id": item_id,
+                    "summary": "",
+                    "content": "",
+                }),
             });
         }
-        if let Some(item) = &mut self.reasoning {
-            item.push_delta(delta);
-            events.push(ServerEvent::ItemReasoningDelta {
-                item_id: Value::from(item.id().to_string()),
-                delta: Value::from(delta.to_string()),
-            });
-        }
+        events.push(ServerEvent::ItemReasoningDelta {
+            item_id: Value::from(item_id.to_string()),
+            delta: Value::from(delta.to_string()),
+        });
     }
 
-    fn project_assistant_message_delta(&mut self, delta: &str, events: &mut Vec<ServerEvent>) {
+    fn project_assistant_message_delta(
+        &mut self,
+        runtime_event: &Value,
+        events: &mut Vec<ServerEvent>,
+    ) {
+        let payload = &runtime_event["payload"];
+        let Some(agent_message_item_id) = payload["agent_message_item_id"].as_str() else {
+            return;
+        };
+        let Some(plan_item_id) = payload["plan_item_id"].as_str() else {
+            return;
+        };
+        let delta = payload["text"].as_str().unwrap_or_default();
         for segment in self.plan_parser.push(delta) {
             match segment {
-                ProposedPlanSegment::Agent(text) => self.project_agent_message_delta(&text, events),
-                ProposedPlanSegment::Plan(text) => self.project_plan_delta(&text, events),
+                ProposedPlanSegment::Agent(text) => self.project_agent_message_delta(
+                    runtime_event,
+                    agent_message_item_id,
+                    &text,
+                    events,
+                ),
+                ProposedPlanSegment::Plan(text) => {
+                    self.project_plan_delta(runtime_event, plan_item_id, &text, events)
+                }
             }
         }
     }
 
-    fn flush_assistant_message_parser(&mut self, events: &mut Vec<ServerEvent>) {
+    fn flush_assistant_message_parser(
+        &mut self,
+        runtime_event: &Value,
+        agent_message_item_id: &str,
+        plan_item_id: &str,
+        events: &mut Vec<ServerEvent>,
+    ) {
         for segment in self.plan_parser.finish() {
             match segment {
-                ProposedPlanSegment::Agent(text) => self.project_agent_message_delta(&text, events),
-                ProposedPlanSegment::Plan(text) => self.project_plan_delta(&text, events),
+                ProposedPlanSegment::Agent(text) => self.project_agent_message_delta(
+                    runtime_event,
+                    agent_message_item_id,
+                    &text,
+                    events,
+                ),
+                ProposedPlanSegment::Plan(text) => {
+                    self.project_plan_delta(runtime_event, plan_item_id, &text, events)
+                }
             }
         }
     }
 
-    fn project_agent_message_delta(&mut self, delta: &str, events: &mut Vec<ServerEvent>) {
+    fn project_agent_message_delta(
+        &mut self,
+        runtime_event: &Value,
+        item_id: &str,
+        delta: &str,
+        events: &mut Vec<ServerEvent>,
+    ) {
         if delta.is_empty() {
             return;
         }
-        if self.agent_message.is_none() {
-            self.agent_message = Some(ProjectedTextItem::new(ProjectedTextItemKind::AgentMessage));
+        if self.agent_message_id.as_deref() != Some(item_id) {
+            self.agent_message_id = Some(item_id.to_string());
             events.push(ServerEvent::ItemStarted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: self
-                    .agent_message
-                    .as_ref()
-                    .expect("agent message item")
-                    .started_item(),
+                thread_id: runtime_event["run_id"].clone(),
+                turn_id: runtime_event["payload"]["turn_id"].clone(),
+                item: json!({
+                    "type": "agent_message",
+                    "id": item_id,
+                    "text": "",
+                }),
             });
         }
-        if let Some(item) = &mut self.agent_message {
-            item.push_delta(delta);
-            events.push(ServerEvent::ItemMessageDelta {
-                item_id: Value::from(item.id().to_string()),
-                delta: Value::from(delta.to_string()),
+        events.push(ServerEvent::ItemMessageDelta {
+            item_id: Value::from(item_id.to_string()),
+            delta: Value::from(delta.to_string()),
+        });
+    }
+
+    fn project_plan_delta(
+        &mut self,
+        runtime_event: &Value,
+        item_id: &str,
+        delta: &str,
+        events: &mut Vec<ServerEvent>,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.plan_item_id.as_deref() != Some(item_id) {
+            self.plan_item_id = Some(item_id.to_string());
+            events.push(ServerEvent::ItemStarted {
+                thread_id: runtime_event["run_id"].clone(),
+                turn_id: runtime_event["payload"]["turn_id"].clone(),
+                item: json!({
+                    "type": "plan",
+                    "id": item_id,
+                    "text": "",
+                }),
+            });
+        }
+        events.push(ServerEvent::ItemPlanDelta {
+            item_id: Value::from(item_id.to_string()),
+            delta: Value::from(delta.to_string()),
+        });
+    }
+
+    fn project_completed_model_response(
+        &mut self,
+        runtime_event: &Value,
+        events: &mut Vec<ServerEvent>,
+    ) {
+        let Ok(response) =
+            serde_json::from_value::<CompletedModelResponse>(runtime_event["payload"].clone())
+        else {
+            return;
+        };
+        self.flush_assistant_message_parser(
+            runtime_event,
+            response.identity.item_ids.agent_message_item_id().as_str(),
+            response.identity.item_ids.plan_item_id.as_str(),
+            events,
+        );
+        for item in response.completed_items() {
+            self.ensure_completed_item_started(runtime_event, &item, events);
+            events.push(ServerEvent::ItemCompleted {
+                thread_id: runtime_event["run_id"].clone(),
+                turn_id: Value::from(response.turn_id().to_string()),
+                item: item.into_value(),
+            });
+        }
+        self.clear_transient_text_items();
+    }
+
+    fn ensure_completed_item_started(
+        &mut self,
+        runtime_event: &Value,
+        item: &CompletedModelItem,
+        events: &mut Vec<ServerEvent>,
+    ) {
+        let already_started = match item {
+            CompletedModelItem::AgentMessage { id, .. } => {
+                self.agent_message_id.as_deref() == Some(id.as_str())
+            }
+            CompletedModelItem::Plan { id, .. } => {
+                self.plan_item_id.as_deref() == Some(id.as_str())
+            }
+            CompletedModelItem::Reasoning { id, .. } => {
+                self.reasoning_item_id.as_deref() == Some(id.as_str())
+            }
+        };
+        if !already_started {
+            events.push(ServerEvent::ItemStarted {
+                thread_id: runtime_event["run_id"].clone(),
+                turn_id: runtime_event["payload"]["identity"]["turn_id"].clone(),
+                item: item.started_item().into_value(),
             });
         }
     }
 
-    fn project_plan_delta(&mut self, delta: &str, events: &mut Vec<ServerEvent>) {
-        if delta.is_empty() {
-            return;
-        }
-        if self.plan.is_none() {
-            self.plan = Some(ProjectedTextItem::new(ProjectedTextItemKind::Plan));
-            events.push(ServerEvent::ItemStarted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: self.plan.as_ref().expect("plan item").started_item(),
-            });
-        }
-        if let Some(item) = &mut self.plan {
-            item.push_delta(delta);
-            events.push(ServerEvent::ItemPlanDelta {
-                item_id: Value::from(item.id().to_string()),
-                delta: Value::from(delta.to_string()),
-            });
-        }
-    }
-
-    fn project_terminal_items(&mut self, events: &mut Vec<ServerEvent>) {
-        if let Some(item) = self.agent_message.take() {
-            events.push(ServerEvent::ItemCompleted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: item.completed_item(),
-            });
-        }
-        if let Some(item) = self.plan.take() {
-            events.push(ServerEvent::ItemCompleted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: item.completed_item(),
-            });
-        }
-        if let Some(item) = self.reasoning.take() {
-            events.push(ServerEvent::ItemCompleted {
-                thread_id: Value::Null,
-                turn_id: Value::Null,
-                item: item.completed_item(),
-            });
-        }
+    fn clear_transient_text_items(&mut self) {
+        self.agent_message_id = None;
+        self.plan_item_id = None;
+        self.reasoning_item_id = None;
+        self.plan_parser = ProposedPlanStreamParser::default();
     }
 
     fn project_tool_item_started(&mut self, runtime_event: &Value, events: &mut Vec<ServerEvent>) {
@@ -529,4 +607,90 @@ fn tool_error_detail(payload: &Value) -> Value {
         return Value::from("tool call failed");
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orca_core::event_schema::EventFactory;
+    use orca_core::event_sink::EventSink;
+    use orca_core::thread_identity::TurnId;
+    use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
+    use orca_core::{config::OutputFormat, event_schema::EventDraft};
+
+    fn runtime_line(event: EventDraft) -> String {
+        let mut output = Vec::new();
+        EventSink::new(&mut output, OutputFormat::Jsonl)
+            .emit(event)
+            .expect("serialize runtime event");
+        String::from_utf8(output)
+            .expect("runtime event is utf8")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn consecutive_model_responses_keep_distinct_item_lifecycles() {
+        let turn_id = TurnId::new();
+        let first_identity = ModelResponseIdentity::new(turn_id.clone());
+        let second_identity = ModelResponseIdentity::new(turn_id);
+        let mut factory = EventFactory::new("thread-model-items".to_string());
+        let mut projector = RuntimeEventProjector::default();
+        let mut projected = Vec::new();
+
+        for (identity, text) in [
+            (&first_identity, "first response"),
+            (&second_identity, "second response"),
+        ] {
+            projected.extend(projector.project_line(&runtime_line(
+                factory.assistant_message_delta(identity, text),
+            )));
+            let completed = CompletedModelResponse::new(
+                identity.clone(),
+                Some(text.to_string()),
+                None,
+                Vec::new(),
+            );
+            projected.extend(
+                projector.project_line(&runtime_line(factory.model_response_completed(&completed))),
+            );
+        }
+
+        let completed = projected
+            .iter()
+            .filter_map(|event| match event {
+                ServerEvent::ItemCompleted { item, .. } if item["type"] == "agent_message" => {
+                    Some(item.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0]["text"], "first response");
+        assert_eq!(completed[1]["text"], "second response");
+        assert_eq!(
+            completed[0]["id"],
+            first_identity.item_ids.agent_message_item_id().as_str()
+        );
+        assert_eq!(
+            completed[1]["id"],
+            second_identity.item_ids.agent_message_item_id().as_str()
+        );
+        assert_ne!(completed[0]["id"], completed[1]["id"]);
+    }
+
+    #[test]
+    fn malformed_completed_model_response_fails_closed() {
+        let projected = RuntimeEventProjector::default().project_line(
+            r#"{"version":"1","run_id":"thread-model-items","seq":0,"timestamp_ms":1,"type":"model.response.completed","payload":{"identity":{"turn_id":"not-a-turn"}}}"#,
+        );
+
+        assert!(
+            projected.iter().all(|event| !matches!(
+                event,
+                ServerEvent::ItemStarted { .. } | ServerEvent::ItemCompleted { .. }
+            )),
+            "malformed canonical completion must not fabricate item lifecycle events: {projected:?}"
+        );
+    }
 }

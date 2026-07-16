@@ -81,6 +81,7 @@ impl<W: Write> EventSink<W> {
                     event.payload["text"].as_str().unwrap_or("")
                 )
             }
+            EventType::ModelResponseCompleted => Ok(()),
             EventType::ProviderReplayUpdated => writeln!(self.writer, "provider replay updated"),
             EventType::ModelRouted => {
                 let actual = event.payload["actual_model"].as_str().unwrap_or("unknown");
@@ -222,6 +223,8 @@ mod tests {
     use crate::event_schema::{
         EVENT_SEQUENCE_RESERVATION_SIZE, EventFactory, EventPublicationStore,
     };
+    use crate::thread_identity::TurnId;
+    use crate::thread_item_projection::ModelResponseIdentity;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -251,14 +254,20 @@ mod tests {
         }
     }
 
+    fn model_response_identity() -> ModelResponseIdentity {
+        ModelResponseIdentity::new(TurnId::new())
+    }
+
     #[test]
     fn jsonl_format_writes_one_line_per_event() {
         let mut buf = Vec::new();
         let mut sink = EventSink::new(&mut buf, OutputFormat::Jsonl);
         let mut f = EventFactory::new("run-1".to_string());
+        let identity = model_response_identity();
 
         sink.emit(f.error("test error")).unwrap();
-        sink.emit(f.assistant_message_delta("hello")).unwrap();
+        sink.emit(f.assistant_message_delta(&identity, "hello"))
+            .unwrap();
 
         let output = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = output.lines().collect();
@@ -278,9 +287,11 @@ mod tests {
         let mut buf = Vec::new();
         let mut sink = EventSink::new(&mut buf, OutputFormat::Text);
         let mut f = EventFactory::new("run-1".to_string());
+        let identity = model_response_identity();
 
         sink.emit(f.error("something broke")).unwrap();
-        sink.emit(f.assistant_message_delta("hi")).unwrap();
+        sink.emit(f.assistant_message_delta(&identity, "hi"))
+            .unwrap();
 
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("error: something broke"));
@@ -299,7 +310,8 @@ mod tests {
             },
         ));
         let mut events = EventFactory::new("typed-observer".to_string());
-        let event = events.assistant_message_delta("hello");
+        let identity = model_response_identity();
+        let event = events.assistant_message_delta(&identity, "hello");
         let expected_run_id = event.run_id.clone();
         let expected_event_type = event.event_type;
         let expected_payload = event.payload.clone();
@@ -367,10 +379,11 @@ mod tests {
             publication_store,
         );
         let mut sink = EventSink::new(io::sink(), OutputFormat::Jsonl);
+        let identity = model_response_identity();
 
-        sink.emit(events.assistant_reasoning_delta("reasoning"))
+        sink.emit(events.assistant_reasoning_delta(&identity, "reasoning"))
             .unwrap();
-        sink.emit(events.assistant_message_delta("message"))
+        sink.emit(events.assistant_message_delta(&identity, "message"))
             .unwrap();
         sink.emit(events.tool_output_delta("tool-1", "chunk"))
             .unwrap();
@@ -391,8 +404,13 @@ mod tests {
             0,
             publication_store,
         );
+        let identity = model_response_identity();
 
-        observe_event(None, events.assistant_message_delta("not published")).unwrap();
+        observe_event(
+            None,
+            events.assistant_message_delta(&identity, "not published"),
+        )
+        .unwrap();
         observe_event(None, events.error("journal only")).unwrap();
 
         let journal = store.semantic_events.lock().unwrap();
@@ -432,6 +450,7 @@ mod tests {
             EventType::ApprovalResolved,
             EventType::ToolCallRequested,
             EventType::ToolCallCompleted,
+            EventType::ModelResponseCompleted,
             EventType::PlanUpdated,
             EventType::SubagentStarted,
             EventType::SubagentCompleted,

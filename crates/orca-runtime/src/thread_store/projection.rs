@@ -296,8 +296,28 @@ fn projected_record_items(
     record: &StoredConversationRecord,
     message: &StoredMessage,
 ) -> io::Result<Vec<ProjectedConversationItem>> {
+    if let Some(completed_items) = &record.completed_model_items {
+        let mut projected = completed_items
+            .iter()
+            .cloned()
+            .map(|item| ProjectedConversationItem {
+                item_id: Some(item.id().to_string()),
+                item: item.into_value(),
+            })
+            .collect::<Vec<_>>();
+        if let StoredMessage::Assistant { tool_calls, .. } = message {
+            projected.extend(tool_calls.iter().map(|tool_call| {
+                let item = tool_call_to_thread_item(tool_call);
+                ProjectedConversationItem {
+                    item_id: item["id"].as_str().map(ToString::to_string),
+                    item,
+                }
+            }));
+        }
+        return Ok(projected);
+    }
     let identified = record.item_id.is_some();
-    stored_message_to_thread_items_for_projection(message)
+    legacy_stored_message_to_thread_items_for_projection(message)
         .into_iter()
         .map(|item| {
             let item_id = if identified {
@@ -522,7 +542,7 @@ fn message_to_thread_items_for_projection(message: &Message) -> Vec<Value> {
     }
 }
 
-fn stored_message_to_thread_items_for_projection(message: &StoredMessage) -> Vec<Value> {
+fn legacy_stored_message_to_thread_items_for_projection(message: &StoredMessage) -> Vec<Value> {
     match message {
         StoredMessage::Assistant {
             content,

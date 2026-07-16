@@ -19,6 +19,8 @@ use orca_core::task_types::{
     BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
+use orca_core::thread_identity::TurnId;
+use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::ToolRequest;
 use orca_core::workflow_types::WorkflowInput;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord, RuntimeUsageTotals,
 };
+use crate::model_response::RuntimeModelResponse;
 use crate::thread_store::redact_sensitive_text;
 
 #[derive(Clone, Debug)]
@@ -53,7 +56,7 @@ pub enum MainSessionTerminalUpdate {
     ApprovalRequired {
         summary: String,
         pending_tool_call: Option<PendingToolCallSummary>,
-        pending_provider_response: Option<ProviderResponse>,
+        pending_provider_response: Option<RuntimeModelResponse>,
     },
 }
 
@@ -77,7 +80,7 @@ pub struct TaskRecord {
     pub tool: Option<String>,
     pub pending_tool_call: Option<PendingToolCallSummary>,
     pub pending_tool_approval_response: Option<bool>,
-    pub pending_provider_response: Option<ProviderResponse>,
+    pub pending_provider_response: Option<RuntimeModelResponse>,
     pub workflow_run_id: Option<String>,
     pub phase_count: Option<usize>,
     pub workflow_progress: Option<WorkflowTaskProgress>,
@@ -187,6 +190,8 @@ struct PersistedProviderResponse {
     #[serde(default)]
     tool_calls: Vec<RawToolCall>,
     usage: Option<Usage>,
+    #[serde(default)]
+    identity: Option<ModelResponseIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -877,7 +882,7 @@ impl TaskRegistry {
         &self,
         id: &str,
         summary: String,
-        response: ProviderResponse,
+        response: RuntimeModelResponse,
     ) -> Result<(), String> {
         self.approval_required_for_pending_provider_response_with_usage(id, summary, response, None)
     }
@@ -886,10 +891,10 @@ impl TaskRegistry {
         &self,
         id: &str,
         summary: String,
-        response: ProviderResponse,
+        response: RuntimeModelResponse,
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
-        let pending_tool_call = pending_tool_call_from_provider_response(&response);
+        let pending_tool_call = pending_tool_call_from_provider_response(&response.response);
         let tool = pending_tool_call
             .as_ref()
             .map(|pending_tool_call| pending_tool_call.name.clone());
@@ -926,7 +931,7 @@ impl TaskRegistry {
         summary: String,
         tool: Option<String>,
         pending_tool_call: Option<PendingToolCallSummary>,
-        pending_provider_response: Option<ProviderResponse>,
+        pending_provider_response: Option<RuntimeModelResponse>,
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
         self.update_task(id, |record| {
@@ -1016,7 +1021,7 @@ impl TaskRegistry {
     pub fn take_approved_pending_provider_response(
         &self,
         id: &str,
-    ) -> Result<Option<ProviderResponse>, String> {
+    ) -> Result<Option<RuntimeModelResponse>, String> {
         self.with_tasks(|tasks| {
             let record = tasks
                 .get_mut(id)
@@ -1436,7 +1441,8 @@ impl PersistedTaskRecord {
         };
         match pending_provider_response {
             Ok(Some(response)) => {
-                record.pending_provider_response = Some(response.into_provider_response());
+                record.pending_provider_response =
+                    Some(response.into_runtime_response_with_migration_identity());
             }
             Ok(None) => {}
             Err(error) => {
@@ -1494,8 +1500,8 @@ impl From<&TaskRecord> for PersistedTaskRecord {
 }
 
 impl PersistedProviderResponse {
-    fn into_provider_response(self) -> ProviderResponse {
-        ProviderResponse {
+    fn into_runtime_response_with_migration_identity(self) -> RuntimeModelResponse {
+        let response = ProviderResponse {
             steps: self
                 .steps
                 .into_iter()
@@ -1505,22 +1511,29 @@ impl PersistedProviderResponse {
             assistant_reasoning: self.assistant_reasoning,
             tool_calls: self.tool_calls,
             usage: self.usage,
-        }
+        };
+        RuntimeModelResponse::from_parts(
+            response,
+            self.identity
+                .unwrap_or_else(|| ModelResponseIdentity::new(TurnId::new())),
+        )
     }
 }
 
-impl From<&ProviderResponse> for PersistedProviderResponse {
-    fn from(response: &ProviderResponse) -> Self {
+impl From<&RuntimeModelResponse> for PersistedProviderResponse {
+    fn from(response: &RuntimeModelResponse) -> Self {
         Self {
             steps: response
+                .response
                 .steps
                 .iter()
                 .filter_map(PersistedProviderStep::from_provider_step)
                 .collect(),
-            assistant_content: response.assistant_content.clone(),
-            assistant_reasoning: response.assistant_reasoning.clone(),
-            tool_calls: response.tool_calls.clone(),
-            usage: response.usage,
+            assistant_content: response.response.assistant_content.clone(),
+            assistant_reasoning: response.response.assistant_reasoning.clone(),
+            tool_calls: response.response.tool_calls.clone(),
+            usage: response.response.usage,
+            identity: Some(response.identity.clone()),
         }
     }
 }
@@ -1937,6 +1950,33 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
 mod tests {
     use super::*;
 
+    fn runtime_response(response: ProviderResponse) -> RuntimeModelResponse {
+        RuntimeModelResponse::new(response, TurnId::new())
+    }
+
+    #[test]
+    fn legacy_pending_provider_response_gets_one_typed_migration_identity() {
+        let response = PersistedProviderResponse {
+            steps: Vec::new(),
+            assistant_content: Some("legacy pending response".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            identity: None,
+        }
+        .into_runtime_response_with_migration_identity();
+
+        assert!(TurnId::parse(response.identity.turn_id.to_string()).is_ok());
+        assert_ne!(
+            response.identity.item_ids.agent_message_item_id(),
+            &response.identity.item_ids.plan_item_id
+        );
+        assert_ne!(
+            response.identity.item_ids.agent_message_item_id(),
+            &response.identity.item_ids.reasoning_item_id
+        );
+    }
+
     #[test]
     fn persistent_registry_recovers_interrupted_subagent_task_by_id() {
         let temp = tempfile::tempdir().unwrap();
@@ -2321,13 +2361,14 @@ mod tests {
             target: None,
             raw_arguments: Some("{}".to_string()),
         };
-        let response = ProviderResponse {
+        let response = runtime_response(ProviderResponse {
             steps: vec![ProviderStep::ToolCall(tool_request.clone())],
             assistant_content: Some("I need to inspect tasks.".to_string()),
             assistant_reasoning: Some("Need task_list.".to_string()),
             tool_calls: Vec::new(),
             usage: None,
-        };
+        });
+        let expected_identity = response.identity.clone();
 
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
@@ -2361,10 +2402,11 @@ mod tests {
             .unwrap()
             .expect("approved provider response");
         assert_eq!(
-            approved.assistant_content.as_deref(),
+            approved.response.assistant_content.as_deref(),
             Some("I need to inspect tasks.")
         );
-        assert_eq!(approved.steps.len(), 1);
+        assert_eq!(approved.response.steps.len(), 1);
+        assert_eq!(approved.identity, expected_identity);
 
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, TaskStatus::Running);
@@ -2402,17 +2444,19 @@ mod tests {
 
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
+        let response = runtime_response(ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(tool_request)],
+            assistant_content: Some("I need to inspect tasks.".to_string()),
+            assistant_reasoning: Some("Need task_list.".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+        });
+        let expected_identity = response.identity.clone();
         registry
             .approval_required_for_pending_provider_response(
                 &task.id,
                 "approval_required".to_string(),
-                ProviderResponse {
-                    steps: vec![ProviderStep::ToolCall(tool_request)],
-                    assistant_content: Some("I need to inspect tasks.".to_string()),
-                    assistant_reasoning: Some("Need task_list.".to_string()),
-                    tool_calls: Vec::new(),
-                    usage: None,
-                },
+                response,
             )
             .unwrap();
         registry
@@ -2428,9 +2472,10 @@ mod tests {
             Some("mock-tool-1")
         );
         assert_eq!(
-            continuation.response.assistant_content.as_deref(),
+            continuation.response.response.assistant_content.as_deref(),
             Some("I need to inspect tasks.")
         );
+        assert_eq!(continuation.response.identity, expected_identity);
         assert!(
             take_approved_background_turn_continuation(&registry, &task.id)
                 .unwrap()
@@ -2459,17 +2504,19 @@ mod tests {
 
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
+        let response = runtime_response(ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(tool_request)],
+            assistant_content: Some("I need to inspect tasks.".to_string()),
+            assistant_reasoning: Some("Need task_list.".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+        });
+        let expected_identity = response.identity.clone();
         registry
             .approval_required_for_pending_provider_response(
                 &task.id,
                 "approval_required".to_string(),
-                ProviderResponse {
-                    steps: vec![ProviderStep::ToolCall(tool_request)],
-                    assistant_content: Some("I need to inspect tasks.".to_string()),
-                    assistant_reasoning: Some("Need task_list.".to_string()),
-                    tool_calls: Vec::new(),
-                    usage: None,
-                },
+                response,
             )
             .unwrap();
         drop(registry);
@@ -2497,10 +2544,11 @@ mod tests {
             Some("mock-tool-1")
         );
         assert_eq!(
-            continuation.response.assistant_content.as_deref(),
+            continuation.response.response.assistant_content.as_deref(),
             Some("I need to inspect tasks.")
         );
-        assert_eq!(continuation.response.steps.len(), 1);
+        assert_eq!(continuation.response.response.steps.len(), 1);
+        assert_eq!(continuation.response.identity, expected_identity);
     }
 
     #[test]
@@ -2527,13 +2575,13 @@ mod tests {
             .approval_required_for_pending_provider_response(
                 &task.id,
                 "approval_required".to_string(),
-                ProviderResponse {
+                runtime_response(ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool_request)],
                     assistant_content: Some("I need to inspect tasks.".to_string()),
                     assistant_reasoning: Some("Need task_list.".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
-                },
+                }),
             )
             .unwrap();
         drop(registry);

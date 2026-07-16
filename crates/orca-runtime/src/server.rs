@@ -2227,11 +2227,20 @@ mod tests {
         HistoryMode, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig, WorkflowConfig,
     };
     use orca_core::conversation::Message;
+    use orca_core::event_schema::{EventDraft, EventFactory};
+    use orca_core::event_sink::EventSink;
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
+    use orca_core::thread_identity::TurnId;
+    use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
     use std::io::{Cursor, Read};
     use tempfile::{TempDir, tempdir};
+
+    fn emit_runtime_event<W: Write>(writer: &mut W, event: EventDraft) {
+        let mut sink = EventSink::new(writer, OutputFormat::Jsonl);
+        sink.emit(event).expect("serialize runtime event");
+    }
 
     #[derive(Clone, Default)]
     struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
@@ -2496,22 +2505,26 @@ mod tests {
     fn server_writer_streams_events_as_lines_arrive() {
         let mut output = Vec::new();
         let id = Value::from(42);
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let item_id = identity.item_ids.agent_message_item_id().to_string();
+        let completed =
+            CompletedModelResponse::new(identity.clone(), Some("hi".to_string()), None, Vec::new());
+        let mut events = EventFactory::new("server-writer-stream".to_string());
         {
             let mut writer = ServerRequestWriter::new(id, &mut output);
-            writer
-                .write_all(
-                    b"{\"type\":\"assistant.message.delta\",\"payload\":{\"text\":\"hi\"}}\n",
-                )
-                .unwrap();
+            emit_runtime_event(&mut writer, events.assistant_message_delta(&identity, "hi"));
+            emit_runtime_event(&mut writer, events.model_response_completed(&completed));
         }
         let events = parse_jsonl(&output);
         assert!(events.iter().all(|event| event["id"] == 42));
         assert!(events.iter().any(|event| {
-            event["event"] == "item_started" && event["item"]["type"] == "agent_message"
+            event["event"] == "item_started"
+                && event["item"]["type"] == "agent_message"
+                && event["item"]["id"] == item_id
         }));
         assert!(events.iter().any(|event| {
             event["event"] == "item_message_delta"
-                && event["itemId"] == "item-agent-message-1"
+                && event["itemId"] == item_id
                 && event["delta"] == "hi"
         }));
         assert!(
@@ -5030,16 +5043,22 @@ enabled = true
     #[test]
     fn server_writer_streams_reasoning_item_lifecycle() {
         let mut output = Vec::new();
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let item_id = identity.item_ids.reasoning_item_id.to_string();
+        let completed = CompletedModelResponse::new(
+            identity.clone(),
+            Some("answer".to_string()),
+            Some("thinking".to_string()),
+            Vec::new(),
+        );
+        let mut events = EventFactory::new("server-writer-reasoning".to_string());
         {
             let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
-            writer
-                .write_all(br#"{"type":"assistant.reasoning.delta","payload":{"text":"thinking"}}"#)
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
-            writer
-                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
+            emit_runtime_event(
+                &mut writer,
+                events.assistant_reasoning_delta(&identity, "thinking"),
+            );
+            emit_runtime_event(&mut writer, events.model_response_completed(&completed));
         }
 
         let events = parse_jsonl(&output);
@@ -5048,7 +5067,7 @@ enabled = true
             .find(|event| {
                 event["event"] == "item_started"
                     && event["item"]["type"] == "reasoning"
-                    && event["item"]["id"] == "item-reasoning-1"
+                    && event["item"]["id"] == item_id
             })
             .expect("reasoning item_started");
         assert_eq!(started["item"]["summary"], "");
@@ -5056,7 +5075,7 @@ enabled = true
 
         assert!(events.iter().any(|event| {
             event["event"] == "item_reasoning_delta"
-                && event["itemId"] == "item-reasoning-1"
+                && event["itemId"] == item_id
                 && event["delta"] == "thinking"
         }));
         assert!(
@@ -5070,7 +5089,7 @@ enabled = true
             .find(|event| {
                 event["event"] == "item_completed"
                     && event["item"]["type"] == "reasoning"
-                    && event["item"]["id"] == "item-reasoning-1"
+                    && event["item"]["id"] == item_id
             })
             .expect("reasoning item_completed");
         assert_eq!(completed["item"]["summary"], "thinking");
@@ -5080,18 +5099,24 @@ enabled = true
     #[test]
     fn server_writer_streams_proposed_plan_item_lifecycle() {
         let mut output = Vec::new();
+        let content = "Preface\n<proposed_plan>\n# Final plan\n- first\n- second\n</proposed_plan>\nPostscript";
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let agent_message_item_id = identity.item_ids.agent_message_item_id().to_string();
+        let plan_item_id = identity.item_ids.plan_item_id.to_string();
+        let completed = CompletedModelResponse::new(
+            identity.clone(),
+            Some(content.to_string()),
+            None,
+            Vec::new(),
+        );
+        let mut events = EventFactory::new("server-writer-plan".to_string());
         {
             let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
-            writer
-                .write_all(
-                    br#"{"type":"assistant.message.delta","payload":{"text":"Preface\n<proposed_plan>\n# Final plan\n- first\n- second\n</proposed_plan>\nPostscript"}}"#,
-                )
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
-            writer
-                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
+            emit_runtime_event(
+                &mut writer,
+                events.assistant_message_delta(&identity, content),
+            );
+            emit_runtime_event(&mut writer, events.model_response_completed(&completed));
         }
 
         let events = parse_jsonl(&output);
@@ -5100,7 +5125,7 @@ enabled = true
             .find(|event| {
                 event["event"] == "item_started"
                     && event["item"]["type"] == "plan"
-                    && event["item"]["id"] == "item-plan-1"
+                    && event["item"]["id"] == plan_item_id
             })
             .expect("plan item_started");
         assert_eq!(plan_started["item"]["text"], "");
@@ -5109,7 +5134,7 @@ enabled = true
             .iter()
             .find(|event| event["event"] == "item_plan_delta")
             .expect("plan delta");
-        assert_eq!(plan_delta["itemId"], "item-plan-1");
+        assert_eq!(plan_delta["itemId"], plan_item_id);
         assert_eq!(plan_delta["delta"], "# Final plan\n- first\n- second\n");
 
         let plan_completed = events
@@ -5117,7 +5142,7 @@ enabled = true
             .find(|event| {
                 event["event"] == "item_completed"
                     && event["item"]["type"] == "plan"
-                    && event["item"]["id"] == "item-plan-1"
+                    && event["item"]["id"] == plan_item_id
             })
             .expect("plan item_completed");
         assert_eq!(
@@ -5135,7 +5160,9 @@ enabled = true
         let agent_completed = events
             .iter()
             .find(|event| {
-                event["event"] == "item_completed" && event["item"]["type"] == "agent_message"
+                event["event"] == "item_completed"
+                    && event["item"]["type"] == "agent_message"
+                    && event["item"]["id"] == agent_message_item_id
             })
             .expect("agent message item_completed");
         assert_eq!(agent_completed["item"]["text"], "Preface\n\nPostscript");
@@ -5144,22 +5171,28 @@ enabled = true
     #[test]
     fn server_writer_parses_proposed_plan_tag_split_across_deltas() {
         let mut output = Vec::new();
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let completed = CompletedModelResponse::new(
+            identity.clone(),
+            Some("Intro\n<proposed_plan>\n- Step 1\n</proposed_plan>\nOutro".to_string()),
+            None,
+            Vec::new(),
+        );
+        let mut events = EventFactory::new("server-writer-split-plan".to_string());
         {
             let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
-            writer
-                .write_all(
-                    br#"{"type":"assistant.message.delta","payload":{"text":"Intro\n<proposed"}}"#,
-                )
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
-            writer
-                .write_all(br#"{"type":"assistant.message.delta","payload":{"text":"_plan>\n- Step 1\n</proposed_plan>\nOutro"}}"#)
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
-            writer
-                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
+            emit_runtime_event(
+                &mut writer,
+                events.assistant_message_delta(&identity, "Intro\n<proposed"),
+            );
+            emit_runtime_event(
+                &mut writer,
+                events.assistant_message_delta(
+                    &identity,
+                    "_plan>\n- Step 1\n</proposed_plan>\nOutro",
+                ),
+            );
+            emit_runtime_event(&mut writer, events.model_response_completed(&completed));
         }
 
         let events = parse_jsonl(&output);
@@ -5188,16 +5221,22 @@ enabled = true
     #[test]
     fn server_writer_leaves_incomplete_proposed_plan_tag_as_agent_message() {
         let mut output = Vec::new();
+        let content = "Intro\n<proposed_plan> not a complete block";
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let completed = CompletedModelResponse::new(
+            identity.clone(),
+            Some(content.to_string()),
+            None,
+            Vec::new(),
+        );
+        let mut events = EventFactory::new("server-writer-incomplete-plan".to_string());
         {
             let mut writer = ServerRequestWriter::new(Value::from("turn"), &mut output);
-            writer
-                .write_all(br#"{"type":"assistant.message.delta","payload":{"text":"Intro\n<proposed_plan> not a complete block"}}"#)
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
-            writer
-                .write_all(br#"{"type":"session.completed","payload":{"status":"completed"}}"#)
-                .unwrap();
-            writer.write_all(b"\n").unwrap();
+            emit_runtime_event(
+                &mut writer,
+                events.assistant_message_delta(&identity, content),
+            );
+            emit_runtime_event(&mut writer, events.model_response_completed(&completed));
         }
 
         let events = parse_jsonl(&output);
@@ -5433,7 +5472,11 @@ enabled = true
                 turn["items"].as_array().is_some_and(|items| {
                     items.iter().any(|item| {
                         item["role"] == "user" && item["content"] == "readable server thread"
-                    }) && items.iter().any(|item| item["role"] == "assistant")
+                    }) && items.iter().any(|item| {
+                        item["type"] == "agent_message"
+                            && item["text"]
+                                == "Mock runtime completed the headless harness contract."
+                    })
                 })
             }));
         });

@@ -24,8 +24,8 @@ use super::types::{
     TurnItemsView,
 };
 use super::writer::{
-    lock_file, read_history_lines, read_records, read_session_meta, read_transcript,
-    rewrite_records, unlock_file,
+    conversation_record_from_semantic_event, lock_file, read_history_lines, read_records,
+    read_session_meta, read_transcript, rewrite_records, unlock_file,
 };
 use super::{LiveThread, ORCA_HOME_ENV};
 
@@ -191,7 +191,13 @@ pub(crate) fn load_thread_records(
                 item_id: id,
                 turn_id,
                 message,
+                completed_model_items: None,
             }),
+            SessionRecord::SemanticEvent { event } => {
+                if let Some(record) = conversation_record_from_semantic_event(&event)? {
+                    conversation_records.push(record);
+                }
+            }
             _ => {}
         }
     }

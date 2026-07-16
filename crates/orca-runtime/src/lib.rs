@@ -26,6 +26,7 @@ pub mod instructions;
 pub mod lifecycle;
 pub mod memory;
 pub mod mentions;
+pub mod model_response;
 pub mod network_proxy;
 pub mod notify;
 pub mod protocol;
@@ -1112,7 +1113,7 @@ mod tests {
         );
         assert!(
             provider_turn_runtime_source.contains(
-                "pub(crate) fn handle<W: io::Write>(\n        &mut self,\n        response: ProviderResponse,\n        input: RuntimeProviderResponseInput<'_, W>,\n        executors: RuntimeProviderResponseExecutors<W>,"
+                "pub(crate) fn handle<W: io::Write>(\n        &mut self,\n        response: RuntimeModelResponse,\n        input: RuntimeProviderResponseInput<'_, W>,\n        executors: RuntimeProviderResponseExecutors<W>,"
             ),
             "RuntimeProviderResponseStep::handle must take RuntimeProviderResponseInput instead of a flat provider-response parameter list"
         );
@@ -1509,80 +1510,114 @@ mod tests {
 
     #[test]
     fn runtime_event_projector_projects_reasoning_lifecycle() {
+        use orca_core::event_schema::EventFactory;
+        use orca_core::event_sink::EventSink;
+        use orca_core::thread_identity::TurnId;
+        use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
+        use orca_core::{config::OutputFormat, event_schema::EventDraft};
+
         use crate::protocol::ServerEvent;
         use crate::runtime_event_projector::RuntimeEventProjector;
 
+        fn runtime_line(event: EventDraft) -> String {
+            let mut output = Vec::new();
+            EventSink::new(&mut output, OutputFormat::Jsonl)
+                .emit(event)
+                .expect("serialize runtime event");
+            String::from_utf8(output)
+                .expect("runtime event is utf8")
+                .trim()
+                .to_string()
+        }
+
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let reasoning_item_id = identity.item_ids.reasoning_item_id.to_string();
+        let response = CompletedModelResponse::new(
+            identity.clone(),
+            Some("answer".to_string()),
+            Some("thinking".to_string()),
+            Vec::new(),
+        );
+        let mut events = EventFactory::new("reasoning-lifecycle".to_string());
         let mut projector = RuntimeEventProjector::default();
-        let started = projector
-            .project_line(r#"{"type":"assistant.reasoning.delta","payload":{"text":"thinking"}}"#);
+        let started = projector.project_line(&runtime_line(
+            events.assistant_reasoning_delta(&identity, "thinking"),
+        ));
 
         assert_eq!(started.len(), 3);
         assert!(matches!(
             &started[0],
             ServerEvent::ItemStarted { item, .. }
-                if item["id"] == "item-reasoning-1"
+                if item["id"] == reasoning_item_id
                     && item["type"] == "reasoning"
                     && item["summary"] == ""
         ));
         assert!(matches!(
             &started[1],
             ServerEvent::ItemReasoningDelta { item_id, delta }
-                if item_id == "item-reasoning-1" && delta == "thinking"
+                if item_id == &reasoning_item_id && delta == "thinking"
         ));
         assert!(matches!(
             &started[2],
             ServerEvent::ReasoningDelta { text } if text == "thinking"
         ));
 
-        let completed = projector
-            .project_line(r#"{"type":"session.completed","payload":{"status":"success"}}"#);
-        assert!(matches!(
-            &completed[0],
-            ServerEvent::TurnCompleted { status } if status == "success"
-        ));
+        let completed =
+            projector.project_line(&runtime_line(events.model_response_completed(&response)));
         assert!(matches!(
             completed.last(),
             Some(ServerEvent::ItemCompleted { item, .. })
-                if item["id"] == "item-reasoning-1"
+                if item["id"] == reasoning_item_id
                     && item["type"] == "reasoning"
                     && item["summary"] == "thinking"
         ));
     }
 
     #[test]
-    fn text_item_lifecycle_projection_is_owned_by_core_thread_item_projection() {
-        let projector_source = include_str!("runtime_event_projector.rs");
-        let projection_source = include_str!("tool_item_projection.rs");
+    fn runtime_event_projector_forwards_core_completed_item_shapes() {
+        use orca_core::event_schema::EventFactory;
+        use orca_core::event_sink::EventSink;
+        use orca_core::thread_identity::TurnId;
+        use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
+        use orca_core::{config::OutputFormat, event_schema::EventDraft};
 
-        for marker in ["ProjectedTextItem", "ProjectedTextItemKind"] {
-            assert!(
-                projection_source.contains(marker),
-                "tool_item_projection should import shared core text item detail {marker}"
-            );
+        use crate::protocol::ServerEvent;
+        use crate::runtime_event_projector::RuntimeEventProjector;
+
+        fn runtime_line(event: EventDraft) -> String {
+            let mut output = Vec::new();
+            EventSink::new(&mut output, OutputFormat::Jsonl)
+                .emit(event)
+                .expect("serialize runtime event");
+            String::from_utf8(output)
+                .expect("runtime event is utf8")
+                .trim()
+                .to_string()
         }
-        for marker in [
-            "pub(crate) enum ProjectedTextThreadItem",
-            "pub(crate) enum ProjectedTextItemKind",
-            "pub(crate) struct ProjectedTextItem",
-            "impl ProjectedTextThreadItem",
-            "impl ProjectedTextItem",
-            "impl ProjectedTextItemKind",
-        ] {
-            assert!(
-                !projection_source.contains(marker),
-                "tool_item_projection must not own text item lifecycle detail {marker}"
-            );
-        }
-        for marker in [
-            "struct AgentMessageItem",
-            "struct PlanItem",
-            "struct ReasoningItem",
-        ] {
-            assert!(
-                !projector_source.contains(marker),
-                "runtime_event_projector must not own text item state {marker}"
-            );
-        }
+
+        let response = CompletedModelResponse::new(
+            ModelResponseIdentity::new(TurnId::new()),
+            Some("Preface\n<proposed_plan>\n- step\n</proposed_plan>".to_string()),
+            Some("thinking".to_string()),
+            Vec::new(),
+        );
+        let expected = response
+            .completed_items()
+            .into_iter()
+            .map(|item| item.into_value())
+            .collect::<Vec<_>>();
+        let mut events = EventFactory::new("completed-item-shapes".to_string());
+        let projected = RuntimeEventProjector::default()
+            .project_line(&runtime_line(events.model_response_completed(&response)));
+        let actual = projected
+            .into_iter()
+            .filter_map(|event| match event {
+                ServerEvent::ItemCompleted { item, .. } => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -4137,26 +4172,51 @@ mod tests {
     }
 
     #[test]
-    fn agent_assistant_response_recording_is_owned_by_session_module() {
-        let agent_loop_source = include_str!("agent_loop.rs");
-        let session_source = include_str!("session.rs");
+    fn session_records_one_canonical_assistant_completion() {
+        use orca_core::config::OutputFormat;
+        use orca_core::conversation::{Conversation, Message};
+        use orca_core::event_schema::{EventEnvelope, EventFactory, EventType};
+        use orca_core::event_sink::EventSink;
+        use orca_core::thread_identity::TurnId;
+        use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
 
-        assert!(
-            !agent_loop_source.contains("conversation.add_assistant"),
-            "agent_loop must not own assistant response conversation recording"
+        let response = CompletedModelResponse::new(
+            ModelResponseIdentity::new(TurnId::new()),
+            Some("answer".to_string()),
+            Some("thinking".to_string()),
+            Vec::new(),
         );
-        assert!(
-            session_source.contains("pub(crate) fn record_assistant_response_for_agent"),
-            "session must expose agent assistant response recording"
-        );
-        assert!(
-            session_source.contains("add_assistant"),
-            "session must own assistant response conversation recording"
-        );
-        assert!(
-            session_source.contains("append_message(message)"),
-            "session must own assistant response history writing"
-        );
+        let mut conversation = Conversation::new();
+        conversation.add_user("question".to_string());
+        let mut output = Vec::new();
+        let mut events = EventFactory::new("assistant-recording".to_string());
+        {
+            let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+            crate::session::record_assistant_response_for_agent(
+                &mut conversation,
+                &response,
+                true,
+                &mut events,
+                &mut sink,
+            )
+            .expect("record assistant response");
+        }
+
+        assert!(matches!(
+            conversation.messages.last(),
+            Some(Message::Assistant {
+                content: Some(content),
+                reasoning_content: Some(reasoning),
+                ..
+            }) if content == "answer" && reasoning == "thinking"
+        ));
+        let envelopes = String::from_utf8(output)
+            .expect("runtime output is utf8")
+            .lines()
+            .map(|line| serde_json::from_str::<EventEnvelope>(line).expect("runtime event"))
+            .collect::<Vec<_>>();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].event_type, EventType::ModelResponseCompleted);
     }
 
     #[test]

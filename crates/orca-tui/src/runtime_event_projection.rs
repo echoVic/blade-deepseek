@@ -509,10 +509,14 @@ mod tests {
     #[test]
     fn runtime_assistant_delta_events_map_to_tui_streaming_events() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
+        let identity = orca_core::thread_item_projection::ModelResponseIdentity::new(
+            orca_core::thread_identity::TurnId::new(),
+        );
 
-        let reasoning =
-            project(events.assistant_reasoning_delta("thinking")).expect("reasoning event");
-        let message = project(events.assistant_message_delta("hello")).expect("message event");
+        let reasoning = project(events.assistant_reasoning_delta(&identity, "thinking"))
+            .expect("reasoning event");
+        let message =
+            project(events.assistant_message_delta(&identity, "hello")).expect("message event");
 
         assert!(matches!(reasoning, TuiEvent::ReasoningDelta(text) if text == "thinking"));
         assert!(matches!(message, TuiEvent::MessageDelta(text) if text == "hello"));

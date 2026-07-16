@@ -85,21 +85,48 @@ mod proposed_plan_tests {
 
 #[cfg(test)]
 mod thread_item_projection_tests {
-    use crate::thread_item_projection::{ProjectedTextItem, ProjectedTextItemKind};
+    use crate::thread_identity::TurnId;
+    use crate::thread_item_projection::{
+        CompletedModelItem, CompletedModelResponse, ModelResponseIdentity,
+    };
 
     #[test]
-    fn core_text_thread_item_lifecycle_serializes_existing_wire_shape() {
-        let mut item = ProjectedTextItem::new(ProjectedTextItemKind::Plan);
+    fn completed_model_response_owns_stable_text_items_and_plan_reduction() {
+        let identity = ModelResponseIdentity::new(TurnId::new());
+        let response = CompletedModelResponse::new(
+            identity.clone(),
+            Some("Preface\n<proposed_plan>\n1. inspect\n</proposed_plan>\nPostscript".to_string()),
+            Some("thinking".to_string()),
+            Vec::new(),
+        );
+        let items = response.completed_items();
 
-        let started = item.started_item();
-        item.push_delta("1. inspect");
-        let completed = item.completed_item();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[0],
+            CompletedModelItem::AgentMessage { id, text }
+                if id == identity.item_ids.agent_message_item_id()
+                    && text == "Preface\n\nPostscript"
+        ));
+        assert!(matches!(
+            &items[1],
+            CompletedModelItem::Plan { id, text }
+                if id == &identity.item_ids.plan_item_id && text == "1. inspect\n"
+        ));
+        assert!(matches!(
+            &items[2],
+            CompletedModelItem::Reasoning { id, summary, content }
+                if id == &identity.item_ids.reasoning_item_id
+                    && summary == "thinking" && content.is_empty()
+        ));
 
-        assert_eq!(started["id"], "item-plan-1");
+        let started = items[1].started_item().into_value();
+        let completed = items[1].clone().into_value();
+        assert_eq!(started["id"], identity.item_ids.plan_item_id.as_str());
         assert_eq!(started["type"], "plan");
         assert_eq!(started["text"], "");
-        assert_eq!(completed["id"], "item-plan-1");
+        assert_eq!(completed["id"], identity.item_ids.plan_item_id.as_str());
         assert_eq!(completed["type"], "plan");
-        assert_eq!(completed["text"], "1. inspect");
+        assert_eq!(completed["text"], "1. inspect\n");
     }
 }

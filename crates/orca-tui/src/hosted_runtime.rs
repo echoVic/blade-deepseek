@@ -137,8 +137,15 @@ mod tests {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let observer = TuiHostedEventObserver::new(event_tx);
         let mut events = EventFactory::new("hosted-terminal-order".to_string());
+        let identity = orca_core::thread_item_projection::ModelResponseIdentity::new(
+            orca_core::thread_identity::TurnId::new(),
+        );
 
-        observe_event(Some(&observer), events.assistant_message_delta("ready")).unwrap();
+        observe_event(
+            Some(&observer),
+            events.assistant_message_delta(&identity, "ready"),
+        )
+        .unwrap();
         observe_event(
             Some(&observer),
             events.session_completed(RunStatus::Success),
