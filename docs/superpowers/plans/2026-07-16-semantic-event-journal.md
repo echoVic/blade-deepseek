@@ -1,6 +1,6 @@
 # P1.1e Semantic Event Journal Plan
 
-- Status: in progress
+- Status: completed
 - Base: `2b86633b63455df789a59fee668eed161cf7c56e`
 - Branch: `codex/semantic-event-journal-p11e`
 
@@ -211,3 +211,42 @@ explicit later gate:
 
 No compatibility layer introduced by P1.1e may become a second event
 sequencer, a per-surface journal, or a per-delta persistence path.
+
+## Completion Evidence
+
+- Implementation commit: `c037cfc21 refactor(runtime): journal semantic events
+  before publication`.
+- The RED publication test first demonstrated that output could become visible
+  before semantic durability. The green implementation now appends and flushes
+  the complete envelope under the publication lock before observer or output
+  delivery. Reservation failure does not consume an unreserved sequence;
+  journal failure blocks delivery and consumes the ambiguous assigned sequence.
+- The sequence-only `EventSequenceStore` is deleted. `EventPublicationStore`
+  is the one typed reservation/journal boundary, `SessionWriter` is its only
+  durable implementation, and no TUI, server, controller, or background-worker
+  journal path was added.
+- Focused validation passes: 36 core event tests, all 161 `orca-core` tests,
+  775 runtime unit tests, 48 RuntimeHost integration tests, 390 TUI tests, 14
+  exec JSONL contracts, 11 history contracts, 21 server-runtime tests, 132
+  session-server tests, and 14 thread-store writer tests. Rewrite, zstd
+  compression/restore, redaction, malformed-record, resume, fork, and legacy
+  history behavior also pass.
+- `cargo test --workspace --all-targets -- --test-threads=1` passes. `cargo
+  clippy --workspace --all-targets` passes with the repository's existing
+  warning baseline. `cargo fmt --all -- --check` still reports only the known
+  pre-existing drift in `runtime_host.rs`, unrelated RuntimeHost test blocks,
+  and `orca-tui/src/app.rs`; this slice does not reformat those unrelated
+  regions.
+- The existing real DeepSeek CLI and malformed-history replay gate passes,
+  including compatibility repair of `legacy-missing-tool-call` as
+  `indeterminate` without re-executing it.
+- A dedicated isolated two-process DeepSeek smoke persisted four exact semantic
+  envelopes from the first process at `seq=0..56` after reserving through
+  `256`; 51 visible reasoning/message delta events produced no journal record.
+  The second process resumed the same thread id, persisted four exact envelopes
+  at `seq=256..300`, and reserved through `512`; its 39 visible deltas also
+  produced no journal record. In both processes the journaled envelopes matched
+  the externally visible envelopes field-for-field.
+- P1.1e remains an unreleased reliability prerequisite. P1.1f is the next
+  vertical slice and may consume journal identity for stable server/history
+  turn and item ids without changing conversation replay ownership.

@@ -23,9 +23,12 @@ typed session JSONL before publication. Process restart resumes at the prior
 exclusive high-water mark, while forked identities start independently; token
 deltas do not incur one disk write each. Workflow identity remains in the typed
 payload `taskId` and `runId`; the host-projected envelope consistently belongs
-to the parent thread. These are unreleased architecture slices; durable
-semantic event records and stable conversation item ids remain explicit
-follow-ups rather than being hidden behind renderer-side deduplication fixes.
+to the parent thread. Selected lifecycle and terminal envelopes are now also
+appended and flushed as typed `event.semantic` records before observer or output
+visibility, while DeepSeek reasoning, message, tool-progress, and tool-output
+deltas remain transient. These are unreleased architecture slices; stable
+conversation turn and item ids remain the explicit next follow-up rather than
+being hidden behind renderer-side deduplication fixes.
 Earlier v0.2.29 extends the runtime ownership model into the
 process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
 operation handles and completion terminals now give headless and TUI turns one
@@ -240,6 +243,40 @@ through `512`. P1.1d remains an unreleased reliability prerequisite. P1.1e can
 now persist selected semantic lifecycle and terminal envelopes without using
 token deltas as a journal; P1.1f can then replace index-derived
 `turn-N`/`item-N` ids with the durable event identity.
+
+P1.1e now makes selected semantic event identity durable before publication.
+`EventPublication` remains the only owner of sequence, timestamp, publication
+order, and outward visibility; its typed `EventPublicationStore` reserves the
+next sequence block and appends a complete `EventEnvelope` under the same lock.
+`SessionWriter` is the only durable implementation. A semantic append failure
+blocks observer/output delivery and consumes the ambiguous identity, while a
+reservation failure consumes nothing. Semantic events are journaled even when
+there is no external observer, but transient no-observer drafts remain
+unpublished. The sequence-only store is deleted, and no surface-specific or
+per-delta journal exists.
+
+The journal is a stable-identity and audit source during this migration, not a
+second domain reducer. Conversation messages, task sessions, plan state, usage,
+compaction, and completion records retain their existing recovery ownership.
+Rewrite, rename, redaction, archive, zstd compression, restoration, fork,
+legacy, and malformed-tail behavior preserve that boundary. This eliminates
+the crash window where the TUI or server could observe a semantic lifecycle
+event without a durable identity, while keeping disk flushes off DeepSeek token
+latency.
+
+Focused validation passes with 36 core event tests, all 161 core tests, 775
+runtime tests, 48 RuntimeHost integration tests, 390 TUI tests, 14 exec JSONL
+contracts, 11 history contracts, 21 server-runtime tests, 132 session-server
+tests, and 14 thread-store writer tests. The serial workspace all-targets gate
+and workspace Clippy pass with the existing warning baseline. The real
+DeepSeek CLI/history-repair gate also passes. An isolated two-process smoke
+journaled four exact semantic envelopes at `seq=0..56`, then resumed the same
+thread id and journaled four at `seq=256..300`; reservations advanced from
+`256` to `512`, while 51 first-process and 39 resumed-process stream deltas
+produced no journal records. P1.1e remains an unreleased reliability
+prerequisite. P1.1f is next: replace index-derived `turn-N`/`item-N` projection
+ids with durable journal identity while retaining an explicit legacy-history
+fallback and unchanged conversation replay ownership.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
