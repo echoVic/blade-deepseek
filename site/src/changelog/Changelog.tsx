@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.36":
+        "Foreground subagents now have one runtime-owned invocation lifetime for admission, child cancellation, worker join, panic classification, schema validation, worktree completion, usage, and exactly-once terminal selection. Interrupting a synchronous delegation waits for child cleanup before the turn settles or the next prompt starts, while a child panic becomes an indeterminate result instead of escaping RuntimeHost. Async delegation now projects its durable task to the TUI immediately without creating an unmatched foreground lifecycle; atomic PID adoption prevents a fast worker from being overwritten, and foreground interrupt remains independent from explicit task_stop cancellation. The inline single-child loop, scoped batch runtime, duplicate formatting, stale adoption path, and source-shape ownership tests are removed; cross-process leases and stale-owner takeover remain P1.4.",
       "v0.2.35":
         "Sequential normal tools now run as runtime-owned child lifetimes. RuntimeToolCallRuntime owns admission, started state, cancellation policy, the worker, join, panic classification, permission deltas, and the exactly-once terminal while bounded typed bridges carry output, approval, and MCP elicitation. Interrupting bash, external tools, or MCP calls waits for cleanup before the turn settles or the next prompt starts; WaitForTerminal preserves an observed mutation, and a worker panic after start becomes indeterminate. Turn permission grants are merged before later sibling calls. The borrowed normal executor, fallback owner, inline path, and source-shape tests are removed; subagents remain the explicit P1.2c boundary.",
       "v0.2.34":
@@ -524,6 +526,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.36":
+        "前台 subagent 现在拥有一条由 runtime 统一管理的调用生命周期，覆盖准入、子取消、worker join、panic 分类、schema 校验、worktree 收尾、usage 与 exactly-once terminal。中断同步委派时，会等待子任务完成清理后再结束 turn 或接收下一次提交；子任务 panic 会变成 indeterminate 结果，不再逃逸为 RuntimeHost panic。异步委派会立即把 durable task 投影到 TUI，同时不再创建无法闭合的前台 lifecycle；原子 PID adoption 避免快速 worker 的新状态被父进程旧快照覆盖，前台 interrupt 也继续与显式 task_stop 取消相互独立。旧的单子任务 inline loop、batch scoped runtime、重复格式化、陈旧 adoption 路径和源码形状测试已删除；跨进程 lease 与 stale-owner takeover 留给 P1.4。",
       "v0.2.35":
         "顺序执行的普通工具现在由 runtime 作为子生命周期统一拥有。RuntimeToolCallRuntime 负责准入、started 状态、取消策略、worker、join、panic 分类、权限增量和 exactly-once terminal；输出、审批与 MCP elicitation 通过有界类型化桥接传递。中断 bash、外部工具或 MCP 调用时，会先等待进程和 transport 完成清理，再结束 turn 或接收下一次提交；WaitForTerminal 会保留已经观察到的变更结果，启动后的 worker panic 会标记为 indeterminate。同一 turn 内获得的权限会在后续 sibling 调用前合并。旧的借用式 normal executor、fallback owner、inline 路径和源码形状测试已删除；subagent 仍是明确的 P1.2c 后续边界。",
       "v0.2.34":

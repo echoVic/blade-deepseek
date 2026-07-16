@@ -4,20 +4,33 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-17
-Current baseline: v0.2.35 gives each sequential normal tool call one
-runtime-owned child lifetime. `RuntimeToolCallRuntime` owns admission, started
-state, the invocation cancel token, registered interrupt semantics, the worker,
-join, panic classification, permission deltas, and exactly-once terminal.
-Bounded typed bridges carry output, permission requests, and MCP elicitation
-without moving borrowed TUI or server handlers into the worker.
+Current baseline: v0.2.36 gives synchronous single and batch subagents one
+runtime-owned invocation lifetime. `RuntimeToolCallRuntime` owns admission,
+lifecycle start, child cancellation, worker spawn, join, panic classification,
+schema validation, usage, worktree completion, result formatting, and the
+exactly-once terminal. Interrupt reaches every admitted child, stops later
+admission, waits for cleanup, preserves provider order, and returns the TUI to a
+clean next prompt. A child panic becomes an indeterminate tool result plus a
+failed subagent terminal instead of escaping RuntimeHost.
 
-Interrupting bash, an external tool, or an MCP call waits for process and
-transport cleanup before the turn settles or the next prompt starts.
-`WaitForTerminal` preserves an observed result, a panic after execution starts
-becomes indeterminate, and turn permission grants merge before later sibling
-calls. The borrowed normal executor, fallback owner, direct inline path, and
-source-shape ownership tests are deleted. P1.2b is complete; subagent execution
-remains the explicit P1.2c boundary.
+Async delegation remains a durable process task with a separate cancellation
+domain. Launch now publishes `task.status.updated` immediately without an
+unmatched foreground subagent row. Atomic PID adoption prevents a fast worker's
+progress or terminal state from being overwritten, and foreground interrupt
+does not stop work that remains explicitly cancellable through `task_stop` and
+the TUI task panel. The inline single-child loop, scoped batch runtime, duplicate
+formatting, stale adoption path, generic foreground child-executor plumbing,
+and source-shape ownership tests are deleted. P1.2c is complete; cross-process
+lease, fencing, stale-owner takeover, and task-wide publication remain P1.4.
+
+Earlier v0.2.35 gives each sequential normal tool call one runtime-owned child
+lifetime. `RuntimeToolCallRuntime` owns admission, started state, the invocation
+cancel token, registered interrupt semantics, the worker, join, panic
+classification, permission deltas, and exactly-once terminal. Bounded typed
+bridges carry output, permission requests, and MCP elicitation without moving
+borrowed TUI or server handlers into the worker. Interrupting bash, an external
+tool, or an MCP call waits for process and transport cleanup before the turn
+settles or the next prompt starts. P1.2b is complete.
 
 Earlier v0.2.34 moves parallel read-only invocation lifetime into
 `RuntimeToolCallRuntime`. Each admitted call has one owner for its concurrency
@@ -422,7 +435,41 @@ regressions, the serial workspace gate, workspace Clippy, site and release
 helpers, and the complete real DeepSeek provider/CLI/history/server harness
 pass. CLI arguments, TUI flows, server/JSONL, persistence, tool identities, and
 permission payloads remain compatible. P1.2b is complete and released in
-v0.2.35; subagent execution remains P1.2c.
+v0.2.35.
+
+P1.2c now gives synchronous single and batch subagents one runtime-owned
+invocation lifetime. `RuntimeToolCallRuntime` owns admission, lifecycle start,
+the invocation-scoped child cancel token, worker spawn, join, panic
+classification, schema validation, usage, worktree completion, provider-order
+result folding, and exactly-once terminal selection. Interrupt reaches all
+admitted children, prevents later admission, waits for every worker and
+worktree owner to finish, and returns RuntimeHost to a clean next prompt. A
+child panic after admission becomes one indeterminate tool result and one
+failed subagent lifecycle terminal without escaping the host; clean worktree
+isolation is still removed after the panic.
+
+Async delegation remains an independently cancellable durable process task.
+Launch emits the existing typed `task.status.updated` event for immediate TUI
+projection and no longer emits an unmatched foreground `subagent.started`.
+`TaskRegistry` atomically adopts the real PID, Running state, and start time
+before the worker may persist progress or terminal state. Late adoption cannot
+overwrite a terminal task, the parent reaper reloads cross-process completion,
+and foreground interrupt does not stop a registered async worker; `task_stop`
+and the TUI task panel remain the explicit cancellation owners.
+
+The inline single-child loop, `thread::scope` batch runtime, duplicate
+schema/worktree/result formatting, stale parent adoption path, obsolete generic
+foreground child-executor plumbing, and source-shape ownership tests are
+deleted. All 800 runtime library tests, 50 RuntimeHost integration tests, 12
+JSONL subagent contracts, focused TUI projections, the serial workspace gate,
+workspace Clippy with the established warning baseline, site and release helper
+gates, and the complete real DeepSeek release harness pass. A dedicated real
+DeepSeek subagent smoke returns successful child and parent sentinels with
+paired lifecycle events and a successful session terminal. CLI, TUI,
+server/JSONL, persisted task fields, tool schemas, synchronous subagent payloads,
+provider order, and DeepSeek request behavior remain compatible. P1.2c is
+complete and released in v0.2.36; cross-process live publication, lease,
+fencing, and stale-owner takeover remain P1.4.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or

@@ -1,6 +1,7 @@
 # P1.2c Runtime-Owned Subagent Calls Plan
 
-- Status: implemented and focused-verified; full release gate pending
+- Status: implemented, full-gate and real-DeepSeek verified; public v0.2.36
+  release pending
 - Base: `354ec9668297d184cec702569a7a9de170656bb0` (`v0.2.35`)
 - Branch: `codex/subagent-call-runtime-p12c`
 
@@ -307,6 +308,24 @@ Focused implementation validation completed on 2026-07-17:
   projection, and TUI task/subagent projection tests pass;
 - async launch emits `task.status.updated` for the durable task and no unmatched
   foreground `subagent.started` event.
+
+Full release validation completed on 2026-07-17:
+
+- all 800 runtime library tests, 50 RuntimeHost integration tests, 12 JSONL
+  subagent contracts, and focused TUI task/subagent projection tests pass;
+- `cargo test --workspace --all-targets -- --test-threads=1` passes;
+- `cargo clippy --workspace --all-targets` passes with the established warning
+  baseline and no new P1.2c warning;
+- the site production build and SEO check pass after installing the declared
+  site dependencies;
+- npm staging, published-verifier, and real-API helper self-tests pass;
+- the complete real DeepSeek release harness passes provider, CLI, history,
+  server, interruption, persistence, and resume verification;
+- a dedicated real DeepSeek synchronous-subagent smoke returns
+  `ORCA_REAL_SUBAGENT_CHILD_OK` from the child and
+  `ORCA_REAL_SUBAGENT_PARENT_OK` from the parent, with paired successful
+  `subagent.started` / `subagent.completed` events and a successful session
+  terminal.
 
 ## Completed Deletion Targets
 
