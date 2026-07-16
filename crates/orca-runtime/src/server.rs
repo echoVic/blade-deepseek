@@ -5468,6 +5468,21 @@ enabled = true
             assert_eq!(turn_events.len(), 1);
             assert_eq!(turn_events[0]["event"], "thread_read");
             let turns = turn_events[0]["turns"].as_array().expect("turns");
+            let projected_users = turns
+                .iter()
+                .flat_map(|turn| {
+                    turn["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item["role"] == "user")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                projected_users.len(),
+                1,
+                "one server turn must project one user item: {projected_users:#?}"
+            );
             assert!(turns.iter().any(|turn| {
                 turn["items"].as_array().is_some_and(|items| {
                     items.iter().any(|item| {
@@ -5479,6 +5494,48 @@ enabled = true
                     })
                 })
             }));
+
+            drop(state);
+            let mut cold_state = ServerState::default();
+            let mut cold_output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut cold_state,
+                &format!(
+                    r#"{{"id":"cold-read","method":"thread/read","params":{{"threadId":"{thread_id}","includeMessages":true,"includeTurns":true}}}}"#
+                ),
+                &mut cold_output,
+            )
+            .expect("cold thread read");
+
+            let cold_events = parse_jsonl(&cold_output);
+            assert_eq!(cold_events.len(), 1);
+            let cold_read = &cold_events[0];
+            assert_eq!(cold_read["event"], "thread_read");
+            let cold_messages = cold_read["messages"].as_array().expect("cold messages");
+            assert_eq!(
+                cold_messages
+                    .iter()
+                    .filter(|message| {
+                        message["role"] == "user" && message["content"] == "readable server thread"
+                    })
+                    .count(),
+                1
+            );
+            let cold_users = cold_read["turns"]
+                .as_array()
+                .expect("cold turns")
+                .iter()
+                .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+                .filter(|item| {
+                    item["role"] == "user" && item["content"] == "readable server thread"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cold_users.len(),
+                1,
+                "cold projection must preserve one canonical user item: {cold_users:#?}"
+            );
         });
     }
 

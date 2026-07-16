@@ -362,6 +362,9 @@ function readStableThreadProjection(args, home, threadId, label) {
   const canonicalItems = itemEntries.filter((entry) =>
     ["agent_message", "reasoning", "plan"].includes(entry.item?.type),
   );
+  const userItemTurnIds = itemEntries
+    .filter((entry) => entry.item?.role === "user")
+    .map((entry) => entry.turnId);
   if (
     turnIds.length === 0 ||
     itemIds.length === 0 ||
@@ -380,6 +383,16 @@ function readStableThreadProjection(args, home, threadId, label) {
   ) {
     throw new Error(
       `${label} did not expose canonical completed model item objects: ${JSON.stringify(itemEntries)}`,
+    );
+  }
+  if (
+    userItemTurnIds.length !== turnIds.length ||
+    turnIds.some(
+      (turnId) => userItemTurnIds.filter((userTurnId) => userTurnId === turnId).length !== 1,
+    )
+  ) {
+    throw new Error(
+      `${label} did not expose exactly one user item per turn: ${JSON.stringify({ turnIds, userItemTurnIds, itemEntries })}`,
     );
   }
   return { turnIds, itemIds, itemObjects };
@@ -1234,6 +1247,17 @@ async function runServerThread(args) {
     });
     const turnsPage2 = Array.isArray(threadTurnsPage2.data) ? threadTurnsPage2.data : [];
     const allTurns = [...turns, ...turnsPage2];
+    if (
+      allTurns.some(
+        (turn) =>
+          !Array.isArray(turn.items) ||
+          turn.items.filter((item) => item?.role === "user").length !== 1,
+      )
+    ) {
+      throw new Error(
+        `Server thread/turns/list did not expose exactly one user item per turn: ${JSON.stringify({ threadTurns, threadTurnsPage2 })}`,
+      );
+    }
     const turnText = turns
       .concat(turnsPage2)
       .flatMap((turn) => (Array.isArray(turn.items) ? turn.items : []))
@@ -1357,6 +1381,18 @@ async function runServerThread(args) {
     });
     const itemsPage2 = Array.isArray(threadItemsPage2.data) ? threadItemsPage2.data : [];
     const allItems = [...items, ...itemsPage2];
+    const userItemTurnIds = allItems
+      .filter((entry) => entry.item?.role === "user")
+      .map((entry) => entry.turnId);
+    if (
+      allTurns.some(
+        (turn) => userItemTurnIds.filter((turnId) => turnId === turn.turnId).length !== 1,
+      )
+    ) {
+      throw new Error(
+        `Server thread/items/list did not expose exactly one user item per turn: ${JSON.stringify({ allTurns, allItems })}`,
+      );
+    }
     const itemText = allItems.map((entry) => entry.item?.content ?? entry.item?.text ?? "").join("\n");
     if (
       !allItems.some((entry) => entry.threadId === threadId && typeof entry.itemId === "string") ||
@@ -1415,6 +1451,17 @@ async function runServerThread(args) {
     });
     const messages = Array.isArray(threadRead.messages) ? threadRead.messages : [];
     const readTurns = Array.isArray(threadRead.turns) ? threadRead.turns : [];
+    if (
+      readTurns.some(
+        (turn) =>
+          !Array.isArray(turn.items) ||
+          turn.items.filter((item) => item?.role === "user").length !== 1,
+      )
+    ) {
+      throw new Error(
+        `Server thread/read did not expose exactly one user item per turn: ${JSON.stringify(threadRead)}`,
+      );
+    }
     const userText = messages
       .filter((message) => message.role === "user")
       .map((message) => message.content ?? "")

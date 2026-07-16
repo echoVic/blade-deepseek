@@ -1,20 +1,23 @@
-use std::io;
 use std::path::Path;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::conversation::Conversation;
 use orca_core::subagent_types::SubagentType;
-use orca_core::thread_identity::TurnId;
 
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
-use crate::session::{
-    AgentConversationContext, bootstrap_agent_conversation_for_loop,
-    record_initial_history_for_agent,
-};
+use crate::session::bootstrap_agent_conversation_for_loop;
 use crate::thread_store::SessionWriter;
 
 pub(crate) struct RuntimeConversationBootstrapStep;
+
+pub(crate) enum AgentConversationContext<'a> {
+    Owned,
+    Borrowed {
+        conversation: &'a mut Conversation,
+        history_writer: Option<&'a mut SessionWriter>,
+    },
+}
 
 pub(crate) struct RuntimePreparedConversation<'a> {
     conversation: RuntimePreparedConversationStorage<'a>,
@@ -26,12 +29,27 @@ enum RuntimePreparedConversationStorage<'a> {
     Owned(Conversation),
 }
 
+impl<'a> AgentConversationContext<'a> {
+    pub(crate) fn owned() -> Self {
+        Self::Owned
+    }
+
+    pub(crate) fn borrowed(
+        conversation: &'a mut Conversation,
+        history_writer: Option<&'a mut SessionWriter>,
+    ) -> Self {
+        Self::Borrowed {
+            conversation,
+            history_writer,
+        }
+    }
+}
+
 impl RuntimeConversationBootstrapStep {
     pub(crate) fn new() -> Self {
         Self
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare<'a>(
         &mut self,
         conversation_context: AgentConversationContext<'a>,
@@ -42,21 +60,11 @@ impl RuntimeConversationBootstrapStep {
         instructions: &ProjectInstructions,
         approval_mode: ApprovalMode,
         memory: &MemoryBlock,
-        turn_id: &TurnId,
-        emit_deltas: bool,
-    ) -> io::Result<RuntimePreparedConversation<'a>> {
-        let AgentConversationContext {
-            resumed,
-            history_writer,
-            conversation,
-        } = conversation_context;
-
-        let mut prepared = RuntimePreparedConversation {
-            conversation: match conversation {
-                Some(conversation) => RuntimePreparedConversationStorage::Borrowed(conversation),
-                None => RuntimePreparedConversationStorage::Owned(
+    ) -> RuntimePreparedConversation<'a> {
+        let prepared = match conversation_context {
+            AgentConversationContext::Owned => RuntimePreparedConversation {
+                conversation: RuntimePreparedConversationStorage::Owned(
                     bootstrap_agent_conversation_for_loop(
-                        resumed,
                         cwd,
                         prompt,
                         subagent_depth,
@@ -66,23 +74,18 @@ impl RuntimeConversationBootstrapStep {
                         memory,
                     ),
                 ),
+                history_writer: None,
             },
-            history_writer,
+            AgentConversationContext::Borrowed {
+                conversation,
+                history_writer,
+            } => RuntimePreparedConversation {
+                conversation: RuntimePreparedConversationStorage::Borrowed(conversation),
+                history_writer,
+            },
         };
 
-        if let Some(writer) = prepared.history_writer.as_deref_mut() {
-            writer.enter_turn(turn_id.clone());
-        }
-
-        let (conversation, history_writer) = prepared.parts_mut();
-        record_initial_history_for_agent(
-            conversation,
-            history_writer,
-            resumed.is_some(),
-            emit_deltas,
-        )?;
-
-        Ok(prepared)
+        prepared
     }
 }
 

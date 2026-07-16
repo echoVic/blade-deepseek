@@ -1429,7 +1429,9 @@ impl RuntimeActorStartedTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
+    use crate::runtime_conversation_bootstrap::{
+        AgentConversationContext, RuntimeConversationBootstrapStep,
+    };
     use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
     use crate::runtime_turn_opening::{
         RuntimeTurnOpeningInput, RuntimeTurnOpeningResult, RuntimeTurnOpeningStep,
@@ -1454,8 +1456,6 @@ mod tests {
     use orca_core::mcp_types::McpServerConfig;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
-
-    use crate::session::AgentConversationContext;
 
     fn config() -> RunConfig {
         RunConfig {
@@ -1779,22 +1779,18 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
-        let context = AgentConversationContext::new();
+        let context = AgentConversationContext::owned();
 
-        let mut prepared = RuntimeConversationBootstrapStep::new()
-            .prepare(
-                context,
-                cwd.path(),
-                "inspect repo",
-                0,
-                &SubagentType::General,
-                &instructions,
-                config.approval_mode,
-                &memory,
-                &TurnId::new(),
-                true,
-            )
-            .expect("prepare conversation");
+        let mut prepared = RuntimeConversationBootstrapStep::new().prepare(
+            context,
+            cwd.path(),
+            "inspect repo",
+            0,
+            &SubagentType::General,
+            &instructions,
+            config.approval_mode,
+            &memory,
+        );
         let conversation = prepared.conversation_mut();
 
         assert_eq!(conversation.messages.len(), 2);

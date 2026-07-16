@@ -4096,29 +4096,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_conversation_context_is_owned_by_session_module() {
-        let agent_loop_source = include_str!("agent_loop.rs");
-        let session_source = include_str!("session.rs");
-
-        assert!(
-            !agent_loop_source.contains("struct AgentConversationContext"),
-            "agent_loop must not own agent conversation context"
-        );
-        assert!(
-            !agent_loop_source.contains("impl<'a> AgentConversationContext"),
-            "agent_loop must not own agent conversation context behavior"
-        );
-        assert!(
-            session_source.contains("struct AgentConversationContext"),
-            "session must own agent conversation context"
-        );
-        assert!(
-            session_source.contains("impl<'a> AgentConversationContext"),
-            "session must own agent conversation context behavior"
-        );
-    }
-
-    #[test]
     fn agent_tool_result_recording_is_owned_by_session_module() {
         let agent_loop_source = include_str!("agent_loop.rs");
         let session_source = include_str!("session.rs");
@@ -4250,73 +4227,6 @@ mod tests {
             memory_source.contains("model::auxiliary_model"),
             "memory module must own auxiliary model selection for memory extraction"
         );
-    }
-
-    #[test]
-    fn agent_initial_history_recording_is_owned_by_session_module() {
-        let agent_loop_source = include_str!("agent_loop.rs");
-        let session_source = include_str!("session.rs");
-
-        for marker in ["writer.append_message", "append_summary_state"] {
-            assert!(
-                !agent_loop_source.contains(marker),
-                "agent_loop must not own initial history recording detail {marker}"
-            );
-            assert!(
-                session_source.contains(marker),
-                "session must own initial history recording detail {marker}"
-            );
-        }
-        assert!(
-            session_source.contains("pub(crate) fn record_initial_history_for_agent"),
-            "session must expose initial history recording"
-        );
-    }
-
-    #[test]
-    fn runtime_conversation_bootstrap_step_is_owned_by_runtime_conversation_bootstrap_module() {
-        let agent_loop_source = include_str!("agent_loop.rs");
-        let lifecycle_source = include_str!("lifecycle.rs");
-        let runtime_conversation_bootstrap_source =
-            std::fs::read_to_string("src/runtime_conversation_bootstrap.rs")
-                .expect("runtime conversation bootstrap source");
-        let lib_source = include_str!("lib.rs");
-
-        for marker in [
-            "let mut owned_conversation",
-            "bootstrap_agent_conversation_for_loop(",
-            "record_initial_history_for_agent(",
-            "resumed.is_some()",
-        ] {
-            assert!(
-                !agent_loop_source.contains(marker),
-                "agent_loop must not own runtime conversation bootstrap detail {marker}"
-            );
-        }
-        assert!(
-            agent_loop_source.contains("RuntimeConversationBootstrapStep"),
-            "agent_loop must delegate runtime conversation bootstrap"
-        );
-        assert!(
-            lib_source.contains("mod runtime_conversation_bootstrap;"),
-            "runtime crate must declare a focused runtime_conversation_bootstrap module"
-        );
-        for marker in [
-            "struct RuntimeConversationBootstrapStep",
-            "impl RuntimeConversationBootstrapStep",
-            "bootstrap_agent_conversation_for_loop(",
-            "record_initial_history_for_agent(",
-            "resumed.is_some()",
-        ] {
-            assert!(
-                !lifecycle_source.contains(marker),
-                "lifecycle must not own runtime conversation bootstrap detail {marker}"
-            );
-            assert!(
-                runtime_conversation_bootstrap_source.contains(marker),
-                "runtime_conversation_bootstrap must own runtime conversation bootstrap detail {marker}"
-            );
-        }
     }
 
     #[test]

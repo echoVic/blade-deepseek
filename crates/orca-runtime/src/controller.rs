@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::conversation::Message;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
@@ -37,18 +38,15 @@ use crate::lifecycle::{
     RuntimeSessionLifecycle, RuntimeUserInputHandler, ThreadSteerHandle,
 };
 use crate::provider_stream::{RuntimeProviderSuspension, RuntimeProviderSuspensionControl};
+use crate::runtime_conversation_bootstrap::AgentConversationContext;
 use crate::runtime_host::{
     HostedTurnRequest, OperationHandle, OperationOutcome, OperationTerminal, RuntimeHost,
     RuntimeHostError,
 };
-use crate::session::{
-    AgentConversationContext, InteractiveSession, InteractiveSessionRuntimeParts,
-};
+use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts};
 use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 #[cfg(test)]
 use crate::thread::RuntimeThread;
-#[cfg(test)]
-use crate::thread_store::SessionStore;
 use crate::tool_invocation::AgentToolPolicyContext;
 #[cfg(test)]
 use crate::tool_invocation::{
@@ -398,20 +396,15 @@ impl<'a> ThreadTurnContext<'a> {
             parts
                 .conversation
                 .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
-            match request.prompt_placement() {
-                ThreadTurnPromptPlacement::BacktrackableUser => {
-                    parts.conversation.add_user(prompt.clone());
-                }
-                ThreadTurnPromptPlacement::PinnedUser => {
-                    parts.conversation.add_user_pinned(prompt.clone());
-                }
+            let message = match request.prompt_placement() {
+                ThreadTurnPromptPlacement::BacktrackableUser => Message::user(prompt.clone()),
+                ThreadTurnPromptPlacement::PinnedUser => Message::pinned_user(prompt.clone()),
                 ThreadTurnPromptPlacement::ExistingTurn => unreachable!(),
+            };
+            if let Some(writer) = parts.writer.as_deref_mut() {
+                writer.append_message(&message)?;
             }
-            if let Some(writer) = parts.writer.as_deref_mut()
-                && let Some(message) = parts.conversation.messages.last()
-            {
-                writer.append_message(message)?;
-            }
+            parts.conversation.messages.push(message);
         }
 
         Ok(Self { cwd, prompt, parts })
@@ -658,9 +651,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                     .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
                 events,
                 sink,
-                AgentConversationContext::new()
-                    .with_history_writer(parts.writer)
-                    .with_conversation(Some(parts.conversation)),
+                AgentConversationContext::borrowed(parts.conversation, parts.writer),
                 request.tool_mode().policy(),
             )
         })();
@@ -1558,6 +1549,107 @@ mod tests {
         assert_controller_failure_persists_error(true);
     }
 
+    #[test]
+    fn hosted_turn_persists_one_user_record_for_one_admitted_prompt() {
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.history_mode = HistoryMode::Record;
+            config.output_format = OutputFormat::Jsonl;
+            let mut thread = RuntimeThread::start(&config, "canonical user turn").expect("thread");
+            let request = ThreadTurnRequest::new("persist this prompt once");
+            let turn_id = request.turn_id().clone();
+
+            thread
+                .run_request(&config, &request, Vec::new())
+                .expect("run hosted turn");
+
+            let records = thread
+                .session()
+                .conversation_records()
+                .expect("recorded conversation ledger");
+            let projected = crate::thread_store::conversation_records_to_thread_items(
+                thread.thread_id(),
+                &records,
+                None,
+                usize::MAX,
+            )
+            .expect("project recorded conversation ledger");
+            let user_records = projected
+                .iter()
+                .filter(|record| {
+                    record.item["role"] == "user"
+                        && record.item["content"] == "persist this prompt once"
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                user_records.len(),
+                1,
+                "one admitted prompt must have one durable user item: {user_records:#?}"
+            );
+            assert_eq!(user_records[0].turn_id, turn_id.as_str());
+            assert!(user_records[0].item_id.starts_with("item_"));
+        });
+    }
+
+    #[test]
+    fn hosted_turn_does_not_commit_user_prompt_when_history_append_fails() {
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.history_mode = HistoryMode::Record;
+            config.output_format = OutputFormat::Jsonl;
+            let mut thread =
+                RuntimeThread::start(&config, "failed user admission").expect("thread");
+            let transcript = crate::history::load_session(thread.thread_id()).expect("transcript");
+            let transcript_dir = transcript.path.parent().expect("transcript directory");
+            std::fs::remove_dir_all(transcript_dir).expect("remove transcript directory");
+            std::fs::write(transcript_dir, "block transcript directory recreation")
+                .expect("replace transcript directory with file");
+
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("must not enter model context"),
+                    Vec::new(),
+                )
+                .expect_err("missing transcript directory must reject turn admission");
+
+            assert!(
+                thread
+                    .session()
+                    .conversation()
+                    .messages
+                    .iter()
+                    .all(|message| {
+                        !matches!(
+                            message,
+                            Message::User { content, .. }
+                                if content == "must not enter model context"
+                        )
+                    }),
+                "a failed durable append must not commit the prompt to model context"
+            );
+            let records = thread
+                .session()
+                .conversation_records()
+                .expect("conversation ledger");
+            let projected = crate::thread_store::conversation_records_to_thread_items(
+                thread.thread_id(),
+                &records,
+                None,
+                usize::MAX,
+            )
+            .expect("project conversation ledger");
+            assert!(
+                projected.iter().all(|record| {
+                    record.item["role"] != "user"
+                        || record.item["content"] != "must not enter model context"
+                }),
+                "a failed durable append must not enter the live projection ledger: {projected:#?}"
+            );
+        });
+    }
+
     fn subagent_request(id: &str) -> tool_types::ToolRequest {
         tool_types::ToolRequest {
             id: id.to_string(),
@@ -1995,29 +2087,6 @@ mod tests {
             Some(orca_core::conversation::Message::System { content, pinned: true })
                 if content.contains("policy hint") && content.contains("repo hint")
         ));
-    }
-
-    #[test]
-    fn agent_conversation_context_groups_history_inputs() {
-        let cwd = tempfile::tempdir().unwrap();
-        let mut writer = SessionStore::new()
-            .start_writer(
-                cwd.path(),
-                "test-provider",
-                Some("test-model".to_string()),
-                "agent-conversation-context",
-            )
-            .unwrap();
-        let mut conversation = Conversation::new();
-        conversation.add_system("system".to_string());
-
-        let context = AgentConversationContext::new()
-            .with_history_writer(Some(&mut writer))
-            .with_conversation(Some(&mut conversation));
-
-        assert!(context.resumed().is_none());
-        assert!(context.history_writer().is_some());
-        assert!(context.conversation().is_some());
     }
 
     #[test]

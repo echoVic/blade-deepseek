@@ -306,8 +306,9 @@ mod tests {
     use crate::instructions::ProjectInstructions;
     use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTurnDeps, RuntimeTurnState};
     use crate::memory::MemoryBlock;
-    use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
-    use crate::session::AgentConversationContext;
+    use crate::runtime_conversation_bootstrap::{
+        AgentConversationContext, RuntimeConversationBootstrapStep,
+    };
     use crate::tasks::TaskRegistry;
     use crate::tool_execution::policy_for_tool_execution;
 
@@ -380,20 +381,16 @@ mod tests {
         let mut events = EventFactory::new("turn-loop-continuation".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
-        let mut prepared_conversation = RuntimeConversationBootstrapStep::new()
-            .prepare(
-                AgentConversationContext::new().with_conversation(Some(&mut conversation)),
-                cwd.path(),
-                "continue",
-                0,
-                &subagent_type,
-                &instructions,
-                config.approval_mode,
-                &memory,
-                &orca_core::thread_identity::TurnId::new(),
-                true,
-            )
-            .expect("prepare conversation");
+        let mut prepared_conversation = RuntimeConversationBootstrapStep::new().prepare(
+            AgentConversationContext::borrowed(&mut conversation, None),
+            cwd.path(),
+            "continue",
+            0,
+            &subagent_type,
+            &instructions,
+            config.approval_mode,
+            &memory,
+        );
         let mut background_workflows = Vec::new();
         let response = ProviderResponse {
             steps: vec![ProviderStep::MessageDelta("continued".to_string())],

@@ -6,14 +6,15 @@ use crate::lifecycle::{
     AgentLoopContext, AgentLoopOutcome, RuntimeSessionLifecycle, RuntimeTaskActor,
     RuntimeTurnContext, RuntimeTurnExecution,
 };
-use crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep;
+use crate::runtime_conversation_bootstrap::{
+    AgentConversationContext, RuntimeConversationBootstrapStep,
+};
 use crate::runtime_turn_loop::{
     RuntimeAgentTurnLoopInput, RuntimeTurnLoopExecutors, RuntimeTurnLoopStep,
     RuntimeTurnOutputContext, RuntimeTurnPolicyContext, RuntimeTurnProviderContext,
     RuntimeTurnRequestContext, RuntimeTurnWorkflowContext, run_agent_turn_loop,
 };
 use crate::runtime_turn_setup::RuntimeTurnSetupStep;
-use crate::session::AgentConversationContext;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::observe_background_workflows;
@@ -44,11 +45,9 @@ pub(crate) fn run_agent_loop(
         turn_execution,
     } = loop_context;
     let RuntimeTurnContext {
-        turn_id,
         cwd,
         prompt,
         subagent_depth,
-        emit_deltas,
         subagent_type,
         ..
     } = turn_context.clone();
@@ -81,9 +80,7 @@ pub(crate) fn run_agent_loop(
         turn_deps.instructions,
         config.approval_mode,
         turn_deps.memory,
-        &turn_id,
-        emit_deltas,
-    )?;
+    );
 
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());
     let lifecycle = lifecycle.unwrap_or(&mut legacy_lifecycle);
@@ -148,7 +145,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         ),
         runtime.events,
         runtime.sink,
-        AgentConversationContext::new(),
+        AgentConversationContext::owned(),
         AgentToolPolicyContext::new(
             request.allowed_tools.as_deref(),
             request.tool_policy_label.as_deref(),

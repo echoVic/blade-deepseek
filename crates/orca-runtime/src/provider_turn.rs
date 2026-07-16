@@ -1382,21 +1382,19 @@ mod tests {
             turn_extensions,
         );
         let mut prepared_conversation =
-            crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep::new()
-                .prepare(
-                    crate::session::AgentConversationContext::new()
-                        .with_conversation(Some(&mut conversation)),
-                    cwd.path(),
-                    "continue",
-                    0,
-                    &orca_core::subagent_types::SubagentType::General,
-                    &instructions,
-                    config.approval_mode,
-                    &memory,
-                    &orca_core::thread_identity::TurnId::new(),
-                    true,
-                )
-                .expect("prepare conversation");
+            crate::runtime_conversation_bootstrap::RuntimeConversationBootstrapStep::new().prepare(
+                crate::runtime_conversation_bootstrap::AgentConversationContext::borrowed(
+                    &mut conversation,
+                    None,
+                ),
+                cwd.path(),
+                "continue",
+                0,
+                &orca_core::subagent_types::SubagentType::General,
+                &instructions,
+                config.approval_mode,
+                &memory,
+            );
         let mut lifecycle = crate::runtime_lifecycle::RuntimeSessionLifecycle::new(
             "provider-cycle-continuation".to_string(),
         );

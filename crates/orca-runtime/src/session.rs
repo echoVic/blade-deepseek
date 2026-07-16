@@ -64,50 +64,6 @@ pub(crate) struct InteractiveSessionRuntimeParts<'a> {
     pub task_registry: &'a TaskRegistry,
 }
 
-pub(crate) struct AgentConversationContext<'a> {
-    pub(crate) resumed: Option<&'a SessionTranscript>,
-    pub(crate) history_writer: Option<&'a mut SessionWriter>,
-    pub(crate) conversation: Option<&'a mut Conversation>,
-}
-
-impl<'a> AgentConversationContext<'a> {
-    pub(crate) fn new() -> Self {
-        Self {
-            resumed: None,
-            history_writer: None,
-            conversation: None,
-        }
-    }
-
-    pub(crate) fn with_history_writer(
-        mut self,
-        history_writer: Option<&'a mut SessionWriter>,
-    ) -> Self {
-        self.history_writer = history_writer;
-        self
-    }
-
-    pub(crate) fn with_conversation(mut self, conversation: Option<&'a mut Conversation>) -> Self {
-        self.conversation = conversation;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resumed(&self) -> Option<&SessionTranscript> {
-        self.resumed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn history_writer(&self) -> Option<&SessionWriter> {
-        self.history_writer.as_deref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn conversation(&self) -> Option<&Conversation> {
-        self.conversation.as_deref()
-    }
-}
-
 pub(crate) fn record_tool_result_for_agent(
     conversation: &mut Conversation,
     history_writer: Option<&mut SessionWriter>,
@@ -151,49 +107,6 @@ pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
     Ok(())
 }
 
-pub(crate) fn record_initial_history_for_agent(
-    conversation: &Conversation,
-    history_writer: Option<&mut SessionWriter>,
-    resumed: bool,
-    emit_deltas: bool,
-) -> io::Result<()> {
-    if !emit_deltas {
-        return Ok(());
-    }
-    let Some(writer) = history_writer else {
-        return Ok(());
-    };
-
-    if resumed {
-        let last_index = conversation.messages.len().saturating_sub(1);
-        for (index, message) in conversation.messages.iter().enumerate() {
-            if index == last_index && matches!(message, Message::User { .. }) {
-                writer.append_message(message)?;
-            } else {
-                writer.append_legacy_message(message)?;
-            }
-        }
-        if !conversation.summary.is_empty() {
-            let inherited_marker = conversation
-                .summary
-                .latest_rolling()
-                .map(|text| text.to_string())
-                .unwrap_or_default();
-            let count = conversation.messages.len();
-            writer.append_summary_state(count, count, inherited_marker, &conversation.summary)?;
-        }
-    } else {
-        if let Some(system) = conversation.messages.first() {
-            writer.append_message(system)?;
-        }
-        if let Some(user) = conversation.messages.last() {
-            writer.append_message(user)?;
-        }
-    }
-
-    Ok(())
-}
-
 pub(crate) fn bootstrap_agent_conversation(
     resumed: Option<&SessionTranscript>,
     system_prompt: String,
@@ -221,7 +134,6 @@ pub(crate) fn bootstrap_agent_conversation(
 }
 
 pub(crate) fn bootstrap_agent_conversation_for_loop(
-    resumed: Option<&SessionTranscript>,
     cwd: &Path,
     prompt: &str,
     subagent_depth: u32,
@@ -238,7 +150,7 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
         approval_mode,
         Some(memory),
     );
-    bootstrap_agent_conversation(resumed, system_prompt, cwd, prompt)
+    bootstrap_agent_conversation(None, system_prompt, cwd, prompt)
 }
 
 pub(crate) fn record_plan_state_for_agent(
@@ -779,7 +691,6 @@ mod tests {
         };
 
         let conversation = bootstrap_agent_conversation_for_loop(
-            None,
             cwd.path(),
             "inspect repo",
             1,

@@ -512,24 +512,38 @@ if (args[0] === "--mode" && args[1] === "server") {
             threadId: "thread-test",
             turnId: "turn-2",
             itemId: "item_00000000000000000000000012",
-            index: 4,
+            index: 3,
             item: { id: "item_00000000000000000000000012", type: "agent_message", text: serverThreadSentinel }
           }
         ] : request.params.cursor ? [
           {
             threadId: "thread-test",
             turnId: "turn-2",
+            itemId: "item-3",
+            index: 2,
+            item: { role: "user", content: "Reply with exactly the token I asked you to remember." }
+          },
+          {
+            threadId: "thread-test",
+            turnId: "turn-2",
             itemId: "item_00000000000000000000000012",
-            index: 4,
+            index: 3,
             item: { id: "item_00000000000000000000000012", type: "agent_message", text: serverThreadSentinel }
           }
         ] : [
           {
             threadId: "thread-test",
             turnId: "turn-1",
-            itemId: "item-2",
-            index: 1,
+            itemId: "item-1",
+            index: 0,
             item: { role: "user", content: \`Remember this exact token for the next turn: \${serverThreadSentinel}. Reply with exactly: READY.\` }
+          },
+          {
+            threadId: "thread-test",
+            turnId: "turn-1",
+            itemId: "item_00000000000000000000000011",
+            index: 1,
+            item: { id: "item_00000000000000000000000011", type: "agent_message", text: "READY" }
           }
         ],
         nextCursor: request.params.cursor ? null : "2",
