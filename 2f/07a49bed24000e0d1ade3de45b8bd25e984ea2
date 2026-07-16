@@ -1,0 +1,21 @@
+.github/ISSUE_TEMPLATE/feature_request.yml
+  s_28af39c24c766d::t_48b457eac2b26b 43-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2f07a49bed24000e0d1ade3de45b8bd25e984ea2",
+  "prompts": {},
+  "sessions": {
+    "s_28af39c24c766d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a41-1587-7a90-989f-4137d0443ee7",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
