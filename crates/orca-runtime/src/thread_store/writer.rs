@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use orca_core::conversation::{Message, SummaryState};
 use orca_core::cost_types::UsageTotals;
+use orca_core::event_schema::EventSequenceStore;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::tool_types::ToolResult;
 use uuid::Uuid;
@@ -165,6 +166,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     let mut last_plan: Option<(Option<String>, Vec<PlanItem>)> = None;
     let mut completion_status = None;
     let mut completion_error = None;
+    let mut next_event_seq = 0;
 
     for record in records {
         match record {
@@ -201,6 +203,9 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
                 has_usage_baseline = true;
                 has_background_usage = false;
             }
+            SessionRecord::EventSequenceReserved { next_seq } => {
+                next_event_seq = next_event_seq.max(next_seq);
+            }
             SessionRecord::PlanState { explanation, plan } => {
                 let all_done = !plan.is_empty()
                     && plan.iter().all(|item| item.status == PlanStatus::Completed);
@@ -235,6 +240,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
         plan: last_plan,
         completion_status,
         completion_error,
+        next_event_seq,
         path: path.to_path_buf(),
     })
 }
@@ -284,7 +290,9 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
                 }
             }
         }
-        SessionRecord::Usage(_) | SessionRecord::UsageBaseline(_) => {}
+        SessionRecord::Usage(_)
+        | SessionRecord::UsageBaseline(_)
+        | SessionRecord::EventSequenceReserved { .. } => {}
         SessionRecord::PlanState { explanation, plan } => {
             if let Some(explanation) = explanation {
                 redact_string_in_place(explanation);
@@ -732,12 +740,25 @@ impl SessionWriter {
         write_record(&self.path, &SessionRecord::Usage(usage))
     }
 
+    fn reserve_event_sequence(&self, next_seq: u64) -> io::Result<()> {
+        write_record(
+            &self.path,
+            &SessionRecord::EventSequenceReserved { next_seq },
+        )
+    }
+
     pub fn append_plan_state(
         &mut self,
         explanation: Option<String>,
         plan: Vec<PlanItem>,
     ) -> io::Result<()> {
         write_record(&self.path, &SessionRecord::PlanState { explanation, plan })
+    }
+}
+
+impl EventSequenceStore for SessionWriter {
+    fn reserve_through(&self, next_seq_exclusive: u64) -> io::Result<()> {
+        self.reserve_event_sequence(next_seq_exclusive)
     }
 }
 
@@ -811,6 +832,37 @@ mod tests {
             .expect("read transcript")
             .usage
             .expect("aggregate usage")
+    }
+
+    #[test]
+    fn transcript_reduces_event_sequence_reservations_to_exclusive_maximum() {
+        let (_directory, path, writer) = new_transcript();
+
+        writer.reserve_through(256).expect("reserve first block");
+        writer.reserve_through(512).expect("reserve second block");
+        writer
+            .reserve_through(256)
+            .expect("stale reservation remains readable");
+
+        let transcript = read_transcript(&path).expect("read sequence reservation");
+        assert_eq!(transcript.next_event_seq, 512);
+        let records = read_records(&path).expect("read typed records");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, SessionRecord::EventSequenceReserved { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn legacy_transcript_without_event_sequence_reservation_starts_at_zero() {
+        let (_directory, path, _writer) = new_transcript();
+
+        let transcript = read_transcript(&path).expect("read legacy transcript");
+
+        assert_eq!(transcript.next_event_seq, 0);
     }
 
     fn seed_foreground_and_background(writer: &mut SessionWriter) {

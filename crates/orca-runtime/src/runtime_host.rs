@@ -1848,7 +1848,7 @@ impl ThreadActor {
         background_capacity: usize,
     ) -> Self {
         let usage_ledger = RuntimeUsageLedger::new(thread.session().aggregate_usage_totals());
-        let events = EventFactory::new(thread.thread_id().to_string());
+        let events = thread.event_factory();
         let (background_completion_tx, background_completion_rx) = tokio_mpsc::unbounded_channel();
         Self {
             state: Some(ThreadActorState { thread, events }),

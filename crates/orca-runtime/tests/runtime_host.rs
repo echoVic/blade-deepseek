@@ -16,7 +16,10 @@ use orca_core::config::{
 };
 use orca_core::conversation::Message;
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::{EventEnvelope, EventFactory, EventType, RunStatus};
+use orca_core::event_schema::{
+    EVENT_SEQUENCE_RESERVATION_SIZE, EventEnvelope, EventFactory, EventSequenceStore, EventType,
+    RunStatus,
+};
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::mcp_types::McpServerConfig;
@@ -409,6 +412,49 @@ impl SharedWriter {
     }
 }
 
+#[derive(Clone)]
+struct ReservationCheckingWriter {
+    output: SharedWriter,
+    thread_id: String,
+    expected_next_seq: u64,
+}
+
+impl ReservationCheckingWriter {
+    fn new(output: SharedWriter, thread_id: impl Into<String>, expected_next_seq: u64) -> Self {
+        Self {
+            output,
+            thread_id: thread_id.into(),
+            expected_next_seq,
+        }
+    }
+}
+
+impl Write for ReservationCheckingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let transcript = history::load_session(&self.thread_id)?;
+        assert_eq!(
+            transcript.next_event_seq, self.expected_next_seq,
+            "event sequence reservation must be durable before output delivery"
+        );
+        self.output.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn event_sequence_reservation_count(transcript: &SessionTranscript) -> usize {
+    fs::read_to_string(&transcript.path)
+        .expect("read plaintext transcript")
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| record["type"] == "event.sequence.reserved")
+        })
+        .count()
+}
+
 impl Write for SharedWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         self.output.lock().unwrap().extend_from_slice(buffer);
@@ -635,6 +681,221 @@ fn actor_owned_events_keep_one_contiguous_sequence_across_operations() {
     );
 
     host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn recorded_event_sequence_is_reserved_once_and_restored_across_resume() {
+    with_orca_home(|_home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::EmitEvent {
+                message: "first recorded event".to_string(),
+                status: RunStatus::Success,
+            },
+            TestBehavior::EmitEvent {
+                message: "second recorded event".to_string(),
+                status: RunStatus::Success,
+            },
+        ]));
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "record durable event sequence")
+            .expect("start recorded thread");
+        let thread_id = thread
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let output = SharedWriter::default();
+
+        for prompt in ["first", "second"] {
+            let operation = thread
+                .start_turn(
+                    HostedTurnRequest::new(prompt),
+                    ReservationCheckingWriter::new(
+                        output.clone(),
+                        thread_id.clone(),
+                        EVENT_SEQUENCE_RESERVATION_SIZE,
+                    ),
+                )
+                .expect("start recorded turn");
+            assert_eq!(
+                operation
+                    .wait_timeout(TEST_TIMEOUT)
+                    .expect("recorded terminal")
+                    .outcome(),
+                &OperationOutcome::Completed(RunStatus::Success)
+            );
+        }
+
+        let events = output.json_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["seq"], 0);
+        assert_eq!(events[1]["seq"], 1);
+        assert!(events.iter().all(|event| event["run_id"] == thread_id));
+        let transcript = history::load_session(&thread_id).expect("load recorded transcript");
+        assert_eq!(transcript.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
+        assert_eq!(event_sequence_reservation_count(&transcript), 1);
+        host.shutdown().expect("shutdown first runtime host");
+
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+            message: "event after process resume".to_string(),
+            status: RunStatus::Success,
+        }]));
+        let host = RuntimeHost::start_with_executor(executor).expect("restart runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Resume(thread_id.clone());
+        let resumed = host
+            .start_thread(config, "resume durable event sequence")
+            .expect("resume recorded thread");
+        assert_eq!(resumed.thread_id(), thread_id);
+        let resumed_output = SharedWriter::default();
+        let operation = resumed
+            .start_turn(
+                HostedTurnRequest::new("resume"),
+                ReservationCheckingWriter::new(
+                    resumed_output.clone(),
+                    thread_id.clone(),
+                    EVENT_SEQUENCE_RESERVATION_SIZE * 2,
+                ),
+            )
+            .expect("start resumed turn");
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("resumed terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+
+        let events = resumed_output.json_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["seq"], EVENT_SEQUENCE_RESERVATION_SIZE);
+        assert_eq!(events[0]["run_id"], thread_id);
+        let transcript = history::load_session(&thread_id).expect("reload resumed transcript");
+        assert_eq!(
+            transcript.next_event_seq,
+            EVENT_SEQUENCE_RESERVATION_SIZE * 2
+        );
+        assert_eq!(event_sequence_reservation_count(&transcript), 2);
+
+        host.shutdown().expect("shutdown resumed runtime host");
+    });
+}
+
+#[test]
+fn forked_event_sequence_resets_for_the_new_thread_identity() {
+    with_orca_home(|_home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let parent_writer = history::SessionWriter::start(
+            cwd.path(),
+            "mock",
+            None,
+            "parent with reserved sequence",
+        )
+        .expect("start parent transcript");
+        parent_writer
+            .reserve_through(EVENT_SEQUENCE_RESERVATION_SIZE)
+            .expect("reserve parent event sequence");
+        let parent = history::load_session("latest").expect("load parent transcript");
+        let parent_id = parent.meta.session_id;
+
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+            message: "first fork event".to_string(),
+            status: RunStatus::Success,
+        }]));
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Fork(parent_id.clone());
+        let fork = host
+            .start_thread(config, "fork durable event sequence")
+            .expect("start forked thread");
+        let fork_id = fork.session_id().expect("forked session id").to_string();
+        assert_ne!(fork_id, parent_id);
+        let output = SharedWriter::default();
+        let operation = fork
+            .start_turn(
+                HostedTurnRequest::new("fork"),
+                ReservationCheckingWriter::new(
+                    output.clone(),
+                    fork_id.clone(),
+                    EVENT_SEQUENCE_RESERVATION_SIZE,
+                ),
+            )
+            .expect("start fork turn");
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("fork terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+
+        let events = output.json_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["seq"], 0);
+        assert_eq!(events[0]["run_id"], fork_id);
+        let fork_transcript = history::load_session(&fork_id).expect("load fork transcript");
+        assert_eq!(
+            fork_transcript.next_event_seq,
+            EVENT_SEQUENCE_RESERVATION_SIZE
+        );
+        assert_eq!(event_sequence_reservation_count(&fork_transcript), 1);
+        assert_eq!(
+            history::load_session(&parent_id)
+                .expect("reload parent transcript")
+                .next_event_seq,
+            EVENT_SEQUENCE_RESERVATION_SIZE
+        );
+
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn legacy_recorded_thread_without_reservation_starts_at_zero() {
+    with_orca_home(|_home| {
+        let cwd = tempfile::tempdir().unwrap();
+        let _legacy_writer =
+            history::SessionWriter::start(cwd.path(), "mock", None, "legacy transcript")
+                .expect("start legacy transcript");
+        let legacy = history::load_session("latest").expect("load legacy transcript");
+        let thread_id = legacy.meta.session_id;
+        assert_eq!(legacy.next_event_seq, 0);
+
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+            message: "first legacy event".to_string(),
+            status: RunStatus::Success,
+        }]));
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Resume(thread_id.clone());
+        let thread = host
+            .start_thread(config, "resume legacy transcript")
+            .expect("resume legacy thread");
+        let output = SharedWriter::default();
+        let operation = thread
+            .start_turn(HostedTurnRequest::new("legacy"), output.clone())
+            .expect("start legacy turn");
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("legacy terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+
+        let events = output.json_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["seq"], 0);
+        assert_eq!(events[0]["run_id"], thread_id);
+        let transcript = history::load_session(&thread_id).expect("reload legacy transcript");
+        assert_eq!(transcript.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
+        assert_eq!(event_sequence_reservation_count(&transcript), 1);
+
+        host.shutdown().expect("shutdown runtime host");
+    });
 }
 
 #[test]
@@ -993,6 +1254,7 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
         plan: None,
         completion_status: Some("success".to_string()),
         completion_error: None,
+        next_event_seq: 0,
         path: transcript_path,
     };
     let mut config = test_config(cwd.path().to_path_buf());

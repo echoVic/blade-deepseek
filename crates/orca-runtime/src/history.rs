@@ -301,6 +301,7 @@ mod tests {
     use crate::thread_store::ORCA_HOME_ENV;
     use orca_core::approval_types::ActionKind;
     use orca_core::conversation::RawToolCall;
+    use orca_core::event_schema::{EVENT_SEQUENCE_RESERVATION_SIZE, EventSequenceStore};
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_core::tool_types::{
         ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminalSource,
@@ -358,6 +359,48 @@ mod tests {
             }
         }
         result.expect("compaction record persisted");
+    }
+
+    #[test]
+    fn event_sequence_reservation_survives_rewrite_and_compression() {
+        let _guard = lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let writer = SessionWriter::start(&cwd, "mock", None, "durable sequence")?;
+            let session_id = load_session("latest")?.meta.session_id;
+            writer.reserve_through(EVENT_SEQUENCE_RESERVATION_SIZE)?;
+
+            rename_session(&session_id, "rewritten durable sequence")?;
+            let rewritten = load_session(&session_id)?;
+            assert_eq!(rewritten.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
+
+            let compressed_path = compress_session(&session_id)?;
+            assert_eq!(
+                compressed_path
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("zst")
+            );
+            let compressed = load_session(&session_id)?;
+            assert_eq!(compressed.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
+            assert_eq!(compressed.meta.title, "rewritten durable sequence");
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("event sequence reservation survived rewrite and compression");
     }
 
     #[test]
@@ -924,6 +967,7 @@ mod tests {
             plan: None,
             completion_status: None,
             completion_error: None,
+            next_event_seq: 0,
             path: cwd.join("reasoning-only.jsonl"),
         };
 

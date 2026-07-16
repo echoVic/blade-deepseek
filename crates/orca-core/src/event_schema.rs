@@ -1,3 +1,5 @@
+use std::fmt;
+use std::io;
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +17,11 @@ use crate::tool_types::{FileChangePreview, ToolRequest, ToolResult, ToolTerminal
 use crate::verification::VerificationResult;
 
 pub const EVENT_SCHEMA_VERSION: &str = "1";
+pub const EVENT_SEQUENCE_RESERVATION_SIZE: u64 = 256;
+
+pub trait EventSequenceStore: Send + Sync {
+    fn reserve_through(&self, next_seq_exclusive: u64) -> io::Result<()>;
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EventEnvelope {
@@ -35,37 +42,82 @@ pub struct EventDraft {
     publication: Arc<EventPublication>,
 }
 
-#[derive(Debug, Default)]
 struct EventPublication {
-    next_seq: Mutex<u64>,
+    state: Mutex<EventPublicationState>,
+    sequence_store: Option<Arc<dyn EventSequenceStore>>,
+}
+
+#[derive(Debug, Default)]
+struct EventPublicationState {
+    next_seq: u64,
+    reserved_until: u64,
+}
+
+impl Default for EventPublication {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(EventPublicationState::default()),
+            sequence_store: None,
+        }
+    }
+}
+
+impl fmt::Debug for EventPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        formatter
+            .debug_struct("EventPublication")
+            .field("state", &*state)
+            .field("has_sequence_store", &self.sequence_store.is_some())
+            .finish()
+    }
 }
 
 struct EventPublicationGuard<'a> {
-    next_seq: MutexGuard<'a, u64>,
+    state: MutexGuard<'a, EventPublicationState>,
 }
 
 impl Drop for EventPublicationGuard<'_> {
     fn drop(&mut self) {
-        *self.next_seq = self.next_seq.saturating_add(1);
+        self.state.next_seq += 1;
     }
 }
 
 impl EventDraft {
-    pub(crate) fn publish<R>(self, publish: impl FnOnce(&EventEnvelope) -> R) -> R {
-        let next_seq = self
+    pub(crate) fn publish<R>(
+        self,
+        publish: impl FnOnce(&EventEnvelope) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let mut state = self
             .publication
-            .next_seq
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.next_seq == u64::MAX {
+            return Err(io::Error::other("event sequence exhausted"));
+        }
+        if let Some(sequence_store) = self.publication.sequence_store.as_deref()
+            && state.next_seq >= state.reserved_until
+        {
+            let reserved_until = state
+                .next_seq
+                .checked_add(EVENT_SEQUENCE_RESERVATION_SIZE)
+                .ok_or_else(|| io::Error::other("event sequence reservation exhausted"))?;
+            sequence_store.reserve_through(reserved_until)?;
+            state.reserved_until = reserved_until;
+        }
         let event = EventEnvelope {
             version: EVENT_SCHEMA_VERSION,
             run_id: self.run_id,
-            seq: *next_seq,
+            seq: state.next_seq,
             timestamp_ms: timestamp_ms(),
             event_type: self.event_type,
             payload: self.payload,
         };
-        let publication = EventPublicationGuard { next_seq };
+        let publication = EventPublicationGuard { state };
         let result = publish(&event);
         drop(publication);
         result
@@ -219,6 +271,23 @@ impl EventFactory {
         Self {
             run_id,
             publication: Arc::new(EventPublication::default()),
+        }
+    }
+
+    pub fn with_sequence_store(
+        run_id: String,
+        next_seq: u64,
+        sequence_store: Arc<dyn EventSequenceStore>,
+    ) -> Self {
+        Self {
+            run_id,
+            publication: Arc::new(EventPublication {
+                state: Mutex::new(EventPublicationState {
+                    next_seq,
+                    reserved_until: next_seq,
+                }),
+                sequence_store: Some(sequence_store),
+            }),
         }
     }
 

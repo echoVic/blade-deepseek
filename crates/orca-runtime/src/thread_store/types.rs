@@ -78,6 +78,7 @@ pub struct SessionTranscript {
     pub plan: Option<(Option<String>, Vec<PlanItem>)>,
     pub completion_status: Option<String>,
     pub completion_error: Option<String>,
+    pub next_event_seq: u64,
     pub path: PathBuf,
 }
 
@@ -113,6 +114,8 @@ pub(crate) enum SessionRecord {
     Usage(UsageTotals),
     #[serde(rename = "session.usage_baseline")]
     UsageBaseline(UsageTotals),
+    #[serde(rename = "event.sequence.reserved")]
+    EventSequenceReserved { next_seq: u64 },
     #[serde(rename = "plan.state")]
     PlanState {
         explanation: Option<String>,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
-use orca_core::event_schema::{EventFactory, RunStatus};
+use orca_core::event_schema::{EventFactory, EventSequenceStore, RunStatus};
 use orca_mcp::McpRegistry;
 
 use crate::controller::{
@@ -95,6 +95,15 @@ impl RuntimeThread {
 
     pub fn thread_extensions_handle(&self) -> Arc<ExtensionData> {
         Arc::clone(&self.thread_extensions)
+    }
+
+    pub(crate) fn event_factory(&self) -> EventFactory {
+        let run_id = self.thread_id.clone();
+        let Some((next_seq, writer)) = self.session.event_sequence_store() else {
+            return EventFactory::new(run_id);
+        };
+        let sequence_store: Arc<dyn EventSequenceStore> = Arc::new(writer);
+        EventFactory::with_sequence_store(run_id, next_seq, sequence_store)
     }
 
     pub fn run_turn_to_writer<W: io::Write>(

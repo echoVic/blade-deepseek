@@ -216,9 +216,25 @@ pub fn observe_event(observer: Option<&dyn EventObserver>, event: EventDraft) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_schema::EventFactory;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::event_schema::{EVENT_SEQUENCE_RESERVATION_SIZE, EventFactory, EventSequenceStore};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct RecordingSequenceStore {
+        fail: AtomicBool,
+        reservations: Mutex<Vec<u64>>,
+    }
+
+    impl EventSequenceStore for RecordingSequenceStore {
+        fn reserve_through(&self, next_seq_exclusive: u64) -> io::Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(io::Error::other("sequence reservation failed"));
+            }
+            self.reservations.lock().unwrap().push(next_seq_exclusive);
+            Ok(())
+        }
+    }
 
     #[test]
     fn jsonl_format_writes_one_line_per_event() {
@@ -385,5 +401,118 @@ mod tests {
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].seq, 0);
         assert_eq!(observed[0].payload["message"], "published");
+    }
+
+    #[test]
+    fn sequence_block_is_reserved_before_delivery_and_shared_by_events() {
+        let store = Arc::new(RecordingSequenceStore::default());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let store = Arc::clone(&store);
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                assert_eq!(
+                    store.reservations.lock().unwrap().as_slice(),
+                    [EVENT_SEQUENCE_RESERVATION_SIZE]
+                );
+                observed.lock().unwrap().push(event.seq);
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
+        let mut events =
+            EventFactory::with_sequence_store("reserved".to_string(), 0, sequence_store);
+        let mut sink = EventSink::new(io::sink(), OutputFormat::Jsonl).with_observer(observer);
+
+        sink.emit(events.error("first")).unwrap();
+        sink.emit(events.error("second")).unwrap();
+
+        assert_eq!(observed.lock().unwrap().as_slice(), [0, 1]);
+        assert_eq!(
+            store.reservations.lock().unwrap().as_slice(),
+            [EVENT_SEQUENCE_RESERVATION_SIZE]
+        );
+    }
+
+    #[test]
+    fn crossing_sequence_block_reserves_before_first_event_in_next_block() {
+        let store = Arc::new(RecordingSequenceStore::default());
+        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
+        let mut events =
+            EventFactory::with_sequence_store("block-crossing".to_string(), 0, sequence_store);
+        let mut sink = EventSink::new(io::sink(), OutputFormat::Jsonl);
+
+        for index in 0..=EVENT_SEQUENCE_RESERVATION_SIZE {
+            sink.emit(events.error(&format!("event {index}"))).unwrap();
+        }
+
+        assert_eq!(
+            store.reservations.lock().unwrap().as_slice(),
+            [
+                EVENT_SEQUENCE_RESERVATION_SIZE,
+                EVENT_SEQUENCE_RESERVATION_SIZE * 2,
+            ]
+        );
+    }
+
+    #[test]
+    fn resumed_factory_starts_after_prior_exclusive_reservation() {
+        let store = Arc::new(RecordingSequenceStore::default());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                observed.lock().unwrap().push(event.seq);
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
+        let mut events = EventFactory::with_sequence_store(
+            "resumed".to_string(),
+            EVENT_SEQUENCE_RESERVATION_SIZE,
+            sequence_store,
+        );
+
+        EventSink::new(io::sink(), OutputFormat::Jsonl)
+            .with_observer(observer)
+            .emit(events.error("after resume"))
+            .unwrap();
+
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            [EVENT_SEQUENCE_RESERVATION_SIZE]
+        );
+        assert_eq!(
+            store.reservations.lock().unwrap().as_slice(),
+            [EVENT_SEQUENCE_RESERVATION_SIZE * 2]
+        );
+    }
+
+    #[test]
+    fn reservation_failure_prevents_delivery_without_consuming_sequence() {
+        let store = Arc::new(RecordingSequenceStore::default());
+        store.fail.store(true, Ordering::SeqCst);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                observed.lock().unwrap().push(event.seq);
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let sequence_store: Arc<dyn EventSequenceStore> = store.clone();
+        let mut events =
+            EventFactory::with_sequence_store("reservation-error".to_string(), 0, sequence_store);
+        let mut sink =
+            EventSink::new(Vec::new(), OutputFormat::Jsonl).with_observer(Arc::clone(&observer));
+
+        let error = sink.emit(events.error("not delivered")).unwrap_err();
+        assert!(error.to_string().contains("sequence reservation failed"));
+        assert!(observed.lock().unwrap().is_empty());
+        assert!(sink.writer_mut().is_empty());
+
+        store.fail.store(false, Ordering::SeqCst);
+        sink.emit(events.error("delivered after retry")).unwrap();
+        assert_eq!(observed.lock().unwrap().as_slice(), [0]);
     }
 }

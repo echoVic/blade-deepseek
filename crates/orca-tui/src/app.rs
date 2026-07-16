@@ -1384,6 +1384,7 @@ mod tests {
             plan: None,
             completion_status: None,
             completion_error: None,
+            next_event_seq: 0,
             path: std::path::PathBuf::from("/tmp/resumed-goal.jsonl"),
         }
     }
