@@ -40,6 +40,8 @@ body:
         - label: subagents/workflows
         - label: history/persistence
         - label: other
+    validations:
+      required: true
   - type: textarea
     id: compatibility
     attributes:
