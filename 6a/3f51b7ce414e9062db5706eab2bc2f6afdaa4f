@@ -1,0 +1,21 @@
+.github/ISSUE_TEMPLATE/bug_report.yml
+  s_d2249ecad3ecca::t_68a59bda3236e3 25-26,32-33,43-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6a3f51b7ce414e9062db5706eab2bc2f6afdaa4f",
+  "prompts": {},
+  "sessions": {
+    "s_d2249ecad3ecca": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a38-b204-7c30-b5bf-6fc5b66cb384",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
