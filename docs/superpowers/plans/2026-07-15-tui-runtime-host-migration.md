@@ -1,6 +1,6 @@
 # P0.3e TUI Runtime Host Migration Plan
 
-- Status: P0.3e1 through P0.3e4c complete; feature integration pending
+- Status: P0.3e1 through P0.3e4c complete; integrated into main for v0.2.30
 - Date: 2026-07-15
 - Base: `35c6361c1cbb49e557f8738b6b1feef88af1b9d8` (latest `origin/main` at P0.3e4c validation)
 - Branch: `codex/tui-runtime-host-migration`
@@ -917,9 +917,13 @@ P0.3e4c implementation checkpoint:
   returned `ORCA_TUI_AFTER_RUNTIME_HOST_INTERRUPT_OK`. Both runs restored the
   cursor, keyboard mode, bracketed paste, mouse modes, and alternate screen
   through the normal consecutive double-`Ctrl-C` exit path.
-- A final fetch confirmed `origin/main` remained `35c6361c1`; the feature branch
-  is linearly based on current main. P0.3e4c has passed its deletion and
-  validation gates and is ready for commit and main-worktree integration.
+- A final feature-worktree fetch confirmed `origin/main` remained `35c6361c1`.
+  The feature branch was then rebased over the clean local-main Goal-notice
+  commit `28fb80987`, reran TUI 389/389, the serial workspace gate, Clippy, and
+  the real DeepSeek harness, and fast-forwarded main. Main release validation
+  repeated the locked/offline workspace and Clippy gates, site/SEO and release
+  helpers, the complete real DeepSeek harness, and an `orca 0.2.30` production
+  PTY run returning `ORCA_TUI_V030_OK` with normal terminal restoration.
 
 ## Slice Acceptance Criteria
 

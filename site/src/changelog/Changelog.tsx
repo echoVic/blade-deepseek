@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.30":
+        "The production TUI now runs foreground turns, interrupted streams, approvals, user input, MCP elicitation, background providers, and saved workflows through one process-owned RuntimeHost. RuntimeHost owns cancellation, joins, terminal events, usage commits, and shutdown cleanup; the duplicate TUI provider/tool/workflow loops and TaskSupervisor are removed. A cancelled live DeepSeek stream releases the foreground operation and the next submit starts cleanly, while repeated idle Goal refreshes no longer duplicate the same notice.",
       "v0.2.29":
         "Runtime now has a process-owned RuntimeHost and one bounded ThreadActor per conversation, with typed operation handles and completion terminals so headless and TUI turns share one ownership boundary. Structured @ mention bindings now resolve exact files, skills, plugins, and MCP resources, recover rejected submissions, and keep mention search and history isolated from user data. TUI selection, clipboard, input history, status formatting, and submission hints are also refined.",
       "v0.2.28":
@@ -512,6 +514,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.30":
+        "生产 TUI 现在通过同一个进程级 RuntimeHost 执行前台 turn、流式中断、审批、用户输入、MCP elicitation、后台 provider 与已保存 workflow。RuntimeHost 统一拥有取消、join、终态事件、usage 提交和 shutdown 清理；重复的 TUI provider/tool/workflow loop 与 TaskSupervisor 已删除。真实 DeepSeek 长流被取消后会释放前台 operation，下一次提交可以干净启动；空闲状态下重复的 Goal 刷新也不会重复显示同一条通知。",
       "v0.2.29":
         "Runtime 现在提供进程级 RuntimeHost，并为每个会话使用一个有界 ThreadActor，通过类型化 operation handle 与 completion terminal 统一 headless 和 TUI turn 的所有权边界。结构化 @ mention binding 现在可以解析文件、skill、plugin 和 MCP resource，恢复被拒绝的提交，并让 mention search 与输入历史和用户数据隔离。TUI 的选择、剪贴板、输入历史、状态栏格式和提交提示也得到优化。",
       "v0.2.28":

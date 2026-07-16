@@ -3,8 +3,16 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-15
-Current baseline: v0.2.29 extends the runtime ownership model into the
+Last updated: 2026-07-16
+Current baseline: v0.2.30 completes the production TUI migration onto the
+process-owned `RuntimeHost`. Foreground turns, DeepSeek stream interruption,
+interactive waits, background providers, and saved workflows now share the
+canonical runtime turn and host-owned cancellation/join boundary. The duplicate
+TUI provider/tool/workflow/subagent loops, local operation cancellation owner,
+and `TuiTaskSupervisor` are deleted. RuntimeHost is the single owner of active
+and background operation terminals, usage commits, and shutdown cleanup. Idle
+Goal refreshes also collapse duplicate status notices.
+Earlier v0.2.29 extends the runtime ownership model into the
 process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
 operation handles and completion terminals now give headless and TUI turns one
 explicit lifecycle boundary. The same release finalizes structured `@` mention
@@ -126,6 +134,38 @@ P0.3e1 verification passed with core 143/143, runtime 769/769, and TUI 506/506
 tests; the serial workspace all-targets gate; workspace Clippy with only
 pre-existing warnings; the release real-API smoke; and the full DeepSeek
 provider/CLI/history/server control, metadata, search, and pagination harness.
+
+P0.3e2 replaces borrowed TUI interaction handlers with an owned broker and
+typed dispatcher. Approval, permission, user-input, and MCP responses are
+fenced by operation id, request id, and interaction kind. Interrupt and
+shutdown wake every waiter, late responses cannot reach a reused id, and the
+bounded ordinary-command mailbox cannot block interaction control or runtime
+teardown.
+
+P0.3e3 moves production TUI session ownership into one `RuntimeHost` and one
+actor-owned `RuntimeThread`. The UI keeps typed thread and operation handles,
+while interrupt and terminal projection follow the addressed `OperationId` and
+joined `OperationCompletion`. The local `OperationCancellation`, compatibility
+session owner, dual hosted/local controller paths, and source-shape ownership
+tests are deleted.
+
+P0.3e4 makes `ThreadTurnExecutor` the only provider/tool/compaction/hook turn
+kernel for TUI, server, and headless use. Provider suspension and background
+workflow batches have typed outcomes; RuntimeHost admits, cancels, joins, and
+settles background providers and workflows. Saved `/workflow` commands submit
+typed `HostedWorkflowRequest` values. The old TUI agent runner, provider/tool/
+workflow/subagent execution modules, task supervisor, detached workflow
+watcher, and their source-shape tests are deleted. Runtime lifecycle operation
+ids are also distinct from persisted turn ids and `TaskRegistry` task ids, with
+a bounded server regression test covering the ownership boundary.
+
+P0.3e final validation passes runtime-host 39/39, TUI 389/389, runtime 769/769,
+the complete serial workspace all-targets gate, workspace Clippy with the
+existing non-deny baseline, site and release-helper gates, the real DeepSeek
+provider/CLI/history/server harness, and production PTY runs for streamed
+output, interruption, next-submit recovery, usage/context projection, and
+terminal restoration. P0.3e is now a releasable TUI reliability feature rather
+than an unreleased compatibility stage.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
