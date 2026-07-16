@@ -632,7 +632,7 @@ impl ToolExecutionActor {
             if emit_deltas {
                 retain_first_io_error(
                     &mut event_error,
-                    sink.emit(&events.approval_requested(&approval)),
+                    sink.emit(events.approval_requested(&approval)),
                 );
             }
 
@@ -641,7 +641,7 @@ impl ToolExecutionActor {
                     if emit_deltas {
                         retain_first_io_error(
                             &mut event_error,
-                            sink.emit(&events.approval_resolved(&resolution)),
+                            sink.emit(events.approval_resolved(&resolution)),
                         );
                     }
                     if event_error.is_some() {
@@ -711,7 +711,7 @@ impl ToolExecutionActor {
                     if emit_deltas {
                         retain_first_io_error(
                             &mut event_error,
-                            sink.emit(&events.approval_resolved(&final_resolution)),
+                            sink.emit(events.approval_resolved(&final_resolution)),
                         );
                     }
                     match final_resolution.decision {
@@ -757,7 +757,7 @@ impl ToolExecutionActor {
                     if emit_deltas {
                         retain_first_io_error(
                             &mut event_error,
-                            sink.emit(&events.approval_resolved(&resolution)),
+                            sink.emit(events.approval_resolved(&resolution)),
                         );
                     }
                     return finish_approval_gate_terminal(
@@ -861,18 +861,18 @@ impl ToolExecutionActor {
                 match orca_tools::update_plan::parse_args(execution_request) {
                     Ok(update) => retain_first_io_error(
                         &mut event_error,
-                        sink.emit(&events.plan_updated(&update)),
+                        sink.emit(events.plan_updated(&update)),
                     ),
                     Err(error) => retain_first_io_error(
                         &mut event_error,
-                        sink.emit(&events.error(&format!("failed to render plan update: {error}"))),
+                        sink.emit(events.error(&format!("failed to render plan update: {error}"))),
                     ),
                 }
             }
             if let Some(warning) =
                 self.run_post_tool_hook(hooks, cwd_display, execution_request, result, cancel)
             {
-                retain_first_io_error(&mut event_error, sink.emit(&events.error(&warning)));
+                retain_first_io_error(&mut event_error, sink.emit(events.error(&warning)));
             }
         }
 
@@ -964,7 +964,7 @@ fn emit_tool_call_requested(
     request: &tool_types::ToolRequest,
 ) -> io::Result<()> {
     let event = RuntimeTaskActor::tool_call_requested_event_for(events, request);
-    sink.emit(&event)
+    sink.emit(event)
 }
 
 fn emit_tool_call_completed(
@@ -974,7 +974,7 @@ fn emit_tool_call_completed(
     result: &tool_types::ToolResult,
 ) -> io::Result<()> {
     let event = RuntimeTaskActor::tool_call_completed_event_for(events, request, result);
-    sink.emit(&event)
+    sink.emit(event)
 }
 
 #[cfg(test)]

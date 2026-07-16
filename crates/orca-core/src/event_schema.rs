@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,51 @@ pub struct EventEnvelope {
     #[serde(rename = "type")]
     pub event_type: EventType,
     pub payload: Value,
+}
+
+#[derive(Debug)]
+pub struct EventDraft {
+    pub run_id: String,
+    pub event_type: EventType,
+    pub payload: Value,
+    publication: Arc<EventPublication>,
+}
+
+#[derive(Debug, Default)]
+struct EventPublication {
+    next_seq: Mutex<u64>,
+}
+
+struct EventPublicationGuard<'a> {
+    next_seq: MutexGuard<'a, u64>,
+}
+
+impl Drop for EventPublicationGuard<'_> {
+    fn drop(&mut self) {
+        *self.next_seq = self.next_seq.saturating_add(1);
+    }
+}
+
+impl EventDraft {
+    pub(crate) fn publish<R>(self, publish: impl FnOnce(&EventEnvelope) -> R) -> R {
+        let next_seq = self
+            .publication
+            .next_seq
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let event = EventEnvelope {
+            version: EVENT_SCHEMA_VERSION,
+            run_id: self.run_id,
+            seq: *next_seq,
+            timestamp_ms: timestamp_ms(),
+            event_type: self.event_type,
+            payload: self.payload,
+        };
+        let publication = EventPublicationGuard { next_seq };
+        let result = publish(&event);
+        drop(publication);
+        result
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -166,14 +211,14 @@ impl RunStatus {
 
 pub struct EventFactory {
     run_id: String,
-    next_seq: Arc<AtomicU64>,
+    publication: Arc<EventPublication>,
 }
 
 impl EventFactory {
     pub fn new(run_id: String) -> Self {
         Self {
             run_id,
-            next_seq: Arc::new(AtomicU64::new(0)),
+            publication: Arc::new(EventPublication::default()),
         }
     }
 
@@ -185,7 +230,7 @@ impl EventFactory {
     pub fn fork(&self) -> Self {
         Self {
             run_id: self.run_id.clone(),
-            next_seq: Arc::clone(&self.next_seq),
+            publication: Arc::clone(&self.publication),
         }
     }
 
@@ -195,7 +240,7 @@ impl EventFactory {
         approval_mode: &str,
         provider: &str,
         verifier: Option<&str>,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::SessionStarted,
             json!({
@@ -207,7 +252,7 @@ impl EventFactory {
         )
     }
 
-    pub fn turn_started(&mut self, turn: u32, prompt: Option<&str>) -> EventEnvelope {
+    pub fn turn_started(&mut self, turn: u32, prompt: Option<&str>) -> EventDraft {
         let mut payload = json!({ "turn": turn });
         if let Some(p) = prompt {
             payload["prompt"] = json!(p);
@@ -215,7 +260,7 @@ impl EventFactory {
         self.make(EventType::TurnStarted, payload)
     }
 
-    pub fn assistant_reasoning_delta(&mut self, text: &str) -> EventEnvelope {
+    pub fn assistant_reasoning_delta(&mut self, text: &str) -> EventDraft {
         self.make(
             EventType::AssistantReasoningDelta,
             json!({
@@ -224,7 +269,7 @@ impl EventFactory {
         )
     }
 
-    pub fn assistant_message_delta(&mut self, text: &str) -> EventEnvelope {
+    pub fn assistant_message_delta(&mut self, text: &str) -> EventDraft {
         self.make(
             EventType::AssistantMessageDelta,
             json!({
@@ -233,7 +278,7 @@ impl EventFactory {
         )
     }
 
-    pub fn provider_replay_updated(&mut self, replay: &ProviderReplayState) -> EventEnvelope {
+    pub fn provider_replay_updated(&mut self, replay: &ProviderReplayState) -> EventDraft {
         self.make(
             EventType::ProviderReplayUpdated,
             json!({
@@ -244,7 +289,7 @@ impl EventFactory {
         )
     }
 
-    pub fn usage_updated(&mut self, usage: UsageTotals) -> EventEnvelope {
+    pub fn usage_updated(&mut self, usage: UsageTotals) -> EventDraft {
         self.make(
             EventType::UsageUpdated,
             json!({
@@ -257,7 +302,7 @@ impl EventFactory {
         )
     }
 
-    pub fn context_updated(&mut self, used_tokens: usize, limit_tokens: usize) -> EventEnvelope {
+    pub fn context_updated(&mut self, used_tokens: usize, limit_tokens: usize) -> EventDraft {
         self.make(
             EventType::ContextUpdated,
             json!({
@@ -271,7 +316,7 @@ impl EventFactory {
         &mut self,
         reason: &str,
         before_messages: usize,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make_serialized(
             EventType::ContextCompactionStarted,
             ContextCompactionStartedPayload {
@@ -289,7 +334,7 @@ impl EventFactory {
         after_messages: usize,
         collapsed_messages: usize,
         status_text: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make_serialized(
             EventType::ContextCompacted,
             ContextCompactedPayload {
@@ -303,7 +348,7 @@ impl EventFactory {
         )
     }
 
-    pub fn model_routed(&mut self, decision: &ModelRouteDecision) -> EventEnvelope {
+    pub fn model_routed(&mut self, decision: &ModelRouteDecision) -> EventDraft {
         self.make(
             EventType::ModelRouted,
             json!({
@@ -314,7 +359,7 @@ impl EventFactory {
         )
     }
 
-    pub fn approval_requested(&mut self, request: &ApprovalRequest) -> EventEnvelope {
+    pub fn approval_requested(&mut self, request: &ApprovalRequest) -> EventDraft {
         self.make(
             EventType::ApprovalRequested,
             json!({
@@ -328,7 +373,7 @@ impl EventFactory {
         )
     }
 
-    pub fn approval_resolved(&mut self, resolution: &ApprovalResolution) -> EventEnvelope {
+    pub fn approval_resolved(&mut self, resolution: &ApprovalResolution) -> EventDraft {
         self.make(
             EventType::ApprovalResolved,
             json!({
@@ -339,7 +384,7 @@ impl EventFactory {
         )
     }
 
-    pub fn tool_call_progress(&mut self, progress: &ToolCallProgress) -> EventEnvelope {
+    pub fn tool_call_progress(&mut self, progress: &ToolCallProgress) -> EventDraft {
         self.make(
             EventType::ToolCallProgress,
             json!({
@@ -350,7 +395,7 @@ impl EventFactory {
         )
     }
 
-    pub fn tool_output_delta(&mut self, id: &str, chunk: &str) -> EventEnvelope {
+    pub fn tool_output_delta(&mut self, id: &str, chunk: &str) -> EventDraft {
         self.make(
             EventType::ToolOutputDelta,
             json!({
@@ -360,7 +405,7 @@ impl EventFactory {
         )
     }
 
-    pub fn tool_call_requested(&mut self, request: &ToolRequest) -> EventEnvelope {
+    pub fn tool_call_requested(&mut self, request: &ToolRequest) -> EventDraft {
         self.make(
             EventType::ToolCallRequested,
             json!({
@@ -373,7 +418,7 @@ impl EventFactory {
         )
     }
 
-    pub fn tool_call_completed(&mut self, result: &ToolResult) -> EventEnvelope {
+    pub fn tool_call_completed(&mut self, result: &ToolResult) -> EventDraft {
         let mut payload = json!({
             "id": result.id,
             "name": result.name,
@@ -401,11 +446,11 @@ impl EventFactory {
         self.make(EventType::ToolCallCompleted, payload)
     }
 
-    pub fn plan_updated(&mut self, update: &UpdatePlanArgs) -> EventEnvelope {
+    pub fn plan_updated(&mut self, update: &UpdatePlanArgs) -> EventDraft {
         self.make(EventType::PlanUpdated, json!(update))
     }
 
-    pub fn subagent_started(&mut self, id: &str, description: &str) -> EventEnvelope {
+    pub fn subagent_started(&mut self, id: &str, description: &str) -> EventDraft {
         self.make(
             EventType::SubagentStarted,
             json!({
@@ -422,7 +467,7 @@ impl EventFactory {
         activity: &str,
         turn: Option<u32>,
         usage: Option<UsageTotals>,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::SubagentProgress,
             json!({
@@ -448,7 +493,7 @@ impl EventFactory {
         status: RunStatus,
         output: Option<&str>,
         error: Option<&str>,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::SubagentCompleted,
             json!({
@@ -467,7 +512,7 @@ impl EventFactory {
         run_id: &str,
         workflow_name: &str,
         phases: &[String],
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowStarted,
             json!({
@@ -484,7 +529,7 @@ impl EventFactory {
         task_id: &str,
         run_id: &str,
         workflow_name: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowResumed,
             json!({
@@ -500,7 +545,7 @@ impl EventFactory {
         task_id: &str,
         run_id: &str,
         phase: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowPhaseStarted,
             json!({
@@ -518,7 +563,7 @@ impl EventFactory {
         phase: &str,
         status: RunStatus,
         summary: Option<&str>,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowPhaseCompleted,
             json!({
@@ -537,7 +582,7 @@ impl EventFactory {
         run_id: &str,
         phase: &str,
         agent_id: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowAgentStarted,
             json!({
@@ -556,7 +601,7 @@ impl EventFactory {
         phase: &str,
         agent_id: &str,
         output: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowAgentCached,
             json!({
@@ -576,7 +621,7 @@ impl EventFactory {
         phase: &str,
         agent_id: &str,
         output: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowAgentCompleted,
             json!({
@@ -596,7 +641,7 @@ impl EventFactory {
         phase: &str,
         agent_id: &str,
         error: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowAgentFailed,
             json!({
@@ -615,7 +660,7 @@ impl EventFactory {
         run_id: &str,
         workflow_name: &str,
         reason: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowPaused,
             json!({
@@ -633,7 +678,7 @@ impl EventFactory {
         run_id: &str,
         workflow_name: &str,
         reason: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowStopped,
             json!({
@@ -650,7 +695,7 @@ impl EventFactory {
         task_id: &str,
         run_id: &str,
         workflow_name: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowCompleted,
             json!({
@@ -669,7 +714,7 @@ impl EventFactory {
         tool_use_id: Option<&str>,
         status: &str,
         result: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowResultAvailable,
             json!({
@@ -690,7 +735,7 @@ impl EventFactory {
         workflow_name: &str,
         tool_use_id: Option<&str>,
         error: &str,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         self.make(
             EventType::WorkflowFailed,
             json!({
@@ -704,7 +749,7 @@ impl EventFactory {
         )
     }
 
-    pub fn workflow_tasks_updated(&mut self, tasks: &[BackgroundTaskSummary]) -> EventEnvelope {
+    pub fn workflow_tasks_updated(&mut self, tasks: &[BackgroundTaskSummary]) -> EventDraft {
         self.make(
             EventType::WorkflowTasksUpdated,
             json!({
@@ -713,7 +758,7 @@ impl EventFactory {
         )
     }
 
-    pub fn task_status_updated(&mut self, task: &BackgroundTaskSummary) -> EventEnvelope {
+    pub fn task_status_updated(&mut self, task: &BackgroundTaskSummary) -> EventDraft {
         self.make(
             EventType::TaskStatusUpdated,
             json!({
@@ -722,7 +767,7 @@ impl EventFactory {
         )
     }
 
-    pub fn verification_started(&mut self, command: &str) -> EventEnvelope {
+    pub fn verification_started(&mut self, command: &str) -> EventDraft {
         self.make(
             EventType::VerificationStarted,
             json!({
@@ -731,7 +776,7 @@ impl EventFactory {
         )
     }
 
-    pub fn verification_completed(&mut self, result: &VerificationResult) -> EventEnvelope {
+    pub fn verification_completed(&mut self, result: &VerificationResult) -> EventDraft {
         self.make(
             EventType::VerificationCompleted,
             json!({
@@ -744,7 +789,7 @@ impl EventFactory {
         )
     }
 
-    pub fn error(&mut self, message: &str) -> EventEnvelope {
+    pub fn error(&mut self, message: &str) -> EventDraft {
         self.make(
             EventType::Error,
             json!({
@@ -753,7 +798,7 @@ impl EventFactory {
         )
     }
 
-    pub fn session_completed(&mut self, status: RunStatus) -> EventEnvelope {
+    pub fn session_completed(&mut self, status: RunStatus) -> EventDraft {
         self.make(
             EventType::SessionCompleted,
             json!({
@@ -762,18 +807,16 @@ impl EventFactory {
         )
     }
 
-    fn make(&mut self, event_type: EventType, payload: Value) -> EventEnvelope {
-        EventEnvelope {
-            version: EVENT_SCHEMA_VERSION,
+    fn make(&mut self, event_type: EventType, payload: Value) -> EventDraft {
+        EventDraft {
             run_id: self.run_id.clone(),
-            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
-            timestamp_ms: timestamp_ms(),
             event_type,
             payload,
+            publication: Arc::clone(&self.publication),
         }
     }
 
-    fn make_serialized(&mut self, event_type: EventType, payload: impl Serialize) -> EventEnvelope {
+    fn make_serialized(&mut self, event_type: EventType, payload: impl Serialize) -> EventDraft {
         self.make(
             event_type,
             serde_json::to_value(payload).expect("runtime event payload serializes"),
@@ -791,18 +834,36 @@ fn timestamp_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OutputFormat;
+    use crate::event_sink::{EventObserver, EventSink};
     use crate::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
     use crate::tool_types::{ToolName, ToolRequest};
+
+    fn publish(drafts: impl IntoIterator<Item = EventDraft>) -> Vec<EventEnvelope> {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                observed.lock().unwrap().push(event.clone());
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let mut sink = EventSink::new(std::io::sink(), OutputFormat::Jsonl).with_observer(observer);
+        for draft in drafts {
+            sink.emit(draft).unwrap();
+        }
+        drop(sink);
+        Arc::try_unwrap(observed).unwrap().into_inner().unwrap()
+    }
 
     #[test]
     fn factory_increments_seq() {
         let mut f = EventFactory::new("run-1".to_string());
-        let e0 = f.error("a");
-        let e1 = f.error("b");
-        let e2 = f.error("c");
-        assert_eq!(e0.seq, 0);
-        assert_eq!(e1.seq, 1);
-        assert_eq!(e2.seq, 2);
+        let events = publish([f.error("a"), f.error("b"), f.error("c")]);
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
     }
 
     #[test]
@@ -846,19 +907,19 @@ mod tests {
         let cancelled = ToolResult::cancelled(&request, "turn interrupted", Some(130));
         let mut events = EventFactory::new("run-1".to_string());
 
-        let value = serde_json::to_value(events.tool_call_completed(&cancelled)).unwrap();
+        let value = events.tool_call_completed(&cancelled).payload;
 
-        assert_eq!(value["payload"]["status"], "cancelled");
-        assert_eq!(value["payload"]["kind"], "cancelled");
-        assert!(value["payload"].get("terminal_source").is_none());
-        assert_eq!(value["payload"]["error"], "turn interrupted");
-        assert_eq!(value["payload"]["exit_code"], 130);
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["kind"], "cancelled");
+        assert!(value.get("terminal_source").is_none());
+        assert_eq!(value["error"], "turn interrupted");
+        assert_eq!(value["exit_code"], 130);
 
         let repaired = ToolResult::indeterminate(&request, "missing terminal result")
             .with_terminal_source(ToolTerminalSource::CompatibilityRepair);
-        let value = serde_json::to_value(events.tool_call_completed(&repaired)).unwrap();
-        assert_eq!(value["payload"]["status"], "indeterminate");
-        assert_eq!(value["payload"]["terminal_source"], "compatibility_repair");
+        let value = events.tool_call_completed(&repaired).payload;
+        assert_eq!(value["status"], "indeterminate");
+        assert_eq!(value["terminal_source"], "compatibility_repair");
     }
 
     #[test]
@@ -1196,8 +1257,11 @@ mod tests {
     #[test]
     fn event_envelope_serializes_to_valid_json() {
         let mut f = EventFactory::new("run-1".to_string());
-        let e = f.assistant_message_delta("test text");
-        let json = serde_json::to_string(&e).unwrap();
+        let mut output = Vec::new();
+        EventSink::new(&mut output, OutputFormat::Jsonl)
+            .emit(f.assistant_message_delta("test text"))
+            .unwrap();
+        let json = String::from_utf8(output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "assistant.message.delta");
         assert_eq!(parsed["payload"]["text"], "test text");
@@ -1210,12 +1274,17 @@ mod tests {
         let mut foreground = EventFactory::new("thread-1".to_string());
         let mut background = foreground.fork();
 
-        let first = foreground.error("foreground");
-        let second = background.error("background");
-        let third = foreground.error("foreground again");
+        let events = publish([
+            foreground.error("foreground"),
+            background.error("background"),
+            foreground.error("foreground again"),
+        ]);
 
-        assert_eq!([first.seq, second.seq, third.seq], [0, 1, 2]);
-        assert_eq!(first.run_id, second.run_id);
-        assert_eq!(second.run_id, third.run_id);
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(events[0].run_id, events[1].run_id);
+        assert_eq!(events[1].run_id, events[2].run_id);
     }
 }

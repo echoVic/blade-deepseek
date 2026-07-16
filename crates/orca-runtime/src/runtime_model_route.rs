@@ -51,7 +51,7 @@ impl RuntimeModelRouteStep {
         if emit_deltas {
             input
                 .sink
-                .emit(&input.events.model_routed(&routed_model.decision))?;
+                .emit(input.events.model_routed(&routed_model.decision))?;
         }
         Ok(routed_model)
     }

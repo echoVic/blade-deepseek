@@ -96,7 +96,7 @@ fn emit_workflow_completed<W: io::Write>(
     let completed_task = task.with_status(RuntimeTaskStatus::Succeeded);
     let completed_event =
         completed_task.attach_to_event(events.workflow_completed(task_id, run_id, workflow_name));
-    sink.emit(&completed_event)?;
+    sink.emit(completed_event)?;
     let result_event = completed_task.attach_to_event(events.workflow_result_available(
         task_id,
         run_id,
@@ -105,7 +105,7 @@ fn emit_workflow_completed<W: io::Write>(
         "completed",
         status_line,
     ));
-    sink.emit(&result_event)
+    sink.emit(result_event)
 }
 
 fn emit_workflow_failed<W: io::Write>(
@@ -125,7 +125,7 @@ fn emit_workflow_failed<W: io::Write>(
         None,
         error,
     ));
-    sink.emit(&event)
+    sink.emit(event)
 }
 
 fn completed_workflow_result(
@@ -182,7 +182,7 @@ pub(crate) fn execute_workflow_tool(
             &launch.workflow_name,
             &launch.phases,
         ));
-        sink.emit(&event)?;
+        sink.emit(event)?;
     }
 
     match wait_for_workflow_startup(launch) {
@@ -284,7 +284,7 @@ pub(crate) fn execute_workflow_draft_action_tool(
                     &launch.workflow_name,
                     &launch.phases,
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             match wait_for_workflow_startup(launch) {
                 WorkflowStartupStatus::StillRunning(launch) => {

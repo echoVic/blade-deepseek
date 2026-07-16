@@ -90,7 +90,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         if emit_deltas {
             retain_first_event_error(
                 &mut event_error,
-                sink.emit(&events.tool_call_requested(tool_request)),
+                sink.emit(events.tool_call_requested(tool_request)),
             );
         }
         if cancel.is_cancelled() {
@@ -165,7 +165,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         if emit_deltas {
             retain_first_event_error(
                 &mut event_error,
-                sink.emit(&events.tool_call_completed(result)),
+                sink.emit(events.tool_call_completed(result)),
             );
             if let Err(error) = hooks.run(
                 HookEvent::PostToolUse,
@@ -181,7 +181,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
             ) {
                 retain_first_event_error(
                     &mut event_error,
-                    sink.emit(&events.error(&format!("post_tool_use hook failed: {error}"))),
+                    sink.emit(events.error(&format!("post_tool_use hook failed: {error}"))),
                 );
             }
         }

@@ -71,7 +71,7 @@ impl RuntimeTurnOpeningStep {
                 input.provider_config,
             );
             input.sink.emit(
-                &input
+                input
                     .events
                     .context_updated(pressure.wire_tokens, pressure.soft_limit),
             )?;

@@ -280,7 +280,7 @@ impl RuntimeProviderTurnResultStep {
             }
             RuntimeProviderTurnOutput::Terminal(error) => {
                 if emit_deltas && error.status != RunStatus::Cancelled {
-                    sink.emit(&events.error(&error.message))?;
+                    sink.emit(events.error(&error.message))?;
                 }
                 Ok(RuntimeProviderTurnResultOutcome::Failed(error))
             }
@@ -403,7 +403,7 @@ impl RuntimeProviderTurnStep {
                 }
             };
             if emit_deltas {
-                sink.emit(&events.usage_updated(totals))?;
+                sink.emit(events.usage_updated(totals))?;
                 if let Some(writer) = history_writer.as_deref_mut() {
                     writer.append_usage(totals)?;
                 }
@@ -424,7 +424,7 @@ impl RuntimeProviderTurnStep {
             Some(input.cancel),
         ) && emit_deltas
         {
-            sink.emit(&events.error(&warning))?;
+            sink.emit(events.error(&warning))?;
         }
         if input.cancel.is_cancelled() {
             return cancelled_provider_turn(emit_deltas, events, sink);
@@ -737,16 +737,16 @@ fn emit_provider_delta<W: io::Write>(
     }
     match step {
         ProviderStep::ReasoningDelta(text) => {
-            let _ = sink.emit(&events.assistant_reasoning_delta(text));
+            let _ = sink.emit(events.assistant_reasoning_delta(text));
         }
         ProviderStep::MessageDelta(text) => {
-            let _ = sink.emit(&events.assistant_message_delta(text));
+            let _ = sink.emit(events.assistant_message_delta(text));
         }
         ProviderStep::ToolCallProgress(progress) => {
-            let _ = sink.emit(&events.tool_call_progress(progress));
+            let _ = sink.emit(events.tool_call_progress(progress));
         }
         ProviderStep::ReplayState(replay) => {
-            let _ = sink.emit(&events.provider_replay_updated(replay));
+            let _ = sink.emit(events.provider_replay_updated(replay));
         }
         _ => {}
     }

@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use crate::config::OutputFormat;
-use crate::event_schema::{EventEnvelope, EventType};
+use crate::event_schema::{EventDraft, EventEnvelope, EventType};
 
 pub trait EventObserver: Send + Sync {
     fn observe(&self, event: &EventEnvelope) -> io::Result<()>;
@@ -46,19 +46,21 @@ impl<W: Write> EventSink<W> {
         &mut self.writer
     }
 
-    pub fn emit(&mut self, event: &EventEnvelope) -> io::Result<()> {
-        if let Some(observer) = &self.observer {
-            observer.observe(event)?;
-        }
-        match self.format {
-            OutputFormat::Jsonl => {
-                serde_json::to_writer(&mut self.writer, event)?;
-                writeln!(self.writer)?;
+    pub fn emit(&mut self, event: EventDraft) -> io::Result<()> {
+        event.publish(|event| {
+            if let Some(observer) = &self.observer {
+                observer.observe(event)?;
             }
-            OutputFormat::Text => self.emit_text(event)?,
-        }
+            match self.format {
+                OutputFormat::Jsonl => {
+                    serde_json::to_writer(&mut self.writer, event)?;
+                    writeln!(self.writer)?;
+                }
+                OutputFormat::Text => self.emit_text(event)?,
+            }
 
-        self.writer.flush()
+            self.writer.flush()
+        })
     }
 
     fn emit_text(&mut self, event: &EventEnvelope) -> io::Result<()> {
@@ -204,10 +206,18 @@ impl<W: Write> EventSink<W> {
     }
 }
 
+pub fn observe_event(observer: Option<&dyn EventObserver>, event: EventDraft) -> io::Result<()> {
+    let Some(observer) = observer else {
+        return Ok(());
+    };
+    event.publish(|event| observer.observe(event))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event_schema::EventFactory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -216,8 +226,8 @@ mod tests {
         let mut sink = EventSink::new(&mut buf, OutputFormat::Jsonl);
         let mut f = EventFactory::new("run-1".to_string());
 
-        sink.emit(&f.error("test error")).unwrap();
-        sink.emit(&f.assistant_message_delta("hello")).unwrap();
+        sink.emit(f.error("test error")).unwrap();
+        sink.emit(f.assistant_message_delta("hello")).unwrap();
 
         let output = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = output.lines().collect();
@@ -238,8 +248,8 @@ mod tests {
         let mut sink = EventSink::new(&mut buf, OutputFormat::Text);
         let mut f = EventFactory::new("run-1".to_string());
 
-        sink.emit(&f.error("something broke")).unwrap();
-        sink.emit(&f.assistant_message_delta("hi")).unwrap();
+        sink.emit(f.error("something broke")).unwrap();
+        sink.emit(f.assistant_message_delta("hi")).unwrap();
 
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("error: something broke"));
@@ -259,19 +269,22 @@ mod tests {
         ));
         let mut events = EventFactory::new("typed-observer".to_string());
         let event = events.assistant_message_delta("hello");
+        let expected_run_id = event.run_id.clone();
+        let expected_event_type = event.event_type;
+        let expected_payload = event.payload.clone();
 
-        sink.emit(&event).unwrap();
+        sink.emit(event).unwrap();
 
         let observed = observed.lock().unwrap();
         let observed = observed.first().expect("one observed event");
-        assert_eq!(observed.run_id, event.run_id);
-        assert_eq!(observed.seq, event.seq);
-        assert_eq!(observed.timestamp_ms, event.timestamp_ms);
-        assert_eq!(observed.event_type, event.event_type);
-        assert_eq!(observed.payload, event.payload);
+        assert_eq!(observed.run_id, expected_run_id);
+        assert_eq!(observed.seq, 0);
+        assert!(observed.timestamp_ms > 0);
+        assert_eq!(observed.event_type, expected_event_type);
+        assert_eq!(observed.payload, expected_payload);
         let serialized: serde_json::Value =
             serde_json::from_str(String::from_utf8(buf).unwrap().trim()).unwrap();
-        assert_eq!(serialized, serde_json::to_value(&event).unwrap());
+        assert_eq!(serialized, serde_json::to_value(observed).unwrap());
     }
 
     #[test]
@@ -281,8 +294,96 @@ mod tests {
         ));
         let mut events = EventFactory::new("typed-observer-error".to_string());
 
-        let error = sink.emit(&events.error("boom")).unwrap_err();
+        let error = sink.emit(events.error("boom")).unwrap_err();
 
         assert!(error.to_string().contains("observer rejected event"));
+    }
+
+    #[test]
+    fn observer_failure_consumes_its_sequence_before_cleanup_event() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let calls = Arc::clone(&calls);
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(io::Error::other("observer rejected event"));
+                }
+                observed.lock().unwrap().push(event.clone());
+                Ok(())
+            })
+        };
+        let mut events = EventFactory::new("observer-cleanup".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl).with_observer(observer);
+
+        assert!(sink.emit(events.error("failed delivery")).is_err());
+        sink.emit(events.error("cleanup delivery")).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].seq, 1);
+        assert_eq!(observed[0].payload["message"], "cleanup delivery");
+    }
+
+    #[test]
+    fn forked_factories_number_events_in_publication_order() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                observed.lock().unwrap().push(event.clone());
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let mut first_factory = EventFactory::new("ordered-publication".to_string());
+        let mut second_factory = first_factory.fork();
+        let first = first_factory.error("constructed first");
+        let second = second_factory.error("published first");
+
+        let second_observer = Arc::clone(&observer);
+        std::thread::spawn(move || {
+            let mut sink =
+                EventSink::new(io::sink(), OutputFormat::Jsonl).with_observer(second_observer);
+            sink.emit(second).unwrap();
+        })
+        .join()
+        .unwrap();
+        EventSink::new(io::sink(), OutputFormat::Jsonl)
+            .with_observer(observer)
+            .emit(first)
+            .unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(observed[0].payload["message"], "published first");
+        assert_eq!(observed[1].payload["message"], "constructed first");
+    }
+
+    #[test]
+    fn unpublished_draft_does_not_create_a_sequence_gap() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |event: &EventEnvelope| {
+                observed.lock().unwrap().push(event.clone());
+                Ok(())
+            }) as Arc<dyn EventObserver>
+        };
+        let mut events = EventFactory::new("draft-gap".to_string());
+        drop(events.error("not published"));
+
+        EventSink::new(io::sink(), OutputFormat::Jsonl)
+            .with_observer(observer)
+            .emit(events.error("published"))
+            .unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].seq, 0);
+        assert_eq!(observed[0].payload["message"], "published");
     }
 }

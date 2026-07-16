@@ -512,7 +512,7 @@ impl ThreadTurnMainSessionTask {
                     format!("main-session task '{}' not found", self.id),
                 )
             })?;
-        sink.emit(&events.task_status_updated(&task))
+        sink.emit(events.task_status_updated(&task))
     }
 
     fn finish(&self, status: RunStatus, error: Option<&str>, usage: UsageTotals) -> io::Result<()> {
@@ -732,7 +732,7 @@ impl ThreadTurnCompletion {
             task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
         }
         if request.emit_session_completed() {
-            sink.emit(&events.session_completed(self.status))?;
+            sink.emit(events.session_completed(self.status))?;
         }
         Ok(self.status)
     }
@@ -1256,7 +1256,7 @@ fn execute_readonly_batch(
         let invocation =
             prepare_tool_invocation_with_external(tool_request, 0, u32::MAX, mcp_registry, &[]);
         if emit_deltas {
-            sink.emit(&events.tool_call_requested(tool_request))?;
+            sink.emit(events.tool_call_requested(tool_request))?;
         }
         match hooks.run(
             HookEvent::PreToolUse,
@@ -1303,7 +1303,7 @@ fn execute_readonly_batch(
 
     for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
         if emit_deltas {
-            sink.emit(&events.tool_call_completed(result))?;
+            sink.emit(events.tool_call_completed(result))?;
             if let Err(error) = hooks.run(
                 HookEvent::PostToolUse,
                 HookContext {
@@ -1316,7 +1316,7 @@ fn execute_readonly_batch(
                     usage: None,
                 },
             ) {
-                sink.emit(&events.error(&format!("post_tool_use hook failed: {error}")))?;
+                sink.emit(events.error(&format!("post_tool_use hook failed: {error}")))?;
             }
         }
     }
@@ -1338,10 +1338,10 @@ fn run_verifier_if_needed(
         return Ok(status);
     };
 
-    sink.emit(&events.verification_started(command))?;
+    sink.emit(events.verification_started(command))?;
     let result = orca_core::verification::run(command);
     let success = result.success;
-    sink.emit(&events.verification_completed(&result))?;
+    sink.emit(events.verification_completed(&result))?;
 
     if success {
         Ok(RunStatus::Success)

@@ -462,8 +462,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     ) -> io::Result<()> {
         if self.turn_context.emit_deltas {
             self.sink.emit(
-                &self
-                    .events
+                self.events
                     .context_compaction_started(trigger.reason().as_str(), before_messages),
             )?;
         }
@@ -472,7 +471,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
 
     pub(crate) fn emit_error(&mut self, error: &str) -> io::Result<()> {
         if self.turn_context.emit_deltas {
-            self.sink.emit(&self.events.error(error))?;
+            self.sink.emit(self.events.error(error))?;
         }
         Ok(())
     }
@@ -505,8 +504,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             }
             Err(error) if self.turn_context.emit_deltas => {
                 self.sink.emit(
-                    &self
-                        .events
+                    self.events
                         .error(&format!("on_budget_warning hook failed: {error}")),
                 )?;
             }
@@ -579,7 +577,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     fn emit_compaction_completed(&mut self, outcome: &RuntimeCompactionOutcome) -> io::Result<()> {
         if self.turn_context.emit_deltas {
             let details = outcome.details();
-            self.sink.emit(&self.events.context_compacted(
+            self.sink.emit(self.events.context_compacted(
                 details.reason.as_str(),
                 details.strategy.as_str(),
                 details.before_messages,
@@ -613,8 +611,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         };
         if let Err(error) = result {
             self.sink.emit(
-                &self
-                    .events
+                self.events
                     .error(&format!("{} hook failed: {error}", event.as_str())),
             )?;
         }

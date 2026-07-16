@@ -1,4 +1,4 @@
-use orca_core::event_schema::{EventEnvelope, EventFactory, RunStatus};
+use orca_core::event_schema::{EventDraft, EventFactory, RunStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -45,11 +45,11 @@ pub struct RuntimeTurnRunner<'a> {
     lifecycle: &'a mut RuntimeSessionLifecycle,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RuntimeStartedTurn {
     pub(crate) turn: u32,
     pub(crate) task: Option<RuntimeTaskLifecycle>,
-    pub event: EventEnvelope,
+    pub event: EventDraft,
 }
 
 #[derive(Clone, Debug)]
@@ -219,7 +219,7 @@ impl RuntimeTaskLifecycle {
         task
     }
 
-    pub fn attach_to_event(&self, mut event: EventEnvelope) -> EventEnvelope {
+    pub fn attach_to_event(&self, mut event: EventDraft) -> EventDraft {
         event.payload["task"] = self.payload();
         event
     }
@@ -247,7 +247,7 @@ impl RuntimeTurnLifecycle {
         events: &mut EventFactory,
         prompt: Option<&str>,
         task: &RuntimeTaskLifecycle,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         let mut event = events.turn_started(self.number, prompt);
         event.payload["task"] = task.payload();
         event

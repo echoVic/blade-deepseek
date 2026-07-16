@@ -5,7 +5,7 @@ use std::thread;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
-use orca_core::event_schema::{EventEnvelope, EventFactory, RunStatus};
+use orca_core::event_schema::{EventDraft, EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
 use orca_core::tool_types;
@@ -97,7 +97,7 @@ struct SubagentBatchExecution {
 
 fn emit_batch_event<W: io::Write>(
     sink: &mut EventSink<W>,
-    event: &EventEnvelope,
+    event: EventDraft,
     event_error: &mut Option<io::Error>,
 ) -> bool {
     match sink.emit(event) {
@@ -288,23 +288,23 @@ fn execute_subagent_batch(
                 if emit_deltas {
                     emit_batch_event(
                         sink,
-                        &events.tool_call_requested(tool_request),
+                        events.tool_call_requested(tool_request),
                         &mut event_error,
                     );
-                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
                 }
                 results[idx] = Some((RunStatus::Failed, result));
                 continue;
             }
             if emit_deltas {
                 let requested = events.tool_call_requested(tool_request);
-                if !emit_batch_event(sink, &requested, &mut event_error) {
+                if !emit_batch_event(sink, requested, &mut event_error) {
                     let result = tool_types::ToolResult::failed_before_start(
                         tool_request,
                         "subagent dispatch stopped because the requested event could not be delivered",
                         None,
                     );
-                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
                     results[idx] = Some((RunStatus::Failed, result));
                     continue;
                 }
@@ -315,7 +315,7 @@ fn execute_subagent_batch(
                     "the subagent batch was cancelled before dispatch",
                 );
                 if emit_deltas {
-                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
                 }
                 results[idx] = Some((RunStatus::Cancelled, result));
                 continue;
@@ -333,7 +333,7 @@ fn execute_subagent_batch(
             {
                 let result = error.into_result();
                 if emit_deltas {
-                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
                 }
                 results[idx] = Some((RunStatus::Failed, result));
                 continue;
@@ -374,7 +374,7 @@ fn execute_subagent_batch(
                     if emit_deltas {
                         emit_batch_event(
                             sink,
-                            &events.tool_call_completed(&result),
+                            events.tool_call_completed(&result),
                             &mut event_error,
                         );
                     }
@@ -394,7 +394,7 @@ fn execute_subagent_batch(
                     if emit_deltas {
                         emit_batch_event(
                             sink,
-                            &events.tool_call_completed(&result),
+                            events.tool_call_completed(&result),
                             &mut event_error,
                         );
                     }
@@ -409,7 +409,7 @@ fn execute_subagent_batch(
                     "the subagent batch was cancelled before dispatch",
                 );
                 if emit_deltas {
-                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
                 }
                 results[idx] = Some((RunStatus::Cancelled, result));
                 continue;
@@ -425,12 +425,12 @@ fn execute_subagent_batch(
                 let event = subagent_task.attach_to_event(
                     events.subagent_started(&tool_request.id, &request.description),
                 );
-                if !emit_batch_event(sink, &event, &mut event_error) {
+                if !emit_batch_event(sink, event, &mut event_error) {
                     let error = "subagent dispatch stopped because its started event could not be delivered";
                     let failed_task = subagent_task.with_status(RuntimeTaskStatus::Failed);
                     emit_batch_event(
                         sink,
-                        &failed_task.attach_to_event(events.subagent_completed(
+                        failed_task.attach_to_event(events.subagent_completed(
                             &tool_request.id,
                             &request.description,
                             RunStatus::Failed,
@@ -441,7 +441,7 @@ fn execute_subagent_batch(
                     );
                     let result =
                         tool_types::ToolResult::failed_before_start(tool_request, error, None);
-                    emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                    emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
                     results[idx] = Some((RunStatus::Failed, result));
                     continue;
                 }
@@ -519,7 +519,7 @@ fn execute_subagent_batch(
                         let failed_task = panic_task.with_status(RuntimeTaskStatus::Failed);
                         emit_batch_event(
                             sink,
-                            &failed_task.attach_to_event(events.subagent_completed(
+                            failed_task.attach_to_event(events.subagent_completed(
                                 &tool_request.id,
                                 &panic_description,
                                 RunStatus::Failed,
@@ -530,7 +530,7 @@ fn execute_subagent_batch(
                         );
                         emit_batch_event(
                             sink,
-                            &events.tool_call_completed(&result),
+                            events.tool_call_completed(&result),
                             &mut event_error,
                         );
                     }
@@ -553,7 +553,7 @@ fn execute_subagent_batch(
                     }
                 };
             if emit_deltas {
-                emit_batch_event(sink, &events.tool_call_completed(&result), &mut event_error);
+                emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
                 if let Err(error) = hooks.run(
                     HookEvent::PostToolUse,
                     HookContext {
@@ -568,7 +568,7 @@ fn execute_subagent_batch(
                 ) {
                     emit_batch_event(
                         sink,
-                        &events.error(&format!("post_tool_use hook failed: {error}")),
+                        events.error(&format!("post_tool_use hook failed: {error}")),
                         &mut event_error,
                     );
                 }
@@ -617,7 +617,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     if emit_deltas {
         let event =
             subagent_task.attach_to_event(events.subagent_started(&tool_request.id, &description));
-        sink.emit(&event)?;
+        sink.emit(event)?;
     }
 
     if subagent_depth >= config.subagents.max_depth {
@@ -634,7 +634,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                 None,
                 Some(&error),
             ));
-            sink.emit(&event)?;
+            sink.emit(event)?;
         }
         return Ok(tool_types::ToolResult::failed(tool_request, error, None));
     }
@@ -653,7 +653,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                 None,
                 Some(error),
             ));
-            sink.emit(&event)?;
+            sink.emit(event)?;
         }
         return Ok(tool_types::ToolResult::failed(tool_request, error, None));
     }
@@ -686,7 +686,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                         None,
                         Some(&error),
                     ));
-                    sink.emit(&event)?;
+                    sink.emit(event)?;
                 }
                 return Ok(tool_types::ToolResult::failed(tool_request, error, None));
             }
@@ -750,7 +750,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                     child.final_message.as_deref(),
                     Some(&error),
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             return Ok(tool_types::ToolResult::failed_after_start(
                 tool_request,
@@ -781,7 +781,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                         Some(&output),
                         Some(&error),
                     ));
-                    sink.emit(&event)?;
+                    sink.emit(event)?;
                 }
                 return Ok(tool_types::ToolResult::failed(
                     tool_request,
@@ -798,7 +798,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                     Some(&output),
                     None,
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             Ok(tool_types::ToolResult::completed(
                 tool_request,
@@ -819,7 +819,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                     child.final_message.as_deref(),
                     Some(&error),
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             Ok(tool_types::ToolResult::cancelled(
                 tool_request,
@@ -840,7 +840,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
                     child.final_message.as_deref(),
                     Some(&error),
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             Ok(tool_types::ToolResult::failed(
                 tool_request,
@@ -891,7 +891,7 @@ fn subagent_execution_to_tool_result(
                         Some(&output),
                         Some(&error),
                     ));
-                    sink.emit(&event)?;
+                    sink.emit(event)?;
                 }
                 return Ok((
                     RunStatus::Failed,
@@ -911,7 +911,7 @@ fn subagent_execution_to_tool_result(
                     Some(&output),
                     None,
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             Ok((
                 RunStatus::Success,
@@ -937,7 +937,7 @@ fn subagent_execution_to_tool_result(
                     execution.child.final_message.as_deref(),
                     Some(&error),
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             Ok((
                 RunStatus::Cancelled,
@@ -963,7 +963,7 @@ fn subagent_execution_to_tool_result(
                     execution.child.final_message.as_deref(),
                     Some(&error),
                 ));
-                sink.emit(&event)?;
+                sink.emit(event)?;
             }
             Ok((
                 RunStatus::Failed,

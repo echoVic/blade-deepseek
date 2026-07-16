@@ -128,6 +128,7 @@ mod tests {
     use std::sync::Arc;
 
     use orca_core::event_schema::{EventFactory, RunStatus};
+    use orca_core::event_sink::observe_event;
 
     use super::*;
 
@@ -137,12 +138,12 @@ mod tests {
         let observer = TuiHostedEventObserver::new(event_tx);
         let mut events = EventFactory::new("hosted-terminal-order".to_string());
 
-        observer
-            .observe(&events.assistant_message_delta("ready"))
-            .unwrap();
-        observer
-            .observe(&events.session_completed(RunStatus::Success))
-            .unwrap();
+        observe_event(Some(&observer), events.assistant_message_delta("ready")).unwrap();
+        observe_event(
+            Some(&observer),
+            events.session_completed(RunStatus::Success),
+        )
+        .unwrap();
 
         assert!(matches!(event_rx.try_recv(), Ok(TuiEvent::MessageDelta(text)) if text == "ready"));
         assert!(event_rx.try_recv().is_err());
@@ -160,9 +161,11 @@ mod tests {
         assert!(!observer.finish_foreground().unwrap());
         let mut events = EventFactory::new("hosted-background-events".to_string());
 
-        observer
-            .observe(&events.session_completed(RunStatus::Cancelled))
-            .unwrap();
+        observe_event(
+            Some(observer.as_ref()),
+            events.session_completed(RunStatus::Cancelled),
+        )
+        .unwrap();
 
         assert!(matches!(
             event_rx.try_recv(),

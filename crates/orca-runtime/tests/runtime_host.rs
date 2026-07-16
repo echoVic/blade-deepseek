@@ -325,7 +325,7 @@ impl ThreadOperationExecutor for ScriptedExecutor {
             }
             TestBehavior::EmitEvent { message, status } => {
                 EventSink::new(writer, generation.config().output_format)
-                    .emit(&events.error(&message))?;
+                    .emit(events.error(&message))?;
                 Ok(status.into())
             }
             TestBehavior::RecordUsage {
@@ -389,12 +389,11 @@ fn assert_one_thread_event_sequence(
         events.iter().all(|event| event.run_id == thread_id),
         "observer must receive events on the owning thread stream"
     );
-    let mut sequences = events.iter().map(|event| event.seq).collect::<Vec<_>>();
-    sequences.sort_unstable();
+    let sequences = events.iter().map(|event| event.seq).collect::<Vec<_>>();
     assert_eq!(
         sequences,
         (0..sequences.len() as u64).collect::<Vec<_>>(),
-        "thread event sequence must be unique and contiguous"
+        "thread events must arrive in one unique contiguous sequence"
     );
     events
 }

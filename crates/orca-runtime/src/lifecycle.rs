@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
-use orca_core::event_schema::{EventEnvelope, EventFactory, RunStatus};
+use orca_core::event_schema::{EventDraft, EventFactory, RunStatus};
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::hook_types::HookEvent;
 use orca_core::model::{ModelRouteContext, ModelRouteDecision, ModelSelection};
@@ -201,11 +201,11 @@ pub struct RuntimeModelTurn {
     pub provider_config: ProviderConfig,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RuntimeActorStartedTurn {
     turn: u32,
     task: Option<RuntimeTaskLifecycle>,
-    event: Option<EventEnvelope>,
+    event: Option<EventDraft>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -430,7 +430,7 @@ impl<'a> RuntimeTaskActor<'a> {
         &mut self,
         events: &mut EventFactory,
         request: &ToolRequest,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         Self::tool_call_requested_event_for(events, request)
     }
 
@@ -439,14 +439,14 @@ impl<'a> RuntimeTaskActor<'a> {
         events: &mut EventFactory,
         request: &ToolRequest,
         result: &ToolResult,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         Self::tool_call_completed_event_for(events, request, result)
     }
 
     pub fn tool_call_requested_event_for(
         events: &mut EventFactory,
         request: &ToolRequest,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         let event = events.tool_call_requested(request);
         attach_shell_task_to_tool_event(event, request, RuntimeTaskStatus::Running)
     }
@@ -455,7 +455,7 @@ impl<'a> RuntimeTaskActor<'a> {
         events: &mut EventFactory,
         request: &ToolRequest,
         result: &ToolResult,
-    ) -> EventEnvelope {
+    ) -> EventDraft {
         let status = RuntimeTaskStatus::from_run_status(run_status_from_tool_status(result.status));
         let event = events.tool_call_completed(result);
         attach_shell_task_to_tool_event(event, request, status)
@@ -1376,10 +1376,10 @@ impl<'a> RuntimeTurnExecution<'a> {
 }
 
 fn attach_shell_task_to_tool_event(
-    event: EventEnvelope,
+    event: EventDraft,
     request: &ToolRequest,
     status: RuntimeTaskStatus,
-) -> EventEnvelope {
+) -> EventDraft {
     if request.action != orca_core::approval_types::ActionKind::Shell {
         return event;
     }
@@ -1401,11 +1401,11 @@ impl RuntimeActorStartedTurn {
         self.task.as_ref()
     }
 
-    pub fn event(&self) -> Option<&EventEnvelope> {
+    pub fn event(&self) -> Option<&EventDraft> {
         self.event.as_ref()
     }
 
-    pub fn into_event(self) -> Option<EventEnvelope> {
+    pub fn into_event(self) -> Option<EventDraft> {
         self.event
     }
 }

@@ -317,8 +317,33 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orca_core::event_schema::{EventFactory, RunStatus};
+    use std::sync::{Arc, Mutex};
+
+    use orca_core::event_schema::{EventDraft, EventFactory, RunStatus};
+    use orca_core::event_sink::{EventObserver, observe_event};
     use orca_core::tool_types;
+
+    fn materialize(draft: EventDraft) -> EventEnvelope {
+        let event = Arc::new(Mutex::new(None));
+        let observer = {
+            let event = Arc::clone(&event);
+            move |published: &EventEnvelope| {
+                *event.lock().unwrap() = Some(published.clone());
+                Ok(())
+            }
+        };
+        observe_event(Some(&observer as &dyn EventObserver), draft).unwrap();
+        drop(observer);
+        Arc::try_unwrap(event)
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .expect("published event")
+    }
+
+    fn project(draft: EventDraft) -> Option<TuiEvent> {
+        tui_event_from_runtime_event(&materialize(draft))
+    }
 
     #[test]
     fn runtime_turn_started_event_maps_task_lifecycle_to_tui() {
@@ -331,7 +356,7 @@ mod tests {
         );
         let event = task.attach_to_event(events.turn_started(3, Some("continue")));
 
-        let projected = tui_event_from_runtime_event(&event).expect("turn started event");
+        let projected = project(event).expect("turn started event");
 
         assert!(matches!(
             projected,
@@ -358,8 +383,7 @@ mod tests {
             raw_arguments: Some(serde_json::json!({ "command": "echo hi" }).to_string()),
         };
 
-        let tui_event =
-            tui_event_from_runtime_event(&events.tool_call_requested(&request)).expect("tui event");
+        let tui_event = project(events.tool_call_requested(&request)).expect("tui event");
 
         match tui_event {
             TuiEvent::ToolRequested { id, name, target } => {
@@ -383,8 +407,7 @@ mod tests {
         };
         let result = tool_types::ToolResult::failed(&request, "preview failed", Some(42));
 
-        let tui_event =
-            tui_event_from_runtime_event(&events.tool_call_completed(&result)).expect("tui event");
+        let tui_event = project(events.tool_call_completed(&result)).expect("tui event");
 
         match tui_event {
             TuiEvent::ToolCompleted {
@@ -410,8 +433,7 @@ mod tests {
     fn runtime_context_updated_event_maps_to_tui_context_budget() {
         let mut events = EventFactory::new("tui-context-budget".to_string());
 
-        let event = tui_event_from_runtime_event(&events.context_updated(4_096, 96_000))
-            .expect("context event");
+        let event = project(events.context_updated(4_096, 96_000)).expect("context event");
 
         assert!(matches!(
             event,
@@ -426,10 +448,8 @@ mod tests {
     fn runtime_tool_output_delta_maps_to_tui_live_output() {
         let mut events = EventFactory::new("tui-tool-output".to_string());
 
-        let event = tui_event_from_runtime_event(
-            &events.tool_output_delta("shell-call", "streamed output\n"),
-        )
-        .expect("tool output event");
+        let event = project(events.tool_output_delta("shell-call", "streamed output\n"))
+            .expect("tool output event");
 
         assert!(matches!(
             event,
@@ -455,8 +475,7 @@ mod tests {
                 });
         let mut events = EventFactory::new("tui-tool-diff".to_string());
 
-        let event = tui_event_from_runtime_event(&events.tool_call_completed(&result))
-            .expect("tool completion event");
+        let event = project(events.tool_call_completed(&result)).expect("tool completion event");
 
         assert!(matches!(
             event,
@@ -477,8 +496,7 @@ mod tests {
         };
         let result = tool_types::ToolResult::cancelled(&request, "turn interrupted", Some(130));
 
-        let tui_event =
-            tui_event_from_runtime_event(&events.tool_call_completed(&result)).expect("tui event");
+        let tui_event = project(events.tool_call_completed(&result)).expect("tui event");
 
         assert!(matches!(
             tui_event,
@@ -491,10 +509,9 @@ mod tests {
     fn runtime_assistant_delta_events_map_to_tui_streaming_events() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 
-        let reasoning = tui_event_from_runtime_event(&events.assistant_reasoning_delta("thinking"))
-            .expect("reasoning event");
-        let message = tui_event_from_runtime_event(&events.assistant_message_delta("hello"))
-            .expect("message event");
+        let reasoning =
+            project(events.assistant_reasoning_delta("thinking")).expect("reasoning event");
+        let message = project(events.assistant_message_delta("hello")).expect("message event");
 
         assert!(matches!(reasoning, TuiEvent::ReasoningDelta(text) if text == "thinking"));
         assert!(matches!(message, TuiEvent::MessageDelta(text) if text == "hello"));
@@ -509,8 +526,7 @@ mod tests {
             arguments_bytes: 12_345,
         };
 
-        let event = tui_event_from_runtime_event(&events.tool_call_progress(&progress))
-            .expect("tool progress event");
+        let event = project(events.tool_call_progress(&progress)).expect("tool progress event");
 
         match event {
             TuiEvent::ToolCallProgress {
@@ -530,17 +546,16 @@ mod tests {
     fn runtime_usage_error_and_completion_events_map_to_tui_events() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 
-        let usage = tui_event_from_runtime_event(&events.usage_updated(UsageTotals {
+        let usage = project(events.usage_updated(UsageTotals {
             input_tokens: 10,
             output_tokens: 5,
             cache_tokens: 2,
             estimated_cost_usd: 0.001,
         }))
         .expect("usage event");
-        let error = tui_event_from_runtime_event(&events.error("boom")).expect("error event");
-        let completed =
-            tui_event_from_runtime_event(&events.session_completed(RunStatus::BudgetExhausted))
-                .expect("completion event");
+        let error = project(events.error("boom")).expect("error event");
+        let completed = project(events.session_completed(RunStatus::BudgetExhausted))
+            .expect("completion event");
 
         match usage {
             TuiEvent::UsageUpdated(totals) => {
@@ -561,7 +576,7 @@ mod tests {
     fn runtime_context_compacted_event_maps_to_tui_compacted() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 
-        let compacted = tui_event_from_runtime_event(&events.context_compacted(
+        let compacted = project(events.context_compacted(
             "prompt_too_long_recovery",
             "remote_summary",
             12,
@@ -621,10 +636,8 @@ mod tests {
     fn runtime_context_compaction_started_event_maps_to_tui_compacting_status() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 
-        let started = tui_event_from_runtime_event(
-            &events.context_compaction_started("approaching_context_limit", 12),
-        )
-        .expect("compaction started event");
+        let started = project(events.context_compaction_started("approaching_context_limit", 12))
+            .expect("compaction started event");
 
         assert!(matches!(started, TuiEvent::CompactionStarted));
     }
@@ -650,16 +663,12 @@ mod tests {
             stderr: "failed".to_string(),
         };
 
-        let routed =
-            tui_event_from_runtime_event(&events.model_routed(&route)).expect("model routed");
-        let resolved = tui_event_from_runtime_event(&events.approval_resolved(&approval))
-            .expect("approval resolved");
+        let routed = project(events.model_routed(&route)).expect("model routed");
+        let resolved = project(events.approval_resolved(&approval)).expect("approval resolved");
         let verification_started =
-            tui_event_from_runtime_event(&events.verification_started("cargo test"))
-                .expect("verification started");
+            project(events.verification_started("cargo test")).expect("verification started");
         let verification_completed =
-            tui_event_from_runtime_event(&events.verification_completed(&verifier))
-                .expect("verification completed");
+            project(events.verification_completed(&verifier)).expect("verification completed");
 
         assert!(matches!(routed, TuiEvent::Notice(message)
                 if message == "Model routed to deepseek-v4-pro (default_pro)"));
@@ -690,13 +699,11 @@ mod tests {
             preview: Some("$ cargo test".to_string()),
         };
 
-        let plan =
-            tui_event_from_runtime_event(&events.plan_updated(&plan_update)).expect("plan event");
-        let approval = tui_event_from_runtime_event(&events.approval_requested(&approval));
+        let plan = project(events.plan_updated(&plan_update)).expect("plan event");
+        let approval = project(events.approval_requested(&approval));
         let subagent_started =
-            tui_event_from_runtime_event(&events.subagent_started("agent-1", "review code"))
-                .expect("subagent started");
-        let subagent_completed = tui_event_from_runtime_event(&events.subagent_completed(
+            project(events.subagent_started("agent-1", "review code")).expect("subagent started");
+        let subagent_completed = project(events.subagent_completed(
             "agent-1",
             "review code",
             RunStatus::Success,
@@ -739,7 +746,7 @@ mod tests {
     fn runtime_workflow_result_event_maps_to_tui_notification() {
         let mut events = EventFactory::new("tui-runtime-adapter".to_string());
 
-        let notification = tui_event_from_runtime_event(&events.workflow_result_available(
+        let notification = project(events.workflow_result_available(
             "task-1",
             "workflow-run-1",
             "mock-workflow",
@@ -773,13 +780,10 @@ mod tests {
     fn runtime_workflow_lifecycle_events_map_to_tui_notices() {
         let mut events = EventFactory::new("run-1".to_string());
 
-        let phase_started = tui_event_from_runtime_event(&events.workflow_phase_started(
-            "task-1",
-            "workflow-run-1",
-            "scan",
-        ))
-        .expect("phase started");
-        let agent_failed = tui_event_from_runtime_event(&events.workflow_agent_failed(
+        let phase_started =
+            project(events.workflow_phase_started("task-1", "workflow-run-1", "scan"))
+                .expect("phase started");
+        let agent_failed = project(events.workflow_agent_failed(
             "task-1",
             "workflow-run-1",
             "scan",
@@ -787,13 +791,9 @@ mod tests {
             "boom",
         ))
         .expect("agent failed");
-        let paused = tui_event_from_runtime_event(&events.workflow_paused(
-            "task-1",
-            "workflow-run-1",
-            "audit",
-            "manual pause",
-        ))
-        .expect("paused");
+        let paused =
+            project(events.workflow_paused("task-1", "workflow-run-1", "audit", "manual pause"))
+                .expect("paused");
 
         assert!(matches!(phase_started, TuiEvent::Notice(message)
                 if message == "Workflow phase started: scan"));
@@ -846,8 +846,8 @@ mod tests {
             error: None,
         };
 
-        let tui_event = tui_event_from_runtime_event(&events.workflow_tasks_updated(&[task]))
-            .expect("workflow tasks updated event");
+        let tui_event =
+            project(events.workflow_tasks_updated(&[task])).expect("workflow tasks updated event");
 
         match tui_event {
             TuiEvent::WorkflowTasksUpdated { tasks } => {
@@ -901,8 +901,8 @@ mod tests {
             error: None,
         };
 
-        let tui_event = tui_event_from_runtime_event(&events.task_status_updated(&task))
-            .expect("task status updated event");
+        let tui_event =
+            project(events.task_status_updated(&task)).expect("task status updated event");
 
         match tui_event {
             TuiEvent::WorkflowTaskUpdated { task } => {

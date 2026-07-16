@@ -205,7 +205,7 @@ impl<'a> RuntimeToolRouter<'a> {
                     if emit_deltas
                         && event_error.is_none()
                         && let Err(error) =
-                            sink.emit(&events.tool_output_delta(&execution_request.id, chunk))
+                            sink.emit(events.tool_output_delta(&execution_request.id, chunk))
                     {
                         event_error = Some(error);
                     }

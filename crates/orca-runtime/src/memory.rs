@@ -167,7 +167,7 @@ pub(crate) fn extract_project_memory_after_final_response(
 ) -> Result<(), std::io::Error> {
     let provider_config = auto_memory_provider_config(config);
     if let Err(error) = extract_project_memory(config.provider, &provider_config, cwd, messages) {
-        sink.emit(&events.error(&format!("memory extraction failed: {error}")))?;
+        sink.emit(events.error(&format!("memory extraction failed: {error}")))?;
     }
     Ok(())
 }

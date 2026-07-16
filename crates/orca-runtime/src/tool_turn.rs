@@ -565,10 +565,10 @@ fn emit_tool_terminal_events<W: io::Write>(
     request: &ToolRequest,
     result: &ToolResult,
 ) -> io::Result<()> {
-    let requested = sink.emit(&RuntimeTaskActor::tool_call_requested_event_for(
+    let requested = sink.emit(RuntimeTaskActor::tool_call_requested_event_for(
         events, request,
     ));
-    let completed = sink.emit(&RuntimeTaskActor::tool_call_completed_event_for(
+    let completed = sink.emit(RuntimeTaskActor::tool_call_completed_event_for(
         events, request, result,
     ));
     requested.and(completed)
@@ -688,7 +688,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         )?;
         let totals = cost_tracker.totals();
         if emit_deltas {
-            if let Err(error) = sink.emit(&events.usage_updated(totals))
+            if let Err(error) = sink.emit(events.usage_updated(totals))
                 && event_error.is_none()
             {
                 event_error = Some(error);

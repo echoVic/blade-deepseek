@@ -11,8 +11,8 @@ use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_core::config::RunConfig;
 use orca_core::conversation::{Conversation, Message};
 use orca_core::cost_types::UsageTotals;
-use orca_core::event_schema::{EventFactory, RunStatus};
-use orca_core::event_sink::{EventObserver, EventSink};
+use orca_core::event_schema::{EventDraft, EventFactory, RunStatus};
+use orca_core::event_sink::{EventObserver, EventSink, observe_event};
 use orca_core::hook_types::HookEvent;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::task_types::TaskStatus;
@@ -735,10 +735,10 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
             let before_messages = thread.session().conversation().messages.len();
             let mut sink = EventSink::new(writer, config.output_format)
                 .with_optional_observer(request.event_observer());
-            sink.emit(&events.context_compaction_started("manual", before_messages))?;
+            sink.emit(events.context_compaction_started("manual", before_messages))?;
             let (before_messages, after_messages) =
                 thread.session_mut().compact(config, &cwd, cancel);
-            sink.emit(&events.context_compacted(
+            sink.emit(events.context_compacted(
                 "manual",
                 "manual",
                 before_messages,
@@ -2470,7 +2470,7 @@ impl ThreadActor {
         };
         observe_runtime_event(
             event_observer.as_deref(),
-            &state.events.tool_call_requested(&tool_request),
+            state.events.tool_call_requested(&tool_request),
         );
 
         let config = config.unwrap_or_else(|| self.config.clone());
@@ -2480,7 +2480,7 @@ impl ThreadActor {
                 orca_core::tool_types::ToolResult::failed(&tool_request, message.clone(), None);
             observe_runtime_event(
                 event_observer.as_deref(),
-                &state.events.tool_call_completed(&failed),
+                state.events.tool_call_completed(&failed),
             );
             return Err(RuntimeHostError::WorkflowLaunchFailed { message });
         }
@@ -2510,7 +2510,7 @@ impl ThreadActor {
                     orca_core::tool_types::ToolResult::failed(&tool_request, message.clone(), None);
                 observe_runtime_event(
                     event_observer.as_deref(),
-                    &state.events.tool_call_completed(&failed),
+                    state.events.tool_call_completed(&failed),
                 );
                 return Err(RuntimeHostError::WorkflowLaunchFailed { message });
             }
@@ -2524,7 +2524,7 @@ impl ThreadActor {
         };
         observe_runtime_event(
             event_observer.as_deref(),
-            &state.events.workflow_started(
+            state.events.workflow_started(
                 &launch.task_id,
                 &launch.run_id,
                 &launch.workflow_name,
@@ -2538,7 +2538,7 @@ impl ThreadActor {
         {
             observe_runtime_event(
                 event_observer.as_deref(),
-                &state.events.task_status_updated(&task),
+                state.events.task_status_updated(&task),
             );
         }
         if let Ok(output) = serde_json::to_string(&launch.output) {
@@ -2546,7 +2546,7 @@ impl ThreadActor {
                 orca_core::tool_types::ToolResult::completed(&tool_request, output, false);
             observe_runtime_event(
                 event_observer.as_deref(),
-                &state.events.tool_call_completed(&completed),
+                state.events.tool_call_completed(&completed),
             );
         }
 
@@ -2614,7 +2614,7 @@ impl ThreadActor {
                     );
                     observe_runtime_event(
                         panic_observer.as_deref(),
-                        &panic_events.workflow_failed(
+                        panic_events.workflow_failed(
                             &panic_task_id,
                             &panic_run_id,
                             &panic_workflow_name,
@@ -2784,7 +2784,7 @@ fn run_workflow_background_task(
         }
         observe_runtime_event(
             context.observer.as_deref(),
-            &events.workflow_tasks_updated(&context.task_registry.list()),
+            events.workflow_tasks_updated(&context.task_registry.list()),
         );
         thread::sleep(WORKFLOW_BACKGROUND_POLL_INTERVAL);
     }
@@ -2801,11 +2801,11 @@ fn run_workflow_background_task(
         Ok(Ok(result)) if task_status == Some(TaskStatus::Completed) => {
             observe_runtime_event(
                 context.observer.as_deref(),
-                &events.workflow_completed(&task_id, &run_id, &workflow_name),
+                events.workflow_completed(&task_id, &run_id, &workflow_name),
             );
             observe_runtime_event(
                 context.observer.as_deref(),
-                &events.workflow_result_available(
+                events.workflow_result_available(
                     &task_id,
                     &run_id,
                     &workflow_name,
@@ -2818,7 +2818,7 @@ fn run_workflow_background_task(
         Ok(Ok(result)) => {
             observe_runtime_event(
                 context.observer.as_deref(),
-                &events.workflow_failed(
+                events.workflow_failed(
                     &task_id,
                     &run_id,
                     &workflow_name,
@@ -2830,7 +2830,7 @@ fn run_workflow_background_task(
         Ok(Err(error)) => {
             observe_runtime_event(
                 context.observer.as_deref(),
-                &events.workflow_failed(
+                events.workflow_failed(
                     &task_id,
                     &run_id,
                     &workflow_name,
@@ -2851,7 +2851,7 @@ fn run_workflow_background_task(
             );
             observe_runtime_event(
                 context.observer.as_deref(),
-                &events.workflow_failed(
+                events.workflow_failed(
                     &task_id,
                     &run_id,
                     &workflow_name,
@@ -2871,9 +2871,9 @@ fn emit_workflow_task_status(
 ) {
     let tasks = task_registry.list();
     if let Some(task) = tasks.iter().find(|task| task.id == task_id) {
-        observe_runtime_event(observer, &events.task_status_updated(task));
+        observe_runtime_event(observer, events.task_status_updated(task));
     }
-    observe_runtime_event(observer, &events.workflow_tasks_updated(&tasks));
+    observe_runtime_event(observer, events.workflow_tasks_updated(&tasks));
 }
 
 fn run_hosted_operation(
@@ -2909,7 +2909,7 @@ fn run_headless_session(
     let cwd = cwd_path.display().to_string();
     let mut sink = EventSink::new(writer, config.output_format)
         .with_optional_observer(request.event_observer());
-    sink.emit(&events.session_started(
+    sink.emit(events.session_started(
         &cwd,
         config.approval_mode.as_str(),
         config.provider.as_str(),
@@ -2927,7 +2927,7 @@ fn run_headless_session(
             usage: None,
         },
     ) {
-        sink.emit(&events.error(&format!("session_start hook failed: {error}")))?;
+        sink.emit(events.error(&format!("session_start hook failed: {error}")))?;
     }
 
     let outcome = executor.run_turn(
@@ -2955,10 +2955,10 @@ fn run_headless_session(
             usage: None,
         },
     ) {
-        sink.emit(&events.error(&format!("session_end hook failed: {error}")))?;
+        sink.emit(events.error(&format!("session_end hook failed: {error}")))?;
     }
     if matches!(outcome, ThreadOperationOutcome::Completed { .. }) {
-        sink.emit(&events.session_completed(status))?;
+        sink.emit(events.session_completed(status))?;
     }
     Ok(outcome)
 }
@@ -3018,7 +3018,7 @@ fn run_provider_background_task(
         .and_then(|response| provider_response_usage_totals(response, context.model.as_deref()));
     if let Some(usage) = usage {
         let totals = context.usage_ledger.add(usage);
-        observe_runtime_event(context.observer.as_deref(), &events.usage_updated(totals));
+        observe_runtime_event(context.observer.as_deref(), events.usage_updated(totals));
     }
     let was_backgrounded = context
         .task_registry
@@ -3093,11 +3093,11 @@ fn run_provider_background_task(
     if !was_backgrounded {
         emit_provider_steps(context.observer.as_deref(), &mut events, buffered_steps);
         if let Some(error) = error.as_deref() {
-            observe_runtime_event(context.observer.as_deref(), &events.error(error));
+            observe_runtime_event(context.observer.as_deref(), events.error(error));
         }
         observe_runtime_event(
             context.observer.as_deref(),
-            &events.session_completed(status),
+            events.session_completed(status),
         );
     }
 }
@@ -3113,10 +3113,7 @@ fn emit_task_status_update(
         .into_iter()
         .find(|task| task.id == task_id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "background task not found"))?;
-    if let Some(observer) = observer {
-        observer.observe(&events.task_status_updated(&task))?;
-    }
-    Ok(())
+    observe_event(observer.as_deref(), events.task_status_updated(&task))
 }
 
 fn background_task_is_foregrounded(task_registry: &TaskRegistry, task_id: &str) -> bool {
@@ -3142,26 +3139,21 @@ fn emit_provider_steps(
     for step in steps {
         match step {
             ProviderStep::ReasoningDelta(text) => {
-                observe_runtime_event(observer, &events.assistant_reasoning_delta(&text));
+                observe_runtime_event(observer, events.assistant_reasoning_delta(&text));
             }
             ProviderStep::MessageDelta(text) => {
-                observe_runtime_event(observer, &events.assistant_message_delta(&text));
+                observe_runtime_event(observer, events.assistant_message_delta(&text));
             }
             ProviderStep::ToolCallProgress(progress) => {
-                observe_runtime_event(observer, &events.tool_call_progress(&progress));
+                observe_runtime_event(observer, events.tool_call_progress(&progress));
             }
             _ => {}
         }
     }
 }
 
-fn observe_runtime_event(
-    observer: Option<&dyn EventObserver>,
-    event: &orca_core::event_schema::EventEnvelope,
-) {
-    if let Some(observer) = observer {
-        let _ = observer.observe(event);
-    }
+fn observe_runtime_event(observer: Option<&dyn EventObserver>, event: EventDraft) {
+    let _ = observe_event(observer, event);
 }
 
 fn provider_response_requires_approval(response: &ProviderResponse) -> bool {
