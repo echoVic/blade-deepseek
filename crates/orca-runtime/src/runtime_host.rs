@@ -5,7 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_core::config::RunConfig;
@@ -2228,6 +2228,7 @@ impl ThreadActor {
         };
         let join = tokio::task::spawn_blocking(move || {
             let mut state = state;
+            let started_at = Instant::now();
             let usage_before = state.thread.session().aggregate_usage_totals();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 run_hosted_operation(
@@ -2251,14 +2252,21 @@ impl ThreadActor {
                 },
             };
             let usage_after = state.thread.session().aggregate_usage_totals();
+            let usage_delta = subtract_usage_totals(
+                usage_totals_delta(usage_before, usage_after),
+                usage_credit,
+            );
+            account_goal_usage_for_generation(
+                &state,
+                &task_request,
+                usage_delta,
+                started_at.elapsed().as_secs() as i64,
+            );
             OperationTaskResult {
                 state,
                 writer,
                 outcome,
-                usage_delta: subtract_usage_totals(
-                    usage_totals_delta(usage_before, usage_after),
-                    usage_credit,
-                ),
+                usage_delta,
             }
         });
         ActiveGeneration {
@@ -3178,6 +3186,27 @@ fn provider_response_usage_totals(
     let usage = response.usage.filter(|usage| !usage.is_empty())?;
     let mut tracker = crate::cost::CostTracker::new(model);
     Some(tracker.add_usage(usage))
+}
+
+fn account_goal_usage_for_generation(
+    state: &ThreadActorState,
+    request: &HostedTurnRequest,
+    usage_delta: UsageTotals,
+    elapsed_secs: i64,
+) {
+    if !request.tracks_goal_usage() {
+        return;
+    }
+    let Some(session_id) = state.thread.session().session_id() else {
+        return;
+    };
+    // Best-effort ledger telemetry: swallow accounting failures so the
+    // generation task keeps its happy path (this file does not use tracing).
+    let _ = crate::goals::GoalStore::load_default().account_usage(
+        session_id,
+        usage_delta.total_tokens() as i64,
+        elapsed_secs,
+    );
 }
 
 fn usage_totals_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {

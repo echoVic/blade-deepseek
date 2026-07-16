@@ -203,6 +203,11 @@ enum TestBehavior {
     WaitForCancelAndRelease { gate: CancelJoinGate },
     WaitForRelease { gate: ManualGate, status: RunStatus },
     EmitEvent { message: String, status: RunStatus },
+    RecordUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+        status: RunStatus,
+    },
     Panic,
 }
 
@@ -321,6 +326,21 @@ impl ThreadOperationExecutor for ScriptedExecutor {
             TestBehavior::EmitEvent { message, status } => {
                 EventSink::new(writer, generation.config().output_format)
                     .emit(&events.error(&message))?;
+                Ok(status.into())
+            }
+            TestBehavior::RecordUsage {
+                input_tokens,
+                output_tokens,
+                status,
+            } => {
+                thread
+                    .session_mut()
+                    .cost_tracker_mut()
+                    .add_usage(orca_core::provider_types::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_tokens: 0,
+                    });
                 Ok(status.into())
             }
             TestBehavior::Panic => panic!("scripted operation panic"),
@@ -2595,4 +2615,157 @@ fn wait_until_task_status(
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+    // edition 2024: set_var/remove_var are unsafe; serialize via lock like
+    // orca-tui's test_support::lock_process_env.
+    let _guard = ORCA_HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let previous = std::env::var_os("ORCA_HOME");
+    unsafe {
+        std::env::set_var("ORCA_HOME", home.path());
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(home.path())));
+    unsafe {
+        if let Some(previous) = previous {
+            std::env::set_var("ORCA_HOME", previous);
+        } else {
+            std::env::remove_var("ORCA_HOME");
+        }
+    }
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[test]
+fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
+    with_orca_home(|_home| {
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::RecordUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+                status: RunStatus::Success,
+            },
+            TestBehavior::RecordUsage {
+                input_tokens: 400,
+                output_tokens: 200,
+                status: RunStatus::Success,
+            },
+        ]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "goal accounting test")
+            .expect("start runtime thread");
+        let session_id = thread
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let mut store = orca_runtime::goals::GoalStore::load_default();
+        store
+            .replace(
+                &session_id,
+                "account my usage",
+                orca_core::goal_types::ThreadGoalStatus::Active,
+                Some(700),
+            )
+            .unwrap();
+
+        let writer = SharedWriter::default();
+        let first = thread
+            .start_turn(
+                HostedTurnRequest::new("turn one").with_goal_usage_tracking(true),
+                writer.clone(),
+            )
+            .expect("start first turn");
+        assert_eq!(
+            first
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("first terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        let after_first = store.get(&session_id).unwrap().unwrap();
+        assert_eq!(after_first.tokens_used, 300);
+        assert_eq!(
+            after_first.status,
+            orca_core::goal_types::ThreadGoalStatus::Active
+        );
+
+        let second = thread
+            .start_turn(
+                HostedTurnRequest::new("turn two").with_goal_usage_tracking(true),
+                writer.clone(),
+            )
+            .expect("start second turn");
+        assert_eq!(
+            second
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("second terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        let after_second = store.get(&session_id).unwrap().unwrap();
+        assert_eq!(after_second.tokens_used, 900);
+        assert_eq!(
+            after_second.status,
+            orca_core::goal_types::ThreadGoalStatus::BudgetLimited
+        );
+
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn turn_without_goal_usage_tracking_does_not_account() {
+    with_orca_home(|_home| {
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::RecordUsage {
+            input_tokens: 200,
+            output_tokens: 100,
+            status: RunStatus::Success,
+        }]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "no accounting test")
+            .expect("start runtime thread");
+        let session_id = thread
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let mut store = orca_runtime::goals::GoalStore::load_default();
+        store
+            .replace(
+                &session_id,
+                "do not account",
+                orca_core::goal_types::ThreadGoalStatus::Active,
+                None,
+            )
+            .unwrap();
+
+        let writer = SharedWriter::default();
+        let turn = thread
+            .start_turn(HostedTurnRequest::new("turn"), writer.clone())
+            .expect("start turn");
+        assert_eq!(
+            turn.wait_timeout(TEST_TIMEOUT)
+                .expect("terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        assert_eq!(store.get(&session_id).unwrap().unwrap().tokens_used, 0);
+
+        host.shutdown().expect("shutdown runtime host");
+    });
 }
