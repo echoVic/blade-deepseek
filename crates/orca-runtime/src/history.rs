@@ -305,6 +305,7 @@ mod tests {
         EVENT_SEQUENCE_RESERVATION_SIZE, EventEnvelope, EventPublicationStore, EventType,
     };
     use orca_core::plan_types::{PlanItem, PlanStatus};
+    use orca_core::thread_identity::TurnId;
     use orca_core::tool_types::{
         ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminalSource,
     };
@@ -446,6 +447,7 @@ mod tests {
         let result = (|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "remember")?;
+            writer.enter_turn(TurnId::new());
             writer.append_message(&Message::pinned_user("pinned constraint".to_string()))?;
             let transcript = load_session("latest")?;
             assert_eq!(transcript.messages.len(), 1);
@@ -489,6 +491,7 @@ mod tests {
                 None,
                 &format!("start ORCA_API_KEY={prompt_secret}"),
             )?;
+            writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user(format!(
                 "please run ORCA_API_KEY={env_secret} and password={password_secret}"
             )))?;
@@ -816,6 +819,7 @@ mod tests {
             let meta = create_meta(&cwd, "mock", None, "bad tool boundary");
             let session_id = meta.session_id.clone();
             let mut writer = SessionWriter::start_from_meta(meta)?;
+            writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("start".to_string()))?;
             writer.append_message(&Message::Assistant {
                 content: None,
@@ -827,6 +831,7 @@ mod tests {
                 }],
                 pinned: false,
             })?;
+            writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("continue after failed turn".to_string()))?;
 
             let transcript = load_session(&session_id)?;
@@ -1114,6 +1119,7 @@ mod tests {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "compacted resume")?;
             writer.append_message(&Message::system("old system".to_string()))?;
+            writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("collapsed old user".repeat(100)))?;
             writer.append_message(&Message::Assistant {
                 content: Some("collapsed old assistant".repeat(100)),
@@ -1137,6 +1143,7 @@ mod tests {
                     deltas: Vec::new(),
                 },
             )?;
+            writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("new prompt after compaction".to_string()))?;
 
             let transcript = load_session("latest")?;

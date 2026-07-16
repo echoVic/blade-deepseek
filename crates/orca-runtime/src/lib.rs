@@ -4670,8 +4670,8 @@ mod tests {
             "stored_message_to_thread_json",
             "messages_to_thread_turns",
             "messages_to_thread_items",
-            "stored_messages_to_thread_turns",
-            "stored_messages_to_thread_items",
+            "conversation_records_to_thread_turns",
+            "conversation_records_to_thread_items",
         ] {
             let signature = format!("fn {function_name}(");
             assert!(

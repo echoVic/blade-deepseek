@@ -9,18 +9,19 @@ use chrono::{DateTime, Utc};
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
-use orca_core::conversation::{Message, normalize_tool_boundaries};
 use orca_core::tool_types::truncate_output;
 
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
-    stored_message_to_thread_json, stored_messages_to_thread_items, stored_messages_to_thread_turns,
+    conversation_records_to_thread_items, conversation_records_to_thread_turns,
+    normalized_stored_messages, stored_message_to_thread_json,
 };
 use super::types::{
-    SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection, StoredMessage,
-    StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
-    StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurnPage, ThreadListFilters,
-    ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
+    SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
+    StoredConversationRecord, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
+    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurnPage,
+    ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
+    TurnItemsView,
 };
 use super::writer::{
     lock_file, read_history_lines, read_records, read_session_meta, read_transcript,
@@ -169,7 +170,7 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
 
 pub(crate) fn load_thread_records(
     thread_id: &str,
-) -> io::Result<(SessionMeta, Vec<StoredMessage>)> {
+) -> io::Result<(SessionMeta, Vec<StoredConversationRecord>)> {
     let path = find_session_path(thread_id, true)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -178,11 +179,19 @@ pub(crate) fn load_thread_records(
     })?;
     let records = read_records(&path)?;
     let mut meta = None;
-    let mut messages = Vec::new();
+    let mut conversation_records = Vec::new();
     for record in records {
         match record {
             SessionRecord::Meta(record_meta) => meta = Some(record_meta),
-            SessionRecord::Message { message } => messages.push(message),
+            SessionRecord::Message {
+                id,
+                turn_id,
+                message,
+            } => conversation_records.push(StoredConversationRecord {
+                item_id: id,
+                turn_id,
+                message,
+            }),
             _ => {}
         }
     }
@@ -192,10 +201,7 @@ pub(crate) fn load_thread_records(
             format!("session '{thread_id}' is missing metadata"),
         )
     })?;
-    let mut recovered_messages = messages.into_iter().map(Message::from).collect::<Vec<_>>();
-    normalize_tool_boundaries(&mut recovered_messages);
-    let messages = recovered_messages.iter().map(StoredMessage::from).collect();
-    Ok((meta, messages))
+    Ok((meta, conversation_records))
 }
 
 pub fn list_sessions(limit: usize) -> io::Result<Vec<SessionSummary>> {
@@ -713,7 +719,8 @@ impl ThreadStore for JsonlThreadStore {
         include_messages: bool,
         include_turns: bool,
     ) -> io::Result<StoredThreadProjection> {
-        let (meta, stored_messages) = load_thread_records(thread_id)?;
+        let (meta, conversation_records) = load_thread_records(thread_id)?;
+        let stored_messages = normalized_stored_messages(&conversation_records);
         let projected_messages = if include_messages {
             stored_messages
                 .iter()
@@ -723,12 +730,12 @@ impl ThreadStore for JsonlThreadStore {
             Vec::new()
         };
         let turns = if include_turns {
-            stored_messages_to_thread_turns(
+            conversation_records_to_thread_turns(
                 &meta.session_id,
-                &stored_messages,
+                &conversation_records,
                 usize::MAX,
                 TurnItemsView::Full,
-            )
+            )?
         } else {
             Vec::new()
         };
@@ -821,9 +828,14 @@ impl ThreadStore for JsonlThreadStore {
         sort_direction: SortDirection,
         items_view: TurnItemsView,
     ) -> io::Result<StoredThreadTurnPage> {
-        let (meta, messages) = load_thread_records(thread_id)?;
+        let (meta, records) = load_thread_records(thread_id)?;
         Ok(page_thread_turns(
-            stored_messages_to_thread_turns(&meta.session_id, &messages, usize::MAX, items_view),
+            conversation_records_to_thread_turns(
+                &meta.session_id,
+                &records,
+                usize::MAX,
+                items_view,
+            )?,
             cursor,
             limit,
             sort_direction,
@@ -838,9 +850,9 @@ impl ThreadStore for JsonlThreadStore {
         limit: usize,
         sort_direction: SortDirection,
     ) -> io::Result<StoredThreadItemPage> {
-        let (meta, messages) = load_thread_records(thread_id)?;
+        let (meta, records) = load_thread_records(thread_id)?;
         Ok(page_thread_items(
-            stored_messages_to_thread_items(&meta.session_id, &messages, turn_id, usize::MAX),
+            conversation_records_to_thread_items(&meta.session_id, &records, turn_id, usize::MAX)?,
             cursor,
             limit,
             sort_direction,

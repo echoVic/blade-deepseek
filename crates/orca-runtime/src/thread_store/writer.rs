@@ -1,18 +1,22 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use orca_core::conversation::{Message, SummaryState};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventPublicationStore};
 use orca_core::plan_types::{PlanItem, PlanStatus};
+use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::tool_types::ToolResult;
 use uuid::Uuid;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
-use super::types::{SessionMeta, SessionRecord, SessionTranscript, StoredMessage};
+use super::types::{
+    SessionMeta, SessionRecord, SessionTranscript, StoredConversationRecord, StoredMessage,
+};
 
 pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -41,6 +45,16 @@ pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
             continue;
         }
         match serde_json::from_str::<SessionRecord>(line) {
+            Ok(SessionRecord::Message { id, turn_id, .. }) if id.is_some() != turn_id.is_some() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid conversation identity at {} line {}: id and turn_id must be present together",
+                        path.display(),
+                        i + 1
+                    ),
+                ));
+            }
             Ok(record) => records.push(record),
             Err(error) if line_has_record_type(line, "event.semantic") => {
                 return Err(io::Error::new(
@@ -62,11 +76,28 @@ pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
                     ),
                 ));
             }
+            Err(error) if line_has_conversation_identity(line) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid conversation identity at {} line {}: {error}",
+                        path.display(),
+                        i + 1
+                    ),
+                ));
+            }
             Err(_) if i == lines.len() - 1 => break,
             Err(_) => continue,
         }
     }
     Ok(records)
+}
+
+fn line_has_conversation_identity(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+        value["type"] == "conversation.message"
+            && (!value["id"].is_null() || !value["turn_id"].is_null())
+    })
 }
 
 fn line_has_record_type(line: &str, record_type: &str) -> bool {
@@ -186,7 +217,9 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
     for record in records {
         match record {
             SessionRecord::Meta(m) => meta = Some(m),
-            SessionRecord::Message { message } => messages.push(message.into()),
+            SessionRecord::Message { message, .. } => {
+                messages.push(message.into());
+            }
             SessionRecord::Completed { status, error, .. } => {
                 completion_status = Some(status);
                 completion_error = error;
@@ -276,7 +309,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
                 redact_string_in_place(parent_id);
             }
         }
-        SessionRecord::Message { message } => redact_stored_message(message),
+        SessionRecord::Message { message, .. } => redact_stored_message(message),
         SessionRecord::Completed { status, error, .. } => {
             redact_string_in_place(status);
             if let Some(error) = error {
@@ -597,6 +630,8 @@ fn unlock_file_impl(_file: &File) -> io::Result<()> {
 #[derive(Clone, Debug)]
 pub struct SessionWriter {
     path: PathBuf,
+    conversation_records: Arc<Mutex<Vec<StoredConversationRecord>>>,
+    turn_id: Option<TurnId>,
 }
 
 fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
@@ -637,7 +672,11 @@ impl SessionWriter {
     pub fn start_from_meta(meta: SessionMeta) -> io::Result<Self> {
         let path = history::session_path(&meta.session_id, meta.created_at)?;
         write_record(&path, &SessionRecord::Meta(meta))?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            conversation_records: Arc::new(Mutex::new(Vec::new())),
+            turn_id: None,
+        })
     }
 
     pub fn append_to_existing(path: PathBuf) -> io::Result<Self> {
@@ -652,16 +691,72 @@ impl SessionWriter {
         // be restored to plaintext before it can be continued.
         let path = restore_plaintext_transcript(path)?;
         append_usage_baseline(&path)?;
-        Ok(Self { path })
+        let conversation_records = read_records(&path)?
+            .into_iter()
+            .filter_map(|record| match record {
+                SessionRecord::Message {
+                    id,
+                    turn_id,
+                    message,
+                } => Some(StoredConversationRecord {
+                    item_id: id,
+                    turn_id,
+                    message,
+                }),
+                _ => None,
+            })
+            .collect();
+        Ok(Self {
+            path,
+            conversation_records: Arc::new(Mutex::new(conversation_records)),
+            turn_id: None,
+        })
+    }
+
+    pub fn enter_turn(&mut self, turn_id: TurnId) {
+        self.turn_id = Some(turn_id);
+    }
+
+    pub(crate) fn conversation_records(&self) -> Vec<StoredConversationRecord> {
+        self.conversation_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::Message {
-                message: StoredMessage::from(message),
-            },
-        )
+        let message = StoredMessage::from(message);
+        let record = match &self.turn_id {
+            Some(turn_id) => StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn_id.clone(),
+                message,
+            ),
+            None if matches!(message, StoredMessage::System { .. }) => {
+                StoredConversationRecord::legacy(message)
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "conversation message append requires an active turn identity",
+                ));
+            }
+        };
+        self.append_conversation_record(record)
+    }
+
+    pub(crate) fn append_legacy_message(&mut self, message: &Message) -> io::Result<()> {
+        self.append_conversation_record(StoredConversationRecord::legacy(StoredMessage::from(
+            message,
+        )))
+    }
+
+    pub(crate) fn append_detached_message(&mut self, message: &Message) -> io::Result<()> {
+        self.append_conversation_record(StoredConversationRecord::identified(
+            ConversationItemId::new(),
+            TurnId::new(),
+            StoredMessage::from(message),
+        ))
     }
 
     pub fn append_tool_result_message(
@@ -670,19 +765,32 @@ impl SessionWriter {
         content: String,
         pinned: bool,
     ) -> io::Result<()> {
-        write_record(
-            &self.path,
-            &SessionRecord::Message {
-                message: StoredMessage::Tool {
-                    tool_call_id: result.id.clone(),
-                    content,
-                    terminal: super::types::StoredToolTerminal::from_terminal(Some(
-                        result.terminal(),
-                    )),
-                    pinned,
-                },
+        let turn_id = self.turn_id.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tool result append requires an active turn identity",
+            )
+        })?;
+        self.append_conversation_record(StoredConversationRecord::identified(
+            ConversationItemId::new(),
+            turn_id,
+            StoredMessage::Tool {
+                tool_call_id: result.id.clone(),
+                content,
+                terminal: super::types::StoredToolTerminal::from_terminal(Some(result.terminal())),
+                pinned,
             },
-        )
+        ))
+    }
+
+    fn append_conversation_record(&mut self, record: StoredConversationRecord) -> io::Result<()> {
+        let mut records = self
+            .conversation_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        write_record(&self.path, &record.as_session_record())?;
+        records.push(record);
+        Ok(())
     }
 
     pub fn complete(&mut self, status: &str) -> io::Result<()> {
@@ -871,8 +979,167 @@ mod tests {
             network_domain_permissions: Default::default(),
         };
         write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");
-        let writer = SessionWriter { path: path.clone() };
+        let writer = SessionWriter {
+            path: path.clone(),
+            conversation_records: Arc::new(Mutex::new(Vec::new())),
+            turn_id: None,
+        };
         (directory, path, writer)
+    }
+
+    #[test]
+    fn writer_clones_share_record_order_but_keep_independent_turn_scopes() {
+        let (_directory, path, mut foreground) = new_transcript();
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        foreground.enter_turn(first_turn.clone());
+        let mut background = foreground.clone();
+        foreground.enter_turn(second_turn.clone());
+
+        background
+            .append_message(&Message::user("background first".to_string()))
+            .expect("append background record");
+        foreground
+            .append_message(&Message::user("foreground second".to_string()))
+            .expect("append foreground record");
+
+        let ledger = foreground.conversation_records();
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger[0].turn_id.as_ref(), Some(&first_turn));
+        assert_eq!(ledger[1].turn_id.as_ref(), Some(&second_turn));
+        assert_ne!(ledger[0].item_id, ledger[1].item_id);
+        assert_eq!(background.conversation_records().len(), 2);
+
+        let persisted = read_records(&path)
+            .expect("read persisted records")
+            .into_iter()
+            .filter_map(|record| match record {
+                SessionRecord::Message { id, turn_id, .. } => Some((id, turn_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted,
+            ledger
+                .iter()
+                .map(|record| (record.item_id.clone(), record.turn_id.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn failed_message_append_never_enters_the_shared_ledger() {
+        let (directory, _path, mut writer) = new_transcript();
+        writer.enter_turn(TurnId::new());
+        writer.path = directory.path().to_path_buf();
+
+        writer
+            .append_message(&Message::user("must fail".to_string()))
+            .expect_err("directory path cannot accept a transcript append");
+
+        assert!(writer.conversation_records().is_empty());
+    }
+
+    #[test]
+    fn detached_message_identity_does_not_replace_the_foreground_turn_scope() {
+        let (_directory, _path, mut writer) = new_transcript();
+        let foreground_turn = TurnId::new();
+        writer.enter_turn(foreground_turn.clone());
+
+        writer
+            .append_detached_message(&Message::pinned_user("context".to_string()))
+            .expect("append detached context");
+        writer
+            .append_message(&Message::user("foreground".to_string()))
+            .expect("append foreground message");
+
+        let records = writer.conversation_records();
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].turn_id.as_ref(), Some(&foreground_turn));
+        assert_eq!(records[1].turn_id.as_ref(), Some(&foreground_turn));
+    }
+
+    #[test]
+    fn redaction_and_compaction_preserve_conversation_identity() {
+        let (_directory, path, mut writer) = new_transcript();
+        let turn_id = TurnId::new();
+        writer.enter_turn(turn_id.clone());
+        writer
+            .append_message(&Message::user(
+                "use token=sk-test-identity-redaction-1234567890".to_string(),
+            ))
+            .expect("append redacted conversation record");
+        let before_compaction = writer.conversation_records();
+        let item_id = before_compaction[0]
+            .item_id
+            .clone()
+            .expect("conversation item id");
+
+        writer
+            .append_compaction(1, 1)
+            .expect("append compaction record");
+
+        let after_compaction = writer.conversation_records();
+        assert_eq!(after_compaction[0].item_id.as_ref(), Some(&item_id));
+        assert_eq!(after_compaction[0].turn_id.as_ref(), Some(&turn_id));
+        let persisted = read_records(&path)
+            .expect("read redacted compacted transcript")
+            .into_iter()
+            .find_map(|record| match record {
+                SessionRecord::Message {
+                    id,
+                    turn_id,
+                    message,
+                } => Some((id, turn_id, message)),
+                _ => None,
+            })
+            .expect("persisted conversation record");
+        assert_eq!(persisted.0.as_ref(), Some(&item_id));
+        assert_eq!(persisted.1.as_ref(), Some(&turn_id));
+        assert!(
+            matches!(persisted.2, StoredMessage::User { content, .. } if content.contains("<redacted>"))
+        );
+    }
+
+    #[test]
+    fn read_records_rejects_partial_or_malformed_conversation_identity() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let item_id = ConversationItemId::new();
+        fs::write(
+            path.path(),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "conversation.message",
+                    "id": item_id,
+                    "message": { "role": "user", "content": "partial" }
+                })
+            ),
+        )
+        .expect("write partial identity");
+        assert!(
+            read_records(path.path())
+                .expect_err("partial identity must fail closed")
+                .to_string()
+                .contains("id and turn_id must be present together")
+        );
+
+        fs::write(
+            path.path(),
+            concat!(
+                "{\"type\":\"conversation.message\",",
+                "\"id\":\"item_not-a-uuid\",",
+                "\"turn_id\":\"turn_not-a-uuid\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"malformed\"}}\n"
+            ),
+        )
+        .expect("write malformed identity");
+        assert!(
+            read_records(path.path())
+                .expect_err("malformed identity must fail closed")
+                .to_string()
+                .contains("invalid conversation identity")
+        );
     }
 
     fn aggregate_usage(path: &Path) -> UsageTotals {
@@ -1079,6 +1346,8 @@ mod tests {
     fn read_records_rejects_conflicting_tool_terminal_record() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
         let valid = serde_json::to_string(&SessionRecord::Message {
+            id: None,
+            turn_id: None,
             message: StoredMessage::User {
                 content: "valid".to_string(),
                 pinned: false,
@@ -1133,6 +1402,8 @@ mod tests {
     fn read_records_ignores_only_truncated_final_record() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
         let valid = serde_json::to_string(&SessionRecord::Message {
+            id: None,
+            turn_id: None,
             message: StoredMessage::User {
                 content: "valid".to_string(),
                 pinned: false,

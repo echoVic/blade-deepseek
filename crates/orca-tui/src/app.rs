@@ -2104,6 +2104,7 @@ mod tests {
             let mut writer =
                 history::SessionWriter::start(home, "mock", Some("auto".to_string()), "goal")
                     .unwrap();
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
             writer
                 .append_message(&orca_core::conversation::Message::user(
                     "previous goal work".to_string(),
@@ -2248,6 +2249,7 @@ mod tests {
             let mut writer =
                 history::SessionWriter::start(home, "mock", Some("auto".to_string()), "goal")
                     .unwrap();
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
             writer
                 .append_message(&orca_core::conversation::Message::user(
                     "previous goal work".to_string(),

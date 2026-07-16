@@ -392,7 +392,7 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
     *messages = normalized;
 }
 
-fn repaired_missing_tool_result(tool_call: &RawToolCall) -> Message {
+pub fn repaired_missing_tool_result(tool_call: &RawToolCall) -> Message {
     let request = ToolRequest {
         id: tool_call.id.clone(),
         name: ToolName::from_str(&tool_call.function_name)

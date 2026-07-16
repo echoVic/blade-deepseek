@@ -828,8 +828,9 @@ mod tests {
             format!("{}\n", serde_json::Value::Object(meta_record)),
         )
         .expect("seed history file");
-        let writer =
+        let mut writer =
             SessionWriter::append_to_existing(history_path.clone()).expect("open existing history");
+        writer.enter_turn(orca_core::thread_identity::TurnId::new());
         std::fs::remove_file(&history_path).expect("remove history file");
         std::fs::create_dir(&history_path).expect("replace history file with directory");
         (history, writer)

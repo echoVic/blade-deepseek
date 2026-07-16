@@ -17,8 +17,10 @@ pub use local::{
 };
 pub(crate) use pagination::{page_thread_items, page_thread_turns};
 pub(crate) use projection::{
+    conversation_records_to_thread_items, conversation_records_to_thread_turns,
     message_to_thread_json, messages_to_thread_items, messages_to_thread_turns,
 };
+pub(crate) use types::StoredConversationRecord;
 pub use types::{
     SessionMeta, SessionSummary, SessionTranscript, SortDirection, StoredThreadItem,
     StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
@@ -42,6 +44,7 @@ mod tests {
     use crate::history;
     use orca_core::approval_types::ActionKind;
     use orca_core::conversation::{MISSING_TOOL_TERMINAL_ERROR, Message, RawToolCall};
+    use orca_core::thread_identity::{ConversationItemId, TurnId};
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminalSource};
 
     #[test]
@@ -126,6 +129,274 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_projection_keeps_legacy_ids_and_uses_persisted_ids_for_new_records() {
+        let typed_turn = TurnId::new();
+        let typed_user = ConversationItemId::new();
+        let typed_assistant = ConversationItemId::new();
+        let mut records = vec![
+            types::StoredConversationRecord::legacy(types::StoredMessage::from(&Message::user(
+                "legacy user".to_string(),
+            ))),
+            types::StoredConversationRecord::legacy(types::StoredMessage::from(
+                &Message::Assistant {
+                    content: Some("legacy assistant".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    pinned: false,
+                },
+            )),
+            types::StoredConversationRecord::identified(
+                typed_user.clone(),
+                typed_turn.clone(),
+                types::StoredMessage::from(&Message::user("typed user".to_string())),
+            ),
+            types::StoredConversationRecord::identified(
+                typed_assistant.clone(),
+                typed_turn.clone(),
+                types::StoredMessage::from(&Message::Assistant {
+                    content: Some("typed assistant".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    pinned: false,
+                }),
+            ),
+        ];
+
+        let initial_turns = projection::conversation_records_to_thread_turns(
+            "thread-a",
+            &records,
+            usize::MAX,
+            TurnItemsView::Full,
+        )
+        .expect("project hybrid turns");
+        let initial_items = projection::conversation_records_to_thread_items(
+            "thread-a",
+            &records,
+            None,
+            usize::MAX,
+        )
+        .expect("project hybrid items");
+
+        assert_eq!(initial_turns[0].turn_id, "turn-1");
+        assert_eq!(initial_turns[1].turn_id, typed_turn.as_str());
+        assert_eq!(initial_items[0].item_id, "item-1");
+        assert_eq!(initial_items[1].item_id, "item-2");
+        assert_eq!(initial_items[2].item_id, typed_user.as_str());
+        assert_eq!(initial_items[3].item_id, typed_assistant.as_str());
+
+        let later_turn = TurnId::new();
+        records.push(types::StoredConversationRecord::identified(
+            ConversationItemId::new(),
+            later_turn,
+            types::StoredMessage::from(&Message::user("later user".to_string())),
+        ));
+        let later_items = projection::conversation_records_to_thread_items(
+            "thread-a",
+            &records,
+            None,
+            usize::MAX,
+        )
+        .expect("project appended hybrid items");
+        assert_eq!(
+            later_items
+                .iter()
+                .take(initial_items.len())
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            initial_items
+                .iter()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn identified_projection_groups_steer_messages_and_rejects_reopened_turns() {
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let identified = |turn_id: &TurnId, content: &str| {
+            types::StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn_id.clone(),
+                types::StoredMessage::from(&Message::user(content.to_string())),
+            )
+        };
+        let records = vec![
+            identified(&first_turn, "prompt"),
+            identified(&first_turn, "steer"),
+            identified(&second_turn, "next"),
+        ];
+
+        let turns = projection::conversation_records_to_thread_turns(
+            "thread-a",
+            &records,
+            usize::MAX,
+            TurnItemsView::Full,
+        )
+        .expect("project typed turns");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].items.len(), 2);
+
+        let reopened = vec![
+            identified(&first_turn, "first"),
+            identified(&second_turn, "second"),
+            identified(&first_turn, "reopened"),
+        ];
+        let error = projection::conversation_records_to_thread_turns(
+            "thread-a",
+            &reopened,
+            usize::MAX,
+            TurnItemsView::Full,
+        )
+        .expect_err("non-contiguous typed turn must fail closed");
+        assert!(error.to_string().contains("is not contiguous"));
+    }
+
+    #[test]
+    fn identified_tool_result_completes_the_domain_item_without_minting_a_wrapper() {
+        let turn_id = TurnId::new();
+        let request = ToolRequest {
+            id: "call-stable".to_string(),
+            name: ToolName::External("deploy".to_string()),
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(r#"{"env":"staging"}"#.to_string()),
+        };
+        let result = ToolResult::completed(&request, "deployed".to_string(), false);
+        let records = vec![
+            types::StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn_id.clone(),
+                types::StoredMessage::from(&Message::user("deploy".to_string())),
+            ),
+            types::StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn_id.clone(),
+                types::StoredMessage::from(&Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![RawToolCall {
+                        id: request.id.clone(),
+                        function_name: "deploy".to_string(),
+                        arguments: request.raw_arguments.clone().unwrap(),
+                    }],
+                    pinned: false,
+                }),
+            ),
+            types::StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn_id,
+                types::StoredMessage::from(&Message::Tool {
+                    tool_call_id: request.id.clone(),
+                    content: "deployed".to_string(),
+                    terminal: Some(result.terminal().clone()),
+                    pinned: false,
+                }),
+            ),
+        ];
+
+        let items = projection::conversation_records_to_thread_items(
+            "thread-a",
+            &records,
+            None,
+            usize::MAX,
+        )
+        .expect("project completed tool");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].item_id, request.id);
+        assert_eq!(items[1].item["status"], "completed");
+        assert_eq!(items[1].item["contentItems"][0]["text"], "deployed");
+    }
+
+    #[test]
+    fn identified_tool_wrappers_keep_their_domain_item_ids() {
+        for (tool_name, arguments, expected_type, expected_id_suffix) in [
+            (
+                "bash",
+                serde_json::json!({ "command": "deploy" }),
+                "commandExecution",
+                "",
+            ),
+            (
+                "mcp__ops__deploy",
+                serde_json::json!({ "env": "production" }),
+                "mcpToolCall",
+                "",
+            ),
+            (
+                "deploy",
+                serde_json::json!({ "env": "production" }),
+                "dynamicToolCall",
+                "",
+            ),
+            (
+                "write_file",
+                serde_json::json!({ "path": "release.txt", "content": "ready" }),
+                "fileChange",
+                ":file-change",
+            ),
+        ] {
+            let turn_id = TurnId::new();
+            let request = ToolRequest {
+                id: format!("{tool_name}-call"),
+                name: ToolName::External(tool_name.to_string()),
+                action: ActionKind::Write,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+            let result = ToolResult::completed(&request, "done".to_string(), false);
+            let records = vec![
+                types::StoredConversationRecord::identified(
+                    ConversationItemId::new(),
+                    turn_id.clone(),
+                    types::StoredMessage::from(&Message::user("run tool".to_string())),
+                ),
+                types::StoredConversationRecord::identified(
+                    ConversationItemId::new(),
+                    turn_id.clone(),
+                    types::StoredMessage::from(&Message::Assistant {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: vec![RawToolCall {
+                            id: request.id.clone(),
+                            function_name: tool_name.to_string(),
+                            arguments: arguments.to_string(),
+                        }],
+                        pinned: false,
+                    }),
+                ),
+                types::StoredConversationRecord::identified(
+                    ConversationItemId::new(),
+                    turn_id,
+                    types::StoredMessage::from(&Message::Tool {
+                        tool_call_id: request.id.clone(),
+                        content: "done".to_string(),
+                        terminal: Some(result.terminal().clone()),
+                        pinned: false,
+                    }),
+                ),
+            ];
+
+            let items = projection::conversation_records_to_thread_items(
+                "thread-a",
+                &records,
+                None,
+                usize::MAX,
+            )
+            .expect("project identified tool records");
+            let expected_item_id = format!("{}{expected_id_suffix}", request.id);
+            let item = items
+                .iter()
+                .find(|item| item.item["type"] == expected_type)
+                .expect("projected domain tool item");
+
+            assert_eq!(item.item_id, expected_item_id, "tool {tool_name}");
+            assert_eq!(item.item["id"], expected_item_id, "tool {tool_name}");
+        }
+    }
+
+    #[test]
     fn tool_terminal_metadata_projects_live_and_stored_items_identically() {
         let request = ToolRequest {
             id: "indeterminate-call".to_string(),
@@ -155,18 +426,20 @@ mod tests {
                 pinned: false,
             },
         ];
-        let stored_messages = messages
+        let stored_records = messages
             .iter()
             .map(types::StoredMessage::from)
+            .map(types::StoredConversationRecord::legacy)
             .collect::<Vec<_>>();
 
         let live_items = messages_to_thread_items("thread-a", &messages, None, usize::MAX);
-        let stored_items = projection::stored_messages_to_thread_items(
+        let stored_items = projection::conversation_records_to_thread_items(
             "thread-a",
-            &stored_messages,
+            &stored_records,
             None,
             usize::MAX,
-        );
+        )
+        .expect("project stored records");
 
         assert_eq!(live_items, stored_items);
         let item = &stored_items
@@ -233,17 +506,19 @@ mod tests {
                     pinned: false,
                 },
             ];
-            let stored_messages = messages
+            let stored_records = messages
                 .iter()
                 .map(types::StoredMessage::from)
+                .map(types::StoredConversationRecord::legacy)
                 .collect::<Vec<_>>();
             let live_items = messages_to_thread_items("thread-a", &messages, None, usize::MAX);
-            let stored_items = projection::stored_messages_to_thread_items(
+            let stored_items = projection::conversation_records_to_thread_items(
                 "thread-a",
-                &stored_messages,
+                &stored_records,
                 None,
                 usize::MAX,
-            );
+            )
+            .expect("project stored records");
             assert_eq!(live_items, stored_items, "tool {tool_name}");
 
             let item = stored_items

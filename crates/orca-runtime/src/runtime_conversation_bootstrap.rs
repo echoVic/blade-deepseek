@@ -4,6 +4,7 @@ use std::path::Path;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::conversation::Conversation;
 use orca_core::subagent_types::SubagentType;
+use orca_core::thread_identity::TurnId;
 
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
@@ -41,6 +42,7 @@ impl RuntimeConversationBootstrapStep {
         instructions: &ProjectInstructions,
         approval_mode: ApprovalMode,
         memory: &MemoryBlock,
+        turn_id: &TurnId,
         emit_deltas: bool,
     ) -> io::Result<RuntimePreparedConversation<'a>> {
         let AgentConversationContext {
@@ -67,6 +69,10 @@ impl RuntimeConversationBootstrapStep {
             },
             history_writer,
         };
+
+        if let Some(writer) = prepared.history_writer.as_deref_mut() {
+            writer.enter_turn(turn_id.clone());
+        }
 
         let (conversation, history_writer) = prepared.parts_mut();
         record_initial_history_for_agent(

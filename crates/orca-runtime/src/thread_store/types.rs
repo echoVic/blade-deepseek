@@ -12,6 +12,7 @@ use orca_core::conversation::{Message, RawToolCall};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventEnvelope;
 use orca_core::plan_types::PlanItem;
+use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::tool_types::{
     ToolInvocationStarted, ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource,
 };
@@ -90,7 +91,13 @@ pub(crate) enum SessionRecord {
     #[serde(rename = "session.meta")]
     Meta(SessionMeta),
     #[serde(rename = "conversation.message")]
-    Message { message: StoredMessage },
+    Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ConversationItemId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+        message: StoredMessage,
+    },
     #[serde(rename = "session.completed")]
     Completed {
         status: String,
@@ -125,6 +132,43 @@ pub(crate) enum SessionRecord {
         explanation: Option<String>,
         plan: Vec<PlanItem>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredConversationRecord {
+    pub(crate) item_id: Option<ConversationItemId>,
+    pub(crate) turn_id: Option<TurnId>,
+    pub(crate) message: StoredMessage,
+}
+
+impl StoredConversationRecord {
+    pub(crate) fn legacy(message: StoredMessage) -> Self {
+        Self {
+            item_id: None,
+            turn_id: None,
+            message,
+        }
+    }
+
+    pub(crate) fn identified(
+        item_id: ConversationItemId,
+        turn_id: TurnId,
+        message: StoredMessage,
+    ) -> Self {
+        Self {
+            item_id: Some(item_id),
+            turn_id: Some(turn_id),
+            message,
+        }
+    }
+
+    pub(crate) fn as_session_record(&self) -> SessionRecord {
+        SessionRecord::Message {
+            id: self.item_id.clone(),
+            turn_id: self.turn_id.clone(),
+            message: self.message.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

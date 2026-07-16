@@ -4981,6 +4981,7 @@ enabled = true
                     && event["item"]["id"] == "workflow-run-1"
             })
             .expect("workflow item_completed");
+        assert_eq!(completed["item"]["id"], started["item"]["id"]);
         assert_eq!(completed["item"]["workflowName"], "audit");
         assert_eq!(completed["item"]["taskId"], "task-1");
         assert_eq!(completed["item"]["status"], "completed");
@@ -5671,21 +5672,24 @@ enabled = true
             let second_turn_id = second.turn_id().clone();
 
             assert_ne!(
-                first_turn_id,
-                second_turn_id,
+                first_turn_id, second_turn_id,
                 "process-level active-turn routing must not reuse a per-thread message index"
             );
             let first_operation = first
-                .start(HostedTurnRequest::new("mock_stream_delay_ms 500"), Vec::new())
+                .start(
+                    HostedTurnRequest::new("mock_stream_delay_ms 500"),
+                    Vec::new(),
+                )
                 .expect("start first thread turn");
             let second_operation = second
-                .start(HostedTurnRequest::new("mock_stream_delay_ms 500"), Vec::new())
+                .start(
+                    HostedTurnRequest::new("mock_stream_delay_ms 500"),
+                    Vec::new(),
+                )
                 .expect("start second thread turn");
-            state.active_turns.insert(
-                first_turn_id.clone(),
-                first_thread.clone(),
-                first_operation,
-            );
+            state
+                .active_turns
+                .insert(first_turn_id.clone(), first_thread.clone(), first_operation);
             state.active_turns.insert(
                 second_turn_id.clone(),
                 second_thread.clone(),
@@ -5941,6 +5945,9 @@ enabled = true
                 .expect("create thread");
             let thread_id = thread.thread_id().to_string();
             thread
+                .writer_mut()
+                .enter_turn(orca_core::thread_identity::TurnId::new());
+            thread
                 .append_items(&[Message::User {
                     content: "needle appears in this transcript".to_string(),
                     pinned: false,
@@ -5951,6 +5958,9 @@ enabled = true
                 .create_live_thread(home, "mock", None, "searchable thread second")
                 .expect("create second thread");
             let second_id = second.thread_id().to_string();
+            second
+                .writer_mut()
+                .enter_turn(orca_core::thread_identity::TurnId::new());
             second
                 .append_items(&[Message::User {
                     content: "needle appears again".to_string(),
@@ -6025,6 +6035,9 @@ enabled = true
                 .create_live_thread(home, "mock", None, "projected server thread")
                 .expect("create thread");
             let thread_id = thread.thread_id().to_string();
+            let first_turn_id = orca_core::thread_identity::TurnId::new();
+            let second_turn_id = orca_core::thread_identity::TurnId::new();
+            thread.writer_mut().enter_turn(first_turn_id.clone());
             thread
                 .append_items(&[
                     Message::User {
@@ -6037,6 +6050,11 @@ enabled = true
                         tool_calls: Vec::new(),
                         pinned: false,
                     },
+                ])
+                .expect("append first turn projection messages");
+            thread.writer_mut().enter_turn(second_turn_id.clone());
+            thread
+                .append_items(&[
                     Message::User {
                         content: "server projected second user".to_string(),
                         pinned: false,
@@ -6048,7 +6066,7 @@ enabled = true
                         pinned: false,
                     },
                 ])
-                .expect("append projection messages");
+                .expect("append second turn projection messages");
             thread.complete("success").expect("complete thread");
 
             let server_config = ServerConfig {
@@ -6071,7 +6089,7 @@ enabled = true
             assert_eq!(turn_events[0]["event"], "thread_turns_list");
             let turns = turn_events[0]["data"].as_array().expect("turn data");
             assert_eq!(turns.len(), 2);
-            assert_eq!(turns[0]["turnId"], "turn-1");
+            assert_eq!(turns[0]["turnId"], first_turn_id.as_str());
             assert_eq!(turns[0]["role"], "user");
             assert_eq!(turns[0]["itemsView"], "full");
             assert_eq!(turns[0]["items"][0]["content"], "server projected user");
@@ -6100,7 +6118,7 @@ enabled = true
                 .as_array()
                 .expect("paged turn data");
             assert_eq!(page_turns.len(), 1);
-            assert_eq!(page_turns[0]["turnId"], "turn-2");
+            assert_eq!(page_turns[0]["turnId"], second_turn_id.as_str());
             assert_eq!(
                 page_turns[0]["items"][0]["content"],
                 "server projected second user"
@@ -6126,7 +6144,7 @@ enabled = true
                 .as_array()
                 .expect("latest turn data");
             assert_eq!(latest_turns.len(), 1);
-            assert_eq!(latest_turns[0]["turnId"], "turn-2");
+            assert_eq!(latest_turns[0]["turnId"], second_turn_id.as_str());
             assert_eq!(
                 latest_turns[0]["items"][1]["content"],
                 "server projected second assistant"
@@ -6151,7 +6169,7 @@ enabled = true
                 .as_array()
                 .expect("unloaded turn data");
             assert_eq!(unloaded_turns.len(), 1);
-            assert_eq!(unloaded_turns[0]["turnId"], "turn-1");
+            assert_eq!(unloaded_turns[0]["turnId"], first_turn_id.as_str());
             assert_eq!(unloaded_turns[0]["itemsView"], "notLoaded");
             assert_eq!(
                 unloaded_turns[0]["items"].as_array().expect("items").len(),
@@ -6163,7 +6181,7 @@ enabled = true
                 &server_config,
                 &mut state,
                 &format!(
-                    r#"{{"id":"items","method":"thread/items/list","params":{{"threadId":"{thread_id}","turnId":"turn-1","limit":10}}}}"#
+                    r#"{{"id":"items","method":"thread/items/list","params":{{"threadId":"{thread_id}","turnId":"{first_turn_id}","limit":10}}}}"#
                 ),
                 &mut items_output,
             )
@@ -6174,8 +6192,13 @@ enabled = true
             assert_eq!(item_events[0]["event"], "thread_items_list");
             let items = item_events[0]["data"].as_array().expect("item data");
             assert_eq!(items.len(), 2);
-            assert_eq!(items[1]["itemId"], "item-2");
-            assert_eq!(items[1]["turnId"], "turn-1");
+            assert!(
+                items[1]["itemId"]
+                    .as_str()
+                    .is_some_and(|item_id| item_id.starts_with("item_"))
+            );
+            assert_ne!(items[0]["itemId"], items[1]["itemId"]);
+            assert_eq!(items[1]["turnId"], first_turn_id.as_str());
             assert_eq!(items[1]["item"]["content"], "server projected assistant");
             assert_eq!(item_events[0]["nextCursor"], Value::Null);
             assert_eq!(item_events[0]["backwardsCursor"], "0");
@@ -6198,8 +6221,12 @@ enabled = true
                 .as_array()
                 .expect("paged item data");
             assert_eq!(page_items.len(), 2);
-            assert_eq!(page_items[0]["itemId"], "item-3");
-            assert_eq!(page_items[0]["turnId"], "turn-2");
+            assert!(
+                page_items[0]["itemId"]
+                    .as_str()
+                    .is_some_and(|item_id| item_id.starts_with("item_"))
+            );
+            assert_eq!(page_items[0]["turnId"], second_turn_id.as_str());
             assert_eq!(
                 page_items[0]["item"]["content"],
                 "server projected second user"
@@ -6225,7 +6252,11 @@ enabled = true
                 .as_array()
                 .expect("latest item data");
             assert_eq!(latest_items.len(), 1);
-            assert_eq!(latest_items[0]["itemId"], "item-4");
+            assert!(
+                latest_items[0]["itemId"]
+                    .as_str()
+                    .is_some_and(|item_id| item_id.starts_with("item_"))
+            );
             assert_eq!(
                 latest_items[0]["item"]["content"],
                 "server projected second assistant"

@@ -1790,6 +1790,7 @@ mod tests {
                 &instructions,
                 config.approval_mode,
                 &memory,
+                &TurnId::new(),
                 true,
             )
             .expect("prepare conversation");

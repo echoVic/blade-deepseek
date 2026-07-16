@@ -2,13 +2,14 @@ use orca_core::approval_rules::{PermissionRule, PermissionRules};
 use orca_core::approval_types::{ActionKind, ApprovalMode, Decision};
 use orca_core::config::ActivePermissionProfile;
 use orca_core::conversation::{MISSING_TOOL_TERMINAL_ERROR, Message, RawToolCall};
+use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{
     ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolResultKind, ToolStatus,
     ToolTerminalSource,
 };
 use orca_runtime::history::{
-    SessionStore, SortDirection, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
-    ThreadSortKey, ThreadStore, TurnItemsView,
+    LiveThread, SessionStore, SortDirection, ThreadListFilters, ThreadMetadataPatch,
+    ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
 };
 use tempfile::tempdir;
 
@@ -29,6 +30,7 @@ fn session_store_thread_store_appends_live_thread_items() {
 
         assert!(!thread.thread_id().is_empty());
 
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -241,6 +243,7 @@ fn session_store_paginates_thread_summaries_and_search_hits() {
         let mut first = store
             .create_live_thread(home, "mock", None, "first paginated thread")
             .expect("create first thread");
+        enter_test_turn(&mut first);
         first
             .append_items(&[Message::User {
                 content: "shared search needle first".to_string(),
@@ -254,6 +257,7 @@ fn session_store_paginates_thread_summaries_and_search_hits() {
         let mut second = store
             .create_live_thread(home, "mock", None, "second paginated thread")
             .expect("create second thread");
+        enter_test_turn(&mut second);
         second
             .append_items(&[Message::User {
                 content: "shared search needle second".to_string(),
@@ -531,6 +535,7 @@ fn session_store_projects_thread_turns_and_items() {
             .create_live_thread(home, "mock", None, "projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        let turn_id = enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -558,7 +563,7 @@ fn session_store_projects_thread_turns_and_items() {
             .expect("list thread turns");
         assert_eq!(turns.data.len(), 1);
         assert_eq!(turns.data[0].items_view, TurnItemsView::Full);
-        assert_eq!(turns.data[0].turn_id, "turn-1");
+        assert_eq!(turns.data[0].turn_id, turn_id.as_str());
         assert_eq!(turns.data[0].index, 0);
         assert_eq!(turns.data[0].role, "user");
         assert_eq!(turns.data[0].items.len(), 2);
@@ -572,18 +577,27 @@ fn session_store_projects_thread_turns_and_items() {
             .list_thread_items(&thread_id, None, None, 10, SortDirection::Asc)
             .expect("list thread items");
         assert_eq!(items.data.len(), 2);
-        assert_eq!(items.data[0].item_id, "item-1");
-        assert_eq!(items.data[0].turn_id, "turn-1");
+        assert!(items.data[0].item_id.starts_with("item_"));
+        assert_eq!(items.data[0].turn_id, turn_id.as_str());
         assert_eq!(items.data[0].item["content"], "turn projection user");
-        assert_eq!(items.data[1].item_id, "item-2");
-        assert_eq!(items.data[1].turn_id, "turn-1");
+        assert!(items.data[1].item_id.starts_with("item_"));
+        assert_ne!(items.data[0].item_id, items.data[1].item_id);
+        assert_eq!(items.data[1].turn_id, turn_id.as_str());
         assert_eq!(items.data[1].item["content"], "turn projection assistant");
 
         let filtered = store
-            .list_thread_items(&thread_id, Some("turn-1"), None, 10, SortDirection::Asc)
+            .list_thread_items(
+                &thread_id,
+                Some(turn_id.as_str()),
+                None,
+                10,
+                SortDirection::Asc,
+            )
             .expect("list filtered thread items");
         assert_eq!(filtered.data.len(), 2);
-        assert_eq!(filtered.data[1].turn_id, "turn-1");
+        assert_eq!(filtered.data[1].turn_id, turn_id.as_str());
+        assert_eq!(filtered.data[0].item_id, items.data[0].item_id);
+        assert_eq!(filtered.data[1].item_id, items.data[1].item_id);
         assert_eq!(
             filtered.data[1].item["content"],
             "turn projection assistant"
@@ -599,6 +613,7 @@ fn session_store_projects_mcp_tool_calls_as_thread_items() {
             .create_live_thread(home, "mock", None, "mcp projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -653,6 +668,7 @@ fn session_store_preserves_failed_mcp_tool_metadata_in_thread_items() {
             .create_live_thread(home, "mock", None, "failed mcp projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -705,6 +721,7 @@ fn session_store_projects_error_prefixed_mcp_tool_content_as_failed_item() {
             .create_live_thread(home, "mock", None, "error prefixed mcp thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -757,6 +774,7 @@ fn session_store_projects_external_tool_calls_as_dynamic_thread_items() {
             .create_live_thread(home, "mock", None, "external projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -814,6 +832,7 @@ fn session_store_preserves_failed_external_tool_metadata_in_dynamic_thread_items
             .create_live_thread(home, "mock", None, "failed external projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -866,6 +885,7 @@ fn session_store_preserves_denied_external_tool_metadata_in_dynamic_thread_items
             .create_live_thread(home, "mock", None, "denied external projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -926,6 +946,7 @@ fn session_store_preserves_truncated_tool_metadata_in_thread_items() {
             .create_live_thread(home, "mock", None, "truncated projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -986,6 +1007,7 @@ fn session_store_preserves_failed_command_projection_without_aggregated_output()
             .create_live_thread(home, "mock", None, "failed command projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -1043,6 +1065,7 @@ fn session_store_round_trips_tool_terminal_metadata() {
             .create_live_thread(home, "mock", None, "terminal metadata round trip")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
 
         let cancelled_request = ToolRequest {
             id: "cancelled-call".to_string(),
@@ -1179,6 +1202,7 @@ fn session_store_repairs_missing_tool_terminal_for_recovered_projections() {
             .create_live_thread(home, "mock", None, "recover missing terminal")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::user("run legacy command".to_string()),
@@ -1192,9 +1216,12 @@ fn session_store_repairs_missing_tool_terminal_for_recovered_projections() {
                     }],
                     pinned: false,
                 },
-                Message::user("continue after recovery".to_string()),
             ])
             .expect("append incomplete legacy turn");
+        enter_test_turn(&mut thread);
+        thread
+            .append_items(&[Message::user("continue after recovery".to_string())])
+            .expect("append recovery continuation turn");
         thread
             .complete("success")
             .expect("complete recovered thread");
@@ -1244,6 +1271,7 @@ fn session_store_projects_file_edit_calls_as_file_change_thread_items() {
             .create_live_thread(home, "mock", None, "edit projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -1307,6 +1335,7 @@ fn session_store_projects_write_file_calls_as_file_change_thread_items() {
             .create_live_thread(home, "mock", None, "write projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -1375,6 +1404,7 @@ fn session_store_projects_builtin_read_tool_as_dynamic_thread_item() {
             .create_live_thread(home, "mock", None, "read projected thread")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -1428,6 +1458,7 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
             .create_live_thread(home, "mock", None, "multi turn projection")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        let first_turn_id = enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -1440,6 +1471,11 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
                     tool_calls: Vec::new(),
                     pinned: false,
                 },
+            ])
+            .expect("append first turn items");
+        let second_turn_id = enter_test_turn(&mut thread);
+        thread
+            .append_items(&[
                 Message::User {
                     content: "second user".to_string(),
                     pinned: false,
@@ -1451,7 +1487,7 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
                     pinned: false,
                 },
             ])
-            .expect("append multi-turn items");
+            .expect("append second turn items");
         thread.complete("success").expect("complete thread");
 
         let turns = store
@@ -1464,36 +1500,46 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
             )
             .expect("list thread turns");
         assert_eq!(turns.data.len(), 2);
-        assert_eq!(turns.data[0].turn_id, "turn-1");
+        assert_eq!(turns.data[0].turn_id, first_turn_id.as_str());
         assert_eq!(turns.data[0].items.len(), 2);
-        assert_eq!(turns.data[1].turn_id, "turn-2");
+        assert_eq!(turns.data[1].turn_id, second_turn_id.as_str());
         assert_eq!(turns.data[1].items.len(), 2);
         assert_eq!(turns.data[1].items[0]["content"], "second user");
 
         let items = store
             .list_thread_items(&thread_id, None, None, 10, SortDirection::Asc)
             .expect("list all items");
-        assert_eq!(
+        assert_eq!(items.data.len(), 4);
+        assert!(
             items
                 .data
                 .iter()
-                .map(|item| (item.item_id.as_str(), item.turn_id.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("item-1", "turn-1"),
-                ("item-2", "turn-1"),
-                ("item-3", "turn-2"),
-                ("item-4", "turn-2"),
-            ]
+                .all(|item| item.item_id.starts_with("item_"))
         );
+        assert_eq!(items.data[0].turn_id, first_turn_id.as_str());
+        assert_eq!(items.data[1].turn_id, first_turn_id.as_str());
+        assert_eq!(items.data[2].turn_id, second_turn_id.as_str());
+        assert_eq!(items.data[3].turn_id, second_turn_id.as_str());
+        let item_ids = items
+            .data
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(item_ids.len(), 4);
 
         let second_turn_items = store
-            .list_thread_items(&thread_id, Some("turn-2"), None, 10, SortDirection::Asc)
+            .list_thread_items(
+                &thread_id,
+                Some(second_turn_id.as_str()),
+                None,
+                10,
+                SortDirection::Asc,
+            )
             .expect("list second turn items");
         assert_eq!(second_turn_items.data.len(), 2);
-        assert_eq!(second_turn_items.data[0].item_id, "item-3");
+        assert_eq!(second_turn_items.data[0].item_id, items.data[2].item_id);
         assert_eq!(second_turn_items.data[0].item["content"], "second user");
-        assert_eq!(second_turn_items.data[1].item_id, "item-4");
+        assert_eq!(second_turn_items.data[1].item_id, items.data[3].item_id);
         assert_eq!(
             second_turn_items.data[1].item["content"],
             "second assistant"
@@ -1509,6 +1555,7 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             .create_live_thread(home, "mock", None, "paginated projection")
             .expect("create live thread");
         let thread_id = thread.thread_id().to_string();
+        let first_turn_id = enter_test_turn(&mut thread);
         thread
             .append_items(&[
                 Message::User {
@@ -1521,6 +1568,11 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
                     tool_calls: Vec::new(),
                     pinned: false,
                 },
+            ])
+            .expect("append first paginated turn");
+        let second_turn_id = enter_test_turn(&mut thread);
+        thread
+            .append_items(&[
                 Message::User {
                     content: "second user".to_string(),
                     pinned: false,
@@ -1532,14 +1584,14 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
                     pinned: false,
                 },
             ])
-            .expect("append paginated items");
+            .expect("append second paginated turn");
         thread.complete("success").expect("complete thread");
 
         let first_turn_page = store
             .list_thread_turns(&thread_id, None, 1, SortDirection::Asc, TurnItemsView::Full)
             .expect("first turn page");
         assert_eq!(first_turn_page.data.len(), 1);
-        assert_eq!(first_turn_page.data[0].turn_id, "turn-1");
+        assert_eq!(first_turn_page.data[0].turn_id, first_turn_id.as_str());
         assert_eq!(first_turn_page.next_cursor.as_deref(), Some("1"));
         assert_eq!(first_turn_page.backwards_cursor.as_deref(), Some("0"));
 
@@ -1553,7 +1605,7 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             )
             .expect("second turn page");
         assert_eq!(second_turn_page.data.len(), 1);
-        assert_eq!(second_turn_page.data[0].turn_id, "turn-2");
+        assert_eq!(second_turn_page.data[0].turn_id, second_turn_id.as_str());
         assert_eq!(second_turn_page.next_cursor, None);
         assert_eq!(second_turn_page.backwards_cursor.as_deref(), Some("1"));
 
@@ -1561,7 +1613,18 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             .list_thread_items(&thread_id, None, None, 2, SortDirection::Asc)
             .expect("first item page");
         assert_eq!(first_item_page.data.len(), 2);
-        assert_eq!(first_item_page.data[0].item_id, "item-1");
+        assert!(
+            first_item_page
+                .data
+                .iter()
+                .all(|item| item.item_id.starts_with("item_"))
+        );
+        assert!(
+            first_item_page
+                .data
+                .iter()
+                .all(|item| item.turn_id == first_turn_id.as_str())
+        );
         assert_eq!(first_item_page.next_cursor.as_deref(), Some("2"));
 
         let second_item_page = store
@@ -1574,7 +1637,18 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             )
             .expect("second item page");
         assert_eq!(second_item_page.data.len(), 2);
-        assert_eq!(second_item_page.data[0].item_id, "item-3");
+        assert!(
+            second_item_page
+                .data
+                .iter()
+                .all(|item| item.item_id.starts_with("item_"))
+        );
+        assert!(
+            second_item_page
+                .data
+                .iter()
+                .all(|item| item.turn_id == second_turn_id.as_str())
+        );
         assert_eq!(second_item_page.next_cursor, None);
         assert_eq!(second_item_page.backwards_cursor.as_deref(), Some("2"));
 
@@ -1588,7 +1662,7 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             )
             .expect("latest turn page");
         assert_eq!(latest_turn_page.data.len(), 1);
-        assert_eq!(latest_turn_page.data[0].turn_id, "turn-2");
+        assert_eq!(latest_turn_page.data[0].turn_id, second_turn_id.as_str());
         assert_eq!(latest_turn_page.next_cursor.as_deref(), Some("1"));
 
         let unloaded_turn_page = store
@@ -1611,7 +1685,10 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             .list_thread_items(&thread_id, None, None, 1, SortDirection::Desc)
             .expect("latest item page");
         assert_eq!(latest_item_page.data.len(), 1);
-        assert_eq!(latest_item_page.data[0].item_id, "item-4");
+        assert_eq!(
+            latest_item_page.data[0].item_id,
+            second_item_page.data[1].item_id
+        );
         assert_eq!(latest_item_page.data[0].item["content"], "second assistant");
     });
 }
@@ -1632,4 +1709,10 @@ fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
         }
     }
     result
+}
+
+fn enter_test_turn(thread: &mut LiveThread) -> TurnId {
+    let turn_id = TurnId::new();
+    thread.writer_mut().enter_turn(turn_id.clone());
+    turn_id
 }

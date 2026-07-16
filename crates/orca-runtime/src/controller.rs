@@ -391,6 +391,9 @@ impl<'a> ThreadTurnContext<'a> {
         let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
         let prompt = request.prompt().to_string();
         let mut parts = session.runtime_parts();
+        if let Some(writer) = parts.writer.as_deref_mut() {
+            writer.enter_turn(request.turn_id().clone());
+        }
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             parts
                 .conversation

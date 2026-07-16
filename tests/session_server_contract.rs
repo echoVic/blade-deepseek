@@ -1420,9 +1420,9 @@ fn server_mode_interrupts_active_thread_turn_before_completion() {
         stdin.flush().expect("flush slow turn");
     }
     let turn_started = child.expect_event("turn-slow", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
 
     let interrupt_sent_at = Instant::now();
@@ -1498,9 +1498,9 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
         stdin.flush().expect("flush hook turn");
     }
     let turn_started = child.expect_event("turn-hook", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
 
     {
@@ -1582,9 +1582,9 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait() {
         stdin.flush().expect("flush bash turn");
     }
     let turn_started = child.expect_event("turn-bash", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
     let tool_requested = child.expect_event("turn-bash", "tool_requested");
     assert_eq!(tool_requested["tool"], "bash");
@@ -1700,9 +1700,9 @@ fn server_mode_interrupt_cancels_active_mcp_tool_wait() {
         stdin.flush().expect("flush MCP turn");
     }
     let turn_started = child.expect_event("turn-mcp", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
     let tool_requested = child.expect_event("turn-mcp", "tool_requested");
     assert_eq!(tool_requested["tool"], "mcp__slow__wait");
@@ -1788,9 +1788,9 @@ fn server_mode_interrupt_cancels_pending_mcp_elicitation() {
         stdin.flush().expect("flush MCP elicitation turn");
     }
     let turn_started = child.expect_event("turn-mcp-elicit", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
     let request = child.expect_event("turn-mcp-elicit", "mcp_elicitation_request");
     assert_eq!(request["turnId"], turn_id);
@@ -2006,9 +2006,9 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
         stdin.flush().expect("flush slow turn");
     }
     let turn_started = child.expect_event("turn-slow", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
 
     {
@@ -2106,9 +2106,9 @@ fn server_mode_steers_active_thread_turn_as_user_item() {
         stdin.flush().expect("flush slow turn");
     }
     let turn_started = child.expect_event("turn-slow", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
 
     {
@@ -2203,9 +2203,9 @@ fn server_mode_steers_active_thread_turn_with_multi_text_input() {
         stdin.flush().expect("flush slow turn");
     }
     let turn_started = child.expect_event("turn-slow", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
+    let turn_id = turn_started["turnId"]
         .as_str()
-        .expect("turn task id")
+        .expect("logical turn id")
         .to_string();
 
     {
@@ -2375,10 +2375,14 @@ fn server_mode_active_turn_id_matches_persisted_turn_id() {
         stdin.flush().expect("flush turn/start");
     }
     let turn_started = child.expect_event("turn-one", "turn_started");
-    let active_turn_id = turn_started["task"]["task_id"]
+    let active_turn_id = turn_started["turnId"]
         .as_str()
         .expect("active turn id")
         .to_string();
+    let runtime_task_id = turn_started["task"]["task_id"]
+        .as_str()
+        .expect("runtime task id");
+    assert_ne!(active_turn_id, runtime_task_id);
     child.expect_event("turn-one", "turn_completed");
 
     {
@@ -2453,9 +2457,7 @@ fn server_mode_rejects_turn_control_thread_mismatch() {
         stdin.flush().expect("flush thread a turn");
     }
     let turn_started = child.expect_event("turn-a", "turn_started");
-    let turn_id = turn_started["task"]["task_id"]
-        .as_str()
-        .expect("turn task id");
+    let turn_id = turn_started["turnId"].as_str().expect("logical turn id");
 
     {
         let stdin = child.stdin_mut();

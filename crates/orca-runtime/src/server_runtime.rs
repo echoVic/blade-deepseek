@@ -300,12 +300,22 @@ impl ServerThread {
             Vec::new()
         };
         let turns = if include_turns {
-            crate::thread_store::messages_to_thread_turns(
-                self.thread_id(),
-                snapshot.messages(),
-                usize::MAX,
-                TurnItemsView::Full,
-            )
+            if let Some(records) = snapshot.conversation_records() {
+                crate::thread_store::conversation_records_to_thread_turns(
+                    self.thread_id(),
+                    records,
+                    usize::MAX,
+                    TurnItemsView::Full,
+                )
+                .ok()?
+            } else {
+                crate::thread_store::messages_to_thread_turns(
+                    self.thread_id(),
+                    snapshot.messages(),
+                    usize::MAX,
+                    TurnItemsView::Full,
+                )
+            }
         } else {
             Vec::new()
         };
@@ -331,13 +341,24 @@ impl ServerThread {
         items_view: TurnItemsView,
     ) -> Option<crate::thread_store::StoredThreadTurnPage> {
         let snapshot = self.handle.snapshot().ok()?;
-        Some(crate::thread_store::page_thread_turns(
+        let turns = if let Some(records) = snapshot.conversation_records() {
+            crate::thread_store::conversation_records_to_thread_turns(
+                self.thread_id(),
+                records,
+                usize::MAX,
+                items_view,
+            )
+            .ok()?
+        } else {
             crate::thread_store::messages_to_thread_turns(
                 self.thread_id(),
                 snapshot.messages(),
                 usize::MAX,
                 items_view,
-            ),
+            )
+        };
+        Some(crate::thread_store::page_thread_turns(
+            turns,
             cursor,
             limit,
             sort_direction,
@@ -352,13 +373,24 @@ impl ServerThread {
         sort_direction: crate::thread_store::SortDirection,
     ) -> Option<crate::thread_store::StoredThreadItemPage> {
         let snapshot = self.handle.snapshot().ok()?;
-        Some(crate::thread_store::page_thread_items(
+        let items = if let Some(records) = snapshot.conversation_records() {
+            crate::thread_store::conversation_records_to_thread_items(
+                self.thread_id(),
+                records,
+                turn_id,
+                usize::MAX,
+            )
+            .ok()?
+        } else {
             crate::thread_store::messages_to_thread_items(
                 self.thread_id(),
                 snapshot.messages(),
                 turn_id,
                 usize::MAX,
-            ),
+            )
+        };
+        Some(crate::thread_store::page_thread_items(
+            items,
             cursor,
             limit,
             sort_direction,

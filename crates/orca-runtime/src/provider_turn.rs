@@ -1367,6 +1367,7 @@ mod tests {
                     &instructions,
                     config.approval_mode,
                     &memory,
+                    &orca_core::thread_identity::TurnId::new(),
                     true,
                 )
                 .expect("prepare conversation");

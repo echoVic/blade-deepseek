@@ -1,4 +1,10 @@
-use orca_core::conversation::{Message, RawToolCall};
+use std::collections::{HashMap, HashSet};
+use std::io;
+
+use orca_core::conversation::{
+    Message, RawToolCall, assistant_message_has_payload, normalize_tool_boundaries,
+    repaired_missing_tool_result,
+};
 use orca_core::thread_item_projection::ProjectedToolTerminalMetadata;
 use orca_core::tool_types::ToolTerminal;
 use serde_json::{Value, json};
@@ -11,8 +17,8 @@ use crate::tool_item_projection::{
 };
 
 use super::types::{
-    SessionSummary, StoredMessage, StoredThreadItem, StoredThreadSummary, StoredThreadTurn,
-    TurnItemsView,
+    SessionSummary, StoredConversationRecord, StoredMessage, StoredThreadItem, StoredThreadSummary,
+    StoredThreadTurn, TurnItemsView,
 };
 
 pub(crate) fn message_to_thread_json(message: &Message) -> Value {
@@ -80,6 +86,324 @@ fn tool_calls_to_values(tool_calls: &[RawToolCall]) -> Vec<Value> {
         .collect()
 }
 
+struct ProjectedConversationItem {
+    item_id: Option<String>,
+    item: Value,
+}
+
+struct ProjectedConversationTurn {
+    turn_id: String,
+    index: usize,
+    role: String,
+    identified: bool,
+    items: Vec<ProjectedConversationItem>,
+}
+
+pub(crate) fn conversation_records_to_thread_turns(
+    thread_id: &str,
+    records: &[StoredConversationRecord],
+    limit: usize,
+    items_view: TurnItemsView,
+) -> io::Result<Vec<StoredThreadTurn>> {
+    Ok(project_conversation_records(records)?
+        .into_iter()
+        .take(limit)
+        .map(|turn| StoredThreadTurn {
+            thread_id: thread_id.to_string(),
+            turn_id: turn.turn_id,
+            index: turn.index,
+            role: turn.role,
+            items_view,
+            items: if items_view == TurnItemsView::NotLoaded {
+                Vec::new()
+            } else {
+                turn.items.into_iter().map(|item| item.item).collect()
+            },
+        })
+        .collect())
+}
+
+pub(crate) fn conversation_records_to_thread_items(
+    thread_id: &str,
+    records: &[StoredConversationRecord],
+    turn_id: Option<&str>,
+    limit: usize,
+) -> io::Result<Vec<StoredThreadItem>> {
+    Ok(project_conversation_records(records)?
+        .into_iter()
+        .flat_map(|turn| {
+            turn.items
+                .into_iter()
+                .map(move |item| (turn.turn_id.clone(), item))
+        })
+        .enumerate()
+        .map(|(index, (item_turn_id, item))| StoredThreadItem {
+            thread_id: thread_id.to_string(),
+            turn_id: item_turn_id,
+            item_id: item.item_id.unwrap_or_else(|| item_id_for_index(index)),
+            index,
+            item: item.item,
+        })
+        .filter(|item| turn_id.is_none_or(|requested| requested == item.turn_id))
+        .take(limit)
+        .collect())
+}
+
+pub(crate) fn normalized_stored_messages(
+    records: &[StoredConversationRecord],
+) -> Vec<StoredMessage> {
+    let mut messages = records
+        .iter()
+        .map(|record| Message::from(record.message.clone()))
+        .collect::<Vec<_>>();
+    normalize_tool_boundaries(&mut messages);
+    messages.iter().map(StoredMessage::from).collect()
+}
+
+fn project_conversation_records(
+    records: &[StoredConversationRecord],
+) -> io::Result<Vec<ProjectedConversationTurn>> {
+    let mut turns = Vec::new();
+    let mut closed_identified_turns = HashSet::new();
+    let mut index = 0usize;
+
+    while index < records.len() {
+        let record = &records[index];
+        validate_record_identity(record)?;
+        match &record.message {
+            StoredMessage::System { .. } | StoredMessage::Tool { .. } => {
+                index += 1;
+            }
+            StoredMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } if !assistant_message_has_payload(content.as_deref(), tool_calls) => {
+                index += 1;
+            }
+            StoredMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                pinned,
+            } if !tool_calls.is_empty() => {
+                let mut seen_call_ids = HashSet::new();
+                let unique_tool_calls = tool_calls
+                    .iter()
+                    .filter(|tool_call| seen_call_ids.insert(tool_call.id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let assistant = StoredMessage::Assistant {
+                    content: content.clone(),
+                    reasoning_content: reasoning_content.clone(),
+                    tool_calls: unique_tool_calls.clone(),
+                    pinned: *pinned,
+                };
+                let mut items = projected_record_items(record, &assistant)?;
+                let expected = unique_tool_calls
+                    .iter()
+                    .map(|tool_call| tool_call.id.as_str())
+                    .collect::<HashSet<_>>();
+                let mut results = HashMap::new();
+                let mut next = index + 1;
+                while next < records.len() {
+                    let tool_record = &records[next];
+                    let StoredMessage::Tool {
+                        tool_call_id,
+                        content,
+                        terminal,
+                        ..
+                    } = &tool_record.message
+                    else {
+                        break;
+                    };
+                    validate_record_identity(tool_record)?;
+                    validate_tool_result_owner(record, tool_record)?;
+                    if expected.contains(tool_call_id.as_str()) {
+                        results.entry(tool_call_id.clone()).or_insert_with(|| {
+                            tool_result_to_thread_item(
+                                tool_call_id,
+                                content,
+                                terminal.terminal_ref(),
+                            )
+                        });
+                    }
+                    next += 1;
+                }
+                for tool_call in &unique_tool_calls {
+                    let result = results
+                        .remove(&tool_call.id)
+                        .unwrap_or_else(|| repaired_tool_result_item(tool_call));
+                    merge_projected_record_items(
+                        &mut items,
+                        vec![ProjectedConversationItem {
+                            item_id: None,
+                            item: result,
+                        }],
+                    );
+                }
+                push_projected_record(
+                    &mut turns,
+                    &mut closed_identified_turns,
+                    record,
+                    "assistant",
+                    items,
+                )?;
+                index = next.max(index + 1);
+            }
+            message => {
+                let role = stored_message_role(message);
+                let items = projected_record_items(record, message)?;
+                push_projected_record(
+                    &mut turns,
+                    &mut closed_identified_turns,
+                    record,
+                    role,
+                    items,
+                )?;
+                index += 1;
+            }
+        }
+    }
+
+    Ok(turns)
+}
+
+fn validate_record_identity(record: &StoredConversationRecord) -> io::Result<()> {
+    if record.item_id.is_some() == record.turn_id.is_some() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "conversation record id and turn_id must be present together",
+    ))
+}
+
+fn validate_tool_result_owner(
+    request: &StoredConversationRecord,
+    result: &StoredConversationRecord,
+) -> io::Result<()> {
+    if request.turn_id == result.turn_id && request.item_id.is_some() == result.item_id.is_some() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "tool result identity does not match its assistant turn",
+    ))
+}
+
+fn projected_record_items(
+    record: &StoredConversationRecord,
+    message: &StoredMessage,
+) -> io::Result<Vec<ProjectedConversationItem>> {
+    let identified = record.item_id.is_some();
+    stored_message_to_thread_items_for_projection(message)
+        .into_iter()
+        .map(|item| {
+            let item_id = if identified {
+                if item.get("role").is_some() {
+                    record.item_id.as_ref().map(ToString::to_string)
+                } else if item["type"] == "tool_result" {
+                    None
+                } else {
+                    Some(
+                        item["id"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "identified tool item is missing its domain id",
+                                )
+                            })?
+                            .to_string(),
+                    )
+                }
+            } else {
+                None
+            };
+            Ok(ProjectedConversationItem { item_id, item })
+        })
+        .collect()
+}
+
+fn push_projected_record(
+    turns: &mut Vec<ProjectedConversationTurn>,
+    closed_identified_turns: &mut HashSet<String>,
+    record: &StoredConversationRecord,
+    role: &str,
+    items: Vec<ProjectedConversationItem>,
+) -> io::Result<()> {
+    if let Some(turn_id) = record.turn_id.as_ref() {
+        let turn_id = turn_id.to_string();
+        if turns.last().is_some_and(|turn| turn.turn_id == turn_id) {
+            merge_projected_record_items(&mut turns.last_mut().expect("last turn").items, items);
+            return Ok(());
+        }
+        if !closed_identified_turns.insert(turn_id.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("identified turn {turn_id} is not contiguous"),
+            ));
+        }
+        let index = turns.len();
+        turns.push(ProjectedConversationTurn {
+            turn_id,
+            index,
+            role: role.to_string(),
+            identified: true,
+            items,
+        });
+        return Ok(());
+    }
+
+    let starts_turn = turns.last().is_none_or(|turn| turn.identified) || role == "user";
+    if starts_turn {
+        let index = turns.len();
+        turns.push(ProjectedConversationTurn {
+            turn_id: turn_id_for_index(index),
+            index,
+            role: role.to_string(),
+            identified: false,
+            items,
+        });
+    } else if let Some(turn) = turns.last_mut() {
+        merge_projected_record_items(&mut turn.items, items);
+    }
+    Ok(())
+}
+
+fn merge_projected_record_items(
+    turn_items: &mut Vec<ProjectedConversationItem>,
+    items: Vec<ProjectedConversationItem>,
+) {
+    for item in items {
+        if item.item["type"] == "tool_result"
+            && let Some(tool_call_id) = item.item["toolCallId"].as_str()
+            && let Some(existing) = turn_items
+                .iter_mut()
+                .rev()
+                .find(|candidate| projected_tool_item_matches_result(&candidate.item, tool_call_id))
+        {
+            complete_tool_item(&mut existing.item, &item.item);
+            continue;
+        }
+        turn_items.push(item);
+    }
+}
+
+fn repaired_tool_result_item(tool_call: &RawToolCall) -> Value {
+    let Message::Tool {
+        tool_call_id,
+        content,
+        terminal,
+        ..
+    } = repaired_missing_tool_result(tool_call)
+    else {
+        unreachable!("tool repair always creates a tool result")
+    };
+    tool_result_to_thread_item(&tool_call_id, &content, terminal.as_ref())
+}
+
 pub(crate) fn messages_to_thread_turns(
     thread_id: &str,
     messages: &[Message],
@@ -99,44 +423,6 @@ pub(crate) fn messages_to_thread_items(
     limit: usize,
 ) -> Vec<StoredThreadItem> {
     group_messages_into_thread_turns(thread_id, messages, TurnItemsView::Full)
-        .into_iter()
-        .flat_map(|turn| {
-            turn.items
-                .into_iter()
-                .map(move |item| (turn.turn_id.clone(), item))
-        })
-        .enumerate()
-        .map(|(item_index, (item_turn_id, item))| StoredThreadItem {
-            thread_id: thread_id.to_string(),
-            turn_id: item_turn_id,
-            item_id: item_id_for_index(item_index),
-            index: item_index,
-            item,
-        })
-        .filter(|item| turn_id.is_none_or(|requested| requested == item.turn_id))
-        .take(limit)
-        .collect()
-}
-
-pub(crate) fn stored_messages_to_thread_turns(
-    thread_id: &str,
-    messages: &[StoredMessage],
-    limit: usize,
-    items_view: TurnItemsView,
-) -> Vec<StoredThreadTurn> {
-    group_stored_messages_into_thread_turns(thread_id, messages, items_view)
-        .into_iter()
-        .take(limit)
-        .collect()
-}
-
-pub(crate) fn stored_messages_to_thread_items(
-    thread_id: &str,
-    messages: &[StoredMessage],
-    turn_id: Option<&str>,
-    limit: usize,
-) -> Vec<StoredThreadItem> {
-    group_stored_messages_into_thread_turns(thread_id, messages, TurnItemsView::Full)
         .into_iter()
         .flat_map(|turn| {
             turn.items
@@ -184,39 +470,6 @@ fn group_messages_into_thread_turns(
             if turn.items_view != TurnItemsView::NotLoaded {
                 merge_projected_items(&mut turn.items, items);
             }
-        }
-    }
-    turns
-}
-
-fn group_stored_messages_into_thread_turns(
-    thread_id: &str,
-    messages: &[StoredMessage],
-    items_view: TurnItemsView,
-) -> Vec<StoredThreadTurn> {
-    let mut turns = Vec::new();
-    for message in messages {
-        if matches!(message, StoredMessage::System { .. }) {
-            continue;
-        }
-        let items = stored_message_to_thread_items_for_projection(message);
-        let role = stored_message_role(message).to_string();
-        let starts_turn = turns.is_empty() || matches!(message, StoredMessage::User { .. });
-
-        if starts_turn {
-            let index = turns.len();
-            turns.push(StoredThreadTurn {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id_for_index(index),
-                index,
-                role,
-                items_view,
-                items: items_for_view(items_view, items),
-            });
-        } else if let Some(turn) = turns.last_mut()
-            && turn.items_view != TurnItemsView::NotLoaded
-        {
-            merge_projected_items(&mut turn.items, items);
         }
     }
     turns

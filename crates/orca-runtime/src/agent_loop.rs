@@ -44,6 +44,7 @@ pub(crate) fn run_agent_loop(
         turn_execution,
     } = loop_context;
     let RuntimeTurnContext {
+        turn_id,
         cwd,
         prompt,
         subagent_depth,
@@ -80,6 +81,7 @@ pub(crate) fn run_agent_loop(
         turn_deps.instructions,
         config.approval_mode,
         turn_deps.memory,
+        &turn_id,
         emit_deltas,
     )?;
 

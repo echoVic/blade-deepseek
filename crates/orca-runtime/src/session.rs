@@ -20,7 +20,8 @@ use crate::instructions::{self, ProjectInstructions};
 use crate::memory::{self, MemoryBlock};
 use crate::tasks::TaskRegistry;
 use crate::thread_store::{
-    SessionMeta, SessionStore, SessionTranscript, SessionWriter, ThreadStore,
+    SessionMeta, SessionStore, SessionTranscript, SessionWriter, StoredConversationRecord,
+    ThreadStore,
 };
 
 const INTERRUPTED_RESUME_HINT: &str = "Previous turn was interrupted; existing workspace edits remain. Inspect git diff before continuing.";
@@ -165,8 +166,13 @@ pub(crate) fn record_initial_history_for_agent(
     };
 
     if resumed {
-        for message in &conversation.messages {
-            writer.append_message(message)?;
+        let last_index = conversation.messages.len().saturating_sub(1);
+        for (index, message) in conversation.messages.iter().enumerate() {
+            if index == last_index && matches!(message, Message::User { .. }) {
+                writer.append_message(message)?;
+            } else {
+                writer.append_legacy_message(message)?;
+            }
         }
         if !conversation.summary.is_empty() {
             let inherited_marker = conversation
@@ -421,6 +427,12 @@ impl InteractiveSession {
         self.writer.as_mut()
     }
 
+    pub(crate) fn conversation_records(&self) -> Option<Vec<StoredConversationRecord>> {
+        self.writer
+            .as_ref()
+            .map(SessionWriter::conversation_records)
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
@@ -518,7 +530,7 @@ impl InteractiveSession {
 
     pub fn append_message(&mut self, message: &orca_core::conversation::Message) {
         if let Some(writer) = &mut self.writer {
-            if let Err(error) = writer.append_message(message) {
+            if let Err(error) = writer.append_detached_message(message) {
                 eprintln!("orca: warning: history write failed: {error}");
                 self.writer = None;
             }
@@ -655,7 +667,7 @@ fn start_writer_with_messages(
     match store.start_writer_from_meta(meta) {
         Ok(mut writer) => {
             for message in &conversation.messages {
-                if let Err(error) = writer.append_message(message) {
+                if let Err(error) = writer.append_legacy_message(message) {
                     eprintln!("orca: warning: history write failed: {error}");
                     return None;
                 }
@@ -843,6 +855,7 @@ mod tests {
             let mut writer =
                 history::SessionWriter::start(home, "mock", Some("auto".to_string()), "resume")
                     .expect("writer");
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
             writer
                 .append_message(&orca_core::conversation::Message::User {
                     content: "previous".to_string(),
@@ -933,6 +946,7 @@ mod tests {
             let mut writer =
                 history::SessionWriter::start(home, "mock", Some("auto".to_string()), "resume")
                     .expect("writer");
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
             writer
                 .append_message(&orca_core::conversation::Message::User {
                     content: "previous".to_string(),

@@ -994,6 +994,7 @@ pub struct RuntimeThreadSnapshot {
     thread_id: String,
     session_id: Option<String>,
     conversation: Conversation,
+    conversation_records: Option<Vec<crate::thread_store::StoredConversationRecord>>,
     usage_totals: UsageTotals,
     completion_error: Option<String>,
     has_active_workflows: bool,
@@ -1006,6 +1007,7 @@ impl RuntimeThreadSnapshot {
             thread_id: thread.thread_id().to_string(),
             session_id: thread.session().session_id().map(str::to_string),
             conversation: thread.session().conversation().clone(),
+            conversation_records: thread.session().conversation_records(),
             usage_totals,
             completion_error: thread.session().completion_error().map(str::to_string),
             has_active_workflows: thread.session().has_active_workflows(),
@@ -1030,6 +1032,12 @@ impl RuntimeThreadSnapshot {
 
     pub fn conversation(&self) -> &Conversation {
         &self.conversation
+    }
+
+    pub(crate) fn conversation_records(
+        &self,
+    ) -> Option<&[crate::thread_store::StoredConversationRecord]> {
+        self.conversation_records.as_deref()
     }
 
     pub fn usage_totals(&self) -> UsageTotals {

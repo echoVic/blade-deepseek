@@ -243,6 +243,56 @@ fn recorded_server_turn_journals_the_emitted_turn_id() {
 }
 
 #[test]
+fn recorded_server_turn_persists_identified_conversation_records() {
+    with_orca_home(|home| {
+        let mut config = test_run_config(home);
+        config.history_mode = HistoryMode::Record;
+        let mut runtime = start_server_runtime();
+        let thread_id = runtime
+            .start_thread(&config)
+            .expect("start recorded thread");
+        let mut output = Vec::new();
+
+        runtime
+            .run_turn(
+                &config,
+                &thread_id,
+                "persist stable item identity",
+                request_writer(&mut output),
+            )
+            .expect("run recorded turn");
+
+        let emitted_turn_id = parse_jsonl(&output)
+            .into_iter()
+            .find(|event| event["event"] == "turn_started")
+            .and_then(|event| event["turnId"].as_str().map(ToString::to_string))
+            .expect("emitted turn identity");
+        let transcript = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load recorded transcript");
+        let records = std::fs::read_to_string(&transcript.path)
+            .expect("read recorded conversation")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| {
+                record["type"] == "conversation.message" && record["message"]["role"] != "system"
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!records.is_empty(), "expected persisted turn messages");
+        for record in records {
+            assert!(
+                record["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("item_")),
+                "new conversation records must own opaque item ids: {record}"
+            );
+            assert_eq!(record["turn_id"], emitted_turn_id);
+        }
+    });
+}
+
+#[test]
 fn thread_turn_executor_runs_interactive_session_turns() {
     with_orca_home(|home| {
         let config = test_run_config(home);
@@ -484,6 +534,164 @@ fn server_thread_runtime_materializes_started_thread_in_session_store() {
 }
 
 #[test]
+fn recorded_thread_live_and_cold_projections_keep_ids_across_resume() {
+    with_orca_home(|home| {
+        let mut runtime = start_server_runtime();
+        let mut config = test_run_config(home);
+        config.history_mode = HistoryMode::Record;
+        let thread_id = runtime.start_thread(&config).expect("start thread");
+        let mut first_output = Vec::new();
+
+        runtime
+            .run_turn(
+                &config,
+                &thread_id,
+                "first stable turn",
+                request_writer(&mut first_output),
+            )
+            .expect("run first turn");
+        let first_turn_id = parse_jsonl(&first_output)
+            .into_iter()
+            .find(|event| event["event"] == "turn_started")
+            .and_then(|event| event["turnId"].as_str().map(ToString::to_string))
+            .expect("first emitted turn id");
+
+        let live_turns = runtime
+            .list_thread_turns(
+                &thread_id,
+                None,
+                usize::MAX,
+                SortDirection::Asc,
+                orca_runtime::history::TurnItemsView::Full,
+            )
+            .expect("live turns");
+        let live_items = runtime
+            .list_thread_items(&thread_id, None, None, usize::MAX, SortDirection::Asc)
+            .expect("live items");
+        let store = SessionStore::new();
+        let cold_turns = store
+            .list_thread_turns(
+                &thread_id,
+                None,
+                usize::MAX,
+                SortDirection::Asc,
+                orca_runtime::history::TurnItemsView::Full,
+            )
+            .expect("cold turns");
+        let cold_items = store
+            .list_thread_items(&thread_id, None, None, usize::MAX, SortDirection::Asc)
+            .expect("cold items");
+
+        assert_eq!(live_turns, cold_turns);
+        assert_eq!(live_items, cold_items);
+        assert_eq!(cold_turns.data[0].turn_id, first_turn_id);
+        assert!(
+            cold_items
+                .data
+                .iter()
+                .all(|item| item.item_id.starts_with("item_"))
+        );
+        let first_item_ids = cold_items
+            .data
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>();
+
+        runtime
+            .resume_thread(&config, &thread_id)
+            .expect("resume recorded thread");
+        let mut second_output = Vec::new();
+        runtime
+            .run_turn(
+                &config,
+                &thread_id,
+                "second stable turn",
+                request_writer(&mut second_output),
+            )
+            .expect("run resumed turn");
+        let second_turn_id = parse_jsonl(&second_output)
+            .into_iter()
+            .find(|event| event["event"] == "turn_started")
+            .and_then(|event| event["turnId"].as_str().map(ToString::to_string))
+            .expect("second emitted turn id");
+        let resumed_turns = store
+            .list_thread_turns(
+                &thread_id,
+                None,
+                usize::MAX,
+                SortDirection::Asc,
+                orca_runtime::history::TurnItemsView::Full,
+            )
+            .expect("resumed turns");
+        let resumed_items = store
+            .list_thread_items(&thread_id, None, None, usize::MAX, SortDirection::Asc)
+            .expect("resumed items");
+
+        assert_eq!(resumed_turns.data[0].turn_id, first_turn_id);
+        assert_eq!(resumed_turns.data[1].turn_id, second_turn_id);
+        assert_eq!(
+            &resumed_items
+                .data
+                .iter()
+                .take(first_item_ids.len())
+                .map(|item| item.item_id.clone())
+                .collect::<Vec<_>>(),
+            &first_item_ids
+        );
+
+        let expected_turn_ids = resumed_turns
+            .data
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect::<Vec<_>>();
+        let expected_item_ids = resumed_items
+            .data
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>();
+        drop(runtime);
+        store
+            .rename_session(&thread_id, "stable identity history")
+            .expect("rename recorded thread");
+        store
+            .archive_session(&thread_id)
+            .expect("archive recorded thread");
+        store
+            .compress_session(&thread_id)
+            .expect("compress archived thread");
+
+        let rewritten_turns = store
+            .list_thread_turns(
+                &thread_id,
+                None,
+                usize::MAX,
+                SortDirection::Asc,
+                orca_runtime::history::TurnItemsView::Full,
+            )
+            .expect("rewritten turns");
+        let rewritten_items = store
+            .list_thread_items(&thread_id, None, None, usize::MAX, SortDirection::Asc)
+            .expect("rewritten items");
+        assert_eq!(
+            rewritten_turns
+                .data
+                .iter()
+                .map(|turn| turn.turn_id.clone())
+                .collect::<Vec<_>>(),
+            expected_turn_ids
+        );
+        assert_eq!(
+            rewritten_items
+                .data
+                .iter()
+                .map(|item| item.item_id.clone())
+                .collect::<Vec<_>>(),
+            expected_item_ids
+        );
+    });
+}
+
+#[test]
 fn server_thread_runtime_resumes_and_forks_persisted_threads() {
     with_orca_home(|home| {
         let mut runtime = start_server_runtime();
@@ -535,6 +743,63 @@ fn server_thread_runtime_resumes_and_forks_persisted_threads() {
             .read_thread(&forked_id, false, false)
             .expect("read stored fork");
         assert_eq!(stored_fork.thread_id, forked_id);
+        let inherited_turns = SessionStore::new()
+            .list_thread_turns(
+                &forked_id,
+                None,
+                usize::MAX,
+                SortDirection::Asc,
+                orca_runtime::history::TurnItemsView::Full,
+            )
+            .expect("read inherited fork turns");
+        let inherited_turn_ids = inherited_turns
+            .data
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect::<Vec<_>>();
+        assert!(!inherited_turn_ids.is_empty());
+        assert!(
+            inherited_turn_ids
+                .iter()
+                .all(|turn_id| turn_id.starts_with("turn-"))
+        );
+
+        let mut fork_output = Vec::new();
+        runtime
+            .run_turn(
+                &config,
+                &forked_id,
+                "new fork turn",
+                request_writer(&mut fork_output),
+            )
+            .expect("run fork turn");
+        let emitted_fork_turn_id = parse_jsonl(&fork_output)
+            .into_iter()
+            .find(|event| event["event"] == "turn_started")
+            .and_then(|event| event["turnId"].as_str().map(ToString::to_string))
+            .expect("emitted fork turn id");
+        let fork_turns = SessionStore::new()
+            .list_thread_turns(
+                &forked_id,
+                None,
+                usize::MAX,
+                SortDirection::Asc,
+                orca_runtime::history::TurnItemsView::Full,
+            )
+            .expect("read fork turns after execution");
+        assert_eq!(
+            fork_turns
+                .data
+                .iter()
+                .take(inherited_turn_ids.len())
+                .map(|turn| turn.turn_id.clone())
+                .collect::<Vec<_>>(),
+            inherited_turn_ids
+        );
+        assert_eq!(
+            fork_turns.data.last().map(|turn| turn.turn_id.as_str()),
+            Some(emitted_fork_turn_id.as_str())
+        );
     });
 }
 
