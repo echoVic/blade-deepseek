@@ -3170,6 +3170,7 @@ enabled = true
             let repo = home.join("repo");
             let git_dir = repo.join(".git");
             std::fs::create_dir_all(&git_dir).expect("git dir");
+            trust_test_folder(home, &repo);
             let index_lock = git_dir.join("index.lock");
             let mut config = test_run_config();
             config.cwd = Some(repo.clone());
@@ -3275,12 +3276,13 @@ enabled = true
             return;
         }
 
-        with_orca_home(|_| {
+        with_orca_home(|home| {
             let parent = sandbox_test_parent("server-unsandboxed-");
             let workspace = parent.path().join("workspace-unsandboxed");
             let outside = parent.path().join("outside-unsandboxed");
             std::fs::create_dir_all(&workspace).expect("workspace dir");
             std::fs::create_dir_all(&outside).expect("outside dir");
+            trust_test_folder(home, &workspace);
             let marker = outside.join("credential-helper-output");
             let mut config = test_run_config();
             config.cwd = Some(workspace.clone());
@@ -3378,12 +3380,13 @@ enabled = true
             return;
         }
 
-        with_orca_home(|_| {
+        with_orca_home(|home| {
             let parent = sandbox_test_parent("server-unsandboxed-stream-");
             let workspace = parent.path().join("workspace-unsandboxed-stream");
             let outside = parent.path().join("outside-unsandboxed-stream");
             std::fs::create_dir_all(&workspace).expect("workspace dir");
             std::fs::create_dir_all(&outside).expect("outside dir");
+            trust_test_folder(home, &workspace);
             let marker = outside.join("credential-helper-output");
             let mut config = test_run_config();
             config.cwd = Some(workspace.clone());
@@ -3471,6 +3474,7 @@ enabled = true
             let repo = home.join("repo-stream");
             let git_dir = repo.join(".git");
             std::fs::create_dir_all(&git_dir).expect("git dir");
+            trust_test_folder(home, &repo);
             let index_lock = git_dir.join("index.lock");
             let mut config = test_run_config();
             config.cwd = Some(repo.clone());
@@ -3616,7 +3620,11 @@ enabled = true
             );
             handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
                 .expect("command exec");
-            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let events = drain_until_command_exec_permission_request(
+                &mut state,
+                &writer,
+                Duration::from_secs(2),
+            );
             assert!(
                 events.iter().any(|event| {
                     event["event"] == "command_exec_started" && event["processId"] == "net-stream-1"
@@ -6902,6 +6910,15 @@ rl.on("line", (line) => {
             }
         }
         result
+    }
+
+    fn trust_test_folder(home: &std::path::Path, folder: &std::path::Path) {
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            folder,
+            home,
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .expect("trust test folder");
     }
 
     fn sandbox_test_parent(prefix: &str) -> TempDir {

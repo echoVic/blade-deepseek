@@ -297,6 +297,7 @@ fn read_only_profile(context: ReadOnlyProfileContext<'_>) -> String {
 (allow signal (target self))
 (allow signal (target children))
 {global_read_rule}
+(allow file-read* (literal "/"))
 (allow file-read* file-write* (literal "/dev/null"))
 {additional_read_rules}
 {additional_write_rules}
@@ -834,6 +835,35 @@ mod tests {
             !output.status.success(),
             "strict read-only sandbox should reject unlisted reads"
         );
+    }
+
+    #[test]
+    fn strict_read_only_sandbox_allows_basic_shell_commands() {
+        if !available() {
+            return;
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let roots = platform_default_read_roots();
+        let output = read_only_bash_command(ReadOnlySandboxCommandContext {
+            command: "echo hi",
+            cwd: workspace.path(),
+            readable_roots: &roots,
+            additional_roots: &[],
+            denied_roots: &[],
+            network_access: false,
+            allow_global_read: false,
+            allowed_unix_socket_roots: &[],
+        })
+        .output()
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "strict read-only shell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hi\n");
     }
 
     #[test]

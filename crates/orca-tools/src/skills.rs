@@ -84,7 +84,11 @@ pub fn discover(
         // ~/.agents/<skill-name>/SKILL.md  (no "skills" subdirectory at global level)
         collect_skills(home, SkillSource::User, None, &mut skills)?;
     }
-    if let Some(project_root) = project_root {
+    if let Some(project_root) = project_root
+        && orca_home.is_some_and(|home| {
+            orca_core::config::folder_trust::is_trusted_with_config_dir(&project_root, home)
+        })
+    {
         collect_skills(
             &project_root.join(".orca/skills"),
             SkillSource::Project,
@@ -447,6 +451,15 @@ fn escape_attr(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn trust_project(home: &Path, project: &Path) {
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            project,
+            home,
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn discovers_user_and_project_skills_with_frontmatter() {
         let home = tempfile::tempdir().unwrap();
@@ -468,6 +481,7 @@ mod tests {
             "Review code safely",
             "Read the diff.",
         );
+        trust_project(home.path(), project.path());
 
         let skills = discover(project.path(), Some(home.path()), None).unwrap();
 
@@ -482,6 +496,7 @@ mod tests {
 
     #[test]
     fn discovers_skills_from_agents_skills_dir() {
+        let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         fs::write(
             project.path().join("Cargo.toml"),
@@ -494,14 +509,16 @@ mod tests {
             "Run linter",
             "Run cargo clippy.",
         );
+        trust_project(home.path(), project.path());
 
-        let skills = discover(project.path(), None, None).unwrap();
+        let skills = discover(project.path(), Some(home.path()), None).unwrap();
 
         assert!(skills.iter().any(|s| s.id == "lint"));
     }
 
     #[test]
     fn orca_skills_take_priority_over_agents_skills_on_same_id() {
+        let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         fs::write(
             project.path().join("Cargo.toml"),
@@ -520,12 +537,34 @@ mod tests {
             "agents version",
             "agents body",
         );
+        trust_project(home.path(), project.path());
 
-        let skills = discover(project.path(), None, None).unwrap();
+        let skills = discover(project.path(), Some(home.path()), None).unwrap();
         let review: Vec<_> = skills.iter().filter(|s| s.id == "review").collect();
 
         assert_eq!(review.len(), 1);
         assert_eq!(review[0].description, "orca version");
+    }
+
+    #[test]
+    fn untrusted_project_skills_are_not_discovered() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "project skill",
+            "untrusted body",
+        );
+
+        let skills = discover(project.path(), Some(home.path()), None).unwrap();
+
+        assert!(!skills.iter().any(|skill| skill.id == "review"));
     }
 
     #[test]

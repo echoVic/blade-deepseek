@@ -6,7 +6,7 @@ use orca_core::config::RunConfig;
 use orca_core::model::ModelSelection;
 use orca_runtime::history;
 
-use crate::commands::{self, GoalSlashCommand, SlashCommand};
+use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
 use crate::types::{AppState, ChatMessage, UserAction};
 
 pub(crate) enum SlashOutcome {
@@ -223,6 +223,46 @@ pub(crate) fn handle_slash_command(
                 "failed to list history: {error}"
             ))),
         },
+        SlashCommand::Trust(trust_command) => {
+            use orca_core::config::folder_trust::{self, TrustLevel};
+            match trust_command {
+                TrustSlashCommand::Show => {
+                    if folder_trust::is_trusted(&cwd) {
+                        state.push_message(ChatMessage::System(format!(
+                            "{} is trusted; the OS sandbox honors the configured write and network policy.",
+                            cwd.display()
+                        )))
+                    } else {
+                        state.push_message(ChatMessage::System(format!(
+                            "{} is not trusted; commands run read-only with no network. Use /trust add to trust it.",
+                            cwd.display()
+                        )))
+                    }
+                }
+                TrustSlashCommand::Add => {
+                    match folder_trust::set_trust(&cwd, TrustLevel::Trusted) {
+                        Ok(()) => state.push_message(ChatMessage::System(format!(
+                            "Trusted {}. Restart Orca to load project config from this folder.",
+                            cwd.display()
+                        ))),
+                        Err(error) => state.push_message(ChatMessage::Error(format!(
+                            "failed to trust folder: {error}"
+                        ))),
+                    }
+                }
+                TrustSlashCommand::Remove => {
+                    match folder_trust::set_trust(&cwd, TrustLevel::Untrusted) {
+                        Ok(()) => state.push_message(ChatMessage::System(format!(
+                            "Removed trust for {}; commands now run read-only with no network.",
+                            cwd.display()
+                        ))),
+                        Err(error) => state.push_message(ChatMessage::Error(format!(
+                            "failed to update trust: {error}"
+                        ))),
+                    }
+                }
+            }
+        }
     }
     state.scroll_to_bottom();
     Some(SlashOutcome::Continue)

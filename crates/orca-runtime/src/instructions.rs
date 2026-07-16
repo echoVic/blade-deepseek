@@ -55,22 +55,31 @@ pub fn load_for_cwd_or_default(cwd: &Path) -> ProjectInstructions {
 }
 
 pub fn load_for_cwd(cwd: &Path) -> io::Result<ProjectInstructions> {
+    let orca_home_path = orca_home();
+    load_for_cwd_with_home(cwd, orca_home_path.as_deref())
+}
+
+fn load_for_cwd_with_home(
+    cwd: &Path,
+    orca_home_path: Option<&Path>,
+) -> io::Result<ProjectInstructions> {
     let mut sections = Vec::new();
     let mut visited = HashSet::new();
 
-    let orca_home_path = orca_home();
-    if let Some(user_agents) = orca_home_path
-        .as_ref()
-        .map(|home| home.join(INSTRUCTIONS_FILE))
+    if let Some(user_agents) = orca_home_path.map(|home| home.join(INSTRUCTIONS_FILE))
         && user_agents.is_file()
     {
         sections.push(InstructionSection {
             source: user_agents.clone(),
-            content: read_with_includes(&user_agents, &mut visited, orca_home_path.as_deref())?,
+            content: read_with_includes(&user_agents, &mut visited, orca_home_path)?,
         });
     }
 
-    if let Some(project_root) = find_project_root(cwd) {
+    if let Some(project_root) = find_project_root(cwd)
+        && orca_home_path.is_some_and(|home| {
+            orca_core::config::folder_trust::is_trusted_with_config_dir(&project_root, home)
+        })
+    {
         let root_agents = project_root.join(INSTRUCTIONS_FILE);
         if root_agents.is_file() {
             sections.push(InstructionSection {
@@ -189,9 +198,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn trust_project(home: &Path, project: &Path) {
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            project,
+            home,
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn loads_agents_file_and_sorted_project_rules() {
         let dir = TempDir::new().expect("temp dir");
+        let home = TempDir::new().expect("temp home");
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         fs::write(dir.path().join(INSTRUCTIONS_FILE), "Root instructions\n").unwrap();
         fs::create_dir_all(dir.path().join(RULES_DIR)).unwrap();
@@ -201,8 +220,9 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join(".orca/rules/010-first.md"), "First rule\n").unwrap();
+        trust_project(home.path(), dir.path());
 
-        let instructions = load_for_cwd(dir.path()).unwrap();
+        let instructions = load_for_cwd_with_home(dir.path(), Some(home.path())).unwrap();
         let block = instructions.to_system_prompt_block().unwrap();
 
         assert!(block.contains("<project-instructions>"));
@@ -216,6 +236,7 @@ mod tests {
     #[test]
     fn expands_relative_includes() {
         let dir = TempDir::new().expect("temp dir");
+        let home = TempDir::new().expect("temp home");
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         fs::write(dir.path().join("shared.md"), "Shared instruction\n").unwrap();
         fs::write(
@@ -223,8 +244,9 @@ mod tests {
             "Before\n@include ./shared.md\nAfter\n",
         )
         .unwrap();
+        trust_project(home.path(), dir.path());
 
-        let instructions = load_for_cwd(dir.path()).unwrap();
+        let instructions = load_for_cwd_with_home(dir.path(), Some(home.path())).unwrap();
         let block = instructions.to_system_prompt_block().unwrap();
 
         assert!(block.contains("Before\nShared instruction\nAfter"));
@@ -233,17 +255,38 @@ mod tests {
     #[test]
     fn include_rejects_path_traversal_outside_project_root() {
         let dir = TempDir::new().expect("temp dir");
+        let home = TempDir::new().expect("temp home");
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         fs::write(
             dir.path().join(INSTRUCTIONS_FILE),
             "@include ../../etc/passwd\n",
         )
         .unwrap();
+        trust_project(home.path(), dir.path());
 
-        let result = load_for_cwd(dir.path());
+        let result = load_for_cwd_with_home(dir.path(), Some(home.path()));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("escapes project root"));
+    }
+
+    #[test]
+    fn untrusted_project_instructions_are_not_loaded() {
+        let dir = TempDir::new().expect("temp dir");
+        let home = TempDir::new().expect("temp home");
+        fs::write(home.path().join(INSTRUCTIONS_FILE), "User instructions\n").unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(
+            dir.path().join(INSTRUCTIONS_FILE),
+            "Untrusted project instructions\n",
+        )
+        .unwrap();
+
+        let instructions = load_for_cwd_with_home(dir.path(), Some(home.path())).unwrap();
+        let block = instructions.to_system_prompt_block().unwrap();
+
+        assert!(block.contains("User instructions"));
+        assert!(!block.contains("Untrusted project instructions"));
     }
 }

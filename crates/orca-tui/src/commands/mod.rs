@@ -14,6 +14,14 @@ pub enum SlashCommand {
     Remember(String),
     SkillList,
     SkillRun { id: String, args: Option<String> },
+    Trust(TrustSlashCommand),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustSlashCommand {
+    Show,
+    Add,
+    Remove,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +119,12 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
                 Some(SlashCommand::Remember(note))
             }
         }
+        "trust" => Some(SlashCommand::Trust(match parts.next() {
+            None | Some("show") => TrustSlashCommand::Show,
+            Some("add") => TrustSlashCommand::Add,
+            Some("remove") => TrustSlashCommand::Remove,
+            Some(_) => return None,
+        })),
         _ => None,
     }
 }
@@ -130,6 +144,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/skills", "List available skills"),
         ("/remember", "Save a note to memory"),
         ("/history", "Browse session history"),
+        ("/trust", "Manage folder trust for the OS sandbox"),
     ]
 }
 
@@ -310,6 +325,27 @@ mod tests {
             Some(SlashCommand::Goal(GoalSlashCommand::Resume))
         );
         assert_eq!(parse("/goal edit"), None);
+    }
+
+    #[test]
+    fn parses_trust_commands() {
+        assert_eq!(
+            parse("/trust"),
+            Some(SlashCommand::Trust(TrustSlashCommand::Show))
+        );
+        assert_eq!(
+            parse("/trust show"),
+            Some(SlashCommand::Trust(TrustSlashCommand::Show))
+        );
+        assert_eq!(
+            parse("/trust add"),
+            Some(SlashCommand::Trust(TrustSlashCommand::Add))
+        );
+        assert_eq!(
+            parse("/trust remove"),
+            Some(SlashCommand::Trust(TrustSlashCommand::Remove))
+        );
+        assert_eq!(parse("/trust unknown"), None);
     }
 
     #[test]

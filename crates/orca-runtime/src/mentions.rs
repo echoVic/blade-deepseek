@@ -91,6 +91,21 @@ pub struct MentionCatalog {
 
 impl MentionCatalog {
     pub fn discover(roots: &[PathBuf], mcp_registry: &orca_mcp::McpRegistry) -> Self {
+        let (orca_home, agents_home) = skill_discovery_dirs_from_env();
+        Self::discover_with_skill_dirs(
+            roots,
+            mcp_registry,
+            orca_home.as_deref(),
+            agents_home.as_deref(),
+        )
+    }
+
+    fn discover_with_skill_dirs(
+        roots: &[PathBuf],
+        mcp_registry: &orca_mcp::McpRegistry,
+        orca_home: Option<&Path>,
+        agents_home: Option<&Path>,
+    ) -> Self {
         let roots = if roots.is_empty() {
             vec![std::env::current_dir().unwrap_or_default()]
         } else {
@@ -98,7 +113,7 @@ impl MentionCatalog {
         };
         let mut catalog = Self::default();
         for root in &roots {
-            match orca_tools::skills::discover_from_env(root) {
+            match orca_tools::skills::discover(root, orca_home, agents_home) {
                 Ok(skills) => {
                     for skill in skills {
                         let target = MentionTarget::Skill {
@@ -237,6 +252,14 @@ impl MentionCatalog {
         scored.truncate(limit);
         scored
     }
+}
+
+fn skill_discovery_dirs_from_env() -> (Option<PathBuf>, Option<PathBuf>) {
+    let orca_home = std::env::var_os("ORCA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".orca")));
+    let agents_home = dirs::home_dir().map(|home| home.join(".agents"));
+    (orca_home, agents_home)
 }
 
 pub fn merge_candidates(
@@ -636,6 +659,27 @@ pub fn expand_mentions(
     workspace_roots: &[PathBuf],
     mcp_registry: &orca_mcp::McpRegistry,
 ) -> Result<String, String> {
+    let (orca_home, agents_home) = skill_discovery_dirs_from_env();
+    expand_mentions_with_skill_dirs(
+        input,
+        bindings,
+        cwd,
+        workspace_roots,
+        mcp_registry,
+        orca_home.as_deref(),
+        agents_home.as_deref(),
+    )
+}
+
+fn expand_mentions_with_skill_dirs(
+    input: &str,
+    bindings: &MentionBindings,
+    cwd: &Path,
+    workspace_roots: &[PathBuf],
+    mcp_registry: &orca_mcp::McpRegistry,
+    orca_home: Option<&Path>,
+    agents_home: Option<&Path>,
+) -> Result<String, String> {
     let valid_bindings = bindings.bindings().iter().filter(|binding| {
         binding.end <= input.len()
             && input.is_char_boundary(binding.start)
@@ -651,6 +695,8 @@ pub fn expand_mentions(
                 cwd,
                 workspace_roots,
                 mcp_registry,
+                orca_home,
+                agents_home,
             )?);
         }
     }
@@ -669,6 +715,8 @@ fn expand_bound_target(
     cwd: &Path,
     workspace_roots: &[PathBuf],
     mcp_registry: &orca_mcp::McpRegistry,
+    orca_home: Option<&Path>,
+    agents_home: Option<&Path>,
 ) -> Result<String, String> {
     match target {
         MentionTarget::File { root, path, kind } => {
@@ -698,7 +746,7 @@ fn expand_bound_target(
             let path = path.canonicalize().unwrap_or_else(|_| path.clone());
             let mut selected = None;
             for root in allowed_workspace_roots(cwd, workspace_roots) {
-                if let Ok(skills) = orca_tools::skills::discover_from_env(&root)
+                if let Ok(skills) = orca_tools::skills::discover(&root, orca_home, agents_home)
                     && let Some(skill) = skills.into_iter().find(|skill| {
                         skill.id == *id
                             && skill.path.canonicalize().unwrap_or(skill.path.clone()) == path
@@ -1333,6 +1381,7 @@ mod tests {
     #[test]
     fn unified_catalog_discovers_skills_and_codex_compatible_plugins() {
         let project = tempfile::tempdir().unwrap();
+        let orca_home = tempfile::tempdir().unwrap();
         fs::write(
             project.path().join("Cargo.toml"),
             "[package]\nname='mentions-test'\nversion='0.1.0'\n",
@@ -1353,9 +1402,27 @@ mod tests {
         )
         .unwrap();
 
-        let catalog = MentionCatalog::discover(
+        let untrusted_catalog = MentionCatalog::discover_with_skill_dirs(
             &[project.path().to_path_buf()],
             &orca_mcp::McpRegistry::default(),
+            Some(orca_home.path()),
+            None,
+        );
+        assert!(!untrusted_catalog.candidates().iter().any(|candidate| {
+            candidate.kind == MentionKind::Skill && candidate.display == "review"
+        }));
+
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            project.path(),
+            orca_home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let catalog = MentionCatalog::discover_with_skill_dirs(
+            &[project.path().to_path_buf()],
+            &orca_mcp::McpRegistry::default(),
+            Some(orca_home.path()),
+            None,
         );
 
         assert!(catalog.candidates().iter().any(|candidate| {
@@ -1399,6 +1466,7 @@ mod tests {
     #[test]
     fn same_visible_name_expands_the_bound_skill_or_plugin_target() {
         let project = tempfile::tempdir().unwrap();
+        let orca_home = tempfile::tempdir().unwrap();
         fs::write(
             project.path().join("Cargo.toml"),
             "[package]\nname='mention-collision-test'\nversion='0.1.0'\n",
@@ -1421,7 +1489,18 @@ mod tests {
 
         let registry = orca_mcp::McpRegistry::default();
         let roots = vec![project.path().to_path_buf()];
-        let catalog = MentionCatalog::discover(&roots, &registry);
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            project.path(),
+            orca_home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let catalog = MentionCatalog::discover_with_skill_dirs(
+            &roots,
+            &registry,
+            Some(orca_home.path()),
+            None,
+        );
         let skill = catalog
             .candidates()
             .iter()
@@ -1448,20 +1527,24 @@ mod tests {
                 }],
             )
         };
-        let skill_expanded = expand_mentions(
+        let skill_expanded = expand_mentions_with_skill_dirs(
             input,
             &bind(skill.target.clone()),
             project.path(),
             &roots,
             &registry,
+            Some(orca_home.path()),
+            None,
         )
         .unwrap();
-        let plugin_expanded = expand_mentions(
+        let plugin_expanded = expand_mentions_with_skill_dirs(
             input,
             &bind(plugin.target.clone()),
             project.path(),
             &roots,
             &registry,
+            Some(orca_home.path()),
+            None,
         )
         .unwrap();
 

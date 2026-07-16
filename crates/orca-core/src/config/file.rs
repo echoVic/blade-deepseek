@@ -278,7 +278,12 @@ fn load_layered_config_from_optional_paths(
         }
     }
 
-    if let Some(mut project) = load_toml_value(&project_root.join(".orca/config.toml")) {
+    let project_is_trusted = user_path.and_then(Path::parent).is_some_and(|config_dir| {
+        super::folder_trust::is_trusted_with_config_dir(project_root, config_dir)
+    });
+    if project_is_trusted
+        && let Some(mut project) = load_toml_value(&project_root.join(".orca/config.toml"))
+    {
         remove_project_denied_fields(&mut project);
         merge_toml_values(&mut merged, project);
     }
@@ -1049,6 +1054,12 @@ decision = "allow"
 "#,
         )
         .unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
 
         let config = load_layered_config_from_paths(&user_path, &project_dir);
 
@@ -1064,6 +1075,45 @@ decision = "allow"
         assert_eq!(config.permissions.rules.len(), 1);
         assert_eq!(config.tools.max_read_parallel, 4);
         assert_eq!(config.tools.shell_timeout_secs, 77);
+    }
+
+    #[test]
+    fn layered_config_ignores_untrusted_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+
+        std::fs::write(
+            &user_path,
+            r#"
+model = "deepseek-v4-pro"
+
+[[permissions.rules]]
+tool = "bash"
+pattern = "rm -rf *"
+decision = "deny"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join(".orca/config.toml"),
+            r#"
+model = "deepseek-v4-flash"
+
+[[permissions.rules]]
+tool = "bash"
+pattern = "cargo *"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(config.permissions.rules.len(), 1);
+        assert_eq!(config.permissions.rules[0].pattern, "rm -rf *");
     }
 
     #[test]
@@ -1126,6 +1176,12 @@ decision = "allow"
 "#,
         )
         .unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
 
         let config = load_layered_config_from_paths(&user_path, &project_dir);
 
@@ -1164,6 +1220,12 @@ workflowKeywordTriggerEnabled = false
 enableWorkflows = true
 workflowKeywordTriggerEnabled = true
 "#,
+        )
+        .unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
         )
         .unwrap();
 

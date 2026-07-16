@@ -221,6 +221,8 @@ enum Command {
     History(HistoryArgs),
     /// Run and inspect local workflows.
     Workflow(WorkflowArgs),
+    /// Inspect or update folder trust.
+    Trust(TrustArgs),
     /// Execute a persisted async subagent task.
     #[command(hide = true)]
     SubagentWorker(SubagentWorkerArgs),
@@ -298,6 +300,24 @@ struct HistoryArgs {
 struct WorkflowArgs {
     #[command(subcommand)]
     command: WorkflowCommand,
+}
+
+#[derive(Debug, Parser)]
+struct TrustArgs {
+    /// Trust action.
+    #[arg(value_enum, default_value_t = TrustAction::Show)]
+    action: TrustAction,
+
+    /// Folder to inspect or update.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TrustAction {
+    Show,
+    Add,
+    Remove,
 }
 
 #[derive(Debug, Subcommand)]
@@ -609,8 +629,48 @@ pub fn run() -> i32 {
         Some(Command::Exec(args)) => run_exec(args),
         Some(Command::History(args)) => run_history(args),
         Some(Command::Workflow(args)) => run_workflow(args),
+        Some(Command::Trust(args)) => run_trust(args),
         Some(Command::SubagentWorker(args)) => run_subagent_worker(args),
         None => run_placeholder(cli),
+    }
+}
+
+fn run_trust(args: TrustArgs) -> i32 {
+    use crate::config::folder_trust::{self, TrustLevel};
+
+    let cwd = args
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    match args.action {
+        TrustAction::Show => {
+            let level = match folder_trust::trust_level(&cwd) {
+                Some(TrustLevel::Trusted) => "trusted",
+                Some(TrustLevel::Untrusted) => "untrusted",
+                None => "unknown (treated as untrusted)",
+            };
+            println!("{}: {level}", cwd.display());
+            0
+        }
+        TrustAction::Add => match folder_trust::set_trust(&cwd, TrustLevel::Trusted) {
+            Ok(()) => {
+                println!("trusted {}", cwd.display());
+                0
+            }
+            Err(error) => {
+                eprintln!("orca: failed to trust folder: {error}");
+                1
+            }
+        },
+        TrustAction::Remove => match folder_trust::set_trust(&cwd, TrustLevel::Untrusted) {
+            Ok(()) => {
+                println!("marked {} untrusted", cwd.display());
+                0
+            }
+            Err(error) => {
+                eprintln!("orca: failed to update folder trust: {error}");
+                1
+            }
+        },
     }
 }
 

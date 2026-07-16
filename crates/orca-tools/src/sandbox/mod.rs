@@ -4,6 +4,21 @@ use std::process::Command;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 
+// Compiled on all platforms so the bwrap argv builder can be unit tested off
+// Linux; only the Linux platform block actually launches bwrap.
+pub mod bwrap;
+// The launch helpers are only invoked from the non-macOS (Linux) platform
+// block; keep the module compiled everywhere for testing without warnings.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub mod linux;
+
+/// Platform read roots a Linux shell runtime needs when the sandbox root is a
+/// fresh tmpfs. Exposed here so the pure `bwrap` argv builder (compiled on all
+/// platforms) can consult the same list the Linux backend uses.
+pub(crate) fn linux_platform_default_read_roots() -> Vec<PathBuf> {
+    linux::platform_default_read_roots()
+}
+
 pub struct WorkspaceWriteSandboxCommandContext<'a> {
     pub command: &'a str,
     pub cwd: &'a Path,
@@ -185,6 +200,105 @@ mod platform {
 mod platform {
     use super::*;
 
+    /// Protected workspace metadata directories: readable but not writable by
+    /// default, matching the macOS Seatbelt backend.
+    #[cfg(target_os = "linux")]
+    const PROTECTED_METADATA_DIRS: [&str; 3] = [".git", ".agents", ".codex"];
+
+    #[cfg(target_os = "linux")]
+    fn canonicalize_all(roots: &[PathBuf]) -> Vec<PathBuf> {
+        roots
+            .iter()
+            .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_sensitive_denied_roots() -> Vec<PathBuf> {
+        let mut roots = dirs::home_dir()
+            .map(|home| vec![home.join(".ssh"), home.join(".orca")])
+            .unwrap_or_default();
+        if let Some(config_dir) = orca_core::config::folder_trust::config_dir()
+            && !roots.contains(&config_dir)
+        {
+            roots.push(config_dir);
+        }
+        roots.retain(|path| path.exists());
+        roots
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn workspace_write_bash_command(
+        context: WorkspaceWriteSandboxCommandContext<'_>,
+    ) -> Command {
+        use crate::sandbox::bwrap::{LinuxReadScope, LinuxSandboxPolicy};
+        use crate::sandbox::linux::{LinuxSandboxRequest, sandbox_command};
+
+        let cwd = context
+            .cwd
+            .canonicalize()
+            .unwrap_or_else(|_| context.cwd.to_path_buf());
+
+        // Writable: the workspace cwd plus any explicit additional roots, plus
+        // temp dirs unless excluded.
+        let additional_roots = canonicalize_all(context.additional_roots);
+        let mut writable_roots = vec![cwd.clone()];
+        for root in &additional_roots {
+            if !writable_roots.contains(root) {
+                writable_roots.push(root.clone());
+            }
+        }
+        if !context.exclude_slash_tmp {
+            writable_roots.push(PathBuf::from("/tmp"));
+        }
+        if !context.exclude_tmpdir_env_var
+            && let Some(tmpdir) = std::env::var_os("TMPDIR").map(PathBuf::from)
+        {
+            let tmpdir = tmpdir.canonicalize().unwrap_or(tmpdir);
+            if !writable_roots.contains(&tmpdir) {
+                writable_roots.push(tmpdir);
+            }
+        }
+
+        // Protect workspace metadata (readable, not writable) unless the caller
+        // explicitly granted it as a writable additional root.
+        let mut read_only_roots = Vec::new();
+        for name in PROTECTED_METADATA_DIRS {
+            let metadata = cwd.join(name);
+            if metadata.exists()
+                && !additional_roots
+                    .iter()
+                    .any(|root| metadata.starts_with(root))
+            {
+                read_only_roots.push(metadata);
+            }
+        }
+
+        let mut denied_roots = canonicalize_all(context.denied_roots);
+        for root in linux_sensitive_denied_roots() {
+            if !denied_roots.contains(&root) {
+                denied_roots.push(root);
+            }
+        }
+
+        let request = LinuxSandboxRequest {
+            command: context.command.to_string(),
+            policy: LinuxSandboxPolicy {
+                cwd,
+                read_scope: LinuxReadScope::Global,
+                readable_roots: canonicalize_all(context.readable_roots),
+                allowed_unix_socket_roots: canonicalize_all(context.allowed_unix_socket_roots),
+                writable_roots,
+                read_only_roots,
+                denied_roots,
+                network_access: context.network_access,
+            },
+            strict: false,
+        };
+        sandbox_command(request)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     pub fn workspace_write_bash_command(
         context: WorkspaceWriteSandboxCommandContext<'_>,
     ) -> Command {
@@ -193,6 +307,54 @@ mod platform {
         cmd
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Command {
+        use crate::sandbox::bwrap::{LinuxReadScope, LinuxSandboxPolicy};
+        use crate::sandbox::linux::{LinuxSandboxRequest, sandbox_command};
+
+        let cwd = context
+            .cwd
+            .canonicalize()
+            .unwrap_or_else(|_| context.cwd.to_path_buf());
+
+        // Additional roots are writable even in read-only mode (e.g. an
+        // explicitly granted output directory), matching the Seatbelt profile.
+        let writable_roots = canonicalize_all(context.additional_roots);
+
+        // A restricted read scope (allow_global_read == false) is fail-closed:
+        // only listed roots are visible.
+        let read_scope = if context.allow_global_read {
+            LinuxReadScope::Global
+        } else {
+            LinuxReadScope::Restricted
+        };
+
+        let mut denied_roots = canonicalize_all(context.denied_roots);
+        for root in linux_sensitive_denied_roots() {
+            if !denied_roots.contains(&root) {
+                denied_roots.push(root);
+            }
+        }
+
+        let request = LinuxSandboxRequest {
+            command: context.command.to_string(),
+            policy: LinuxSandboxPolicy {
+                cwd,
+                read_scope,
+                readable_roots: canonicalize_all(context.readable_roots),
+                allowed_unix_socket_roots: canonicalize_all(context.allowed_unix_socket_roots),
+                writable_roots,
+                read_only_roots: Vec::new(),
+                denied_roots,
+                network_access: context.network_access,
+            },
+            // Strict read-only (no global read) fails closed if unenforceable.
+            strict: !context.allow_global_read,
+        };
+        sandbox_command(request)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(context.command).current_dir(context.cwd);
@@ -206,7 +368,14 @@ mod platform {
     }
 
     pub fn platform_default_read_roots() -> Vec<PathBuf> {
-        Vec::new()
+        #[cfg(target_os = "linux")]
+        {
+            crate::sandbox::linux::platform_default_read_roots()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
+        }
     }
 
     #[cfg(test)]

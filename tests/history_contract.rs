@@ -3,6 +3,15 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
+fn trust_project(home: &std::path::Path, project: &std::path::Path) {
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        project,
+        home,
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trust project");
+}
+
 #[test]
 fn exec_saves_history_and_history_commands_can_read_it() {
     let home = TempDir::new().expect("temp home");
@@ -154,6 +163,7 @@ fn exec_injects_project_instructions_into_system_prompt() {
         "Keep user-facing output concise.\n",
     )
     .expect("write rule");
+    trust_project(home.path(), project.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(project.path())
@@ -238,6 +248,7 @@ fn exec_injects_user_instructions_before_project_instructions() {
         .expect("write global AGENTS.md");
     std::fs::write(project.path().join("AGENTS.md"), "Project instruction\n")
         .expect("write project AGENTS.md");
+    trust_project(home.path(), project.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(project.path())

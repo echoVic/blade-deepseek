@@ -6,6 +6,15 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::tempdir;
 
+fn trust_project(home: &std::path::Path, project: &std::path::Path) {
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        project,
+        home,
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trust workflow project");
+}
+
 #[test]
 fn workflow_run_command_executes_script() {
     let temp = tempdir().unwrap();
@@ -39,6 +48,7 @@ fn workflow_run_command_executes_script() {
 #[test]
 fn workflow_run_named_script_resolves_project_workflow() {
     let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
     let dir = temp.path().join(".orca/workflows");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
@@ -46,8 +56,10 @@ fn workflow_run_named_script_resolves_project_workflow() {
         "export const meta = { name: 'audit', description: 'Audit code', phases: [] };\nexport default await agent('inspect repo');",
     )
     .unwrap();
+    trust_project(&home, temp.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
         .args([
             "workflow",
             "run",
@@ -63,7 +75,7 @@ fn workflow_run_named_script_resolves_project_workflow() {
     assert_eq!(output.status.code(), Some(0));
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["workflowName"], "audit");
-    wait_for_workflow_terminal_status(temp.path(), None, value["taskId"].as_str().unwrap());
+    wait_for_workflow_terminal_status(temp.path(), Some(&home), value["taskId"].as_str().unwrap());
 }
 
 #[test]
@@ -159,6 +171,7 @@ fn workflow_source_command_prints_saved_workflow_source() {
     let script = workflow_dir.join("audit.js");
     let source = "export const meta = { name: 'audit', description: 'Audit code', phases: ['scan'] };\nexport default await agent('inspect repo');";
     fs::write(&script, source).unwrap();
+    trust_project(&home.join(".orca"), temp.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(temp.path())

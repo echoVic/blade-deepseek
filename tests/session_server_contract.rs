@@ -43,6 +43,7 @@ impl OrcaCommand {
     {
         if key.as_ref() == OsStr::new("ORCA_HOME") {
             self.home.take();
+            trust_all_test_folders(Path::new(value.as_ref()));
         }
         self.command.env(key, value);
         self
@@ -78,11 +79,21 @@ fn orca_command() -> OrcaCommand {
         .prefix("orca-server-contract-")
         .tempdir()
         .expect("create isolated ORCA_HOME");
+    trust_all_test_folders(home.path());
     command.env("ORCA_HOME", home.path());
     OrcaCommand {
         command,
         home: Some(home),
     }
+}
+
+fn trust_all_test_folders(home: &Path) {
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        Path::new("/"),
+        home,
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trust server contract workspaces");
 }
 
 #[test]
@@ -1207,7 +1218,10 @@ fn server_mode_streams_workflow_item_lifecycle() {
         .find(|event| event["event"] == "item_completed" && event["item"]["id"] == workflow_id)
         .expect("workflow item_completed");
     assert_eq!(completed["item"]["type"], "workflow");
-    assert_eq!(completed["item"]["status"], "completed");
+    assert_eq!(
+        completed["item"]["status"], "completed",
+        "workflow events: {events:?}"
+    );
     assert_eq!(completed["item"]["workflowName"], "mock-workflow");
     assert!(
         completed["item"]["result"]
@@ -3508,7 +3522,7 @@ fn server_mode_command_exec_inherits_thread_active_permission_profile() {
         let stdin = child.stdin_mut();
         writeln!(
             stdin,
-            r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
+            r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-c",{}]}}}}"#,
             thread_id,
             serde_json::to_string(&command).expect("command json")
         )
@@ -3518,7 +3532,6 @@ fn server_mode_command_exec_inherits_thread_active_permission_profile() {
             .expect("flush inherited permissionProfile command/exec");
     }
     child.close_stdin();
-
     let completed = child.expect_event("cmd", "command_exec_completed");
     assert_ne!(completed["exitCode"], 0);
     assert!(!workspace_file.exists());
@@ -3589,7 +3602,7 @@ fn server_mode_command_exec_resolves_thread_active_permission_profile_from_confi
             let stdin = child.stdin_mut();
             writeln!(
                 stdin,
-                r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-lc",{}]}}}}"#,
+                r#"{{"id":"cmd","method":"command/exec","params":{{"threadId":"{}","command":["sh","-c",{}]}}}}"#,
                 thread_id,
                 serde_json::to_string(&command).expect("command json")
             )
@@ -3599,7 +3612,6 @@ fn server_mode_command_exec_resolves_thread_active_permission_profile_from_confi
                 .expect("flush config-backed permissionProfile command/exec");
         }
         child.close_stdin();
-
         let completed = child.expect_event("cmd", "command_exec_completed");
         assert_ne!(completed["exitCode"], 0);
         assert!(!workspace_file.exists());
@@ -5544,13 +5556,16 @@ fn server_mode_command_exec_read_drains_streaming_output() {
         .expect("command_exec_read event");
     assert_eq!(read_ack["processId"], "read-1");
     assert_eq!(read_ack["status"], "running");
-    if !command_exec_events_contain(&read_events, "stdout", "read-out")
-        || !command_exec_events_contain(&read_events, "stderr", "read-err")
-    {
+    let saw_stdout = command_exec_events_contain(&read_events, "stdout", "read-out");
+    let saw_stderr = command_exec_events_contain(&read_events, "stderr", "read-err");
+    if !saw_stdout || !saw_stderr {
         read_events.extend(read_command_exec_output_until(
             &mut child,
             "read-1",
-            |stdout, stderr| stdout.contains("read-out") && stderr.contains("read-err"),
+            |stdout, stderr| {
+                (saw_stdout || stdout.contains("read-out"))
+                    && (saw_stderr || stderr.contains("read-err"))
+            },
         ));
     }
     assert_command_exec_delta_seen(&read_events, "stdout", "read-out");

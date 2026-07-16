@@ -44,10 +44,16 @@ pub fn resolve_workflow_script_to_path(
     cwd: &Path,
     persisted_path: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
-    let user_dir = dirs::home_dir()
-        .map(|home| home.join(".orca").join("workflows"))
-        .unwrap_or_else(|| PathBuf::from(".orca/workflows"));
-    resolve_workflow_script_with_user_dir_to_path(input, cwd, &user_dir, persisted_path)
+    let config_dir =
+        orca_core::config::folder_trust::config_dir().unwrap_or_else(|| PathBuf::from(".orca"));
+    let user_dir = config_dir.join("workflows");
+    resolve_workflow_script_with_dirs_to_path(
+        input,
+        cwd,
+        &user_dir,
+        Some(&config_dir),
+        persisted_path,
+    )
 }
 
 pub fn resolve_workflow_script_with_user_dir(
@@ -63,10 +69,47 @@ pub fn resolve_workflow_script_with_user_dir(
     resolve_workflow_script_with_user_dir_to_path(input, cwd, user_workflow_dir, &persisted_path)
 }
 
+pub fn resolve_workflow_script_with_user_dir_and_config_dir(
+    input: &WorkflowInput,
+    cwd: &Path,
+    session_dir: &Path,
+    user_workflow_dir: &Path,
+    config_dir: &Path,
+) -> io::Result<ResolvedWorkflowScript> {
+    let persisted_path = session_dir
+        .join("workflows")
+        .join("scripts")
+        .join("script.js");
+    resolve_workflow_script_with_dirs_to_path(
+        input,
+        cwd,
+        user_workflow_dir,
+        Some(config_dir),
+        &persisted_path,
+    )
+}
+
 pub fn resolve_workflow_script_with_user_dir_to_path(
     input: &WorkflowInput,
     cwd: &Path,
     user_workflow_dir: &Path,
+    persisted_path: &Path,
+) -> io::Result<ResolvedWorkflowScript> {
+    let config_dir = orca_core::config::folder_trust::config_dir();
+    resolve_workflow_script_with_dirs_to_path(
+        input,
+        cwd,
+        user_workflow_dir,
+        config_dir.as_deref(),
+        persisted_path,
+    )
+}
+
+fn resolve_workflow_script_with_dirs_to_path(
+    input: &WorkflowInput,
+    cwd: &Path,
+    user_workflow_dir: &Path,
+    config_dir: Option<&Path>,
     persisted_path: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
     let (source_kind, original_path, script) = if let Some(script_path) = input
@@ -84,7 +127,7 @@ pub fn resolve_workflow_script_with_user_dir_to_path(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        let path = find_named_workflow(cwd, name, user_workflow_dir)?;
+        let path = find_named_workflow(cwd, name, user_workflow_dir, config_dir)?;
         let script = fs::read_to_string(&path)?;
         (WorkflowScriptSource::NamedWorkflow, Some(path), script)
     } else {
@@ -126,8 +169,13 @@ fn resolve_path(cwd: &Path, raw_path: &str) -> PathBuf {
     }
 }
 
-fn find_named_workflow(cwd: &Path, name: &str, user_workflow_dir: &Path) -> io::Result<PathBuf> {
-    find_saved_workflow(cwd, name, user_workflow_dir)
+fn find_named_workflow(
+    cwd: &Path,
+    name: &str,
+    user_workflow_dir: &Path,
+    config_dir: Option<&Path>,
+) -> io::Result<PathBuf> {
+    find_saved_workflow_in(cwd, name, user_workflow_dir, config_dir)
 }
 
 pub fn find_saved_workflow(
@@ -135,12 +183,35 @@ pub fn find_saved_workflow(
     name: &str,
     user_workflow_dir: &Path,
 ) -> io::Result<PathBuf> {
+    let config_dir = orca_core::config::folder_trust::config_dir();
+    find_saved_workflow_in(cwd, name, user_workflow_dir, config_dir.as_deref())
+}
+
+pub fn find_saved_workflow_with_config_dir(
+    cwd: &Path,
+    name: &str,
+    user_workflow_dir: &Path,
+    config_dir: &Path,
+) -> io::Result<PathBuf> {
+    find_saved_workflow_in(cwd, name, user_workflow_dir, Some(config_dir))
+}
+
+fn find_saved_workflow_in(
+    cwd: &Path,
+    name: &str,
+    user_workflow_dir: &Path,
+    config_dir: Option<&Path>,
+) -> io::Result<PathBuf> {
     for ancestor in cwd.ancestors() {
         let candidate = ancestor
             .join(".orca")
             .join("workflows")
             .join(format!("{name}.js"));
-        if candidate.exists() {
+        if candidate.exists()
+            && config_dir.is_some_and(|config_dir| {
+                orca_core::config::folder_trust::is_trusted_with_config_dir(ancestor, config_dir)
+            })
+        {
             return Ok(candidate);
         }
     }
@@ -1019,7 +1090,9 @@ fn sha256_hex(input: &[u8]) -> String {
 mod tests {
     use orca_core::config::WorkflowConfig;
 
-    use super::{contains_workflow_keyword, parse_workflow_meta};
+    use super::{
+        contains_workflow_keyword, find_saved_workflow_with_config_dir, parse_workflow_meta,
+    };
 
     #[test]
     fn parser_accepts_double_quotes() {
@@ -1089,5 +1162,47 @@ mod tests {
             "please run ultracode now",
             &disabled
         ));
+    }
+
+    #[test]
+    fn named_project_workflows_require_folder_trust() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_workflows = project.path().join(".orca/workflows");
+        let user_workflows = home.path().join("workflows");
+        std::fs::create_dir_all(&project_workflows).unwrap();
+        std::fs::create_dir_all(&user_workflows).unwrap();
+        let project_script = project_workflows.join("audit.js");
+        let user_script = user_workflows.join("audit.js");
+        std::fs::write(&project_script, "project").unwrap();
+        std::fs::write(&user_script, "user").unwrap();
+
+        assert_eq!(
+            find_saved_workflow_with_config_dir(
+                project.path(),
+                "audit",
+                &user_workflows,
+                home.path(),
+            )
+            .unwrap(),
+            user_script
+        );
+
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            project.path(),
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        assert_eq!(
+            find_saved_workflow_with_config_dir(
+                project.path(),
+                "audit",
+                &user_workflows,
+                home.path(),
+            )
+            .unwrap(),
+            project_script
+        );
     }
 }

@@ -14,6 +14,7 @@ use crate::subagent_config::SubagentConfig;
 use crate::tool_types::ToolOutputTruncation;
 
 pub mod file;
+pub mod folder_trust;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]

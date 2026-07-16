@@ -127,6 +127,19 @@ api_key = "sk-..."
 base_url = "https://api.deepseek.com"
 ```
 
+Project-local `.orca/config.toml`, `AGENTS.md`, `.orca/rules`, project skills,
+and named project workflows are loaded only after the folder is trusted. New
+folders use a strict read-only, no-network default sandbox. Manage trust with:
+
+```sh
+orca trust show --cwd /path/to/project
+orca trust add --cwd /path/to/project
+orca trust remove --cwd /path/to/project
+```
+
+The TUI exposes the same state through `/trust`, `/trust add`, and
+`/trust remove`.
+
 ### Updates
 
 When `update_check` is enabled, Orca checks for a newer release before opening the interactive TUI. If a newer release is available, Orca shows a startup prompt with `Update now`, `Skip`, and `Skip until next version`. Choosing `Update now` updates the currently running install: npm-managed launches run the npm upgrade command, while direct binary launches rerun the curl installer into the current executable's directory. Choosing either skip option continues into the TUI.
@@ -176,6 +189,7 @@ output_truncation = { mode = "tokens", limit = 2000 }
 ```sh
 orca exec [options] <prompt>
 orca --mode=server
+orca trust [show|add|remove] --cwd <path>
 ```
 
 For headless harnesses, `orca exec` also accepts prompt input from stdin:

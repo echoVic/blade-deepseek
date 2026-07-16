@@ -9,7 +9,7 @@ use orca_core::workflow_types::{
 use orca_runtime::workflow::report::{render_evidence_markdown, render_report_for_run};
 use orca_runtime::workflow::script::{
     parse_workflow_args_schema, resolve_workflow_script, resolve_workflow_script_to_path,
-    resolve_workflow_script_with_user_dir, validate_workflow_args,
+    resolve_workflow_script_with_user_dir_and_config_dir, validate_workflow_args,
 };
 use orca_runtime::workflow::state::{
     WorkflowAgentCacheRecord, WorkflowAgentRecord, WorkflowStateStore,
@@ -107,7 +107,6 @@ fn script_path_takes_precedence_over_inline_script() {
         "export const meta = { name: 'chosen', description: 'Chosen script', phases: [] };\nexport default 'ok';",
     )
     .unwrap();
-
     let input = WorkflowInput {
         script: Some(
             "export const meta = { name: 'ignored', description: 'Ignored', phases: [] };"
@@ -140,17 +139,24 @@ fn nearest_project_workflow_wins_over_user_workflow() {
         "export const meta = { name: 'audit', description: 'User audit', phases: [] };\nexport default 'user';",
     )
     .unwrap();
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        &repo_root,
+        &temp.path().join("home/.orca"),
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .unwrap();
 
     let input = WorkflowInput {
         name: Some("audit".to_string()),
         ..Default::default()
     };
 
-    let resolved = resolve_workflow_script_with_user_dir(
+    let resolved = resolve_workflow_script_with_user_dir_and_config_dir(
         &input,
         &cwd,
         &temp.path().join("session"),
         &temp.path().join("home/.orca/workflows"),
+        &temp.path().join("home/.orca"),
     )
     .unwrap();
 
@@ -220,6 +226,7 @@ fn workflow_args_validation_applies_defaults_and_rejects_bad_inputs() {
 #[test]
 fn saved_workflow_args_schema_is_validated_before_launch_persistence() {
     let temp = tempdir().unwrap();
+    let config_dir = temp.path().join("home");
     let workflow_dir = temp.path().join(".orca/workflows");
     fs::create_dir_all(&workflow_dir).unwrap();
     fs::write(
@@ -229,6 +236,12 @@ fn saved_workflow_args_schema_is_validated_before_launch_persistence() {
          export default args;",
     )
     .unwrap();
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        temp.path(),
+        &config_dir,
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .unwrap();
 
     let input = WorkflowInput {
         name: Some("audit".to_string()),
@@ -236,8 +249,14 @@ fn saved_workflow_args_schema_is_validated_before_launch_persistence() {
         ..Default::default()
     };
 
-    let resolved = resolve_workflow_script(&input, temp.path(), &temp.path().join("session"))
-        .expect("saved workflow resolves");
+    let resolved = resolve_workflow_script_with_user_dir_and_config_dir(
+        &input,
+        temp.path(),
+        &temp.path().join("session"),
+        &config_dir.join("workflows"),
+        &config_dir,
+    )
+    .expect("saved workflow resolves");
     let normalized = validate_workflow_args(input.args.clone(), &resolved.args_schema).unwrap();
 
     assert_eq!(resolved.args_schema.len(), 2);

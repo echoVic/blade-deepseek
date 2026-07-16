@@ -70,6 +70,73 @@ pub(crate) fn command_exec_sandbox_mode(
     runtime_workspace_roots: &[PathBuf],
     tmpdir: Option<&std::path::Path>,
 ) -> Result<CommandExecSandbox, String> {
+    let resolved = command_exec_sandbox_mode_inner(
+        config,
+        options,
+        thread_permission_profile,
+        cwd,
+        runtime_workspace_roots,
+        tmpdir,
+    )?;
+    if uses_default_folder_policy(options, thread_permission_profile) {
+        Ok(apply_folder_trust_gate(
+            resolved,
+            orca_core::config::folder_trust::is_trusted(cwd),
+            cwd,
+        ))
+    } else {
+        Ok(resolved)
+    }
+}
+
+fn uses_default_folder_policy(
+    options: &protocol::CommandExecOptions,
+    thread_permission_profile: Option<&ActivePermissionProfile>,
+) -> bool {
+    options.permission_profile.is_none()
+        && options.sandbox_policy == protocol::CommandSandboxPolicy::Default
+        && thread_permission_profile.is_none()
+}
+
+/// Unknown and explicitly untrusted folders get a strict default. Explicit
+/// sandbox/profile selections remain authoritative and continue through the
+/// existing approval and capability paths.
+fn apply_folder_trust_gate(
+    sandbox: CommandExecSandbox,
+    folder_is_trusted: bool,
+    cwd: &Path,
+) -> CommandExecSandbox {
+    if folder_is_trusted {
+        return sandbox;
+    }
+
+    let mut additional_readable_roots = sandbox.additional_readable_roots;
+    push_unique_path(&mut additional_readable_roots, cwd.to_path_buf());
+    for root in orca_tools::sandbox::platform_default_read_roots() {
+        push_unique_path(&mut additional_readable_roots, root);
+    }
+
+    CommandExecSandbox {
+        mode: ShellSandboxMode::ReadOnly {
+            network_access: false,
+            allow_global_read: false,
+        },
+        additional_readable_roots,
+        additional_writable_roots: Vec::new(),
+        denied_writable_roots: sandbox.denied_writable_roots,
+        allowed_unix_socket_roots: Vec::new(),
+        network_policy_domains: HashMap::new(),
+    }
+}
+
+fn command_exec_sandbox_mode_inner(
+    config: &RunConfig,
+    options: &protocol::CommandExecOptions,
+    thread_permission_profile: Option<&ActivePermissionProfile>,
+    cwd: &std::path::Path,
+    runtime_workspace_roots: &[PathBuf],
+    tmpdir: Option<&std::path::Path>,
+) -> Result<CommandExecSandbox, String> {
     if let Some(profile) = options.permission_profile.as_deref() {
         return shell_sandbox_mode_from_permission_profile(
             config,
@@ -514,5 +581,74 @@ fn materialize_profile_special_path(
             .unwrap_or_default()),
         Some(":minimal") => Ok(orca_tools::sandbox::platform_default_read_roots()),
         _ => Ok(vec![path]),
+    }
+}
+
+#[cfg(test)]
+mod folder_trust_tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_default_is_strict_read_only() {
+        let sandbox = CommandExecSandbox {
+            mode: ShellSandboxMode::WorkspaceWrite {
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            additional_readable_roots: vec![PathBuf::from("/inputs")],
+            additional_writable_roots: vec![PathBuf::from("/outputs")],
+            denied_writable_roots: vec![PathBuf::from("/secret")],
+            allowed_unix_socket_roots: vec![PathBuf::from("/run/service.sock")],
+            network_policy_domains: HashMap::from([(
+                "api.example.com".to_string(),
+                orca_core::config::PermissionProfileNetworkAccess::Allow,
+            )]),
+        };
+
+        let cwd = PathBuf::from("/workspace");
+        let gated = apply_folder_trust_gate(sandbox, false, &cwd);
+
+        assert_eq!(
+            gated.mode,
+            ShellSandboxMode::ReadOnly {
+                network_access: false,
+                allow_global_read: false,
+            }
+        );
+        assert!(
+            gated
+                .additional_readable_roots
+                .contains(&PathBuf::from("/inputs"))
+        );
+        assert!(gated.additional_readable_roots.contains(&cwd));
+        assert!(gated.additional_writable_roots.is_empty());
+        assert_eq!(gated.denied_writable_roots, vec![PathBuf::from("/secret")]);
+        assert!(gated.allowed_unix_socket_roots.is_empty());
+        assert!(gated.network_policy_domains.is_empty());
+    }
+
+    #[test]
+    fn explicit_policy_and_profile_skip_the_folder_default() {
+        let explicit_policy = protocol::CommandExecOptions {
+            sandbox_policy: protocol::CommandSandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            ..Default::default()
+        };
+        assert!(!uses_default_folder_policy(&explicit_policy, None));
+
+        let explicit_profile = protocol::CommandExecOptions {
+            permission_profile: Some("locked-down".to_string()),
+            ..Default::default()
+        };
+        assert!(!uses_default_folder_policy(&explicit_profile, None));
+        assert!(uses_default_folder_policy(
+            &protocol::CommandExecOptions::default(),
+            None
+        ));
     }
 }

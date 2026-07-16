@@ -75,7 +75,6 @@ decision = "allow"
 "#,
     )
     .expect("write config");
-
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
         .args([
