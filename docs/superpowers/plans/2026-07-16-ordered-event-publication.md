@@ -1,8 +1,9 @@
 # P1.1c Ordered Event Publication Plan
 
-- Status: in progress
+- Status: complete
 - Base: `028aae78a3b8b90dbe2bf70f63d2b0b11a9f59bf`
 - Branch: `codex/ordered-event-publication-p11c`
+- Validated after rebase onto: `87dd307d1`
 
 ## Structural Problem And Evidence
 
@@ -106,6 +107,21 @@ long-term dual path.
 This slice does not add durable replay, process-loss recovery, or stable
 turn/item ids. Those remain later P1.1 slices after live publication has one
 provable order.
+
+## Completion Evidence
+
+- `EventFactory` now creates typed `EventDraft` values, and the old
+  allocation-time `AtomicU64` path is deleted.
+- `EventSink::emit` and observer-only `observe_event` calls assign the final
+  sequence and timestamp while holding the shared publication boundary.
+- RuntimeHost has no production direct `EventObserver::observe` bypass, and
+  its sequence assertions compare observer arrival order without sorting.
+- Core tests cover publication order, unpublished drafts, shared observer and
+  writer envelopes, and sequence consumption after observer failure.
+- After rebasing onto the latest local `main`, 152 core tests, 43 RuntimeHost
+  tests, and 390 TUI tests passed. The serial workspace all-targets gate and
+  workspace Clippy also passed with the repository's existing warning
+  baseline.
 
 ## Final Deletion Targets
 

@@ -13,14 +13,16 @@ and `TuiTaskSupervisor` are deleted. RuntimeHost is the single owner of active
 and background operation terminals, usage commits, and shutdown cleanup. Idle
 Goal refreshes also collapse duplicate status notices.
 The first P1.1 follow-ups now give a thread-owned event stream one shared
-sequence allocator across foreground turns plus host-adopted provider and
-workflow background work, so handoff progress and terminal events cannot
-restart at `seq=0`. Workflow identity remains in the typed payload `taskId` and
-`runId`; the host-projected envelope now consistently belongs to the parent
-thread. These are unreleased architecture slices; ordered multi-producer
-publication, durable semantic journaling, and stable conversation item ids
-remain explicit follow-ups rather than being hidden behind renderer-side
-deduplication fixes.
+publication boundary across foreground turns plus host-adopted provider and
+workflow background work. `EventFactory` creates unpublished typed drafts;
+only publication assigns the final sequence and timestamp while serializing
+observer, writer, and flush side effects. Handoff progress and terminal events
+therefore cannot restart at `seq=0` or arrive in a different order from their
+sequence values. Workflow identity remains in the typed payload `taskId` and
+`runId`; the host-projected envelope consistently belongs to the parent
+thread. These are unreleased architecture slices; durable semantic journaling
+and stable conversation item ids remain explicit follow-ups rather than being
+hidden behind renderer-side deduplication fixes.
 Earlier v0.2.29 extends the runtime ownership model into the
 process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
 operation handles and completion terminals now give headless and TUI turns one
@@ -194,6 +196,22 @@ runtime-host tests, the serial workspace all-targets gate, and workspace Clippy
 pass. Ordered multi-producer publication, durable semantic journal records,
 and replacement of index-derived `turn-N`/`item-N` projection ids remain the
 next P1.1 vertical slices.
+
+P1.1c now moves final sequence and timestamp assignment from event construction
+into one thread-owned publication boundary. `EventFactory` produces typed
+`EventDraft` values; `EventSink::emit` and the observer-only `observe_event`
+path consume them while serializing observer, writer, and flush side effects.
+An unpublished draft consumes no sequence, while a failed publication consumes
+its assigned sequence before cleanup can continue, so no later event can reuse
+it. RuntimeHost no longer calls observers directly, its concurrency assertions
+verify arrival order without sorting, and the allocation-time event
+`AtomicU64` is deleted. Event schema, payloads, JSONL text, server methods, TUI
+flows, persistence, cancellation, and shutdown behavior remain compatible.
+After rebasing onto the goal continuation redesign, 152 core tests, 43
+RuntimeHost tests, 390 TUI tests, the serial workspace all-targets gate, and
+workspace Clippy pass. Durable semantic journal records and replacement of
+index-derived `turn-N`/`item-N` projection ids remain the next P1.1 vertical
+slices.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
