@@ -22,11 +22,15 @@ body:
         - Built from source
         - Package manager
         - Other
+    validations:
+      required: true
   - type: input
     id: platform
     attributes:
       label: Platform
       description: Include the operating system, architecture, and terminal when relevant.
+    validations:
+      required: true
   - type: dropdown
     id: mode
     attributes:
@@ -36,6 +40,8 @@ body:
         - orca exec
         - Embedded server
         - Other
+    validations:
+      required: true
   - type: textarea
     id: steps
     attributes:
