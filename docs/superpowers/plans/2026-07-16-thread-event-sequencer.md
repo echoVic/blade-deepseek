@@ -1,6 +1,6 @@
 # P1.1 Thread Event Sequencer Plan
 
-- Status: P1.1a in progress
+- Status: P1.1a complete
 - Base: `3c6eb902c2c4ad7a4f4cf12a506f5811716d541b`
 - Branch: `codex/thread-event-sequencer-p11a`
 
@@ -70,6 +70,8 @@ The shared allocator is target architecture, not a compatibility wrapper. The
 temporary limitation is explicit: allocation is shared before event delivery
 and persistence are unified.
 
+P1.1a implementation is complete in `91b61bae6`.
+
 ## Acceptance Criteria
 
 - A host-adopted provider emits no duplicate `(run_id, seq)` values.
@@ -81,6 +83,14 @@ and persistence are unified.
 - `orca-core` event-schema tests and `orca-runtime` runtime-host tests pass.
 - The full serial workspace gate and Clippy pass before integration because the
   shared event type affects every runtime surface.
+
+Validation completed on the feature worktree:
+
+- `cargo fmt --all -- --check`
+- core event-schema focused test and all 148 `orca-core` tests
+- all 40 `orca-runtime` `runtime_host` tests
+- `cargo test --workspace --all-targets -- --test-threads=1`
+- `cargo clippy --workspace --all-targets` (exit 0; existing warning baseline)
 
 ## Final Deletion Targets
 

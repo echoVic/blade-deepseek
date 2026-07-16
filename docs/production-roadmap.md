@@ -12,6 +12,12 @@ TUI provider/tool/workflow/subagent loops, local operation cancellation owner,
 and `TuiTaskSupervisor` are deleted. RuntimeHost is the single owner of active
 and background operation terminals, usage commits, and shutdown cleanup. Idle
 Goal refreshes also collapse duplicate status notices.
+The first P1.1 follow-up now gives a thread-owned event stream one shared
+sequence allocator across foreground turns and host-adopted provider
+background work, so provider handoff terminal events cannot restart at
+`seq=0`. This is an unreleased architecture slice; workflow event streams,
+durable semantic journaling, and stable conversation item ids remain explicit
+follow-ups rather than being hidden behind a renderer-side deduplication fix.
 Earlier v0.2.29 extends the runtime ownership model into the
 process-owned `RuntimeHost` and bounded `ThreadActor` control plane. Typed
 operation handles and completion terminals now give headless and TUI turns one
@@ -166,6 +172,17 @@ provider/CLI/history/server harness, and production PTY runs for streamed
 output, interruption, next-submit recovery, usage/context projection, and
 terminal restoration. P0.3e is now a releasable TUI reliability feature rather
 than an unreleased compatibility stage.
+
+P1.1a now removes the provider-background sequence fork left after P0.3e. A
+host-adopted provider worker receives a fork of the actor-owned `EventFactory`
+allocator, preserving one unique contiguous `(run_id, seq)` stream across the
+foreground-to-background handoff without changing the event schema or wire
+payloads. The RED handoff test, core event-schema tests, all 40 runtime-host
+tests, the serial workspace all-targets gate, and workspace Clippy pass. This
+slice deliberately stops before workflow stream unification, ordered
+multi-producer publication, durable semantic journal records, and replacement
+of index-derived `turn-N`/`item-N` projection ids; those are the next P1.1
+vertical slices.
 
 Earlier v0.2.26 replaces the TUI's unbounded runtime-event and
 user-action lanes with blocking bounded mailboxes of 256 and 64 values. Slow or
