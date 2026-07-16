@@ -60,7 +60,8 @@ from the first rendered frame.
 | `active` | Orca should continue automatically after successful turns |
 | `paused` | User stopped automatic continuation; `/goal resume` can restart |
 | `blocked` | Agent reported a blocker that needs user input or an external change |
-| `usage_limited` | Orca stopped after the continuation cap |
+| `stalled` | Orca stopped after consecutive continuation turns made no measurable progress; `/goal resume` can restart |
+| `usage_limited` | Legacy status from the removed continuation cap; kept for old records |
 | `budget_limited` | Token budget was reached |
 | `complete` | Agent reported the objective is finished |
 
@@ -88,8 +89,16 @@ Automatic continuation stops when:
 - the goal status is no longer `active`
 - the current turn fails, is interrupted, or needs approval
 - the goal is cleared
-- the continuation cap is reached
-- cost or token budget checks stop the session
+- the goal token budget is exhausted (`budget_limited`)
+- consecutive continuation turns make no measurable token progress (`stalled`)
+- cost budget checks stop the session
+
+There is no fixed continuation cap. Each hosted goal turn accounts its token
+usage into the persisted goal record; a goal with a `token_budget` flips to
+`budget_limited` when usage reaches the budget. Independently, if three
+consecutive automatic continuation turns each add fewer than 500 tokens of
+recorded usage, Orca marks the goal `stalled` and stops. Both states are
+recoverable with `/goal resume`.
 
 An unknown or malformed provider function name is recoverable inside the same
 agent turn rather than being treated as a failed turn. Orca preserves the
