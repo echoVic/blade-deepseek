@@ -1,0 +1,40 @@
+site/src/shared.ts
+  s_c7f520a79d070d::t_f6031828690e3d 10
+  s_c7f520a79d070d::t_ecdf790e6ae8a3 11-13
+  s_c7f520a79d070d::t_a504a5446eb17f 7,14
+docs/releases/v0.2.37.md
+  s_c7f520a79d070d::t_fb8fe64c0ac413 3-4,8-28,32-35,42,44-47,55-56
+  s_c7f520a79d070d::t_c0675ea2743c94 1,62,69
+docs/production-roadmap.md
+  s_c7f520a79d070d::t_fa4000c5e61fa9 8-14
+  s_c7f520a79d070d::t_3158930697edd8 7
+site/src/changelog/Changelog.tsx
+  s_c7f520a79d070d::t_a44bc88726419f 80,531-532
+  s_c7f520a79d070d::t_ccd892ec21563a 79
+Cargo.lock
+  s_c7f520a79d070d::t_d3cf24fc7efc02 137
+Cargo.toml
+  s_c7f520a79d070d::t_d0db23a508acd9 39
+README.md
+  s_c7f520a79d070d::t_9171010129f8c9 36
+npm/orca/package.json
+  s_c7f520a79d070d::t_e41796c1fcb8c9 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fb4ef9c2267f3a2d310c10a2e1908d1d629516bd",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
