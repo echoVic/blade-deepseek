@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.44":
+        "macOS Sequoia sandbox shell resolution is fixed. sandbox-exec invocations now use /bin/sh instead of bare sh, bypassing the /private/var/select/sh kernel lookup that macOS 15 blocks inside a seatbelt sandbox. This eliminates the spurious Unsandboxed Shell Required approval prompt that appeared on every tool call in full-auto mode.",
       "v0.2.43":
         "Linux fail-closed enforcement is now scoped to strict restricted-read policies, so untrusted-folder and strict read-only modes still refuse to run when neither bubblewrap nor Landlock can enforce them. Non-strict capability modes (workspace write and global read-only) keep their established Landlock-plus-seccomp or plain compatibility fallback when a policy needs bwrap-only features and no bwrap is on PATH, matching the reference agents' fail-open-for-built-ins behavior. The release test runner no longer installs bubblewrap, so CI exercises the Landlock plus seccomp fallback path directly.",
       "v0.2.42":
@@ -530,6 +532,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.44":
+        "macOS Sequoia 沙箱 shell 解析问题已修复。sandbox-exec 调用现在使用 /bin/sh 而非裸 sh，绕过了 macOS 15 在 seatbelt 沙箱内拦截的 /private/var/select/sh 内核查找。这消除了 full-auto 模式下每次工具调用都会弹出的多余 \"Unsandboxed Shell Required\" 审批提示。",
       "v0.2.43":
         "Linux 的 fail-closed 强制现在仅限于严格的受限只读策略：未信任目录与严格只读模式在 bubblewrap 和 Landlock 都无法执行时仍会拒绝运行。非严格 capability mode（workspace write 与全局只读）在策略需要仅 bwrap 才能表达的特性、且 PATH 上没有 bwrap 时，保持其既有的 Landlock 加 seccomp 或纯 shell 兼容回退，与参考 agent 对内置 profile 的 fail-open 行为一致。release 测试运行器不再安装 bubblewrap，因此 CI 直接验证 Landlock 加 seccomp 的回退路径。",
       "v0.2.42":
