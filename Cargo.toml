@@ -36,7 +36,7 @@ seccompiler = "0.5.0"
 
 [package]
 name = "blade-deepseek"
-version = "0.2.39"
+version = "0.2.40"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"
