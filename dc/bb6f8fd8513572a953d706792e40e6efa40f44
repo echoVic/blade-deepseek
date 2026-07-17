@@ -1,0 +1,21 @@
+tests/runtime_lifecycle_contract.rs
+  s_c7f520a79d070d::t_577d55f652bca7 36-37,45-87,1297,1650,1783,1830
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dcbb6f8fd8513572a953d706792e40e6efa40f44",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
