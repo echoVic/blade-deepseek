@@ -1,0 +1,21 @@
+crates/orca-mcp/src/transport.rs
+  s_c7f520a79d070d::t_2fab2f5a714192 1345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0702f8c31b6e2e900063f49a6b9962366cedadd0",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
