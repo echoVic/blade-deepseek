@@ -1,408 +1,91 @@
 # Orca
 
-Orca is a DeepSeek-native coding agent.
+A DeepSeek-native coding agent for your terminal.
 
-A local terminal coding agent built in Rust, focused on DeepSeek reasoning and tool-use semantics. It runs a multi-turn agent loop with SSE streaming, automatic context window management, and HTTP retry with exponential backoff.
+Give Orca a task and it reads code, edits files, runs commands, verifies the
+result, and keeps working until the task is done or it needs you. Use the TUI
+for interactive work or `orca exec` for scripts and CI. Orca is built in Rust,
+runs locally, and is MIT licensed.
 
-## Installation
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md)
 
-### npm
+[Website](https://orcaagent.dev/) · [Changelog](https://orcaagent.dev/changelog/) · [Releases](https://github.com/echoVic/blade-deepseek/releases/latest) · [npm](https://www.npmjs.com/package/@blade-ai/orca)
+
+## Install
 
 ```bash
 npm install -g @blade-ai/orca
-orca --version
 ```
 
-The npm package installs a small Node.js launcher and the native `orca` binary for supported platforms.
-
-Supported npm platforms:
-
-- macOS Apple Silicon (`darwin/arm64`)
-- macOS Intel (`darwin/x64`)
-- Linux x64 (`linux/x64`)
-- Linux ARM64 (`linux/arm64`)
-
-### curl
+Or install the native binary directly:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
 
-The installer downloads the native binary for your platform from GitHub Releases.
-Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
+The npm package supports macOS and Linux on ARM64 and x64. Prebuilt archives
+are also available from [GitHub Releases](https://github.com/echoVic/blade-deepseek/releases/latest).
+
+## Use
 
 ```bash
-curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.50 sh
+export DEEPSEEK_API_KEY=sk-...
+
+orca                                      # open the TUI
+orca exec "fix the failing test"          # run headlessly
+orca exec --verifier "cargo test" "fix it" # verify before finishing
+orca --mode=acp                           # connect an ACP client
 ```
 
-### GitHub Releases
+In the TUI, `@` searches files, skills, plugins, and MCP resources. Use
+`/plan` for read-only planning, `/goal` for a persistent objective,
+`/workflows` for background work, and `/trust` to manage the current folder's
+sandbox permissions.
 
-Download the archive for your platform from the latest GitHub Release, extract it, and place `orca` on your `PATH`.
+## What it does
+
+- Uses DeepSeek's reasoning and tool-use semantics directly, with SSE streaming,
+  prefix-cache-friendly prompts, automatic context management, and retry logic.
+- Reads, searches, edits, and writes code; runs shell commands; and can verify
+  the result with a command you choose.
+- Gates risky actions with `suggest`, sandboxed `auto-edit`, full-access
+  `full-auto`, and read-only `plan` modes, plus per-folder trust.
+- Saves local conversation history with resume, fork, search, rename, archive,
+  and compression support.
+- Runs persistent goals without a fixed turn ceiling, plus subagents and
+  JavaScript workflows for longer tasks that need continuation or parallel work.
+- Loads project instructions, skills, plugins, custom tools, MCP tools, and MCP
+  resources after the workspace is trusted.
+- Exposes stable JSONL, app-server, and Agent Client Protocol (ACP) contracts
+  for editors, harnesses, and CI.
+
+Configuration priority is environment variables, CLI arguments, config files,
+then defaults. Run `orca --help` or `orca exec --help` for the full command
+surface. User configuration lives at `~/.orca/config.toml`; trusted projects
+can also provide `.orca/config.toml`, `AGENTS.md`, rules, skills, and workflows.
+
+More detail:
+
+- [Persistent Goal Mode](docs/goal-mode.md)
+- [Harness and app-server contract](docs/harness-contract.md)
+- [Dynamic workflow design](docs/claude-code-workflow-parity.md)
+- [Production roadmap](docs/production-roadmap.md)
 
 ## Community
 
 - QQ group: `472309526`
-- Telegram: https://t.me/+11No1w5ZbTMyZTQ1
+- [Telegram](https://t.me/+11No1w5ZbTMyZTQ1)
 
-## Contributing and Support
+## Contributing
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing. Open an issue first for large or compatibility-sensitive changes.
-- Report bugs with the [bug report form](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml).
-- Propose features with the [feature request form](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml).
-- Suggest documentation improvements with the [documentation form](https://github.com/echoVic/blade-deepseek/issues/new?template=documentation.yml).
-- Use [SUPPORT.md](SUPPORT.md) for questions and help.
-- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing. Open an issue first
+for large or compatibility-sensitive changes.
 
-## Quick Start
+- [Report a bug](https://github.com/echoVic/blade-deepseek/issues/new?template=bug_report.yml)
+- [Request a feature](https://github.com/echoVic/blade-deepseek/issues/new?template=feature_request.yml)
+- [Ask for help](SUPPORT.md)
+- [Report a vulnerability](SECURITY.md)
 
-```sh
-# Set your API key
-export DEEPSEEK_API_KEY=sk-...
+## License
 
-# Run a task
-orca exec "fix this test"
-
-# With options
-orca exec --approval-mode full-auto "refactor the auth module"
-orca exec --model deepseek-v4-pro "explain this codebase"
-orca exec --verifier "cargo test" "fix the failing test"
-```
-
-## Terminal UI
-
-The interactive TUI keeps long-running sessions compact without changing the
-content sent to the model:
-
-- Pastes over 1,000 characters appear as `[Pasted Content N chars]` in the
-  composer and expand only for submission. Long submitted messages remain a
-  bounded transcript preview.
-- Goal objectives, task-plan steps, tool targets, and Goal status notices are
-  shortened by terminal display width with a visible ellipsis.
-- Approval dialogs keep the decision options visible when commands or previews
-  are long, and slash/file candidate menus scroll with the current selection.
-- Drag over the transcript to select text with a theme-aware highlight;
-  releasing the button copies it to the system clipboard via OSC 52 (with
-  `pbcopy` fallback on macOS) and shows a `copied N chars` notice. Double-click
-  copies the word under the cursor, dragging past the first/last row
-  auto-scrolls to grow the selection, and a `Jump to bottom` pill re-arms
-  auto-follow after scrolling up.
-- The status line preserves permission mode and context pressure first on narrow
-  terminals, then adds token, cost, and shortcut metadata as space permits.
-- Permission modes use semantic colors: `suggest` blue, `auto-edit` violet,
-  `full-auto` red, and `plan` teal.
-- `@` opens one unified Mention menu for streaming multi-root files, Skills,
-  Plugins, and MCP Resources. The visible token stays editable while Orca keeps
-  a hidden atomic target binding, so equal names from different roots or
-  providers expand to the object the user actually selected.
-- Completed agent-message, reasoning, and proposed-plan rows keep the same
-  opaque ids while streaming, after approval continuation, and when a saved
-  thread is reopened or resumed. Live and cold history reduce one durable model
-  response instead of replacing the streamed rows with another assistant shape.
-- If DeepSeek ends a turn without visible content or a tool call, Orca performs
-  one bounded corrective retry without persisting the incomplete response or
-  repeating already displayed reasoning. Terminal provider failures retain a
-  redacted diagnostic in session and task history for later analysis.
-
-## Configuration
-
-Priority chain (highest wins): Environment variables > CLI arguments > Config file > Defaults.
-
-### Environment Variables
-
-- `DEEPSEEK_API_KEY` — API key (required)
-- `DEEPSEEK_MODEL` — Model override
-- `DEEPSEEK_BASE_URL` — API base URL override
-- `DEEPSEEK_REASONING_EFFORT` — Reasoning effort override (`high` or `max`; default `max`)
-- `ORCA_NODE_PATH` — Node.js executable used by workflow scripts when `node` is not on `PATH` (npm installs set this automatically)
-
-### Config File
-
-`~/.orca/config.toml`:
-
-```toml
-model = "auto"
-reasoning_effort = "max"
-api_key = "sk-..."
-base_url = "https://api.deepseek.com"
-```
-
-Project-local `.orca/config.toml`, `AGENTS.md`, `.orca/rules`, project skills,
-and named project workflows are loaded only after the folder is trusted. New
-folders use a strict read-only, no-network default sandbox. Manage trust with:
-
-```sh
-orca trust show --cwd /path/to/project
-orca trust add --cwd /path/to/project
-orca trust remove --cwd /path/to/project
-```
-
-The TUI exposes the same state through `/trust`, `/trust add`, and
-`/trust remove`.
-
-### Updates
-
-When `update_check` is enabled, Orca checks for a newer release before opening the interactive TUI. If a newer release is available, Orca shows a startup prompt with `Update now`, `Skip`, and `Skip until next version`. Choosing `Update now` updates the currently running install: npm-managed launches run the npm upgrade command, while direct binary launches rerun the curl installer into the current executable's directory. Choosing either skip option continues into the TUI.
-
-If you installed with curl and later switch to npm, make sure the npm global bin directory appears before `~/.local/bin` on `PATH`, or remove the older curl-installed `~/.local/bin/orca`. Otherwise your shell may keep running the curl-installed binary.
-
-Disable the startup check with:
-
-```toml
-update_check = false
-```
-
-Hooks may return structured JSON on stdout. `{"action":"deny","reason":"..."}` blocks, `{"action":"modify","modified_target":"..."}` rewrites a tool target, and `{"action":"inject","context":"..."}` adds model context. When JSON declares an `action`, Orca validates the action and required string fields so typoed or malformed structured outputs fail visibly. Plain non-JSON stdout and JSON without `action` are treated as injected context for compatibility. Supported events are `session_start`, `session_end`, `pre_tool_use`, `post_tool_use`, `pre_model_call`, `post_model_call`, `on_budget_warning`, `pre_compact`, and `post_compact`.
-
-Custom tools can be added with TOML descriptors under `~/.orca/tools/`:
-
-```toml
-name = "deploy"
-description = "Deploy the current branch"
-action_kind = "write"
-command = "./scripts/deploy.sh"
-schema = { target = { type = "string", description = "environment" } }
-```
-
-External tool commands run from the workspace directory. Raw JSON arguments are
-always provided on stdin and, when they are at most 64 KiB, are also mirrored
-in `ORCA_TOOL_ARGS` for compatibility.
-
-Tool output truncation can be configured under `[tools]`. Byte mode preserves the historical 8 KiB default; token mode adds an explicit warning with original token and line counts before compacting large outputs:
-
-```toml
-[tools]
-output_truncation = { mode = "tokens", limit = 2000 }
-```
-
-### Defaults
-
-- Model: `auto` (main loop uses `deepseek-v4-pro`, auxiliary tasks use `deepseek-v4-flash`)
-- Reasoning effort: `max`
-- Base URL: `https://api.deepseek.com`
-- Approval mode: `suggest`
-- Output format: `text`
-- Max turns: 128
-
-## Command
-
-```sh
-orca exec [options] <prompt>
-orca --mode=server
-orca --mode=acp
-orca trust [show|add|remove] --cwd <path>
-```
-
-For headless harnesses, `orca exec` also accepts prompt input from stdin:
-
-```sh
-printf 'fix the failing test\n' | orca exec --output-format jsonl
-printf 'review this diff\n' | orca exec --output-format jsonl -
-printf 'compiler output\n' | orca exec --output-format jsonl 'summarize this failure'
-```
-
-When no prompt argument is provided, stdin becomes the prompt. A lone `-` also
-forces reading the prompt from stdin. When a prompt argument and piped stdin are
-both provided, stdin is appended to the prompt inside a `<stdin>...</stdin>`
-context block.
-
-Options:
-
-- `--output-format text|jsonl` — Output format (default: text)
-- `--cwd <path>` — Workspace directory
-- `--approval-mode suggest|auto-edit|full-auto` — Approval policy
-- `--model auto|deepseek-v4-flash|deepseek-v4-pro` — Model to use; `auto` defaults to Pro for the main loop and Flash for auxiliary tasks
-- `--base-url <url>` — API base URL
-- `--verifier <command>` — Post-run verification command
-- `--resume <session|latest>` — Continue from a saved conversation transcript
-- `--fork <session|latest>` — Continue from a saved transcript in a new child session with parent metadata
-- `--continue` / `--last` — Continue from the latest saved conversation transcript
-- `--no-history` — Disable local transcript persistence for this run
-- `--save-history` — Persist transcript even with `--output-format jsonl`
-- top-level `--continue` / `--last` — Open the latest saved conversation in TUI mode
-- top-level `--resume <session|latest>` — Open a saved conversation in TUI mode
-- top-level `--fork <session|latest>` — Fork a saved conversation in TUI mode
-- top-level `--session-picker` — Choose a saved conversation before entering TUI mode
-- top-level `--mode=server` — Run the JSONL app-server, including thread/turn
-  methods, multi-root `fuzzyFileSearch/*`, unified `mention/search/*`, and
-  atomic structured Mention input. Selecting a candidate or sending structured
-  Mention input creates a binding; plain `@...` text stays literal. See
-  [the harness contract](docs/harness-contract.md)
-- top-level `--mode=acp` — Run the stdio Agent Client Protocol adapter. ACP
-  sessions and prompts project onto `RuntimeHost`; the internal JSONL server
-  remains available and unchanged.
-
-Approval modes also select the default execution boundary:
-
-- `suggest` asks before mutating or external actions.
-- `auto-edit` runs actions without interruption while keeping the workspace
-  sandbox; requests to write outside it, use blocked network access, or retry
-  without a sandbox still require a permission response.
-- `full-auto` enables full access (`danger-full-access`) and does not fall back
-  to a post-failure permission prompt for sandbox escape.
-- `plan` keeps the shell read-only and denies mutations.
-
-## Workflows
-
-`orca workflow run <script-or-name>` runs an Orca dynamic workflow.
-Named workflows resolve from the nearest `.orca/workflows/` directory first,
-then `~/.orca/workflows/`. Project workflows win over user workflows.
-Workflow tool calls launch background tasks and return task metadata immediately;
-the final workflow report is delivered back into the active TUI session as a
-task notification.
-If a backgrounded TUI turn pauses for tool approval, approving it from the
-workflow/tasks panel continues the stored provider response. The originally
-approved tool call is not prompted again; later approval-requiring tools still
-follow the active approval policy.
-
-Workflow scripts are JavaScript modules beginning with:
-
-```js
-export const meta = { name: "audit", description: "Audit code", phases: ["scan"] };
-```
-
-## Conversation History
-
-Text-mode `orca exec` saves local JSONL transcripts under `~/.orca/sessions/YYYY/MM/DD/`.
-JSONL mode is side-effect free by default for harness use; pass `--save-history` when a machine-readable run should also be resumable.
-
-```sh
-orca history list
-orca history list --all
-orca history show latest
-orca history rename latest "short title"
-orca history search "needle"
-orca history compress latest
-orca history archive latest
-orca history delete <session>
-orca exec --resume latest "continue the refactor"
-orca exec --continue "continue the refactor"
-orca exec --fork latest "try another approach"
-orca --session-picker
-```
-
-`--resume` and `--fork` accept a full session ID, a filename/session prefix, or `latest`. Resumed runs create a new transcript that includes the loaded context plus the new turn. Forked runs also write `parent_id` and `forked: true` metadata. Context compaction is persisted as `context.collapsed` records, appends are guarded with file locks on Unix, `history search` uses local ripgrep when available, and `history compress` rewrites large transcripts as `.jsonl.zst` while keeping list/show/search support.
-
-In the TUI, `Esc` during an idle composer backtracks to the previous user message and places that prompt back in the input box for editing and re-asking.
-
-## Persistent Goal Mode
-
-TUI sessions support persistent goals with `/goal`. A goal is stored by session id in `~/.orca/goals_1.json` or `$ORCA_HOME/goals_1.json`, so it survives process restarts when the session is saved.
-
-```text
-/goal                         # show the current goal
-/goal ship the refactor       # create or replace the active goal and start it
-/goal edit finish the parser  # update the objective and reactivate it
-/goal pause                   # stop automatic continuation
-/goal resume                  # reactivate and continue when idle
-/goal clear                   # delete the goal for this session
-```
-
-While a goal is active, Orca automatically starts another turn after a successful turn and injects goal-mode instructions as pinned context. There is no fixed turn or continuation limit. The loop stops when the goal is paused, cleared, blocked, completed, budget-limited, interrupted, waiting on an interaction or workflow, or repeatedly makes no progress. Goal turns expose `get_goal`, `create_goal`, and `update_goal`; the model can only use `update_goal` to request a verified `complete` or `blocked` terminal state, while `/goal` commands own pause, resume, edit, and clear.
-
-The running timer for an active Goal is cumulative: Orca displays persisted time from completed Goal turns plus the elapsed time of the current turn. Time between turns, while the Goal is paused, or while Orca is closed is excluded. `/goal resume` preserves the elapsed time, tokens used, token budget, objective, and original creation timestamp instead of starting the Goal's accounting over.
-
-Persistent goals require recorded history. If history is disabled with `--no-history`, `/goal` reports an error instead of creating ephemeral goal state.
-
-## Tools
-
-Built-in tools:
-
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read file contents (UTF-8, truncated at 8KB) |
-| `glob` | Find files and directories by glob pattern or fuzzy path query; preferred for file discovery |
-| `list_files` | Compatibility alias for directory listing |
-| `grep` | Search with ripgrep (regex, line numbers) |
-| `bash` | Execute shell commands via `sh -c` |
-| `edit` | Exact text replacement in files |
-| `write_file` | Create or overwrite a file |
-| `git_status` | Show git working tree status |
-| `web_search` | Search the web for current information |
-| `subagent` | Run a synchronous child agent for a delegated task |
-| `Workflow` | Launch a background dynamic workflow |
-| `update_plan` | Update the visible task plan |
-| `get_goal` | Read active persistent goal state during goal mode |
-| `create_goal` | Create a persistent goal during goal mode when no unfinished goal exists |
-| `update_goal` | Mark active persistent goal complete or blocked from goal mode |
-| `request_user_input` | Ask a structured clarification question; TUI answers continue the same turn |
-| `list_skills` | List Markdown skills from user and project skill directories |
-| `read_skill` | Read a skill's Markdown instructions by id |
-| `list_mcp_resources` | List read-only resources exposed by configured MCP servers |
-| `read_mcp_resource` | Read a specific MCP resource by server name and URI |
-
-Tools are registered through a canonical tool registry with capability metadata. Approval behavior is derived from those capabilities: read-only tools run directly, write tools follow write approval policy, shell tools follow shell approval policy, network tools follow network policy, and agent/workflow tools follow agent policy. Tool arguments are validated before execution, including common JSON Schema object keywords plus `oneOf` and `anyOf`, so provider-advertised schemas and runtime rejection behavior stay aligned. `glob` is the model-facing file discovery tool and supports both normal glob patterns and `mode: "fuzzy"` path queries; `list_files` remains accepted for older prompts and saved sessions. `request_user_input` stays deterministic in headless runs and becomes interactive in TUI sessions.
-
-Markdown skills live under `$ORCA_HOME/skills/*/SKILL.md`, `~/.orca/skills/*/SKILL.md`, or project `.orca/skills/*/SKILL.md`. The model can inspect them with `list_skills` and `read_skill`; when a prompt explicitly mentions a skill id such as `$debugging`, Orca injects that skill's instructions into the model context for the turn.
-
-MCP tools and custom external tools can be added at startup. External tools live under `~/.orca/tools/*.toml` or `$ORCA_HOME/tools/*.toml`, and configured MCP server tools are exposed with namespaced tool names. MCP resources can also be listed and read through the read-only resource tools.
-
-## Architecture
-
-- **Agent Loop**: prompt → model → tool_call → execute → feed result → next turn (up to 128 turns)
-- **Subagents**: Synchronous child agent loops share the parent workspace, provider/model config, and approval policy, then return a concise result to the parent
-- **Persistent Goal Mode**: TUI sessions can persist a long-running objective, auto-continue successful turns, and stop through `/goal` controls or goal-mode tools
-- **SSE Streaming**: Real-time reasoning and content deltas via Server-Sent Events
-- **Context Window**: DeepSeek V4 1M-token context, 80% threshold compaction with response reserve (preserves system + recent messages)
-- **Conversation History**: Local JSONL transcripts support listing, inspection, resume/fork, full-text search, archive/delete/rename, and zstd compression
-- **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
-- **Approval Policy**: Tool capabilities drive approval; `suggest` prompts for mutating or external actions, `auto-edit` allows actions inside its workspace sandbox, `full-auto` combines automatic approval with `danger-full-access`, and `plan` denies mutations
-- **Verification**: Optional post-completion verifier command with pass/fail status
-- **Release Gate**: `scripts/release/verify-published.mjs` checks the GitHub Release, npm registry, and `npm exec` smoke path after publishing
-
-## Event Stream (JSONL)
-
-When `--output-format jsonl` is used, each line is a versioned event:
-
-```json
-{"version":"1","run_id":"run-...","seq":0,"timestamp_ms":1780647978857,"type":"session.started","payload":{}}
-```
-
-Event types: `session.started`, `turn.started`, `assistant.reasoning.delta`, `assistant.message.delta`, `provider.replay.updated`, `approval.requested`, `approval.resolved`, `tool.call.requested`, `tool.call.completed`, `subagent.started`, `subagent.completed`, `verification.started`, `verification.completed`, `error`, `session.completed`.
-
-## Agent Client Protocol (ACP)
-
-Orca supports the [Agent Client Protocol](https://agentclientprotocol.com) as a
-parallel entry point alongside the internal JSONL protocol. This lets code
-editors (Zed, etc.) communicate with Orca using the standard ACP JSON-RPC wire
-format over stdio.
-
-```bash
-orca --mode=acp
-```
-
-The ACP adapter projects protocol messages onto existing internals:
-
-| ACP method | Orca mechanism |
-|---|---|
-| `session/new` | `RuntimeHost::start_thread` |
-| `session/load` | Resume from conversation history |
-| `session/prompt` | `RuntimeThreadHandle::start_turn_with_config` |
-| `session/update` | `EventObserver` → projected `SessionUpdate` |
-| `session/cancel` | `OperationHandle::interrupt()` |
-
-Supported methods: `initialize`, `authenticate` (no-op), `session/new`,
-`session/load`, `session/prompt`, `session/cancel`, plus streaming
-`session/update` notifications (message chunks, reasoning chunks, tool calls,
-tool call updates, and plan updates).
-
-The internal JSONL protocol (`--mode=server`) remains unchanged and available.
-
-## Exit Codes
-
-- `0`: success
-- `1`: failed
-- `2`: verification failed
-- `3`: approval required or denied
-- `4`: budget exhausted
-- `130`: cancelled
-
-## Tech Stack
-
-- Rust 2024 edition
-- clap (CLI), reqwest (blocking HTTP), serde (JSON), toml (config), dirs (XDG paths)
-- Synchronous blocking I/O, suitable for CLI interaction
-
-## Status
-
-Production-ready agent loop with DeepSeek streaming provider. Core tools, multi-turn conversation, persistent goals, context management, subagents, workflows, approval policies, and verification support are implemented.
+[MIT](LICENSE)
