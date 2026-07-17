@@ -96,7 +96,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/orca" "dist/orca-${{ matrix.target }}/orca"
           tar -C "dist/orca-${{ matrix.target }}" -czf "dist/orca-${{ matrix.target }}.tar.gz" orca
           shasum -a 256 "dist/orca-${{ matrix.target }}.tar.gz" > "dist/orca-${{ matrix.target }}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: orca-${{ matrix.target }}
           path: |
@@ -111,7 +111,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist/artifacts
           merge-multiple: true
@@ -142,7 +142,7 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist/artifacts
           merge-multiple: true
@@ -160,7 +160,7 @@ jobs:
             --stage-dir dist/npm/stage \
             --tarballs-dir dist/npm/tarballs
       - name: Upload npm tarballs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: npm-tarballs
           path: dist/npm/tarballs/*.tgz
@@ -203,7 +203,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: npm-tarballs
           path: dist/npm/tarballs
