@@ -160,7 +160,7 @@ jobs:
             --stage-dir dist/npm/stage \
             --tarballs-dir dist/npm/tarballs
       - name: Upload npm tarballs artifact
-      - uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4
         with:
           name: npm-tarballs
           path: dist/npm/tarballs/*.tgz
