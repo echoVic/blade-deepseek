@@ -1442,7 +1442,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"tools/call"'*)
       exec 0<&-
-      (sleep 0.4; : > "$1") &
+      (sleep 2; : > "$1") &
       printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create","params":{"message":"Authorize"}}\n'
       wait
       ;;

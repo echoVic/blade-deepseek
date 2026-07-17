@@ -647,71 +647,79 @@ mod tests {
         if !orca_runtime::workflow::host::WorkflowHost::node_available() {
             return;
         }
-        let temp = tempdir().expect("workflow workspace");
-        let workflow_dir = temp.path().join(".orca").join("workflows");
-        std::fs::create_dir_all(&workflow_dir).expect("workflow directory");
-        std::fs::write(
+        with_orca_home(|home| {
+            let temp = tempdir().expect("workflow workspace");
+            let workflow_dir = temp.path().join(".orca").join("workflows");
+            std::fs::create_dir_all(&workflow_dir).expect("workflow directory");
+            std::fs::write(
             workflow_dir.join("runtime-owned.js"),
             "export const meta = { name: 'runtime-owned', description: 'Runtime host test', phases: ['main'] };\nexport default await phase('main', async () => agent('inspect repo'));",
         )
         .expect("saved workflow");
+            orca_core::config::folder_trust::set_trust_with_config_dir(
+                temp.path(),
+                home,
+                orca_core::config::folder_trust::TrustLevel::Trusted,
+            )
+            .expect("trust workflow workspace");
 
-        let mut config = test_config(HistoryMode::Disabled);
-        config.cwd = Some(temp.path().to_path_buf());
-        config.output_format = OutputFormat::Jsonl;
-        config.approval_mode = ApprovalMode::FullAuto;
-        let config = Arc::new(Mutex::new(config));
-        let preloaded = Arc::new(Mutex::new(None));
-        let (event_tx, event_rx) = mpsc::unbounded();
-        let (action_tx, action_rx) = mpsc::unbounded();
-        let handle = std::thread::spawn({
-            let config = Arc::clone(&config);
-            let preloaded = Arc::clone(&preloaded);
-            move || {
-                run_hosted_tui_controller_for_test(
-                    config,
-                    preloaded,
-                    event_tx,
-                    action_rx,
-                    CancelToken::new(),
-                    test_pending_workflow_notifications(),
-                )
-            }
-        });
+            let mut config = test_config(HistoryMode::Disabled);
+            config.cwd = Some(temp.path().to_path_buf());
+            config.output_format = OutputFormat::Jsonl;
+            config.approval_mode = ApprovalMode::FullAuto;
+            let config = Arc::new(Mutex::new(config));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                move || {
+                    run_hosted_tui_controller_for_test(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        CancelToken::new(),
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
 
-        action_tx
-            .send(UserAction::RunWorkflow {
-                name: "runtime-owned".to_string(),
-                args: None,
-            })
-            .expect("run saved workflow action");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut events = Vec::new();
-        while Instant::now() < deadline
-            && !events
-                .iter()
-                .any(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
-        {
-            if let Ok(event) = event_rx.recv_timeout(Duration::from_millis(50)) {
-                events.push(event);
+            action_tx
+                .send(UserAction::RunWorkflow {
+                    name: "runtime-owned".to_string(),
+                    args: None,
+                })
+                .expect("run saved workflow action");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut events = Vec::new();
+            while Instant::now() < deadline
+                && !events
+                    .iter()
+                    .any(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
+            {
+                if let Ok(event) = event_rx.recv_timeout(Duration::from_millis(50)) {
+                    events.push(event);
+                }
             }
-        }
-        assert!(
+            assert!(
             events
                 .iter()
                 .any(|event| matches!(event, TuiEvent::ToolCompleted { name, status, .. } if name == "Workflow" && status == "completed")),
             "saved workflow should publish a typed tool completion"
         );
-        assert!(
+            assert!(
             events
                 .iter()
                 .any(|event| matches!(event, TuiEvent::WorkflowNotification { status, .. } if status == "completed")),
             "saved workflow should publish a terminal notification"
         );
-        action_tx
-            .send(UserAction::Cancel)
-            .expect("stop TUI test loop");
-        handle.join().expect("hosted TUI test loop joined");
+            action_tx
+                .send(UserAction::Cancel)
+                .expect("stop TUI test loop");
+            handle.join().expect("hosted TUI test loop joined");
+        });
     }
 
     fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
