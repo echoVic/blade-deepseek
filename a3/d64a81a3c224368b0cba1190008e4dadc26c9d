@@ -1,0 +1,31 @@
+crates/orca-runtime/src/runtime_host.rs
+  s_c7f520a79d070d::t_8afb44b2b630fe 2279-2280
+crates/orca-runtime/src/runtime_special.rs
+  s_c7f520a79d070d::t_e9bc9f5627693f 674-675,680-681,686-688,690,698-703,709-718
+crates/orca-runtime/src/tasks.rs
+  s_c7f520a79d070d::t_0307d940eb29ae 1771-1773,2858,2866,2871-2872,2874
+crates/orca-runtime/tests/runtime_host.rs
+  s_c7f520a79d070d::t_978e9a5871a920 375-376,380-381,2997-3016,3019-3054,3056-3057,3104-3130,3139-3143,3145-3149,3151-3170,3349
+crates/orca-tui/src/app.rs
+  s_c7f520a79d070d::t_1ce6aec931a99b 2224
+tests/support/server_test_client.rs
+  s_c7f520a79d070d::t_38df14557373a7 1391
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a3d64a81a3c224368b0cba1190008e4dadc26c9d",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

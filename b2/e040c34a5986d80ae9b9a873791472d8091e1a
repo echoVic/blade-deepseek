@@ -1,0 +1,21 @@
+docs/superpowers/specs/2026-07-16-harness-contract-refresh-design.md
+  s_ccc9f6a61a1e71::t_376a210127201d 1-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b2e040c34a5986d80ae9b9a873791472d8091e1a",
+  "prompts": {},
+  "sessions": {
+    "s_ccc9f6a61a1e71": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f693f-d3f9-7f42-bc9b-62aa61f5f8e8",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

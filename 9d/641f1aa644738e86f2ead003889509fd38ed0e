@@ -1,0 +1,29 @@
+docs/production-roadmap.md
+  s_c7f520a79d070d::t_fa4000c5e61fa9 6,8-14
+docs/releases/v0.2.37.md
+  s_c7f520a79d070d::t_fb8fe64c0ac413 2-54,56-61,63-68,70
+site/public/sitemap.xml
+  s_c7f520a79d070d::t_8e13794d6ae313 5,11,17,23,29,35
+site/src/changelog/Changelog.tsx
+  s_c7f520a79d070d::t_a44bc88726419f 80,532
+site/src/shared.ts
+  s_c7f520a79d070d::t_f6031828690e3d 10,22,33-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9d641f1aa644738e86f2ead003889509fd38ed0e",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

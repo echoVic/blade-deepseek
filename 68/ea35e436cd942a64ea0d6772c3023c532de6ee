@@ -1,0 +1,25 @@
+.github/ISSUE_TEMPLATE/bug_report.yml
+  s_c7f520a79d070d::t_039748ca2f6a5b 8
+docs/superpowers/plans/2026-07-16-contributor-governance.md
+  s_c7f520a79d070d::t_b4623d63294827 259-261
+docs/superpowers/specs/2026-07-16-contributor-governance-design.md
+  s_c7f520a79d070d::t_300069766633ad 66-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "68ea35e436cd942a64ea0d6772c3023c532de6ee",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

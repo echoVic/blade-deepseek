@@ -1,0 +1,21 @@
+docs/superpowers/specs/2026-07-16-contributor-governance-design.md
+  s_ccc9f6a61a1e71::t_f48d22bfa72ea0 123-130,138-139,155-157,172-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4a2a11d2a5da1c1256033a1c147012fe6175f5bc",
+  "prompts": {},
+  "sessions": {
+    "s_ccc9f6a61a1e71": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f693f-d3f9-7f42-bc9b-62aa61f5f8e8",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
