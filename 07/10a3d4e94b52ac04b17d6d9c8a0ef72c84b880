@@ -1,0 +1,35 @@
+Cargo.lock
+  s_c7f520a79d070d::t_018a2bfe47053b 137
+Cargo.toml
+  s_c7f520a79d070d::t_7a1f4ba4276b3c 39
+README.md
+  s_c7f520a79d070d::t_91b0d3577c774f 36
+docs/production-roadmap.md
+  s_c7f520a79d070d::t_ab32c1624d1c8a 7
+docs/releases/v0.2.40.md
+  s_c7f520a79d070d::t_aa9cc7e22b44a0 1,59,66,73
+npm/orca/package.json
+  s_c7f520a79d070d::t_15f10fceb3417f 3
+site/src/changelog/Changelog.tsx
+  s_c7f520a79d070d::t_0531cec0f7263a 79,531
+site/src/shared.ts
+  s_c7f520a79d070d::t_25563801eacf69 7,11,13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0710a3d4e94b52ac04b17d6d9c8a0ef72c84b880",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
