@@ -1262,6 +1262,7 @@ fn task_actor_executes_normal_tool_with_runtime_policy() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
     let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let task_registry = TaskRegistry::new("run-actor".to_string());
     let request = ToolRequest {
         id: "tool-1".to_string(),
         name: ToolName::Bash,
@@ -1279,7 +1280,7 @@ fn task_actor_executes_normal_tool_with_runtime_policy() {
         &[],
         ToolConfig::default().output_truncation,
         ToolConfig::default().shell_timeout_secs,
-        None,
+        Some(&task_registry),
         None,
         None,
     );
