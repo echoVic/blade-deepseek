@@ -230,12 +230,15 @@ Persistent goal mode:
 
 ## Approval Policy
 
-Four modes control which tool actions require user confirmation:
+Four modes control which tool actions require user confirmation. `auto-edit`
+is autonomous within the workspace sandbox; crossing that boundary still uses
+the runtime permission flow. `full-auto` removes both the approval prompt and
+the default sandbox boundary.
 
 | Mode | read | write | network | agent | shell |
 |------|------|-------|---------|-------|-------|
 | `suggest` (default) | allow | ask | ask | ask | ask |
-| `auto-edit` | allow | allow | ask | ask | ask |
+| `auto-edit` | allow | allow | allow | allow | allow |
 | `full-auto` | allow | allow | allow | allow | allow |
 | `plan` | allow | deny | deny | deny | deny |
 

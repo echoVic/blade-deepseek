@@ -3173,6 +3173,7 @@ enabled = true
             trust_test_folder(home, &repo);
             let index_lock = git_dir.join("index.lock");
             let mut config = test_run_config();
+            config.approval_mode = ApprovalMode::AutoEdit;
             config.cwd = Some(repo.clone());
             config.history_mode = HistoryMode::Record;
             let server_config = ServerConfig { run_config: config };
@@ -3285,6 +3286,7 @@ enabled = true
             trust_test_folder(home, &workspace);
             let marker = outside.join("credential-helper-output");
             let mut config = test_run_config();
+            config.approval_mode = ApprovalMode::AutoEdit;
             config.cwd = Some(workspace.clone());
             config.history_mode = HistoryMode::Record;
             let server_config = ServerConfig { run_config: config };
@@ -3389,6 +3391,7 @@ enabled = true
             trust_test_folder(home, &workspace);
             let marker = outside.join("credential-helper-output");
             let mut config = test_run_config();
+            config.approval_mode = ApprovalMode::AutoEdit;
             config.cwd = Some(workspace.clone());
             config.history_mode = HistoryMode::Record;
             let server_config = ServerConfig { run_config: config };
@@ -3477,6 +3480,7 @@ enabled = true
             trust_test_folder(home, &repo);
             let index_lock = git_dir.join("index.lock");
             let mut config = test_run_config();
+            config.approval_mode = ApprovalMode::AutoEdit;
             config.cwd = Some(repo.clone());
             config.history_mode = HistoryMode::Record;
             let server_config = ServerConfig { run_config: config };

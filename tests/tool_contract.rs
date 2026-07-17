@@ -393,7 +393,7 @@ command = "printf '%s' '{\"action\":\"deny\",\"reason\":\"blocked by hook\"}'"
 }
 
 #[test]
-fn full_auto_bash_cannot_write_outside_workspace() {
+fn full_auto_bash_writes_outside_workspace() {
     let _guard = tool_cli_test_guard();
     if !sandbox_seatbelt_available() {
         return;
@@ -427,12 +427,12 @@ fn full_auto_bash_cannot_write_outside_workspace() {
         .expect("run orca");
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(!outside.exists());
+    assert_eq!(fs::read_to_string(&outside).expect("full-auto write"), "blocked");
 
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
-    assert_eq!(completed["payload"]["status"], "failed");
+    assert_eq!(completed["payload"]["status"], "completed");
 }
 
 #[test]

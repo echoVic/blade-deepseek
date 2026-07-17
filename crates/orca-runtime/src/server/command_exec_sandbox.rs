@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
+use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{DEFAULT_PERMISSION_PROFILE_GLOB_SCAN_MAX_DEPTH, RunConfig};
 use walkdir::WalkDir;
 
@@ -78,7 +79,7 @@ pub(crate) fn command_exec_sandbox_mode(
         runtime_workspace_roots,
         tmpdir,
     )?;
-    if uses_default_folder_policy(options, thread_permission_profile) {
+    if should_apply_folder_trust_gate(config.approval_mode, options, thread_permission_profile) {
         Ok(apply_folder_trust_gate(
             resolved,
             orca_core::config::folder_trust::is_trusted(cwd),
@@ -96,6 +97,15 @@ fn uses_default_folder_policy(
     options.permission_profile.is_none()
         && options.sandbox_policy == protocol::CommandSandboxPolicy::Default
         && thread_permission_profile.is_none()
+}
+
+fn should_apply_folder_trust_gate(
+    approval_mode: ApprovalMode,
+    options: &protocol::CommandExecOptions,
+    thread_permission_profile: Option<&ActivePermissionProfile>,
+) -> bool {
+    approval_mode != ApprovalMode::FullAuto
+        && uses_default_folder_policy(options, thread_permission_profile)
 }
 
 /// Unknown and explicitly untrusted folders get a strict default. Explicit
@@ -161,9 +171,24 @@ fn command_exec_sandbox_mode_inner(
             tmpdir,
         );
     }
-    Ok(CommandExecSandbox::new(
-        shell_sandbox_mode_from_command_policy(&options.sandbox_policy),
-    ))
+    Ok(CommandExecSandbox::new(default_sandbox_mode(
+        config.approval_mode,
+    )))
+}
+
+fn default_sandbox_mode(mode: ApprovalMode) -> ShellSandboxMode {
+    match mode {
+        ApprovalMode::Plan => ShellSandboxMode::ReadOnly {
+            network_access: false,
+            allow_global_read: true,
+        },
+        ApprovalMode::Suggest | ApprovalMode::AutoEdit => ShellSandboxMode::WorkspaceWrite {
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        },
+        ApprovalMode::FullAuto => ShellSandboxMode::DangerFullAccess,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -587,6 +612,43 @@ fn materialize_profile_special_path(
 #[cfg(test)]
 mod folder_trust_tests {
     use super::*;
+
+    #[test]
+    fn default_sandbox_matches_approval_mode() {
+        assert_eq!(
+            default_sandbox_mode(ApprovalMode::Plan),
+            ShellSandboxMode::ReadOnly {
+                network_access: false,
+                allow_global_read: true,
+            }
+        );
+        assert_eq!(
+            default_sandbox_mode(ApprovalMode::AutoEdit),
+            ShellSandboxMode::WorkspaceWrite {
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
+        assert_eq!(
+            default_sandbox_mode(ApprovalMode::FullAuto),
+            ShellSandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn full_auto_does_not_get_folder_trust_downgrade() {
+        assert!(!should_apply_folder_trust_gate(
+            ApprovalMode::FullAuto,
+            &protocol::CommandExecOptions::default(),
+            None,
+        ));
+        assert!(should_apply_folder_trust_gate(
+            ApprovalMode::AutoEdit,
+            &protocol::CommandExecOptions::default(),
+            None,
+        ));
+    }
 
     #[test]
     fn untrusted_default_is_strict_read_only() {

@@ -35,7 +35,7 @@ fn suggest_denies_write_in_jsonl_mode() {
 }
 
 #[test]
-fn auto_edit_denies_shell_in_jsonl_mode() {
+fn auto_edit_allows_sandboxed_shell_in_jsonl_mode() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -50,16 +50,18 @@ fn auto_edit_denies_shell_in_jsonl_mode() {
         .output()
         .expect("run orca");
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.status.code(), Some(0));
 
     let events = parse_jsonl(&output.stdout);
     assert!(events.iter().any(|event| {
-        event["type"] == "approval.resolved" && event["payload"]["decision"] == "deny"
+        event["type"] == "approval.resolved"
+            && event["payload"]["decision"] == "allow"
+            && event["payload"]["reason"] == "auto-edit permits shell"
     }));
-    assert_eq!(
-        events.last().unwrap()["payload"]["status"],
-        "approval_required"
-    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "tool.call.completed" && event["payload"]["status"] == "completed"
+    }));
+    assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 }
 
 #[test]

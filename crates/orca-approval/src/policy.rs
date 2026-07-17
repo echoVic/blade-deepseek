@@ -58,6 +58,9 @@ impl ApprovalPolicy {
             };
         }
 
+        // Auto-edit means autonomous execution inside the active sandbox. Any
+        // request to extend that sandbox is still handled by the runtime
+        // permission path rather than this tool approval policy.
         let decision = match (self.mode, request.action) {
             (_, ActionKind::Read) => ApprovalDecision::Allow,
             (
@@ -72,7 +75,7 @@ impl ApprovalPolicy {
             (
                 ApprovalMode::AutoEdit,
                 ActionKind::Network | ActionKind::Agent | ActionKind::Shell,
-            ) => ApprovalDecision::Ask,
+            ) => ApprovalDecision::Allow,
             (ApprovalMode::FullAuto, _) => ApprovalDecision::Allow,
         };
 
@@ -151,10 +154,21 @@ mod tests {
     }
 
     #[test]
-    fn auto_edit_asks_shell() {
+    fn auto_edit_allows_sandboxed_actions() {
         let policy = ApprovalPolicy::new(ApprovalMode::AutoEdit);
-        let res = policy.resolve(&make_request(ActionKind::Shell));
-        assert_eq!(res.decision, ApprovalDecision::Ask);
+        for action in [
+            ActionKind::Read,
+            ActionKind::Write,
+            ActionKind::Network,
+            ActionKind::Agent,
+            ActionKind::Shell,
+        ] {
+            assert_eq!(
+                policy.resolve(&make_request(action)).decision,
+                ApprovalDecision::Allow,
+                "auto-edit should allow {action:?} inside its sandbox"
+            );
+        }
     }
 
     #[test]

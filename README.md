@@ -228,6 +228,16 @@ Options:
   Mention input creates a binding; plain `@...` text stays literal. See
   [the harness contract](docs/harness-contract.md)
 
+Approval modes also select the default execution boundary:
+
+- `suggest` asks before mutating or external actions.
+- `auto-edit` runs actions without interruption while keeping the workspace
+  sandbox; requests to write outside it, use blocked network access, or retry
+  without a sandbox still require a permission response.
+- `full-auto` enables full access (`danger-full-access`) and does not fall back
+  to a post-failure permission prompt for sandbox escape.
+- `plan` keeps the shell read-only and denies mutations.
+
 ## Workflows
 
 `orca workflow run <script-or-name>` runs an Orca dynamic workflow.
@@ -332,7 +342,7 @@ MCP tools and custom external tools can be added at startup. External tools live
 - **Context Window**: DeepSeek V4 1M-token context, 80% threshold compaction with response reserve (preserves system + recent messages)
 - **Conversation History**: Local JSONL transcripts support listing, inspection, resume/fork, full-text search, archive/delete/rename, and zstd compression
 - **HTTP Client**: Singleton with 30s connect / 120s request / 300s streaming timeouts, exponential backoff retry (3 attempts, handles 429/5xx)
-- **Approval Policy**: Tool capabilities drive approval; read operations are allowed, `suggest` asks for write/network/agent/shell, `auto-edit` allows writes but asks for network/agent/shell, and `full-auto` allows all
+- **Approval Policy**: Tool capabilities drive approval; `suggest` prompts for mutating or external actions, `auto-edit` allows actions inside its workspace sandbox, `full-auto` combines automatic approval with `danger-full-access`, and `plan` denies mutations
 - **Verification**: Optional post-completion verifier command with pass/fail status
 - **Release Gate**: `scripts/release/verify-published.mjs` checks the GitHub Release, npm registry, and `npm exec` smoke path after publishing
 

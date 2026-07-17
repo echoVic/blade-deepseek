@@ -668,8 +668,8 @@ fn runtime_summary(config: &RunConfig) -> RuntimeSummary {
 fn filesystem_posture(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Plan => "read-only",
-        ApprovalMode::Suggest => "approval-required",
-        ApprovalMode::AutoEdit | ApprovalMode::FullAuto => "workspace-write",
+        ApprovalMode::Suggest | ApprovalMode::AutoEdit => "workspace-write",
+        ApprovalMode::FullAuto => "danger-full-access",
     }
 }
 
@@ -745,7 +745,7 @@ mod tests {
         assert!(shown.contains("model_soft_compact_token_limit = \"64000\""));
         assert!(shown.contains("mode = \"full-auto\""));
         assert!(shown.contains("[runtime]"));
-        assert!(shown.contains("filesystem = \"workspace-write\""));
+        assert!(shown.contains("filesystem = \"danger-full-access\""));
         assert!(shown.contains("network = \"allowed\""));
         assert!(shown.contains("approval = \"full-auto\""));
         assert!(shown.contains("history = \"disabled\""));
