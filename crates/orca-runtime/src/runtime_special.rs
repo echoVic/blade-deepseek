@@ -671,17 +671,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let signal_file = temp.path().join("signals");
         let ready_file = temp.path().join("ready");
+        let descendant_pid_file = temp.path().join("descendant-pid");
+        let descendant_ready_file = temp.path().join("descendant-ready");
         let mut command = Command::new("sh");
         command
             .env("ORCA_TEST_SIGNAL_FILE", &signal_file)
             .env("ORCA_TEST_READY_FILE", &ready_file)
+            .env("ORCA_TEST_DESCENDANT_PID_FILE", &descendant_pid_file)
+            .env("ORCA_TEST_DESCENDANT_READY_FILE", &descendant_ready_file)
             .arg("-c")
             .arg(
                 r#"
 trap 'printf "worker\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0' TERM
-sh -c 'trap '\''printf "descendant\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0'\'' TERM; while :; do sleep 1; done' &
+sh -c 'trap '\''printf "descendant\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0'\'' TERM; printf "ready\n" > "$ORCA_TEST_DESCENDANT_READY_FILE"; while :; do :; done' &
+printf '%s\n' "$!" > "$ORCA_TEST_DESCENDANT_PID_FILE"
+while [ ! -e "$ORCA_TEST_DESCENDANT_READY_FILE" ]; do sleep 0.01; done
 printf 'ready\n' > "$ORCA_TEST_READY_FILE"
-wait
+while :; do :; done
 "#,
             )
             .stdin(Stdio::null())
@@ -689,11 +695,27 @@ wait
             .stderr(Stdio::null())
             .process_group(0);
         let child = command.spawn().expect("spawn async subagent fixture");
+        let child_pid = i32::try_from(child.id()).expect("child PID fits pid_t");
+        assert_eq!(
+            unsafe { libc::getpgid(child_pid) },
+            child_pid,
+            "async subagent worker must lead its own process group"
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         while !ready_file.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(ready_file.exists(), "async subagent fixture did not start");
+        let descendant_pid = fs::read_to_string(&descendant_pid_file)
+            .expect("descendant PID")
+            .trim()
+            .parse::<i32>()
+            .expect("valid descendant PID");
+        assert_eq!(
+            unsafe { libc::getpgid(descendant_pid) },
+            child_pid,
+            "async subagent descendant must stay in the worker process group"
+        );
 
         let registry = TaskRegistry::new("session-1".to_string());
         let task = registry.create_subagent("long-running async work".to_string(), None);

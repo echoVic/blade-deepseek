@@ -2276,10 +2276,8 @@ impl ThreadActor {
                 },
             };
             let usage_after = state.thread.session().aggregate_usage_totals();
-            let usage_delta = subtract_usage_totals(
-                usage_totals_delta(usage_before, usage_after),
-                usage_credit,
-            );
+            let usage_delta =
+                subtract_usage_totals(usage_totals_delta(usage_before, usage_after), usage_credit);
             account_goal_usage_for_generation(
                 &state,
                 &task_request,

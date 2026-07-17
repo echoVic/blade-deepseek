@@ -1768,7 +1768,9 @@ fn terminate_recovered_worker(pid: u32, agent_id: &str) -> Result<(), String> {
             "failed to signal async subagent worker process group with SIGTERM: {error}"
         ));
     }
-    thread::sleep(Duration::from_millis(50));
+    // A shell can defer TERM handling while it waits for a child in the same
+    // process group. Give both handlers time to settle before escalating.
+    thread::sleep(Duration::from_millis(250));
     if !process_group_has_live_members(pid)? {
         return Ok(());
     }
@@ -2853,6 +2855,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let signal_file = temp.path().join("signals");
         let ready_file = temp.path().join("ready");
+        let descendant_ready_file = temp.path().join("descendant-ready");
         let root = temp.path().join("tasks");
         let registry = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
         let task = registry.create_subagent("long-running recovered work".to_string(), None);
@@ -2860,13 +2863,15 @@ mod tests {
         command
             .env("ORCA_TEST_SIGNAL_FILE", &signal_file)
             .env("ORCA_TEST_READY_FILE", &ready_file)
+            .env("ORCA_TEST_DESCENDANT_READY_FILE", &descendant_ready_file)
             .arg("-c")
             .arg(
                 r#"
 trap 'printf "worker\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0' TERM
-sh -c 'trap '\''printf "descendant\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0'\'' TERM; while :; do sleep 1; done' &
+sh -c 'trap '\''printf "descendant\n" >> "$ORCA_TEST_SIGNAL_FILE"; exit 0'\'' TERM; printf "ready\n" > "$ORCA_TEST_DESCENDANT_READY_FILE"; while :; do :; done' &
+while [ ! -e "$ORCA_TEST_DESCENDANT_READY_FILE" ]; do sleep 0.01; done
 printf 'ready\n' > "$ORCA_TEST_READY_FILE"
-wait
+while :; do :; done
 "#,
             )
             .arg0(subagent_worker_process_name(&task.id))

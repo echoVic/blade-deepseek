@@ -2221,9 +2221,7 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while std::time::Instant::now() < deadline && !(stalled_notice && stalled_status) {
                 match event_rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(TuiEvent::Notice(message))
-                        if message.contains("no measurable progress") =>
-                    {
+                    Ok(TuiEvent::Notice(message)) if message.contains("no measurable progress") => {
                         stalled_notice = true;
                     }
                     Ok(TuiEvent::GoalUpdated(goal))

@@ -372,14 +372,13 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                 output_tokens,
                 status,
             } => {
-                thread
-                    .session_mut()
-                    .cost_tracker_mut()
-                    .add_usage(orca_core::provider_types::Usage {
+                thread.session_mut().cost_tracker_mut().add_usage(
+                    orca_core::provider_types::Usage {
                         input_tokens,
                         output_tokens,
                         cache_tokens: 0,
-                    });
+                    },
+                );
                 Ok(status.into())
             }
             TestBehavior::Panic => panic!("scripted operation panic"),
@@ -2995,66 +2994,67 @@ fn runtime_host_launches_saved_workflow_without_blocking_the_next_turn() {
         return;
     }
 
-    let cwd = tempfile::tempdir().unwrap();
-    write_saved_workflow(cwd.path(), "slow-audit", "mock_stream_delay_ms 1200");
-    let mut config = test_config(cwd.path().to_path_buf());
-    config.approval_mode = ApprovalMode::FullAuto;
-    let host = RuntimeHost::start().expect("start runtime host");
-    let thread = host
-        .start_thread(config, "hosted saved workflow")
-        .expect("start hosted runtime thread");
-    let observer = Arc::new(RecordingEventObserver::default());
-    let launched = thread
-        .launch_workflow(
-            HostedWorkflowRequest::new("slow-audit").with_event_observer(observer.clone()),
-        )
-        .expect("launch saved workflow");
-    assert_eq!(
-        thread
-            .task_registry()
-            .get(launched.task_id())
-            .expect("running workflow task")
-            .status,
-        TaskStatus::Running
-    );
-
-    let next = thread
-        .start_turn(
-            HostedTurnRequest::new("next foreground turn").with_event_observer(observer.clone()),
-            io::sink(),
-        )
-        .expect("actor accepts next turn");
-    assert_eq!(
-        next.wait_timeout(TEST_TIMEOUT)
-            .expect("next foreground terminal")
-            .outcome(),
-        &OperationOutcome::Completed(RunStatus::Success)
-    );
-    wait_until_task_status(&thread, launched.task_id(), TaskStatus::Completed);
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    while observer.count(EventType::WorkflowResultAvailable) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "workflow terminal event was not published"
+    with_trusted_saved_workflow("slow-audit", "mock_stream_delay_ms 1200", |cwd| {
+        let mut config = test_config(cwd.to_path_buf());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(config, "hosted saved workflow")
+            .expect("start hosted runtime thread");
+        let observer = Arc::new(RecordingEventObserver::default());
+        let launched = thread
+            .launch_workflow(
+                HostedWorkflowRequest::new("slow-audit").with_event_observer(observer.clone()),
+            )
+            .expect("launch saved workflow");
+        assert_eq!(
+            thread
+                .task_registry()
+                .get(launched.task_id())
+                .expect("running workflow task")
+                .status,
+            TaskStatus::Running
         );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(observer.count(EventType::WorkflowResultAvailable), 1);
 
-    let events = assert_one_thread_event_sequence(&observer, thread.thread_id());
-    for event in events.iter().filter(|event| {
-        matches!(
-            event.event_type,
-            EventType::WorkflowStarted
-                | EventType::WorkflowCompleted
-                | EventType::WorkflowResultAvailable
-                | EventType::WorkflowFailed
-        )
-    }) {
-        assert_eq!(event.payload["runId"], launched.run_id());
-    }
+        let next = thread
+            .start_turn(
+                HostedTurnRequest::new("next foreground turn")
+                    .with_event_observer(observer.clone()),
+                io::sink(),
+            )
+            .expect("actor accepts next turn");
+        assert_eq!(
+            next.wait_timeout(TEST_TIMEOUT)
+                .expect("next foreground terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        wait_until_task_status(&thread, launched.task_id(), TaskStatus::Completed);
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while observer.count(EventType::WorkflowResultAvailable) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "workflow terminal event was not published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(observer.count(EventType::WorkflowResultAvailable), 1);
 
-    host.shutdown().expect("shutdown runtime host");
+        let events = assert_one_thread_event_sequence(&observer, thread.thread_id());
+        for event in events.iter().filter(|event| {
+            matches!(
+                event.event_type,
+                EventType::WorkflowStarted
+                    | EventType::WorkflowCompleted
+                    | EventType::WorkflowResultAvailable
+                    | EventType::WorkflowFailed
+            )
+        }) {
+            assert_eq!(event.payload["runId"], launched.run_id());
+        }
+
+        host.shutdown().expect("shutdown runtime host");
+    });
 }
 
 #[test]
@@ -3101,33 +3101,33 @@ fn runtime_host_shutdown_cancels_and_joins_saved_workflow() {
         return;
     }
 
-    let cwd = tempfile::tempdir().unwrap();
-    write_saved_workflow(cwd.path(), "shutdown-audit", "mock_stream_delay_ms 5000");
-    let mut config = test_config(cwd.path().to_path_buf());
-    config.approval_mode = ApprovalMode::FullAuto;
-    let host = RuntimeHost::start().expect("start runtime host");
-    let thread = host
-        .start_thread(config, "shutdown saved workflow")
-        .expect("start hosted runtime thread");
-    let launched = thread
-        .launch_workflow(HostedWorkflowRequest::new("shutdown-audit"))
-        .expect("launch saved workflow");
-    let task_id = launched.task_id().to_string();
+    with_trusted_saved_workflow("shutdown-audit", "mock_stream_delay_ms 5000", |cwd| {
+        let mut config = test_config(cwd.to_path_buf());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(config, "shutdown saved workflow")
+            .expect("start hosted runtime thread");
+        let launched = thread
+            .launch_workflow(HostedWorkflowRequest::new("shutdown-audit"))
+            .expect("launch saved workflow");
+        let task_id = launched.task_id().to_string();
 
-    let started = Instant::now();
-    host.shutdown().expect("shutdown joins saved workflow");
-    assert!(
-        started.elapsed() < TEST_TIMEOUT,
-        "shutdown waited for the workflow's full provider delay"
-    );
-    assert_eq!(
-        thread
-            .task_registry()
-            .get(&task_id)
-            .expect("settled workflow task")
-            .status,
-        TaskStatus::Stopped
-    );
+        let started = Instant::now();
+        host.shutdown().expect("shutdown joins saved workflow");
+        assert!(
+            started.elapsed() < TEST_TIMEOUT,
+            "shutdown waited for the workflow's full provider delay"
+        );
+        assert_eq!(
+            thread
+                .task_registry()
+                .get(&task_id)
+                .expect("settled workflow task")
+                .status,
+            TaskStatus::Stopped
+        );
+    });
 }
 
 #[test]
@@ -3136,20 +3136,38 @@ fn runtime_host_rejects_saved_workflow_before_launch_when_background_capacity_is
         return;
     }
 
-    let cwd = tempfile::tempdir().unwrap();
-    write_saved_workflow(cwd.path(), "capacity-audit", "inspect repo");
-    let host = RuntimeHost::start_with_background_capacity(0).expect("start runtime host");
-    let thread = host
-        .start_thread(test_config(cwd.path().to_path_buf()), "workflow capacity")
-        .expect("start hosted runtime thread");
+    with_trusted_saved_workflow("capacity-audit", "inspect repo", |cwd| {
+        let host = RuntimeHost::start_with_background_capacity(0).expect("start runtime host");
+        let thread = host
+            .start_thread(test_config(cwd.to_path_buf()), "workflow capacity")
+            .expect("start hosted runtime thread");
 
-    let error = thread
-        .launch_workflow(HostedWorkflowRequest::new("capacity-audit"))
-        .expect_err("capacity exhaustion rejects launch");
-    assert!(error.to_string().contains("capacity exhausted (0)"));
-    assert!(thread.task_registry().list().is_empty());
+        let error = thread
+            .launch_workflow(HostedWorkflowRequest::new("capacity-audit"))
+            .expect_err("capacity exhaustion rejects launch");
+        assert!(error.to_string().contains("capacity exhausted (0)"));
+        assert!(thread.task_registry().list().is_empty());
 
-    host.shutdown().expect("shutdown runtime host");
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+fn with_trusted_saved_workflow<T>(
+    name: &str,
+    prompt: &str,
+    run: impl FnOnce(&std::path::Path) -> T,
+) -> T {
+    with_orca_home(|home| {
+        let cwd = tempfile::tempdir().unwrap();
+        write_saved_workflow(cwd.path(), name, prompt);
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            cwd.path(),
+            home,
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .expect("trust saved workflow fixture");
+        run(cwd.path())
+    })
 }
 
 fn write_saved_workflow(cwd: &std::path::Path, name: &str, prompt: &str) {
@@ -3328,9 +3346,7 @@ fn turn_without_goal_usage_tracking_does_not_account() {
             .start_turn(HostedTurnRequest::new("turn"), writer.clone())
             .expect("start turn");
         assert_eq!(
-            turn.wait_timeout(TEST_TIMEOUT)
-                .expect("terminal")
-                .outcome(),
+            turn.wait_timeout(TEST_TIMEOUT).expect("terminal").outcome(),
             &OperationOutcome::Completed(RunStatus::Success)
         );
         assert_eq!(store.get(&session_id).unwrap().unwrap().tokens_used, 0);

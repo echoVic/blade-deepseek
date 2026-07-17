@@ -1388,7 +1388,7 @@ mod tests {
         let mut client = scripted_client(
             "printf 'startup noise\\n{\"id\":\"turn\",\"event\":\"turn_started\"}\\n'; sleep 5",
         );
-        client.set_event_timeout(Duration::from_millis(100));
+        client.set_event_timeout(Duration::from_millis(500));
 
         let started = Instant::now();
         let error = client
