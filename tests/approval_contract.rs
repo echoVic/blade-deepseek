@@ -75,6 +75,12 @@ decision = "allow"
 "#,
     )
     .expect("write config");
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        &std::env::current_dir().expect("cwd"),
+        home.path(),
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trust approval contract workspace");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
         .args([
