@@ -1,0 +1,21 @@
+tests/runtime_lifecycle_contract.rs
+  s_3cd5db053ed2cf::t_7793203312d2e4 5-6,43-49,1261,1273-1274,1277,1283-1284,1618,1658-1659,1662,1668-1669,1755,1769-1770,1773,1780,1808,1821-1822,1825,1832
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a72ffc46c2f82858c19ace2b84c06ed605a86e01",
+  "prompts": {},
+  "sessions": {
+    "s_3cd5db053ed2cf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e1b4c3cd-3595-4267-a51e-57c916eba3a7",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
