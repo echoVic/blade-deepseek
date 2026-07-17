@@ -33,12 +33,57 @@ use orca_runtime::protocol::{
 };
 use orca_runtime::tasks::TaskRegistry;
 use serde_json::Value;
+use std::ffi::OsString;
+use std::sync::Mutex;
 use tempfile::tempdir;
 
 #[path = "support/sandbox_test_parent.rs"]
 mod sandbox_test_support;
 
 use sandbox_test_support::sandbox_test_parent;
+
+static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct TrustedOrcaHome {
+    previous: Option<OsString>,
+    _home: tempfile::TempDir,
+    _env_lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TrustedOrcaHome {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+    }
+}
+
+fn trusted_orca_home(cwd: &std::path::Path) -> TrustedOrcaHome {
+    let env_lock = ORCA_HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home = tempdir().expect("temporary ORCA_HOME");
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        cwd,
+        home.path(),
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trust runtime lifecycle workspace");
+
+    let previous = std::env::var_os("ORCA_HOME");
+    unsafe {
+        std::env::set_var("ORCA_HOME", home.path());
+    }
+    TrustedOrcaHome {
+        previous,
+        _home: home,
+        _env_lock: env_lock,
+    }
+}
 
 #[test]
 fn agent_loop_module_does_not_depend_on_controller() {
@@ -1249,6 +1294,7 @@ fn tool_actor_context_includes_strict_auto_review_in_permission_output() {
 
 #[test]
 fn task_actor_executes_normal_tool_with_runtime_policy() {
+    let _home = trusted_orca_home(&std::env::current_dir().expect("cwd"));
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
     let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
@@ -1601,6 +1647,7 @@ fn tool_actor_context_reports_git_index_lock_sandbox_denial() {
 
 #[test]
 fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution() {
+    let _home = trusted_orca_home(&std::env::current_dir().expect("cwd"));
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
     let request = ToolRequest {
@@ -1733,6 +1780,7 @@ fn tool_actor_context_cancels_normal_tool_before_admission_without_shell_task() 
 
 #[test]
 fn tool_actor_context_preserves_shell_session_timeout_as_failure() {
+    let _home = trusted_orca_home(&std::env::current_dir().expect("cwd"));
     let mut context = RuntimeToolActorContext::new("run-tools", 2);
     let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
     let request = ToolRequest {
@@ -1779,6 +1827,7 @@ fn tool_actor_context_preserves_shell_session_timeout_as_failure() {
 
 #[test]
 fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
+    let _home = trusted_orca_home(&std::env::current_dir().expect("cwd"));
     let task_registry = TaskRegistry::new("run-tools".to_string());
     let shell_registry = task_registry.clone();
     let handle = std::thread::spawn(move || {
