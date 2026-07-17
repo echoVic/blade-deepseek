@@ -183,9 +183,9 @@ Built-in tools:
 | `grep` | read | Regex search via `rg` with line numbers, `(no matches)` for empty results |
 | `git_status` | read | Runs `git status --short` |
 | `web_search` | network | Searches the web for current information |
-| `bash` | shell | Executes via `sh -c`, requires approval unless `full-auto` |
-| `edit` | write | Exact text replacement, requires approval unless `full-auto` |
-| `write_file` | write | Creates or overwrites a file, requires approval unless `full-auto` |
+| `bash` | shell | Executes via `sh -c` under the active approval policy and sandbox |
+| `edit` | write | Exact text replacement under the active approval policy and sandbox |
+| `write_file` | write | Creates or overwrites a file under the active approval policy and sandbox |
 | `subagent` | agent | Runs a synchronous child agent with `description` and `prompt`, returning the child summary |
 | `Workflow` | agent | Starts a background dynamic workflow |
 | `update_plan` | read | Updates the visible plan state |
