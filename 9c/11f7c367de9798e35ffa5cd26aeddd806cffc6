@@ -1,0 +1,33 @@
+README.es-419.md
+  s_09df07f6a55e52::t_e23d62329565b9 1-91
+README.ja-JP.md
+  s_09df07f6a55e52::t_c24ca59fddf982 1-84
+README.ko-KR.md
+  s_09df07f6a55e52::t_af75946f107132 1-85
+README.md
+  s_09df07f6a55e52::t_ff000487adc889 3,5-8,10,12-14,20,26-27,29,31,34-36,39-70,72,74-75,77,79-80,82-85,87,89
+README.pt-BR.md
+  s_09df07f6a55e52::t_98eb3b63b332eb 1-91
+README.vi.md
+  s_09df07f6a55e52::t_cbc419692af4a7 1-87
+README.zh-CN.md
+  s_09df07f6a55e52::t_5d52190ebe22c2 1-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9c11f7c367de9798e35ffa5cd26aeddd806cffc6",
+  "prompts": {},
+  "sessions": {
+    "s_09df07f6a55e52": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6f66-68af-7e93-b9ac-b10062bd68f3",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
