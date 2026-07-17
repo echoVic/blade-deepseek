@@ -372,14 +372,13 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                 output_tokens,
                 status,
             } => {
-                thread
-                    .session_mut()
-                    .cost_tracker_mut()
-                    .add_usage(orca_core::provider_types::Usage {
+                thread.session_mut().cost_tracker_mut().add_usage(
+                    orca_core::provider_types::Usage {
                         input_tokens,
                         output_tokens,
                         cache_tokens: 0,
-                    });
+                    },
+                );
                 Ok(status.into())
             }
             TestBehavior::Panic => panic!("scripted operation panic"),
@@ -3328,9 +3327,7 @@ fn turn_without_goal_usage_tracking_does_not_account() {
             .start_turn(HostedTurnRequest::new("turn"), writer.clone())
             .expect("start turn");
         assert_eq!(
-            turn.wait_timeout(TEST_TIMEOUT)
-                .expect("terminal")
-                .outcome(),
+            turn.wait_timeout(TEST_TIMEOUT).expect("terminal").outcome(),
             &OperationOutcome::Completed(RunStatus::Success)
         );
         assert_eq!(store.get(&session_id).unwrap().unwrap().tokens_used, 0);
