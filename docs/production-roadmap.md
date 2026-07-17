@@ -4,6 +4,13 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-17
+Current baseline: v0.2.43 scopes the Linux fail-closed default to strict
+restricted-read policies. Untrusted folders and strict read-only modes still
+refuse to run when neither bubblewrap nor Landlock can enforce them, while
+non-strict capability modes keep their established Landlock-plus-seccomp or
+plain compatibility fallback when a policy needs bwrap-only features and no
+bwrap is on PATH. CI now exercises that fallback path directly.
+
 Current baseline: v0.2.42 adds OS-enforced Linux command isolation and
 folder-level trust. Linux uses bubblewrap when available, with Landlock plus
 seccomp as the compatible fallback; strict restricted-read policies fail closed

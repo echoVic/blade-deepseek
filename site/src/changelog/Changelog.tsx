@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.43":
+        "Linux fail-closed enforcement is now scoped to strict restricted-read policies, so untrusted-folder and strict read-only modes still refuse to run when neither bubblewrap nor Landlock can enforce them. Non-strict capability modes (workspace write and global read-only) keep their established Landlock-plus-seccomp or plain compatibility fallback when a policy needs bwrap-only features and no bwrap is on PATH, matching the reference agents' fail-open-for-built-ins behavior. The release test runner no longer installs bubblewrap, so CI exercises the Landlock plus seccomp fallback path directly.",
       "v0.2.42":
         "Linux command isolation now prefers bubblewrap for mount, namespace, capability, and network boundaries, then falls back to Landlock plus seccomp when the policy is expressible. Strict restricted-read policies refuse to run when neither backend can enforce them. Folder trust persists user decisions outside the repository: untrusted folders do not load project config, instructions, skills, or named workflows and receive a read-only, no-network default, while explicit capability modes, permission rules, and network-proxy grants keep their existing authority. Runtime lifecycle tests now use an explicit danger-full-access capability profile, proving that this established override remains authoritative without weakening the Linux fail-closed default.",
       "v0.2.36":
@@ -528,6 +530,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.43":
+        "Linux 的 fail-closed 强制现在仅限于严格的受限只读策略：未信任目录与严格只读模式在 bubblewrap 和 Landlock 都无法执行时仍会拒绝运行。非严格 capability mode（workspace write 与全局只读）在策略需要仅 bwrap 才能表达的特性、且 PATH 上没有 bwrap 时，保持其既有的 Landlock 加 seccomp 或纯 shell 兼容回退，与参考 agent 对内置 profile 的 fail-open 行为一致。release 测试运行器不再安装 bubblewrap，因此 CI 直接验证 Landlock 加 seccomp 的回退路径。",
       "v0.2.42":
         "Linux 命令隔离现在优先使用 bubblewrap 提供挂载、namespace、capability 与网络边界；当策略可表达时则回退到 Landlock 加 seccomp。严格的受限只读策略在两种后端都无法执行时会拒绝运行。folder trust 会把用户决定持久化在仓库外：未信任目录不会加载 project config、instructions、skills 或命名 workflow，并采用只读、无网络默认值；显式 capability mode、权限规则和网络代理授权仍保持原有优先级。runtime lifecycle 测试现在使用显式的 danger-full-access capability profile，证明该既有覆盖仍有最高优先级，同时不会放宽 Linux 的 fail-closed 默认值。",
       "v0.2.36":
