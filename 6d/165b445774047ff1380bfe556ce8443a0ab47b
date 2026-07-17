@@ -1,0 +1,21 @@
+tests/approval_contract.rs
+  s_c7f520a79d070d::t_0ed7c849b029d5 78-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6d165b445774047ff1380bfe556ce8443a0ab47b",
+  "prompts": {},
+  "sessions": {
+    "s_c7f520a79d070d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69db-364e-72f2-8b71-23b3a382179e",
+        "model": "unknown"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
