@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.45":
+        "Approval modes now match their execution boundaries: auto-edit runs autonomously inside the workspace sandbox, while full-auto combines automatic approval with danger-full-access and no post-failure sandbox escape prompt.",
       "v0.2.44":
         "macOS Sequoia sandbox shell resolution is fixed. sandbox-exec invocations now use /bin/sh instead of bare sh, bypassing the /private/var/select/sh kernel lookup that macOS 15 blocks inside a seatbelt sandbox. This eliminates the spurious Unsandboxed Shell Required approval prompt that appeared on every tool call in full-auto mode.",
       "v0.2.43":
@@ -532,6 +534,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.45":
+        "权限模式现在与执行边界一致：auto-edit 在工作区沙箱内自主执行，full-auto 同时启用自动批准与 danger-full-access，不再在沙箱失败后弹出越界授权提示。",
       "v0.2.44":
         "macOS Sequoia 沙箱 shell 解析问题已修复。sandbox-exec 调用现在使用 /bin/sh 而非裸 sh，绕过了 macOS 15 在 seatbelt 沙箱内拦截的 /private/var/select/sh 内核查找。这消除了 full-auto 模式下每次工具调用都会弹出的多余 \"Unsandboxed Shell Required\" 审批提示。",
       "v0.2.43":
