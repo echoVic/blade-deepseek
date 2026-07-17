@@ -76,8 +76,8 @@ const copy = {
       ],
     },
     summaries: {
-      "v0.2.37":
-        "Linux command isolation now prefers bubblewrap for mount, namespace, capability, and network boundaries, then falls back to Landlock plus seccomp when the policy is expressible. Strict restricted-read policies refuse to run when neither backend can enforce them. Folder trust persists user decisions outside the repository: untrusted folders do not load project config, instructions, skills, or named workflows and receive a read-only, no-network default, while explicit capability modes, permission rules, and network-proxy grants keep their existing authority.",
+      "v0.2.38":
+        "Linux command isolation now prefers bubblewrap for mount, namespace, capability, and network boundaries, then falls back to Landlock plus seccomp when the policy is expressible. Strict restricted-read policies refuse to run when neither backend can enforce them. Folder trust persists user decisions outside the repository: untrusted folders do not load project config, instructions, skills, or named workflows and receive a read-only, no-network default, while explicit capability modes, permission rules, and network-proxy grants keep their existing authority. Runtime lifecycle tests now explicitly establish trusted test workspaces, keeping the Linux fail-closed path covered without weakening it.",
       "v0.2.36":
         "Foreground subagents now have one runtime-owned invocation lifetime for admission, child cancellation, worker join, panic classification, schema validation, worktree completion, usage, and exactly-once terminal selection. Interrupting a synchronous delegation waits for child cleanup before the turn settles or the next prompt starts, while a child panic becomes an indeterminate result instead of escaping RuntimeHost. Async delegation now projects its durable task to the TUI immediately without creating an unmatched foreground lifecycle; atomic PID adoption prevents a fast worker from being overwritten, and foreground interrupt remains independent from explicit task_stop cancellation. The inline single-child loop, scoped batch runtime, duplicate formatting, stale adoption path, and source-shape ownership tests are removed; cross-process leases and stale-owner takeover remain P1.4.",
       "v0.2.35":
@@ -528,8 +528,8 @@ const copy = {
       ],
     },
     summaries: {
-      "v0.2.37":
-        "Linux 命令隔离现在优先使用 bubblewrap 提供挂载、namespace、capability 与网络边界；当策略可表达时则回退到 Landlock 加 seccomp。严格的受限只读策略在两种后端都无法执行时会拒绝运行。folder trust 会把用户决定持久化在仓库外：未信任目录不会加载 project config、instructions、skills 或命名 workflow，并采用只读、无网络默认值；显式 capability mode、权限规则和网络代理授权仍保持原有优先级。",
+      "v0.2.38":
+        "Linux 命令隔离现在优先使用 bubblewrap 提供挂载、namespace、capability 与网络边界；当策略可表达时则回退到 Landlock 加 seccomp。严格的受限只读策略在两种后端都无法执行时会拒绝运行。folder trust 会把用户决定持久化在仓库外：未信任目录不会加载 project config、instructions、skills 或命名 workflow，并采用只读、无网络默认值；显式 capability mode、权限规则和网络代理授权仍保持原有优先级。runtime lifecycle 测试会显式建立临时可信工作区，因此 Linux 的 fail-closed 路径保持覆盖且不会被放宽。",
       "v0.2.36":
         "前台 subagent 现在拥有一条由 runtime 统一管理的调用生命周期，覆盖准入、子取消、worker join、panic 分类、schema 校验、worktree 收尾、usage 与 exactly-once terminal。中断同步委派时，会等待子任务完成清理后再结束 turn 或接收下一次提交；子任务 panic 会变成 indeterminate 结果，不再逃逸为 RuntimeHost panic。异步委派会立即把 durable task 投影到 TUI，同时不再创建无法闭合的前台 lifecycle；原子 PID adoption 避免快速 worker 的新状态被父进程旧快照覆盖，前台 interrupt 也继续与显式 task_stop 取消相互独立。旧的单子任务 inline loop、batch scoped runtime、重复格式化、陈旧 adoption 路径和源码形状测试已删除；跨进程 lease 与 stale-owner takeover 留给 P1.4。",
       "v0.2.35":
