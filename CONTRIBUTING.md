@@ -72,3 +72,9 @@ feedback in scope and ensure the branch is ready for maintainers to reproduce.
 
 By contributing, you agree that your contribution is licensed under the
 [MIT License](LICENSE).
+
+## Release Process
+
+See [docs/release-process.md](docs/release-process.md) for the full release
+checklist, including version bumps, site updates, tagging, and post-publish
+verification.
