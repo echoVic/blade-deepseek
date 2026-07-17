@@ -67,7 +67,11 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
     }
 
     // No bwrap: try the in-process Landlock + seccomp fallback.
-    let must_fail_closed = request.strict || policy_requires_bwrap(&request);
+    // Some nested deny/read-only policies require namespace mounts that
+    // Landlock cannot express. Only strict restricted-read requests must fail
+    // closed when no enforcing backend is available; non-strict capability
+    // modes retain their established compatibility fallback.
+    let must_fail_closed = request.strict;
     match landlock_command(&request) {
         Ok(command) => command,
         Err(_) if must_fail_closed => {
