@@ -4,6 +4,14 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-07-17
+Current baseline: v0.2.37 adds OS-enforced Linux command isolation and
+folder-level trust. Linux uses bubblewrap when available, with Landlock plus
+seccomp as the compatible fallback; strict restricted-read policies fail closed
+when neither backend can enforce them. Unknown folders load no project-local
+configuration, instructions, skills, or named workflows, and start from a
+read-only, no-network default without overriding an explicit permission profile
+or sandbox policy.
+
 Current baseline: v0.2.36 gives synchronous single and batch subagents one
 runtime-owned invocation lifetime. `RuntimeToolCallRuntime` owns admission,
 lifecycle start, child cancellation, worker spawn, join, panic classification,
