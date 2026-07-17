@@ -94,7 +94,7 @@ pub fn workspace_write_bash_command(context: WorkspaceWriteSandboxCommandContext
             exclude_slash_tmp: context.exclude_slash_tmp,
             allowed_unix_socket_roots: context.allowed_unix_socket_roots,
         }))
-        .arg("sh")
+        .arg("/bin/sh")
         .arg("-c")
         .arg(context.command)
         .current_dir(context.cwd);
@@ -131,7 +131,7 @@ pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Com
             allow_global_read: context.allow_global_read,
             allowed_unix_socket_roots: context.allowed_unix_socket_roots,
         }))
-        .arg("sh")
+        .arg("/bin/sh")
         .arg("-c")
         .arg(context.command)
         .current_dir(context.cwd);
