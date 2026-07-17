@@ -427,7 +427,10 @@ fn full_auto_bash_writes_outside_workspace() {
         .expect("run orca");
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(fs::read_to_string(&outside).expect("full-auto write"), "blocked");
+    assert_eq!(
+        fs::read_to_string(&outside).expect("full-auto write"),
+        "blocked"
+    );
 
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
