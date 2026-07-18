@@ -1,5 +1,11 @@
 # Persistent Goal Mode Design
 
+> Historical design record. The thread-local execution approach in this file
+> was removed by the v0.2.46 runtime control-plane redesign. See
+> `docs/goal-mode.md` and
+> `docs/reports/2026-07-18-goal-runtime-control-plane-incident.md` for the
+> current contract.
+
 ## Goal
 
 Implement an OpenAI Codex-style `/goal` mode for Orca: goals are persisted per TUI conversation session, can be viewed and controlled with slash commands, continue automatically between turns while active, and can be completed or blocked by the agent through a tool.

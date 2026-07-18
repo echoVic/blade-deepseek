@@ -3,8 +3,18 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-17
-Current baseline: v0.2.43 scopes the Linux fail-closed default to strict
+Last updated: 2026-07-18
+Current baseline: v0.2.46 closes the Goal tool control-plane ownership gap.
+`ThreadTurnToolMode::Goal` now drives both provider schema visibility and
+runtime execution capability. `get_goal`, `create_goal`, and `update_goal` are
+runtime-special operations that use the recorded session id and live extension
+stores before any normal-tool worker boundary. Model-correctable arguments can
+continue sampling; missing runtime ownership and persistence failures stop the
+turn, atomically stall an active Goal, and clear volatile Goal context. The
+thread-local callback path is deleted, and a billed DeepSeek gate proves one
+non-Goal tool followed by one terminal Goal update with no continuation.
+
+Earlier v0.2.43 scopes the Linux fail-closed default to strict
 restricted-read policies. Untrusted folders and strict read-only modes still
 refuse to run when neither bubblewrap nor Landlock can enforce them, while
 non-strict capability modes keep their established Landlock-plus-seccomp or
@@ -19,7 +29,7 @@ configuration, instructions, skills, or named workflows, and start from a
 read-only, no-network default without overriding an explicit permission profile
 or sandbox policy.
 
-Current baseline: v0.2.36 gives synchronous single and batch subagents one
+Earlier v0.2.36 gives synchronous single and batch subagents one
 runtime-owned invocation lifetime. `RuntimeToolCallRuntime` owns admission,
 lifecycle start, child cancellation, worker spawn, join, panic classification,
 schema validation, usage, worktree completion, result formatting, and the
@@ -970,7 +980,7 @@ working baseline used to prioritize the next patch releases.
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
-| Persistent goals | `/goal` with persisted state, cumulative active-Goal timing, metadata-preserving atomic resume, plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal` | Codex goal extension | Implemented; runtime orchestration still open |
+| Persistent goals | `/goal` with persisted state, cumulative active-Goal timing, metadata-preserving atomic resume, plus goal-scoped `get_goal`, `create_goal`, and narrow `update_goal`. v0.2.46 makes schema visibility imply executable persistent runtime context, dispatches Goal tools before normal workers, distinguishes recoverable model errors from terminal control-plane faults, and atomically stalls failed active Goals | Codex goal extension plus explicit call context patterns in Claude Code and Grok Build | Tool execution ownership implemented; runtime continuation orchestration still open |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
 | Runtime lifecycle | Headless, server-mode, and TUI agent runs seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` owns long-lived interactive state, and focused server processors/managers handle queries, turn control, shell and command execution, permission/user-input responses, and submit operations. Workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`. v0.2.24 closes accepted tool calls with truthful terminal metadata and gives external tools, MCP/workflow children, async subagents, verifier commands, server turns, ordinary shells, and mention-search reapers explicit cleanup ownership; recovered workers require identity checks, and internal worker credentials no longer use argv or persisted workflow records | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; v0.2.24 published, with Windows process-tree parity and deeper TUI loop delegation still open |
 | TUI | Markdown-ish rendering, themes, Vim mode, bounded committed diff previews, slash commands, atomic unified mentions, workflow panel, per-turn timers plus cumulative active-Goal timing, truthful interrupted/indeterminate tool rows, mouse text selection with OSC 52 clipboard copy, double-click word copy, edge auto-scroll, and a jump-to-bottom control | Codex/Claude richer terminal UX | Partial |
@@ -2078,7 +2088,7 @@ instruction and capability system.
 | P1.3 | Durable interaction broker | Lets approval, user input, and MCP elicitation survive process loss as idempotent continuations | High |
 | P1.4 | Unified task supervisor, cancellation tree, lease, and fencing | Makes stop, pause, shutdown, reattach, stale-owner takeover, and stale-commit rejection verifiable | High |
 | P2.1 | Checkpointable workflow and subagent resume | Resumes the same run from a safe cursor instead of replaying only completed cache entries | High |
-| P2.2 | Runtime goal orchestrator | Moves goal cursor, attempts, usage, lease, and continuation policy out of the TUI | High |
+| P2.2 | Runtime goal orchestrator | Goal tool execution ownership is complete in v0.2.46; next move goal cursor, attempts, usage, lease, and continuation policy out of the TUI | High |
 | P2.3 | App-server dependency inversion | Lets processors depend on operation/thread handles and stores instead of full mutable server state | Medium |
 | P2.4 | Context and cache identity | Adds deterministic compatibility repair ids, immutable cache-critical prefixes, isolated fork state, and explicit checkpoints | Medium/High |
 | P3 | Crate cleanup, plugins, remote compaction, worktree automation, richer PTY, multi-format reading | Remove source-text architecture tests and compatibility shims only after compiler-enforced ownership; build product breadth on stable contracts | Medium/High |

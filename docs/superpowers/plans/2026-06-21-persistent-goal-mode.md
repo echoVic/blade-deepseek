@@ -1,5 +1,9 @@
 # Persistent Goal Mode Implementation Plan
 
+> Historical implementation plan. Its thread-local Goal tool path was removed
+> in v0.2.46; current execution ownership is defined by
+> `docs/superpowers/plans/2026-07-18-goal-runtime-control-plane.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build an OpenAI Codex-style persistent `/goal` mode for Orca TUI sessions.

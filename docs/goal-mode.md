@@ -82,6 +82,28 @@ Goal mode exposes three scoped tools to the model while a persistent goal turn i
 
 The tools are intentionally scoped to goal turns. Outside goal mode they are not advertised to the model, and direct calls fail with a clear message instead of creating hidden state.
 
+Schema visibility is also an execution invariant. If a hosted turn advertises a
+goal tool, the runtime must own the recorded session id, live extension stores,
+and persistent `GoalStore` needed to execute it. RuntimeHost rejects an
+impossible Goal Mode turn before provider sampling, and goal calls are
+classified as runtime-special control-plane operations before the normal-tool
+worker boundary. They never depend on thread-local callbacks and never execute
+inside `orca-normal-tool`.
+
+Goal tool failures have two dispositions:
+
+- malformed JSON, unsupported status transitions, and other model-correctable
+  arguments return a failed tool result and let the model retry in the same
+  turn
+- missing runtime capabilities, missing persistent ownership, or `GoalStore`
+  I/O failure return a failed tool result and stop the turn
+
+After a non-successful tracked Goal Mode generation, RuntimeHost atomically
+changes an `active` goal to `stalled`. It does not overwrite a concurrent or
+already persisted `paused`, `blocked`, `complete`, or `budget_limited` status.
+This control-plane failure rule is separate from the low-token progress
+detector below.
+
 ## Continuation Rules
 
 Automatic continuation stops when:
@@ -112,7 +134,11 @@ never infers or executes `bash` from a command-shaped function name. Genuine
 transport, provider, and quota failures still fail the turn and pause automatic
 Goal continuation.
 
-Before each active turn, Orca injects a single pinned goal context block. The block is replaced between turns, so long-running goals do not accumulate duplicate instructions.
+Before each active turn, Orca injects a single pinned goal context block. The
+block is replaced between turns, so long-running goals do not accumulate
+duplicate instructions. Pause, clear, complete, blocked, budget limit, runtime
+stall, and ordinary non-Goal turns remove the volatile block so stale Goal Mode
+instructions cannot leak into later requests.
 
 ## Shell Worker Cleanup On macOS
 
@@ -155,5 +181,14 @@ for the evidence and the separate v0.2.24 defense-in-depth scope.
 
 - Shared types live in `crates/orca-core/src/goal_types.rs`.
 - Persistence lives in `crates/orca-runtime/src/goals.rs`.
-- The model-facing goal tools live in `crates/orca-tools/src/update_goal.rs`.
-- TUI slash commands and continuation live in `crates/orca-tui/src/app.rs` and `crates/orca-tui/src/bridge.rs`.
+- Argument parsing and model-facing result formatting live in
+  `crates/orca-tools/src/update_goal.rs` without session or runtime ownership.
+- Runtime execution and terminal disposition live in
+  `crates/orca-runtime/src/runtime_special.rs` and
+  `crates/orca-runtime/src/tool_router.rs`.
+- Runtime admission, failed-generation stalling, and volatile context cleanup
+  live in `crates/orca-runtime/src/runtime_host.rs`.
+- TUI slash commands and automatic continuation live in
+  `crates/orca-tui/src/app.rs`.
+- The v0.2.46 control-plane incident and deletion audit are recorded in
+  [`docs/reports/2026-07-18-goal-runtime-control-plane-incident.md`](reports/2026-07-18-goal-runtime-control-plane-incident.md).

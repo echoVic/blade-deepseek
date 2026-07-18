@@ -93,7 +93,7 @@ is a control-plane ownership failure, not a model retry-policy defect.
 - Modify: `crates/orca-runtime/tests/runtime_host.rs`
 - Modify: `crates/orca-runtime/src/goals.rs`
 
-- [ ] **Step 1: Add a hosted runtime goal-tool execution test**
+- [x] **Step 1: Add a hosted runtime goal-tool execution test**
 
 Create a recorded `RuntimeThread`, persist an active goal, execute one non-goal
 tool to establish live progress, then feed a provider continuation containing:
@@ -111,25 +111,25 @@ ToolRequest {
 Run the request with `ThreadTurnToolMode::Goal` and assert `RunStatus::Success`
 plus persisted `ThreadGoalStatus::Complete`.
 
-- [ ] **Step 2: Add a missing goal runtime context terminal test**
+- [x] **Step 2: Add a missing goal runtime context terminal test**
 
 Run the same provider continuation through a history-disabled thread in Goal
 Mode. Assert the turn returns `RunStatus::Failed`, records one matching failed
 tool result, and does not continue to a successful assistant terminal.
 
-- [ ] **Step 3: Add RuntimeHost admission coverage**
+- [x] **Step 3: Add RuntimeHost admission coverage**
 
 Start a history-disabled RuntimeHost thread and submit
 `HostedTurnRequest::new("goal").with_goal_tools(true)`. Assert admission returns
 `RuntimeHostError::ThreadStartFailed` before its executor is called.
 
-- [ ] **Step 4: Add atomic active-to-stalled store coverage**
+- [x] **Step 4: Add atomic active-to-stalled store coverage**
 
 Create one goal per status, call `GoalStore::stall_if_active`, and assert active
 becomes stalled while paused, blocked, complete, and budget-limited records
 remain byte-for-byte unchanged except for no write occurring.
 
-- [ ] **Step 5: Run RED tests**
+- [x] **Step 5: Run RED tests**
 
 ```bash
 cargo test -p orca-runtime hosted_goal_tool --lib -- --nocapture
@@ -149,7 +149,7 @@ validation, and absent atomic stall behavior.
 - Modify: `crates/orca-runtime/src/tool_execution.rs`
 - Modify: `crates/orca-runtime/src/tool_turn.rs`
 
-- [ ] **Step 1: Remove implicit goal ownership from orca-tools**
+- [x] **Step 1: Remove implicit goal ownership from orca-tools**
 
 Delete `GOAL_HANDLER`, `GoalHandler`, `with_goal_handler`, and `dispatch`. Export
 pure helpers with this responsibility:
@@ -162,7 +162,7 @@ pub fn unavailable_result(request: &ToolRequest) -> ToolResult;
 
 Keep the normal registry executor deterministic outside runtime Goal Mode.
 
-- [ ] **Step 2: Add goal variants to special dispatch**
+- [x] **Step 2: Add goal variants to special dispatch**
 
 Extend `RuntimeSpecialToolDispatch` with `GetGoal`, `CreateGoal`, and
 `UpdateGoal`. Implement a runtime goal executor that:
@@ -189,13 +189,13 @@ match operation {
 Parsing/policy errors return `ContinueModel`; missing visible capability,
 session/live extension state, and store I/O return `StopTurn`.
 
-- [ ] **Step 3: Carry the schema capability through execution**
+- [x] **Step 3: Carry the schema capability through execution**
 
 Add `goal_mode: bool` to `RuntimeNormalToolTurnRequest`,
 `ToolExecutionContext`, and `RuntimeToolInvocationContext`; populate it from
 `tool_policy.is_goal_mode()` at the existing step snapshot boundary.
 
-- [ ] **Step 4: Propagate explicit turn disposition**
+- [x] **Step 4: Propagate explicit turn disposition**
 
 Change router dispatch to return:
 
@@ -210,7 +210,7 @@ Carry the disposition through `ToolExecutionCompletion`. Record every tool
 result exactly once, then return `ToolTurnOutcome::Return { status: Failed }`
 only for `StopTurn`.
 
-- [ ] **Step 5: Run GREEN and compatibility tests**
+- [x] **Step 5: Run GREEN and compatibility tests**
 
 ```bash
 cargo test -p orca-tools update_goal --lib
@@ -231,20 +231,20 @@ failed-tool continuation tests remain green.
 - Modify: `crates/orca-runtime/src/session.rs`
 - Modify: `crates/orca-tui/src/app.rs`
 
-- [ ] **Step 1: Reject impossible hosted goal capability**
+- [x] **Step 1: Reject impossible hosted goal capability**
 
 In idle StartTurn admission, reject `request.allows_goal_tools()` when
 `state.thread.session().session_id()` is absent. Do this before task creation or
 generation spawn.
 
-- [ ] **Step 2: Stall active goal on failed hosted generation**
+- [x] **Step 2: Stall active goal on failed hosted generation**
 
 After accounting goal usage, inspect the executed terminal. For a tracked Goal
 Mode generation whose status is not `Success`, call `stall_if_active`. Do not
 change non-active states and do not relabel successful turns containing
 recoverable ordinary tool errors.
 
-- [ ] **Step 3: Add typed goal context removal**
+- [x] **Step 3: Add typed goal context removal**
 
 Change the replacement path to accept `Option<String>`:
 
@@ -259,13 +259,13 @@ pub fn replace_goal_state(&mut self, content: Option<String>) {
 Carry `Option<String>` through `InteractiveSession` and
 `RuntimeThreadMutation::ReplaceGoalContext`.
 
-- [ ] **Step 4: Clear context at every inactive transition**
+- [x] **Step 4: Clear context at every inactive transition**
 
 Clear the live context after `/goal pause`, `/goal clear`, completed/blocked
 tool updates, stalled turn failure, and before a turn for which no active goal
 was loaded. Keep active context when waiting for owned workflows.
 
-- [ ] **Step 5: Verify continuation stop behavior**
+- [x] **Step 5: Verify continuation stop behavior**
 
 ```bash
 cargo test -p orca-core replace_goal_state --lib
@@ -283,20 +283,20 @@ Expected: deterministic control failure stops after one failed turn, persists
 - Modify: `scripts/release/real-api-e2e.mjs`
 - Modify: `scripts/release/test-real-api-e2e.mjs`
 
-- [ ] **Step 1: Add a release-harness Goal Mode case**
+- [x] **Step 1: Add a release-harness Goal Mode case**
 
 Run a recorded TUI-compatible goal sequence against real DeepSeek that performs
 at least one non-goal tool, calls `update_goal` once, and verifies the goal
 record becomes `complete|blocked` without a second automatic continuation. Use
 an isolated `ORCA_HOME` and a bounded budget.
 
-- [ ] **Step 2: Test the release-harness parser and fixtures**
+- [x] **Step 2: Test the release-harness parser and fixtures**
 
 ```bash
 node scripts/release/test-real-api-e2e.mjs
 ```
 
-- [ ] **Step 3: Run focused and complete local gates**
+- [x] **Step 3: Run focused and complete local gates**
 
 ```bash
 cargo fmt --all -- --check
@@ -310,7 +310,7 @@ npm --prefix site run check:seo
 git diff --check
 ```
 
-- [ ] **Step 4: Run the real API gate**
+- [x] **Step 4: Run the real API gate**
 
 ```bash
 node scripts/release/real-api-e2e.mjs --max-budget 0.02 --timeout-ms 300000
@@ -333,24 +333,24 @@ the configured DeepSeek credentials.
 - Modify: `site/src/shared.ts`
 - Modify: `site/src/changelog/Changelog.tsx`
 
-- [ ] **Step 1: Document the incident and invariant**
+- [x] **Step 1: Document the incident and invariant**
 
 Record the 463-call/120-continuation evidence, regression commits, TLS boundary,
 explicit runtime owner, recoverable/control-plane error distinction, context
 cleanup, and deletion audit.
 
-- [ ] **Step 2: Update product and architecture docs**
+- [x] **Step 2: Update product and architecture docs**
 
 Document that schema visibility implies executable runtime context, goal tools
 never run as normal workers, control failures stall once, and ordinary tool
 errors remain recoverable.
 
-- [ ] **Step 3: Prepare v0.2.46 metadata**
+- [x] **Step 3: Prepare v0.2.46 metadata**
 
 Bump all version sources to `0.2.46`, add release notes, and update both website
 languages and release list. Run `cargo check` to align `Cargo.lock`.
 
-- [ ] **Step 4: Re-run release gates on final metadata**
+- [x] **Step 4: Re-run release gates on final metadata**
 
 Repeat Task 4 Step 3 after the version and docs changes.
 
