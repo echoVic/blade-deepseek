@@ -1195,7 +1195,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "update_goal",
-            "Update the active persistent goal status from goal mode. The model may only set status to complete when the goal is fully achieved or blocked after the strict blocked audit is satisfied; pause, resume, clear, budget, and objective edits are controlled by the user or system.",
+            "Submit a terminal intent for the active persistent goal. The runtime audits complete and blocked claims at outer-turn end; a successful tool call does not itself make the Goal terminal. Pause, resume, clear, budget, and objective edits remain user or system controls.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1207,6 +1207,50 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "reason": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": "Optional short reason for the status update"
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "description": "Concrete evidence supporting the terminal claim",
+                        "maxItems": 32,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["test", "file", "command", "observation", "external"]
+                                },
+                                "summary": {"type": "string"},
+                                "target": {
+                                    "anyOf": [{"type": "string"}, {"type": "null"}]
+                                }
+                            },
+                            "required": ["kind", "summary"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "blocker": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                            "user_decision",
+                                            "missing_authority",
+                                            "external_state",
+                                            "environment_contradiction",
+                                            "unverifiable_requirement"
+                                        ]
+                                    },
+                                    "summary": {"type": "string"}
+                                },
+                                "required": ["kind", "summary"],
+                                "additionalProperties": false
+                            },
+                            {"type": "null"}
+                        ],
+                        "description": "Typed non-model-fixable dependency for a blocked intent"
                     }
                 },
                 "required": ["status"],
@@ -2250,6 +2294,30 @@ mod tests {
             "error={:?}",
             result.error
         );
+    }
+
+    #[test]
+    fn update_goal_schema_accepts_structured_evidence_and_blocker() {
+        validate_tool_request(
+            default_tool_registry(),
+            &request(
+                ToolName::UpdateGoal,
+                r#"{
+                    "status":"blocked",
+                    "reason":"waiting for a credential",
+                    "evidence":[{
+                        "kind":"observation",
+                        "summary":"credential lookup returned no value",
+                        "target":"DEEPSEEK_API_KEY"
+                    }],
+                    "blocker":{
+                        "kind":"missing_authority",
+                        "summary":"the user must provide a credential"
+                    }
+                }"#,
+            ),
+        )
+        .expect("structured terminal evidence must match advertised schema");
     }
 
     #[test]

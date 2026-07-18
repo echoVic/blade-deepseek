@@ -131,9 +131,10 @@ git commit -m "feat(goal): add typed tracker and outer turn domain"
 **Files:**
 
 - Modify: `crates/orca-tools/src/update_goal.rs`
+- Modify: `crates/orca-tools/src/registry.rs`
 - Test: existing update-goal module
 
-- [ ] **Step 1: Add RED protocol tests**
+- [x] **Step 1: Add RED protocol tests**
 
 Add parser tests for evidence and blocker fields, missing evidence rejection at
 the runtime boundary, deferred ack formatting, duplicate intent formatting, and
@@ -148,20 +149,20 @@ cargo test -p orca-tools update_goal --lib
 
 Expected: the new fields and typed result variants are absent.
 
-- [ ] **Step 2: Keep `orca-tools` pure**
+- [x] **Step 2: Keep `orca-tools` pure**
 
 Make `UpdateGoalArgs` deserialize `status`, `reason`, bounded `evidence`, and
 optional typed `blocker`. Convert it to `GoalUpdateIntent`. Do not add a store,
 session lookup, callback, or thread-local value to `orca-tools`.
 
-- [ ] **Step 3: Format typed acknowledgements without runtime ownership**
+- [x] **Step 3: Format typed acknowledgements without runtime ownership**
 
 Add a pure formatter that maps every `GoalUpdateAck` variant into an explicit
 model-facing `ToolResult`. Deferred intent output must say that terminal audit
 will run at outer-turn end. Rejected and inactive variants remain failed tool
 results; no formatter opens a store or claims the Goal already transitioned.
 
-- [ ] **Step 4: Preserve compatibility normalization**
+- [x] **Step 4: Preserve compatibility normalization**
 
 ```rust
 pub fn parse_update_intent(request: &ToolRequest) -> Result<GoalUpdateIntent, String>;
@@ -172,16 +173,16 @@ Continue accepting `completed: true`, `complete: true`, and `status:
 "completed"` as normalization aliases while the advertised schema exposes only
 `status: complete|blocked` plus reason/evidence/blocker.
 
-- [ ] **Step 5: Run protocol and runtime tests**
+- [x] **Step 5: Run protocol and runtime tests**
 
 ```bash
 cargo test -p orca-tools update_goal --lib
 ```
 
-- [ ] **Step 6: Commit the protocol slice**
+- [x] **Step 6: Commit the protocol slice**
 
 ```bash
-git add crates/orca-tools/src/update_goal.rs
+git add crates/orca-tools/src/update_goal.rs crates/orca-tools/src/registry.rs
 git commit -m "feat(goal): make terminal updates typed runtime intents"
 ```
 

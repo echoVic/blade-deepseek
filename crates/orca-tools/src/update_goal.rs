@@ -1,3 +1,7 @@
+use orca_core::goal_runtime::{
+    BlockerKind, BlockerSummary, EvidenceItem, GoalRequestedState, GoalUpdateAck, GoalUpdateIntent,
+    IntentId,
+};
 use orca_core::goal_types::{
     GoalUpdate, ThreadGoal, ThreadGoalStatus, goal_usage_summary, validate_thread_goal_objective,
 };
@@ -28,9 +32,24 @@ pub struct UpdateGoalArgs {
     pub objective: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceItem>,
+    #[serde(default)]
+    pub blocker: Option<UpdateGoalBlockerArgs>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UpdateGoalBlockerArgs {
+    pub kind: BlockerKind,
+    pub summary: String,
 }
 
 const UPDATE_GOAL_STATUS_FLAG_KEYS: [&str; 3] = ["complete", "completed", "blocked"];
+const MAX_GOAL_UPDATE_REASON_CHARS: usize = 4_000;
+const MAX_GOAL_EVIDENCE_ITEMS: usize = 32;
+const MAX_GOAL_EVIDENCE_SUMMARY_CHARS: usize = 2_000;
+const MAX_GOAL_EVIDENCE_TARGET_CHARS: usize = 4_000;
+const MAX_GOAL_BLOCKER_SUMMARY_CHARS: usize = 2_000;
 
 pub fn execute_get(request: &ToolRequest) -> ToolResult {
     execute_unavailable(request)
@@ -147,7 +166,7 @@ pub fn parse_update_args(request: &ToolRequest) -> Result<UpdateGoalArgs, String
         .ok_or_else(|| "update_goal requires raw JSON arguments".to_string())?;
     let normalized = normalize_update_raw_arguments(raw);
     let effective = normalized.as_deref().unwrap_or(raw);
-    let args: UpdateGoalArgs = serde_json::from_str(effective)
+    let mut args: UpdateGoalArgs = serde_json::from_str(effective)
         .map_err(|error| format!("invalid update_goal JSON: {error}"))?;
     if args.objective.is_some() {
         return Err(
@@ -164,7 +183,152 @@ pub fn parse_update_args(request: &ToolRequest) -> Result<UpdateGoalArgs, String
     ) {
         return Err("update_goal can only set status to complete or blocked".to_string());
     }
+    args.reason = args
+        .reason
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty());
+    if args
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.chars().count() > MAX_GOAL_UPDATE_REASON_CHARS)
+    {
+        return Err(format!(
+            "update_goal reason must be at most {MAX_GOAL_UPDATE_REASON_CHARS} characters"
+        ));
+    }
+    if args.evidence.len() > MAX_GOAL_EVIDENCE_ITEMS {
+        return Err(format!(
+            "update_goal evidence must contain at most {MAX_GOAL_EVIDENCE_ITEMS} items"
+        ));
+    }
+    for evidence in &mut args.evidence {
+        evidence.summary = evidence.summary.trim().to_string();
+        if evidence.summary.is_empty() {
+            return Err("update_goal evidence summary must not be empty".to_string());
+        }
+        if evidence.summary.chars().count() > MAX_GOAL_EVIDENCE_SUMMARY_CHARS {
+            return Err(format!(
+                "update_goal evidence summary must be at most {MAX_GOAL_EVIDENCE_SUMMARY_CHARS} characters"
+            ));
+        }
+        evidence.target = evidence
+            .target
+            .take()
+            .map(|target| target.trim().to_string())
+            .filter(|target| !target.is_empty());
+        if evidence
+            .target
+            .as_deref()
+            .is_some_and(|target| target.chars().count() > MAX_GOAL_EVIDENCE_TARGET_CHARS)
+        {
+            return Err(format!(
+                "update_goal evidence target must be at most {MAX_GOAL_EVIDENCE_TARGET_CHARS} characters"
+            ));
+        }
+    }
+    if let Some(blocker) = args.blocker.as_mut() {
+        blocker.summary = blocker.summary.trim().to_string();
+        if blocker.summary.is_empty() {
+            return Err("update_goal blocker summary must not be empty".to_string());
+        }
+        if blocker.summary.chars().count() > MAX_GOAL_BLOCKER_SUMMARY_CHARS {
+            return Err(format!(
+                "update_goal blocker summary must be at most {MAX_GOAL_BLOCKER_SUMMARY_CHARS} characters"
+            ));
+        }
+    }
     Ok(args)
+}
+
+pub fn parse_update_intent(request: &ToolRequest) -> Result<GoalUpdateIntent, String> {
+    let args = parse_update_args(request)?;
+    let requested_state = match args.status.expect("parse_update_args requires status") {
+        ThreadGoalStatus::Complete => GoalRequestedState::Complete,
+        ThreadGoalStatus::Blocked => GoalRequestedState::Blocked,
+        _ => unreachable!("parse_update_args restricts model-controlled status"),
+    };
+    let reason = args.reason.unwrap_or_else(|| match requested_state {
+        GoalRequestedState::Complete => "goal completion requested".to_string(),
+        GoalRequestedState::Blocked => "goal blocked state requested".to_string(),
+    });
+    let blocker = args.blocker.map(|blocker| BlockerSummary {
+        kind: blocker.kind,
+        fingerprint: blocker_fingerprint(blocker.kind, &blocker.summary),
+        summary: blocker.summary,
+        evidence: args.evidence.clone(),
+    });
+    Ok(GoalUpdateIntent {
+        intent_id: IntentId::new(),
+        requested_state,
+        reason,
+        evidence: args.evidence,
+        blocker,
+    })
+}
+
+pub fn acknowledgement_result(request: &ToolRequest, ack: &GoalUpdateAck) -> ToolResult {
+    match ack {
+        GoalUpdateAck::DeferredToTurnEnd {
+            intent_id,
+            pending_depth,
+        } => ToolResult::completed(
+            request,
+            format!(
+                "Goal terminal update deferred until the outer turn ends for host verification. intent_id={intent_id} pending_depth={pending_depth}"
+            ),
+            false,
+        ),
+        GoalUpdateAck::AlreadyPending { intent_id } => ToolResult::completed(
+            request,
+            format!(
+                "Goal terminal update is already pending outer-turn verification. intent_id={intent_id}"
+            ),
+            false,
+        ),
+        GoalUpdateAck::Rejected { code, message } => ToolResult::failed(
+            request,
+            format!("goal terminal update rejected ({code:?}): {message}"),
+            None,
+        ),
+        GoalUpdateAck::BlockedAgainstInactive { state } => ToolResult::failed(
+            request,
+            format!("goal terminal update rejected because the goal is inactive: {state:?}"),
+            None,
+        ),
+    }
+}
+
+fn blocker_fingerprint(kind: BlockerKind, summary: &str) -> String {
+    let mut slug = String::new();
+    let mut separator_pending = false;
+    for character in summary.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            if separator_pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            separator_pending = false;
+            slug.push(character);
+        } else {
+            separator_pending = true;
+        }
+        if slug.chars().count() >= 160 {
+            break;
+        }
+    }
+    if slug.is_empty() {
+        slug.push_str("unspecified");
+    }
+    format!("{}:{slug}", blocker_kind_word(kind))
+}
+
+fn blocker_kind_word(kind: BlockerKind) -> &'static str {
+    match kind {
+        BlockerKind::UserDecision => "user_decision",
+        BlockerKind::MissingAuthority => "missing_authority",
+        BlockerKind::ExternalState => "external_state",
+        BlockerKind::EnvironmentContradiction => "environment_contradiction",
+        BlockerKind::UnverifiableRequirement => "unverifiable_requirement",
+    }
 }
 
 pub fn normalize_update_raw_arguments(raw: &str) -> Option<String> {
@@ -238,6 +402,9 @@ fn goal_status_word(status: ThreadGoalStatus) -> &'static str {
 mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
+    use orca_core::goal_runtime::{
+        BlockerKind, GoalRejectCode, GoalState, GoalUpdateAck, IntentId,
+    };
     use orca_core::tool_types::{ToolName, ToolStatus};
 
     fn request(name: ToolName, arguments: &str) -> ToolRequest {
@@ -289,6 +456,96 @@ mod tests {
         let args =
             parse_update_args(&request(ToolName::UpdateGoal, r#"{"status":"complete"}"#)).unwrap();
         assert_eq!(args.status, Some(ThreadGoalStatus::Complete));
+    }
+
+    #[test]
+    fn parses_structured_terminal_intent() {
+        let request = request(
+            ToolName::UpdateGoal,
+            r#"{
+                "status":"blocked",
+                "reason":"waiting for a user-owned credential",
+                "evidence":[{
+                    "kind":"observation",
+                    "summary":"credential lookup returned no value",
+                    "target":"DEEPSEEK_API_KEY"
+                }],
+                "blocker":{
+                    "kind":"missing_authority",
+                    "summary":"the user must provide a credential"
+                }
+            }"#,
+        );
+
+        let intent = parse_update_intent(&request).unwrap();
+
+        assert_eq!(
+            intent.requested_state,
+            orca_core::goal_runtime::GoalRequestedState::Blocked
+        );
+        assert_eq!(intent.evidence.len(), 1);
+        let blocker = intent.blocker.expect("typed blocker");
+        assert_eq!(blocker.kind, BlockerKind::MissingAuthority);
+        assert_eq!(
+            blocker.fingerprint,
+            "missing_authority:the-user-must-provide-a-credential"
+        );
+    }
+
+    #[test]
+    fn deferred_ack_does_not_claim_goal_already_transitioned() {
+        let request = request(ToolName::UpdateGoal, r#"{"status":"complete"}"#);
+        let result = acknowledgement_result(
+            &request,
+            &GoalUpdateAck::DeferredToTurnEnd {
+                intent_id: IntentId::new(),
+                pending_depth: 1,
+            },
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output = result.output.unwrap();
+        assert!(output.contains("deferred"));
+        assert!(output.contains("outer turn"));
+        assert!(!output.contains("Goal complete."));
+    }
+
+    #[test]
+    fn duplicate_ack_is_idempotent_and_rejection_is_failed() {
+        let request = request(ToolName::UpdateGoal, r#"{"status":"complete"}"#);
+        let intent_id = IntentId::new();
+        let duplicate = acknowledgement_result(
+            &request,
+            &GoalUpdateAck::AlreadyPending {
+                intent_id: intent_id.clone(),
+            },
+        );
+        let rejected = acknowledgement_result(
+            &request,
+            &GoalUpdateAck::Rejected {
+                code: GoalRejectCode::MissingEvidence,
+                message: "terminal goal intent requires structured evidence".to_string(),
+            },
+        );
+        let inactive = acknowledgement_result(
+            &request,
+            &GoalUpdateAck::BlockedAgainstInactive {
+                state: GoalState::BudgetLimited,
+            },
+        );
+
+        assert_eq!(duplicate.status, ToolStatus::Completed);
+        assert!(duplicate.output.unwrap().contains(intent_id.as_str()));
+        assert_eq!(rejected.status, ToolStatus::Failed);
+        assert!(
+            rejected
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("structured evidence")
+        );
+        assert_eq!(inactive.status, ToolStatus::Failed);
+        assert!(inactive.error.as_deref().unwrap().contains("inactive"));
     }
 
     #[test]
