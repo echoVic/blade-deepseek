@@ -5108,9 +5108,14 @@ fn run_hosted_goal_run(
     if let Some(goal) = active_goal.as_ref() {
         let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
     }
-    let request = hosted_turn_request(&submitted_turn, active_goal.is_some())
-        .with_operation_kind(HostedOperationKind::GoalRun)
-        .with_goal_turn_origin(origin);
+    let request = hosted_turn_request(&submitted_turn, active_goal.is_some());
+    let request = if active_goal.is_some() {
+        request
+            .with_operation_kind(HostedOperationKind::GoalRun)
+            .with_goal_turn_origin(origin)
+    } else {
+        request
+    };
     let status = match run_hosted_operation(thread, request, config.clone(), controller, event_tx) {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
