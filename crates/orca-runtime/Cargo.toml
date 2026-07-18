@@ -27,6 +27,10 @@ nucleo = { workspace = true }
 walkdir = { workspace = true }
 crossbeam-channel = { workspace = true }
 libc = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+agent-client-protocol = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }

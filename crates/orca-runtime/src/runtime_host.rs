@@ -541,7 +541,7 @@ impl HostedTurnRequest {
         request
     }
 
-    fn event_observer(&self) -> Option<Arc<dyn EventObserver>> {
+    pub fn event_observer(&self) -> Option<Arc<dyn EventObserver>> {
         self.event_observer.clone()
     }
 

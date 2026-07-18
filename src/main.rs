@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+mod acp;
 mod approval;
 mod cli;
 mod config;

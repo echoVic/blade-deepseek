@@ -9,7 +9,11 @@ serde_json = "1.0.145"
 clap = { version = "4.5.50", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "v7"] }
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "sync", "time"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "net", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false }
+agent-client-protocol = { version = "=0.10.4", features = ["unstable"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "hickory-dns", "json", "rustls-tls", "stream"] }
 hickory-resolver = "0.25.2"
 toml = "0.8"
@@ -36,7 +40,7 @@ seccompiler = "0.5.0"
 
 [package]
 name = "blade-deepseek"
-version = "0.2.46"
+version = "0.2.47"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"

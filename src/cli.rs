@@ -186,7 +186,7 @@ pub struct Cli {
     #[arg(long)]
     model: Option<String>,
 
-    /// Approval mode to use, or 'server' to start stdin/stdout JSON-RPC mode.
+    /// Approval mode to use, 'server' for stdin/stdout JSON-RPC mode, or 'acp' for Agent Client Protocol mode.
     #[arg(long = "mode", alias = "approval-mode")]
     mode: Option<String>,
 
@@ -623,6 +623,9 @@ pub fn run() -> i32 {
 
     if matches!(cli.mode.as_deref(), Some("server")) {
         return run_server(cli);
+    }
+    if matches!(cli.mode.as_deref(), Some("acp")) {
+        return run_acp(cli);
     }
 
     match cli.command {
@@ -2565,6 +2568,77 @@ fn run_server(cli: Cli) -> i32 {
     };
 
     crate::server::run(crate::server::ServerConfig { run_config: config })
+}
+
+fn run_acp(cli: Cli) -> i32 {
+    if cli.command.is_some() || !cli.prompt.is_empty() {
+        eprintln!("orca: --mode=acp cannot be combined with a subcommand or prompt");
+        return 1;
+    }
+
+    let cwd = cli
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let file_config = match load_effective_file_config(
+        &cwd,
+        ConfigOverrides {
+            model: cli.model,
+            mode: None,
+            api_key: cli.api_key,
+            base_url: cli.base_url,
+            reasoning_effort: None,
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let model = match ModelSelection::parse(file_config.model) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
+    let config = RunConfig {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        prompt: String::new(),
+        cwd: Some(cwd),
+        output_format: OutputFormat::Jsonl,
+        approval_mode: file_config.mode.unwrap_or_default(),
+        provider: cli.provider,
+        verifier: None,
+        model,
+        model_runtime: file_config.model_runtime,
+        reasoning_effort: file_config.reasoning_effort,
+        api_key: file_config.api_key,
+        base_url: file_config.base_url,
+        history_mode: HistoryMode::Record,
+        show_session_picker: false,
+        active_permission_profile: None,
+        permission_profiles: file_config.permission_profiles,
+        runtime_workspace_roots: None,
+        permission_rules: file_config.permissions,
+        additional_working_directories: Vec::new(),
+        max_budget_usd: None,
+        mcp_servers: file_config.mcp_servers,
+        hooks: file_config.hooks,
+        external_tools: crate::tools::external::load_default_external_tools(),
+        subagents: file_config.subagents.normalized(),
+        tools: file_config.tools.normalized(),
+        workflows: file_config.workflows.resolved(),
+        theme: file_config.theme,
+        vim_mode: file_config.vim_mode,
+        update_check: file_config.update_check,
+        desktop_notifications: false,
+        auto_memory: file_config.auto_memory,
+    };
+
+    crate::acp::run(config)
 }
 
 #[cfg(test)]

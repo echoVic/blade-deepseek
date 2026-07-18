@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.46 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.47 sh
 ```
 
 ### GitHub Releases
@@ -355,6 +355,34 @@ When `--output-format jsonl` is used, each line is a versioned event:
 ```
 
 Event types: `session.started`, `turn.started`, `assistant.reasoning.delta`, `assistant.message.delta`, `provider.replay.updated`, `approval.requested`, `approval.resolved`, `tool.call.requested`, `tool.call.completed`, `subagent.started`, `subagent.completed`, `verification.started`, `verification.completed`, `error`, `session.completed`.
+
+## Agent Client Protocol (ACP)
+
+Orca supports the [Agent Client Protocol](https://agentclientprotocol.com) as a
+parallel entry point alongside the internal JSONL protocol. This lets code
+editors (Zed, etc.) communicate with Orca using the standard ACP JSON-RPC wire
+format over stdio.
+
+```bash
+orca --mode=acp
+```
+
+The ACP adapter projects protocol messages onto existing internals:
+
+| ACP method | Orca mechanism |
+|---|---|
+| `session/new` | `RuntimeHost::start_thread` |
+| `session/load` | Resume from conversation history |
+| `session/prompt` | `RuntimeThreadHandle::start_turn_with_config` |
+| `session/update` | `EventObserver` → projected `SessionUpdate` |
+| `session/cancel` | `OperationHandle::interrupt()` |
+
+Supported methods: `initialize`, `authenticate` (no-op), `session/new`,
+`session/load`, `session/prompt`, `session/cancel`, plus streaming
+`session/update` notifications (message chunks, reasoning chunks, tool calls,
+tool call updates, and plan updates).
+
+The internal JSONL protocol (`--mode=server`) remains unchanged and available.
 
 ## Exit Codes
 
