@@ -44,10 +44,9 @@ pub fn run(config: RunConfig) -> i32 {
         let agent = OrcaAcpAgent::new(host_handle, config, note_tx);
 
         let (incoming, outgoing) = transport::stdio();
-        let (conn, io_task) =
-            AgentSideConnection::new(agent, outgoing, incoming, |fut| {
-                tokio::task::spawn_local(fut);
-            });
+        let (conn, io_task) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
+            tokio::task::spawn_local(fut);
+        });
 
         // Drain notifications from the runtime onto the ACP connection.
         tokio::task::spawn_local(async move {

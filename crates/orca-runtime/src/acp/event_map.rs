@@ -68,11 +68,7 @@ fn tool_call_completed(payload: &Value) -> SessionUpdate {
 
     let output = payload["output"].as_str().unwrap_or_default();
     let error = payload["error"].as_str().unwrap_or_default();
-    let body = if !error.is_empty() {
-        error
-    } else {
-        output
-    };
+    let body = if !error.is_empty() { error } else { output };
     if !body.is_empty() {
         content.push(ToolCallContent::from(body.to_string()));
     }
@@ -83,7 +79,10 @@ fn tool_call_completed(payload: &Value) -> SessionUpdate {
             .or_else(|| payload["name"].as_str())
             .unwrap_or("change")
             .to_string();
-        content.push(ToolCallContent::from(Diff::new(path, diff_text.to_string())));
+        content.push(ToolCallContent::from(Diff::new(
+            path,
+            diff_text.to_string(),
+        )));
     }
 
     let mut fields = ToolCallUpdateFields::new().status(status);
@@ -114,8 +113,13 @@ fn plan_updated(payload: &Value) -> SessionUpdate {
 /// coarse action classification when the specific name is unknown.
 fn tool_kind(name: &str, action: Option<&str>) -> ToolKind {
     match name {
-        "read_file" | "list_files" | "read_mcp_resource" | "list_mcp_resources"
-        | "list_mcp_resource_templates" | "read_skill" | "list_skills" => ToolKind::Read,
+        "read_file"
+        | "list_files"
+        | "read_mcp_resource"
+        | "list_mcp_resources"
+        | "list_mcp_resource_templates"
+        | "read_skill"
+        | "list_skills" => ToolKind::Read,
         "glob" | "grep" | "web_search" => ToolKind::Search,
         "bash" | "git_status" => ToolKind::Execute,
         "edit" | "write_file" => ToolKind::Edit,

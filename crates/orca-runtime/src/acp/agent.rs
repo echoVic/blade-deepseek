@@ -138,7 +138,8 @@ impl Agent for OrcaAcpAgent {
         Ok(InitializeResponse::new(ProtocolVersion::V1)
             .agent_capabilities(AgentCapabilities::new().load_session(true))
             .agent_info(
-                Implementation::new("orca", env!("CARGO_PKG_VERSION")).title("Orca".to_string()),
+                Implementation::new("orca", self.base_config.app_version.clone())
+                    .title("Orca".to_string()),
             ))
     }
 
@@ -177,23 +178,20 @@ impl Agent for OrcaAcpAgent {
 
     async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
         let selector = args.session_id.to_string();
-        let transcript = tokio::task::spawn_blocking(move || {
-            orca_runtime_history_load(&selector)
-        })
-        .await
-        .map_err(Error::into_internal_error)?
-        .map_err(Error::into_internal_error)?;
+        let transcript = tokio::task::spawn_blocking(move || orca_runtime_history_load(&selector))
+            .await
+            .map_err(Error::into_internal_error)?
+            .map_err(Error::into_internal_error)?;
 
         let config = self.build_session_config(args.cwd);
         let session_config = config.clone();
         let host = self.host.clone();
         let request =
             RuntimeThreadStartRequest::new(config, "ACP session").with_preloaded(transcript);
-        let thread =
-            tokio::task::spawn_blocking(move || host.start_thread_with_request(request))
-                .await
-                .map_err(Error::into_internal_error)?
-                .map_err(Error::into_internal_error)?;
+        let thread = tokio::task::spawn_blocking(move || host.start_thread_with_request(request))
+            .await
+            .map_err(Error::into_internal_error)?
+            .map_err(Error::into_internal_error)?;
 
         self.state.borrow_mut().sessions.insert(
             args.session_id.clone(),
@@ -288,8 +286,6 @@ impl Agent for OrcaAcpAgent {
 }
 
 /// Loads a session transcript by selector, reusing the runtime history layer.
-fn orca_runtime_history_load(
-    selector: &str,
-) -> io::Result<crate::thread_store::SessionTranscript> {
+fn orca_runtime_history_load(selector: &str) -> io::Result<crate::thread_store::SessionTranscript> {
     crate::history::load_session(selector)
 }

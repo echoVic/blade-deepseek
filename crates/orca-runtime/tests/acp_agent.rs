@@ -5,10 +5,11 @@
 //! projector maps onto `SessionUpdate` notifications.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_client_protocol::{
@@ -34,6 +35,43 @@ use orca_runtime::thread::RuntimeThread;
 use tokio::sync::mpsc;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct OrcaHomeGuard {
+    previous: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
+    _home: tempfile::TempDir,
+}
+
+impl OrcaHomeGuard {
+    fn new() -> Self {
+        let lock = ORCA_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().expect("create temporary ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        // This guard serializes environment mutation until the host shuts down.
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        Self {
+            previous,
+            _lock: lock,
+            _home: home,
+        }
+    }
+}
+
+impl Drop for OrcaHomeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("ORCA_HOME", previous),
+                None => std::env::remove_var("ORCA_HOME"),
+            }
+        }
+    }
+}
 
 fn test_config(cwd: PathBuf) -> RunConfig {
     RunConfig {
@@ -81,6 +119,7 @@ enum TestBehavior {
 struct AcpTestExecutor {
     behaviors: Mutex<Vec<TestBehavior>>,
     calls: AtomicUsize,
+    working_directories: Mutex<Vec<Option<PathBuf>>>,
 }
 
 impl AcpTestExecutor {
@@ -88,11 +127,16 @@ impl AcpTestExecutor {
         Self {
             behaviors: Mutex::new(behaviors),
             calls: AtomicUsize::new(0),
+            working_directories: Mutex::new(Vec::new()),
         }
     }
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::Acquire)
+    }
+
+    fn working_directories(&self) -> Vec<Option<PathBuf>> {
+        self.working_directories.lock().unwrap().clone()
     }
 }
 
@@ -107,12 +151,15 @@ impl ThreadOperationExecutor for AcpTestExecutor {
         cancel: &CancelToken,
     ) -> io::Result<ThreadOperationOutcome> {
         self.calls.fetch_add(1, Ordering::AcqRel);
+        self.working_directories
+            .lock()
+            .unwrap()
+            .push(generation.config().cwd.clone());
         let behavior = self.behaviors.lock().unwrap().remove(0);
         match behavior {
             TestBehavior::EmitMessageAndComplete { message } => {
-                let identity = orca_core::thread_item_projection::ModelResponseIdentity::new(
-                    TurnId::new(),
-                );
+                let identity =
+                    orca_core::thread_item_projection::ModelResponseIdentity::new(TurnId::new());
                 let mut sink = EventSink::new(writer, generation.config().output_format)
                     .with_optional_observer(request.event_observer());
                 sink.emit(events.assistant_message_delta(&identity, &message))?;
@@ -135,7 +182,9 @@ impl ThreadOperationExecutor for AcpTestExecutor {
 
 // --- Helper to drain notifications from the channel ---
 
-fn drain_notifications(rx: &mut mpsc::UnboundedReceiver<SessionNotification>) -> Vec<SessionUpdate> {
+fn drain_notifications(
+    rx: &mut mpsc::UnboundedReceiver<SessionNotification>,
+) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
     while let Ok(notification) = rx.try_recv() {
         updates.push(notification.update);
@@ -147,11 +196,16 @@ fn drain_notifications(rx: &mut mpsc::UnboundedReceiver<SessionNotification>) ->
 
 #[test]
 fn acp_initialize_returns_v1_with_load_session_capability() {
+    let _home = OrcaHomeGuard::new();
     let cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![]));
     let host = RuntimeHost::start_with_executor(executor).expect("start host");
     let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new(host.handle(), test_config(cwd.path().to_path_buf()), note_tx);
+    let agent = OrcaAcpAgent::new(
+        host.handle(),
+        test_config(cwd.path().to_path_buf()),
+        note_tx,
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -172,13 +226,19 @@ fn acp_initialize_returns_v1_with_load_session_capability() {
         response.agent_info.as_ref().map(|i| i.name.as_str()),
         Some("orca")
     );
+    assert_eq!(
+        response.agent_info.as_ref().map(|i| i.version.as_str()),
+        Some("test")
+    );
 
     host.shutdown().expect("shutdown");
 }
 
 #[test]
 fn acp_new_session_and_prompt_produces_message_chunk_notification() {
-    let cwd = tempfile::tempdir().unwrap();
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![
         TestBehavior::EmitMessageAndComplete {
             message: "Hello from Orca!".to_string(),
@@ -186,7 +246,11 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
     ]));
     let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
     let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new(host.handle(), test_config(cwd.path().to_path_buf()), note_tx);
+    let agent = OrcaAcpAgent::new(
+        host.handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -196,7 +260,7 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
 
     let (session_id, stop_reason) = local.block_on(&rt, async {
         let session = agent
-            .new_session(NewSessionRequest::new(cwd.path().to_path_buf()))
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
             .expect("new_session");
 
@@ -213,6 +277,10 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
 
     assert_eq!(stop_reason, StopReason::EndTurn);
     assert_eq!(executor.call_count(), 1);
+    assert_eq!(
+        executor.working_directories(),
+        vec![Some(session_cwd.path().to_path_buf())]
+    );
 
     let updates = drain_notifications(&mut note_rx);
     assert!(
@@ -234,11 +302,16 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
 
 #[test]
 fn acp_cancel_stops_in_flight_prompt() {
+    let _home = OrcaHomeGuard::new();
     let cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![TestBehavior::WaitForCancel]));
     let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
     let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new(host.handle(), test_config(cwd.path().to_path_buf()), note_tx);
+    let agent = OrcaAcpAgent::new(
+        host.handle(),
+        test_config(cwd.path().to_path_buf()),
+        note_tx,
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -254,8 +327,8 @@ fn acp_cancel_stops_in_flight_prompt() {
         let session_id_for_prompt = session.session_id.clone();
         let session_id_for_cancel = session.session_id.clone();
 
-        // We need to run prompt and cancel concurrently. Use select! to race
-        // the prompt future against a delayed cancel.
+        // Poll prompt first so it enters start_turn, then issue cancellation
+        // immediately. This exercises the pre-install cancellation window.
         let prompt_fut = Agent::prompt(
             &agent,
             PromptRequest::new(
@@ -264,7 +337,6 @@ fn acp_cancel_stops_in_flight_prompt() {
             ),
         );
         let cancel_fut = async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
             Agent::cancel(&agent, CancelNotification::new(session_id_for_cancel))
                 .await
                 .expect("cancel");
@@ -274,7 +346,7 @@ fn acp_cancel_stops_in_flight_prompt() {
         tokio::pin!(prompt_fut);
         tokio::pin!(cancel_fut);
 
-        // Drive both: cancel fires after 50ms, prompt completes once cancelled.
+        // Drive both: prompt completes once the compensation interrupt lands.
         let (prompt_result, _) = tokio::join!(prompt_fut, cancel_fut);
         prompt_result.expect("prompt").stop_reason
     });
@@ -286,11 +358,16 @@ fn acp_cancel_stops_in_flight_prompt() {
 
 #[test]
 fn acp_prompt_on_unknown_session_returns_error() {
+    let _home = OrcaHomeGuard::new();
     let cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![]));
     let host = RuntimeHost::start_with_executor(executor).expect("start host");
     let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new(host.handle(), test_config(cwd.path().to_path_buf()), note_tx);
+    let agent = OrcaAcpAgent::new(
+        host.handle(),
+        test_config(cwd.path().to_path_buf()),
+        note_tx,
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
