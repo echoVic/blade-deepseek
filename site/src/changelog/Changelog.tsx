@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.46":
+        "Goal Mode control tools now execute through the runtime that advertised them. get_goal, create_goal, and update_goal use the recorded session and live extension context before any normal-tool worker boundary, with the old thread-local callback removed. Invalid model arguments remain recoverable, while missing control-plane ownership or persistence failures stop one turn, atomically stall an active goal, and clear stale Goal context. A billed DeepSeek gate verifies one non-goal tool, exactly one terminal update_goal call, and zero eligible continuations.",
       "v0.2.45":
         "Approval modes now match their execution boundaries: auto-edit runs autonomously inside the workspace sandbox, while full-auto combines automatic approval with danger-full-access and no post-failure sandbox escape prompt.",
       "v0.2.44":
@@ -534,6 +536,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.46":
+        "Goal Mode 控制工具现在由展示它们的同一个 runtime 执行。get_goal、create_goal 和 update_goal 会在普通工具 worker 边界之前使用已记录 session 与 live extension context，旧的 thread-local callback 已删除。模型参数错误仍可在同一轮自纠；缺少控制面 owner 或持久化失败会结束一次 turn、原子 stall active Goal，并清除陈旧 Goal context。真实 DeepSeek gate 已验证先执行一个普通工具，再且仅调用一次终态 update_goal，后续 continuation 为零。",
       "v0.2.45":
         "权限模式现在与执行边界一致：auto-edit 在工作区沙箱内自主执行，full-auto 同时启用自动批准与 danger-full-access，不再在沙箱失败后弹出越界授权提示。",
       "v0.2.44":
