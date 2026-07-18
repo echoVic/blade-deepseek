@@ -11,6 +11,7 @@ use orca_mcp::{McpElicitationHandler, McpRegistry};
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionStores;
+use crate::goal_actor::{GoalRuntimeHandle, GoalTurnContext};
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -57,6 +58,8 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
+    pub(crate) goal_runtime: Option<GoalRuntimeHandle>,
+    pub(crate) goal_turn: Option<GoalTurnContext>,
     pub(crate) event_error: &'a mut Option<io::Error>,
     pub(crate) subagent_child_executor: ChildAgentExecutor<io::Sink>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
@@ -140,6 +143,8 @@ impl<'a> RuntimeToolRouter<'a> {
             user_input_handler,
             mcp_elicitation_handler,
             extension_stores,
+            goal_runtime,
+            goal_turn,
             event_error,
             subagent_child_executor,
             workflow_child_executor,
@@ -157,7 +162,8 @@ impl<'a> RuntimeToolRouter<'a> {
                         execution_request,
                         RuntimeGoalToolRequest {
                             persistent_session_id,
-                            extension_stores,
+                            goal_runtime,
+                            goal_turn,
                         },
                     ) {
                         RuntimeGoalToolOutcome::Continue(result) => {

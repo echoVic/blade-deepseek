@@ -30,6 +30,7 @@ use crate::controller::{
     ControllerRunOptions, RuntimeBackgroundWorkflows, ThreadTurnPromptPlacement, ThreadTurnRequest,
     ThreadTurnToolMode,
 };
+use crate::goal_actor::GoalRuntimeHandle;
 use crate::hooks::HookContext;
 use crate::lifecycle::{
     RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeTaskKind,
@@ -1399,6 +1400,12 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    pub fn goal_runtime(&self) -> Result<GoalRuntimeHandle, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::GoalRuntime { reply: reply_tx })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     pub fn mutate(&self, mutation: RuntimeThreadMutation) -> Result<(), RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::MutateIdle {
@@ -1627,6 +1634,9 @@ enum ThreadCommand {
     },
     ReadSnapshot {
         reply: SyncSender<Result<RuntimeThreadSnapshot, RuntimeHostError>>,
+    },
+    GoalRuntime {
+        reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
     },
     MutateIdle {
         mutation: RuntimeThreadMutation,
@@ -2100,6 +2110,20 @@ impl ThreadActor {
                     .ok_or(RuntimeHostError::ThreadUnavailable);
                 let _ = reply.send(result);
             }
+            ThreadCommand::GoalRuntime { reply } => {
+                let result = self
+                    .state
+                    .as_mut()
+                    .ok_or(RuntimeHostError::ThreadUnavailable)
+                    .and_then(|state| {
+                        state.thread.goal_runtime_handle().map_err(|error| {
+                            RuntimeHostError::ThreadStartFailed {
+                                message: error.to_string(),
+                            }
+                        })
+                    });
+                let _ = reply.send(result);
+            }
             ThreadCommand::MutateIdle { mutation, reply } => {
                 let result = self
                     .state
@@ -2220,6 +2244,11 @@ impl ThreadActor {
                 let _ = reply.send(Ok(RuntimeThreadState::Running { generation, phase }));
             }
             ThreadCommand::ReadSnapshot { reply } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::GoalRuntime { reply } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));

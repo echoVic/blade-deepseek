@@ -13,6 +13,7 @@ use orca_mcp::{McpElicitationHandler, McpRegistry};
 use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
+use crate::goal_actor::GoalRuntimeBinding;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -668,6 +669,13 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     if let Some(extensions) = extensions {
         execution_context =
             execution_context.with_extensions(extensions.registry(), extensions.stores());
+        if let Some(binding) = extensions
+            .stores()
+            .thread_store()
+            .get::<GoalRuntimeBinding>()
+        {
+            execution_context = execution_context.with_goal_runtime_binding((*binding).clone());
+        }
     }
     let execution = execute_tool_with_approval(
         config,

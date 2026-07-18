@@ -16,6 +16,7 @@ use crate::cost::CostTracker;
 use crate::extension::{
     ExtensionRegistry, RuntimeExtensionStores, ToolCallOutcome, ToolFinishInput, ToolStartInput,
 };
+use crate::goal_actor::{GoalRuntimeBinding, GoalRuntimeHandle, GoalTurnContext};
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -62,6 +63,8 @@ pub(crate) struct ToolExecutionContext<'a> {
     mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     extension_registry: Option<&'a ExtensionRegistry>,
     extension_stores: Option<RuntimeExtensionStores<'a>>,
+    goal_runtime: Option<GoalRuntimeHandle>,
+    goal_turn: Option<GoalTurnContext>,
 }
 
 pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
@@ -152,6 +155,8 @@ impl<'a> ToolExecutionContext<'a> {
             mcp_elicitation_handler: None,
             extension_registry: None,
             extension_stores: None,
+            goal_runtime: None,
+            goal_turn: None,
         }
     }
 
@@ -221,6 +226,12 @@ impl<'a> ToolExecutionContext<'a> {
     ) -> Self {
         self.extension_registry = Some(extension_registry);
         self.extension_stores = Some(extension_stores);
+        self
+    }
+
+    pub(crate) fn with_goal_runtime_binding(mut self, binding: GoalRuntimeBinding) -> Self {
+        self.goal_runtime = Some(binding.handle);
+        self.goal_turn = binding.turn;
         self
     }
 
@@ -425,6 +436,8 @@ impl ToolExecutionActor {
             mcp_elicitation_handler,
             extension_registry,
             extension_stores,
+            goal_runtime,
+            goal_turn,
         } = context;
         let instructions = instructions.expect("tool execution instructions");
         let memory = memory.expect("tool execution memory");
@@ -584,6 +597,8 @@ impl ToolExecutionActor {
                 user_input_handler,
                 mcp_elicitation_handler,
                 extension_stores,
+                goal_runtime,
+                goal_turn,
                 event_error: &mut dispatch_event_error,
                 subagent_child_executor,
                 workflow_child_executor,

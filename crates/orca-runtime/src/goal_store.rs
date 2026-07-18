@@ -557,6 +557,15 @@ impl GoalStore {
         Ok(connection.query_row("SELECT COUNT(*) FROM goals", [], |row| row.get(0))?)
     }
 
+    pub fn clear_goal(&self, session_id: &str) -> Result<bool, GoalStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed =
+            transaction.execute("DELETE FROM goals WHERE session_id = ?1", [session_id])?;
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     fn initialize_schema(&self) -> Result<(), GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

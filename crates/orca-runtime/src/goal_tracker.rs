@@ -2,9 +2,9 @@ use std::fmt;
 
 use orca_core::goal_runtime::{
     GoalContinuationReason, GoalGap, GoalId, GoalNextAction, GoalOuterTurnId,
-    GoalOuterTurnSnapshot, GoalPauseReason, GoalRejectCode, GoalRequestedState, GoalRunId,
-    GoalState, GoalTurnOrigin, GoalTurnStatus, GoalUpdateAck, GoalUpdateIntent, GoalUsage,
-    GoalVerificationResult,
+    GoalOuterTurnSnapshot, GoalPauseReason, GoalRecord, GoalRejectCode, GoalRequestedState,
+    GoalRunId, GoalState, GoalTurnOrigin, GoalTurnStatus, GoalUpdateAck, GoalUpdateIntent,
+    GoalUsage, GoalVerificationResult,
 };
 
 const SAME_GAP_STREAK_LIMIT: u32 = 3;
@@ -80,6 +80,30 @@ impl GoalTracker {
             current_outer_turn: None,
             last_outer_turn: None,
             outer_turn_count: 0,
+            pending_intent: None,
+            last_gap_fingerprint: None,
+            same_gap_streak: 0,
+        }
+    }
+
+    pub fn from_record(record: &GoalRecord) -> Self {
+        Self {
+            goal_id: record.goal_id.clone(),
+            run_id: record
+                .current_run
+                .as_ref()
+                .map(|run| run.goal_run_id.clone())
+                .unwrap_or_default(),
+            state: record.state.clone(),
+            token_budget: record.token_budget,
+            usage: record.usage.clone(),
+            current_outer_turn: None,
+            last_outer_turn: None,
+            outer_turn_count: record
+                .current_run
+                .as_ref()
+                .map(|run| run.continuation_count)
+                .unwrap_or_default(),
             pending_intent: None,
             last_gap_fingerprint: None,
             same_gap_streak: 0,

@@ -272,13 +272,13 @@ git commit -m "feat(goal): persist lifecycle in transactional sqlite store"
 - Modify: `crates/orca-runtime/src/lib.rs`
 - Test: `crates/orca-runtime/src/goal_actor.rs`, `runtime_host.rs`
 
-- [ ] **Step 1: Add RED mailbox tests**
+- [x] **Step 1: Add RED mailbox tests**
 
 Test create, read, pause, resume, clear, begin-turn, submit-intent, finish-turn,
 duplicate intent, stale run, and closed mailbox behavior. Test that a GoalActor
 never invokes the provider and that every command receives one reply.
 
-- [ ] **Step 2: Implement `GoalRuntimeHandle` and actor commands**
+- [x] **Step 2: Implement `GoalRuntimeHandle` and actor commands**
 
 Implement a bounded channel with commands:
 
@@ -302,34 +302,34 @@ The actor owns `GoalTracker`, `GoalStore`, transition event publication, and
 the verifier port. The handle is cloneable and is the only capability passed
 into a Goal tool.
 
-- [ ] **Step 3: Attach actor handles to RuntimeThread**
+- [x] **Step 3: Attach actor handles to RuntimeThread**
 
 Start one GoalActor per RuntimeThread, expose `goal_runtime()` on
 `RuntimeThreadHandle`, and shut it down after the thread actor joins. TUI
 commands must use this handle instead of loading `GoalStore` directly.
 
-- [ ] **Step 4: Carry explicit Goal context through dispatch**
+- [x] **Step 4: Carry explicit Goal context through dispatch**
 
 Extend the runtime invocation snapshot with a required `Option<GoalTurnContext>`
 that is `Some` only for Goal mode. The context carries `goal_id`, `goal_run_id`,
 `outer_turn_id`, `session_id`, `origin`, and `GoalRuntimeHandle`; no function
 reconstructs these from a thread id or current store row.
 
-- [ ] **Step 5: Route terminal tools through the actor**
+- [x] **Step 5: Route terminal tools through the actor**
 
 Change `RuntimeToolActorContext::execute_goal_tool` so it only parses the pure
 operation, validates `GoalTurnContext`, sends `SubmitIntent`, waits for the ack,
 and formats the result. Remove direct `GoalStore::update` and
 `validate_goal_terminal_update_against_extensions` from production dispatch.
 
-- [ ] **Step 6: Add typed tool disposition**
+- [x] **Step 6: Add typed tool disposition**
 
 Return `ContinueModel` for malformed model arguments and typed actor rejections.
 Return `StopTurn` for missing visible capability, closed GoalActor, stale
 generation identity, or persistence failure. Record exactly one tool terminal
 before stopping the outer turn.
 
-- [ ] **Step 7: Run actor tests and commit**
+- [x] **Step 7: Run actor tests and commit**
 
 ```bash
 cargo test -p orca-runtime goal_actor --lib

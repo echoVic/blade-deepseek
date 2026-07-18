@@ -151,7 +151,13 @@ impl GoalStore {
     }
 
     pub fn get(&self, session_id: &str) -> io::Result<Option<ThreadGoal>> {
-        Ok(self.load()?.goals.get(session_id).cloned())
+        let goal = self.load()?.goals.get(session_id).cloned();
+        if goal.is_none() && self.path == goals_db_path() {
+            return crate::goal_store::GoalStore::load_default()
+                .and_then(|store| store.project_thread_goal(session_id))
+                .map_err(io::Error::other);
+        }
+        Ok(goal)
     }
 
     pub fn latest_active(&self) -> io::Result<Option<ThreadGoal>> {

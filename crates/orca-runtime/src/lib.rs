@@ -20,6 +20,7 @@ pub use compaction::{
 pub mod controller;
 pub mod cost;
 pub mod extension;
+pub mod goal_actor;
 pub mod goal_store;
 pub mod goal_tracker;
 pub mod goals;

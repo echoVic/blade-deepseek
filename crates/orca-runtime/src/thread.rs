@@ -10,6 +10,7 @@ use crate::controller::{
     ControllerRunOptions, ThreadTurnExecutor, ThreadTurnOutcome, ThreadTurnRequest,
 };
 use crate::extension::ExtensionData;
+use crate::goal_actor::{GoalRuntimeBinding, GoalRuntimeHandle};
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use crate::session::{InteractiveSession, new_run_id};
 use crate::thread_store::SessionTranscript;
@@ -20,6 +21,8 @@ pub struct RuntimeThread {
     lifecycle: RuntimeSessionLifecycle,
     thread_extensions: Arc<ExtensionData>,
     next_extension_turn: u64,
+    goal_runtime: Option<GoalRuntimeHandle>,
+    goal_actor_join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RuntimeThread {
@@ -66,7 +69,85 @@ impl RuntimeThread {
             session,
             lifecycle,
             next_extension_turn: 0,
+            goal_runtime: None,
+            goal_actor_join: None,
         }
+    }
+
+    fn begin_goal_turn(
+        &mut self,
+        request: &ThreadTurnRequest,
+    ) -> io::Result<Option<GoalRuntimeBinding>> {
+        if request.tool_mode() != crate::controller::ThreadTurnToolMode::Goal {
+            return Ok(None);
+        }
+        let Some(session_id) = self.session().session_id().map(str::to_string) else {
+            return Ok(None);
+        };
+        let handle = match self.goal_runtime_handle() {
+            Ok(handle) => handle,
+            Err(_) => return Ok(None),
+        };
+        let origin = if request.continuation().is_some() {
+            orca_core::goal_runtime::GoalTurnOrigin::Continuation
+        } else {
+            orca_core::goal_runtime::GoalTurnOrigin::User
+        };
+        let turn = handle
+            .begin_outer_turn(
+                &session_id,
+                origin,
+                request.turn_id().to_string(),
+                now_timestamp(),
+            )
+            .ok();
+        let binding = GoalRuntimeBinding { handle, turn };
+        self.thread_extensions.insert(binding.clone());
+        Ok(Some(binding))
+    }
+
+    pub(crate) fn goal_runtime_handle(&mut self) -> io::Result<GoalRuntimeHandle> {
+        if self.goal_runtime.is_none() {
+            let (handle, join) = GoalRuntimeHandle::open_default().map_err(io::Error::other)?;
+            self.goal_runtime = Some(handle);
+            self.goal_actor_join = Some(join);
+        }
+        Ok(self
+            .goal_runtime
+            .as_ref()
+            .expect("goal runtime initialized")
+            .clone())
+    }
+
+    fn finish_goal_turn(&mut self, binding: Option<&GoalRuntimeBinding>, status: RunStatus) {
+        let Some(binding) = binding else {
+            return;
+        };
+        let Some(turn) = binding.turn.as_ref() else {
+            self.thread_extensions.remove::<GoalRuntimeBinding>();
+            return;
+        };
+        let goal_status = match status {
+            RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
+            RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
+            RunStatus::ApprovalRequired => {
+                orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
+            }
+            RunStatus::BudgetExhausted => orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted,
+            RunStatus::Failed | RunStatus::VerificationFailed => {
+                orca_core::goal_runtime::GoalTurnStatus::Failed
+            }
+        };
+        let _ = binding.handle.finish_outer_turn(
+            &turn.session_id,
+            goal_status,
+            orca_core::goal_runtime::GoalUsage::default(),
+            0,
+            0,
+            None,
+            now_timestamp(),
+        );
+        self.thread_extensions.remove::<GoalRuntimeBinding>();
     }
 
     pub fn thread_id(&self) -> &str {
@@ -126,16 +207,21 @@ impl RuntimeThread {
         request: &ThreadTurnRequest,
         writer: W,
     ) -> io::Result<RunStatus> {
+        let binding = self.begin_goal_turn(request)?;
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
-        ThreadTurnExecutor::new_with_thread_extensions(
+        let result = ThreadTurnExecutor::new_with_thread_extensions(
             config,
             &mut self.session,
             &mut self.lifecycle,
             thread_extensions,
             turn_extension_id,
         )
-        .run_request(request, writer)
+        .run_request(request, writer);
+        if let Ok(status) = result {
+            self.finish_goal_turn(binding.as_ref(), status);
+        }
+        result
     }
 
     pub fn run_request_with_cancel<W: io::Write>(
@@ -145,16 +231,21 @@ impl RuntimeThread {
         writer: W,
         cancel: CancelToken,
     ) -> io::Result<RunStatus> {
+        let binding = self.begin_goal_turn(request)?;
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
-        ThreadTurnExecutor::new_with_thread_extensions(
+        let result = ThreadTurnExecutor::new_with_thread_extensions(
             config,
             &mut self.session,
             &mut self.lifecycle,
             thread_extensions,
             turn_extension_id,
         )
-        .run_request_with_cancel(request, writer, cancel)
+        .run_request_with_cancel(request, writer, cancel);
+        if let Ok(status) = result {
+            self.finish_goal_turn(binding.as_ref(), status);
+        }
+        result
     }
 
     pub fn run_request_with_event_factory<W: io::Write>(
@@ -181,16 +272,21 @@ impl RuntimeThread {
         events: &mut EventFactory,
         cancel: CancelToken,
     ) -> io::Result<RunStatus> {
+        let binding = self.begin_goal_turn(request)?;
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
-        ThreadTurnExecutor::new_with_thread_extensions(
+        let result = ThreadTurnExecutor::new_with_thread_extensions(
             config,
             &mut self.session,
             &mut self.lifecycle,
             thread_extensions,
             turn_extension_id,
         )
-        .run_request_with_event_factory_and_cancel(request, writer, events, cancel)
+        .run_request_with_event_factory_and_cancel(request, writer, events, cancel);
+        if let Ok(status) = result {
+            self.finish_goal_turn(binding.as_ref(), status);
+        }
+        result
     }
 
     pub fn run_request_with_event_factory_and_cancel_outcome<W: io::Write>(
@@ -201,22 +297,42 @@ impl RuntimeThread {
         events: &mut EventFactory,
         cancel: CancelToken,
     ) -> io::Result<ThreadTurnOutcome> {
+        let binding = self.begin_goal_turn(request)?;
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
-        ThreadTurnExecutor::new_with_thread_extensions(
+        let result = ThreadTurnExecutor::new_with_thread_extensions(
             config,
             &mut self.session,
             &mut self.lifecycle,
             thread_extensions,
             turn_extension_id,
         )
-        .run_request_with_event_factory_and_cancel_outcome(request, writer, events, cancel)
+        .run_request_with_event_factory_and_cancel_outcome(request, writer, events, cancel);
+        if let Ok(ThreadTurnOutcome::Completed { status, .. }) = &result {
+            self.finish_goal_turn(binding.as_ref(), *status);
+        }
+        result
     }
 
     fn next_turn_extension_id(&mut self) -> String {
         self.next_extension_turn = self.next_extension_turn.saturating_add(1);
         format!("{}:turn-{}", self.thread_id, self.next_extension_turn)
     }
+}
+
+impl Drop for RuntimeThread {
+    fn drop(&mut self) {
+        if let Some(handle) = self.goal_runtime.as_ref() {
+            let _ = handle.shutdown();
+        }
+        if let Some(join) = self.goal_actor_join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn now_timestamp() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 #[cfg(test)]

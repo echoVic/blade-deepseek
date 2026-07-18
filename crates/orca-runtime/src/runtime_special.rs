@@ -1,15 +1,16 @@
 use std::io;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::approval_types::ApprovalMode;
-use orca_core::goal_types::ThreadGoalStatus;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
-use orca_tools::update_goal::GoalToolOperation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::extension::RuntimeExtensionStores;
+use crate::goal_actor::{GoalRuntimeHandle, GoalTurnContext};
+use crate::goal_store::CreateGoalInput;
 use crate::lifecycle::{
     AllowRequestedPermissions, RuntimePermissionRequest, RuntimePermissionRequestHandler,
     RuntimeSubagentStatusLookup, RuntimeToolActorContext, RuntimeUsageTotals, RuntimeWorkflowIpc,
@@ -19,6 +20,13 @@ use crate::runtime_permission::{RuntimePermissionPolicy, RuntimePermissionPrompt
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::tasks::TaskRegistry;
 use crate::workflow::WorkflowDraftStore;
+
+fn goal_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,10 +59,11 @@ pub(crate) enum RuntimeGoalToolOutcome {
     StopTurn(ToolResult),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct RuntimeGoalToolRequest<'a> {
     pub(crate) persistent_session_id: Option<&'a str>,
-    pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
+    pub(crate) goal_runtime: Option<GoalRuntimeHandle>,
+    pub(crate) goal_turn: Option<GoalTurnContext>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,59 +116,85 @@ impl RuntimeToolActorContext {
                 None,
             ));
         };
-        let Some(extension_stores) = context.extension_stores else {
+        let Some(goal_runtime) = context.goal_runtime else {
             return RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
                 request,
-                "goal tools require live runtime extension context",
+                "goal tools require a runtime-owned goal actor",
                 None,
             ));
         };
-        let operation = match orca_tools::update_goal::parse_operation(request) {
-            Ok(operation) => operation,
-            Err(error) => {
-                return RuntimeGoalToolOutcome::Continue(ToolResult::failed(request, error, None));
-            }
-        };
-        let mut store = crate::goals::GoalStore::load_default();
-        let result = match operation {
-            GoalToolOperation::Get => store.get(session_id),
-            GoalToolOperation::Create {
-                objective,
-                token_budget,
-            } => match store.get(session_id) {
-                Ok(Some(goal)) if goal.status.should_continue() || !goal.status.is_terminal() => {
-                    Ok(None)
-                }
-                Ok(_) => store
-                    .replace(
-                        session_id,
-                        &objective,
-                        ThreadGoalStatus::Active,
-                        token_budget,
-                    )
-                    .map(Some),
-                Err(error) => Err(error),
+        let result = match request.name {
+            ToolName::GetGoal => match orca_tools::update_goal::parse_get_args(request) {
+                Ok(()) => goal_runtime
+                    .project_thread_goal(session_id)
+                    .map(|goal| orca_tools::update_goal::completed_result(request, goal.as_ref())),
+                Err(error) => Ok(ToolResult::failed(request, error, None)),
             },
-            GoalToolOperation::Update(update) => {
-                if let Err(error) = crate::goals::validate_goal_terminal_update_against_extensions(
-                    &update,
-                    extension_stores.thread_store(),
-                ) {
-                    return RuntimeGoalToolOutcome::Continue(ToolResult::failed(
-                        request, error, None,
-                    ));
+            ToolName::CreateGoal => {
+                let args = match orca_tools::update_goal::parse_create_args(request) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        return RuntimeGoalToolOutcome::Continue(ToolResult::failed(
+                            request, error, None,
+                        ));
+                    }
+                };
+                match goal_runtime.read(session_id) {
+                    Ok(Some(goal)) if goal.state.should_continue() => Ok(ToolResult::failed(
+                        request,
+                        "cannot create a goal because an active goal already exists",
+                        None,
+                    )),
+                    Ok(Some(_)) => Ok(ToolResult::failed(
+                        request,
+                        "cannot create a goal until the existing goal is cleared",
+                        None,
+                    )),
+                    Ok(None) => goal_runtime
+                        .create(CreateGoalInput {
+                            session_id: session_id.to_string(),
+                            objective: args.objective,
+                            token_budget: args.token_budget,
+                            now: goal_now(),
+                        })
+                        .and_then(|_| goal_runtime.project_thread_goal(session_id))
+                        .map(|goal| {
+                            orca_tools::update_goal::completed_result(request, goal.as_ref())
+                        }),
+                    Err(error) => Err(error),
                 }
-                store.update(session_id, update)
             }
+            ToolName::UpdateGoal => {
+                let intent = match orca_tools::update_goal::parse_update_intent(request) {
+                    Ok(intent) => intent,
+                    Err(error) => {
+                        return RuntimeGoalToolOutcome::Continue(ToolResult::failed(
+                            request, error, None,
+                        ));
+                    }
+                };
+                let Some(turn) = context.goal_turn else {
+                    return RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
+                        request,
+                        "update_goal requires an active runtime outer turn",
+                        None,
+                    ));
+                };
+                goal_runtime
+                    .submit_intent(&turn.session_id, intent, goal_now())
+                    .map(|ack| orca_tools::update_goal::acknowledgement_result(request, &ack))
+            }
+            _ => Ok(ToolResult::failed(
+                request,
+                "unsupported goal tool operation",
+                None,
+            )),
         };
-
         match result {
-            Ok(goal) => RuntimeGoalToolOutcome::Continue(
-                orca_tools::update_goal::completed_result(request, goal.as_ref()),
-            ),
+            Ok(result) => RuntimeGoalToolOutcome::Continue(result),
             Err(error) => RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
                 request,
-                format!("failed to access persistent goal state: {error}"),
+                format!("failed to access runtime-owned goal state: {error}"),
                 None,
             )),
         }

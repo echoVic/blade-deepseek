@@ -1682,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_goal_tool_updates_persisted_goal_through_runtime_context() {
+    fn hosted_goal_tool_rejects_unverified_terminal_update_through_runtime_context() {
         with_orca_home(|_| {
             let mut config = config(SubagentConfig::default());
             config.history_mode = HistoryMode::Record;
@@ -1745,7 +1745,25 @@ mod tests {
                     .expect("load persisted goal")
                     .expect("persisted goal")
                     .status,
-                orca_core::goal_types::ThreadGoalStatus::Complete
+                orca_core::goal_types::ThreadGoalStatus::Active
+            );
+            assert!(
+                thread
+                    .session()
+                    .conversation()
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        matches!(
+                            message,
+                            Message::Tool {
+                                tool_call_id,
+                                terminal: Some(terminal),
+                                ..
+                            } if tool_call_id == "goal-update-1"
+                                && terminal.status == tool_types::ToolStatus::Failed
+                        )
+                    })
             );
         });
     }
@@ -2541,6 +2559,8 @@ mod tests {
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
                 extension_stores: None,
+                goal_runtime: None,
+                goal_turn: None,
                 event_error: &mut event_error,
                 subagent_child_executor: execute_child_agent_loop,
                 workflow_child_executor: execute_child_agent_loop,
@@ -2608,6 +2628,8 @@ mod tests {
                     user_input_handler: None,
                     mcp_elicitation_handler: None,
                     extension_stores: None,
+                    goal_runtime: None,
+                    goal_turn: None,
                     event_error: &mut event_error,
                     subagent_child_executor: execute_child_agent_loop,
                     workflow_child_executor: execute_child_agent_loop,
