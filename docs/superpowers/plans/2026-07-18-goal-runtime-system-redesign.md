@@ -198,7 +198,7 @@ git commit -m "feat(goal): make terminal updates typed runtime intents"
 - Modify: `crates/orca-runtime/src/lib.rs`
 - Test: `crates/orca-runtime/src/goal_store.rs`
 
-- [ ] **Step 1: Add RED store tests**
+- [x] **Step 1: Add RED store tests**
 
 Add tests for schema creation, transactional transition rollback, usage-event
 idempotency, in-flight recovery, concurrent writers, JSON migration, malformed
@@ -212,7 +212,7 @@ cargo test -p orca-runtime goal_store --lib
 
 Expected: the SQLite store module and dependency are absent.
 
-- [ ] **Step 2: Add SQLite dependency and schema bootstrap**
+- [x] **Step 2: Add SQLite dependency and schema bootstrap**
 
 Add `rusqlite = { version = "0.32", features = ["bundled"] }` to workspace
 dependencies and `orca-runtime`. Open `$ORCA_HOME/goals.sqlite3` with WAL,
@@ -220,7 +220,7 @@ foreign keys, a busy timeout, and a schema-version table. Implement migrations
 for `goals`, `goal_runs`, `goal_turns`, `goal_intents`, `goal_usage_events`, and
 `goal_transitions` exactly as defined in the approved spec.
 
-- [ ] **Step 3: Implement transactional APIs**
+- [x] **Step 3: Implement transactional APIs**
 
 Expose:
 
@@ -238,20 +238,20 @@ Every transition and usage insert uses one transaction. `usage_event_id` is a
 unique generation/source key; a duplicate returns the original usage without
 adding tokens.
 
-- [ ] **Step 4: Implement one-time legacy JSON migration**
+- [x] **Step 4: Implement one-time legacy JSON migration**
 
 When the SQLite database has no migration marker and `goals_1.json` exists,
 validate every record, insert it, commit, then rename the JSON to a timestamped
 backup. On parse, validation, collision, or rename failure leave the source
 untouched and return a recovery error.
 
-- [ ] **Step 5: Implement recovery semantics**
+- [x] **Step 5: Implement recovery semantics**
 
 On open, any `goal_runs.in_flight = 1` becomes `Paused(Recovery)` in one
 transaction, its stale continuation is rejected, and a `goal.recovered`
 transition is recorded. Recovery never starts a provider call.
 
-- [ ] **Step 6: Run store tests and commit**
+- [x] **Step 6: Run store tests and commit**
 
 ```bash
 cargo fmt --all
