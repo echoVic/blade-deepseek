@@ -1,0 +1,25 @@
+crates/orca-tools/src/bash.rs
+  s_810605d84b7f5d::t_1fb98d45c0365f 4,189-192,215-228,252,256-258,272-292,298,300-301,305,307-313,326-381
+crates/orca-runtime/src/hooks.rs
+  s_810605d84b7f5d::t_289d141b5d6d21 1-2,37-45,48-49,116-120,122-148,288,321-355
+crates/orca-tools/src/external.rs
+  s_810605d84b7f5d::t_95dd2934695134 95-96,107-111,198-248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "70e7e8c3fbbd440c43d3c5f0b6c1322760270c09",
+  "prompts": {},
+  "sessions": {
+    "s_810605d84b7f5d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a33aa139ec2b7adfd9a0c81",
+        "model": "c_o_new__dev"
+      },
+      "human_author": "echoVic <137844255@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
