@@ -553,7 +553,7 @@ rg -n "run_hosted_goal_turns|GoalToolProgressState|stall_if_active|GOAL_HANDLER|
 
 Only migration tests and historical documents may mention legacy names.
 
-- [ ] **Step 4: Run complete gates**
+- [x] **Step 4: Run complete gates**
 
 ```bash
 cargo fmt --all -- --check
@@ -575,7 +575,7 @@ text. Verify one outer-turn row per admission, one usage event per generation,
 typed transition reasons, role-safe request messages, and no continuation after
 completion/blocked/pause/recovery.
 
-- [ ] **Step 6: Final branch verification and commit**
+- [x] **Step 6: Final branch verification and commit**
 
 ```bash
 git status --short --branch

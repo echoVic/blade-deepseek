@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.49":
+        "Goal Mode now has one runtime owner for lifecycle, continuation admission, cancellation, recovery, usage, and persistence. Terminal model claims are typed intents audited at turn end, SQLite replaces direct JSON mutation with migration and crash recovery, and role-safe context plus semantic events keep TUI and ACP projections consistent. Five real DeepSeek scenarios verify completion, rejected completion, genuine blocking, cancellation, and resume with no stale continuation or in-flight run.",
       "v0.2.48":
         "ACP initialization now reports the Orca binary release version from RunConfig instead of the internal orca-runtime crate version. Integration coverage also isolates ORCA_HOME, verifies that each session keeps its requested working directory, and exercises cancellation arriving before the hosted operation handle is installed.",
       "v0.2.47":
@@ -540,6 +542,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.49":
+        "Goal Mode 现在由一个 runtime owner 统一管理生命周期、continuation 准入、取消、恢复、usage 与持久化。模型的终态声明改为类型化 intent，并在 turn 结束时审计；SQLite 取代直接 JSON 写入，同时提供迁移与崩溃恢复；role-safe context 和语义事件让 TUI 与 ACP 投影保持一致。五组真实 DeepSeek 场景验证了完成、拒绝完成、真实阻塞、取消与恢复，且没有陈旧 continuation 或未关闭 run。",
       "v0.2.48":
         "ACP 初始化现在从 RunConfig 上报 Orca 二进制发布版本，不再误用内部 orca-runtime crate 的版本。集成测试同时隔离 ORCA_HOME，验证每个 session 保留请求的工作目录，并覆盖 hosted operation handle 安装前到达的取消请求。",
       "v0.2.47":
