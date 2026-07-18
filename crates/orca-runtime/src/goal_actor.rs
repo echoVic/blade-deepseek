@@ -4,8 +4,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use orca_core::goal_runtime::{
-    GoalId, GoalNextAction, GoalOuterTurnId, GoalRecord, GoalState, GoalTurnOrigin, GoalTurnStatus,
-    GoalUpdateAck, GoalUpdateIntent, GoalUsage, GoalVerificationResult,
+    GoalGap, GoalId, GoalNextAction, GoalOuterTurnId, GoalRecord, GoalState, GoalTurnOrigin,
+    GoalTurnStatus, GoalUpdateAck, GoalUpdateIntent, GoalUsage, GoalVerificationResult,
 };
 use orca_core::goal_types::ThreadGoal;
 
@@ -29,6 +29,20 @@ pub struct GoalTurnContext {
 pub struct GoalRuntimeBinding {
     pub handle: GoalRuntimeHandle,
     pub turn: Option<GoalTurnContext>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoalContinuationStatus {
+    Ready,
+    OuterTurnInFlight,
+    PendingVerification,
+    Inactive,
+}
+
+#[derive(Clone, Debug)]
+pub struct GoalContinuationSnapshot {
+    pub record: GoalRecord,
+    pub status: GoalContinuationStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +85,7 @@ pub struct GoalActor {
     store: GoalStore,
     sender: Receiver<GoalActorCommand>,
     active: HashMap<String, ActiveGoalTurn>,
+    trackers: HashMap<String, GoalTracker>,
     pending_verification: HashMap<String, PendingVerification>,
 }
 
@@ -90,6 +105,10 @@ enum GoalActorCommand {
         reply: Reply,
     },
     Project {
+        session_id: String,
+        reply: Reply,
+    },
+    ContinuationState {
         session_id: String,
         reply: Reply,
     },
@@ -152,6 +171,7 @@ enum GoalActorReply {
     None,
     Record(Option<GoalRecord>),
     Projected(Option<ThreadGoal>),
+    Continuation(Option<GoalContinuationSnapshot>),
     Created(GoalRecord),
     Turn(GoalTurnContext),
     Ack(GoalUpdateAck),
@@ -165,6 +185,7 @@ impl GoalRuntimeHandle {
             store,
             sender: receiver,
             active: HashMap::new(),
+            trackers: HashMap::new(),
             pending_verification: HashMap::new(),
         };
         let join = thread::Builder::new()
@@ -203,6 +224,22 @@ impl GoalRuntimeHandle {
             GoalActorReply::Projected(goal) => Ok(goal),
             _ => Err(GoalActorError::Invalid(
                 "goal actor returned wrong projection reply".to_string(),
+            )),
+        })
+    }
+
+    pub fn continuation_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<GoalContinuationSnapshot>, GoalActorError> {
+        self.request(|reply| GoalActorCommand::ContinuationState {
+            session_id: session_id.to_string(),
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::Continuation(state) => Ok(state),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong continuation reply".to_string(),
             )),
         })
     }
@@ -397,6 +434,11 @@ impl GoalActor {
                     .map(GoalActorReply::Projected)
                     .map_err(Into::into),
             ),
+            GoalActorCommand::ContinuationState { session_id, reply } => (
+                reply,
+                self.continuation_state(&session_id)
+                    .map(GoalActorReply::Continuation),
+            ),
             GoalActorCommand::Create { input, reply } => (
                 reply,
                 self.store
@@ -494,6 +536,25 @@ impl GoalActor {
         self.store.get_by_session(session_id).map_err(Into::into)
     }
 
+    fn continuation_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<GoalContinuationSnapshot>, GoalActorError> {
+        let Some(record) = self.store.get_by_session(session_id)? else {
+            return Ok(None);
+        };
+        let status = if self.pending_verification.contains_key(session_id) {
+            GoalContinuationStatus::PendingVerification
+        } else if self.active.contains_key(session_id) {
+            GoalContinuationStatus::OuterTurnInFlight
+        } else if record.state.should_continue() {
+            GoalContinuationStatus::Ready
+        } else {
+            GoalContinuationStatus::Inactive
+        };
+        Ok(Some(GoalContinuationSnapshot { record, status }))
+    }
+
     fn begin_outer_turn(
         &mut self,
         session_id: &str,
@@ -539,7 +600,10 @@ impl GoalActor {
         } else {
             run_id
         };
-        let mut tracker = GoalTracker::from_record(&record);
+        let mut tracker = self
+            .trackers
+            .remove(session_id)
+            .unwrap_or_else(|| GoalTracker::from_record(&record));
         let outer_turn_id = tracker
             .begin_outer_turn(origin)
             .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
@@ -599,6 +663,8 @@ impl GoalActor {
         gap_fingerprint: Option<String>,
         finished_at: i64,
     ) -> Result<GoalNextAction, GoalActorError> {
+        let gap_fingerprint =
+            gap_fingerprint.unwrap_or_else(|| "outer_turn:no_structured_progress".to_string());
         let mut active = self
             .active
             .remove(session_id)
@@ -608,7 +674,11 @@ impl GoalActor {
             .finish_outer_turn(GoalTurnResult {
                 status,
                 usage: usage.clone(),
-                gaps: Vec::new(),
+                gaps: vec![GoalGap {
+                    summary: "outer turn ended without structured progress evidence".to_string(),
+                    fingerprint: gap_fingerprint.clone(),
+                    model_fixable: true,
+                }],
                 evidence_count: 0,
             })
             .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
@@ -619,7 +689,7 @@ impl GoalActor {
             status,
             tool_count,
             model_response_count,
-            gap_fingerprint,
+            gap_fingerprint: Some(gap_fingerprint),
             usage_event: Some(GoalUsageEvent {
                 usage_event_id: format!("{}:turn", active.context.outer_turn_id),
                 goal_id: active.context.goal_id.clone(),
@@ -629,14 +699,12 @@ impl GoalActor {
             }),
             finished_at,
         })?;
+        let ActiveGoalTurn { context, tracker } = active;
         match action.clone() {
             GoalNextAction::Verify { intent: _ } => {
                 self.pending_verification.insert(
                     session_id.to_string(),
-                    PendingVerification {
-                        context: active.context,
-                        tracker: active.tracker,
-                    },
+                    PendingVerification { context, tracker },
                 );
             }
             GoalNextAction::Pause {
@@ -644,26 +712,28 @@ impl GoalActor {
                 ref message,
             } => {
                 self.store.transition_state(
-                    &active.context.goal_id,
+                    &context.goal_id,
                     GoalState::Paused {
                         reason,
                         message: message.clone(),
                     },
                     "turn_paused",
-                    Some(&active.context.outer_turn_id),
+                    Some(&context.outer_turn_id),
                     finished_at,
                 )?;
             }
             GoalNextAction::BudgetLimited => {
                 self.store.transition_state(
-                    &active.context.goal_id,
+                    &context.goal_id,
                     GoalState::BudgetLimited,
                     "budget_limited",
-                    Some(&active.context.outer_turn_id),
+                    Some(&context.outer_turn_id),
                     finished_at,
                 )?;
             }
-            _ => {}
+            _ => {
+                self.trackers.insert(session_id.to_string(), tracker);
+            }
         }
         Ok(action)
     }
@@ -674,7 +744,7 @@ impl GoalActor {
         result: GoalVerificationResult,
         at: i64,
     ) -> Result<GoalNextAction, GoalActorError> {
-        let mut pending = self
+        let pending = self
             .pending_verification
             .remove(session_id)
             .ok_or_else(|| {
@@ -682,47 +752,57 @@ impl GoalActor {
                     "no terminal goal intent is pending verification".to_string(),
                 )
             })?;
-        let action = pending.tracker.apply_verification(result).clone();
+        let PendingVerification {
+            context,
+            mut tracker,
+        } = pending;
+        let action = tracker.apply_verification(result).clone();
         match action.clone() {
             GoalNextAction::Complete { ref evidence } => self.store.transition_state(
-                &pending.context.goal_id,
+                &context.goal_id,
                 GoalState::Complete {
                     evidence: evidence.clone(),
                 },
                 "verified_complete",
-                Some(&pending.context.outer_turn_id),
+                Some(&context.outer_turn_id),
                 at,
             )?,
             GoalNextAction::Blocked { ref blocker } => self.store.transition_state(
-                &pending.context.goal_id,
+                &context.goal_id,
                 GoalState::Blocked {
                     blocker: blocker.clone(),
                 },
                 "verified_blocked",
-                Some(&pending.context.outer_turn_id),
+                Some(&context.outer_turn_id),
                 at,
             )?,
             GoalNextAction::Pause {
                 reason,
                 ref message,
             } => self.store.transition_state(
-                &pending.context.goal_id,
+                &context.goal_id,
                 GoalState::Paused {
                     reason,
                     message: message.clone(),
                 },
                 "verification_paused",
-                Some(&pending.context.outer_turn_id),
+                Some(&context.outer_turn_id),
                 at,
             )?,
             GoalNextAction::BudgetLimited => self.store.transition_state(
-                &pending.context.goal_id,
+                &context.goal_id,
                 GoalState::BudgetLimited,
                 "budget_limited",
-                Some(&pending.context.outer_turn_id),
+                Some(&context.outer_turn_id),
                 at,
             )?,
             _ => {}
+        }
+        if !matches!(
+            action,
+            GoalNextAction::Complete { .. } | GoalNextAction::Blocked { .. }
+        ) {
+            self.trackers.insert(session_id.to_string(), tracker);
         }
         Ok(action)
     }
@@ -749,6 +829,7 @@ impl GoalActor {
             at,
         )?;
         self.active.remove(session_id);
+        self.trackers.remove(session_id);
         self.pending_verification.remove(session_id);
         Ok(GoalNextAction::Pause { reason, message })
     }
@@ -763,11 +844,15 @@ impl GoalActor {
             .store
             .get_by_session(session_id)?
             .ok_or_else(|| GoalActorError::Invalid("goal does not exist".to_string()))?;
-        let mut tracker = GoalTracker::from_record(&record);
+        let mut tracker = self
+            .trackers
+            .remove(session_id)
+            .unwrap_or_else(|| GoalTracker::from_record(&record));
         let action = tracker.resume(origin).clone();
         if matches!(action, GoalNextAction::Continue { .. }) {
             self.store
                 .transition_state(&record.goal_id, GoalState::Active, "resumed", None, at)?;
+            self.trackers.insert(session_id.to_string(), tracker);
         }
         Ok(action)
     }

@@ -2183,7 +2183,7 @@ mod tests {
             let persisted = store.get(&resumed_session_id).unwrap().unwrap();
             assert_eq!(
                 persisted.status,
-                orca_core::goal_types::ThreadGoalStatus::Stalled,
+                orca_core::goal_types::ThreadGoalStatus::Paused,
                 "interrupting the resumed Goal generation must stop automatic continuation"
             );
             assert_eq!(persisted.token_budget, Some(80_000));
@@ -2195,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_auto_continuation_stalls_after_three_no_progress_turns() {
+    fn goal_auto_continuation_pauses_after_three_no_progress_turns() {
         with_orca_home(|_home| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
             let preloaded = Arc::new(Mutex::new(None));
@@ -2224,7 +2224,7 @@ mod tests {
                 .unwrap();
 
             // mock provider 不产生 usage，goal 一直 active：
-            // 用户 turn 后应跑满 3 个零增量续跑 turn，然后置 Stalled 并停。
+            // 用户 turn 后应跑满 3 个无结构化进展 turn，然后暂停并停。
             let mut stalled_notice = false;
             let mut stalled_status = false;
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -4339,9 +4339,6 @@ fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     )
 }
 
-const STALL_TOKEN_DELTA_THRESHOLD: i64 = 500;
-const STALL_TURN_LIMIT: u32 = 3;
-
 fn send_submission_error(
     event_tx: &mpsc::Sender<TuiEvent>,
     rejection_prompt: Option<&str>,
@@ -4599,14 +4596,12 @@ fn hosted_tui_controller_loop(
                                 .to_string(),
                         ));
                         if let Some(runtime_thread) = thread.as_ref() {
-                            run_hosted_goal_turns(
+                            run_hosted_goal_run(
                                 &cfg,
                                 runtime_thread,
                                 SubmittedTurn::user(objective),
                                 &event_tx,
                                 &controller,
-                                0,
-                                &pending_workflow_notifications,
                             );
                         }
                     }
@@ -4712,14 +4707,12 @@ fn hosted_tui_controller_loop(
                     .flatten();
                 if let (Some(runtime_thread), Some(goal)) = (thread.as_ref(), goal) {
                     let cfg = config.lock().unwrap().clone();
-                    run_hosted_goal_turns(
+                    run_hosted_goal_run(
                         &cfg,
                         runtime_thread,
                         SubmittedTurn::user(goal_continuation_prompt(&goal.objective, 1)),
                         &event_tx,
                         &controller,
-                        1,
-                        &pending_workflow_notifications,
                     );
                 }
             }
@@ -4780,7 +4773,7 @@ fn handle_hosted_submitted_turn(
     pending_pinned_context: &mut Vec<String>,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
-    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
     host: &RuntimeHostHandle,
 ) {
@@ -4821,14 +4814,12 @@ fn handle_hosted_submitted_turn(
             return;
         }
     };
-    run_hosted_goal_turns(
+    run_hosted_goal_run(
         &cfg,
         runtime_thread,
         submitted_turn.with_model_prompt(prompt),
         event_tx,
         controller,
-        0,
-        pending_workflow_notifications,
     );
     if cfg.desktop_notifications {
         let _ = orca_runtime::notify::notify("Orca", "Task completed");
@@ -4897,7 +4888,9 @@ fn run_hosted_operation(
             HostedOperationKind::ManualCompaction => {
                 Ok(TuiHostedOperationOutcome::ManualCompaction)
             }
-            HostedOperationKind::Turn | HostedOperationKind::BackgroundContinuation { .. } => {
+            HostedOperationKind::Turn
+            | HostedOperationKind::GoalRun
+            | HostedOperationKind::BackgroundContinuation { .. } => {
                 Ok(TuiHostedOperationOutcome::Turn {
                     status: status.as_str().to_string(),
                 })
@@ -4928,146 +4921,89 @@ fn send_hosted_operation_terminal_failure(
     });
 }
 
-fn run_hosted_goal_turns(
+fn run_hosted_goal_run(
     config: &RunConfig,
     thread: &RuntimeThreadHandle,
-    mut submitted_turn: SubmittedTurn,
+    submitted_turn: SubmittedTurn,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
-    starting_continuation: usize,
-    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
 ) {
     let Some(session_id) = thread.session_id().map(str::to_string) else {
         send_goal_history_error(event_tx);
         return;
     };
-    let mut continuation = starting_continuation;
-    let mut stall_streak: u32 = 0;
-    let mut turn_was_continuation = starting_continuation > 0;
-    loop {
-        let active_goal = orca_runtime::goals::GoalStore::load_default()
-            .get(&session_id)
-            .ok()
-            .flatten()
-            .filter(|goal| goal.status.should_continue());
-        let tokens_before = active_goal
-            .as_ref()
-            .map(|goal| goal.tokens_used)
-            .unwrap_or(0);
-        if let Some(goal) = active_goal.as_ref() {
-            if !replace_hosted_goal_context(
-                thread,
-                Some(orca_runtime::agent_common::format_goal_mode_instructions(
-                    goal,
-                )),
-                event_tx,
-            ) {
-                break;
-            }
-            let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
-        } else if !replace_hosted_goal_context(thread, None, event_tx) {
-            break;
+    let runtime = match thread.goal_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            return;
         }
-        let request = hosted_turn_request(&submitted_turn, active_goal.is_some());
-        let status =
-            match run_hosted_operation(thread, request, config.clone(), controller, event_tx) {
-                Ok(TuiHostedOperationOutcome::Turn { status }) => status,
-                Ok(TuiHostedOperationOutcome::ManualCompaction) => {
-                    replace_hosted_goal_context(thread, None, event_tx);
-                    let _ = event_tx.send(TuiEvent::Error(
-                        "hosted turn returned a compaction result".to_string(),
-                    ));
-                    break;
-                }
-                Err(error) => {
-                    replace_hosted_goal_context(thread, None, event_tx);
-                    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                    break;
-                }
-            };
-        if status != "success" {
-            replace_hosted_goal_context(thread, None, event_tx);
-            if let Ok(Some(goal)) = orca_runtime::goals::GoalStore::load_default().get(&session_id)
-            {
-                let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
-                let message = if goal.status.should_continue() {
-                    format!(
-                        "Goal paused because the last turn ended with status `{status}`. Resolve the issue, then use /goal resume to continue."
-                    )
-                } else {
-                    format!(
-                        "Goal auto-continuation stopped because the goal is {}.",
-                        orca_core::goal_types::goal_status_label(goal.status)
-                    )
-                };
-                let _ = event_tx.send(TuiEvent::Notice(message));
-            }
-            break;
+    };
+    let active_goal = match runtime.project_thread_goal(&session_id) {
+        Ok(goal) => goal.filter(|goal| goal.status.should_continue()),
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            return;
         }
-        if let Some(notification) = pending_workflow_notifications.pop_notification() {
-            submitted_turn = SubmittedTurn::workflow_notification(notification);
-            turn_was_continuation = false;
-            continue;
+    };
+    if let Some(goal) = active_goal.as_ref() {
+        if !replace_hosted_goal_context(
+            thread,
+            Some(orca_runtime::agent_common::format_goal_mode_instructions(
+                goal,
+            )),
+            event_tx,
+        ) {
+            return;
         }
-        match thread.snapshot() {
-            Ok(snapshot) if snapshot.has_active_workflows() => {
-                let _ = event_tx.send(TuiEvent::Notice(
-                    "Goal is waiting for active workflow tasks to finish.".to_string(),
-                ));
-                break;
-            }
-            Err(error) => {
-                replace_hosted_goal_context(thread, None, event_tx);
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                break;
-            }
-            _ => {}
-        }
-        let goal = match orca_runtime::goals::GoalStore::load_default().get(&session_id) {
-            Ok(Some(goal)) => goal,
-            Ok(None) => {
-                replace_hosted_goal_context(thread, None, event_tx);
-                break;
-            }
-            Err(error) => {
-                replace_hosted_goal_context(thread, None, event_tx);
-                let _ = event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
-                break;
-            }
-        };
         let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
-        if !goal.status.should_continue() {
-            replace_hosted_goal_context(thread, None, event_tx);
-            let label = orca_core::goal_types::goal_status_label(goal.status);
-            let _ = event_tx.send(TuiEvent::Notice(format!(
-                "Goal auto-continuation stopped because the goal is {label}."
-            )));
-            break;
+    }
+    let request = hosted_turn_request(&submitted_turn, active_goal.is_some())
+        .with_operation_kind(HostedOperationKind::GoalRun);
+    let status = match run_hosted_operation(thread, request, config.clone(), controller, event_tx) {
+        Ok(TuiHostedOperationOutcome::Turn { status }) => status,
+        Ok(TuiHostedOperationOutcome::ManualCompaction) => {
+            let _ = event_tx.send(TuiEvent::Error(
+                "goal run returned a compaction result".to_string(),
+            ));
+            return;
         }
-        if turn_was_continuation {
-            let delta = goal.tokens_used.saturating_sub(tokens_before);
-            if delta < STALL_TOKEN_DELTA_THRESHOLD {
-                stall_streak += 1;
-            } else {
-                stall_streak = 0;
-            }
-            if stall_streak >= STALL_TURN_LIMIT {
-                update_goal_status_for_session(
-                    Some(&session_id),
-                    orca_core::goal_types::ThreadGoalStatus::Stalled,
-                    event_tx,
-                );
-                replace_hosted_goal_context(thread, None, event_tx);
-                let _ = event_tx.send(TuiEvent::Notice(format!(
-                    "Goal auto-continuation stopped because the last {STALL_TURN_LIMIT} turns made no measurable progress. Use /goal resume to continue."
-                )));
-                break;
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            return;
+        }
+    };
+    replace_hosted_goal_context(thread, None, event_tx);
+    match runtime.project_thread_goal(&session_id) {
+        Ok(Some(goal)) => {
+            let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
+            let _ = event_tx.send(TuiEvent::GoalUpdated(goal.clone()));
+            if status != "success" || !goal.status.should_continue() {
+                let notice = match runtime.read(&session_id) {
+                    Ok(Some(record)) => match record.state {
+                        orca_core::goal_runtime::GoalState::Paused {
+                            reason: orca_core::goal_runtime::GoalPauseReason::NoProgress,
+                            ..
+                        } => "Goal paused because the last turns made no measurable progress. Use /goal resume to continue.".to_string(),
+                        _ => format!(
+                            "Goal run stopped with status `{status}` while the goal is {}.",
+                            orca_core::goal_types::goal_status_label(goal.status)
+                        ),
+                    },
+                    _ => format!(
+                        "Goal run stopped with status `{status}` while the goal is {}.",
+                        orca_core::goal_types::goal_status_label(goal.status)
+                    ),
+                };
+                let _ = event_tx.send(TuiEvent::Notice(notice));
             }
         }
-        continuation += 1;
-        submitted_turn =
-            SubmittedTurn::user(goal_continuation_prompt(&goal.objective, continuation));
-        turn_was_continuation = true;
+        Ok(None) => {
+            let _ = event_tx.send(TuiEvent::GoalStatus(None));
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+        }
     }
 }
 
@@ -5160,7 +5096,7 @@ fn resume_latest_active_goal_hosted(
     mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
-    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         send_goal_history_error(event_tx);
@@ -5238,14 +5174,12 @@ fn resume_latest_active_goal_hosted(
         "Resumed latest active goal in a restored session.".to_string(),
     ));
     if let Some(runtime_thread) = thread.as_ref() {
-        run_hosted_goal_turns(
+        run_hosted_goal_run(
             &cfg,
             runtime_thread,
             SubmittedTurn::user(goal_continuation_prompt(&active_goal.objective, 1)),
             event_tx,
             controller,
-            1,
-            pending_workflow_notifications,
         );
     }
 }

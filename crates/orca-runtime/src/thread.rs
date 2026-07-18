@@ -11,6 +11,7 @@ use crate::controller::{
 };
 use crate::extension::ExtensionData;
 use crate::goal_actor::{GoalRuntimeBinding, GoalRuntimeHandle};
+use crate::goal_verifier::{DeterministicGoalVerifier, GoalVerifier};
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use crate::session::{InteractiveSession, new_run_id};
 use crate::thread_store::SessionTranscript;
@@ -138,7 +139,7 @@ impl RuntimeThread {
                 orca_core::goal_runtime::GoalTurnStatus::Failed
             }
         };
-        let _ = binding.handle.finish_outer_turn(
+        let action = binding.handle.finish_outer_turn(
             &turn.session_id,
             goal_status,
             orca_core::goal_runtime::GoalUsage::default(),
@@ -147,6 +148,24 @@ impl RuntimeThread {
             None,
             now_timestamp(),
         );
+        if let Ok(orca_core::goal_runtime::GoalNextAction::Verify { intent }) = action {
+            let verifier = DeterministicGoalVerifier;
+            match verifier.verify("", &intent) {
+                Ok(output) => {
+                    let _ = binding
+                        .handle
+                        .verify(&turn.session_id, output.result, now_timestamp());
+                }
+                Err(error) => {
+                    let _ = binding.handle.pause(
+                        &turn.session_id,
+                        orca_core::goal_runtime::GoalPauseReason::Infrastructure,
+                        error.to_string(),
+                        now_timestamp(),
+                    );
+                }
+            }
+        }
         self.thread_extensions.remove::<GoalRuntimeBinding>();
     }
 

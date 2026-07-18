@@ -23,6 +23,7 @@ pub mod extension;
 pub mod goal_actor;
 pub mod goal_store;
 pub mod goal_tracker;
+pub mod goal_verifier;
 pub mod goals;
 pub mod history;
 pub mod hooks;

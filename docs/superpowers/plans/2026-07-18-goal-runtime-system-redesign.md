@@ -349,7 +349,7 @@ git commit -m "feat(goal): add runtime goal actor ownership"
 - Modify: `crates/orca-tui/src/app.rs`
 - Test: `crates/orca-runtime/src/runtime_host.rs`, `crates/orca-tui/src/app.rs`
 
-- [ ] **Step 1: Add RED composite-operation tests**
+- [x] **Step 1: Add RED composite-operation tests**
 
 Add a mock-provider test where one Goal command runs two successful outer turns,
 then a third turn containing a deferred complete intent. Assert one operation
@@ -357,14 +357,14 @@ handle, monotonic outer-turn ids, and no second TUI submission. Add admission
 tests for queued user input, cancellation, duplicate continuation, active
 workflow, plan mode, and exhausted budget.
 
-- [ ] **Step 2: Add `HostedOperationKind::GoalRun`**
+- [x] **Step 2: Add `HostedOperationKind::GoalRun`**
 
 Represent a GoalRun as one active RuntimeHost operation containing the current
 generation, GoalRuntimeHandle, writer, origin, and next outer-turn state. The
 operation remains active while the actor admits another outer turn; terminal
 completion is published only after GoalNextAction is terminal.
 
-- [ ] **Step 3: Implement one admission gate**
+- [x] **Step 3: Implement one admission gate**
 
 Add a host method returning:
 
@@ -379,20 +379,20 @@ The gate checks Goal state, pending input, cancellation, pending interaction,
 workflow ownership, duplicate in-flight continuation, plan mode, and all
 budgets. Emit one semantic event for every decision.
 
-- [ ] **Step 4: Move cancellation/pause into the owner**
+- [x] **Step 4: Move cancellation/pause into the owner**
 
 `pause`, `cancel`, and shutdown first send the GoalActor transition, then cancel
 and join the current generation. Resume creates a fresh GoalRun and outer turn;
 it never reuses an in-flight generation fence.
 
-- [ ] **Step 5: Remove TUI continuation ownership**
+- [x] **Step 5: Remove TUI continuation ownership**
 
 Replace `run_hosted_goal_turns` with one `HostedOperationKind::GoalRun` request.
 Delete `continuation`, `stall_streak`, `tokens_before`, and the TUI loop's direct
 GoalStore reads. Keep TUI event handling and notices only as projections of
 runtime events.
 
-- [ ] **Step 6: Run composite tests and commit**
+- [x] **Step 6: Run composite tests and commit**
 
 ```bash
 cargo test -p orca-runtime runtime_host goal --lib -- --test-threads=1
