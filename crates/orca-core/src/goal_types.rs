@@ -25,6 +25,26 @@ impl ThreadGoalStatus {
     pub fn should_continue(self) -> bool {
         matches!(self, Self::Active)
     }
+
+    pub fn from_runtime_state(state: &crate::goal_runtime::GoalState) -> Self {
+        use crate::goal_runtime::{GoalPauseReason, GoalState};
+
+        match state {
+            GoalState::Active => Self::Active,
+            GoalState::Paused {
+                reason: GoalPauseReason::NoProgress,
+                ..
+            } => Self::Stalled,
+            GoalState::Paused {
+                reason: GoalPauseReason::UsageLimit,
+                ..
+            } => Self::UsageLimited,
+            GoalState::Paused { .. } => Self::Paused,
+            GoalState::Blocked { .. } => Self::Blocked,
+            GoalState::BudgetLimited => Self::BudgetLimited,
+            GoalState::Complete { .. } => Self::Complete,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -217,5 +237,18 @@ mod tests {
         assert_eq!(json, "\"stalled\"");
         let parsed: ThreadGoalStatus = serde_json::from_str("\"stalled\"").unwrap();
         assert_eq!(parsed, ThreadGoalStatus::Stalled);
+    }
+
+    #[test]
+    fn runtime_state_projects_no_progress_without_losing_legacy_status_compatibility() {
+        let state = crate::goal_runtime::GoalState::Paused {
+            reason: crate::goal_runtime::GoalPauseReason::NoProgress,
+            message: "same gap repeated".to_string(),
+        };
+
+        assert_eq!(
+            ThreadGoalStatus::from_runtime_state(&state),
+            ThreadGoalStatus::Stalled
+        );
     }
 }
