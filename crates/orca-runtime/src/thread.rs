@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
+use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, EventPublicationStore, RunStatus};
 use orca_mcp::McpRegistry;
 
@@ -11,7 +12,10 @@ use crate::controller::{
 };
 use crate::extension::ExtensionData;
 use crate::goal_actor::{GoalRuntimeBinding, GoalRuntimeHandle};
-use crate::goal_verifier::{DeterministicGoalVerifier, GoalVerifier};
+use crate::goal_store::GoalUsageEvent;
+use crate::goal_verifier::{
+    DeepSeekGoalVerifier, DeterministicGoalVerifier, GoalVerificationRequest, GoalVerifier,
+};
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind};
 use crate::session::{InteractiveSession, new_run_id};
 use crate::thread_store::SessionTranscript;
@@ -75,7 +79,7 @@ impl RuntimeThread {
         }
     }
 
-    fn begin_goal_turn(
+    pub(crate) fn begin_goal_turn(
         &mut self,
         request: &ThreadTurnRequest,
     ) -> io::Result<Option<GoalRuntimeBinding>> {
@@ -89,11 +93,9 @@ impl RuntimeThread {
             Ok(handle) => handle,
             Err(_) => return Ok(None),
         };
-        let origin = if request.continuation().is_some() {
-            orca_core::goal_runtime::GoalTurnOrigin::Continuation
-        } else {
-            orca_core::goal_runtime::GoalTurnOrigin::User
-        };
+        let origin = request
+            .goal_turn_origin()
+            .unwrap_or(orca_core::goal_runtime::GoalTurnOrigin::User);
         let turn = handle
             .begin_outer_turn(
                 &session_id,
@@ -101,8 +103,11 @@ impl RuntimeThread {
                 request.turn_id().to_string(),
                 now_timestamp(),
             )
-            .ok();
-        let binding = GoalRuntimeBinding { handle, turn };
+            .map_err(io::Error::other)?;
+        let binding = GoalRuntimeBinding {
+            handle,
+            turn: Some(turn),
+        };
         self.thread_extensions.insert(binding.clone());
         Ok(Some(binding))
     }
@@ -120,7 +125,16 @@ impl RuntimeThread {
             .clone())
     }
 
-    fn finish_goal_turn(&mut self, binding: Option<&GoalRuntimeBinding>, status: RunStatus) {
+    pub(crate) fn finish_goal_turn(
+        &mut self,
+        binding: Option<&GoalRuntimeBinding>,
+        status: RunStatus,
+        usage: orca_core::goal_runtime::GoalUsage,
+        mut events: Option<&mut EventFactory>,
+        observer: Option<&dyn orca_core::event_sink::EventObserver>,
+        config: &RunConfig,
+        cancel: CancelToken,
+    ) {
         let Some(binding) = binding else {
             return;
         };
@@ -139,34 +153,177 @@ impl RuntimeThread {
                 orca_core::goal_runtime::GoalTurnStatus::Failed
             }
         };
+        let previous_state = binding
+            .handle
+            .read(&turn.session_id)
+            .ok()
+            .and_then(|record| record.map(|record| record.state));
         let action = binding.handle.finish_outer_turn(
             &turn.session_id,
             goal_status,
-            orca_core::goal_runtime::GoalUsage::default(),
+            usage.clone(),
             0,
             0,
             None,
             now_timestamp(),
         );
+        let mut final_action = action.clone().ok();
         if let Ok(orca_core::goal_runtime::GoalNextAction::Verify { intent }) = action {
-            let verifier = DeterministicGoalVerifier;
-            match verifier.verify("", &intent) {
+            let record = binding.handle.read(&turn.session_id).ok().flatten();
+            let mut verification_request = GoalVerificationRequest::new(
+                record
+                    .as_ref()
+                    .map(|record| record.objective.clone())
+                    .unwrap_or_default(),
+                intent,
+            );
+            if let Some(record) = record.as_ref() {
+                verification_request.goal_state = record.state.clone();
+                verification_request.budget_remaining = record
+                    .token_budget
+                    .map(|budget| budget.saturating_sub(record.usage.charged_tokens()));
+            }
+            verification_request.active_workflow = self.session.has_active_workflows();
+            verification_request.last_model_response =
+                self.session.conversation().messages.iter().rev().find_map(
+                    |message| match message {
+                        orca_core::conversation::Message::Assistant { content, .. } => {
+                            content.clone()
+                        }
+                        _ => None,
+                    },
+                );
+            let verifier: Box<dyn GoalVerifier> =
+                if config.provider == orca_core::config::ProviderKind::DeepSeek {
+                    Box::new(DeepSeekGoalVerifier::new(
+                        orca_provider::ProviderConfig {
+                            api_key: config.api_key.clone(),
+                            base_url: config.base_url.clone(),
+                            model: config.model.as_option(),
+                            reasoning_effort: config.reasoning_effort,
+                            tools_override: Some(Vec::new()),
+                            mcp_registry: None,
+                            external_tools: Vec::new(),
+                        },
+                        cancel,
+                    ))
+                } else {
+                    Box::new(DeterministicGoalVerifier)
+                };
+            match verifier.verify(&verification_request) {
                 Ok(output) => {
+                    if output.usage.charged_tokens() > 0
+                        || output.usage.cost_micros > 0
+                        || output.usage.elapsed_seconds > 0
+                    {
+                        let _ = binding.handle.record_verifier_usage_once(
+                            &turn.outer_turn_id,
+                            GoalUsageEvent {
+                                usage_event_id: format!("verifier:{}:1", turn.outer_turn_id),
+                                goal_id: turn.goal_id.clone(),
+                                source: "goal_verifier".to_string(),
+                                usage: output.usage.clone(),
+                                created_at: now_timestamp(),
+                            },
+                        );
+                    }
+                    if let Some(events) = events.as_deref_mut() {
+                        let _ = orca_core::event_sink::observe_event(
+                            observer,
+                            events.goal_verification_completed(&turn.outer_turn_id, &output.result),
+                        );
+                    }
                     let _ = binding
                         .handle
-                        .verify(&turn.session_id, output.result, now_timestamp());
+                        .verify(&turn.session_id, output.result, now_timestamp())
+                        .map(|action| final_action = Some(action));
                 }
                 Err(error) => {
+                    if let Some(events) = events.as_deref_mut() {
+                        let result =
+                            orca_core::goal_runtime::GoalVerificationResult::Indeterminate {
+                                message: error.to_string(),
+                            };
+                        let _ = orca_core::event_sink::observe_event(
+                            observer,
+                            events.goal_verification_completed(&turn.outer_turn_id, &result),
+                        );
+                    }
                     let _ = binding.handle.pause(
                         &turn.session_id,
                         orca_core::goal_runtime::GoalPauseReason::Infrastructure,
                         error.to_string(),
                         now_timestamp(),
                     );
+                    final_action = Some(orca_core::goal_runtime::GoalNextAction::Pause {
+                        reason: orca_core::goal_runtime::GoalPauseReason::Infrastructure,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        if let (Some(events), Some(next_action)) = (events.as_deref_mut(), final_action.as_ref()) {
+            let _ = orca_core::event_sink::observe_event(
+                observer,
+                events.goal_turn_finished(&turn.outer_turn_id, goal_status, &usage, next_action),
+            );
+        }
+        if let (Some(events), Some(previous_state)) = (events.as_deref_mut(), previous_state) {
+            if let Ok(Some(record)) = binding.handle.read(&turn.session_id)
+                && record.state != previous_state
+            {
+                let _ = orca_core::event_sink::observe_event(
+                    observer,
+                    events.goal_transitioned(
+                        &turn.goal_id,
+                        &previous_state,
+                        &record.state,
+                        record
+                            .last_transition
+                            .as_ref()
+                            .map(|transition| transition.reason_code.as_str())
+                            .unwrap_or("runtime"),
+                    ),
+                );
+                if let orca_core::goal_runtime::GoalState::Complete { evidence } = &record.state {
+                    let _ = orca_core::event_sink::observe_event(
+                        observer,
+                        events.goal_completed(
+                            &turn.goal_id,
+                            Some(&turn.goal_run_id),
+                            evidence,
+                            &record.usage,
+                        ),
+                    );
                 }
             }
         }
         self.thread_extensions.remove::<GoalRuntimeBinding>();
+    }
+
+    pub(crate) fn emit_goal_turn_started(
+        binding: Option<&GoalRuntimeBinding>,
+        events: &mut EventFactory,
+        observer: Option<&dyn orca_core::event_sink::EventObserver>,
+    ) {
+        let Some(turn) = binding.and_then(|binding| binding.turn.as_ref()) else {
+            return;
+        };
+        if turn.run_started {
+            let _ = orca_core::event_sink::observe_event(
+                observer,
+                events.goal_run_started(&turn.goal_id, &turn.goal_run_id),
+            );
+        }
+        let _ = orca_core::event_sink::observe_event(
+            observer,
+            events.goal_turn_started(
+                &turn.goal_id,
+                &turn.goal_run_id,
+                &turn.outer_turn_id,
+                turn.origin,
+            ),
+        );
     }
 
     pub fn thread_id(&self) -> &str {
@@ -227,6 +384,7 @@ impl RuntimeThread {
         writer: W,
     ) -> io::Result<RunStatus> {
         let binding = self.begin_goal_turn(request)?;
+        let usage_before = self.session.aggregate_usage_totals();
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -237,9 +395,15 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request(request, writer);
-        if let Ok(status) = result {
-            self.finish_goal_turn(binding.as_ref(), status);
-        }
+        self.finish_goal_turn(
+            binding.as_ref(),
+            result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
+            None,
+            None,
+            config,
+            CancelToken::new(),
+        );
         result
     }
 
@@ -251,6 +415,8 @@ impl RuntimeThread {
         cancel: CancelToken,
     ) -> io::Result<RunStatus> {
         let binding = self.begin_goal_turn(request)?;
+        let verifier_cancel = cancel.clone();
+        let usage_before = self.session.aggregate_usage_totals();
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -261,9 +427,15 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request_with_cancel(request, writer, cancel);
-        if let Ok(status) = result {
-            self.finish_goal_turn(binding.as_ref(), status);
-        }
+        self.finish_goal_turn(
+            binding.as_ref(),
+            result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
+            None,
+            None,
+            config,
+            verifier_cancel,
+        );
         result
     }
 
@@ -292,6 +464,10 @@ impl RuntimeThread {
         cancel: CancelToken,
     ) -> io::Result<RunStatus> {
         let binding = self.begin_goal_turn(request)?;
+        let observer = request.event_observer().map(Arc::as_ref);
+        Self::emit_goal_turn_started(binding.as_ref(), events, observer);
+        let verifier_cancel = cancel.clone();
+        let usage_before = self.session.aggregate_usage_totals();
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -302,10 +478,36 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request_with_event_factory_and_cancel(request, writer, events, cancel);
-        if let Ok(status) = result {
-            self.finish_goal_turn(binding.as_ref(), status);
-        }
+        self.finish_goal_turn(
+            binding.as_ref(),
+            result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
+            Some(events),
+            observer,
+            config,
+            verifier_cancel,
+        );
         result
+    }
+
+    pub(crate) fn run_request_with_event_factory_and_cancel_outcome_unbound<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        request: &ThreadTurnRequest,
+        writer: W,
+        events: &mut EventFactory,
+        cancel: CancelToken,
+    ) -> io::Result<ThreadTurnOutcome> {
+        let thread_extensions = self.thread_extensions_handle();
+        let turn_extension_id = self.next_turn_extension_id();
+        ThreadTurnExecutor::new_with_thread_extensions(
+            config,
+            &mut self.session,
+            &mut self.lifecycle,
+            thread_extensions,
+            turn_extension_id,
+        )
+        .run_request_with_event_factory_and_cancel_outcome(request, writer, events, cancel)
     }
 
     pub fn run_request_with_event_factory_and_cancel_outcome<W: io::Write>(
@@ -317,19 +519,26 @@ impl RuntimeThread {
         cancel: CancelToken,
     ) -> io::Result<ThreadTurnOutcome> {
         let binding = self.begin_goal_turn(request)?;
-        let thread_extensions = self.thread_extensions_handle();
-        let turn_extension_id = self.next_turn_extension_id();
-        let result = ThreadTurnExecutor::new_with_thread_extensions(
+        let observer = request.event_observer().map(Arc::as_ref);
+        Self::emit_goal_turn_started(binding.as_ref(), events, observer);
+        let verifier_cancel = cancel.clone();
+        let usage_before = self.session.aggregate_usage_totals();
+        let result = self.run_request_with_event_factory_and_cancel_outcome_unbound(
+            config, request, writer, events, cancel,
+        );
+        self.finish_goal_turn(
+            binding.as_ref(),
+            match &result {
+                Ok(ThreadTurnOutcome::Completed { status, .. }) => *status,
+                Ok(ThreadTurnOutcome::ProviderSuspended { .. }) => RunStatus::ApprovalRequired,
+                Err(_) => RunStatus::Failed,
+            },
+            goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
+            Some(events),
+            observer,
             config,
-            &mut self.session,
-            &mut self.lifecycle,
-            thread_extensions,
-            turn_extension_id,
-        )
-        .run_request_with_event_factory_and_cancel_outcome(request, writer, events, cancel);
-        if let Ok(ThreadTurnOutcome::Completed { status, .. }) = &result {
-            self.finish_goal_turn(binding.as_ref(), *status);
-        }
+            verifier_cancel,
+        );
         result
     }
 
@@ -352,6 +561,20 @@ impl Drop for RuntimeThread {
 
 fn now_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+pub(crate) fn goal_usage_delta(
+    before: UsageTotals,
+    after: UsageTotals,
+) -> orca_core::goal_runtime::GoalUsage {
+    orca_core::goal_runtime::GoalUsage {
+        charged_input_tokens: after.input_tokens.saturating_sub(before.input_tokens) as i64,
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens) as i64,
+        cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens) as i64,
+        cost_micros: ((after.estimated_cost_usd - before.estimated_cost_usd).max(0.0) * 1_000_000.0)
+            as i64,
+        ..orca_core::goal_runtime::GoalUsage::default()
+    }
 }
 
 #[cfg(test)]
@@ -432,9 +655,9 @@ mod tests {
         let skill_context = thread
             .session()
             .conversation()
-            .volatile
-            .skill
-            .as_deref()
+            .internal_context
+            .get(orca_core::conversation::SKILL_CONTEXT_FRAGMENT_ID)
+            .map(|fragment| fragment.content.as_str())
             .unwrap_or_default();
         assert!(skill_context.contains("thread skill marker"));
     }

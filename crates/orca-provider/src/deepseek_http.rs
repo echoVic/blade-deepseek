@@ -12,6 +12,7 @@ use orca_core::tool_types::{ToolName, ToolRequest};
 use orca_tools::registry;
 
 use crate::ProviderConfig;
+use crate::context::render_internal_context;
 use crate::tool_schema::deepseek_tools_schema_with_mcp_and_external;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -873,16 +874,22 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         inject_summary_messages(&conversation.summary, &mut messages);
     }
 
-    if !conversation.volatile.is_empty() {
-        let overlay = conversation.volatile.render();
-        if let Some(last) = messages.last_mut() {
-            let existing = last.content.take().unwrap_or_default();
-            last.content = Some(if existing.is_empty() {
-                overlay
-            } else {
-                format!("{existing}\n\n{overlay}")
-            });
-        }
+    if let Some(overlay) = render_internal_context(conversation) {
+        let insert_at = messages
+            .iter()
+            .position(|message| message.role == "system")
+            .map(|index| index.saturating_add(1))
+            .unwrap_or_default();
+        messages.insert(
+            insert_at,
+            ApiMessage {
+                role: "system".to_string(),
+                content: Some(overlay),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
     }
 
     messages
@@ -912,6 +919,7 @@ fn inject_summary_messages(summary: &SummaryState, messages: &mut Vec<ApiMessage
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::TokenCounter;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::ToolName;
     use std::io::{Read, Write};
@@ -1224,7 +1232,9 @@ mod tests {
         );
         assert_eq!(
             update_goal.pointer("/function/parameters/required"),
-            Some(&serde_json::json!(["reason", "status"]))
+            Some(&serde_json::json!([
+                "blocker", "evidence", "reason", "status"
+            ]))
         );
         assert_eq!(
             update_goal.pointer("/function/parameters/properties/reason/anyOf/1/type"),
@@ -1450,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn volatile_overlay_appended_to_last_message() {
+    fn internal_context_is_a_separate_system_message_after_instructions() {
         let mut conv = Conversation::new();
         conv.add_system("system prompt".to_string());
         conv.add_user("do something".to_string());
@@ -1458,15 +1468,37 @@ mod tests {
         conv.replace_goal_state(Some("build a widget".to_string()));
 
         let messages = conversation_to_api_messages(&conv);
-        assert_eq!(messages.len(), 2);
-        let last_content = messages.last().unwrap().content.as_deref().unwrap();
-        assert!(last_content.starts_with("do something"));
-        assert!(last_content.contains("[Goal state]"));
-        assert!(last_content.contains("[Plan]"));
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "system");
+        let overlay = messages[1].content.as_deref().unwrap();
+        assert!(overlay.contains("[Goal state]"));
+        assert!(overlay.contains("[Plan]"));
+        assert_eq!(messages[2].content.as_deref(), Some("do something"));
     }
 
     #[test]
-    fn volatile_overlay_on_tool_result() {
+    fn internal_context_fragment_respects_its_token_limit() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("do something".to_string());
+        conv.replace_internal_context(
+            "bounded-runtime",
+            orca_core::conversation::InternalContextKind::Runtime,
+            orca_core::conversation::InternalContextOrigin::System,
+            Some("one two three four five six".to_string()),
+            2,
+        );
+
+        let messages = conversation_to_api_messages(&conv);
+        let overlay = messages[1].content.as_deref().unwrap();
+
+        assert!(crate::context::DefaultTokenCounter.count_text(overlay) <= 2);
+        assert_ne!(overlay, "one two three four five six");
+    }
+
+    #[test]
+    fn internal_context_does_not_modify_tool_result() {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
         conv.add_user("read a file".to_string());
@@ -1483,20 +1515,17 @@ mod tests {
         conv.replace_plan_state("updated plan".to_string());
 
         let messages = conversation_to_api_messages(&conv);
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 5);
+        let overlay = &messages[1];
+        assert_eq!(overlay.role, "system");
+        assert!(overlay.content.as_deref().unwrap().contains("updated plan"));
         let last = messages.last().unwrap();
         assert_eq!(last.role, "tool");
-        assert!(last.content.as_deref().unwrap().contains("updated plan"));
-        assert!(
-            last.content
-                .as_deref()
-                .unwrap()
-                .starts_with("file contents")
-        );
+        assert_eq!(last.content.as_deref(), Some("file contents"));
     }
 
     #[test]
-    fn no_volatile_means_no_overlay() {
+    fn no_internal_context_means_no_overlay() {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
         conv.add_user("hello".to_string());
@@ -1587,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn volatile_overlay_does_not_mutate_source_messages() {
+    fn internal_context_rendering_does_not_mutate_source_messages() {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
         conv.add_user("original text".to_string());

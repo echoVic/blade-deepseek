@@ -5,8 +5,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_core::config::RunConfig;
 use orca_core::conversation::{Conversation, Message};
@@ -39,6 +40,7 @@ use crate::lifecycle::{
 use crate::provider_stream::{
     RuntimeProviderSuspension, RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
 };
+use crate::runtime_pending_interaction::RuntimePendingInteractionStore;
 use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 use crate::thread::RuntimeThread;
 use crate::thread_store::SessionTranscript;
@@ -228,6 +230,7 @@ pub struct HostedTurnRequest {
     backtrack_target: bool,
     allow_goal_tools: bool,
     track_goal_usage: bool,
+    goal_turn_origin: orca_core::goal_runtime::GoalTurnOrigin,
     emit_session_completed: bool,
     envelope: HostedOperationEnvelope,
     approval_handler: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
@@ -240,6 +243,7 @@ pub struct HostedTurnRequest {
     task_id: Option<String>,
     main_session_task_id: Option<String>,
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
     usage_credit: UsageTotals,
 }
 
@@ -266,11 +270,86 @@ pub enum GoalContinuationAdmission {
 pub enum GoalContinuationRejectCode {
     GoalInactive,
     Cancelled,
+    NonSuccessfulTurn,
+    QueuedUserInput,
+    PendingInteraction,
     ActiveWorkflow,
+    PlanMode,
+    DuplicateAdmission,
     PendingVerification,
     BudgetLimited,
     RuntimeUnavailable,
     OuterTurnLimit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GoalContinuationPreflight {
+    cancelled: bool,
+    successful_turn: bool,
+    queued_user_input: bool,
+    pending_interaction: bool,
+    active_workflow: bool,
+    plan_mode: bool,
+    duplicate_admission: bool,
+    continuation_count: u64,
+}
+
+fn goal_continuation_preflight(
+    input: GoalContinuationPreflight,
+) -> Option<GoalContinuationAdmission> {
+    let reject = |code, message: &str| GoalContinuationAdmission::Reject {
+        code,
+        message: message.to_string(),
+    };
+    if input.cancelled {
+        return Some(reject(
+            GoalContinuationRejectCode::Cancelled,
+            "goal continuation rejected because the operation was cancelled",
+        ));
+    }
+    if !input.successful_turn {
+        return Some(reject(
+            GoalContinuationRejectCode::NonSuccessfulTurn,
+            "goal continuation rejected after a non-successful outer turn",
+        ));
+    }
+    if input.queued_user_input {
+        return Some(reject(
+            GoalContinuationRejectCode::QueuedUserInput,
+            "goal continuation yielded to queued user input",
+        ));
+    }
+    if input.pending_interaction {
+        return Some(reject(
+            GoalContinuationRejectCode::PendingInteraction,
+            "goal continuation waits for a pending user interaction",
+        ));
+    }
+    if input.active_workflow {
+        return Some(reject(
+            GoalContinuationRejectCode::ActiveWorkflow,
+            "goal continuation waits for active workflow ownership",
+        ));
+    }
+    if input.plan_mode {
+        return Some(reject(
+            GoalContinuationRejectCode::PlanMode,
+            "goal continuation is disabled while the runtime is in plan mode",
+        ));
+    }
+    if input.duplicate_admission {
+        return Some(reject(
+            GoalContinuationRejectCode::DuplicateAdmission,
+            "goal continuation was already admitted for this generation fence",
+        ));
+    }
+    if input.continuation_count >= MAX_GOAL_OUTER_TURNS_PER_RUN {
+        return Some(reject(
+            GoalContinuationRejectCode::OuterTurnLimit,
+            "goal continuation reached the outer-turn safety limit",
+        ));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,6 +369,7 @@ impl HostedTurnRequest {
             backtrack_target: false,
             allow_goal_tools: false,
             track_goal_usage: false,
+            goal_turn_origin: orca_core::goal_runtime::GoalTurnOrigin::User,
             emit_session_completed: true,
             envelope: HostedOperationEnvelope::Turn,
             approval_handler: None,
@@ -302,6 +382,7 @@ impl HostedTurnRequest {
             task_id: None,
             main_session_task_id: None,
             generation_handler_factory: None,
+            pending_interactions: None,
             usage_credit: UsageTotals::default(),
         }
     }
@@ -370,6 +451,14 @@ impl HostedTurnRequest {
 
     pub fn with_goal_usage_tracking(mut self, track_goal_usage: bool) -> Self {
         self.track_goal_usage = track_goal_usage;
+        self
+    }
+
+    pub fn with_goal_turn_origin(
+        mut self,
+        origin: orca_core::goal_runtime::GoalTurnOrigin,
+    ) -> Self {
+        self.goal_turn_origin = origin;
         self
     }
 
@@ -451,6 +540,14 @@ impl HostedTurnRequest {
         self
     }
 
+    pub fn with_pending_interactions(
+        mut self,
+        pending_interactions: RuntimePendingInteractionStore,
+    ) -> Self {
+        self.pending_interactions = Some(pending_interactions);
+        self
+    }
+
     fn prepare_main_session_task(&mut self, registry: &TaskRegistry) -> Result<(), String> {
         let Some(description) = self.task_description.as_ref() else {
             return Ok(());
@@ -514,6 +611,7 @@ impl HostedTurnRequest {
             .with_turn_id(self.turn_id.clone())
             .with_prompt_placement(prompt_placement)
             .with_tool_mode(tool_mode)
+            .with_goal_turn_origin(self.goal_turn_origin)
             .with_options(self.options)
             .with_session_completed_event(
                 self.envelope == HostedOperationEnvelope::Turn
@@ -803,7 +901,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
             ));
         }
         thread
-            .run_request_with_event_factory_and_cancel_outcome(
+            .run_request_with_event_factory_and_cancel_outcome_unbound(
                 generation.config(),
                 &request.thread_turn_request(generation),
                 writer,
@@ -836,6 +934,7 @@ pub enum RuntimeHostError {
     MailboxFull { owner: &'static str },
     ResponseChannelClosed { owner: &'static str },
     OperationActive { operation_id: OperationId },
+    GoalControlFailed { message: String },
     ThreadStartFailed { message: String },
     WorkflowLaunchFailed { message: String },
     RuntimeStartFailed { message: String },
@@ -854,6 +953,9 @@ impl fmt::Display for RuntimeHostError {
             }
             Self::OperationActive { operation_id } => {
                 write!(formatter, "operation {operation_id:?} is already active")
+            }
+            Self::GoalControlFailed { message } => {
+                write!(formatter, "goal control command failed: {message}")
             }
             Self::ThreadStartFailed { message } => {
                 write!(formatter, "failed to start runtime thread: {message}")
@@ -883,6 +985,26 @@ pub enum InterruptOperationResult {
         generation: GenerationFence,
     },
     AlreadyRequested {
+        generation: GenerationFence,
+    },
+    Stale {
+        requested_operation_id: OperationId,
+        active: GenerationFence,
+    },
+    Idle {
+        requested_operation_id: OperationId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseGoalRunResult {
+    Requested {
+        generation: GenerationFence,
+    },
+    AlreadyRequested {
+        generation: GenerationFence,
+    },
+    NotGoalRun {
         generation: GenerationFence,
     },
     Stale {
@@ -1000,7 +1122,6 @@ impl RuntimeThreadStartRequest {
 pub enum RuntimeThreadMutation {
     SetModel(Option<String>),
     AddPinnedContext(String),
-    ReplaceGoalContext(Option<String>),
     ReplaceSkillContext(Option<String>),
 }
 
@@ -1009,9 +1130,6 @@ impl RuntimeThreadMutation {
         match self {
             Self::SetModel(model) => thread.session_mut().set_model(model.as_deref()),
             Self::AddPinnedContext(content) => thread.session_mut().add_pinned_context(content),
-            Self::ReplaceGoalContext(content) => {
-                thread.session_mut().replace_goal_context(content);
-            }
             Self::ReplaceSkillContext(content) => {
                 thread.session_mut().replace_skill_context(content);
             }
@@ -1215,6 +1333,10 @@ impl OperationHandle {
         self.thread.interrupt_operation(self.operation_id)
     }
 
+    pub fn pause_goal(&self) -> Result<PauseGoalRunResult, RuntimeHostError> {
+        self.thread.pause_goal_run(self.operation_id)
+    }
+
     pub fn resume(&self) -> Result<ResumeOperationResult, RuntimeHostError> {
         self.thread.resume_operation(self.operation_id)
     }
@@ -1371,6 +1493,18 @@ impl RuntimeThreadHandle {
     ) -> Result<InterruptOperationResult, RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::InterruptOperation {
+            operation_id,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub fn pause_goal_run(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<PauseGoalRunResult, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::PauseGoalRun {
             operation_id,
             reply: reply_tx,
         })?;
@@ -1643,6 +1777,10 @@ enum ThreadCommand {
         operation_id: OperationId,
         reply: SyncSender<Result<InterruptOperationResult, RuntimeHostError>>,
     },
+    PauseGoalRun {
+        operation_id: OperationId,
+        reply: SyncSender<Result<PauseGoalRunResult, RuntimeHostError>>,
+    },
     ResumeOperation {
         operation_id: OperationId,
         reply: SyncSender<Result<ResumeOperationResult, RuntimeHostError>>,
@@ -1822,7 +1960,26 @@ struct ActiveOperation {
     config: RunConfig,
     steer_handle: ThreadSteerHandle,
     resume_queued: bool,
+    goal_admitted_generation: Option<GenerationFence>,
+    goal_control: Option<ActiveGoalControl>,
+    pending_goal_pause_event: Option<PendingGoalPauseEvent>,
     generation: ActiveGeneration,
+}
+
+struct ActiveGoalControl {
+    session_id: String,
+    runtime: GoalRuntimeHandle,
+}
+
+struct PendingGoalPauseEvent {
+    goal_id: orca_core::goal_runtime::GoalId,
+    goal_run_id: Option<orca_core::goal_runtime::GoalRunId>,
+    outer_turn_id: Option<orca_core::goal_runtime::GoalOuterTurnId>,
+    previous_state: orca_core::goal_runtime::GoalState,
+    next_state: orca_core::goal_runtime::GoalState,
+    reason: orca_core::goal_runtime::GoalPauseReason,
+    message: String,
+    reason_code: String,
 }
 
 struct ActiveGeneration {
@@ -1959,20 +2116,46 @@ impl ThreadActor {
                 command = command_rx.recv() => {
                     match command {
                         Some(ThreadCommand::ShutdownThread { reply }) => {
+                            let pause_result = Self::pause_active_goal(
+                                &mut active,
+                                "goal run paused during runtime shutdown",
+                            );
                             active.generation.cancel.cancel();
                             let result = (&mut active.generation.join).await;
                             self.finish_generation(active, result, false);
                             self.shutdown_background_tasks().await;
                             if let Some(reply) = reply {
-                                let _ = reply.send(Ok(()));
+                                let _ = reply.send(pause_result);
                             }
                             break;
+                        }
+                        Some(ThreadCommand::PauseGoalRun {
+                            operation_id,
+                            reply,
+                        }) => {
+                            let result = Self::request_goal_pause(&mut active, operation_id);
+                            let waits_for_join = matches!(
+                                result,
+                                Ok(PauseGoalRunResult::Requested { .. }
+                                    | PauseGoalRunResult::AlreadyRequested { .. })
+                            );
+                            if waits_for_join {
+                                let generation_result = (&mut active.generation.join).await;
+                                self.finish_generation(active, generation_result, false);
+                            } else {
+                                self.active = Some(active);
+                            }
+                            let _ = reply.send(result);
                         }
                         Some(command) => {
                             self.handle_running_command(command, &mut active);
                             self.active = Some(active);
                         }
                         None => {
+                            let _ = Self::pause_active_goal(
+                                &mut active,
+                                "goal run paused because runtime command channel closed",
+                            );
                             active.generation.cancel.cancel();
                             let result = (&mut active.generation.join).await;
                             self.finish_generation(active, result, false);
@@ -2026,6 +2209,41 @@ impl ThreadActor {
                     }));
                     return;
                 }
+                let goal_control = if request.operation_kind() == &HostedOperationKind::GoalRun {
+                    let Some(session_id) = state.thread.session().session_id().map(str::to_string)
+                    else {
+                        self.state = Some(state);
+                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                            message: "goal run requires a persistent session".to_string(),
+                        }));
+                        return;
+                    };
+                    let runtime = match state.thread.goal_runtime_handle() {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            self.state = Some(state);
+                            let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                                message: error.to_string(),
+                            }));
+                            return;
+                        }
+                    };
+                    if let Err(error) = Self::publish_goal_recoveries(
+                        &mut state,
+                        &runtime,
+                        request.event_observer().as_deref(),
+                    ) {
+                        self.state = Some(state);
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                    Some(ActiveGoalControl {
+                        session_id,
+                        runtime,
+                    })
+                } else {
+                    None
+                };
                 if let Err(error) =
                     request.prepare_background_continuation(state.thread.session().task_registry())
                 {
@@ -2076,6 +2294,9 @@ impl ThreadActor {
                     config,
                     steer_handle,
                     resume_queued: false,
+                    goal_admitted_generation: None,
+                    goal_control,
+                    pending_goal_pause_event: None,
                     generation,
                 });
                 let _ = reply.send(Ok(OperationHandle {
@@ -2094,6 +2315,14 @@ impl ThreadActor {
                 reply,
             } => {
                 let _ = reply.send(Ok(InterruptOperationResult::Idle {
+                    requested_operation_id: operation_id,
+                }));
+            }
+            ThreadCommand::PauseGoalRun {
+                operation_id,
+                reply,
+            } => {
+                let _ = reply.send(Ok(PauseGoalRunResult::Idle {
                     requested_operation_id: operation_id,
                 }));
             }
@@ -2148,11 +2377,13 @@ impl ThreadActor {
                     .as_mut()
                     .ok_or(RuntimeHostError::ThreadUnavailable)
                     .and_then(|state| {
-                        state.thread.goal_runtime_handle().map_err(|error| {
+                        let runtime = state.thread.goal_runtime_handle().map_err(|error| {
                             RuntimeHostError::ThreadStartFailed {
                                 message: error.to_string(),
                             }
-                        })
+                        })?;
+                        Self::publish_goal_recoveries(state, &runtime, None)?;
+                        Ok(runtime)
                     });
                 let _ = reply.send(result);
             }
@@ -2200,11 +2431,22 @@ impl ThreadActor {
                     }
                 } else if active.generation.cancel.is_cancelled() {
                     InterruptOperationResult::AlreadyRequested { generation }
+                } else if let Err(error) =
+                    Self::pause_active_goal(active, "goal run interrupted by user")
+                {
+                    let _ = reply.send(Err(error));
+                    return;
                 } else {
                     active.generation.cancel.cancel();
                     InterruptOperationResult::Requested { generation }
                 };
                 let _ = reply.send(Ok(result));
+            }
+            ThreadCommand::PauseGoalRun {
+                operation_id,
+                reply,
+            } => {
+                let _ = reply.send(Self::request_goal_pause(active, operation_id));
             }
             ThreadCommand::ResumeOperation {
                 operation_id,
@@ -2299,6 +2541,147 @@ impl ThreadActor {
         }
     }
 
+    fn pause_active_goal(
+        active: &mut ActiveOperation,
+        message: &str,
+    ) -> Result<(), RuntimeHostError> {
+        let Some(control) = active.goal_control.as_ref() else {
+            return Ok(());
+        };
+        let runtime = control.runtime.clone();
+        let session_id = control.session_id.clone();
+        let previous =
+            runtime
+                .read(&session_id)
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?;
+        runtime
+            .pause(
+                &session_id,
+                orca_core::goal_runtime::GoalPauseReason::User,
+                message,
+                chrono::Utc::now().timestamp(),
+            )
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        let next =
+            runtime
+                .read(&session_id)
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?;
+        if active.pending_goal_pause_event.is_none()
+            && let (Some(previous), Some(next)) = (previous, next)
+            && previous.state != next.state
+            && let orca_core::goal_runtime::GoalState::Paused { reason, message } = &next.state
+        {
+            active.pending_goal_pause_event = Some(PendingGoalPauseEvent {
+                goal_id: next.goal_id.clone(),
+                goal_run_id: previous
+                    .current_run
+                    .as_ref()
+                    .map(|run| run.goal_run_id.clone()),
+                outer_turn_id: previous
+                    .current_run
+                    .as_ref()
+                    .and_then(|run| run.outer_turn_id.clone()),
+                previous_state: previous.state,
+                next_state: next.state.clone(),
+                reason: *reason,
+                message: message.clone(),
+                reason_code: next
+                    .last_transition
+                    .as_ref()
+                    .map(|transition| transition.reason_code.clone())
+                    .unwrap_or_else(|| "paused".to_string()),
+            });
+        }
+        Ok(())
+    }
+
+    fn publish_pending_goal_pause_event(
+        &self,
+        state: &mut ThreadActorState,
+        active: &mut ActiveOperation,
+    ) {
+        let Some(event) = active.pending_goal_pause_event.take() else {
+            return;
+        };
+        let observer = active.request.event_observer();
+        observe_runtime_event(
+            observer.as_deref(),
+            state.events.goal_transitioned(
+                &event.goal_id,
+                &event.previous_state,
+                &event.next_state,
+                &event.reason_code,
+            ),
+        );
+        observe_runtime_event(
+            observer.as_deref(),
+            state.events.goal_paused(
+                &event.goal_id,
+                event.goal_run_id.as_ref(),
+                event.outer_turn_id.as_ref(),
+                event.reason,
+                &event.message,
+            ),
+        );
+    }
+
+    fn publish_goal_recoveries(
+        state: &mut ThreadActorState,
+        runtime: &GoalRuntimeHandle,
+        observer: Option<&dyn EventObserver>,
+    ) -> Result<(), RuntimeHostError> {
+        let Some(session_id) = state.thread.session().session_id().map(str::to_string) else {
+            return Ok(());
+        };
+        let recoveries = runtime.take_recoveries(&session_id).map_err(|error| {
+            RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            }
+        })?;
+        for recovery in recoveries {
+            observe_runtime_event(
+                observer,
+                state.events.goal_recovered(
+                    &recovery.goal_id,
+                    &recovery.stale_goal_run_id,
+                    recovery.outer_turn_id.as_ref(),
+                    &recovery.recovered_state,
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn request_goal_pause(
+        active: &mut ActiveOperation,
+        operation_id: OperationId,
+    ) -> Result<PauseGoalRunResult, RuntimeHostError> {
+        let generation = active.generation.context.fence();
+        if operation_id != active.operation_id {
+            return Ok(PauseGoalRunResult::Stale {
+                requested_operation_id: operation_id,
+                active: generation,
+            });
+        }
+        if active.goal_control.is_none() {
+            return Ok(PauseGoalRunResult::NotGoalRun { generation });
+        }
+        let already_requested = active.generation.cancel.is_cancelled();
+        Self::pause_active_goal(active, "paused by user")?;
+        active.generation.cancel.cancel();
+        Ok(if already_requested {
+            PauseGoalRunResult::AlreadyRequested { generation }
+        } else {
+            PauseGoalRunResult::Requested { generation }
+        })
+    }
+
     fn spawn_generation(
         &self,
         state: ThreadActorState,
@@ -2369,6 +2752,7 @@ impl ThreadActor {
         let outcome = match result {
             Ok(mut result) => {
                 self.usage_ledger.add(result.usage_delta);
+                self.publish_pending_goal_pause_event(&mut result.state, &mut active);
                 let background_error = match &mut result.outcome {
                     GenerationTaskOutcome::Executed(outcome) => {
                         let required = outcome
@@ -2454,62 +2838,103 @@ impl ThreadActor {
                             .then(|| {
                                 self.goal_continuation_admission(
                                     &mut result.state,
-                                    &active,
+                                    &mut active,
                                     &result.outcome,
                                 )
                             });
-                        if let Some((GoalContinuationAdmission::Admit { .. }, Some(objective))) =
-                            goal_continuation
-                        {
-                            if let Err(error) = result.writer.finish_generation(false) {
-                                self.state = Some(result.state);
-                                let outcome = OperationOutcome::ExecutionFailed {
-                                    kind: error.kind(),
-                                    message: error.to_string(),
+                        if let Some((admission, objective)) = goal_continuation {
+                            if let Some(session_id) = result
+                                .state
+                                .thread
+                                .session()
+                                .session_id()
+                                .map(str::to_string)
+                                && let Ok(handle) = result.state.thread.goal_runtime_handle()
+                                && let Ok(Some(record)) = handle.read(&session_id)
+                            {
+                                let (admitted, reason) = match &admission {
+                                    GoalContinuationAdmission::Admit { reason } => {
+                                        (true, goal_continuation_reason_name(*reason))
+                                    }
+                                    GoalContinuationAdmission::Reject { code, .. } => {
+                                        (false, goal_continuation_reject_name(*code))
+                                    }
                                 };
-                                let completed = active.completion.complete(OperationTerminal {
-                                    operation_id: active.operation_id,
-                                    outcome,
-                                });
-                                debug_assert!(completed);
+                                observe_runtime_event(
+                                    active.request.event_observer().as_deref(),
+                                    result.state.events.goal_continuation_admission(
+                                        &record.goal_id,
+                                        record.current_run.as_ref().map(|run| &run.goal_run_id),
+                                        record
+                                            .current_run
+                                            .as_ref()
+                                            .and_then(|run| run.outer_turn_id.as_ref()),
+                                        admitted,
+                                        reason,
+                                        &record.state,
+                                        record
+                                            .current_run
+                                            .as_ref()
+                                            .map(|run| run.continuation_count)
+                                            .unwrap_or_default(),
+                                    ),
+                                );
+                            }
+                            if let (GoalContinuationAdmission::Admit { .. }, Some(objective)) =
+                                (admission, objective)
+                            {
+                                if let Err(error) = result.writer.finish_generation(false) {
+                                    self.state = Some(result.state);
+                                    let outcome = OperationOutcome::ExecutionFailed {
+                                        kind: error.kind(),
+                                        message: error.to_string(),
+                                    };
+                                    let completed = active.completion.complete(OperationTerminal {
+                                        operation_id: active.operation_id,
+                                        outcome,
+                                    });
+                                    debug_assert!(completed);
+                                    return;
+                                }
+                                if let Some(task_id) = active.runtime_task_id.as_deref() {
+                                    result
+                                        .state
+                                        .thread
+                                        .lifecycle_mut()
+                                        .start_task_with_id(RuntimeTaskKind::Agent, task_id);
+                                }
+                                let continuation = active
+                                    .generation
+                                    .context
+                                    .fence()
+                                    .generation_id()
+                                    .as_u64()
+                                    .saturating_add(1);
+                                active.request.prompt = goal_continuation_prompt(
+                                    &objective,
+                                    usize::try_from(continuation).unwrap_or(usize::MAX),
+                                );
+                                active.request.turn_id = TurnId::new();
+                                active.request.continuation = None;
+                                active.request.goal_turn_origin =
+                                    orca_core::goal_runtime::GoalTurnOrigin::Continuation;
+                                active.request.resumes_existing_turn = false;
+                                let context = GenerationContext::new(
+                                    active.generation.context.fence().next(),
+                                    active.steer_handle.clone(),
+                                    false,
+                                    HostedGenerationHandlers::default(),
+                                    active.config.clone(),
+                                );
+                                active.generation = self.spawn_generation(
+                                    result.state,
+                                    &active.request,
+                                    result.writer,
+                                    context,
+                                );
+                                self.active = Some(active);
                                 return;
                             }
-                            if let Some(task_id) = active.runtime_task_id.as_deref() {
-                                result
-                                    .state
-                                    .thread
-                                    .lifecycle_mut()
-                                    .start_task_with_id(RuntimeTaskKind::Agent, task_id);
-                            }
-                            let continuation = active
-                                .generation
-                                .context
-                                .fence()
-                                .generation_id()
-                                .as_u64()
-                                .saturating_add(1);
-                            active.request.prompt = goal_continuation_prompt(
-                                &objective,
-                                usize::try_from(continuation).unwrap_or(usize::MAX),
-                            );
-                            active.request.turn_id = TurnId::new();
-                            active.request.continuation = None;
-                            active.request.resumes_existing_turn = false;
-                            let context = GenerationContext::new(
-                                active.generation.context.fence().next(),
-                                active.steer_handle.clone(),
-                                false,
-                                HostedGenerationHandlers::default(),
-                                active.config.clone(),
-                            );
-                            active.generation = self.spawn_generation(
-                                result.state,
-                                &active.request,
-                                result.writer,
-                                context,
-                            );
-                            self.active = Some(active);
-                            return;
                         }
                         let writer_error = result.writer.finish_generation(true).err();
                         if let Some(error) = writer_error {
@@ -2582,44 +3007,17 @@ impl ThreadActor {
     fn goal_continuation_admission(
         &self,
         state: &mut ThreadActorState,
-        active: &ActiveOperation,
+        active: &mut ActiveOperation,
         outcome: &GenerationTaskOutcome,
     ) -> (GoalContinuationAdmission, Option<String>) {
-        if active.generation.cancel.is_cancelled() {
-            return (
-                GoalContinuationAdmission::Reject {
-                    code: GoalContinuationRejectCode::Cancelled,
-                    message: "goal continuation rejected because the operation was cancelled"
-                        .to_string(),
-                },
-                None,
-            );
-        }
-        if !matches!(
+        let fence = active.generation.context.fence();
+        let successful_turn = matches!(
             outcome,
             GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
                 status: RunStatus::Success,
                 ..
             })
-        ) {
-            return (
-                GoalContinuationAdmission::Reject {
-                    code: GoalContinuationRejectCode::GoalInactive,
-                    message: "goal continuation rejected after a non-successful outer turn"
-                        .to_string(),
-                },
-                None,
-            );
-        }
-        if state.thread.session().has_active_workflows() {
-            return (
-                GoalContinuationAdmission::Reject {
-                    code: GoalContinuationRejectCode::ActiveWorkflow,
-                    message: "goal continuation waits for active workflow ownership".to_string(),
-                },
-                None,
-            );
-        }
+        );
         let continuation_count = active
             .generation
             .context
@@ -2627,28 +3025,25 @@ impl ThreadActor {
             .generation_id()
             .as_u64()
             .saturating_add(1);
-        if continuation_count >= MAX_GOAL_OUTER_TURNS_PER_RUN {
-            if let Some(session_id) = state.thread.session().session_id().map(str::to_string)
-                && let Ok(handle) = state.thread.goal_runtime_handle()
-            {
-                let _ = handle.pause(
-                    &session_id,
-                    orca_core::goal_runtime::GoalPauseReason::NoProgress,
-                    format!(
-                        "goal run reached the safety limit of {MAX_GOAL_OUTER_TURNS_PER_RUN} outer turns"
-                    ),
-                    chrono::Utc::now().timestamp(),
-                );
+        if let Some(rejection) = goal_continuation_preflight(GoalContinuationPreflight {
+            cancelled: active.generation.cancel.is_cancelled(),
+            successful_turn,
+            queued_user_input: active.steer_handle.has_pending(),
+            pending_interaction: active
+                .request
+                .pending_interactions
+                .as_ref()
+                .is_some_and(|pending| !pending.is_empty()),
+            active_workflow: state.thread.session().has_active_workflows(),
+            plan_mode: active.config.approval_mode == ApprovalMode::Plan,
+            duplicate_admission: active.goal_admitted_generation == Some(fence),
+            continuation_count,
+        }) {
+            if let GoalContinuationAdmission::Reject { code, message } = &rejection {
+                self.persist_queued_goal_input(state, active, *code);
+                self.pause_goal_after_rejected_admission(state, *code, message);
             }
-            return (
-                GoalContinuationAdmission::Reject {
-                    code: GoalContinuationRejectCode::OuterTurnLimit,
-                    message: format!(
-                        "goal continuation rejected after {MAX_GOAL_OUTER_TURNS_PER_RUN} outer turns"
-                    ),
-                },
-                None,
-            );
+            return (rejection, None);
         }
         let Some(session_id) = state.thread.session().session_id().map(str::to_string) else {
             return (
@@ -2693,12 +3088,15 @@ impl ThreadActor {
             }
         };
         match snapshot.status {
-            GoalContinuationStatus::Ready => (
-                GoalContinuationAdmission::Admit {
-                    reason: orca_core::goal_runtime::GoalContinuationReason::Progress,
-                },
-                Some(snapshot.record.objective),
-            ),
+            GoalContinuationStatus::Ready => {
+                active.goal_admitted_generation = Some(fence);
+                (
+                    GoalContinuationAdmission::Admit {
+                        reason: orca_core::goal_runtime::GoalContinuationReason::Progress,
+                    },
+                    Some(snapshot.record.objective),
+                )
+            }
             GoalContinuationStatus::PendingVerification => (
                 GoalContinuationAdmission::Reject {
                     code: GoalContinuationRejectCode::PendingVerification,
@@ -2735,6 +3133,63 @@ impl ThreadActor {
                 )
             }
         }
+    }
+
+    fn persist_queued_goal_input(
+        &self,
+        state: &mut ThreadActorState,
+        active: &ActiveOperation,
+        code: GoalContinuationRejectCode,
+    ) {
+        if code != GoalContinuationRejectCode::QueuedUserInput {
+            return;
+        }
+        for input in active.steer_handle.drain() {
+            let message = Message::user(input);
+            state
+                .thread
+                .session_mut()
+                .conversation_mut()
+                .messages
+                .push(message.clone());
+            state.thread.session_mut().append_message(&message);
+        }
+    }
+
+    fn pause_goal_after_rejected_admission(
+        &self,
+        state: &mut ThreadActorState,
+        code: GoalContinuationRejectCode,
+        message: &str,
+    ) {
+        let reason = match code {
+            GoalContinuationRejectCode::QueuedUserInput
+            | GoalContinuationRejectCode::PendingInteraction
+            | GoalContinuationRejectCode::PlanMode => {
+                orca_core::goal_runtime::GoalPauseReason::User
+            }
+            GoalContinuationRejectCode::ActiveWorkflow => {
+                orca_core::goal_runtime::GoalPauseReason::WaitingForWorkflow
+            }
+            GoalContinuationRejectCode::DuplicateAdmission => {
+                orca_core::goal_runtime::GoalPauseReason::Infrastructure
+            }
+            GoalContinuationRejectCode::OuterTurnLimit => {
+                orca_core::goal_runtime::GoalPauseReason::NoProgress
+            }
+            _ => return,
+        };
+        if let Some(session_id) = state.thread.session().session_id().map(str::to_string)
+            && let Ok(handle) = state.thread.goal_runtime_handle()
+        {
+            let _ = handle.pause(
+                &session_id,
+                reason,
+                message.to_string(),
+                chrono::Utc::now().timestamp(),
+            );
+        }
+        state.thread.session_mut().replace_goal_context(None);
     }
 
     fn launch_hosted_workflow(
@@ -3200,7 +3655,61 @@ fn run_hosted_operation(
 ) -> io::Result<ThreadOperationOutcome> {
     match request.envelope {
         HostedOperationEnvelope::Turn => {
-            executor.run_turn(thread, request, generation, events, writer, cancel)
+            let turn_request = request.thread_turn_request(generation);
+            let event_observer = request.event_observer();
+            if request.allows_goal_tools()
+                && let Some(session_id) = thread.session().session_id().map(str::to_string)
+            {
+                let handle = thread.goal_runtime_handle().map_err(io::Error::other)?;
+                let goal = handle
+                    .project_thread_goal(&session_id)
+                    .map_err(io::Error::other)?;
+                thread.session_mut().replace_goal_context(
+                    goal.as_ref()
+                        .map(crate::agent_common::format_goal_mode_instructions),
+                );
+            } else if !request.allows_goal_tools() {
+                thread.session_mut().replace_goal_context(None);
+            }
+            let binding = thread.begin_goal_turn(&turn_request)?;
+            RuntimeThread::emit_goal_turn_started(
+                binding.as_ref(),
+                events,
+                event_observer.as_deref(),
+            );
+            let usage_before = thread.session().aggregate_usage_totals();
+            let outcome = executor.run_turn(thread, request, generation, events, writer, cancel);
+            let status = match &outcome {
+                Ok(ThreadOperationOutcome::Completed { status, .. }) => *status,
+                Ok(ThreadOperationOutcome::ProviderSuspended { .. }) => RunStatus::ApprovalRequired,
+                Err(_) => RunStatus::Failed,
+            };
+            let usage = crate::thread::goal_usage_delta(
+                usage_before,
+                thread.session().aggregate_usage_totals(),
+            );
+            thread.finish_goal_turn(
+                binding.as_ref(),
+                status,
+                usage,
+                Some(events),
+                event_observer.as_deref(),
+                generation.config(),
+                cancel.clone(),
+            );
+            if request.allows_goal_tools()
+                && let Some(session_id) = thread.session().session_id().map(str::to_string)
+            {
+                let keep_context = thread
+                    .goal_runtime_handle()
+                    .ok()
+                    .and_then(|handle| handle.read(&session_id).ok().flatten())
+                    .is_some_and(|record| record.state.should_continue());
+                if !keep_context {
+                    thread.session_mut().replace_goal_context(None);
+                }
+            }
+            outcome
         }
         HostedOperationEnvelope::HeadlessSession => run_headless_session(
             executor, thread, events, request, generation, writer, cancel,
@@ -3507,6 +4016,37 @@ fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     )
 }
 
+fn goal_continuation_reason_name(
+    reason: orca_core::goal_runtime::GoalContinuationReason,
+) -> &'static str {
+    match reason {
+        orca_core::goal_runtime::GoalContinuationReason::Initial => "initial",
+        orca_core::goal_runtime::GoalContinuationReason::Progress => "progress",
+        orca_core::goal_runtime::GoalContinuationReason::GapFeedback => "gap_feedback",
+        orca_core::goal_runtime::GoalContinuationReason::Resume => "resume",
+        orca_core::goal_runtime::GoalContinuationReason::WorkflowNotification => {
+            "workflow_notification"
+        }
+    }
+}
+
+fn goal_continuation_reject_name(code: GoalContinuationRejectCode) -> &'static str {
+    match code {
+        GoalContinuationRejectCode::GoalInactive => "goal_inactive",
+        GoalContinuationRejectCode::Cancelled => "cancelled",
+        GoalContinuationRejectCode::NonSuccessfulTurn => "non_successful_turn",
+        GoalContinuationRejectCode::QueuedUserInput => "queued_user_input",
+        GoalContinuationRejectCode::PendingInteraction => "pending_interaction",
+        GoalContinuationRejectCode::ActiveWorkflow => "active_workflow",
+        GoalContinuationRejectCode::PlanMode => "plan_mode",
+        GoalContinuationRejectCode::DuplicateAdmission => "duplicate_admission",
+        GoalContinuationRejectCode::PendingVerification => "pending_verification",
+        GoalContinuationRejectCode::BudgetLimited => "budget_limited",
+        GoalContinuationRejectCode::RuntimeUnavailable => "runtime_unavailable",
+        GoalContinuationRejectCode::OuterTurnLimit => "outer_turn_limit",
+    }
+}
+
 fn usage_totals_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
     UsageTotals {
         input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
@@ -3593,6 +4133,58 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest};
 
     use crate::model_response::RuntimeModelResponse;
+
+    #[test]
+    fn goal_continuation_preflight_rejects_every_competing_owner() {
+        let baseline = GoalContinuationPreflight {
+            cancelled: false,
+            successful_turn: true,
+            queued_user_input: false,
+            pending_interaction: false,
+            active_workflow: false,
+            plan_mode: false,
+            duplicate_admission: false,
+            continuation_count: 1,
+        };
+        let cases = [
+            (
+                GoalContinuationPreflight {
+                    queued_user_input: true,
+                    ..baseline
+                },
+                GoalContinuationRejectCode::QueuedUserInput,
+            ),
+            (
+                GoalContinuationPreflight {
+                    pending_interaction: true,
+                    ..baseline
+                },
+                GoalContinuationRejectCode::PendingInteraction,
+            ),
+            (
+                GoalContinuationPreflight {
+                    plan_mode: true,
+                    ..baseline
+                },
+                GoalContinuationRejectCode::PlanMode,
+            ),
+            (
+                GoalContinuationPreflight {
+                    duplicate_admission: true,
+                    ..baseline
+                },
+                GoalContinuationRejectCode::DuplicateAdmission,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert!(matches!(
+                goal_continuation_preflight(input),
+                Some(GoalContinuationAdmission::Reject { code, .. }) if code == expected
+            ));
+        }
+        assert_eq!(goal_continuation_preflight(baseline), None);
+    }
 
     #[test]
     fn background_continuation_reuses_pending_response_turn_identity() {

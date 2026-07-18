@@ -25,6 +25,25 @@ pub struct GoalStore {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GoalAuditSnapshot {
+    pub outer_turns: i64,
+    pub intents: i64,
+    pub usage_events: i64,
+    pub verifier_tokens: i64,
+    pub transitions: i64,
+    pub in_flight_runs: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalRecoveryRecord {
+    pub session_id: String,
+    pub goal_id: GoalId,
+    pub stale_goal_run_id: GoalRunId,
+    pub outer_turn_id: Option<GoalOuterTurnId>,
+    pub recovered_state: GoalState,
+}
+
 #[derive(Debug)]
 pub enum GoalStoreError {
     Sqlite(rusqlite::Error),
@@ -170,7 +189,6 @@ impl GoalStore {
         if let Some(legacy_path) = legacy_path.as_deref() {
             store.migrate_legacy_once(legacy_path)?;
         }
-        store.recover_in_flight_runs()?;
         Ok(store)
     }
 
@@ -259,6 +277,222 @@ impl GoalStore {
             created_at: stored.created_at,
             updated_at: stored.updated_at,
         }))
+    }
+
+    pub fn latest_active(&self) -> Result<Option<ThreadGoal>, GoalStoreError> {
+        let connection = self.connection()?;
+        let session_id: Option<String> = connection
+            .query_row(
+                "SELECT session_id FROM goals
+                 WHERE state LIKE '{\"status\":\"active\"%'
+                 ORDER BY updated_at DESC, created_at DESC, session_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match session_id.as_deref() {
+            Some(session_id) => self.project_thread_goal(session_id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn edit_goal(
+        &self,
+        session_id: &str,
+        objective: &str,
+        token_budget: Option<i64>,
+        updated_at: i64,
+    ) -> Result<Option<GoalRecord>, GoalStoreError> {
+        validate_thread_goal_objective(objective).map_err(GoalStoreError::Invalid)?;
+        if token_budget.is_some_and(|budget| budget <= 0) {
+            return Err(GoalStoreError::Invalid(
+                "goal token budget must be positive".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT goal_id, state FROM goals WHERE session_id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((goal_id, previous_json)) = row else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let previous = parse_state(&previous_json)?;
+        let goal_id = GoalId::parse(goal_id).map_err(GoalStoreError::Invalid)?;
+        ensure_goal_not_in_flight(&transaction, goal_id.as_str(), "edit")?;
+        let next = GoalState::Active;
+        transaction.execute(
+            "UPDATE goals SET objective = ?1, objective_revision = objective_revision + 1,
+                state = ?2, token_budget = ?3, updated_at = ?4 WHERE session_id = ?5",
+            params![
+                objective.trim(),
+                state_json(&next)?,
+                token_budget,
+                updated_at,
+                session_id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE goal_runs
+             SET status = 'edited', in_flight = 0, finished_at = COALESCE(finished_at, ?1)
+             WHERE goal_id = ?2 AND finished_at IS NULL",
+            params![updated_at, goal_id.as_str()],
+        )?;
+        insert_transition(
+            &transaction,
+            &goal_id,
+            None,
+            &previous,
+            &next,
+            "edited",
+            updated_at,
+        )?;
+        transaction.commit()?;
+        self.get_by_session(session_id)
+    }
+
+    pub fn resume_into(
+        &self,
+        source_session_id: &str,
+        resumed_session_id: &str,
+        now: i64,
+    ) -> Result<Option<GoalRecord>, GoalStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let source = transaction
+            .query_row(
+                "SELECT goal_id, objective, token_budget, created_at, state
+                 FROM goals WHERE session_id = ?1",
+                [source_session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((source_goal_id, objective, token_budget, created_at, source_state_json)) = source
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        ensure_goal_not_in_flight(&transaction, &source_goal_id, "resume")?;
+        let source_state = parse_state(&source_state_json)?;
+        if source_session_id != resumed_session_id
+            && transaction
+                .query_row(
+                    "SELECT 1 FROM goals WHERE session_id = ?1",
+                    [resumed_session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some()
+        {
+            return Err(GoalStoreError::Invalid(format!(
+                "goal already exists for resume target session '{resumed_session_id}'"
+            )));
+        }
+        if source_session_id == resumed_session_id {
+            let goal_id = GoalId::parse(source_goal_id).map_err(GoalStoreError::Invalid)?;
+            let next = GoalState::Active;
+            transaction.execute(
+                "UPDATE goals SET state = ?1, updated_at = ?2 WHERE session_id = ?3",
+                params![state_json(&next)?, now, resumed_session_id],
+            )?;
+            insert_transition(
+                &transaction,
+                &goal_id,
+                None,
+                &source_state,
+                &next,
+                "resumed",
+                now,
+            )?;
+        } else {
+            let source_goal_id = GoalId::parse(source_goal_id).map_err(GoalStoreError::Invalid)?;
+            let usage = usage_totals(&transaction, &source_goal_id)?;
+            let next_goal_id = GoalId::new();
+            let next = GoalState::Active;
+            let paused = GoalState::Paused {
+                reason: GoalPauseReason::User,
+                message: format!("paused while resuming into session {resumed_session_id}"),
+            };
+            transaction.execute(
+                "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+                params![state_json(&paused)?, now, source_goal_id.as_str()],
+            )?;
+            transaction.execute(
+                "UPDATE goal_runs
+                 SET status = 'resumed_elsewhere', in_flight = 0,
+                     finished_at = COALESCE(finished_at, ?1)
+                 WHERE goal_id = ?2 AND finished_at IS NULL",
+                params![now, source_goal_id.as_str()],
+            )?;
+            insert_transition(
+                &transaction,
+                &source_goal_id,
+                None,
+                &source_state,
+                &paused,
+                "resume_fork_source_paused",
+                now,
+            )?;
+            transaction.execute(
+                "INSERT INTO goals (
+                    goal_id, session_id, objective, objective_revision, state,
+                    token_budget, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)",
+                params![
+                    next_goal_id.as_str(),
+                    resumed_session_id,
+                    objective,
+                    state_json(&next)?,
+                    token_budget,
+                    created_at,
+                    now
+                ],
+            )?;
+            insert_transition(
+                &transaction,
+                &next_goal_id,
+                None,
+                &next,
+                &next,
+                "resumed",
+                now,
+            )?;
+            if usage.charged_tokens() > 0 || usage.elapsed_seconds > 0 {
+                transaction.execute(
+                    "INSERT INTO goal_usage_events (
+                        usage_event_id, goal_id, source, charged_input_tokens,
+                        output_tokens, cache_tokens, verifier_tokens, cost_micros,
+                        elapsed_seconds, created_at
+                     ) VALUES (?1, ?2, 'resume_copy', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        format!("resume:{source_goal_id}:{resumed_session_id}"),
+                        next_goal_id.as_str(),
+                        usage.charged_input_tokens,
+                        usage.output_tokens,
+                        usage.cache_tokens,
+                        usage.verifier_tokens,
+                        usage.cost_micros,
+                        usage.elapsed_seconds,
+                        now
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        self.get_by_session(resumed_session_id)
     }
 
     pub fn begin_run(&self, input: BeginGoalRunInput) -> Result<(), GoalStoreError> {
@@ -375,6 +609,83 @@ impl GoalStore {
         Ok(usage)
     }
 
+    pub fn record_verifier_usage_once(
+        &self,
+        outer_turn_id: &GoalOuterTurnId,
+        event: GoalUsageEvent,
+    ) -> Result<GoalUsage, GoalStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO goal_usage_events (
+                usage_event_id, goal_id, source, charged_input_tokens,
+                output_tokens, cache_tokens, verifier_tokens, cost_micros,
+                elapsed_seconds, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.usage_event_id,
+                event.goal_id.as_str(),
+                event.source,
+                event.usage.charged_input_tokens.max(0),
+                event.usage.output_tokens.max(0),
+                event.usage.cache_tokens.max(0),
+                event.usage.verifier_tokens.max(0),
+                event.usage.cost_micros.max(0),
+                event.usage.elapsed_seconds.max(0),
+                event.created_at,
+            ],
+        )?;
+        if inserted == 1 {
+            let changed = transaction.execute(
+                "UPDATE goal_turns
+                 SET verifier_tokens = verifier_tokens + ?1
+                 WHERE outer_turn_id = ?2
+                   AND finished_at IS NOT NULL
+                   AND goal_run_id IN (
+                       SELECT goal_run_id FROM goal_runs WHERE goal_id = ?3
+                   )",
+                params![
+                    event.usage.verifier_tokens.max(0),
+                    outer_turn_id.as_str(),
+                    event.goal_id.as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(GoalStoreError::Invalid(
+                    "verifier usage references a missing, in-flight, or unrelated outer turn"
+                        .to_string(),
+                ));
+            }
+        }
+        let usage = usage_totals(&transaction, &event.goal_id)?;
+        let (state, token_budget) = transaction.query_row(
+            "SELECT state, token_budget FROM goals WHERE goal_id = ?1",
+            [event.goal_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        let state = parse_state(&state)?;
+        if state.should_continue()
+            && token_budget.is_some_and(|budget| usage.charged_tokens() >= budget)
+        {
+            let next = GoalState::BudgetLimited;
+            transaction.execute(
+                "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+                params![state_json(&next)?, event.created_at, event.goal_id.as_str()],
+            )?;
+            insert_transition(
+                &transaction,
+                &event.goal_id,
+                Some(outer_turn_id.as_str()),
+                &state,
+                &next,
+                "budget_limited",
+                event.created_at,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(usage)
+    }
+
     pub fn record_intent(&self, record: GoalIntentRecord) -> Result<GoalUpdateAck, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -438,17 +749,27 @@ impl GoalStore {
                 usage,
             });
         }
+        let turn_usage = input
+            .usage_event
+            .as_ref()
+            .map(|event| event.usage.clone())
+            .unwrap_or_default();
         if let Some(event) = input.usage_event {
             insert_usage_event(&transaction, &event)?;
         }
         let changed = transaction.execute(
             "UPDATE goal_turns SET status = ?1, tool_count = ?2,
-                model_response_count = ?3, gap_fingerprint = ?4, finished_at = ?5
-             WHERE outer_turn_id = ?6 AND goal_run_id = ?7 AND status = 'in_flight'",
+                model_response_count = ?3, charged_input_tokens = ?4,
+                output_tokens = ?5, verifier_tokens = ?6,
+                gap_fingerprint = ?7, finished_at = ?8
+             WHERE outer_turn_id = ?9 AND goal_run_id = ?10 AND status = 'in_flight'",
             params![
                 turn_status_name(input.status),
                 input.tool_count,
                 input.model_response_count,
+                turn_usage.charged_input_tokens.max(0),
+                turn_usage.output_tokens.max(0),
+                turn_usage.verifier_tokens.max(0),
                 input.gap_fingerprint,
                 input.finished_at,
                 input.outer_turn_id.as_str(),
@@ -466,6 +787,48 @@ impl GoalStore {
             params![input.goal_run_id.as_str(), input.goal_id.as_str()],
         )?;
         let usage = usage_totals(&transaction, &input.goal_id)?;
+        let (state_json_value, token_budget): (String, Option<i64>) = transaction.query_row(
+            "SELECT state, token_budget FROM goals WHERE goal_id = ?1",
+            [input.goal_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let state = parse_state(&state_json_value)?;
+        if state.should_continue()
+            && token_budget.is_some_and(|budget| usage.charged_tokens() >= budget)
+        {
+            let next = GoalState::BudgetLimited;
+            transaction.execute(
+                "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+                params![
+                    state_json(&next)?,
+                    input.finished_at,
+                    input.goal_id.as_str()
+                ],
+            )?;
+            insert_transition(
+                &transaction,
+                &input.goal_id,
+                Some(input.outer_turn_id.as_str()),
+                &state,
+                &next,
+                "budget_limited",
+                input.finished_at,
+            )?;
+        }
+        let final_state = goal_state_by_id(&transaction, &input.goal_id)?;
+        if let Some(run_status) = closed_run_status(&final_state) {
+            transaction.execute(
+                "UPDATE goal_runs
+                 SET status = ?1, in_flight = 0, finished_at = COALESCE(finished_at, ?2)
+                 WHERE goal_run_id = ?3 AND goal_id = ?4",
+                params![
+                    run_status,
+                    input.finished_at,
+                    input.goal_run_id.as_str(),
+                    input.goal_id.as_str()
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(FinishOuterTurnOutcome {
             already_finished: false,
@@ -481,6 +844,20 @@ impl GoalStore {
         Ok(connection
             .query_row(
                 "SELECT status FROM goal_turns WHERE outer_turn_id = ?1",
+                [outer_turn_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn outer_turn_verifier_tokens(
+        &self,
+        outer_turn_id: &GoalOuterTurnId,
+    ) -> Result<Option<i64>, GoalStoreError> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT verifier_tokens FROM goal_turns WHERE outer_turn_id = ?1",
                 [outer_turn_id.as_str()],
                 |row| row.get(0),
             )
@@ -508,19 +885,86 @@ impl GoalStore {
                 "complete goal cannot be downgraded by a runtime transition".to_string(),
             ));
         }
-        transaction.execute(
-            "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
-            params![state_json(&next)?, updated_at, goal_id.as_str()],
+        if previous != next {
+            transaction.execute(
+                "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+                params![state_json(&next)?, updated_at, goal_id.as_str()],
+            )?;
+        }
+        if let Some(run_status) = closed_run_status(&next) {
+            transaction.execute(
+                "UPDATE goal_runs
+                 SET status = ?1, in_flight = 0, finished_at = COALESCE(finished_at, ?2)
+                 WHERE goal_id = ?3 AND finished_at IS NULL",
+                params![run_status, updated_at, goal_id.as_str()],
+            )?;
+        }
+        if previous != next {
+            insert_transition(
+                &transaction,
+                goal_id,
+                outer_turn_id.map(GoalOuterTurnId::as_str),
+                &previous,
+                &next,
+                reason_code,
+                updated_at,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn transition_state_while_turn_in_flight(
+        &self,
+        goal_id: &GoalId,
+        next: GoalState,
+        reason_code: &str,
+        outer_turn_id: &GoalOuterTurnId,
+        updated_at: i64,
+    ) -> Result<(), GoalStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = goal_state_by_id(&transaction, goal_id).map_err(|error| match error {
+            GoalStoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
+                GoalStoreError::Invalid("goal does not exist".to_string())
+            }
+            error => error,
+        })?;
+        if matches!(previous, GoalState::Complete { .. }) && previous != next {
+            return Err(GoalStoreError::Invalid(
+                "complete goal cannot be downgraded by a runtime transition".to_string(),
+            ));
+        }
+        let in_flight: bool = transaction.query_row(
+            "SELECT EXISTS(
+                    SELECT 1 FROM goal_turns AS turns
+                    JOIN goal_runs AS runs ON runs.goal_run_id = turns.goal_run_id
+                    WHERE turns.outer_turn_id = ?1 AND runs.goal_id = ?2
+                      AND turns.status = 'in_flight' AND runs.in_flight = 1
+                )",
+            params![outer_turn_id.as_str(), goal_id.as_str()],
+            |row| row.get(0),
         )?;
-        insert_transition(
-            &transaction,
-            goal_id,
-            outer_turn_id.map(GoalOuterTurnId::as_str),
-            &previous,
-            &next,
-            reason_code,
-            updated_at,
-        )?;
+        if !in_flight {
+            return Err(GoalStoreError::Invalid(
+                "goal pause request requires the active outer turn".to_string(),
+            ));
+        }
+        if previous != next {
+            transaction.execute(
+                "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+                params![state_json(&next)?, updated_at, goal_id.as_str()],
+            )?;
+            insert_transition(
+                &transaction,
+                goal_id,
+                Some(outer_turn_id.as_str()),
+                &previous,
+                &next,
+                reason_code,
+                updated_at,
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -532,6 +976,41 @@ impl GoalStore {
             [goal_id.as_str()],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn audit_snapshot(&self, goal_id: &GoalId) -> Result<GoalAuditSnapshot, GoalStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM goal_turns AS turns
+                     JOIN goal_runs AS runs ON runs.goal_run_id = turns.goal_run_id
+                     WHERE runs.goal_id = ?1),
+                    (SELECT COUNT(*) FROM goal_intents AS intents
+                     JOIN goal_turns AS turns ON turns.outer_turn_id = intents.outer_turn_id
+                     JOIN goal_runs AS runs ON runs.goal_run_id = turns.goal_run_id
+                     WHERE runs.goal_id = ?1),
+                    (SELECT COUNT(*) FROM goal_usage_events WHERE goal_id = ?1),
+                    (SELECT COALESCE(SUM(turns.verifier_tokens), 0)
+                     FROM goal_turns AS turns
+                     JOIN goal_runs AS runs ON runs.goal_run_id = turns.goal_run_id
+                     WHERE runs.goal_id = ?1),
+                    (SELECT COUNT(*) FROM goal_transitions WHERE goal_id = ?1),
+                    (SELECT COUNT(*) FROM goal_runs
+                     WHERE goal_id = ?1 AND in_flight = 1)",
+                [goal_id.as_str()],
+                |row| {
+                    Ok(GoalAuditSnapshot {
+                        outer_turns: row.get(0)?,
+                        intents: row.get(1)?,
+                        usage_events: row.get(2)?,
+                        verifier_tokens: row.get(3)?,
+                        transitions: row.get(4)?,
+                        in_flight_runs: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     pub fn in_flight_run_count(&self) -> Result<i64, GoalStoreError> {
@@ -560,6 +1039,16 @@ impl GoalStore {
     pub fn clear_goal(&self, session_id: &str) -> Result<bool, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let goal_id = transaction
+            .query_row(
+                "SELECT goal_id FROM goals WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(goal_id) = goal_id.as_deref() {
+            ensure_goal_not_in_flight(&transaction, goal_id, "clear")?;
+        }
         let changed =
             transaction.execute("DELETE FROM goals WHERE session_id = ?1", [session_id])?;
         transaction.commit()?;
@@ -750,13 +1239,16 @@ impl GoalStore {
         Ok(())
     }
 
-    fn recover_in_flight_runs(&self) -> Result<(), GoalStoreError> {
+    pub(crate) fn recover_in_flight_runs(&self) -> Result<Vec<GoalRecoveryRecord>, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let recoveries = {
             let mut statement = transaction.prepare(
-                "SELECT goal_run_id, goal_id, current_outer_turn_id
-                 FROM goal_runs WHERE in_flight = 1",
+                "SELECT runs.goal_run_id, runs.goal_id, runs.current_outer_turn_id,
+                        goals.session_id
+                 FROM goal_runs AS runs
+                 JOIN goals ON goals.goal_id = runs.goal_id
+                 WHERE runs.in_flight = 1",
             )?;
             statement
                 .query_map([], |row| {
@@ -764,14 +1256,17 @@ impl GoalStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         let now = Utc::now().timestamp();
-        for (run_id, goal_id, outer_turn_id) in recoveries {
+        let mut records = Vec::with_capacity(recoveries.len());
+        for (run_id, goal_id, outer_turn_id, session_id) in recoveries {
             let goal_id = GoalId::parse(goal_id).map_err(GoalStoreError::Invalid)?;
             let previous = goal_state_by_id(&transaction, &goal_id)?;
+            let mut recovered_state = previous.clone();
             if !matches!(previous, GoalState::Complete { .. }) {
                 let next = GoalState::Paused {
                     reason: GoalPauseReason::Recovery,
@@ -790,6 +1285,7 @@ impl GoalStore {
                     "recovered",
                     now,
                 )?;
+                recovered_state = next;
             }
             transaction.execute(
                 "UPDATE goal_runs
@@ -797,7 +1293,7 @@ impl GoalStore {
                  WHERE goal_run_id = ?2",
                 params![now, run_id],
             )?;
-            if let Some(outer_turn_id) = outer_turn_id {
+            if let Some(ref outer_turn_id) = outer_turn_id {
                 transaction.execute(
                     "UPDATE goal_turns
                      SET status = 'cancelled', finished_at = ?1
@@ -805,9 +1301,19 @@ impl GoalStore {
                     params![now, outer_turn_id],
                 )?;
             }
+            records.push(GoalRecoveryRecord {
+                session_id,
+                goal_id,
+                stale_goal_run_id: GoalRunId::parse(run_id).map_err(GoalStoreError::Invalid)?,
+                outer_turn_id: outer_turn_id
+                    .map(GoalOuterTurnId::parse)
+                    .transpose()
+                    .map_err(GoalStoreError::Invalid)?,
+                recovered_state,
+            });
         }
         transaction.commit()?;
-        Ok(())
+        Ok(records)
     }
 
     fn connection(&self) -> Result<Connection, GoalStoreError> {
@@ -1019,6 +1525,16 @@ fn turn_status_name(status: GoalTurnStatus) -> &'static str {
     }
 }
 
+fn closed_run_status(state: &GoalState) -> Option<&'static str> {
+    match state {
+        GoalState::Active => None,
+        GoalState::Paused { .. } => Some("paused"),
+        GoalState::Blocked { .. } => Some("blocked"),
+        GoalState::BudgetLimited => Some("budget_limited"),
+        GoalState::Complete { .. } => Some("complete"),
+    }
+}
+
 fn goal_state_by_id(
     connection: &Connection,
     goal_id: &GoalId,
@@ -1029,6 +1545,26 @@ fn goal_state_by_id(
         |row| row.get(0),
     )?;
     parse_state(&state)
+}
+
+fn ensure_goal_not_in_flight(
+    transaction: &Transaction<'_>,
+    goal_id: &str,
+    action: &str,
+) -> Result<(), GoalStoreError> {
+    let in_flight: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM goal_runs WHERE goal_id = ?1 AND in_flight = 1
+        )",
+        [goal_id],
+        |row| row.get(0),
+    )?;
+    if in_flight {
+        return Err(GoalStoreError::Invalid(format!(
+            "cannot {action} goal while an outer turn is in flight"
+        )));
+    }
+    Ok(())
 }
 
 fn insert_transition(
@@ -1287,6 +1823,7 @@ mod tests {
         drop(store);
 
         let reopened = GoalStore::open(path).unwrap();
+        reopened.recover_in_flight_runs().unwrap();
         let recovered = reopened
             .get_by_session("session-recovery")
             .unwrap()
@@ -1301,6 +1838,105 @@ mod tests {
         ));
         assert_eq!(reopened.in_flight_run_count().unwrap(), 0);
         assert!(reopened.transition_count(&goal.goal_id).unwrap() >= 2);
+    }
+
+    #[test]
+    fn opening_a_reader_does_not_recover_a_live_in_flight_run() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("goals.sqlite3");
+        let owner = GoalStore::open(&path).unwrap();
+        let goal = create_goal(&owner, "session-live-owner");
+        let run_id = GoalRunId::new();
+        owner
+            .begin_run(BeginGoalRunInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                origin: GoalTurnOrigin::User,
+                started_at: 400,
+            })
+            .unwrap();
+        owner
+            .begin_outer_turn(BeginOuterTurnInput {
+                goal_id: goal.goal_id,
+                goal_run_id: run_id,
+                outer_turn_id: GoalOuterTurnId::new(),
+                origin: GoalTurnOrigin::User,
+                provider_turn_id: "live-provider-turn".to_string(),
+                started_at: 401,
+            })
+            .unwrap();
+
+        let reader = GoalStore::open(&path).unwrap();
+        let record = reader
+            .get_by_session("session-live-owner")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(record.state, GoalState::Active);
+        assert!(record.current_run.as_ref().is_some_and(|run| run.in_flight));
+        assert_eq!(reader.in_flight_run_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn detached_controls_cannot_mutate_an_in_flight_goal() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let goal = create_goal(&store, "session-detached-control");
+        let run_id = GoalRunId::new();
+        let outer_turn_id = GoalOuterTurnId::new();
+        store
+            .begin_run(BeginGoalRunInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                origin: GoalTurnOrigin::User,
+                started_at: 500,
+            })
+            .unwrap();
+        store
+            .begin_outer_turn(BeginOuterTurnInput {
+                goal_id: goal.goal_id,
+                goal_run_id: run_id,
+                outer_turn_id: outer_turn_id.clone(),
+                origin: GoalTurnOrigin::User,
+                provider_turn_id: "detached-control-turn".to_string(),
+                started_at: 501,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            store.edit_goal(
+                "session-detached-control",
+                "unsafe detached edit",
+                None,
+                502,
+            ),
+            Err(GoalStoreError::Invalid(message)) if message.contains("in flight")
+        ));
+        assert!(matches!(
+            store.resume_into(
+                "session-detached-control",
+                "session-detached-resume",
+                503,
+            ),
+            Err(GoalStoreError::Invalid(message)) if message.contains("in flight")
+        ));
+        assert!(matches!(
+            store.clear_goal("session-detached-control"),
+            Err(GoalStoreError::Invalid(message)) if message.contains("in flight")
+        ));
+        assert_eq!(
+            store.outer_turn_status(&outer_turn_id).unwrap().as_deref(),
+            Some("in_flight")
+        );
+        assert_eq!(store.in_flight_run_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .get_by_session("session-detached-control")
+                .unwrap()
+                .unwrap()
+                .objective,
+            "ship runtime-owned goals"
+        );
     }
 
     #[test]
@@ -1475,6 +2111,150 @@ mod tests {
             store.outer_turn_status(&outer_turn_id).unwrap().as_deref(),
             Some("success")
         );
+    }
+
+    #[test]
+    fn verifier_usage_is_charged_once_to_goal_and_outer_turn() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let goal = create_goal(&store, "session-verifier-usage");
+        let run_id = GoalRunId::new();
+        let outer_turn_id = GoalOuterTurnId::new();
+        store
+            .begin_run(BeginGoalRunInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                origin: GoalTurnOrigin::User,
+                started_at: 510,
+            })
+            .unwrap();
+        store
+            .begin_outer_turn(BeginOuterTurnInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                outer_turn_id: outer_turn_id.clone(),
+                origin: GoalTurnOrigin::User,
+                provider_turn_id: "turn-provider-verifier".to_string(),
+                started_at: 511,
+            })
+            .unwrap();
+        store
+            .finish_outer_turn(FinishOuterTurnInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id,
+                outer_turn_id: outer_turn_id.clone(),
+                status: GoalTurnStatus::Success,
+                tool_count: 1,
+                model_response_count: 1,
+                gap_fingerprint: None,
+                usage_event: None,
+                finished_at: 512,
+            })
+            .unwrap();
+        let event = GoalUsageEvent {
+            usage_event_id: format!("verifier:{outer_turn_id}:1"),
+            goal_id: goal.goal_id.clone(),
+            source: "goal_verifier".to_string(),
+            usage: GoalUsage {
+                verifier_tokens: 17,
+                cost_micros: 4,
+                elapsed_seconds: 1,
+                ..GoalUsage::default()
+            },
+            created_at: 513,
+        };
+
+        let first = store
+            .record_verifier_usage_once(&outer_turn_id, event.clone())
+            .unwrap();
+        let second = store
+            .record_verifier_usage_once(&outer_turn_id, event)
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.verifier_tokens, 17);
+        assert_eq!(store.usage_event_count(&goal.goal_id).unwrap(), 1);
+        assert_eq!(
+            store.outer_turn_verifier_tokens(&outer_turn_id).unwrap(),
+            Some(17)
+        );
+        assert_eq!(
+            store.audit_snapshot(&goal.goal_id).unwrap(),
+            GoalAuditSnapshot {
+                outer_turns: 1,
+                intents: 0,
+                usage_events: 1,
+                verifier_tokens: 17,
+                transitions: 1,
+                in_flight_runs: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn finishing_outer_turn_at_budget_boundary_pauses_continuation() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let goal = store
+            .create_goal(CreateGoalInput {
+                session_id: "session-budget-boundary".to_string(),
+                objective: "stop exactly at the budget".to_string(),
+                token_budget: Some(100),
+                now: 600,
+            })
+            .unwrap();
+        let run_id = GoalRunId::new();
+        let outer_turn_id = orca_core::goal_runtime::GoalOuterTurnId::new();
+        store
+            .begin_run(BeginGoalRunInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                origin: GoalTurnOrigin::User,
+                started_at: 601,
+            })
+            .unwrap();
+        store
+            .begin_outer_turn(BeginOuterTurnInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                outer_turn_id: outer_turn_id.clone(),
+                origin: GoalTurnOrigin::User,
+                provider_turn_id: "provider-budget-boundary".to_string(),
+                started_at: 602,
+            })
+            .unwrap();
+
+        store
+            .finish_outer_turn(FinishOuterTurnInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id,
+                outer_turn_id: outer_turn_id,
+                status: GoalTurnStatus::Success,
+                tool_count: 1,
+                model_response_count: 1,
+                gap_fingerprint: None,
+                usage_event: Some(GoalUsageEvent {
+                    usage_event_id: "budget-boundary:model".to_string(),
+                    goal_id: goal.goal_id.clone(),
+                    source: "model".to_string(),
+                    usage: GoalUsage {
+                        charged_input_tokens: 70,
+                        output_tokens: 30,
+                        ..GoalUsage::default()
+                    },
+                    created_at: 603,
+                }),
+                finished_at: 603,
+            })
+            .unwrap();
+
+        let record = store
+            .get_by_session("session-budget-boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, GoalState::BudgetLimited);
+        assert_eq!(record.usage.charged_tokens(), 100);
+        assert_eq!(store.in_flight_run_count().unwrap(), 0);
     }
 
     #[test]

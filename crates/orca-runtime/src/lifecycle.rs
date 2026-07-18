@@ -27,7 +27,6 @@ use crate::extension::{
     ExtensionData, ExtensionRegistry, ExtensionRegistryBuilder, RuntimeExtensionContext,
     RuntimeExtensionStores,
 };
-use crate::goals::install_goal_tool_lifecycle;
 use crate::hooks::{HookContext, HookOutcome, HookRunError, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
@@ -722,6 +721,14 @@ impl ThreadSteerHandle {
             .drain(..)
             .collect()
     }
+
+    pub fn has_pending(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .expect("thread steer handle lock")
+            .is_empty()
+    }
 }
 
 impl<'a> AgentLoopContext<'a> {
@@ -1230,8 +1237,7 @@ impl<'a> RuntimeTurnState<'a> {
         thread_extensions: Arc<ExtensionData>,
         turn_extension_id: impl Into<String>,
     ) -> Self {
-        let mut extension_builder = ExtensionRegistryBuilder::new();
-        install_goal_tool_lifecycle(&mut extension_builder);
+        let extension_builder = ExtensionRegistryBuilder::new();
         Self {
             cost_tracker,
             cancel,

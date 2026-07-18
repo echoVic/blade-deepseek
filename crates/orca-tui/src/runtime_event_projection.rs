@@ -100,6 +100,19 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
             explanation: serde_json::from_value(event.payload["explanation"].clone()).ok()?,
             plan: serde_json::from_value(event.payload["plan"].clone()).ok()?,
         }),
+        EventType::GoalCreated
+        | EventType::GoalRunStarted
+        | EventType::GoalTurnStarted
+        | EventType::GoalIntentRequested
+        | EventType::GoalIntentAcknowledged
+        | EventType::GoalTurnFinished
+        | EventType::GoalVerificationCompleted
+        | EventType::GoalTransitioned
+        | EventType::GoalContinuationAdmitted
+        | EventType::GoalContinuationRejected
+        | EventType::GoalPaused
+        | EventType::GoalRecovered
+        | EventType::GoalCompleted => Some(TuiEvent::Notice(goal_event_notice(event))),
         // An actionable approval must carry the active operation fence. The
         // surface interaction handler emits that typed event directly.
         EventType::ApprovalRequested => None,
@@ -253,6 +266,57 @@ pub(crate) fn tui_event_from_runtime_event(event: &EventEnvelope) -> Option<TuiE
             status: event.payload["status"].as_str()?.to_string(),
         }),
         _ => None,
+    }
+}
+
+fn goal_event_notice(event: &EventEnvelope) -> String {
+    match event.event_type {
+        EventType::GoalTransitioned => format!(
+            "Goal transitioned: {} -> {} ({})",
+            event.payload["previous_state"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            event.payload["next_state"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            event.payload["reason_code"].as_str().unwrap_or("runtime")
+        ),
+        EventType::GoalContinuationAdmitted | EventType::GoalContinuationRejected => format!(
+            "Goal continuation {}: {}",
+            if event.payload["admitted"].as_bool().unwrap_or(false) {
+                "admitted"
+            } else {
+                "rejected"
+            },
+            event.payload["reason"].as_str().unwrap_or("unknown")
+        ),
+        EventType::GoalVerificationCompleted => format!(
+            "Goal verification: {}",
+            event.payload["result"]["outcome"]
+                .as_str()
+                .unwrap_or("indeterminate")
+        ),
+        EventType::GoalIntentAcknowledged => format!(
+            "Goal intent acknowledged: {}",
+            event.payload["ack"]["ack"].as_str().unwrap_or("unknown")
+        ),
+        EventType::GoalIntentRequested => format!(
+            "Goal intent requested: {}",
+            event.payload["requested_state"]
+                .as_str()
+                .unwrap_or("unknown")
+        ),
+        EventType::GoalCreated => "Goal created".to_string(),
+        EventType::GoalRunStarted => "Goal run started".to_string(),
+        EventType::GoalTurnStarted => "Goal turn started".to_string(),
+        EventType::GoalTurnFinished => "Goal turn finished".to_string(),
+        EventType::GoalPaused => format!(
+            "Goal paused: {}",
+            event.payload["message"].as_str().unwrap_or("paused")
+        ),
+        EventType::GoalRecovered => "Goal recovered in paused state".to_string(),
+        EventType::GoalCompleted => "Goal completed".to_string(),
+        _ => "Goal runtime event".to_string(),
     }
 }
 
@@ -683,6 +747,41 @@ mod tests {
                 if message == "Verification started: cargo test"));
         assert!(matches!(verification_completed, TuiEvent::Notice(message)
                 if message == "Verification failed: cargo test (exit 101)"));
+    }
+
+    #[test]
+    fn goal_semantic_events_map_to_runtime_notices() {
+        let mut events = EventFactory::new("goal-runtime-adapter".to_string());
+        let goal_id = orca_core::goal_runtime::GoalId::new();
+        let transitioned = project(events.goal_transitioned(
+            &goal_id,
+            &orca_core::goal_runtime::GoalState::Active,
+            &orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::NoProgress,
+                message: "same gap".to_string(),
+            },
+            "no_progress",
+        ))
+        .expect("goal transition notice");
+        assert!(matches!(
+            transitioned,
+            TuiEvent::Notice(message) if message.contains("no_progress")
+        ));
+
+        let admission = project(events.goal_continuation_admission(
+            &goal_id,
+            None,
+            None,
+            false,
+            "budget_limited",
+            &orca_core::goal_runtime::GoalState::BudgetLimited,
+            2,
+        ))
+        .expect("goal admission notice");
+        assert!(matches!(
+            admission,
+            TuiEvent::Notice(message) if message.contains("budget_limited")
+        ));
     }
 
     #[test]

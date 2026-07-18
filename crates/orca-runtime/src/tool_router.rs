@@ -164,6 +164,9 @@ impl<'a> RuntimeToolRouter<'a> {
                             persistent_session_id,
                             goal_runtime,
                             goal_turn,
+                            events,
+                            sink,
+                            event_error,
                         },
                     ) {
                         RuntimeGoalToolOutcome::Continue(result) => {

@@ -32,7 +32,6 @@ impl TuiApprovalHandler {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_pending_interactions(
         mut self,
         store: RuntimePendingInteractionStore,
@@ -95,11 +94,24 @@ impl RuntimeApprovalHandler for TuiApprovalHandler {
 pub(crate) struct TuiPermissionRequestHandler {
     event_tx: Sender<TuiEvent>,
     control: TuiTurnControl,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
 impl TuiPermissionRequestHandler {
     pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
-        Self { event_tx, control }
+        Self {
+            event_tx,
+            control,
+            pending_interactions: None,
+        }
+    }
+
+    pub(crate) fn with_pending_interactions(
+        mut self,
+        store: RuntimePendingInteractionStore,
+    ) -> Self {
+        self.pending_interactions = Some(store);
+        self
     }
 }
 
@@ -118,17 +130,25 @@ impl RuntimePermissionRequestHandler for TuiPermissionRequestHandler {
             .control
             .register_interaction(TuiInteractionKind::Permission, &request.id)?;
         let key = waiter.key().clone();
+        let projected =
+            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
         if self
             .event_tx
             .send(approval_event_from_pending_interaction(&key, &pending))
             .is_err()
         {
+            remove_projected_interaction(
+                self.pending_interactions.as_ref(),
+                &request.id,
+                projected,
+            );
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TUI event channel closed while waiting for permission",
             ));
         }
         let response = waiter.wait();
+        remove_projected_interaction(self.pending_interactions.as_ref(), &request.id, projected);
         let allowed = match response {
             Ok(TuiInteractionResponse::Permission(allowed)) => allowed,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => false,
@@ -201,7 +221,6 @@ impl TuiUserInputHandler {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_pending_interactions(
         mut self,
         store: RuntimePendingInteractionStore,
@@ -252,11 +271,24 @@ impl RuntimeUserInputHandler for TuiUserInputHandler {
 pub(crate) struct TuiMcpElicitationHandler {
     event_tx: Sender<TuiEvent>,
     control: TuiTurnControl,
+    pending_interactions: Option<RuntimePendingInteractionStore>,
 }
 
 impl TuiMcpElicitationHandler {
     pub(crate) fn new(event_tx: Sender<TuiEvent>, control: TuiTurnControl) -> Self {
-        Self { event_tx, control }
+        Self {
+            event_tx,
+            control,
+            pending_interactions: None,
+        }
+    }
+
+    pub(crate) fn with_pending_interactions(
+        mut self,
+        store: RuntimePendingInteractionStore,
+    ) -> Self {
+        self.pending_interactions = Some(store);
+        self
     }
 
     pub(crate) fn request_mcp_elicitation(
@@ -268,6 +300,8 @@ impl TuiMcpElicitationHandler {
             .control
             .register_interaction(TuiInteractionKind::McpElicitation, &request.id)?;
         let key = waiter.key().clone();
+        let projected =
+            project_pending_interaction(self.pending_interactions.as_ref(), pending.clone());
         if self
             .event_tx
             .send(mcp_elicitation_event_from_pending_interaction(
@@ -275,12 +309,18 @@ impl TuiMcpElicitationHandler {
             ))
             .is_err()
         {
+            remove_projected_interaction(
+                self.pending_interactions.as_ref(),
+                &request.id,
+                projected,
+            );
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TUI event channel closed while waiting for MCP elicitation",
             ));
         }
         let response = waiter.wait();
+        remove_projected_interaction(self.pending_interactions.as_ref(), &request.id, projected);
         match response {
             Ok(TuiInteractionResponse::McpElicitation {
                 accepted,

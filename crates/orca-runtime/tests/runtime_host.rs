@@ -30,16 +30,19 @@ use orca_core::thread_identity::TurnId;
 use orca_mcp::McpRegistry;
 use orca_runtime::controller::{ThreadTurnOutcome, ThreadTurnRequest};
 use orca_runtime::history::{self, SessionTranscript};
-use orca_runtime::lifecycle::{RuntimeApprovalHandler, RuntimeTaskStatus};
+use orca_runtime::lifecycle::{RuntimeApprovalHandler, RuntimeTaskStatus, RuntimeUserInputRequest};
 use orca_runtime::provider_stream::{
     RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
 };
 use orca_runtime::runtime_host::{
     GenerationAdmissionResult, GenerationContext, GenerationFence, HostedGenerationHandlers,
-    HostedOperationWriter, HostedTurnRequest, HostedWorkflowRequest, InterruptOperationResult,
-    OperationOutcome, ResumeOperationResult, RuntimeHost, RuntimeHostError, RuntimeThreadMutation,
-    RuntimeThreadStartRequest, RuntimeThreadState, SteerOperationResult, ThreadOperationExecutor,
-    ThreadOperationOutcome,
+    HostedOperationKind, HostedOperationWriter, HostedTurnRequest, HostedWorkflowRequest,
+    InterruptOperationResult, OperationOutcome, ResumeOperationResult, RuntimeHost,
+    RuntimeHostError, RuntimeThreadMutation, RuntimeThreadStartRequest, RuntimeThreadState,
+    SteerOperationResult, ThreadOperationExecutor, ThreadOperationOutcome,
+};
+use orca_runtime::runtime_pending_interaction::{
+    RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
 };
 use orca_runtime::thread::RuntimeThread;
 
@@ -209,7 +212,16 @@ enum TestBehavior {
     WaitForCancelAndRelease {
         gate: CancelJoinGate,
     },
+    RecordUsageThenWaitForCancelAndRelease {
+        gate: CancelJoinGate,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     WaitForRelease {
+        gate: ManualGate,
+        status: RunStatus,
+    },
+    WaitForReleaseWithoutDrainingSteer {
         gate: ManualGate,
         status: RunStatus,
     },
@@ -343,12 +355,32 @@ impl ThreadOperationExecutor for ScriptedExecutor {
                 thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
                 Ok(RunStatus::Cancelled.into())
             }
+            TestBehavior::RecordUsageThenWaitForCancelAndRelease {
+                gate,
+                input_tokens,
+                output_tokens,
+            } => {
+                thread.session_mut().cost_tracker_mut().add_usage(
+                    orca_core::provider_types::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_tokens: 0,
+                    },
+                );
+                gate.enter_wait_for_cancel_and_release(cancel);
+                thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+                Ok(RunStatus::Cancelled.into())
+            }
             TestBehavior::WaitForRelease { gate, status } => {
                 gate.enter_and_wait();
                 self.steer_inputs
                     .lock()
                     .unwrap()
                     .push(generation.drain_steer_inputs());
+                Ok(status.into())
+            }
+            TestBehavior::WaitForReleaseWithoutDrainingSteer { gate, status } => {
+                gate.enter_and_wait();
                 Ok(status.into())
             }
             TestBehavior::EmitEvent { message, status } => {
@@ -1661,11 +1693,6 @@ fn typed_idle_session_commands_mutate_only_actor_owned_state() {
         ))
         .expect("add pinned context");
     thread
-        .mutate(RuntimeThreadMutation::ReplaceGoalContext(Some(
-            "goal context".to_string(),
-        )))
-        .expect("replace goal context");
-    thread
         .mutate(RuntimeThreadMutation::ReplaceSkillContext(Some(
             "skill context".to_string(),
         )))
@@ -1675,35 +1702,14 @@ fn typed_idle_session_commands_mutate_only_actor_owned_state() {
     assert!(
         snapshot
             .conversation()
-            .volatile
-            .goal
-            .as_deref()
-            .is_some_and(|context| context.contains("goal context"))
-    );
-    assert!(
-        snapshot
-            .conversation()
-            .volatile
-            .skill
-            .as_deref()
+            .internal_context
+            .get(orca_core::conversation::SKILL_CONTEXT_FRAGMENT_ID)
+            .map(|fragment| fragment.content.as_str())
             .is_some_and(|context| context.contains("skill context"))
     );
     assert!(snapshot.messages().iter().any(|message| {
         matches!(message, Message::User { content, pinned: true } if content == "remember this")
     }));
-
-    thread
-        .mutate(RuntimeThreadMutation::ReplaceGoalContext(None))
-        .expect("clear goal context");
-    assert!(
-        thread
-            .snapshot()
-            .expect("read cleared snapshot")
-            .conversation()
-            .volatile
-            .goal
-            .is_none()
-    );
 
     host.shutdown().expect("shutdown runtime host");
 }
@@ -3306,20 +3312,22 @@ fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
             .session_id()
             .expect("recorded session id")
             .to_string();
-        let mut store = orca_runtime::goals::GoalStore::load_default();
+        let store = orca_runtime::goal_store::GoalStore::load_default().unwrap();
         store
-            .replace(
-                &session_id,
-                "account my usage",
-                orca_core::goal_types::ThreadGoalStatus::Active,
-                Some(700),
-            )
+            .create_goal(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "account my usage".to_string(),
+                token_budget: Some(700),
+                now: 1,
+            })
             .unwrap();
 
         let writer = SharedWriter::default();
         let first = thread
             .start_turn(
-                HostedTurnRequest::new("turn one").with_goal_usage_tracking(true),
+                HostedTurnRequest::new("turn one")
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true),
                 writer.clone(),
             )
             .expect("start first turn");
@@ -3330,7 +3338,7 @@ fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
                 .outcome(),
             &OperationOutcome::Completed(RunStatus::Success)
         );
-        let after_first = store.get(&session_id).unwrap().unwrap();
+        let after_first = store.project_thread_goal(&session_id).unwrap().unwrap();
         assert_eq!(after_first.tokens_used, 300);
         assert_eq!(
             after_first.status,
@@ -3339,7 +3347,9 @@ fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
 
         let second = thread
             .start_turn(
-                HostedTurnRequest::new("turn two").with_goal_usage_tracking(true),
+                HostedTurnRequest::new("turn two")
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true),
                 writer.clone(),
             )
             .expect("start second turn");
@@ -3350,7 +3360,7 @@ fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
                 .outcome(),
             &OperationOutcome::Completed(RunStatus::Success)
         );
-        let after_second = store.get(&session_id).unwrap().unwrap();
+        let after_second = store.project_thread_goal(&session_id).unwrap().unwrap();
         assert_eq!(after_second.tokens_used, 900);
         assert_eq!(
             after_second.status,
@@ -3358,6 +3368,559 @@ fn turn_with_goal_usage_tracking_accounts_tokens_and_flips_budget_limited() {
         );
 
         host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn composite_goal_run_marks_automatic_outer_turn_as_continuation() {
+    with_orca_home(|_home| {
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::RecordUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                status: RunStatus::Success,
+            },
+            TestBehavior::RecordUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                status: RunStatus::Failed,
+            },
+        ]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "goal continuation origin")
+            .expect("start runtime thread");
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().expect("goal runtime");
+        runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id,
+                objective: "record outer-turn origin".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let observer = Arc::new(RecordingEventObserver::default());
+
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("start goal")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true)
+                    .with_event_observer(observer.clone()),
+                io::sink(),
+            )
+            .expect("start goal run");
+
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("goal run terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Failed)
+        );
+        let origins = observer
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == EventType::GoalTurnStarted)
+            .map(|event| event.payload["origin"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(origins, vec!["user", "continuation"]);
+
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn active_goal_run_pause_is_runtime_owned_and_settles_usage_before_closing() {
+    with_orca_home(|home| {
+        let gate = CancelJoinGate::new();
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::RecordUsageThenWaitForCancelAndRelease {
+                gate: gate.clone(),
+                input_tokens: 40,
+                output_tokens: 10,
+            },
+        ]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "runtime-owned goal pause")
+            .expect("start runtime thread");
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().expect("goal runtime");
+        let goal = runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "pause without orphaning usage".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .expect("create goal");
+        let observer = Arc::new(RecordingEventObserver::default());
+        let operation = Arc::new(
+            thread
+                .start_turn(
+                    HostedTurnRequest::new("start goal")
+                        .with_operation_kind(HostedOperationKind::GoalRun)
+                        .with_goal_tools(true)
+                        .with_goal_usage_tracking(true)
+                        .with_event_observer(observer.clone()),
+                    io::sink(),
+                )
+                .expect("start goal run"),
+        );
+        gate.wait_until_entered();
+
+        let pause_operation = Arc::clone(&operation);
+        let pause = std::thread::spawn(move || pause_operation.pause_goal());
+        gate.wait_until_cancel_seen();
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::User,
+                ..
+            }
+        ));
+        assert!(
+            !pause.is_finished(),
+            "pause returned before generation join"
+        );
+        assert!(operation.wait_timeout(Duration::from_millis(20)).is_none());
+
+        gate.release();
+        assert!(matches!(
+            pause.join().unwrap().unwrap(),
+            orca_runtime::runtime_host::PauseGoalRunResult::Requested { .. }
+        ));
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("paused goal run terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Cancelled)
+        );
+        assert!(gate.exited());
+
+        let record = runtime.read(&session_id).unwrap().unwrap();
+        assert_eq!(record.usage.charged_input_tokens, 40);
+        assert_eq!(record.usage.output_tokens, 10);
+        assert!(record.current_run.is_none());
+        let store = orca_runtime::goal_store::GoalStore::open(home.join("goals.sqlite3")).unwrap();
+        let audit = store.audit_snapshot(&goal.goal_id).unwrap();
+        assert_eq!(audit.outer_turns, 1);
+        assert_eq!(audit.in_flight_runs, 0);
+        assert_eq!(audit.usage_events, 1);
+        assert_eq!(observer.count(EventType::GoalTransitioned), 1);
+        assert_eq!(observer.count(EventType::GoalPaused), 1);
+
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn interrupting_active_goal_run_persists_user_pause_before_cancellation() {
+    with_orca_home(|home| {
+        let gate = CancelJoinGate::new();
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::RecordUsageThenWaitForCancelAndRelease {
+                gate: gate.clone(),
+                input_tokens: 18,
+                output_tokens: 7,
+            },
+        ]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host.start_thread(config, "interrupt goal run").unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        let goal = runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "interrupt safely".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("start goal")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true),
+                io::sink(),
+            )
+            .unwrap();
+        gate.wait_until_entered();
+
+        assert!(matches!(
+            operation.interrupt().unwrap(),
+            InterruptOperationResult::Requested { .. }
+        ));
+        gate.wait_until_cancel_seen();
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::User,
+                ..
+            }
+        ));
+        gate.release();
+        assert_eq!(
+            operation.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+            &OperationOutcome::Completed(RunStatus::Cancelled)
+        );
+
+        let record = runtime.read(&session_id).unwrap().unwrap();
+        assert_eq!(record.usage.charged_tokens(), 25);
+        assert!(record.current_run.is_none());
+        let store = orca_runtime::goal_store::GoalStore::open(home.join("goals.sqlite3")).unwrap();
+        assert_eq!(
+            store.audit_snapshot(&goal.goal_id).unwrap().in_flight_runs,
+            0
+        );
+
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn shutting_down_active_goal_run_persists_pause_before_cancel_and_join() {
+    with_orca_home(|home| {
+        let gate = CancelJoinGate::new();
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::RecordUsageThenWaitForCancelAndRelease {
+                gate: gate.clone(),
+                input_tokens: 12,
+                output_tokens: 3,
+            },
+        ]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host.start_thread(config, "shutdown goal run").unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        let goal = runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "shutdown safely".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("start goal")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true),
+                io::sink(),
+            )
+            .unwrap();
+        gate.wait_until_entered();
+
+        let shutdown = std::thread::spawn(move || host.shutdown());
+        gate.wait_until_cancel_seen();
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::User,
+                ..
+            }
+        ));
+        assert!(!shutdown.is_finished());
+        gate.release();
+        shutdown.join().unwrap().unwrap();
+
+        assert_eq!(
+            operation.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+            &OperationOutcome::Completed(RunStatus::Cancelled)
+        );
+        let store = orca_runtime::goal_store::GoalStore::open(home.join("goals.sqlite3")).unwrap();
+        let record = store.get_by_session(&session_id).unwrap().unwrap();
+        assert_eq!(record.usage.charged_tokens(), 15);
+        assert!(record.current_run.is_none());
+        assert_eq!(
+            store.audit_snapshot(&goal.goal_id).unwrap().in_flight_runs,
+            0
+        );
+    });
+}
+
+#[test]
+fn first_runtime_owner_recovers_stale_run_and_publishes_semantic_event() {
+    with_orca_home(|_home| {
+        let executor = Arc::new(ScriptedExecutor::new([]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host.start_thread(config, "recover stale goal").unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let store = orca_runtime::goal_store::GoalStore::load_default().unwrap();
+        let goal = store
+            .create_goal(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "recover without self-driving".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let run_id = orca_core::goal_runtime::GoalRunId::new();
+        let outer_turn_id = orca_core::goal_runtime::GoalOuterTurnId::new();
+        store
+            .begin_run(orca_runtime::goal_store::BeginGoalRunInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                origin: orca_core::goal_runtime::GoalTurnOrigin::User,
+                started_at: 2,
+            })
+            .unwrap();
+        store
+            .begin_outer_turn(orca_runtime::goal_store::BeginOuterTurnInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                outer_turn_id: outer_turn_id.clone(),
+                origin: orca_core::goal_runtime::GoalTurnOrigin::User,
+                provider_turn_id: "stale-provider-turn".to_string(),
+                started_at: 3,
+            })
+            .unwrap();
+
+        let runtime = thread.goal_runtime().expect("open first runtime owner");
+        let recovered = runtime.read(&session_id).unwrap().unwrap();
+        assert!(matches!(
+            recovered.state,
+            orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::Recovery,
+                ..
+            }
+        ));
+        assert!(recovered.current_run.is_none());
+        assert_eq!(store.in_flight_run_count().unwrap(), 0);
+
+        let transcript = history::load_session(&session_id).unwrap();
+        let events = semantic_event_records(&transcript);
+        let recovery = events
+            .iter()
+            .find(|event| event["type"] == "goal.recovered")
+            .expect("durable goal.recovered event");
+        assert_eq!(recovery["payload"]["goal_id"], goal.goal_id.as_str());
+        assert_eq!(recovery["payload"]["stale_goal_run_id"], run_id.as_str());
+        assert_eq!(recovery["payload"]["outer_turn_id"], outer_turn_id.as_str());
+        assert_eq!(recovery["payload"]["discarded_continuation"], true);
+
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn goal_run_rejects_automatic_continuation_in_plan_mode() {
+    with_orca_home(|_home| {
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::RecordUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            status: RunStatus::Success,
+        }]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor.clone()).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        config.approval_mode = ApprovalMode::Plan;
+        let thread = host.start_thread(config, "plan-mode goal").unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "do not auto-run in plan mode".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let observer = Arc::new(RecordingEventObserver::default());
+
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("plan only")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_event_observer(observer.clone()),
+                io::sink(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            operation.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        assert_eq!(executor.call_count(), 1);
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::User,
+                ..
+            }
+        ));
+        assert!(observer.events().iter().any(|event| {
+            event.event_type == EventType::GoalContinuationRejected
+                && event.payload["reason"] == "plan_mode"
+        }));
+
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn goal_run_rejects_continuation_while_interaction_is_pending() {
+    with_orca_home(|_home| {
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::RecordUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            status: RunStatus::Success,
+        }]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor.clone()).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "pending-interaction goal")
+            .unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "wait for user input".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let pending = RuntimePendingInteractionStore::default();
+        pending
+            .insert(RuntimePendingInteractionRecord::from_user_input(
+                &RuntimeUserInputRequest {
+                    id: "goal-input-1".to_string(),
+                    question: "Choose a target?".to_string(),
+                    choices: vec!["A".to_string(), "B".to_string()],
+                },
+            ))
+            .unwrap();
+        let observer = Arc::new(RecordingEventObserver::default());
+
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("wait for interaction")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_pending_interactions(pending)
+                    .with_event_observer(observer.clone()),
+                io::sink(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            operation.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        assert_eq!(executor.call_count(), 1);
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::User,
+                ..
+            }
+        ));
+        assert!(observer.events().iter().any(|event| {
+            event.event_type == EventType::GoalContinuationRejected
+                && event.payload["reason"] == "pending_interaction"
+        }));
+
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn goal_run_persists_late_user_input_and_yields_continuation() {
+    with_orca_home(|_home| {
+        let gate = ManualGate::new();
+        let executor = Arc::new(ScriptedExecutor::new([
+            TestBehavior::WaitForReleaseWithoutDrainingSteer {
+                gate: gate.clone(),
+                status: RunStatus::Success,
+            },
+        ]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor.clone()).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host.start_thread(config, "queued-input goal").unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "yield to user input".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let observer = Arc::new(RecordingEventObserver::default());
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("start")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_event_observer(observer.clone()),
+                io::sink(),
+            )
+            .unwrap();
+        gate.wait_until_entered();
+        assert!(matches!(
+            operation.steer("late user constraint").unwrap(),
+            SteerOperationResult::Accepted { .. }
+        ));
+        gate.release();
+
+        assert_eq!(
+            operation.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+            &OperationOutcome::Completed(RunStatus::Success)
+        );
+        assert_eq!(executor.call_count(), 1);
+        assert!(matches!(
+            runtime.read(&session_id).unwrap().unwrap().state,
+            orca_core::goal_runtime::GoalState::Paused {
+                reason: orca_core::goal_runtime::GoalPauseReason::User,
+                ..
+            }
+        ));
+        let snapshot = thread.snapshot().unwrap();
+        assert!(snapshot.messages().iter().any(
+            |message| matches!(message, Message::User { content, .. } if content == "late user constraint")
+        ));
+        assert!(
+            snapshot
+                .conversation()
+                .internal_context
+                .get(orca_core::conversation::GOAL_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
+        assert!(observer.events().iter().any(|event| {
+            event.event_type == EventType::GoalContinuationRejected
+                && event.payload["reason"] == "queued_user_input"
+        }));
+
+        host.shutdown().unwrap();
     });
 }
 
@@ -3380,14 +3943,14 @@ fn turn_without_goal_usage_tracking_does_not_account() {
             .session_id()
             .expect("recorded session id")
             .to_string();
-        let mut store = orca_runtime::goals::GoalStore::load_default();
+        let store = orca_runtime::goal_store::GoalStore::load_default().unwrap();
         store
-            .replace(
-                &session_id,
-                "do not account",
-                orca_core::goal_types::ThreadGoalStatus::Active,
-                None,
-            )
+            .create_goal(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "do not account".to_string(),
+                token_budget: None,
+                now: 1,
+            })
             .unwrap();
 
         let writer = SharedWriter::default();
@@ -3398,7 +3961,14 @@ fn turn_without_goal_usage_tracking_does_not_account() {
             turn.wait_timeout(TEST_TIMEOUT).expect("terminal").outcome(),
             &OperationOutcome::Completed(RunStatus::Success)
         );
-        assert_eq!(store.get(&session_id).unwrap().unwrap().tokens_used, 0);
+        assert_eq!(
+            store
+                .project_thread_goal(&session_id)
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            0
+        );
 
         host.shutdown().expect("shutdown runtime host");
     });
@@ -3423,21 +3993,15 @@ fn failed_goal_generation_stalls_active_goal_and_clears_context() {
             .session_id()
             .expect("recorded session id")
             .to_string();
-        let mut store = orca_runtime::goals::GoalStore::load_default();
+        let store = orca_runtime::goal_store::GoalStore::load_default().unwrap();
         store
-            .replace(
-                &session_id,
-                "fail once and stop",
-                orca_core::goal_types::ThreadGoalStatus::Active,
-                None,
-            )
+            .create_goal(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "fail once and stop".to_string(),
+                token_budget: None,
+                now: 1,
+            })
             .unwrap();
-        thread
-            .mutate(RuntimeThreadMutation::ReplaceGoalContext(Some(
-                "active goal context".to_string(),
-            )))
-            .expect("install goal context");
-
         let operation = thread
             .start_turn(
                 HostedTurnRequest::new("goal turn")
@@ -3454,16 +4018,20 @@ fn failed_goal_generation_stalls_active_goal_and_clears_context() {
             &OperationOutcome::Completed(RunStatus::Failed)
         );
         assert_eq!(
-            store.get(&session_id).unwrap().unwrap().status,
-            orca_core::goal_types::ThreadGoalStatus::Stalled
+            store
+                .project_thread_goal(&session_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            orca_core::goal_types::ThreadGoalStatus::Paused
         );
         assert!(
             thread
                 .snapshot()
                 .expect("failed goal snapshot")
                 .conversation()
-                .volatile
-                .goal
+                .internal_context
+                .get(orca_core::conversation::GOAL_CONTEXT_FRAGMENT_ID)
                 .is_none()
         );
 

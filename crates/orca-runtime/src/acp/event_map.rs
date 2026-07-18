@@ -30,6 +30,19 @@ pub fn event_to_session_update(event: &EventEnvelope) -> Option<SessionUpdate> {
         EventType::ToolCallRequested => Some(tool_call_requested(payload)),
         EventType::ToolCallCompleted => Some(tool_call_completed(payload)),
         EventType::PlanUpdated => Some(plan_updated(payload)),
+        EventType::GoalCreated
+        | EventType::GoalRunStarted
+        | EventType::GoalTurnStarted
+        | EventType::GoalIntentRequested
+        | EventType::GoalIntentAcknowledged
+        | EventType::GoalTurnFinished
+        | EventType::GoalVerificationCompleted
+        | EventType::GoalTransitioned
+        | EventType::GoalContinuationAdmitted
+        | EventType::GoalContinuationRejected
+        | EventType::GoalPaused
+        | EventType::GoalRecovered
+        | EventType::GoalCompleted => Some(goal_runtime_update(event)),
         EventType::Error => {
             let message = payload["message"].as_str().unwrap_or("unknown error");
             Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
@@ -38,6 +51,58 @@ pub fn event_to_session_update(event: &EventEnvelope) -> Option<SessionUpdate> {
         }
         _ => None,
     }
+}
+
+fn goal_runtime_update(event: &EventEnvelope) -> SessionUpdate {
+    let text = match event.event_type {
+        EventType::GoalTransitioned => format!(
+            "Goal transitioned: {} -> {} ({})",
+            event.payload["previous_state"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            event.payload["next_state"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            event.payload["reason_code"].as_str().unwrap_or("runtime")
+        ),
+        EventType::GoalContinuationAdmitted | EventType::GoalContinuationRejected => format!(
+            "Goal continuation {}: {}",
+            if event.payload["admitted"].as_bool().unwrap_or(false) {
+                "admitted"
+            } else {
+                "rejected"
+            },
+            event.payload["reason"].as_str().unwrap_or("unknown")
+        ),
+        EventType::GoalVerificationCompleted => format!(
+            "Goal verification: {}",
+            event.payload["result"]["outcome"]
+                .as_str()
+                .unwrap_or("indeterminate")
+        ),
+        EventType::GoalIntentAcknowledged => format!(
+            "Goal intent acknowledged: {}",
+            event.payload["ack"]["ack"].as_str().unwrap_or("unknown")
+        ),
+        EventType::GoalIntentRequested => format!(
+            "Goal intent requested: {}",
+            event.payload["requested_state"]
+                .as_str()
+                .unwrap_or("unknown")
+        ),
+        EventType::GoalCreated => "Goal created".to_string(),
+        EventType::GoalRunStarted => "Goal run started".to_string(),
+        EventType::GoalTurnStarted => "Goal turn started".to_string(),
+        EventType::GoalTurnFinished => "Goal turn finished".to_string(),
+        EventType::GoalPaused => format!(
+            "Goal paused: {}",
+            event.payload["message"].as_str().unwrap_or("paused")
+        ),
+        EventType::GoalRecovered => "Goal recovered in paused state".to_string(),
+        EventType::GoalCompleted => "Goal completed".to_string(),
+        _ => "Goal runtime event".to_string(),
+    };
+    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text)))
 }
 
 fn tool_call_requested(payload: &Value) -> SessionUpdate {

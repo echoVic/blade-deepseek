@@ -146,22 +146,53 @@ fn route_action(
         UserAction::BackgroundCurrentTurn => {
             controller.request_background_current();
         }
-        UserAction::Cancel => return false,
-        action => {
-            if backlog.is_empty() {
-                match command_tx.try_send(action) {
-                    Ok(()) => return true,
-                    Err(TrySendError::Full(action)) => backlog.push_back(action),
-                    Err(TrySendError::Disconnected(_)) => return false,
+        UserAction::GoalPause => match controller.pause_current_goal() {
+            Ok(true) => {}
+            Ok(false) => {
+                match enqueue_action(UserAction::GoalPause, command_tx, backlog, backlog_capacity) {
+                    EnqueueResult::Queued => {}
+                    EnqueueResult::Disconnected => return false,
+                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
                 }
-            } else if backlog.len() < backlog_capacity {
-                backlog.push_back(action);
-            } else {
-                reject_overflowed_action(event_tx, action);
             }
-        }
+            Err(error) => {
+                let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
+            }
+        },
+        UserAction::Cancel => return false,
+        action => match enqueue_action(action, command_tx, backlog, backlog_capacity) {
+            EnqueueResult::Queued => {}
+            EnqueueResult::Disconnected => return false,
+            EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+        },
     }
     true
+}
+
+enum EnqueueResult {
+    Queued,
+    Disconnected,
+    Overflow(UserAction),
+}
+
+fn enqueue_action(
+    action: UserAction,
+    command_tx: &Sender<UserAction>,
+    backlog: &mut VecDeque<UserAction>,
+    backlog_capacity: usize,
+) -> EnqueueResult {
+    if backlog.is_empty() {
+        match command_tx.try_send(action) {
+            Ok(()) => return EnqueueResult::Queued,
+            Err(TrySendError::Full(action)) => backlog.push_back(action),
+            Err(TrySendError::Disconnected(_)) => return EnqueueResult::Disconnected,
+        }
+    } else if backlog.len() < backlog_capacity {
+        backlog.push_back(action);
+    } else {
+        return EnqueueResult::Overflow(action);
+    }
+    EnqueueResult::Queued
 }
 
 fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {

@@ -3,6 +3,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use orca_core::approval_types::ApprovalMode;
+use orca_core::event_schema::EventFactory;
+use orca_core::event_sink::EventSink;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use serde::Deserialize;
@@ -59,11 +61,13 @@ pub(crate) enum RuntimeGoalToolOutcome {
     StopTurn(ToolResult),
 }
 
-#[derive(Clone)]
-pub(crate) struct RuntimeGoalToolRequest<'a> {
+pub(crate) struct RuntimeGoalToolRequest<'a, W: io::Write> {
     pub(crate) persistent_session_id: Option<&'a str>,
     pub(crate) goal_runtime: Option<GoalRuntimeHandle>,
     pub(crate) goal_turn: Option<GoalTurnContext>,
+    pub(crate) events: &'a mut EventFactory,
+    pub(crate) sink: &'a mut EventSink<W>,
+    pub(crate) event_error: &'a mut Option<io::Error>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,10 +108,10 @@ impl RuntimeToolActorContext {
         }
     }
 
-    pub(crate) fn execute_goal_tool(
+    pub(crate) fn execute_goal_tool<W: io::Write>(
         &mut self,
         request: &ToolRequest,
-        context: RuntimeGoalToolRequest<'_>,
+        context: RuntimeGoalToolRequest<'_, W>,
     ) -> RuntimeGoalToolOutcome {
         let Some(session_id) = context.persistent_session_id else {
             return RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
@@ -157,7 +161,13 @@ impl RuntimeToolActorContext {
                             token_budget: args.token_budget,
                             now: goal_now(),
                         })
-                        .and_then(|_| goal_runtime.project_thread_goal(session_id))
+                        .and_then(|record| {
+                            let event = context.events.goal_created(&record);
+                            if let Err(error) = context.sink.emit(event) {
+                                *context.event_error = Some(error);
+                            }
+                            goal_runtime.project_thread_goal(session_id)
+                        })
                         .map(|goal| {
                             orca_tools::update_goal::completed_result(request, goal.as_ref())
                         }),
@@ -173,16 +183,32 @@ impl RuntimeToolActorContext {
                         ));
                     }
                 };
-                let Some(turn) = context.goal_turn else {
+                let Some(turn) = context.goal_turn.clone() else {
                     return RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
                         request,
                         "update_goal requires an active runtime outer turn",
                         None,
                     ));
                 };
+                let requested = context
+                    .events
+                    .goal_intent_requested(&turn.outer_turn_id, &intent);
+                if let Err(error) = context.sink.emit(requested) {
+                    *context.event_error = Some(error);
+                }
                 goal_runtime
-                    .submit_intent(&turn.session_id, intent, goal_now())
-                    .map(|ack| orca_tools::update_goal::acknowledgement_result(request, &ack))
+                    .submit_intent(&turn.session_id, intent.clone(), goal_now())
+                    .map(|ack| {
+                        let acknowledged = context.events.goal_intent_acknowledged(
+                            &turn.outer_turn_id,
+                            &intent,
+                            &ack,
+                        );
+                        if let Err(error) = context.sink.emit(acknowledged) {
+                            *context.event_error = Some(error);
+                        }
+                        orca_tools::update_goal::acknowledgement_result(request, &ack)
+                    })
             }
             _ => Ok(ToolResult::failed(
                 request,

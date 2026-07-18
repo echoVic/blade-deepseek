@@ -85,18 +85,48 @@ impl Message {
     }
 }
 
+pub const RUNTIME_CONTEXT_FRAGMENT_ID: &str = "runtime";
+pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
+pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
+pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
+
+pub const RUNTIME_CONTEXT_MAX_TOKENS: usize = 1_024;
+pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
+pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
+pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalContextKind {
+    Runtime,
+    Goal,
+    Plan,
+    Skill,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalContextOrigin {
+    System,
+    GoalRuntime,
+    Model,
+    User,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InternalContextFragment {
+    pub id: String,
+    pub kind: InternalContextKind,
+    pub origin: InternalContextOrigin,
+    pub content: String,
+    pub max_tokens: usize,
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct VolatileContext {
-    pub runtime: Option<String>,
-    pub plan: Option<String>,
-    pub goal: Option<String>,
-    pub skill: Option<String>,
-    /// Assistant turns since the pinned plan was last successfully updated.
-    /// Once this passes [`PLAN_REMINDER_AFTER_TURNS`] with open steps left,
-    /// `render` appends a reconciliation reminder. Guards against the model
-    /// finishing (or abandoning) work while the pinned plan silently goes
-    /// stale — e.g. after failed update_plan calls it never retried.
-    pub plan_age_turns: u32,
+pub struct InternalContext {
+    fragments: Vec<InternalContextFragment>,
+    /// Assistant turns since the plan fragment was last successfully updated.
+    plan_age_turns: u32,
 }
 
 /// Assistant turns a plan with open steps may go without an update before the
@@ -105,43 +135,72 @@ pub const PLAN_REMINDER_AFTER_TURNS: u32 = 10;
 
 const PLAN_REMINDER: &str = "[Plan reminder] The pinned plan above has open steps but has not been updated for a while. If steps were finished, call update_plan now with every step's current status. If the plan no longer matches the work, replace or clear it via update_plan. Do not announce completion while the plan still shows open steps.";
 
-impl VolatileContext {
+impl InternalContext {
     pub fn is_empty(&self) -> bool {
-        self.runtime.is_none() && self.plan.is_none() && self.goal.is_none() && self.skill.is_none()
+        self.fragments.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.fragments.len()
+    }
+
+    pub fn get(&self, id: &str) -> Option<&InternalContextFragment> {
+        self.fragments.iter().find(|fragment| fragment.id == id)
+    }
+
+    pub fn fragments(&self) -> &[InternalContextFragment] {
+        &self.fragments
+    }
+
+    pub fn replace(&mut self, fragment: InternalContextFragment) {
+        if let Some(existing) = self
+            .fragments
+            .iter_mut()
+            .find(|existing| existing.id == fragment.id)
+        {
+            *existing = fragment;
+        } else {
+            self.fragments.push(fragment);
+        }
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.fragments.retain(|fragment| fragment.id != id);
     }
 
     pub fn note_assistant_turn(&mut self) {
-        if self.plan.is_some() {
+        if self.get(PLAN_CONTEXT_FRAGMENT_ID).is_some() {
             self.plan_age_turns = self.plan_age_turns.saturating_add(1);
         }
     }
 
     fn plan_reminder_due(&self) -> bool {
         self.plan_age_turns >= PLAN_REMINDER_AFTER_TURNS
-            && self
-                .plan
-                .as_deref()
-                .is_some_and(|plan| plan.contains("[in_progress]") || plan.contains("[pending]"))
+            && self.get(PLAN_CONTEXT_FRAGMENT_ID).is_some_and(|plan| {
+                plan.content.contains("[in_progress]") || plan.content.contains("[pending]")
+            })
+    }
+
+    pub fn rendered_fragments(&self) -> Vec<InternalContextFragment> {
+        let mut fragments = self.fragments.clone();
+        fragments.sort_by_key(|fragment| fragment.kind);
+        if self.plan_reminder_due()
+            && let Some(plan) = fragments
+                .iter_mut()
+                .find(|fragment| fragment.id == PLAN_CONTEXT_FRAGMENT_ID)
+        {
+            plan.content.push_str("\n\n");
+            plan.content.push_str(PLAN_REMINDER);
+        }
+        fragments
     }
 
     pub fn render(&self) -> String {
-        let mut parts: Vec<&str> = Vec::new();
-        if let Some(runtime) = &self.runtime {
-            parts.push(runtime.as_str());
-        }
-        if let Some(goal) = &self.goal {
-            parts.push(goal.as_str());
-        }
-        if let Some(plan) = &self.plan {
-            parts.push(plan.as_str());
-            if self.plan_reminder_due() {
-                parts.push(PLAN_REMINDER);
-            }
-        }
-        if let Some(skill) = &self.skill {
-            parts.push(skill.as_str());
-        }
-        parts.join("\n\n")
+        self.rendered_fragments()
+            .into_iter()
+            .map(|fragment| fragment.content)
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -183,7 +242,7 @@ pub trait TokenCountable {
 #[derive(Clone, Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
-    pub volatile: VolatileContext,
+    pub internal_context: InternalContext,
     pub rolling_summary: Option<String>,
     pub summary: SummaryState,
 }
@@ -192,7 +251,7 @@ impl Conversation {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
-            volatile: VolatileContext::default(),
+            internal_context: InternalContext::default(),
             rolling_summary: None,
             summary: SummaryState::default(),
         }
@@ -207,26 +266,71 @@ impl Conversation {
     }
 
     pub fn replace_plan_state(&mut self, content: String) {
-        self.volatile.plan = Some(content);
-        self.volatile.plan_age_turns = 0;
+        self.internal_context.replace(InternalContextFragment {
+            id: PLAN_CONTEXT_FRAGMENT_ID.to_string(),
+            kind: InternalContextKind::Plan,
+            origin: InternalContextOrigin::Model,
+            content,
+            max_tokens: PLAN_CONTEXT_MAX_TOKENS,
+        });
+        self.internal_context.plan_age_turns = 0;
     }
 
     pub fn replace_goal_state(&mut self, content: Option<String>) {
-        self.volatile.goal = content
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| format!("[Goal state]\n{text}"));
+        self.replace_internal_context(
+            GOAL_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Goal,
+            InternalContextOrigin::GoalRuntime,
+            content
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| format!("[Goal state]\n{text}")),
+            GOAL_CONTEXT_MAX_TOKENS,
+        );
     }
 
     pub fn replace_runtime_context(&mut self, content: Option<String>) {
-        self.volatile.runtime = content
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| format!("[Runtime context]\n{text}"));
+        self.replace_internal_context(
+            RUNTIME_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Runtime,
+            InternalContextOrigin::System,
+            content
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| format!("[Runtime context]\n{text}")),
+            RUNTIME_CONTEXT_MAX_TOKENS,
+        );
     }
 
     pub fn replace_skill_context(&mut self, content: Option<String>) {
-        self.volatile.skill = content
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| format!("[Skill context]\n{text}"));
+        self.replace_internal_context(
+            SKILL_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Skill,
+            InternalContextOrigin::User,
+            content
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| format!("[Skill context]\n{text}")),
+            SKILL_CONTEXT_MAX_TOKENS,
+        );
+    }
+
+    pub fn replace_internal_context(
+        &mut self,
+        id: &str,
+        kind: InternalContextKind,
+        origin: InternalContextOrigin,
+        content: Option<String>,
+        max_tokens: usize,
+    ) {
+        let content = content.filter(|text| !text.trim().is_empty());
+        match content {
+            Some(content) => self.internal_context.replace(InternalContextFragment {
+                id: id.to_string(),
+                kind,
+                origin,
+                content,
+                max_tokens: max_tokens.max(1),
+            }),
+            None => self.internal_context.remove(id),
+        }
     }
 
     pub fn strip_legacy_pinned_volatile(&mut self) {
@@ -270,7 +374,7 @@ impl Conversation {
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
     ) {
-        self.volatile.note_assistant_turn();
+        self.internal_context.note_assistant_turn();
         self.messages.push(Message::Assistant {
             content,
             reasoning_content,
@@ -448,32 +552,57 @@ mod tests {
     }
 
     #[test]
-    fn replace_goal_state_keeps_single_volatile_goal() {
+    fn replace_goal_state_keeps_single_internal_fragment() {
         let mut conv = Conversation::new();
         conv.replace_goal_state(Some("first".to_string()));
         conv.replace_goal_state(Some("second".to_string()));
 
         assert!(conv.messages.is_empty());
-        assert!(conv.volatile.goal.as_ref().unwrap().contains("second"));
-        assert!(!conv.volatile.goal.as_ref().unwrap().contains("first"));
+        let fragment = conv
+            .internal_context
+            .get(GOAL_CONTEXT_FRAGMENT_ID)
+            .expect("goal fragment");
+        assert_eq!(fragment.kind, InternalContextKind::Goal);
+        assert_eq!(fragment.origin, InternalContextOrigin::GoalRuntime);
+        assert!(fragment.content.contains("second"));
+        assert!(!fragment.content.contains("first"));
+        assert_eq!(conv.internal_context.len(), 1);
 
         conv.replace_goal_state(None);
-        assert!(conv.volatile.goal.is_none());
+        assert!(
+            conv.internal_context
+                .get(GOAL_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
         conv.replace_goal_state(Some("  ".to_string()));
-        assert!(conv.volatile.goal.is_none());
+        assert!(
+            conv.internal_context
+                .get(GOAL_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
     }
 
     #[test]
-    fn replace_skill_context_updates_volatile_skill() {
+    fn replace_skill_context_updates_internal_fragment() {
         let mut conv = Conversation::new();
         conv.replace_skill_context(Some("first".to_string()));
         conv.replace_skill_context(Some("second".to_string()));
 
         assert!(conv.messages.is_empty());
-        assert!(conv.volatile.skill.as_ref().unwrap().contains("second"));
+        assert!(
+            conv.internal_context
+                .get(SKILL_CONTEXT_FRAGMENT_ID)
+                .unwrap()
+                .content
+                .contains("second")
+        );
 
         conv.replace_skill_context(None);
-        assert!(conv.volatile.skill.is_none());
+        assert!(
+            conv.internal_context
+                .get(SKILL_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
     }
 
     #[test]
@@ -671,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn volatile_updates_never_touch_messages() {
+    fn internal_context_updates_never_touch_messages() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
         conv.add_user("hello".to_string());
@@ -685,13 +814,25 @@ mod tests {
 
         assert_eq!(render_prefix(&conv), snapshot);
         assert_eq!(conv.messages.len(), 3);
-        assert!(conv.volatile.plan.is_some());
-        assert!(conv.volatile.goal.is_some());
-        assert!(conv.volatile.skill.is_some());
+        assert!(
+            conv.internal_context
+                .get(PLAN_CONTEXT_FRAGMENT_ID)
+                .is_some()
+        );
+        assert!(
+            conv.internal_context
+                .get(GOAL_CONTEXT_FRAGMENT_ID)
+                .is_some()
+        );
+        assert!(
+            conv.internal_context
+                .get(SKILL_CONTEXT_FRAGMENT_ID)
+                .is_some()
+        );
     }
 
     #[test]
-    fn multiple_plan_updates_only_change_volatile_not_messages() {
+    fn multiple_plan_updates_only_change_internal_context_not_messages() {
         let mut conv = Conversation::new();
         conv.add_system("sys".to_string());
         conv.add_user("do work".to_string());
@@ -703,7 +844,12 @@ mod tests {
         conv.replace_plan_state("plan v3".to_string());
 
         assert_eq!(render_prefix(&conv), snapshot);
-        assert_eq!(conv.volatile.plan.as_deref(), Some("plan v3"));
+        assert_eq!(
+            conv.internal_context
+                .get(PLAN_CONTEXT_FRAGMENT_ID)
+                .map(|fragment| fragment.content.as_str()),
+            Some("plan v3")
+        );
     }
 
     #[test]
@@ -717,13 +863,13 @@ mod tests {
             conv.add_assistant(Some("working".to_string()), None, vec![]);
         }
         assert!(
-            !conv.volatile.render().contains("[Plan reminder]"),
+            !conv.internal_context.render().contains("[Plan reminder]"),
             "reminder must not fire before the threshold"
         );
 
         conv.add_assistant(Some("working".to_string()), None, vec![]);
         assert!(
-            conv.volatile.render().contains("[Plan reminder]"),
+            conv.internal_context.render().contains("[Plan reminder]"),
             "reminder must fire once the plan has gone stale"
         );
     }
@@ -735,11 +881,11 @@ mod tests {
         for _ in 0..PLAN_REMINDER_AFTER_TURNS {
             conv.add_assistant(None, None, vec![]);
         }
-        assert!(conv.volatile.render().contains("[Plan reminder]"));
+        assert!(conv.internal_context.render().contains("[Plan reminder]"));
 
         conv.replace_plan_state("[Pinned plan state]\n[in_progress] a".to_string());
         assert!(
-            !conv.volatile.render().contains("[Plan reminder]"),
+            !conv.internal_context.render().contains("[Plan reminder]"),
             "a successful update must clear the reminder"
         );
     }
@@ -751,7 +897,7 @@ mod tests {
         for _ in 0..PLAN_REMINDER_AFTER_TURNS * 2 {
             conv.add_assistant(None, None, vec![]);
         }
-        assert!(!conv.volatile.render().contains("[Plan reminder]"));
+        assert!(!conv.internal_context.render().contains("[Plan reminder]"));
     }
 
     #[test]
@@ -760,10 +906,10 @@ mod tests {
         for _ in 0..PLAN_REMINDER_AFTER_TURNS * 2 {
             conv.add_assistant(None, None, vec![]);
         }
-        assert_eq!(conv.volatile.plan_age_turns, 0);
+        assert_eq!(conv.internal_context.plan_age_turns, 0);
 
         conv.replace_plan_state("[Pinned plan state]\n[pending] a".to_string());
-        assert!(!conv.volatile.render().contains("[Plan reminder]"));
+        assert!(!conv.internal_context.render().contains("[Plan reminder]"));
     }
 
     #[test]

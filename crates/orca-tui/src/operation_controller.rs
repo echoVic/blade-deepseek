@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use orca_core::cancel::{CancelToken, OperationId};
 use orca_runtime::provider_stream::RuntimeProviderSuspensionControl;
+use orca_runtime::runtime_host::PauseGoalRunResult;
 use orca_runtime::runtime_host::{InterruptOperationResult, OperationHandle};
 
 use crate::interaction_broker::TuiInteractionBroker;
@@ -80,6 +81,27 @@ impl TuiOperationController {
             *background = None;
         }
         Some(operation_id)
+    }
+
+    pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
+        let hosted = self.lock_hosted().active.clone();
+        let Some(hosted) = hosted else {
+            return Ok(false);
+        };
+        let operation_id = hosted.id();
+        match hosted.pause_goal().map_err(io::Error::other)? {
+            PauseGoalRunResult::Requested { .. } | PauseGoalRunResult::AlreadyRequested { .. } => {
+                self.broker.interrupt(operation_id);
+                let mut background = self.lock_background_current();
+                if *background == Some(operation_id) {
+                    *background = None;
+                }
+                Ok(true)
+            }
+            PauseGoalRunResult::NotGoalRun { .. }
+            | PauseGoalRunResult::Stale { .. }
+            | PauseGoalRunResult::Idle { .. } => Ok(false),
+        }
     }
 
     pub(crate) fn request_background_current(&self) -> bool {

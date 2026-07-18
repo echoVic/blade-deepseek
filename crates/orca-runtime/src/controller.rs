@@ -235,6 +235,7 @@ pub struct ThreadTurnRequest {
     prompt: String,
     prompt_placement: ThreadTurnPromptPlacement,
     tool_mode: ThreadTurnToolMode,
+    goal_turn_origin: Option<orca_core::goal_runtime::GoalTurnOrigin>,
     main_session_task_id: Option<String>,
     options: ControllerRunOptions,
     emit_session_completed: bool,
@@ -787,6 +788,7 @@ impl ThreadTurnRequest {
             prompt: prompt.into(),
             prompt_placement: ThreadTurnPromptPlacement::BacktrackableUser,
             tool_mode: ThreadTurnToolMode::Standard,
+            goal_turn_origin: None,
             main_session_task_id: None,
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
@@ -839,6 +841,18 @@ impl ThreadTurnRequest {
 
     pub fn tool_mode(&self) -> ThreadTurnToolMode {
         self.tool_mode
+    }
+
+    pub fn with_goal_turn_origin(
+        mut self,
+        origin: orca_core::goal_runtime::GoalTurnOrigin,
+    ) -> Self {
+        self.goal_turn_origin = Some(origin);
+        self
+    }
+
+    pub fn goal_turn_origin(&self) -> Option<orca_core::goal_runtime::GoalTurnOrigin> {
+        self.goal_turn_origin
     }
 
     pub fn with_main_session_task_id(mut self, task_id: impl Into<String>) -> Self {
@@ -1694,14 +1708,14 @@ mod tests {
                 .session_id()
                 .expect("recorded session id")
                 .to_string();
-            let mut store = crate::goals::GoalStore::load_default();
+            let store = crate::goal_store::GoalStore::load_default().expect("goal store");
             store
-                .replace(
-                    &session_id,
-                    "finish the hosted goal",
-                    orca_core::goal_types::ThreadGoalStatus::Active,
-                    None,
-                )
+                .create_goal(crate::goal_store::CreateGoalInput {
+                    session_id: session_id.clone(),
+                    objective: "finish the hosted goal".to_string(),
+                    token_budget: None,
+                    now: 1,
+                })
                 .expect("active goal");
 
             let progress = ThreadTurnRequest::new("establish live goal progress")
@@ -1741,7 +1755,7 @@ mod tests {
             );
             assert_eq!(
                 store
-                    .get(&session_id)
+                    .project_thread_goal(&session_id)
                     .expect("load persisted goal")
                     .expect("persisted goal")
                     .status,
@@ -1826,14 +1840,14 @@ mod tests {
             config.approval_mode = ApprovalMode::FullAuto;
             let mut thread = RuntimeThread::start(&config, "invalid goal update").expect("thread");
             let session_id = thread.session().session_id().unwrap().to_string();
-            let mut store = crate::goals::GoalStore::load_default();
+            let store = crate::goal_store::GoalStore::load_default().unwrap();
             store
-                .replace(
-                    &session_id,
-                    "keep correcting the goal update",
-                    orca_core::goal_types::ThreadGoalStatus::Active,
-                    None,
-                )
+                .create_goal(crate::goal_store::CreateGoalInput {
+                    session_id: session_id.clone(),
+                    objective: "keep correcting the goal update".to_string(),
+                    token_budget: None,
+                    now: 1,
+                })
                 .unwrap();
             let request = ThreadTurnRequest::new("reject invalid goal update")
                 .with_tool_mode(ThreadTurnToolMode::Goal)
@@ -1866,7 +1880,11 @@ mod tests {
 
             assert_eq!(status, RunStatus::Success);
             assert_eq!(
-                store.get(&session_id).unwrap().unwrap().status,
+                store
+                    .project_thread_goal(&session_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 orca_core::goal_types::ThreadGoalStatus::Active
             );
             assert!(

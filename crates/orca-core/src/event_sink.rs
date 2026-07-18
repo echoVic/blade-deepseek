@@ -151,6 +151,27 @@ impl<W: Write> EventSink<W> {
                 }
                 Ok(())
             }
+            EventType::GoalCreated => writeln!(self.writer, "goal created"),
+            EventType::GoalRunStarted => writeln!(self.writer, "goal run started"),
+            EventType::GoalTurnStarted => writeln!(self.writer, "goal turn started"),
+            EventType::GoalIntentRequested => writeln!(self.writer, "goal intent requested"),
+            EventType::GoalIntentAcknowledged => {
+                writeln!(self.writer, "goal intent acknowledged")
+            }
+            EventType::GoalTurnFinished => writeln!(self.writer, "goal turn finished"),
+            EventType::GoalVerificationCompleted => {
+                writeln!(self.writer, "goal verification completed")
+            }
+            EventType::GoalTransitioned => writeln!(self.writer, "goal transitioned"),
+            EventType::GoalContinuationAdmitted => {
+                writeln!(self.writer, "goal continuation admitted")
+            }
+            EventType::GoalContinuationRejected => {
+                writeln!(self.writer, "goal continuation rejected")
+            }
+            EventType::GoalPaused => writeln!(self.writer, "goal paused"),
+            EventType::GoalRecovered => writeln!(self.writer, "goal recovered"),
+            EventType::GoalCompleted => writeln!(self.writer, "goal completed"),
             EventType::SubagentStarted => {
                 let description = event.payload["description"].as_str().unwrap_or("subagent");
                 writeln!(self.writer, "subagent started: {description}")

@@ -162,15 +162,71 @@ fn conversation_tokens_with_counter(
         .iter()
         .map(|message| message_tokens_with_counter(message, counter))
         .sum::<usize>()
-        + volatile_tokens_with_counter(conversation, counter)
+        + internal_context_tokens_with_counter(conversation, counter)
         + summary_state_tokens(conversation, counter)
 }
 
-fn volatile_tokens_with_counter(conversation: &Conversation, counter: &impl TokenCounter) -> usize {
-    if conversation.messages.is_empty() || conversation.volatile.is_empty() {
-        return 0;
+fn internal_context_tokens_with_counter(
+    conversation: &Conversation,
+    counter: &impl TokenCounter,
+) -> usize {
+    render_internal_context_with_counter(conversation, counter)
+        .map(|content| counter.count_text(&content))
+        .unwrap_or_default()
+}
+
+pub(crate) fn render_internal_context(conversation: &Conversation) -> Option<String> {
+    render_internal_context_with_counter(conversation, &DefaultTokenCounter)
+}
+
+fn render_internal_context_with_counter(
+    conversation: &Conversation,
+    counter: &impl TokenCounter,
+) -> Option<String> {
+    let parts = conversation
+        .internal_context
+        .rendered_fragments()
+        .into_iter()
+        .filter_map(|fragment| {
+            let content =
+                truncate_text_to_token_limit(fragment.content.trim(), fragment.max_tokens, counter);
+            (!content.is_empty()).then_some(content)
+        })
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn truncate_text_to_token_limit(
+    text: &str,
+    max_tokens: usize,
+    counter: &impl TokenCounter,
+) -> String {
+    if max_tokens == 0 || text.is_empty() {
+        return String::new();
     }
-    counter.count_text(&conversation.volatile.render())
+    if counter.count_text(text) <= max_tokens {
+        return text.to_string();
+    }
+
+    let mut boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(text.len());
+    let mut low = 0usize;
+    let mut high = boundaries.len().saturating_sub(1);
+    while low < high {
+        let midpoint = (low + high).div_ceil(2);
+        if counter.count_text(&text[..boundaries[midpoint]]) <= max_tokens {
+            low = midpoint;
+        } else {
+            high = midpoint.saturating_sub(1);
+        }
+    }
+    while low > 0 && counter.count_text(&text[..boundaries[low]]) > max_tokens {
+        low -= 1;
+    }
+    text[..boundaries[low]].trim_end().to_string()
 }
 
 pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> bool {
@@ -178,14 +234,11 @@ pub fn needs_compaction(conversation: &Conversation, config: &ContextConfig) -> 
     total > config.effective_limit()
 }
 
-/// Wire-equivalent token count: estimates the byte-equivalent prompt the
-/// provider will actually send (`conversation_to_api_messages` + tool schema
-/// JSON), not just the in-memory `messages` token sum. This is what matters
-/// for `prompt_too_long` decisions and for the "compaction storm" check —
-/// without it, local budgeting passes while the real wire prompt is well past
-/// the limit (because injected `[Summary baseline]` / `[Summary update N]`
-/// system messages, the volatile overlay glued to the last message, and the
-/// tool schema JSON are all real tokens on the wire).
+/// Wire-equivalent token count: estimates the prompt the provider actually
+/// sends (`conversation_to_api_messages` + tool schema JSON), not just the
+/// in-memory transcript. Injected summary and internal-context system
+/// messages are counted once at their wire position, without changing the
+/// token accounting of the final user or tool message.
 pub fn wire_equivalent_tokens(
     conversation: &Conversation,
     provider_config: &ProviderConfig,
@@ -229,34 +282,21 @@ fn wire_equivalent_tokens_with_counter(
 ) -> usize {
     let mut tokens = 0;
     let mut first_system_done = false;
-    let last_index = conversation.messages.len().saturating_sub(1);
-    let volatile_overlay = if conversation.volatile.is_empty() {
-        None
-    } else {
-        Some(conversation.volatile.render())
-    };
-
-    for (index, message) in conversation.messages.iter().enumerate() {
-        let mut message_tokens = message_tokens_with_counter(message, counter);
-        // The volatile overlay is appended ("\n\n{overlay}") to the very last
-        // wire message, regardless of role. Mirror that here so the wire count
-        // matches `conversation_to_api_messages`'s actual output.
-        if let Some(overlay) = volatile_overlay.as_deref()
-            && index == last_index
-        {
-            // 2 newlines + overlay text. The 2-byte separator is negligible in
-            // tokens; we count the overlay text only.
-            message_tokens += counter.count_text(overlay);
-        }
+    for message in &conversation.messages {
+        let message_tokens = message_tokens_with_counter(message, counter);
         tokens += message_tokens;
         if !first_system_done && matches!(message, Message::System { .. }) {
             first_system_done = true;
             tokens += inject_summary_tokens_with_counter(&conversation.summary, counter);
+            tokens += internal_context_tokens_with_counter(conversation, counter);
         }
     }
 
-    if !first_system_done && !conversation.summary.is_empty() {
-        tokens += inject_summary_tokens_with_counter(&conversation.summary, counter);
+    if !first_system_done {
+        if !conversation.summary.is_empty() {
+            tokens += inject_summary_tokens_with_counter(&conversation.summary, counter);
+        }
+        tokens += internal_context_tokens_with_counter(conversation, counter);
     }
 
     tokens += tools_schema_tokens_with_counter(provider_config, counter);
@@ -362,7 +402,7 @@ fn compact_with_summary_inner(
     let micro_compacted = micro_compact_stale_tool_outputs(&normalized);
     // Wire-equivalent gate: cheap micro compaction only counts as "enough"
     // when the prompt the provider will actually receive (messages +
-    // injected summary + volatile overlay + tool schema JSON) is back under
+    // injected summary + internal context + tool schema JSON) is back under
     // the limit, otherwise the next turn re-enters the storm.
     let pressure = context_pressure(&micro_compacted, context_config, provider_config);
     if !pressure.should_soft_compact && !pressure.should_hard_compact {
@@ -449,7 +489,7 @@ fn summarize_collapsed_messages(
     }
     result.messages.extend(pinned);
     result.messages.extend(kept);
-    result.volatile = conversation.volatile.clone();
+    result.internal_context = conversation.internal_context.clone();
     result.rolling_summary = Some(new_delta.clone());
 
     let mut summary = conversation.summary.clone();
@@ -552,8 +592,8 @@ fn partition_for_compaction(
         .iter()
         .map(|message| message_tokens_with_counter(message, counter))
         .sum();
-    let volatile_tokens = volatile_tokens_with_counter(conversation, counter);
-    let mut budget = system_tokens + pinned_tokens + summary_tokens + volatile_tokens + 4;
+    let internal_context_tokens = internal_context_tokens_with_counter(conversation, counter);
+    let mut budget = system_tokens + pinned_tokens + summary_tokens + internal_context_tokens + 4;
     for msg in droppable.iter().rev() {
         let msg_tokens = message_tokens_with_counter(msg, counter);
         if budget + msg_tokens > target_tokens {
@@ -1135,7 +1175,7 @@ pub fn compact_with_counter(
     let mut budget = system_tokens
         + pinned_tokens
         + summary_state_tokens(&micro_compacted, counter)
-        + volatile_tokens_with_counter(&micro_compacted, counter)
+        + internal_context_tokens_with_counter(&micro_compacted, counter)
         + counter.count_text("[Earlier conversation history was truncated to fit context window]")
         + 4;
 
@@ -1163,7 +1203,7 @@ pub fn compact_with_counter(
     }
     result.messages.extend(pinned);
     result.messages.extend(kept);
-    result.volatile = conversation.volatile.clone();
+    result.internal_context = conversation.internal_context.clone();
     result.rolling_summary = conversation.rolling_summary.clone();
     result.summary = conversation.summary.clone();
     result
@@ -1185,7 +1225,7 @@ fn keep_latest_droppable_if_empty(kept: &mut Vec<Message>, droppable: &[&Message
 
 fn micro_compact_stale_tool_outputs(conversation: &Conversation) -> Conversation {
     let mut result = Conversation::new();
-    result.volatile = conversation.volatile.clone();
+    result.internal_context = conversation.internal_context.clone();
     result.rolling_summary = conversation.rolling_summary.clone();
     result.summary = conversation.summary.clone();
     let last_user_index = conversation
@@ -1439,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_tokens_include_volatile_overlay() {
+    fn conversation_tokens_include_internal_context() {
         let mut conv = Conversation::new();
         conv.add_system("system".to_string());
         conv.add_user("hello world".to_string());
@@ -2343,7 +2383,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_inherits_volatile_state() {
+    fn compaction_inherits_internal_context() {
         let config = ContextConfig {
             max_tokens: 16,
             compaction_threshold: 1.0,
@@ -2363,19 +2403,25 @@ mod tests {
         let compacted = compact_with_counter(&conv, &config, &FixedCounter);
 
         assert!(compacted.messages.len() < conv.messages.len());
-        assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
+        assert_eq!(
+            compacted
+                .internal_context
+                .get(orca_core::conversation::PLAN_CONTEXT_FRAGMENT_ID)
+                .map(|fragment| fragment.content.as_str()),
+            Some("active plan")
+        );
         assert!(
             compacted
-                .volatile
-                .goal
-                .as_ref()
+                .internal_context
+                .get(orca_core::conversation::GOAL_CONTEXT_FRAGMENT_ID)
                 .unwrap()
+                .content
                 .contains("active goal")
         );
     }
 
     #[test]
-    fn micro_compaction_preserves_volatile_state_when_no_truncation_needed() {
+    fn micro_compaction_preserves_internal_context_when_no_truncation_needed() {
         let config = ContextConfig {
             max_tokens: 1_000,
             compaction_threshold: 1.0,
@@ -2402,7 +2448,13 @@ mod tests {
 
         let compacted = compact_with_counter(&conv, &config, &FixedCounter);
 
-        assert_eq!(compacted.volatile.plan.as_deref(), Some("active plan"));
+        assert_eq!(
+            compacted
+                .internal_context
+                .get(orca_core::conversation::PLAN_CONTEXT_FRAGMENT_ID)
+                .map(|fragment| fragment.content.as_str()),
+            Some("active plan")
+        );
     }
 
     #[test]

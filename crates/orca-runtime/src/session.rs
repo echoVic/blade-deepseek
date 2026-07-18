@@ -828,7 +828,7 @@ mod tests {
                 "continue",
             );
 
-            assert!(conversation.volatile.render().contains(
+            assert!(conversation.internal_context.render().contains(
                 "Previous turn was interrupted; existing workspace edits remain. Inspect git diff before continuing."
             ));
         });
@@ -852,7 +852,7 @@ mod tests {
 
             assert!(
                 !conversation
-                    .volatile
+                    .internal_context
                     .render()
                     .contains("Previous turn was interrupted; existing workspace edits remain.")
             );

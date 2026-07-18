@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 
 use crate::approval_types::{ApprovalRequest, ApprovalResolution};
 use crate::cost_types::UsageTotals;
+use crate::goal_runtime::{
+    EvidenceItem, GoalId, GoalNextAction, GoalOuterTurnId, GoalPauseReason, GoalRecord, GoalRunId,
+    GoalState, GoalTurnOrigin, GoalTurnStatus, GoalUpdateAck, GoalUpdateIntent, GoalUsage,
+    GoalVerificationResult,
+};
 use crate::model::ModelRouteDecision;
 use crate::plan_types::UpdatePlanArgs;
 use crate::provider_types::{ProviderReplayState, ToolCallProgress};
@@ -176,6 +181,32 @@ pub enum EventType {
     ToolCallCompleted,
     #[serde(rename = "plan.updated")]
     PlanUpdated,
+    #[serde(rename = "goal.created")]
+    GoalCreated,
+    #[serde(rename = "goal.run.started")]
+    GoalRunStarted,
+    #[serde(rename = "goal.turn.started")]
+    GoalTurnStarted,
+    #[serde(rename = "goal.intent.requested")]
+    GoalIntentRequested,
+    #[serde(rename = "goal.intent.acknowledged")]
+    GoalIntentAcknowledged,
+    #[serde(rename = "goal.turn.finished")]
+    GoalTurnFinished,
+    #[serde(rename = "goal.verification.completed")]
+    GoalVerificationCompleted,
+    #[serde(rename = "goal.transitioned")]
+    GoalTransitioned,
+    #[serde(rename = "goal.continuation.admitted")]
+    GoalContinuationAdmitted,
+    #[serde(rename = "goal.continuation.rejected")]
+    GoalContinuationRejected,
+    #[serde(rename = "goal.paused")]
+    GoalPaused,
+    #[serde(rename = "goal.recovered")]
+    GoalRecovered,
+    #[serde(rename = "goal.completed")]
+    GoalCompleted,
     #[serde(rename = "subagent.started")]
     SubagentStarted,
     #[serde(rename = "subagent.progress")]
@@ -236,6 +267,19 @@ impl EventType {
             | Self::ToolCallCompleted
             | Self::ModelResponseCompleted
             | Self::PlanUpdated
+            | Self::GoalCreated
+            | Self::GoalRunStarted
+            | Self::GoalTurnStarted
+            | Self::GoalIntentRequested
+            | Self::GoalIntentAcknowledged
+            | Self::GoalTurnFinished
+            | Self::GoalVerificationCompleted
+            | Self::GoalTransitioned
+            | Self::GoalContinuationAdmitted
+            | Self::GoalContinuationRejected
+            | Self::GoalPaused
+            | Self::GoalRecovered
+            | Self::GoalCompleted
             | Self::SubagentStarted
             | Self::SubagentCompleted
             | Self::WorkflowStarted
@@ -605,6 +649,206 @@ impl EventFactory {
 
     pub fn plan_updated(&mut self, update: &UpdatePlanArgs) -> EventDraft {
         self.make(EventType::PlanUpdated, json!(update))
+    }
+
+    pub fn goal_created(&mut self, goal: &GoalRecord) -> EventDraft {
+        self.make_serialized(EventType::GoalCreated, goal)
+    }
+
+    pub fn goal_run_started(&mut self, goal_id: &GoalId, goal_run_id: &GoalRunId) -> EventDraft {
+        self.make(
+            EventType::GoalRunStarted,
+            json!({ "goal_id": goal_id, "goal_run_id": goal_run_id }),
+        )
+    }
+
+    pub fn goal_turn_started(
+        &mut self,
+        goal_id: &GoalId,
+        goal_run_id: &GoalRunId,
+        outer_turn_id: &GoalOuterTurnId,
+        origin: GoalTurnOrigin,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalTurnStarted,
+            json!({
+                "goal_id": goal_id,
+                "goal_run_id": goal_run_id,
+                "outer_turn_id": outer_turn_id,
+                "origin": origin
+            }),
+        )
+    }
+
+    pub fn goal_intent_acknowledged(
+        &mut self,
+        outer_turn_id: &GoalOuterTurnId,
+        intent: &GoalUpdateIntent,
+        ack: &GoalUpdateAck,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalIntentAcknowledged,
+            json!({
+                "outer_turn_id": outer_turn_id,
+                "intent": intent,
+                "ack": ack
+            }),
+        )
+    }
+
+    pub fn goal_intent_requested(
+        &mut self,
+        outer_turn_id: &GoalOuterTurnId,
+        intent: &GoalUpdateIntent,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalIntentRequested,
+            json!({
+                "intent_id": intent.intent_id,
+                "requested_state": intent.requested_state,
+                "outer_turn_id": outer_turn_id,
+                "reason": intent.reason,
+                "evidence": intent.evidence,
+                "blocker": intent.blocker,
+            }),
+        )
+    }
+
+    pub fn goal_turn_finished(
+        &mut self,
+        outer_turn_id: &GoalOuterTurnId,
+        status: GoalTurnStatus,
+        usage: &GoalUsage,
+        next_action: &GoalNextAction,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalTurnFinished,
+            json!({
+                "outer_turn_id": outer_turn_id,
+                "status": status,
+                "usage": usage,
+                "next_action": next_action
+            }),
+        )
+    }
+
+    pub fn goal_verification_completed(
+        &mut self,
+        outer_turn_id: &GoalOuterTurnId,
+        result: &GoalVerificationResult,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalVerificationCompleted,
+            json!({ "outer_turn_id": outer_turn_id, "result": result }),
+        )
+    }
+
+    pub fn goal_transitioned(
+        &mut self,
+        goal_id: &GoalId,
+        previous: &GoalState,
+        next: &GoalState,
+        reason_code: &str,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalTransitioned,
+            json!({
+                "goal_id": goal_id,
+                "previous_state": previous,
+                "next_state": next,
+                "reason_code": reason_code
+            }),
+        )
+    }
+
+    pub fn goal_continuation_admission(
+        &mut self,
+        goal_id: &GoalId,
+        goal_run_id: Option<&GoalRunId>,
+        outer_turn_id: Option<&GoalOuterTurnId>,
+        admitted: bool,
+        reason: &str,
+        current_state: &GoalState,
+        continuation_count: u32,
+    ) -> EventDraft {
+        let event_type = if admitted {
+            EventType::GoalContinuationAdmitted
+        } else {
+            EventType::GoalContinuationRejected
+        };
+        self.make(
+            event_type,
+            json!({
+                "goal_id": goal_id,
+                "goal_run_id": goal_run_id,
+                "outer_turn_id": outer_turn_id,
+                "admitted": admitted,
+                "reason": reason,
+                "admission_reason": admitted.then_some(reason),
+                "rejection_code": (!admitted).then_some(reason),
+                "current_state": current_state,
+                "counters": {
+                    "continuation_count": continuation_count,
+                }
+            }),
+        )
+    }
+
+    pub fn goal_paused(
+        &mut self,
+        goal_id: &GoalId,
+        goal_run_id: Option<&GoalRunId>,
+        outer_turn_id: Option<&GoalOuterTurnId>,
+        reason: GoalPauseReason,
+        message: &str,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalPaused,
+            json!({
+                "goal_id": goal_id,
+                "goal_run_id": goal_run_id,
+                "outer_turn_id": outer_turn_id,
+                "reason": reason,
+                "message": message,
+            }),
+        )
+    }
+
+    pub fn goal_recovered(
+        &mut self,
+        goal_id: &GoalId,
+        stale_goal_run_id: &GoalRunId,
+        outer_turn_id: Option<&GoalOuterTurnId>,
+        recovered_state: &GoalState,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalRecovered,
+            json!({
+                "goal_id": goal_id,
+                "stale_goal_run_id": stale_goal_run_id,
+                "outer_turn_id": outer_turn_id,
+                "recovered_state": recovered_state,
+                "discarded_continuation": true,
+            }),
+        )
+    }
+
+    pub fn goal_completed(
+        &mut self,
+        goal_id: &GoalId,
+        goal_run_id: Option<&GoalRunId>,
+        evidence: &[EvidenceItem],
+        usage: &GoalUsage,
+    ) -> EventDraft {
+        self.make(
+            EventType::GoalCompleted,
+            json!({
+                "goal_id": goal_id,
+                "goal_run_id": goal_run_id,
+                "evidence": evidence,
+                "usage": usage,
+            }),
+        )
     }
 
     pub fn subagent_started(&mut self, id: &str, description: &str) -> EventDraft {
@@ -1412,6 +1656,84 @@ mod tests {
             event.payload["diff"],
             "--- a/notes.txt\n+++ b/notes.txt\n-old\n+new\n"
         );
+    }
+
+    #[test]
+    fn goal_events_are_typed_semantic_records() {
+        let mut events = EventFactory::new("goal-events".to_string());
+        let goal_id = GoalId::new();
+        let run_id = GoalRunId::new();
+        let turn_id = GoalOuterTurnId::new();
+        let intent = GoalUpdateIntent {
+            intent_id: crate::goal_runtime::IntentId::new(),
+            requested_state: crate::goal_runtime::GoalRequestedState::Complete,
+            reason: "tests passed".to_string(),
+            evidence: vec![crate::goal_runtime::EvidenceItem::observation(
+                "focused tests passed",
+            )],
+            blocker: None,
+        };
+
+        let started =
+            events.goal_turn_started(&goal_id, &run_id, &turn_id, GoalTurnOrigin::Continuation);
+        let requested = events.goal_intent_requested(&turn_id, &intent);
+        let admission = events.goal_continuation_admission(
+            &goal_id,
+            Some(&run_id),
+            Some(&turn_id),
+            false,
+            "budget_limited",
+            &GoalState::BudgetLimited,
+            3,
+        );
+        let recovered = events.goal_recovered(
+            &goal_id,
+            &run_id,
+            Some(&turn_id),
+            &GoalState::Paused {
+                reason: GoalPauseReason::Recovery,
+                message: "recovered stale owner".to_string(),
+            },
+        );
+        let completed = events.goal_completed(
+            &goal_id,
+            Some(&run_id),
+            &intent.evidence,
+            &GoalUsage {
+                charged_input_tokens: 10,
+                output_tokens: 2,
+                ..GoalUsage::default()
+            },
+        );
+
+        assert_eq!(started.event_type, EventType::GoalTurnStarted);
+        assert_eq!(started.payload["outer_turn_id"], turn_id.as_str());
+        assert_eq!(started.payload["origin"], "continuation");
+        assert!(started.event_type.is_semantic());
+        assert_eq!(requested.event_type, EventType::GoalIntentRequested);
+        assert_eq!(requested.payload["intent_id"], intent.intent_id.as_str());
+        assert_eq!(requested.payload["requested_state"], "complete");
+        assert_eq!(admission.event_type, EventType::GoalContinuationRejected);
+        assert_eq!(admission.payload["rejection_code"], "budget_limited");
+        assert_eq!(admission.payload["goal_run_id"], run_id.as_str());
+        assert_eq!(admission.payload["outer_turn_id"], turn_id.as_str());
+        assert_eq!(
+            admission.payload["current_state"]["status"],
+            "budget_limited"
+        );
+        assert_eq!(admission.payload["counters"]["continuation_count"], 3);
+        assert!(admission.event_type.is_semantic());
+        assert_eq!(recovered.event_type, EventType::GoalRecovered);
+        assert_eq!(recovered.payload["stale_goal_run_id"], run_id.as_str());
+        assert_eq!(recovered.payload["outer_turn_id"], turn_id.as_str());
+        assert!(recovered.event_type.is_semantic());
+        assert_eq!(completed.event_type, EventType::GoalCompleted);
+        assert_eq!(
+            completed.payload["evidence"][0]["summary"],
+            "focused tests passed"
+        );
+        assert_eq!(completed.payload["usage"]["charged_input_tokens"], 10);
+        assert!(completed.event_type.is_semantic());
     }
 
     #[test]
