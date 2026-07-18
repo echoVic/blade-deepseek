@@ -33,7 +33,7 @@ Set `INSTALL_DIR` to choose a destination and `ORCA_VERSION` to pin a version:
 
 ```bash
 curl -fsSL https://orcaagent.dev/install.sh | \
-  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.47 sh
+  INSTALL_DIR=/usr/local/bin ORCA_VERSION=0.2.48 sh
 ```
 
 ### GitHub Releases
@@ -189,6 +189,7 @@ output_truncation = { mode = "tokens", limit = 2000 }
 ```sh
 orca exec [options] <prompt>
 orca --mode=server
+orca --mode=acp
 orca trust [show|add|remove] --cwd <path>
 ```
 
@@ -227,6 +228,9 @@ Options:
   atomic structured Mention input. Selecting a candidate or sending structured
   Mention input creates a binding; plain `@...` text stays literal. See
   [the harness contract](docs/harness-contract.md)
+- top-level `--mode=acp` — Run the stdio Agent Client Protocol adapter. ACP
+  sessions and prompts project onto `RuntimeHost`; the internal JSONL server
+  remains available and unchanged.
 
 Approval modes also select the default execution boundary:
 

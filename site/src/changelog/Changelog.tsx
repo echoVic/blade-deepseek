@@ -76,6 +76,10 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.48":
+        "ACP initialization now reports the Orca binary release version from RunConfig instead of the internal orca-runtime crate version. Integration coverage also isolates ORCA_HOME, verifies that each session keeps its requested working directory, and exercises cancellation arriving before the hosted operation handle is installed.",
+      "v0.2.47":
+        "Orca now exposes an additive Agent Client Protocol adapter over stdio with --mode=acp. ACP sessions and prompts project directly onto RuntimeHost threads and hosted turns, EventEnvelope streams become standard session/update notifications, and cancellation reaches the active Generation Fence through OperationHandle. The existing internal JSONL server protocol remains unchanged.",
       "v0.2.46":
         "Goal Mode control tools now execute through the runtime that advertised them. get_goal, create_goal, and update_goal use the recorded session and live extension context before any normal-tool worker boundary, with the old thread-local callback removed. Invalid model arguments remain recoverable, while missing control-plane ownership or persistence failures stop one turn, atomically stall an active goal, and clear stale Goal context. A billed DeepSeek gate verifies one non-goal tool, exactly one terminal update_goal call, and zero eligible continuations.",
       "v0.2.45":
@@ -536,6 +540,10 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.48":
+        "ACP 初始化现在从 RunConfig 上报 Orca 二进制发布版本，不再误用内部 orca-runtime crate 的版本。集成测试同时隔离 ORCA_HOME，验证每个 session 保留请求的工作目录，并覆盖 hosted operation handle 安装前到达的取消请求。",
+      "v0.2.47":
+        "Orca 新增通过 --mode=acp 启动的 stdio Agent Client Protocol 适配层。ACP session 与 prompt 直接投影到 RuntimeHost thread 和 hosted turn，EventEnvelope 流转换为标准 session/update 通知，取消则通过 OperationHandle 抵达活动 Generation Fence。现有内部 JSONL server 协议保持不变。",
       "v0.2.46":
         "Goal Mode 控制工具现在由展示它们的同一个 runtime 执行。get_goal、create_goal 和 update_goal 会在普通工具 worker 边界之前使用已记录 session 与 live extension context，旧的 thread-local callback 已删除。模型参数错误仍可在同一轮自纠；缺少控制面 owner 或持久化失败会结束一次 turn、原子 stall active Goal，并清除陈旧 Goal context。真实 DeepSeek gate 已验证先执行一个普通工具，再且仅调用一次终态 update_goal，后续 continuation 为零。",
       "v0.2.45":
