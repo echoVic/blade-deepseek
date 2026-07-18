@@ -770,10 +770,7 @@ mod tests {
 
     use super::*;
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
-    use crate::extension::{ExtensionData, ExtensionRegistryBuilder};
-    use crate::goals::{GoalToolProgressState, install_goal_tool_lifecycle};
     use crate::hooks::HookRunner;
-    use crate::runtime_turn_kernel::RuntimeTurnKernel;
     use crate::tool_execution::policy_for_tool_execution;
     use crate::tool_invocation::AgentToolPolicyContext;
 
@@ -2675,89 +2672,6 @@ mod tests {
                 && terminal.status == ToolStatus::Failed
                 && terminal.started == ToolInvocationStarted::No
         ));
-    }
-
-    #[test]
-    fn run_tool_turns_notifies_extension_lifecycle_for_normal_tool() {
-        let cwd = tempfile::tempdir().expect("cwd");
-        let mut config = config_with_external(Vec::new());
-        config.approval_mode = ApprovalMode::FullAuto;
-        let mut events = EventFactory::new("tool-turns-extension-lifecycle".to_string());
-        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
-        let mut conversation = Conversation::new();
-        let request = request(
-            ToolName::Bash,
-            ActionKind::Shell,
-            Some("printf lifecycle"),
-            Some(
-                json!({ "command": "printf lifecycle" })
-                    .to_string()
-                    .as_str(),
-            ),
-        );
-        let instructions = ProjectInstructions::default();
-        let memory = MemoryBlock::default();
-        let mcp_registry = McpRegistry::default();
-        let hooks = HookRunner::default();
-        let mut cost_tracker = CostTracker::new(None);
-        let cancel = CancelToken::new();
-        let task_registry = TaskRegistry::new("tool-turns-extension-lifecycle".to_string());
-        let mut background_workflows = Vec::new();
-        let mut sampling_state = RuntimeSamplingRequestState::new();
-        let policy = policy_for_tool_execution(&config);
-        let mut extension_builder = ExtensionRegistryBuilder::new();
-        install_goal_tool_lifecycle(&mut extension_builder);
-        let extension_registry = extension_builder.build();
-        let thread_extensions = ExtensionData::new("session-1");
-        let turn_extensions = ExtensionData::new("turn-1");
-        let kernel = RuntimeTurnKernel::new(&thread_extensions, &turn_extensions);
-        let step_context = RuntimeStepContext::new(
-            &config,
-            cwd.path(),
-            AgentToolPolicyContext::unrestricted(),
-            0,
-            false,
-            &policy,
-            &instructions,
-            &memory,
-            &mcp_registry,
-            &hooks,
-            &cancel,
-            &task_registry,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let step_context = kernel.bind_step_context(step_context, &extension_registry);
-
-        let outcome = run_tool_turns(RuntimeToolTurnsContext {
-            step_context,
-            sampling_state: &mut sampling_state,
-            io: RuntimeToolTurnsIo {
-                events: &mut events,
-                sink: &mut sink,
-                conversation: &mut conversation,
-                history_writer: None,
-                cost_tracker: &mut cost_tracker,
-                background_workflows: &mut background_workflows,
-            },
-            tool_requests: &[request],
-            executors: RuntimeToolTurnsExecutors {
-                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
-                batch_child_executor: unused_child_executor::<io::Sink>,
-            },
-        })
-        .expect("run tool turns");
-
-        assert!(matches!(outcome, ToolTurnOutcome::Continue));
-        let progress = thread_extensions
-            .get::<GoalToolProgressState>()
-            .expect("goal progress from tool lifecycle contributor");
-        assert_eq!(progress.completed_tool_attempts(), 1);
-        assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
-        assert_eq!(progress.last_call_id().as_deref(), Some("tool-1"));
     }
 
     #[test]

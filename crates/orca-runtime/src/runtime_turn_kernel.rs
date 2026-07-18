@@ -22,7 +22,7 @@ use crate::workflow_execution::BackgroundWorkflowRun;
 pub(crate) struct RuntimeTurnKernel<'a> {
     extension_stores: RuntimeExtensionStores<'a>,
     sampling_state: RuntimeSamplingRequestState,
-    reducer: RuntimeTurnReducer<'a>,
+    reducer: RuntimeTurnReducer,
 }
 
 impl<'a> RuntimeTurnKernel<'a> {
@@ -49,6 +49,7 @@ impl<'a> RuntimeTurnKernel<'a> {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn bind_step_context(
         &self,
         mut step_context: RuntimeStepContext<'a>,
@@ -120,7 +121,7 @@ impl<'a> RuntimeTurnKernel<'a> {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn reducer(&self) -> RuntimeTurnReducer<'a> {
+    pub(crate) fn reducer(&self) -> RuntimeTurnReducer {
         self.reducer
     }
 }

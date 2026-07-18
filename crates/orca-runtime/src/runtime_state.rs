@@ -1,7 +1,6 @@
 use std::io;
 
-use crate::extension::{ExtensionData, RuntimeExtensionStores, ToolCallOutcome};
-use crate::goals;
+use crate::extension::{ExtensionData, RuntimeExtensionStores};
 use crate::runtime_capability::{RuntimeCapabilityPatch, RuntimeCapabilitySnapshot};
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_permission::{
@@ -10,35 +9,20 @@ use crate::runtime_permission::{
 };
 
 #[derive(Clone, Copy, Debug)]
-pub struct RuntimeToolFinish<'a> {
-    pub tool_name: &'a str,
-    pub call_id: &'a str,
-    pub outcome: ToolCallOutcome,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ToolRuntimeState<'a> {
-    thread_store: &'a ExtensionData,
-    turn_store: &'a ExtensionData,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct RuntimeTurnReducer<'a> {
+pub struct RuntimeTurnReducer {
     directive_state: DirectiveRuntimeState,
     permission_state: PermissionRuntimeState,
-    tool_state: ToolRuntimeState<'a>,
 }
 
-impl<'a> RuntimeTurnReducer<'a> {
-    pub fn new(thread_store: &'a ExtensionData, turn_store: &'a ExtensionData) -> Self {
+impl RuntimeTurnReducer {
+    pub fn new(_thread_store: &ExtensionData, _turn_store: &ExtensionData) -> Self {
         Self {
             directive_state: DirectiveRuntimeState,
             permission_state: PermissionRuntimeState,
-            tool_state: ToolRuntimeState::new(thread_store, turn_store),
         }
     }
 
-    pub fn from_extension_stores(extension_stores: RuntimeExtensionStores<'a>) -> Self {
+    pub fn from_extension_stores<'a>(extension_stores: RuntimeExtensionStores<'a>) -> Self {
         Self::new(
             extension_stores.thread_store(),
             extension_stores.turn_store(),
@@ -87,10 +71,6 @@ impl<'a> RuntimeTurnReducer<'a> {
     ) {
         self.permission_state.merge_permission_delta(overlay, delta);
     }
-
-    pub fn record_tool_finish(&self, finish: RuntimeToolFinish<'_>) {
-        self.tool_state.record_finish(finish);
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,24 +117,5 @@ impl PermissionRuntimeState {
         delta: &TurnPermissionOverlayDelta,
     ) {
         overlay.apply_delta(delta);
-    }
-}
-
-impl<'a> ToolRuntimeState<'a> {
-    pub fn new(thread_store: &'a ExtensionData, turn_store: &'a ExtensionData) -> Self {
-        Self {
-            thread_store,
-            turn_store,
-        }
-    }
-
-    pub fn record_finish(&self, finish: RuntimeToolFinish<'_>) {
-        goals::record_goal_tool_finish(
-            self.thread_store,
-            self.turn_store,
-            finish.tool_name,
-            finish.call_id,
-            finish.outcome,
-        );
     }
 }

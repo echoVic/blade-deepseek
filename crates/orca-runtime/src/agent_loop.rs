@@ -364,35 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_turn_state_installs_goal_tool_lifecycle_extensions() {
-        let mut cost_tracker = CostTracker::new(None);
-        let cancel = CancelToken::new();
-        let task_registry = TaskRegistry::new("agent-loop-extension-state".to_string());
-        let state = RuntimeTurnState::new(&mut cost_tracker, &cancel, &task_registry);
-
-        state
-            .extension_registry()
-            .on_tool_finish(crate::extension::ToolFinishInput {
-                thread_store: state.thread_extensions(),
-                turn_store: state.turn_extensions(),
-                tool_name: "bash",
-                call_id: "tool-1",
-                outcome: crate::extension::ToolCallOutcome::Completed,
-            });
-
-        let progress = state
-            .thread_extensions()
-            .get::<crate::goals::GoalToolProgressState>()
-            .expect("goal lifecycle progress");
-        assert_eq!(progress.completed_tool_attempts(), 1);
-        assert_eq!(
-            progress.last_turn_id(),
-            Some("agent-loop-extension-state".to_string())
-        );
-        assert_eq!(progress.last_call_id(), Some("tool-1".to_string()));
-    }
-
-    #[test]
     fn runtime_turn_state_applies_runtime_directives_in_order() {
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();

@@ -24,7 +24,6 @@ pub mod goal_actor;
 pub mod goal_store;
 pub mod goal_tracker;
 pub mod goal_verifier;
-pub mod goals;
 pub mod history;
 pub mod hooks;
 pub mod instructions;
@@ -94,7 +93,6 @@ mod tests {
         ExtensionData, ExtensionRegistryBuilder, ToolCallOutcome, ToolFinishInput,
         ToolLifecycleContributor,
     };
-    use crate::goals::GoalToolProgressState;
     use crate::lifecycle::{
         RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
         TurnPermissionOverlay,
@@ -105,7 +103,7 @@ mod tests {
     };
     use crate::runtime_capability::{RuntimeCapabilityPatch, RuntimeCapabilitySnapshot};
     use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
-    use crate::runtime_state::{RuntimeToolFinish, RuntimeTurnReducer};
+    use crate::runtime_state::RuntimeTurnReducer;
     use crate::thread_store::{SessionStore, ThreadStore};
     use orca_core::config::PermissionProfileNetworkAccess;
     use std::collections::HashMap;
@@ -185,26 +183,6 @@ mod tests {
             calls.lock().unwrap().as_slice(),
             ["first:thread-a:turn-1:bash", "second:thread-a:turn-1:bash"]
         );
-    }
-
-    #[test]
-    fn runtime_turn_reducer_records_tool_finish_goal_progress() {
-        let thread_store = ExtensionData::new("thread-a");
-        let turn_store = ExtensionData::new("turn-1");
-        let reducer = RuntimeTurnReducer::new(&thread_store, &turn_store);
-
-        reducer.record_tool_finish(RuntimeToolFinish {
-            tool_name: "bash",
-            call_id: "call-1",
-            outcome: ToolCallOutcome::Completed,
-        });
-
-        let progress = thread_store
-            .get::<GoalToolProgressState>()
-            .expect("tool finish should update goal progress through reducer");
-        assert_eq!(progress.completed_tool_attempts(), 1);
-        assert_eq!(progress.last_turn_id().as_deref(), Some("turn-1"));
-        assert_eq!(progress.last_call_id().as_deref(), Some("call-1"));
     }
 
     #[test]
@@ -943,7 +921,9 @@ mod tests {
             "RuntimeTurnKernel must retain the extension stores used by its reducer"
         );
         assert!(
-            kernel_source.contains("#[cfg(test)]\n    pub(crate) fn bind_step_context("),
+            kernel_source.contains(
+                "#[cfg(test)]\n    #[allow(dead_code)]\n    pub(crate) fn bind_step_context("
+            ),
             "RuntimeTurnKernel must keep the standalone step-context binding helper test-only"
         );
         assert!(
