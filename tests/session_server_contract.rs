@@ -1734,6 +1734,7 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
 #[test]
 fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
     let workspace = tempdir().expect("workspace");
+    let invocation_marker = workspace.path().join("bash-invocation-started");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::write(
@@ -1772,7 +1773,7 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
         let stdin = child.stdin_mut();
         writeln!(
             stdin,
-            r#"{{"id":"turn-bash","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"bash printf before; sleep 5; printf after"}}]}}}}"#,
+            r#"{{"id":"turn-bash","method":"turn/start","params":{{"threadId":"{}","input":[{{"type":"text","text":"bash touch bash-invocation-started; sleep 5; printf after"}}]}}}}"#,
             thread_id
         )
         .expect("write bash turn");
@@ -1785,6 +1786,7 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
         .to_string();
     let tool_requested = child.expect_event("turn-bash", "tool_requested");
     assert_eq!(tool_requested["tool"], "bash");
+    wait_for_path(&invocation_marker);
 
     {
         let stdin = child.stdin_mut();
