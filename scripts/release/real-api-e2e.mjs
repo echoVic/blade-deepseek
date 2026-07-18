@@ -33,6 +33,7 @@ function parseArgs(argv) {
     timeoutMs: 180000,
     skipBuild: false,
     skipProviderSummary: false,
+    skipGoalMode: false,
     skipCli: false,
     skipServer: false,
   };
@@ -49,6 +50,8 @@ function parseArgs(argv) {
       args.skipBuild = true;
     } else if (arg === "--skip-provider-summary") {
       args.skipProviderSummary = true;
+    } else if (arg === "--skip-goal-mode") {
+      args.skipGoalMode = true;
     } else if (arg === "--skip-cli") {
       args.skipCli = true;
     } else if (arg === "--skip-server") {
@@ -114,6 +117,43 @@ function runProviderSummary(args) {
     throw new Error(`Provider summary real API e2e did not report ALL TARGETS MET:\n${output}`);
   }
   console.log("Provider summary real API e2e verified");
+}
+
+function runGoalMode(args) {
+  if (args.skipGoalMode) {
+    console.log("Goal Mode real API e2e skipped");
+    return;
+  }
+
+  const home = mkdtempSync(path.join(os.tmpdir(), "orca-goal-mode-e2e-"));
+  const sourceHome = process.env.ORCA_HOME ?? path.join(os.homedir(), ".orca");
+  const sourceAuthPath = path.join(sourceHome, "auth.json");
+  if (existsSync(sourceAuthPath)) {
+    copyFileSync(sourceAuthPath, path.join(home, "auth.json"));
+  }
+
+  try {
+    const output = run(
+      "cargo",
+      [
+        "run",
+        "-p",
+        "orca-runtime",
+        "--example",
+        "goal_mode_realapi",
+        "--",
+        "--max-budget",
+        args.maxBudget,
+      ],
+      { env: { ...process.env, ORCA_HOME: home }, timeoutMs: args.timeoutMs },
+    );
+    if (!output.includes("Goal Mode real API e2e verified:")) {
+      throw new Error(`Goal Mode real API e2e did not report success:\n${output}`);
+    }
+    console.log(output.trim());
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 function parseJsonLines(output, label) {
@@ -1544,6 +1584,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   runBuild(args);
   runProviderSummary(args);
+  runGoalMode(args);
   runCli(args);
   runHistoryReplay(args);
   runStableThreadIdentityResume(args);

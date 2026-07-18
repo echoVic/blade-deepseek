@@ -29,6 +29,9 @@ case "$*" in
     printf '== Acceptance ==\\n'
     printf 'ALL TARGETS MET\\n'
     ;;
+  "run -p orca-runtime --example goal_mode_realapi -- --max-budget 0.01")
+    printf 'Goal Mode real API e2e verified: status=complete non_goal_tools=1 update_goal_calls=1 continuations=0\\n'
+    ;;
   *) exit 42 ;;
 esac
 `,
@@ -622,6 +625,7 @@ if (args[0] === "--mode" && args[1] === "server") {
   for (const expected of [
     "Build verified",
     "Provider summary real API e2e verified",
+    "Goal Mode real API e2e verified: status=complete non_goal_tools=1 update_goal_calls=1 continuations=0",
     "CLI real API e2e verified: ORCA_REAL_E2E_OK",
     "History replay real API e2e verified: ORCA_HISTORY_REPLAY_OK",
     "History replay repair verified: legacy-missing-tool-call status=indeterminate terminalSource=compatibility_repair",
@@ -664,6 +668,7 @@ if (args[0] === "--mode" && args[1] === "server") {
   for (const expected of [
     "cargo build --bin orca",
     "cargo run -p orca-provider --example summary_render_realapi",
+    "cargo run -p orca-runtime --example goal_mode_realapi -- --max-budget 0.01",
     "orca exec --output-format jsonl --no-history --mode suggest --max-budget 0.01 Reply with exactly: ORCA_REAL_E2E_OK",
     "orca exec --output-format jsonl --mode full-auto --max-budget 0.01 --resume latest Do not call tools or retry prior work. Reply with exactly: ORCA_HISTORY_REPLAY_OK",
     "history-replay-fixture legacy-missing-tool-call missing-result",
