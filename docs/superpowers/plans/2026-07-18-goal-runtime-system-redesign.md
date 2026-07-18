@@ -52,7 +52,7 @@
 - Modify: `crates/orca-runtime/src/lib.rs`
 - Test: module tests in the three files above
 
-- [ ] **Step 1: Add RED state-transition tests**
+- [x] **Step 1: Add RED state-transition tests**
 
 Add tests for:
 
@@ -78,7 +78,7 @@ cargo test -p orca-runtime goal_tracker --lib
 
 Expected: the new module/types are missing and the RED tests fail to compile.
 
-- [ ] **Step 2: Implement typed domain values**
+- [x] **Step 2: Implement typed domain values**
 
 Add serde-compatible types for `GoalId`, `GoalRunId`, `GoalOuterTurnId`,
 `IntentId`, `GoalTurnOrigin`, `GoalState`, `GoalPauseReason`, `EvidenceItem`,
@@ -87,7 +87,7 @@ Add serde-compatible types for `GoalId`, `GoalRunId`, `GoalOuterTurnId`,
 compatibility enum and map `Stalled` to `Paused { reason: NoProgress }` in the
 new projection.
 
-- [ ] **Step 3: Implement the pure tracker**
+- [x] **Step 3: Implement the pure tracker**
 
 Implement `GoalTracker` with these invariants:
 
@@ -106,7 +106,7 @@ Only a verifier result can create `Complete` or `Blocked`. Same-gap counting
 uses closed outer turns and resets on a new fingerprint, progress evidence, or
 resume.
 
-- [ ] **Step 4: Run GREEN tracker tests and serialization tests**
+- [x] **Step 4: Run GREEN tracker tests and serialization tests**
 
 Run:
 
@@ -119,23 +119,19 @@ cargo test -p orca-runtime goal_tracker --lib
 Expected: all new tracker tests pass and existing `goal_types` compatibility
 tests remain green.
 
-- [ ] **Step 5: Commit the domain slice**
+- [x] **Step 5: Commit the domain slice**
 
 ```bash
 git add crates/orca-core/src/goal_types.rs crates/orca-core/src/goal_runtime.rs crates/orca-core/src/lib.rs crates/orca-runtime/src/goal_tracker.rs crates/orca-runtime/src/lib.rs
 git commit -m "feat(goal): add typed tracker and outer turn domain"
 ```
 
-## Task 2: Pure Model Protocol And Explicit Turn Context
+## Task 2: Pure Model Protocol And Ack Formatting
 
 **Files:**
 
 - Modify: `crates/orca-tools/src/update_goal.rs`
-- Modify: `crates/orca-runtime/src/runtime_special.rs`
-- Modify: `crates/orca-runtime/src/tool_router.rs`
-- Modify: `crates/orca-runtime/src/tool_turn.rs`
-- Modify: `crates/orca-runtime/src/controller.rs`
-- Test: existing update-goal/runtime-special/tool-turn modules
+- Test: existing update-goal module
 
 - [ ] **Step 1: Add RED protocol tests**
 
@@ -158,47 +154,34 @@ Make `UpdateGoalArgs` deserialize `status`, `reason`, bounded `evidence`, and
 optional typed `blocker`. Convert it to `GoalUpdateIntent`. Do not add a store,
 session lookup, callback, or thread-local value to `orca-tools`.
 
-- [ ] **Step 3: Carry `GoalTurnContext` through runtime dispatch**
+- [ ] **Step 3: Format typed acknowledgements without runtime ownership**
 
-Extend the runtime invocation snapshot with a required `Option<GoalTurnContext>`
-that is `Some` only for Goal mode. Reject a visible Goal tool if the context is
-absent. The context must carry `goal_id`, `goal_run_id`, `outer_turn_id`,
-`session_id`, `origin`, and `GoalRuntimeHandle`; no function may reconstruct
-these from a thread id or current store row.
+Add a pure formatter that maps every `GoalUpdateAck` variant into an explicit
+model-facing `ToolResult`. Deferred intent output must say that terminal audit
+will run at outer-turn end. Rejected and inactive variants remain failed tool
+results; no formatter opens a store or claims the Goal already transitioned.
 
-- [ ] **Step 4: Add typed tool disposition and ack output**
-
-Replace the current boolean/implicit terminal behavior with:
+- [ ] **Step 4: Preserve compatibility normalization**
 
 ```rust
-pub enum RuntimeToolTurnDisposition {
-    ContinueModel,
-    StopTurn { reason: String },
-}
-
-pub struct RuntimeToolDispatchOutput {
-    pub result: ToolResult,
-    pub disposition: RuntimeToolTurnDisposition,
-}
+pub fn parse_update_intent(request: &ToolRequest) -> Result<GoalUpdateIntent, String>;
+pub fn acknowledgement_result(request: &ToolRequest, ack: &GoalUpdateAck) -> ToolResult;
 ```
 
-Forward `GoalUpdateAck` content into `ToolResult`. A malformed model argument
-uses `ContinueModel`; closed actor, stale fence, or persistence failure uses
-`StopTurn`.
+Continue accepting `completed: true`, `complete: true`, and `status:
+"completed"` as normalization aliases while the advertised schema exposes only
+`status: complete|blocked` plus reason/evidence/blocker.
 
 - [ ] **Step 5: Run protocol and runtime tests**
 
 ```bash
 cargo test -p orca-tools update_goal --lib
-cargo test -p orca-runtime runtime_special --lib
-cargo test -p orca-runtime tool_turn --lib
-cargo test -p orca-runtime --test runtime_host hosted_goal_tool -- --nocapture
 ```
 
 - [ ] **Step 6: Commit the protocol slice**
 
 ```bash
-git add crates/orca-tools/src/update_goal.rs crates/orca-runtime/src/runtime_special.rs crates/orca-runtime/src/tool_router.rs crates/orca-runtime/src/tool_turn.rs crates/orca-runtime/src/controller.rs
+git add crates/orca-tools/src/update_goal.rs
 git commit -m "feat(goal): make terminal updates typed runtime intents"
 ```
 
@@ -324,20 +307,34 @@ Start one GoalActor per RuntimeThread, expose `goal_runtime()` on
 `RuntimeThreadHandle`, and shut it down after the thread actor joins. TUI
 commands must use this handle instead of loading `GoalStore` directly.
 
-- [ ] **Step 4: Route terminal tools through the actor**
+- [ ] **Step 4: Carry explicit Goal context through dispatch**
+
+Extend the runtime invocation snapshot with a required `Option<GoalTurnContext>`
+that is `Some` only for Goal mode. The context carries `goal_id`, `goal_run_id`,
+`outer_turn_id`, `session_id`, `origin`, and `GoalRuntimeHandle`; no function
+reconstructs these from a thread id or current store row.
+
+- [ ] **Step 5: Route terminal tools through the actor**
 
 Change `RuntimeToolActorContext::execute_goal_tool` so it only parses the pure
 operation, validates `GoalTurnContext`, sends `SubmitIntent`, waits for the ack,
 and formats the result. Remove direct `GoalStore::update` and
 `validate_goal_terminal_update_against_extensions` from production dispatch.
 
-- [ ] **Step 5: Run actor tests and commit**
+- [ ] **Step 6: Add typed tool disposition**
+
+Return `ContinueModel` for malformed model arguments and typed actor rejections.
+Return `StopTurn` for missing visible capability, closed GoalActor, stale
+generation identity, or persistence failure. Record exactly one tool terminal
+before stopping the outer turn.
+
+- [ ] **Step 7: Run actor tests and commit**
 
 ```bash
 cargo test -p orca-runtime goal_actor --lib
 cargo test -p orca-runtime hosted_goal_tool --lib
 cargo test -p orca-runtime --test runtime_host goal_tools -- --nocapture
-git add crates/orca-runtime/src/goal_actor.rs crates/orca-runtime/src/runtime_host.rs crates/orca-runtime/src/thread.rs crates/orca-runtime/src/runtime_special.rs crates/orca-runtime/src/lib.rs
+git add crates/orca-runtime/src/goal_actor.rs crates/orca-runtime/src/runtime_host.rs crates/orca-runtime/src/thread.rs crates/orca-runtime/src/runtime_special.rs crates/orca-runtime/src/tool_router.rs crates/orca-runtime/src/tool_turn.rs crates/orca-runtime/src/controller.rs crates/orca-runtime/src/lib.rs
 git commit -m "feat(goal): add runtime goal actor ownership"
 ```
 
