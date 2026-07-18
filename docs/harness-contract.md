@@ -191,7 +191,7 @@ Built-in tools:
 | `update_plan` | read | Updates the visible plan state |
 | `get_goal` | read | Reads active persistent goal state while goal mode is running |
 | `create_goal` | read | Creates a persistent goal while goal mode is running and no unfinished goal exists |
-| `update_goal` | read | Marks the active persistent goal complete or blocked while goal mode is running |
+| `update_goal` | read | Submits an evidence-bearing complete/blocked intent for turn-end verification while Goal mode is running |
 
 Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list. Tool arguments are validated before execution with common JSON Schema object keywords, enums, arrays, and `oneOf` / `anyOf` composition.
 
@@ -223,10 +223,18 @@ Subagent events:
 
 Persistent goal mode:
 - `/goal` is a TUI feature, not a headless `orca exec` contract.
-- Goals are keyed by saved TUI session id and stored in `$ORCA_HOME/goals_1.json` or `~/.orca/goals_1.json`.
-- `get_goal`, `create_goal`, and `update_goal` are advertised only while a TUI goal turn has installed goal context. Outside goal mode they return failed tool results instead of creating hidden state.
-- `update_goal` only accepts `complete` or `blocked`; pause, resume, edit, clear, and budget/usage limiting are user or system controls.
-- Active goals auto-continue after successful turns until the status becomes `paused`, `blocked`, `usage_limited`, `budget_limited`, or `complete`.
+- Goals are keyed by saved TUI session id and stored transactionally in `$ORCA_HOME/goals.sqlite3` or `~/.orca/goals.sqlite3`. A validated `goals_1.json` is migrated once and backed up only after commit.
+- One runtime `GoalActor` owns state, outer-turn accounting, terminal intents, usage, and recovery. `RuntimeHost` owns the composite GoalRun and continuation admission; the TUI does not run a continuation loop.
+- Runtime owners share one in-process lease and use an exclusive cross-process `flock`. Only the first owner recovers stale in-flight runs; opening a `GoalStore` reader has no recovery side effect.
+- `get_goal`, `create_goal`, and `update_goal` are advertised only while a live Goal turn carries an explicit `GoalTurnContext`. Outside Goal mode they return failed tool results instead of creating hidden state.
+- `update_goal` accepts only evidence-bearing `complete` or typed `blocked` intents. The acknowledgement is deferred; only turn-end verifier output can persist `complete` or `blocked`.
+- Rejected terminal intents emit request/ack events but do not enter the SQLite pending-intent ledger. Accepted/deferred acknowledgements and persisted intent rows must match exactly.
+- Progress and stop policy use closed outer turns and structured verifier gaps. Inner model/tool iterations and token deltas do not advance the no-progress threshold.
+- Continuation is rejected for queued user input, cancellation, pending interaction, active workflow ownership, plan mode, duplicate generation fences, inactive state, exhausted budget, or the 64-outer-turn safety limit.
+- Pause, verifier/control-plane failure, crash recovery, and no-progress are typed resumable reasons. Resume starts a fresh run and generation fence; recovery never calls the provider automatically.
+- Active pause, interrupt, and shutdown persist `Paused(User)` before cancellation. `/goal pause` returns only after generation join, usage settlement, outer-turn closure, and clearing the in-flight run.
+- Goal/plan/runtime/skill steering uses bounded `InternalContextFragment` system messages outside transcript history. Tool-result content is never modified.
+- `goal.intent.requested`, `goal.intent.acknowledged`, turn/verification/transition events, typed continuation admitted/rejected events, and `goal.paused`, `goal.recovered`, and `goal.completed` are journaled and sent to TUI/ACP observers.
 
 ## Approval Policy
 

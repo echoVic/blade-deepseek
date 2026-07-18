@@ -119,6 +119,31 @@ function runProviderSummary(args) {
   console.log("Provider summary real API e2e verified");
 }
 
+function parseGoalMetrics(line, label) {
+  const separator = line.indexOf(":");
+  if (separator < 0) {
+    throw new Error(`${label} is missing a metric separator: ${line}`);
+  }
+  const entries = line
+    .slice(separator + 1)
+    .trim()
+    .split(/\s+/)
+    .map((entry) => entry.split("="));
+  if (entries.some(([key, value, extra]) => !key || value === undefined || extra !== undefined)) {
+    throw new Error(`${label} contains a malformed metric: ${line}`);
+  }
+  return Object.fromEntries(entries);
+}
+
+function requireGoalInteger(metrics, key, { positive = false } = {}) {
+  const value = Number(metrics[key]);
+  if (!Number.isInteger(value) || (positive ? value <= 0 : value < 0)) {
+    const qualifier = positive ? "positive " : "non-negative ";
+    throw new Error(`Goal Mode real API missing ${qualifier}${key}: ${JSON.stringify(metrics)}`);
+  }
+  return value;
+}
+
 function runGoalMode(args) {
   if (args.skipGoalMode) {
     console.log("Goal Mode real API e2e skipped");
@@ -147,8 +172,130 @@ function runGoalMode(args) {
       ],
       { env: { ...process.env, ORCA_HOME: home }, timeoutMs: args.timeoutMs },
     );
-    if (!output.includes("Goal Mode real API e2e verified:")) {
+    const lines = output.split(/\r?\n/);
+    const scenarioLines = lines.filter((line) =>
+      line.startsWith("Goal Mode real API scenario verified:"),
+    );
+    const scenarios = new Map();
+    for (const line of scenarioLines) {
+      const metrics = parseGoalMetrics(line, "Goal Mode real API scenario");
+      if (!metrics.scenario || scenarios.has(metrics.scenario)) {
+        throw new Error(`Goal Mode real API duplicate or unnamed scenario: ${line}`);
+      }
+      scenarios.set(metrics.scenario, metrics);
+    }
+
+    const expected = {
+      completion: { state: "complete", reason: "verified_complete", verifier: true },
+      rejected_completion: {
+        state: "paused",
+        reason: "paused",
+        rejectionCode: "plan_mode",
+        rejected: true,
+      },
+      blocked: { state: "blocked", reason: "verified_blocked", verifier: true },
+      cancellation: {
+        state: "paused",
+        reason: "paused",
+        pauseReason: "user",
+        cancelled: true,
+      },
+      resume: {
+        state: "complete",
+        reason: "verified_complete",
+        verifier: true,
+        resumed: true,
+      },
+    };
+    if (
+      scenarios.size !== Object.keys(expected).length ||
+      Object.keys(expected).some((scenario) => !scenarios.has(scenario))
+    ) {
+      throw new Error(
+        `Goal Mode real API scenario matrix mismatch: expected=${Object.keys(expected).join(",")} actual=${[
+          ...scenarios.keys(),
+        ].join(",")}`,
+      );
+    }
+
+    for (const [scenario, contract] of Object.entries(expected)) {
+      const metrics = scenarios.get(scenario);
+      for (const key of ["outer_turns", "usage_events", "charged_tokens", "journal_goal_events"]) {
+        requireGoalInteger(metrics, key, { positive: true });
+      }
+      for (const key of [
+        "update_goal_requests",
+        "update_goal_acks",
+        "accepted_acks",
+        "rejected_acks",
+        "persisted_intents",
+        "verifier_outcomes",
+        "verifier_tokens",
+        "cost_micros",
+        "continuations",
+        "stale_continuations",
+        "in_flight_runs",
+      ]) {
+        requireGoalInteger(metrics, key);
+      }
+      if (
+        metrics.state !== contract.state ||
+        metrics.reason !== contract.reason ||
+        (contract.rejectionCode && metrics.rejection_code !== contract.rejectionCode) ||
+        (contract.pauseReason && metrics.pause_reason !== contract.pauseReason) ||
+        metrics.update_goal_requests !== metrics.update_goal_acks ||
+        Number(metrics.accepted_acks) + Number(metrics.rejected_acks) !==
+          Number(metrics.update_goal_acks) ||
+        metrics.continuations !== "0" ||
+        metrics.stale_continuations !== "0" ||
+        metrics.in_flight_runs !== "0"
+      ) {
+        throw new Error(`Goal Mode real API ${scenario} audit mismatch: ${JSON.stringify(metrics)}`);
+      }
+      if (metrics.persisted_intents !== metrics.accepted_acks) {
+        throw new Error(
+          `Goal Mode real API ${scenario} persistence mismatch: ${JSON.stringify(metrics)}`,
+        );
+      }
+      if (
+        contract.verifier &&
+        (requireGoalInteger(metrics, "verifier_outcomes", { positive: true }) < 1 ||
+          requireGoalInteger(metrics, "verifier_tokens", { positive: true }) < 1)
+      ) {
+        throw new Error(`Goal Mode real API ${scenario} missed verifier audit`);
+      }
+      if (
+        contract.rejected &&
+        (requireGoalInteger(metrics, "rejected_acks", { positive: true }) < 1 ||
+          metrics.verifier_outcomes !== "0" ||
+          metrics.verifier_tokens !== "0")
+      ) {
+        throw new Error(`Goal Mode real API ${scenario} was not rejected before verification`);
+      }
+      if (
+        contract.cancelled &&
+        (metrics.update_goal_requests !== "0" ||
+          metrics.update_goal_acks !== "0" ||
+          metrics.verifier_outcomes !== "0")
+      ) {
+        throw new Error(`Goal Mode real API ${scenario} crossed a terminal-intent boundary`);
+      }
+      if (contract.resumed && requireGoalInteger(metrics, "resume_turns", { positive: true }) < 1) {
+        throw new Error(`Goal Mode real API ${scenario} did not record a resume-origin turn`);
+      }
+    }
+
+    const summary = lines.find((line) => line.startsWith("Goal Mode real API e2e verified:"));
+    if (!summary) {
       throw new Error(`Goal Mode real API e2e did not report success:\n${output}`);
+    }
+    const aggregate = parseGoalMetrics(summary, "Goal Mode real API aggregate");
+    if (
+      aggregate.scenarios !== String(Object.keys(expected).length) ||
+      aggregate.stale_continuations !== "0" ||
+      aggregate.in_flight_runs !== "0"
+    ) {
+      throw new Error(`Goal Mode real API aggregate mismatch: ${summary}`);
     }
     console.log(output.trim());
   } finally {

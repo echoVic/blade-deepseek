@@ -30,7 +30,14 @@ case "$*" in
     printf 'ALL TARGETS MET\\n'
     ;;
   "run -p orca-runtime --example goal_mode_realapi -- --max-budget 0.01")
-    printf 'Goal Mode real API e2e verified: status=complete non_goal_tools=1 update_goal_calls=1 continuations=0\\n'
+    printf 'Goal Mode real API scenario verified: scenario=completion state=complete reason=verified_complete outer_turns=1 update_goal_requests=1 update_goal_acks=1 accepted_acks=1 rejected_acks=0 persisted_intents=1 verifier_outcomes=1 verifier_tokens=42 usage_events=2 charged_tokens=320 cost_micros=4 journal_goal_events=10 continuations=0 stale_continuations=0 in_flight_runs=0\\n'
+    rejected_persisted_intents="\${ORCA_FAKE_GOAL_REJECTED_PERSISTED_INTENTS:-0}"
+    printf 'Goal Mode real API scenario verified: scenario=rejected_completion state=paused reason=paused rejection_code=plan_mode outer_turns=1 update_goal_requests=1 update_goal_acks=1 accepted_acks=0 rejected_acks=1 persisted_intents=%s verifier_outcomes=0 verifier_tokens=0 usage_events=1 charged_tokens=180 cost_micros=2 journal_goal_events=8 continuations=0 stale_continuations=0 in_flight_runs=0\\n' "$rejected_persisted_intents"
+    printf 'Goal Mode real API scenario verified: scenario=blocked state=blocked reason=verified_blocked outer_turns=1 update_goal_requests=1 update_goal_acks=1 accepted_acks=1 rejected_acks=0 persisted_intents=1 verifier_outcomes=1 verifier_tokens=38 usage_events=2 charged_tokens=280 cost_micros=3 journal_goal_events=10 continuations=0 stale_continuations=0 in_flight_runs=0\\n'
+    pause_reason="\${ORCA_FAKE_GOAL_PAUSE_REASON:-user}"
+    printf 'Goal Mode real API scenario verified: scenario=cancellation state=paused reason=paused pause_reason=%s outer_turns=1 update_goal_requests=0 update_goal_acks=0 accepted_acks=0 rejected_acks=0 persisted_intents=0 verifier_outcomes=0 verifier_tokens=0 usage_events=1 charged_tokens=120 cost_micros=1 journal_goal_events=6 continuations=0 stale_continuations=0 in_flight_runs=0\\n' "$pause_reason"
+    printf 'Goal Mode real API scenario verified: scenario=resume state=complete reason=verified_complete resume_turns=1 outer_turns=2 update_goal_requests=1 update_goal_acks=1 accepted_acks=1 rejected_acks=0 persisted_intents=1 verifier_outcomes=1 verifier_tokens=40 usage_events=3 charged_tokens=360 cost_micros=5 journal_goal_events=17 continuations=0 stale_continuations=0 in_flight_runs=0\\n'
+    printf 'Goal Mode real API e2e verified: scenarios=5 stale_continuations=0 in_flight_runs=0\\n'
     ;;
   *) exit 42 ;;
 esac
@@ -625,7 +632,12 @@ if (args[0] === "--mode" && args[1] === "server") {
   for (const expected of [
     "Build verified",
     "Provider summary real API e2e verified",
-    "Goal Mode real API e2e verified: status=complete non_goal_tools=1 update_goal_calls=1 continuations=0",
+    "Goal Mode real API scenario verified: scenario=completion state=complete reason=verified_complete",
+    "Goal Mode real API scenario verified: scenario=rejected_completion state=paused reason=paused rejection_code=plan_mode",
+    "Goal Mode real API scenario verified: scenario=blocked state=blocked reason=verified_blocked",
+    "Goal Mode real API scenario verified: scenario=cancellation state=paused reason=paused pause_reason=user",
+    "Goal Mode real API scenario verified: scenario=resume state=complete reason=verified_complete resume_turns=1",
+    "Goal Mode real API e2e verified: scenarios=5 stale_continuations=0 in_flight_runs=0",
     "CLI real API e2e verified: ORCA_REAL_E2E_OK",
     "History replay real API e2e verified: ORCA_HISTORY_REPLAY_OK",
     "History replay repair verified: legacy-missing-tool-call status=indeterminate terminalSource=compatibility_repair",
@@ -716,7 +728,16 @@ if (args[0] === "--mode" && args[1] === "server") {
   try {
     execFileSync(
       "node",
-      [script, "--orca-bin", orcaBin],
+      [
+        script,
+        "--orca-bin",
+        orcaBin,
+        "--max-budget",
+        "0.01",
+        "--skip-build",
+        "--skip-provider-summary",
+        "--skip-server",
+      ],
       {
         cwd: repoRoot,
         env: {
@@ -731,6 +752,82 @@ if (args[0] === "--mode" && args[1] === "server") {
     throw new Error("real-api-e2e should fail when the CLI sentinel is missing");
   } catch (error) {
     if (error.message.includes("real-api-e2e should fail")) {
+      throw error;
+    }
+    const failure = `${error.stdout ?? ""}\n${error.stderr ?? ""}`;
+    if (!failure.includes("CLI real API e2e missing sentinel")) {
+      throw error;
+    }
+  }
+
+  try {
+    execFileSync(
+      "node",
+      [
+        script,
+        "--orca-bin",
+        orcaBin,
+        "--max-budget",
+        "0.01",
+        "--skip-build",
+        "--skip-provider-summary",
+        "--skip-cli",
+        "--skip-server",
+      ],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+          ORCA_FAKE_GOAL_PAUSE_REASON: "infrastructure",
+        },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    throw new Error("real-api-e2e should fail when Goal cancellation has the wrong pause reason");
+  } catch (error) {
+    if (error.message.includes("real-api-e2e should fail")) {
+      throw error;
+    }
+    const failure = `${error.stdout ?? ""}\n${error.stderr ?? ""}`;
+    if (!failure.includes("Goal Mode real API cancellation audit mismatch")) {
+      throw error;
+    }
+  }
+
+  try {
+    execFileSync(
+      "node",
+      [
+        script,
+        "--orca-bin",
+        orcaBin,
+        "--max-budget",
+        "0.01",
+        "--skip-build",
+        "--skip-provider-summary",
+        "--skip-cli",
+        "--skip-server",
+      ],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+          ORCA_FAKE_GOAL_REJECTED_PERSISTED_INTENTS: "1",
+        },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    throw new Error("real-api-e2e should fail when a rejected Goal intent is persisted");
+  } catch (error) {
+    if (error.message.includes("real-api-e2e should fail")) {
+      throw error;
+    }
+    const failure = `${error.stdout ?? ""}\n${error.stderr ?? ""}`;
+    if (!failure.includes("Goal Mode real API rejected_completion persistence mismatch")) {
       throw error;
     }
   }

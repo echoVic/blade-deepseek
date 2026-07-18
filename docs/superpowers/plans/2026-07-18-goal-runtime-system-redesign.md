@@ -413,7 +413,7 @@ git commit -m "feat(goal): own continuation in composite runtime operation"
 - Modify: `crates/orca-runtime/src/runtime_special.rs`
 - Test: verifier/tracker/runtime integration modules
 
-- [ ] **Step 1: Add RED verifier tests**
+- [x] **Step 1: Add RED verifier tests**
 
 Cover achieved, not achieved with gaps, genuine external blocked, false blocked,
 indeterminate, classifier cap, active workflow preflight, missing tool terminal,
@@ -421,33 +421,33 @@ and token budget boundary. The false-blocked fixture must contain a roadmap with
 viable model-fixable alternatives and assert `Paused(NoProgress)` rather than
 `Blocked`.
 
-- [ ] **Step 2: Implement deterministic preflight**
+- [x] **Step 2: Implement deterministic preflight**
 
 Reject stale ids, active workflows for completion, empty terminal evidence,
 missing terminal tool results, in-flight state, exhausted budget, and invalid
 blocker kinds before any verifier provider request.
 
-- [ ] **Step 3: Implement the verifier port and DeepSeek adapter**
+- [x] **Step 3: Implement the verifier port and DeepSeek adapter**
 
 Add a closed structured JSON schema, no tools, bounded input/evidence size,
 bounded output tokens, cancellation propagation, and usage accounting with a
 unique `verifier:<outer_turn_id>:<attempt>` usage-event id. Provider errors map
 to `Indeterminate`, then `Paused(Infrastructure)`.
 
-- [ ] **Step 4: Implement progress and budget decisions**
+- [x] **Step 4: Implement progress and budget decisions**
 
 Use outer-turn gap fingerprints and evidence as the primary signal. Three
 successful identical model-fixable gaps become `Paused(NoProgress)`. Charge
 input plus output once; cache tokens are diagnostic only. Budget exhaustion
 becomes `BudgetLimited` and rejects continuation.
 
-- [ ] **Step 5: Test cancellation and failure paths**
+- [x] **Step 5: Test cancellation and failure paths**
 
 Verify provider error, tool control-plane error, approval wait, user input wait,
 cancellation, and verifier cancellation all close the outer ledger and cannot
 auto-continue an active Goal.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```bash
 cargo test -p orca-runtime goal_verifier --lib
@@ -471,41 +471,41 @@ git commit -m "feat(goal): verify terminal claims and classify progress"
 - Modify: `crates/orca-tui/src/ui.rs`
 - Test: conversation/provider/event/TUI modules
 
-- [ ] **Step 1: Add RED role-safety tests**
+- [x] **Step 1: Add RED role-safety tests**
 
 Build a conversation ending with an assistant tool call and tool result, install
 a Goal fragment, and assert the output contains a separate system message, the
 tool result bytes are unchanged, and repeated updates do not add transcript
 messages. Add event payload tests for all Goal semantic events.
 
-- [ ] **Step 2: Implement `InternalContextFragment`**
+- [x] **Step 2: Implement `InternalContextFragment`**
 
 Store fragments outside `Conversation.messages`; bound each fragment by token
 count and replace by id. Render Goal state after canonical system instructions
 and before user/tool history. Keep plan/runtime/skill fragments on the same
 structured path.
 
-- [ ] **Step 3: Add semantic Goal events**
+- [x] **Step 3: Add semantic Goal events**
 
 Add event factory methods and JSON payloads for created, run/turn started,
 intent requested/acknowledged, turn finished, verification, transition,
 continuation admission, pause, recovery, and complete. Preserve sequence and
 observer failure semantics.
 
-- [ ] **Step 4: Migrate TUI commands**
+- [x] **Step 4: Migrate TUI commands**
 
 Route `/goal`, `/goal edit`, `/goal pause`, `/goal resume`, and `/goal clear`
 through `RuntimeThreadHandle` commands. The TUI may display a compatibility
 `ThreadGoal` projection but must not open or mutate the GoalStore directly.
 Render pause reason, current outer turn, last gap/blocker, and charged usage.
 
-- [ ] **Step 5: Migrate ACP projection**
+- [x] **Step 5: Migrate ACP projection**
 
 Map Goal semantic events to existing ACP item/event types without creating a
 second Goal state machine. Add read/control methods only through the same typed
 runtime handle.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 ```bash
 cargo test -p orca-core conversation --lib
@@ -529,21 +529,21 @@ git commit -m "feat(goal): project role-safe runtime state to frontends"
 - Delete production paths: old TUI loop, direct JSON mutation, stale progress
   extension, and last-message Goal overlay logic
 
-- [ ] **Step 1: Add RED real-harness assertions**
+- [x] **Step 1: Add RED real-harness assertions**
 
 Extend the isolated real-API case to record outer turns, continuation admission,
 update request/ack counts, verifier result, usage, final state, and zero stale
 continuations. Add cases for completion, rejected completion, genuine blocked,
 cancellation, and resume.
 
-- [ ] **Step 2: Update user-facing contracts**
+- [x] **Step 2: Update user-facing contracts**
 
 Document SQLite location/migration, typed statuses/reasons, turn-end audit,
 pause/recovery behavior, evidence schema, and the fact that `orca exec` does
 not expose Goal tools. Mark old JSON/TUI-loop documents as historical when the
 new path is live.
 
-- [ ] **Step 3: Delete obsolete production paths**
+- [x] **Step 3: Delete obsolete production paths**
 
 Run searches and remove every production reference to:
 
@@ -567,7 +567,7 @@ git diff --check
 The known baseline workflow failure must be fixed as a separate commit or
 explicitly resolved before this Goal branch can claim a clean full gate.
 
-- [ ] **Step 5: Run real DeepSeek validation**
+- [x] **Step 5: Run real DeepSeek validation**
 
 With a fresh isolated `ORCA_HOME` and a real API key, run the bounded Goal
 harness. Inspect the JSONL event journal and SQLite rows, not only the final
