@@ -1,18 +1,8 @@
-use std::cell::RefCell;
-use std::sync::Arc;
-
 use orca_core::goal_types::{
     GoalUpdate, ThreadGoal, ThreadGoalStatus, goal_usage_summary, validate_thread_goal_objective,
 };
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use serde::Deserialize;
-
-type GoalHandler =
-    Arc<dyn Fn(GoalToolOperation) -> Result<Option<ThreadGoal>, String> + Send + Sync>;
-
-thread_local! {
-    static GOAL_HANDLER: RefCell<Option<GoalHandler>> = RefCell::new(None);
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalToolOperation {
@@ -43,42 +33,77 @@ pub struct UpdateGoalArgs {
 const UPDATE_GOAL_STATUS_FLAG_KEYS: [&str; 3] = ["complete", "completed", "blocked"];
 
 pub fn execute_get(request: &ToolRequest) -> ToolResult {
-    match parse_get_args(request).and_then(|()| dispatch(GoalToolOperation::Get)) {
-        Ok(Some(goal)) => ToolResult::completed(request, format_goal("Goal active.", &goal), false),
-        Ok(None) => ToolResult::completed(request, "No goal is currently set.".to_string(), false),
-        Err(error) => ToolResult::failed(request, error, None),
-    }
+    execute_unavailable(request)
 }
 
 pub fn execute_create(request: &ToolRequest) -> ToolResult {
-    match parse_create_args(request).and_then(|args| {
-        dispatch(GoalToolOperation::Create {
+    execute_unavailable(request)
+}
+
+pub fn execute_update(request: &ToolRequest) -> ToolResult {
+    execute_unavailable(request)
+}
+
+pub fn parse_operation(request: &ToolRequest) -> Result<GoalToolOperation, String> {
+    match request.name {
+        ToolName::GetGoal => parse_get_args(request).map(|()| GoalToolOperation::Get),
+        ToolName::CreateGoal => parse_create_args(request).map(|args| GoalToolOperation::Create {
             objective: args.objective,
             token_budget: args.token_budget,
-        })
-    }) {
-        Ok(Some(goal)) => {
-            ToolResult::completed(request, format_goal("Goal created.", &goal), false)
+        }),
+        ToolName::UpdateGoal => parse_update_args(request).map(|args| {
+            GoalToolOperation::Update(GoalUpdate {
+                objective: None,
+                status: args.status,
+                token_budget: None,
+            })
+        }),
+        _ => Err(format!(
+            "unsupported goal tool operation: {}",
+            request.name.as_str()
+        )),
+    }
+}
+
+pub fn completed_result(request: &ToolRequest, goal: Option<&ThreadGoal>) -> ToolResult {
+    match (&request.name, goal) {
+        (ToolName::GetGoal, Some(goal)) => {
+            ToolResult::completed(request, format_goal("Goal active.", goal), false)
         }
-        Ok(None) => ToolResult::failed(
+        (ToolName::GetGoal, None) => {
+            ToolResult::completed(request, "No goal is currently set.".to_string(), false)
+        }
+        (ToolName::CreateGoal, Some(goal)) => {
+            ToolResult::completed(request, format_goal("Goal created.", goal), false)
+        }
+        (ToolName::CreateGoal, None) => ToolResult::failed(
             request,
             "cannot create a goal because an unfinished goal already exists",
             None,
         ),
-        Err(error) => ToolResult::failed(request, error, None),
+        (ToolName::UpdateGoal, Some(goal)) => ToolResult::completed(
+            request,
+            format_goal(&format!("Goal {}.", goal_status_word(goal.status)), goal),
+            false,
+        ),
+        (ToolName::UpdateGoal, None) => {
+            ToolResult::failed(request, "no goal is currently set", None)
+        }
+        _ => unavailable_result(request),
     }
 }
 
-pub fn execute_update(request: &ToolRequest) -> ToolResult {
-    match parse_update_args(request)
-        .and_then(|args| dispatch(GoalToolOperation::Update(update_from_args(args))))
-    {
-        Ok(Some(goal)) => ToolResult::completed(
-            request,
-            format_goal(&format!("Goal {}.", goal_status_word(goal.status)), &goal),
-            false,
-        ),
-        Ok(None) => ToolResult::failed(request, "no goal is currently set", None),
+pub fn unavailable_result(request: &ToolRequest) -> ToolResult {
+    ToolResult::failed(
+        request,
+        "goal tools are only available while goal mode is active",
+        None,
+    )
+}
+
+fn execute_unavailable(request: &ToolRequest) -> ToolResult {
+    match parse_operation(request) {
+        Ok(_) => unavailable_result(request),
         Err(error) => ToolResult::failed(request, error, None),
     }
 }
@@ -193,40 +218,6 @@ pub fn normalized_update_raw_arguments(raw: &str) -> String {
     normalize_update_raw_arguments(raw).unwrap_or_else(|| raw.to_string())
 }
 
-pub fn with_goal_handler<R>(handler: GoalHandler, f: impl FnOnce() -> R) -> R {
-    struct Reset(Option<GoalHandler>);
-
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            let previous = self.0.take();
-            GOAL_HANDLER.with(|slot| {
-                *slot.borrow_mut() = previous;
-            });
-        }
-    }
-
-    let previous = GOAL_HANDLER.with(|slot| slot.borrow_mut().replace(handler));
-    let _reset = Reset(previous);
-    f()
-}
-
-fn dispatch(operation: GoalToolOperation) -> Result<Option<ThreadGoal>, String> {
-    GOAL_HANDLER.with(|slot| {
-        let Some(handler) = slot.borrow().clone() else {
-            return Err("goal tools are only available while goal mode is active".to_string());
-        };
-        handler(operation)
-    })
-}
-
-fn update_from_args(args: UpdateGoalArgs) -> GoalUpdate {
-    GoalUpdate {
-        objective: None,
-        status: args.status,
-        token_budget: None,
-    }
-}
-
 fn format_goal(prefix: &str, goal: &ThreadGoal) -> String {
     format!("{prefix}\n{}", goal_usage_summary(goal))
 }
@@ -248,7 +239,6 @@ mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{ToolName, ToolStatus};
-    use std::sync::{Arc, Mutex};
 
     fn request(name: ToolName, arguments: &str) -> ToolRequest {
         ToolRequest {
@@ -379,58 +369,36 @@ mod tests {
     }
 
     #[test]
-    fn execute_get_uses_installed_goal_context() {
-        let handler: GoalHandler = Arc::new(move |operation| {
-            assert_eq!(operation, GoalToolOperation::Get);
-            Ok(Some(sample_goal(ThreadGoalStatus::Active)))
-        });
-
-        let result = with_goal_handler(handler, || execute_get(&request(ToolName::GetGoal, "{}")));
+    fn completed_get_result_formats_goal_context() {
+        let request = request(ToolName::GetGoal, "{}");
+        let goal = sample_goal(ThreadGoalStatus::Active);
+        let result = completed_result(&request, Some(&goal));
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert!(result.output.unwrap().contains("Goal active."));
     }
 
     #[test]
-    fn execute_create_reports_unfinished_existing_goal() {
-        let handler: GoalHandler = Arc::new(move |operation| {
-            assert!(matches!(operation, GoalToolOperation::Create { .. }));
-            Ok(None)
-        });
-
-        let result = with_goal_handler(handler, || {
-            execute_create(&request(
-                ToolName::CreateGoal,
-                r#"{"objective":"ship goals"}"#,
-            ))
-        });
+    fn completed_create_result_reports_unfinished_existing_goal() {
+        let request = request(ToolName::CreateGoal, r#"{"objective":"ship goals"}"#);
+        let result = completed_result(&request, None);
 
         assert_eq!(result.status, ToolStatus::Failed);
         assert!(result.error.as_deref().unwrap().contains("unfinished goal"));
     }
 
     #[test]
-    fn execute_update_uses_installed_goal_context() {
-        let seen = Arc::new(Mutex::new(None));
-        let seen_for_handler = Arc::clone(&seen);
-        let handler: GoalHandler = Arc::new(move |operation| {
-            if let GoalToolOperation::Update(update) = operation {
-                *seen_for_handler.lock().unwrap() = Some(update.clone());
-                Ok(Some(sample_goal(update.status.unwrap())))
-            } else {
-                panic!("expected update");
-            }
-        });
-
-        let result = with_goal_handler(handler, || {
-            execute_update(&request(ToolName::UpdateGoal, r#"{"status":"complete"}"#))
-        });
+    fn parse_and_format_completed_update_operation() {
+        let request = request(ToolName::UpdateGoal, r#"{"status":"complete"}"#);
+        let operation = parse_operation(&request).unwrap();
+        let GoalToolOperation::Update(update) = operation else {
+            panic!("expected update operation");
+        };
+        let goal = sample_goal(update.status.unwrap());
+        let result = completed_result(&request, Some(&goal));
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert!(result.output.unwrap().contains("Goal complete."));
-        assert_eq!(
-            seen.lock().unwrap().as_ref().unwrap().status,
-            Some(ThreadGoalStatus::Complete)
-        );
+        assert_eq!(update.status, Some(ThreadGoalStatus::Complete));
     }
 }

@@ -2,8 +2,10 @@ use std::io;
 use std::path::Path;
 
 use orca_core::approval_types::ApprovalMode;
+use orca_core::goal_types::ThreadGoalStatus;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_tools::update_goal::GoalToolOperation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -28,6 +30,9 @@ struct RuntimePermissionRequestArgs {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeSpecialToolDispatch {
+    GetGoal,
+    CreateGoal,
+    UpdateGoal,
     WorkflowDraft,
     WorkflowDraftAction,
     Workflow,
@@ -41,6 +46,17 @@ pub enum RuntimeSpecialToolDispatch {
     Normal,
 }
 
+pub(crate) enum RuntimeGoalToolOutcome {
+    Continue(ToolResult),
+    StopTurn(ToolResult),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeGoalToolRequest<'a> {
+    pub(crate) persistent_session_id: Option<&'a str>,
+    pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeWorkflowDraftRequest<'a> {
     pub workflows_enabled: bool,
@@ -50,8 +66,15 @@ pub struct RuntimeWorkflowDraftRequest<'a> {
 }
 
 impl RuntimeToolActorContext {
-    pub fn classify_dispatch(&self, request: &ToolRequest) -> RuntimeSpecialToolDispatch {
+    pub fn classify_dispatch(
+        &self,
+        request: &ToolRequest,
+        goal_mode: bool,
+    ) -> RuntimeSpecialToolDispatch {
         match request.name {
+            ToolName::GetGoal if goal_mode => RuntimeSpecialToolDispatch::GetGoal,
+            ToolName::CreateGoal if goal_mode => RuntimeSpecialToolDispatch::CreateGoal,
+            ToolName::UpdateGoal if goal_mode => RuntimeSpecialToolDispatch::UpdateGoal,
             ToolName::WorkflowDraft => RuntimeSpecialToolDispatch::WorkflowDraft,
             ToolName::WorkflowDraftAction => RuntimeSpecialToolDispatch::WorkflowDraftAction,
             ToolName::Workflow => RuntimeSpecialToolDispatch::Workflow,
@@ -69,6 +92,76 @@ impl RuntimeToolActorContext {
             | ToolName::WorkflowCompleteTask
             | ToolName::WorkflowListTasks => RuntimeSpecialToolDispatch::WorkflowIpc,
             _ => RuntimeSpecialToolDispatch::Normal,
+        }
+    }
+
+    pub(crate) fn execute_goal_tool(
+        &mut self,
+        request: &ToolRequest,
+        context: RuntimeGoalToolRequest<'_>,
+    ) -> RuntimeGoalToolOutcome {
+        let Some(session_id) = context.persistent_session_id else {
+            return RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
+                request,
+                "goal tools require a persistent session owned by the live runtime",
+                None,
+            ));
+        };
+        let Some(extension_stores) = context.extension_stores else {
+            return RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
+                request,
+                "goal tools require live runtime extension context",
+                None,
+            ));
+        };
+        let operation = match orca_tools::update_goal::parse_operation(request) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return RuntimeGoalToolOutcome::Continue(ToolResult::failed(request, error, None));
+            }
+        };
+        let mut store = crate::goals::GoalStore::load_default();
+        let result = match operation {
+            GoalToolOperation::Get => store.get(session_id),
+            GoalToolOperation::Create {
+                objective,
+                token_budget,
+            } => match store.get(session_id) {
+                Ok(Some(goal)) if goal.status.should_continue() || !goal.status.is_terminal() => {
+                    Ok(None)
+                }
+                Ok(_) => store
+                    .replace(
+                        session_id,
+                        &objective,
+                        ThreadGoalStatus::Active,
+                        token_budget,
+                    )
+                    .map(Some),
+                Err(error) => Err(error),
+            },
+            GoalToolOperation::Update(update) => {
+                if let Err(error) = crate::goals::validate_goal_terminal_update_against_extensions(
+                    &update,
+                    extension_stores.thread_store(),
+                ) {
+                    return RuntimeGoalToolOutcome::Continue(ToolResult::failed(
+                        request, error, None,
+                    ));
+                }
+                store.update(session_id, update)
+            }
+        };
+
+        match result {
+            Ok(goal) => RuntimeGoalToolOutcome::Continue(
+                orca_tools::update_goal::completed_result(request, goal.as_ref()),
+            ),
+            Err(error) => RuntimeGoalToolOutcome::StopTurn(ToolResult::failed(
+                request,
+                format!("failed to access persistent goal state: {error}"),
+                None,
+            )),
         }
     }
 

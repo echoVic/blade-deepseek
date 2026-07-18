@@ -210,7 +210,8 @@ pub(crate) fn should_run_readonly_batch(
     max_read_parallel: usize,
     tool_request: &ToolRequest,
 ) -> bool {
-    orca_tools::should_run_readonly_batch(max_read_parallel, tool_request)
+    !is_goal_control_tool(tool_request)
+        && orca_tools::should_run_readonly_batch(max_read_parallel, tool_request)
 }
 
 pub(crate) fn collect_readonly_batch(
@@ -218,7 +219,21 @@ pub(crate) fn collect_readonly_batch(
     tool_requests: &[ToolRequest],
     start: usize,
 ) -> usize {
-    orca_tools::collect_readonly_batch(max_read_parallel, tool_requests, start)
+    let end = orca_tools::collect_readonly_batch(max_read_parallel, tool_requests, start);
+    tool_requests[start..end]
+        .iter()
+        .position(is_goal_control_tool)
+        .map(|offset| start + offset)
+        .unwrap_or(end)
+}
+
+fn is_goal_control_tool(request: &ToolRequest) -> bool {
+    matches!(
+        request.name,
+        orca_core::tool_types::ToolName::GetGoal
+            | orca_core::tool_types::ToolName::CreateGoal
+            | orca_core::tool_types::ToolName::UpdateGoal
+    )
 }
 
 pub(crate) fn record_readonly_batch_results(

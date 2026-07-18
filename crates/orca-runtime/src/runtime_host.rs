@@ -972,7 +972,7 @@ impl RuntimeThreadStartRequest {
 pub enum RuntimeThreadMutation {
     SetModel(Option<String>),
     AddPinnedContext(String),
-    ReplaceGoalContext(String),
+    ReplaceGoalContext(Option<String>),
     ReplaceSkillContext(Option<String>),
 }
 
@@ -1976,6 +1976,14 @@ impl ThreadActor {
                 let config = config
                     .map(|config| *config)
                     .unwrap_or_else(|| self.config.clone());
+                if request.allows_goal_tools() && state.thread.session().session_id().is_none() {
+                    self.state = Some(state);
+                    let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                        message: "goal tools require a persistent session before turn execution"
+                            .to_string(),
+                    }));
+                    return;
+                }
                 if let Err(error) =
                     request.prepare_background_continuation(state.thread.session().task_registry())
                 {
@@ -2284,6 +2292,7 @@ impl ThreadActor {
                 usage_delta,
                 started_at.elapsed().as_secs() as i64,
             );
+            stall_active_goal_after_failed_generation(&mut state, &task_request, &outcome);
             OperationTaskResult {
                 state,
                 writer,
@@ -3230,6 +3239,35 @@ fn account_goal_usage_for_generation(
         usage_delta.total_tokens() as i64,
         elapsed_secs,
     );
+}
+
+fn stall_active_goal_after_failed_generation(
+    state: &mut ThreadActorState,
+    request: &HostedTurnRequest,
+    outcome: &GenerationTaskOutcome,
+) {
+    if !request.allows_goal_tools() || !request.tracks_goal_usage() {
+        return;
+    }
+    let failed = match outcome {
+        GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed { status, .. }) => {
+            *status != RunStatus::Success
+        }
+        GenerationTaskOutcome::Executed(ThreadOperationOutcome::ProviderSuspended { .. }) => false,
+        GenerationTaskOutcome::ExecutionFailed { .. } | GenerationTaskOutcome::Panicked { .. } => {
+            true
+        }
+    };
+    if !failed {
+        return;
+    }
+    let Some(session_id) = state.thread.session().session_id() else {
+        return;
+    };
+    if let Err(error) = crate::goals::GoalStore::load_default().stall_if_active(session_id) {
+        eprintln!("orca: warning: failed to stall goal after failed generation: {error}");
+    }
+    state.thread.session_mut().replace_goal_context(None);
 }
 
 fn usage_totals_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {

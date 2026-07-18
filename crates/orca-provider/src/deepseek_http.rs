@@ -1455,7 +1455,7 @@ mod tests {
         conv.add_system("system prompt".to_string());
         conv.add_user("do something".to_string());
         conv.replace_plan_state("[Plan]\n1. step one".to_string());
-        conv.replace_goal_state("build a widget".to_string());
+        conv.replace_goal_state(Some("build a widget".to_string()));
 
         let messages = conversation_to_api_messages(&conv);
         assert_eq!(messages.len(), 2);

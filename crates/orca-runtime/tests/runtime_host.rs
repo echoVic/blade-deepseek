@@ -1196,6 +1196,42 @@ fn headless_session_writer_failure_is_typed_before_turn_execution() {
 }
 
 #[test]
+fn goal_tools_require_persistent_session_before_turn_execution() {
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+        message: "must not execute".to_string(),
+        status: RunStatus::Success,
+    }]));
+    let (_cwd, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    assert!(thread.session_id().is_none());
+
+    let result = thread.start_turn(
+        HostedTurnRequest::new("goal").with_goal_tools(true),
+        SharedWriter::default(),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(operation) => {
+            let terminal = operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("unexpected goal turn terminal");
+            host.shutdown().expect("shutdown runtime host");
+            panic!("goal tools without a persistent session reached the executor: {terminal:?}");
+        }
+    };
+
+    assert!(
+        matches!(
+            &error,
+            RuntimeHostError::ThreadStartFailed { message }
+                if message.contains("goal tools") && message.contains("persistent session")
+        ),
+        "unexpected admission error: {error:?}"
+    );
+    assert_eq!(executor.call_count(), 0);
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
 fn host_shutdown_joins_headless_session_before_terminal_completion() {
     let finished = Arc::new(AtomicBool::new(false));
     let executor = Arc::new(ScriptedExecutor::new([TestBehavior::WaitForCancel {
@@ -1625,9 +1661,9 @@ fn typed_idle_session_commands_mutate_only_actor_owned_state() {
         ))
         .expect("add pinned context");
     thread
-        .mutate(RuntimeThreadMutation::ReplaceGoalContext(
+        .mutate(RuntimeThreadMutation::ReplaceGoalContext(Some(
             "goal context".to_string(),
-        ))
+        )))
         .expect("replace goal context");
     thread
         .mutate(RuntimeThreadMutation::ReplaceSkillContext(Some(
@@ -1655,6 +1691,19 @@ fn typed_idle_session_commands_mutate_only_actor_owned_state() {
     assert!(snapshot.messages().iter().any(|message| {
         matches!(message, Message::User { content, pinned: true } if content == "remember this")
     }));
+
+    thread
+        .mutate(RuntimeThreadMutation::ReplaceGoalContext(None))
+        .expect("clear goal context");
+    assert!(
+        thread
+            .snapshot()
+            .expect("read cleared snapshot")
+            .conversation()
+            .volatile
+            .goal
+            .is_none()
+    );
 
     host.shutdown().expect("shutdown runtime host");
 }
@@ -3350,6 +3399,73 @@ fn turn_without_goal_usage_tracking_does_not_account() {
             &OperationOutcome::Completed(RunStatus::Success)
         );
         assert_eq!(store.get(&session_id).unwrap().unwrap().tokens_used, 0);
+
+        host.shutdown().expect("shutdown runtime host");
+    });
+}
+
+#[test]
+fn failed_goal_generation_stalls_active_goal_and_clears_context() {
+    with_orca_home(|_home| {
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::RecordUsage {
+            input_tokens: 200,
+            output_tokens: 100,
+            status: RunStatus::Failed,
+        }]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).expect("start runtime host");
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "failed goal generation")
+            .expect("start runtime thread");
+        let session_id = thread
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let mut store = orca_runtime::goals::GoalStore::load_default();
+        store
+            .replace(
+                &session_id,
+                "fail once and stop",
+                orca_core::goal_types::ThreadGoalStatus::Active,
+                None,
+            )
+            .unwrap();
+        thread
+            .mutate(RuntimeThreadMutation::ReplaceGoalContext(Some(
+                "active goal context".to_string(),
+            )))
+            .expect("install goal context");
+
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("goal turn")
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true),
+                SharedWriter::default(),
+            )
+            .expect("start goal turn");
+        assert_eq!(
+            operation
+                .wait_timeout(TEST_TIMEOUT)
+                .expect("failed goal terminal")
+                .outcome(),
+            &OperationOutcome::Completed(RunStatus::Failed)
+        );
+        assert_eq!(
+            store.get(&session_id).unwrap().unwrap().status,
+            orca_core::goal_types::ThreadGoalStatus::Stalled
+        );
+        assert!(
+            thread
+                .snapshot()
+                .expect("failed goal snapshot")
+                .conversation()
+                .volatile
+                .goal
+                .is_none()
+        );
 
         host.shutdown().expect("shutdown runtime host");
     });

@@ -294,6 +294,22 @@ impl GoalStore {
         Ok(Some(goal))
     }
 
+    pub fn stall_if_active(&mut self, session_id: &str) -> io::Result<Option<ThreadGoal>> {
+        let _guard = goal_db_mutation_lock();
+        let mut db = self.load()?;
+        let Some(goal) = db.goals.get_mut(session_id) else {
+            return Ok(None);
+        };
+        if goal.status != ThreadGoalStatus::Active {
+            return Ok(Some(goal.clone()));
+        }
+        goal.status = ThreadGoalStatus::Stalled;
+        goal.updated_at = now_timestamp();
+        let goal = goal.clone();
+        self.save(&db)?;
+        Ok(Some(goal))
+    }
+
     fn load(&self) -> io::Result<GoalDb> {
         match fs::read_to_string(&self.path) {
             Ok(contents) => serde_json::from_str(&contents).map_err(io::Error::other),
@@ -690,6 +706,53 @@ mod tests {
             .expect("goal exists");
 
         assert_eq!(updated.status, ThreadGoalStatus::Complete);
+    }
+
+    #[test]
+    fn stall_if_active_only_transitions_active_goal() {
+        let dir = tempdir().unwrap();
+        let mut store = GoalStore::with_path(dir.path().join("goals_1.json"));
+        let cases = [
+            ("active", ThreadGoalStatus::Active),
+            ("paused", ThreadGoalStatus::Paused),
+            ("blocked", ThreadGoalStatus::Blocked),
+            ("complete", ThreadGoalStatus::Complete),
+            ("budget-limited", ThreadGoalStatus::BudgetLimited),
+        ];
+        for (session_id, status) in cases {
+            store
+                .replace(session_id, session_id, status, Some(50_000))
+                .unwrap();
+            store
+                .account_usage(session_id, 1_234, 56)
+                .unwrap()
+                .expect("goal exists");
+        }
+        let unchanged_before = cases[1..]
+            .iter()
+            .map(|(session_id, _)| {
+                (
+                    *session_id,
+                    store.get(session_id).unwrap().expect("goal exists"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (session_id, _) in cases {
+            store.stall_if_active(session_id).unwrap();
+        }
+
+        assert_eq!(
+            store.get("active").unwrap().expect("active goal").status,
+            ThreadGoalStatus::Stalled
+        );
+        for (session_id, before) in unchanged_before {
+            assert_eq!(
+                store.get(session_id).unwrap().expect("unchanged goal"),
+                before,
+                "stall_if_active mutated {session_id}"
+            );
+        }
     }
 
     #[test]

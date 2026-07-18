@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 
 use orca_core::cancel::CancelToken;
-use orca_core::config::RunConfig;
+use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::tool_types;
@@ -18,7 +18,10 @@ use crate::lifecycle::{
     RuntimeWorkflowIpc, TurnPermissionOverlay,
 };
 use crate::memory::MemoryBlock;
-use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
+use crate::runtime_special::{
+    RuntimeGoalToolOutcome, RuntimeGoalToolRequest, RuntimeSpecialToolDispatch,
+    RuntimeWorkflowDraftRequest,
+};
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::runtime_tool_call::{
     RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
@@ -37,6 +40,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) execution_request: &'a tool_types::ToolRequest,
+    pub(crate) goal_mode: bool,
     pub(crate) subagent_depth: u32,
     pub(crate) instructions: &'a ProjectInstructions,
     pub(crate) memory: &'a MemoryBlock,
@@ -56,6 +60,33 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) event_error: &'a mut Option<io::Error>,
     pub(crate) subagent_child_executor: ChildAgentExecutor<io::Sink>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeToolTurnDisposition {
+    ContinueModel,
+    StopTurn,
+}
+
+pub(crate) struct RuntimeToolDispatchOutput {
+    pub(crate) result: tool_types::ToolResult,
+    pub(crate) disposition: RuntimeToolTurnDisposition,
+}
+
+impl RuntimeToolDispatchOutput {
+    fn continue_model(result: tool_types::ToolResult) -> Self {
+        Self {
+            result,
+            disposition: RuntimeToolTurnDisposition::ContinueModel,
+        }
+    }
+
+    fn stop_turn(result: tool_types::ToolResult) -> Self {
+        Self {
+            result,
+            disposition: RuntimeToolTurnDisposition::StopTurn,
+        }
+    }
 }
 
 pub(crate) struct RuntimeToolRouter<'a> {
@@ -85,13 +116,14 @@ impl<'a> RuntimeToolRouter<'a> {
     pub(crate) fn dispatch<W: io::Write>(
         &mut self,
         context: RuntimeToolInvocationContext<'_, W>,
-    ) -> io::Result<tool_types::ToolResult> {
+    ) -> io::Result<RuntimeToolDispatchOutput> {
         let RuntimeToolInvocationContext {
             config,
             cwd,
             events,
             sink,
             execution_request,
+            goal_mode,
             subagent_depth,
             instructions,
             memory,
@@ -113,7 +145,30 @@ impl<'a> RuntimeToolRouter<'a> {
             workflow_child_executor,
         } = context;
 
-        match self.runtime.classify_dispatch(execution_request) {
+        let result = match self.runtime.classify_dispatch(execution_request, goal_mode) {
+            RuntimeSpecialToolDispatch::GetGoal
+            | RuntimeSpecialToolDispatch::CreateGoal
+            | RuntimeSpecialToolDispatch::UpdateGoal => {
+                let persistent_session_id = (!matches!(config.history_mode, HistoryMode::Disabled)
+                    && task_registry.session_id() == events.run_id())
+                .then_some(task_registry.session_id());
+                return Ok(
+                    match self.runtime.execute_goal_tool(
+                        execution_request,
+                        RuntimeGoalToolRequest {
+                            persistent_session_id,
+                            extension_stores,
+                        },
+                    ) {
+                        RuntimeGoalToolOutcome::Continue(result) => {
+                            RuntimeToolDispatchOutput::continue_model(result)
+                        }
+                        RuntimeGoalToolOutcome::StopTurn(result) => {
+                            RuntimeToolDispatchOutput::stop_turn(result)
+                        }
+                    },
+                );
+            }
             RuntimeSpecialToolDispatch::WorkflowDraft => self.runtime.execute_workflow_draft_tool(
                 execution_request,
                 RuntimeWorkflowDraftRequest {
@@ -195,10 +250,12 @@ impl<'a> RuntimeToolRouter<'a> {
             }
             RuntimeSpecialToolDispatch::RequestUserInput => {
                 let Some(user_input_handler) = user_input_handler else {
-                    return Ok(tool_types::ToolResult::failed(
-                        execution_request,
-                        "request_user_input requires a runtime user input handler",
-                        None,
+                    return Ok(RuntimeToolDispatchOutput::continue_model(
+                        tool_types::ToolResult::failed(
+                            execution_request,
+                            "request_user_input requires a runtime user input handler",
+                            None,
+                        ),
                     ));
                 };
                 self.runtime
@@ -261,6 +318,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 }
                 Ok(output.result)
             }
-        }
+        }?;
+        Ok(RuntimeToolDispatchOutput::continue_model(result))
     }
 }

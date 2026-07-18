@@ -1660,6 +1660,257 @@ mod tests {
         }
     }
 
+    fn tool_continuation(request: tool_types::ToolRequest) -> RuntimeTurnContinuation {
+        let raw_tool_call = orca_core::conversation::RawToolCall {
+            id: request.id.clone(),
+            function_name: request.name.as_str().to_string(),
+            arguments: request
+                .raw_arguments
+                .clone()
+                .unwrap_or_else(|| "{}".to_string()),
+        };
+        RuntimeTurnContinuation::from_response(
+            orca_core::provider_types::ProviderResponse {
+                steps: vec![orca_core::provider_types::ProviderStep::ToolCall(request)],
+                assistant_content: Some("Executing the requested tool.".to_string()),
+                assistant_reasoning: None,
+                tool_calls: vec![raw_tool_call],
+                usage: None,
+            },
+            orca_core::thread_identity::TurnId::new(),
+        )
+    }
+
+    #[test]
+    fn hosted_goal_tool_updates_persisted_goal_through_runtime_context() {
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.history_mode = HistoryMode::Record;
+            config.output_format = OutputFormat::Jsonl;
+            config.approval_mode = ApprovalMode::FullAuto;
+            let mut thread = RuntimeThread::start(&config, "hosted goal tool").expect("thread");
+            let session_id = thread
+                .session()
+                .session_id()
+                .expect("recorded session id")
+                .to_string();
+            let mut store = crate::goals::GoalStore::load_default();
+            store
+                .replace(
+                    &session_id,
+                    "finish the hosted goal",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .expect("active goal");
+
+            let progress = ThreadTurnRequest::new("establish live goal progress")
+                .with_tool_mode(ThreadTurnToolMode::Goal)
+                .with_continuation(tool_continuation(tool_types::ToolRequest {
+                    id: "goal-progress-1".to_string(),
+                    name: tool_types::ToolName::TaskList,
+                    action: ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some("{}".to_string()),
+                }));
+            assert_eq!(
+                thread
+                    .run_request(&config, &progress, Vec::new())
+                    .expect("run non-goal progress tool"),
+                RunStatus::Success
+            );
+
+            let update = ThreadTurnRequest::new("complete the hosted goal")
+                .with_tool_mode(ThreadTurnToolMode::Goal)
+                .with_continuation(tool_continuation(tool_types::ToolRequest {
+                    id: "goal-update-1".to_string(),
+                    name: tool_types::ToolName::UpdateGoal,
+                    action: ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some(r#"{"status":"complete"}"#.to_string()),
+                }));
+            let status = thread
+                .run_request(&config, &update, Vec::new())
+                .expect("run hosted goal update");
+
+            assert_eq!(
+                status,
+                RunStatus::Success,
+                "hosted goal messages: {:#?}",
+                thread.session().conversation().messages
+            );
+            assert_eq!(
+                store
+                    .get(&session_id)
+                    .expect("load persisted goal")
+                    .expect("persisted goal")
+                    .status,
+                orca_core::goal_types::ThreadGoalStatus::Complete
+            );
+        });
+    }
+
+    #[test]
+    fn hosted_goal_tool_without_persistent_context_stops_failed_turn() {
+        let mut config = config(SubagentConfig::default());
+        config.output_format = OutputFormat::Jsonl;
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "missing goal context").expect("thread");
+        assert!(thread.session().session_id().is_none());
+        let request = ThreadTurnRequest::new("complete unavailable goal")
+            .with_tool_mode(ThreadTurnToolMode::Goal)
+            .with_continuation(tool_continuation(tool_types::ToolRequest {
+                id: "goal-update-missing-context".to_string(),
+                name: tool_types::ToolName::UpdateGoal,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(r#"{"status":"complete"}"#.to_string()),
+            }));
+
+        let status = thread
+            .run_request(&config, &request, Vec::new())
+            .expect("goal control failure completes the hosted turn");
+        let messages = &thread.session().conversation().messages;
+        let matching_results = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| match message {
+                Message::Tool {
+                    tool_call_id,
+                    terminal: Some(terminal),
+                    ..
+                } if tool_call_id == "goal-update-missing-context" => Some((index, terminal)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            status,
+            RunStatus::Failed,
+            "missing-context messages: {messages:#?}"
+        );
+        assert_eq!(matching_results.len(), 1);
+        assert_eq!(matching_results[0].1.status, tool_types::ToolStatus::Failed);
+        assert!(
+            messages[matching_results[0].0 + 1..]
+                .iter()
+                .all(|message| !matches!(message, Message::Assistant { .. })),
+            "goal control failure must not resume model sampling: {messages:#?}"
+        );
+    }
+
+    #[test]
+    fn hosted_goal_tool_invalid_update_remains_model_recoverable() {
+        with_orca_home(|_| {
+            let mut config = config(SubagentConfig::default());
+            config.history_mode = HistoryMode::Record;
+            config.output_format = OutputFormat::Jsonl;
+            config.approval_mode = ApprovalMode::FullAuto;
+            let mut thread = RuntimeThread::start(&config, "invalid goal update").expect("thread");
+            let session_id = thread.session().session_id().unwrap().to_string();
+            let mut store = crate::goals::GoalStore::load_default();
+            store
+                .replace(
+                    &session_id,
+                    "keep correcting the goal update",
+                    orca_core::goal_types::ThreadGoalStatus::Active,
+                    None,
+                )
+                .unwrap();
+            let request = ThreadTurnRequest::new("reject invalid goal update")
+                .with_tool_mode(ThreadTurnToolMode::Goal)
+                .with_continuation(tool_continuation(tool_types::ToolRequest {
+                    id: "goal-update-invalid".to_string(),
+                    name: tool_types::ToolName::UpdateGoal,
+                    action: ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some(r#"{"status":"paused"}"#.to_string()),
+                }));
+
+            let status = thread
+                .run_request(&config, &request, Vec::new())
+                .expect("run invalid goal update");
+            let messages = &thread.session().conversation().messages;
+            let result_index = messages
+                .iter()
+                .position(|message| {
+                    matches!(
+                        message,
+                        Message::Tool {
+                            tool_call_id,
+                            terminal: Some(terminal),
+                            ..
+                        } if tool_call_id == "goal-update-invalid"
+                            && terminal.status == tool_types::ToolStatus::Failed
+                    )
+                })
+                .expect("failed goal tool result");
+
+            assert_eq!(status, RunStatus::Success);
+            assert_eq!(
+                store.get(&session_id).unwrap().unwrap().status,
+                orca_core::goal_types::ThreadGoalStatus::Active
+            );
+            assert!(
+                messages[result_index + 1..]
+                    .iter()
+                    .any(|message| matches!(message, Message::Assistant { .. })),
+                "invalid goal arguments must allow another model sample: {messages:#?}"
+            );
+        });
+    }
+
+    #[test]
+    fn hosted_goal_tool_store_failure_stops_failed_turn() {
+        with_orca_home(|home| {
+            let mut config = config(SubagentConfig::default());
+            config.history_mode = HistoryMode::Record;
+            config.output_format = OutputFormat::Jsonl;
+            config.approval_mode = ApprovalMode::FullAuto;
+            let mut thread = RuntimeThread::start(&config, "broken goal store").expect("thread");
+            std::fs::write(home.join("goals_1.json"), "{not valid JSON")
+                .expect("break goal store fixture");
+            let request = ThreadTurnRequest::new("read unavailable goal store")
+                .with_tool_mode(ThreadTurnToolMode::Goal)
+                .with_continuation(tool_continuation(tool_types::ToolRequest {
+                    id: "goal-get-store-failure".to_string(),
+                    name: tool_types::ToolName::GetGoal,
+                    action: ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some("{}".to_string()),
+                }));
+
+            let status = thread
+                .run_request(&config, &request, Vec::new())
+                .expect("goal store failure completes turn");
+            let messages = &thread.session().conversation().messages;
+            let matching_results = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    matches!(
+                        message,
+                        Message::Tool {
+                            tool_call_id,
+                            terminal: Some(terminal),
+                            ..
+                        } if tool_call_id == "goal-get-store-failure"
+                            && terminal.status == tool_types::ToolStatus::Failed
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(status, RunStatus::Failed);
+            assert_eq!(matching_results.len(), 1);
+            assert!(
+                messages[matching_results[0].0 + 1..]
+                    .iter()
+                    .all(|message| !matches!(message, Message::Assistant { .. })),
+                "goal store failure must not resume model sampling: {messages:#?}"
+            );
+        });
+    }
+
     #[test]
     fn thread_turn_request_routes_user_input_handler_through_agent_loop() {
         struct AnswerHandler;
@@ -2273,6 +2524,7 @@ mod tests {
                 events: &mut events,
                 sink: &mut sink,
                 execution_request: &request,
+                goal_mode: false,
                 subagent_depth: 0,
                 instructions: &instructions,
                 memory: &memory,
@@ -2295,7 +2547,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert_eq!(result.result.status, tool_types::ToolStatus::Completed);
         assert!(event_error.is_none());
     }
 
@@ -2339,6 +2591,7 @@ mod tests {
                     events: &mut events,
                     sink: &mut sink,
                     execution_request: request,
+                    goal_mode: false,
                     subagent_depth: 0,
                     instructions: &instructions,
                     memory: &memory,
@@ -2361,7 +2614,7 @@ mod tests {
                 })
                 .expect("dispatch normal call");
 
-            assert_eq!(result.status, tool_types::ToolStatus::Completed);
+            assert_eq!(result.result.status, tool_types::ToolStatus::Completed);
             assert!(event_error.is_none());
         }
 

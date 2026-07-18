@@ -1444,7 +1444,7 @@ mod tests {
         conv.add_system("system".to_string());
         conv.add_user("hello world".to_string());
         conv.replace_plan_state("plan".to_string());
-        conv.replace_goal_state("goal".to_string());
+        conv.replace_goal_state(Some("goal".to_string()));
 
         assert_eq!(conversation_tokens_with_counter(&conv, &FixedCounter), 11);
     }
@@ -2358,7 +2358,7 @@ mod tests {
         conv.add_assistant(Some("old answer ".repeat(40)), None, vec![]);
         conv.add_user("newest".to_string());
         conv.replace_plan_state("active plan".to_string());
-        conv.replace_goal_state("active goal".to_string());
+        conv.replace_goal_state(Some("active goal".to_string()));
 
         let compacted = compact_with_counter(&conv, &config, &FixedCounter);
 

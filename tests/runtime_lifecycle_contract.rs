@@ -1887,47 +1887,63 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
     let context = RuntimeToolActorContext::new("run-tools", 2);
 
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::WorkflowDraft)),
+        context.classify_dispatch(&tool_request(ToolName::WorkflowDraft), false),
         RuntimeSpecialToolDispatch::WorkflowDraft
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::WorkflowDraftAction)),
+        context.classify_dispatch(&tool_request(ToolName::WorkflowDraftAction), false),
         RuntimeSpecialToolDispatch::WorkflowDraftAction
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::Workflow)),
+        context.classify_dispatch(&tool_request(ToolName::Workflow), false),
         RuntimeSpecialToolDispatch::Workflow
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::Subagent)),
+        context.classify_dispatch(&tool_request(ToolName::Subagent), false),
         RuntimeSpecialToolDispatch::Subagent
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::SubagentStatus)),
+        context.classify_dispatch(&tool_request(ToolName::SubagentStatus), false),
         RuntimeSpecialToolDispatch::SubagentStatus
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::TaskList)),
+        context.classify_dispatch(&tool_request(ToolName::TaskList), false),
         RuntimeSpecialToolDispatch::TaskList
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::TaskStop)),
+        context.classify_dispatch(&tool_request(ToolName::TaskStop), false),
         RuntimeSpecialToolDispatch::TaskStop
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::RequestPermissions)),
+        context.classify_dispatch(&tool_request(ToolName::RequestPermissions), false),
         RuntimeSpecialToolDispatch::RequestPermissions
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::RequestUserInput)),
+        context.classify_dispatch(&tool_request(ToolName::RequestUserInput), false),
         RuntimeSpecialToolDispatch::RequestUserInput
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::WorkflowReadMessages)),
+        context.classify_dispatch(&tool_request(ToolName::WorkflowReadMessages), false),
         RuntimeSpecialToolDispatch::WorkflowIpc
     );
     assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::Bash)),
+        context.classify_dispatch(&tool_request(ToolName::Bash), false),
+        RuntimeSpecialToolDispatch::Normal
+    );
+    assert_eq!(
+        context.classify_dispatch(&tool_request(ToolName::GetGoal), true),
+        RuntimeSpecialToolDispatch::GetGoal
+    );
+    assert_eq!(
+        context.classify_dispatch(&tool_request(ToolName::CreateGoal), true),
+        RuntimeSpecialToolDispatch::CreateGoal
+    );
+    assert_eq!(
+        context.classify_dispatch(&tool_request(ToolName::UpdateGoal), true),
+        RuntimeSpecialToolDispatch::UpdateGoal
+    );
+    assert_eq!(
+        context.classify_dispatch(&tool_request(ToolName::UpdateGoal), false),
         RuntimeSpecialToolDispatch::Normal
     );
 }

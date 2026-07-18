@@ -166,6 +166,30 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_keeps_goal_control_tools_out_of_readonly_batches() {
+        let config = config();
+        let requests = vec![
+            request("read-a", ToolName::ReadFile, ActionKind::Read),
+            request("goal-update", ToolName::UpdateGoal, ActionKind::Read),
+            request("read-b", ToolName::ReadFile, ActionKind::Read),
+        ];
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+
+        let first = RuntimeToolDispatchScheduler::new(&config, 0)
+            .next_dispatch(&sampling_state, &requests)
+            .expect("first dispatch");
+        assert!(matches!(first, RuntimeToolDispatch::ReadonlyBatch(_)));
+        assert_eq!(ids(&first), vec!["read-a"]);
+
+        sampling_state.advance_tool_cursor_one(requests.len());
+        let second = RuntimeToolDispatchScheduler::new(&config, 0)
+            .next_dispatch(&sampling_state, &requests)
+            .expect("goal dispatch");
+        assert!(matches!(second, RuntimeToolDispatch::Normal(_)));
+        assert_eq!(ids(&second), vec!["goal-update"]);
+    }
+
+    #[test]
     fn scheduler_batches_adjacent_sync_subagents_until_first_non_batchable_boundary() {
         let config = config();
         let async_request = ToolRequest {

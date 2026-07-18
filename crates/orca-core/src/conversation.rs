@@ -211,8 +211,10 @@ impl Conversation {
         self.volatile.plan_age_turns = 0;
     }
 
-    pub fn replace_goal_state(&mut self, content: String) {
-        self.volatile.goal = Some(format!("[Goal state]\n{content}"));
+    pub fn replace_goal_state(&mut self, content: Option<String>) {
+        self.volatile.goal = content
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| format!("[Goal state]\n{text}"));
     }
 
     pub fn replace_runtime_context(&mut self, content: Option<String>) {
@@ -448,12 +450,17 @@ mod tests {
     #[test]
     fn replace_goal_state_keeps_single_volatile_goal() {
         let mut conv = Conversation::new();
-        conv.replace_goal_state("first".to_string());
-        conv.replace_goal_state("second".to_string());
+        conv.replace_goal_state(Some("first".to_string()));
+        conv.replace_goal_state(Some("second".to_string()));
 
         assert!(conv.messages.is_empty());
         assert!(conv.volatile.goal.as_ref().unwrap().contains("second"));
         assert!(!conv.volatile.goal.as_ref().unwrap().contains("first"));
+
+        conv.replace_goal_state(None);
+        assert!(conv.volatile.goal.is_none());
+        conv.replace_goal_state(Some("  ".to_string()));
+        assert!(conv.volatile.goal.is_none());
     }
 
     #[test]
@@ -673,7 +680,7 @@ mod tests {
         let snapshot = render_prefix(&conv);
 
         conv.replace_plan_state("step 1: do X".to_string());
-        conv.replace_goal_state("build a widget".to_string());
+        conv.replace_goal_state(Some("build a widget".to_string()));
         conv.replace_skill_context(Some("rust expertise".to_string()));
 
         assert_eq!(render_prefix(&conv), snapshot);

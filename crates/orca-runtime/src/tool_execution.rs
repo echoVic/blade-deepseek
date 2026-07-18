@@ -30,7 +30,10 @@ use crate::tool_invocation::{
     ToolInvocation, apply_pre_tool_outcome, approval_request_for_invocation,
     prepare_tool_invocation, validate_tool_invocation,
 };
-use crate::tool_router::{RuntimeToolInvocationContext, RuntimeToolRouter};
+use crate::tool_router::{
+    RuntimeToolDispatchOutput, RuntimeToolInvocationContext, RuntimeToolRouter,
+    RuntimeToolTurnDisposition,
+};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -41,6 +44,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     cwd: &'a Path,
     subagent_depth: u32,
     emit_deltas: bool,
+    goal_mode: bool,
     policy: &'a ApprovalPolicy,
     instructions: Option<&'a ProjectInstructions>,
     memory: Option<&'a MemoryBlock>,
@@ -91,6 +95,7 @@ pub(crate) struct ToolExecutionActor {
 pub(crate) struct ToolExecutionCompletion {
     pub(crate) status: RunStatus,
     pub(crate) result: tool_types::ToolResult,
+    pub(crate) disposition: RuntimeToolTurnDisposition,
     pub(crate) event_error: Option<io::Error>,
 }
 
@@ -99,6 +104,7 @@ impl ToolExecutionCompletion {
         Self {
             status,
             result,
+            disposition: RuntimeToolTurnDisposition::ContinueModel,
             event_error: None,
         }
     }
@@ -128,6 +134,7 @@ impl<'a> ToolExecutionContext<'a> {
             cwd,
             subagent_depth,
             emit_deltas,
+            goal_mode: false,
             policy,
             instructions: None,
             memory: None,
@@ -146,6 +153,11 @@ impl<'a> ToolExecutionContext<'a> {
             extension_registry: None,
             extension_stores: None,
         }
+    }
+
+    pub(crate) fn with_goal_mode(mut self, goal_mode: bool) -> Self {
+        self.goal_mode = goal_mode;
+        self
     }
 
     pub(crate) fn with_services(
@@ -395,6 +407,7 @@ impl ToolExecutionActor {
             cwd,
             subagent_depth,
             emit_deltas,
+            goal_mode,
             policy,
             instructions,
             memory,
@@ -547,13 +560,14 @@ impl ToolExecutionActor {
             });
         }
         let mut dispatch_event_error = None;
-        let result = match RuntimeToolRouter::new(&mut self.runtime).dispatch(
+        let dispatch = match RuntimeToolRouter::new(&mut self.runtime).dispatch(
             RuntimeToolInvocationContext {
                 config,
                 cwd,
                 events,
                 sink,
                 execution_request,
+                goal_mode,
                 subagent_depth,
                 instructions,
                 memory,
@@ -575,14 +589,18 @@ impl ToolExecutionActor {
                 workflow_child_executor,
             },
         ) {
-            Ok(result) => result,
-            Err(error) => tool_types::ToolResult::indeterminate(
-                execution_request,
-                format!(
-                    "Tool invocation outcome is indeterminate after an execution I/O error: {error}. Inspect external state before retrying."
+            Ok(output) => output,
+            Err(error) => RuntimeToolDispatchOutput {
+                result: tool_types::ToolResult::indeterminate(
+                    execution_request,
+                    format!(
+                        "Tool invocation outcome is indeterminate after an execution I/O error: {error}. Inspect external state before retrying."
+                    ),
                 ),
-            ),
+                disposition: RuntimeToolTurnDisposition::ContinueModel,
+            },
         };
+        let result = dispatch.result;
         if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
             registry.on_tool_finish(ToolFinishInput {
                 thread_store: extension_stores.thread_store(),
@@ -605,6 +623,7 @@ impl ToolExecutionActor {
         if dispatch_event_error.is_some() {
             completion.event_error = dispatch_event_error;
         }
+        completion.disposition = dispatch.disposition;
         Ok(completion)
     }
 
@@ -887,6 +906,7 @@ impl ToolExecutionActor {
         ToolExecutionCompletion {
             status,
             result: result.clone(),
+            disposition: RuntimeToolTurnDisposition::ContinueModel,
             event_error,
         }
     }

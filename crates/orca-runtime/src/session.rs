@@ -476,7 +476,7 @@ impl InteractiveSession {
         }
     }
 
-    pub fn replace_goal_context(&mut self, content: String) {
+    pub fn replace_goal_context(&mut self, content: Option<String>) {
         self.conversation.replace_goal_state(content);
     }
 

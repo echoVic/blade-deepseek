@@ -40,6 +40,7 @@ use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
 use crate::tool_invocation::reject_disallowed_child_tool;
+use crate::tool_router::RuntimeToolTurnDisposition;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
@@ -96,6 +97,7 @@ pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
     pub(crate) tool_request: &'a ToolRequest,
     pub(crate) subagent_depth: u32,
     pub(crate) emit_deltas: bool,
+    pub(crate) goal_mode: bool,
     pub(crate) policy: &'a ApprovalPolicy,
 }
 
@@ -401,6 +403,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 tool_request,
                 subagent_depth,
                 emit_deltas,
+                goal_mode: tool_policy.is_goal_mode(),
                 policy,
             },
             io: RuntimeNormalToolTurnIo {
@@ -592,6 +595,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         tool_request,
         subagent_depth,
         emit_deltas,
+        goal_mode,
         policy,
     } = request;
     let RuntimeNormalToolTurnExecutors {
@@ -647,6 +651,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         });
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
+        .with_goal_mode(goal_mode)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
             cost_tracker,
@@ -707,16 +712,22 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             error: Some(error),
         }
     } else {
-        sampling_state
-            .record_normal_tool_result(
-                conversation,
-                history_writer.as_deref_mut(),
-                tool_request,
-                &execution.result,
-                execution.status,
-                emit_deltas,
-            )
-            .map(ToolTurnOutcome::from_record_outcome)?
+        let record_outcome = sampling_state.record_normal_tool_result(
+            conversation,
+            history_writer.as_deref_mut(),
+            tool_request,
+            &execution.result,
+            execution.status,
+            emit_deltas,
+        )?;
+        if execution.disposition == RuntimeToolTurnDisposition::StopTurn {
+            ToolTurnOutcome::Return {
+                status: execution.status,
+                error: execution.result.error.clone(),
+            }
+        } else {
+            ToolTurnOutcome::from_record_outcome(record_outcome)
+        }
     };
     Ok(RuntimeNormalToolTurnExecution {
         outcome,
@@ -1266,6 +1277,7 @@ mod tests {
                 tool_request: &request,
                 subagent_depth: 0,
                 emit_deltas: false,
+                goal_mode: false,
                 policy: &policy,
             },
             io: RuntimeNormalToolTurnIo {
@@ -2601,6 +2613,7 @@ mod tests {
                 tool_request: &requests[1],
                 subagent_depth: 0,
                 emit_deltas: false,
+                goal_mode: false,
                 policy: &policy,
             },
             io: RuntimeNormalToolTurnIo {
