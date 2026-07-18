@@ -1,0 +1,24 @@
+Cargo.toml
+  s_6655f055950c7b::t_2c3aa625f37345 12-16
+crates/orca-runtime/Cargo.toml
+  s_6655f055950c7b::t_930730c1b265d9 30-32
+  s_6655f055950c7b::t_0ed3f522b12c0c 33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1b7f2ebd29fa074b89560c38b06fe5a8f207c15f",
+  "prompts": {},
+  "sessions": {
+    "s_6655f055950c7b": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a59f4c3a25829a5f7a108ac",
+        "model": "gpt-5.6-sol__max"
+      },
+      "human_author": null
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
