@@ -51,7 +51,6 @@ pub const HOST_COMMAND_CAPACITY: usize = 16;
 pub const THREAD_COMMAND_CAPACITY: usize = 16;
 pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_GOAL_OUTER_TURNS_PER_RUN: u64 = 64;
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
@@ -279,7 +278,6 @@ pub enum GoalContinuationRejectCode {
     PendingVerification,
     BudgetLimited,
     RuntimeUnavailable,
-    OuterTurnLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,7 +289,6 @@ struct GoalContinuationPreflight {
     active_workflow: bool,
     plan_mode: bool,
     duplicate_admission: bool,
-    continuation_count: u64,
 }
 
 fn goal_continuation_preflight(
@@ -341,12 +338,6 @@ fn goal_continuation_preflight(
         return Some(reject(
             GoalContinuationRejectCode::DuplicateAdmission,
             "goal continuation was already admitted for this generation fence",
-        ));
-    }
-    if input.continuation_count >= MAX_GOAL_OUTER_TURNS_PER_RUN {
-        return Some(reject(
-            GoalContinuationRejectCode::OuterTurnLimit,
-            "goal continuation reached the outer-turn safety limit",
         ));
     }
     None
@@ -3018,13 +3009,6 @@ impl ThreadActor {
                 ..
             })
         );
-        let continuation_count = active
-            .generation
-            .context
-            .fence()
-            .generation_id()
-            .as_u64()
-            .saturating_add(1);
         if let Some(rejection) = goal_continuation_preflight(GoalContinuationPreflight {
             cancelled: active.generation.cancel.is_cancelled(),
             successful_turn,
@@ -3037,7 +3021,6 @@ impl ThreadActor {
             active_workflow: state.thread.session().has_active_workflows(),
             plan_mode: active.config.approval_mode == ApprovalMode::Plan,
             duplicate_admission: active.goal_admitted_generation == Some(fence),
-            continuation_count,
         }) {
             if let GoalContinuationAdmission::Reject { code, message } = &rejection {
                 self.persist_queued_goal_input(state, active, *code);
@@ -3173,9 +3156,6 @@ impl ThreadActor {
             }
             GoalContinuationRejectCode::DuplicateAdmission => {
                 orca_core::goal_runtime::GoalPauseReason::Infrastructure
-            }
-            GoalContinuationRejectCode::OuterTurnLimit => {
-                orca_core::goal_runtime::GoalPauseReason::NoProgress
             }
             _ => return,
         };
@@ -4043,7 +4023,6 @@ fn goal_continuation_reject_name(code: GoalContinuationRejectCode) -> &'static s
         GoalContinuationRejectCode::PendingVerification => "pending_verification",
         GoalContinuationRejectCode::BudgetLimited => "budget_limited",
         GoalContinuationRejectCode::RuntimeUnavailable => "runtime_unavailable",
-        GoalContinuationRejectCode::OuterTurnLimit => "outer_turn_limit",
     }
 }
 
@@ -4135,7 +4114,7 @@ mod tests {
     use crate::model_response::RuntimeModelResponse;
 
     #[test]
-    fn goal_continuation_preflight_rejects_every_competing_owner() {
+    fn goal_continuation_preflight_has_no_outer_turn_limit() {
         let baseline = GoalContinuationPreflight {
             cancelled: false,
             successful_turn: true,
@@ -4144,7 +4123,6 @@ mod tests {
             active_workflow: false,
             plan_mode: false,
             duplicate_admission: false,
-            continuation_count: 1,
         };
         let cases = [
             (
