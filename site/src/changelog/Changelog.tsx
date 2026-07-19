@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.50":
+        "Goal Mode no longer has a fixed outer-turn or continuation ceiling. RuntimeHost admits the next turn from semantic state, cancellation, pending interactions, workflow ownership, progress, and token budget; continuation_count remains only persisted ledger and event telemetry. This removes the false Paused(NoProgress) terminal that could appear after 64 otherwise valid turns without weakening budget, stall, or user-control boundaries.",
       "v0.2.49":
         "Goal Mode now has one runtime owner for lifecycle, continuation admission, cancellation, recovery, usage, and persistence. Terminal model claims are typed intents audited at turn end, SQLite replaces direct JSON mutation with migration and crash recovery, and role-safe context plus semantic events keep TUI and ACP projections consistent. Five real DeepSeek scenarios verify completion, rejected completion, genuine blocking, cancellation, and resume with no stale continuation or in-flight run.",
       "v0.2.48":
@@ -542,6 +544,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.50":
+        "Goal Mode 不再设置固定 outer-turn 或 continuation 上限。RuntimeHost 只根据语义状态、取消、待处理交互、workflow 所有权、进展与 token budget 决定是否续轮；continuation_count 继续持久化，但只用于账本与事件观测。这消除了 Goal 在 64 个正常 turn 后被错误映射为 Paused(NoProgress) 的终态，同时保留预算、stall 与用户控制边界。",
       "v0.2.49":
         "Goal Mode 现在由一个 runtime owner 统一管理生命周期、continuation 准入、取消、恢复、usage 与持久化。模型的终态声明改为类型化 intent，并在 turn 结束时审计；SQLite 取代直接 JSON 写入，同时提供迁移与崩溃恢复；role-safe context 和语义事件让 TUI 与 ACP 投影保持一致。五组真实 DeepSeek 场景验证了完成、拒绝完成、真实阻塞、取消与恢复，且没有陈旧 continuation 或未关闭 run。",
       "v0.2.48":
