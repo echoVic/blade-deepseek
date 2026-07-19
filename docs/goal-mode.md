@@ -164,7 +164,6 @@ Automatic continuation is admitted only when all of these are true:
 - the operation is not in plan mode
 - the completed generation fence has not already admitted a continuation
 - Goal and verifier budgets remain available
-- the 64-outer-turn safety limit has not been reached
 
 Every decision emits either `goal.continuation.admitted` or
 `goal.continuation.rejected` with the Goal/run/outer-turn ids, current state,
@@ -173,9 +172,9 @@ transcript before the Goal pauses, so rejecting automatic continuation does not
 discard user input.
 
 The primary no-progress rule is three closed, successful outer turns with the
-same normalized model-fixable gap. Token deltas are accounting data, not proof
-of progress. The 64-turn limit is a final safety boundary, not the normal stop
-policy.
+same normalized model-fixable gap. Token deltas and continuation counts are
+accounting and observability data, not proof of progress and not stopping
+conditions.
 
 ## Internal Context
 

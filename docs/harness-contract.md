@@ -230,7 +230,7 @@ Persistent goal mode:
 - `update_goal` accepts only evidence-bearing `complete` or typed `blocked` intents. The acknowledgement is deferred; only turn-end verifier output can persist `complete` or `blocked`.
 - Rejected terminal intents emit request/ack events but do not enter the SQLite pending-intent ledger. Accepted/deferred acknowledgements and persisted intent rows must match exactly.
 - Progress and stop policy use closed outer turns and structured verifier gaps. Inner model/tool iterations and token deltas do not advance the no-progress threshold.
-- Continuation is rejected for queued user input, cancellation, pending interaction, active workflow ownership, plan mode, duplicate generation fences, inactive state, exhausted budget, or the 64-outer-turn safety limit.
+- Continuation is rejected for queued user input, cancellation, pending interaction, active workflow ownership, plan mode, duplicate generation fences, inactive state, or exhausted budget.
 - Pause, verifier/control-plane failure, crash recovery, and no-progress are typed resumable reasons. Resume starts a fresh run and generation fence; recovery never calls the provider automatically.
 - Active pause, interrupt, and shutdown persist `Paused(User)` before cancellation. `/goal pause` returns only after generation join, usage settlement, outer-turn closure, and clearing the in-flight run.
 - Goal/plan/runtime/skill steering uses bounded `InternalContextFragment` system messages outside transcript history. Tool-result content is never modified.
