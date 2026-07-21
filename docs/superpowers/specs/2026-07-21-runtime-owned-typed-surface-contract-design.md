@@ -529,9 +529,24 @@ SurfaceSnapshot {
   pinned_context,
   session_health,
 }
-SurfaceEventEnvelope { cursor_before, cursor_after, event_id, scope, event }
-SurfaceAttachment { baseline, replay, subscription, capabilities }
-OperationTerminalAtCursor { operation_id, terminal, cursor, commit_class }
+SurfaceEventEnvelope { ordinal, event_id, commit_class, scope, event }
+SurfaceCommitBatch {
+  cursor_before,
+  cursor_after,
+  commit_class,
+  event_count,
+  batch_digest,
+  events: NonEmpty<SurfaceEventEnvelope>,
+}
+SurfaceSubscriptionItem =
+  Batch { batch: SurfaceCommitBatch }
+  | Gap { required: SnapshotRequired }
+  | Sealed { reason: ThreadClosed | HostShutdown }
+SurfaceAttachment =
+  Fresh { baseline, subscription: Stream<SurfaceSubscriptionItem>, capabilities }
+  | Cursor { head, replay: Vec<SurfaceCommitBatch>,
+             subscription: Stream<SurfaceSubscriptionItem>, capabilities }
+OperationTerminalAtCursor { operation_id, terminal, cursor, commit_class, batch_digest }
 SnapshotRequired { reason, retained_from, head }
 ```
 
@@ -591,6 +606,24 @@ in the separately reviewed two-file companion bundle before RED tests or
 production implementation begin. Adding a new authoritative fact requires extending the
 closed enum, reducer, snapshot, materializer, replay tests, and all relevant
 client mappings in the same change.
+
+The complete `SurfaceCommitBatch` is the only public linearization and delivery
+unit. Every envelope in it carries the batch's byte-identical complete
+`CommitClass`; ordinals and boundary cursors prove exact membership. The hub
+preflights and reduces the whole batch, advances one immutable snapshot, retains
+one complete batch, and fans it out atomically. A durable or live prefix is an
+incomplete commit and must be repaired or reported as a replay hole; it is never
+published as a smaller valid batch.
+
+One complete batch is itself bounded: at most 1,024 events and at most 8 MiB in
+the private v1 canonical batch encoding. Those limits are no larger than an
+empty subscriber lane. `CommitBatchTooLarge` is a closed precommit failure: the
+builder must detect it before a coordinator WAL prepare, source-store mutation,
+receipt, cursor advance, or authoritative fact. Splittable stream/progress facts
+are chunked into independent complete batches before that point; an indivisible
+fact or terminal/finalizer payload must use the contract's bounded typed
+representation. The runtime never publishes an oversized batch and never turns
+one into an immediate subscriber gap.
 
 The durability/scope matrix is fixed:
 
@@ -676,123 +709,38 @@ Unknown or malformed input fails closed at the private ingress. It cannot
 partially mutate the snapshot and cannot silently disappear when it represents
 an authoritative runtime fact.
 
-Candidate command results are also closed. Every mutation returns one of:
+Command results use one exact closed algebra, defined normatively only in the
+Phase 0A private companion. `RuntimeSurfaceMutationResult` is
+`Committed | Deferred | Uncommitted`; `MutationReply<T>` binds a command's closed
+value to that result. `Committed` contains the exact ordered requirement/witness
+set. The requirement/witness sum includes thread batch-head cursors, remote-owner
+acks, typed host receipts, Goal-store receipts, operation-terminal receipts, and
+policy-revocation barriers. A local cursor witness names an event member but its
+cursor is always the containing complete batch's `cursor_after`.
 
-```text
-RuntimeSurfaceMutationResult =
-  Committed {
-    request_id,
-    target,
-    disposition: Accepted | Queued | Rejected | AlreadyApplied,
-    acknowledgements: NonEmpty<MutationCommitAck>,
-  }
-  | Deferred {
-      request_id,
-      target,
-      commit_id,
-      committed_acknowledgements: Vec<MutationCommitAck>,
-      state:
-        MutationDegraded { settlement_id }
-        | ProjectionDegraded { durable_commit_id, fact_kind }
-        | OwnerAckPending { thread_owner_epoch, durable_revision }
-        | StartCommitDegraded { generation_fence }
-        | FinalizingDegraded { operation_id, finalize_intent_id }
-        | MemoryPinPending { memory_revision, thread_id }
-        | PolicyRevocationPending {
-            policy_epoch,
-            pending_owner_leases,
-            pending_resources,
-          },
-      retry: ReconcileMutation | ReconcileHostMutation
-             | ReconcileMemoryMutation
-             | ReconcileFolderTrustRevocation | RetryStartCommit
-             | RetryProjection | RetryFinalization,
-    }
-  | Uncommitted {
-      request_id,
-      target?,
-      disposition: Invalid | Stale | Unavailable | CommitFailed,
-      error,
-    }
+`Deferred` contains the unique proved acknowledgement subsequence, its exact
+nonempty missing complement, and one `DeferredRepair` closed variant. The repair
+variant binds state and token together for mutation, local projection,
+remote-owner acknowledgement, start commit, finalization, memory pin, policy
+revocation, or close/shutdown barrier repair. There is no separately selectable
+`state + retry` pair. A repair reuses the original semantic request, target, and
+commit identities and may only establish missing witnesses; it cannot enable a
+new side effect.
 
-MutationCommitAck =
-  ThreadLocalCursor { cursor, commit_class }
-  | ThreadRemoteOwnerAck {
-      thread_owner_epoch,
-      durable_revision,
-      commit_id,
-    }
-  | HostCommitAck {
-      host_incarnation,
-      revision,
-      commit_id,
-      commit_class,
-      receipt: HostDomainReceipt,
-    }
+`Uncommitted` is one of four disjoint, exhaustive error classes: invalid, stale,
+unavailable, or commit-failed. It carries no cursor, receipt, or durability
+claim. `CommitBatchTooLarge` is in the invalid precommit set. A later operation
+terminal has its own receipt. Fire-and-forget control commands are not permitted
+for operation, interaction, Goal, task, workflow, memory, settings, close, or
+shutdown mutations.
 
-HostDomainReceipt =
-  Memory { scope, record_id, display_path }
-  | FolderTrust {
-      canonical_path,
-      old_effective_level,
-      new_effective_level,
-      trust_revision,
-      policy_epoch,
-      reload_required,
-      reconciliation_proof?,
-    }
-  | RuntimeSettings {
-      host_revision,
-      thread_revision?,
-      effective,
-      pending?,
-    }
-  | SessionCatalog { catalog_revision, thread_id?, action }
-```
-
-Host and thread mutations both return this algebra; the retry variant routes to
-the host or thread handle that owns `target`. A thread acknowledgement means the
-accepted/rejected fact reached the owning `SurfaceHub` before the command
-response became observable. A local caller gets the exact cursor. A
-capability-valid cross-process interaction responder waits for the owner actor's
-durable projection acknowledgement and receives `ThreadRemoteOwnerAck`; it
-cannot claim a local live cursor from another incarnation.
-
-A host acknowledgement uses the owning host registry/store revision rather than
-fabricating a thread cursor. Before returning it, the host must commit/probe the
-domain store or atomic in-memory revision and update its immutable registry view.
-Thread/remote acknowledgements required by a composite remain separate, while a
-host-domain receipt may carry the reconciliation proof accumulated so far. This
-is a host command barrier, not a second execution actor or `SurfaceHub`.
-`RememberMemory` with a thread pin returns both host and thread acknowledgements;
-a host-only memory, trust, or defaults mutation returns a `HostCommitAck`.
-`Committed` means every acknowledgement required by that target is present.
-The acknowledgement list is ordered by the command's commit barrier and cannot
-contain duplicate identities; Phase 0A fixes the required ack/receipt set for
-each host and thread command.
-
-`Deferred.committed_acknowledgements` is the ordered, proven subset already
-established and may be empty; it never contains a missing or inferred ack. Thus
-`MemoryPinPending` carries the committed Memory receipt/path while naming the
-missing thread pin, and `PolicyRevocationPending` carries the committed trust
-decision/revision while naming pending owners/resources. Retry preserves that
-subset under the same commit/request id and may return `Committed` only after it
-adds every required acknowledgement. Clients may render facts present in the
-subset but must not treat the deferred composite as complete.
-
-`ReconcileMutation` is thread-scoped. `ReconcileHostMutation` accepts the
-original host target/request/settlement token for a generic host composite such
-as runtime defaults plus thread settings or session-catalog mutation. Memory and
-folder-trust use their dedicated stricter reconcile commands. No reconcile path
-creates a new semantic mutation or request id.
-
-`Uncommitted` never carries a cursor or durability claim. `Deferred` means the
-semantic fact may already be durable but its projection/finalization barrier is
-not established; the caller must retry the same request id or the named repair
-command, not submit the semantic mutation under a new identity. A later
-operation terminal has its own receipt. Fire-and-forget control commands are not
-permitted for operation, interaction, Goal, task, workflow, memory, or settings
-mutations.
+Host and thread handles both return this algebra. Host receipts use their owning
+typed host revision/target/receipt digest rather than a fabricated thread cursor;
+cross-process interaction responses use the exact durable owner acknowledgement
+rather than another process's live cursor. The private command matrices and
+immutable policy/shutdown plans are the sole exact definitions of required
+acknowledgements, legal deferred values, repair equality, and uncommitted codes;
+this parent intentionally does not duplicate a second candidate schema.
 
 ### Contract-freeze gate
 
@@ -863,9 +811,12 @@ Generation, repeated zero or more times inside one admitted operation:
 The diagram is a closed transition table, not an illustration. The only legal
 operation transitions are `Requested -> Admitted`, `Requested ->
 Terminal(NotAdmitted)`, `Admitted -> Suspended`, `Admitted -> Finalizing`,
-`Suspended -> Admitted` through an explicit resume, `Finalizing -> Terminal`,
-`Finalizing -> FinalizingDegraded`, and `FinalizingDegraded -> Finalizing` only
-through `RetryFinalization`; `Terminal` is absorbing. The only legal generation
+`Suspended -> Admitted` only when the resumed generation's `Started` commit is
+established, `Suspended -> Finalizing` through cancel/close/shutdown, an
+irrecoverable resumed-generation Started commit, or non-replayable recovery
+abort, `Finalizing -> Terminal`, `Finalizing ->
+FinalizingDegraded`, and `FinalizingDegraded -> Terminal` only through
+`RetryFinalization`; `Terminal` is absorbing. The only legal generation
 transitions are `Reserved -> Started`, `Reserved -> Stopped(NotStarted)`,
 `Started -> Stopped`, `Started -> Transferred`, `Transferred -> Stopped`, and
 no transition out of `Stopped`. Every omitted source/target pair is
@@ -877,7 +828,7 @@ The reducer also enforces these cross-field invariants:
 
 - an operation and every nested fence share one `operation_id`, thread id, and
   thread owner epoch; the first admitted generation is id `0`, has phase
-  `Reserved`, no `started_commit`, and no `stop_reason`; later generations are
+  `Reserved`, no `started_witness`, and no `stop_reason`; later generations are
   contiguous, have a stopped predecessor in the same operation, and retain the
   same logical turn/input identities unless the transition is a Goal outer-turn
   admission explicitly carrying the new identities;
@@ -888,13 +839,15 @@ The reducer also enforces these cross-field invariants:
   `Terminal` has exactly one terminal record and no live reservation, generation,
   interaction, or pending control;
 - `GenerationStarted` is valid only for a matching `Reserved` generation and
-  freezes the operation's settings revision, policy epoch, replayability, and
-  capability fingerprint; `AgentLoopTurnStarted` uses a matching Started
+  freezes that generation's settings revision, policy epoch, replayability,
+  required capabilities, and capability fingerprint; generation zero also
+  matches the Requested admission receipt. `AgentLoopTurnStarted` uses a matching Started
   generation and the next ordinal; `GenerationTransferred` carries the same
   fence as the resulting background owner;
 - `Suspended`/`RecoveryRequired` require a preceding `Stopped` generation with
   `InterruptedResumable` or `RuntimeRestart` (or the explicitly typed provider
-  suspension), and `ResumeOperation` must carry that exact stopped fence;
+  suspension), and `ResumeOperation` must carry that exact stopped fence plus a
+  durable replay capsule or current-incarnation live-resume capability;
 - the terminalizer is the only code allowed to map a stopped generation to an
   operation terminal: successful completion maps to `Succeeded`, verification
   failure to `Failed(Verification)`, budget exhaustion to the corresponding
@@ -903,6 +856,12 @@ The reducer also enforces these cross-field invariants:
   their matching terminal class. `NotAdmitted` is legal only before the first
   generation is Started; an admitted-but-Reserved generation has performed no
   external side effect and may still settle as `NotAdmitted`.
+- cancelling a `Requested` operation is the sole control path that directly
+  invokes the reservation finalizer. It atomically commits
+  `Terminal(NotAdmitted(CancelledBeforeAdmission))` and returns that terminal
+  receipt; it never creates a pending terminalization intent.
+- an operation-level join settlement failure is a closed finalizer source and
+  maps exactly to `Terminal(JoinFailed)`; no adapter may synthesize that outcome.
 
 `Stopped` ends one execution attempt; it does not terminalize the operation. A
 resume reserves a fresh monotonically increasing generation under the same
@@ -914,10 +873,12 @@ phases or alternative terminal rails.
 For recorded threads:
 
 - `Requested` is appended before a client-visible request acknowledgement.
-- `Admitted` fixes operation, logical turn, canonical input item, and initial
-  generation identity in one thread-ledger commit before executor enqueue. The
-  runtime preallocates the turn and item ids and appends the explicit-identity
-  user item in the same batch.
+- `Admitted` fixes operation, logical turn, and initial generation identity in
+  one thread-ledger commit before executor enqueue. An input-bearing User/Goal/
+  workflow-followup admission preallocates its item id and appends the pending
+  explicit-identity user item in that batch. Manual compaction, backtrack, and
+  standalone workflow admission are typed `NotApplicable` and append neither an
+  input-item identity nor an Item patch.
 - every `Generation::Started` is durably synced immediately before that
   generation's first model, provider, hook, tool, workflow, continuation
   consumption, or other externally visible side effect;
@@ -961,9 +922,16 @@ GoalGenerationIdentity {
   attempt: Initial | RecoveryReplacement,
   predecessor_generation?,
   objective_revision,
-  continuation_count,
+  outer_turn_count,
 }
 ```
+
+The complete `GoalGenerationIdentity` is stored as one typed value on both the
+Goal continuation admission and the matching generation record. The duplicated
+operation fence, logical turn, canonical input, objective revision, released
+outer-turn count (first started turn is one), and predecessor fence must compare equal. A predecessor
+fence can authorize at most one identity; replay of the same identity is
+`AlreadyApplied`, while any field mismatch is a stale-identity rejection.
 
 `GoalSet`, an admitted user-authored turn while a Goal is active, attached
 `GoalResume`, host `ResumeLatestActiveGoal`, and an admitted durable workflow
@@ -983,7 +951,7 @@ it is marked `RecoveryReplacement` and is not counted as a new Goal
 continuation.
 
 A continuation input is a typed runtime fact containing Goal/objective revision,
-prior generation/verification receipt, and continuation count. It is not a TUI
+prior generation/verification receipt, and released outer-turn count. It is not a TUI
 prompt, ACP prompt, synthetic user message, or client-owned XML/string. Runtime
 may render provider prompt text from that fact only after the new generation's
 Started barrier. A concurrent Goal edit affects only a continuation whose
@@ -991,22 +959,25 @@ admission records the edited objective revision.
 
 After each Goal generation joins, runtime performs this actor-owned sequence:
 
-1. commit `Generation::Stopped` and finish the exact Goal outer turn, usage, and
-   verifier settlements through the coordinator receipt protocol;
-2. evaluate one closed `GoalContinuationDecision` against the committed
-   predecessor result, Goal state/revision/budget, queued user input, pending
-   interactions, workflow ownership, plan mode, terminalizing control intent,
-   and the predecessor generation fence;
-3. on `Admit`, atomically append `GoalContinuationAdmitted` plus the next
-   `Generation::Reserved`, new outer-turn/turn/input identities, objective
-   revision, and predecessor fence. Admission is idempotent by predecessor
-   fence, so one generation can authorize at most one successor;
-4. commit the next Started barrier, then and only then resolve the typed
-   continuation input and launch that generation;
-5. on `Stop`, persist the Goal status/reason and enter the one operation
-   finalizer instead of allocating another generation.
+1. reconcile the generation result, usage, verifier, Goal-store, and coordinator
+   receipts without publishing a standalone Stopped fact;
+2. evaluate one closed `GoalContinuationDecision` against that exact predecessor
+   result, Goal state/revision/budget, queued user input, pending interactions,
+   workflow ownership, plan mode, terminalizing control intent, and predecessor
+   generation fence;
+3. on `Admit`, atomically commit one batch containing `Generation::Stopped`, the
+   exact outer-turn/usage/verifier settlement, `GoalContinuationAdmitted`, and
+   the successor `Generation::Reserved` with its new outer-turn/turn/input
+   identities, objective revision, and predecessor fence. The operation remains
+   admitted and does not enter its finalizer;
+4. commit the successor Started barrier, then and only then resolve its typed
+   continuation input and launch it;
+5. on `Stop`, atomically commit `Generation::Stopped`, the exact outer-turn
+   settlement and Goal status/reason, plus the one `FinalizationStarted` fact.
+   No crash-recoverable state contains a stopped current generation without
+   either a reserved successor or a finalization disposition.
 
-Automatic `Admit` requires a successfully Stopped predecessor, an Active Goal
+Automatic `Admit` requires a successfully completed predecessor result, an Active Goal
 whose outer-turn settlement says continuation is ready, no terminalizing intent,
 no queued user input, no unresolved interaction or workflow owner, and a mode
 that permits continuation. A duplicate predecessor fence is `AlreadyApplied`.
@@ -1014,7 +985,7 @@ There is no fixed outer-turn ceiling; Goal token budget, explicit pause/cancel,
 completion/verification, user input, workflow/interaction ownership, and runtime
 failure are the stopping authorities.
 
-The stop-to-terminal mapping is closed: a completed or deliberately yielded
+The `Stop` branch's stop-to-terminal mapping is closed: a completed or deliberately yielded
 successful outer turn finalizes `Succeeded` while its Goal patch records
 Completed/Paused and the exact reason; Goal token exhaustion finalizes
 `BudgetExhausted(GoalTokenBudget)`; cancel/Goal pause finalizes `Cancelled`; an
@@ -1040,7 +1011,7 @@ prompt call:
 | --- | --- | --- | --- |
 | `ReserveOperation(intent)` | bounded reservation capacity available | operation id, admission lease, and Requested receipt; no user item | adapter may request admission or cancel by id |
 | `AdmitReserved(id)` | matching Requested with a valid lease | mark the reservation ready; return queued or Admitted plus initial Generation::Reserved receipt | actor admits the oldest ready reservation when the foreground slot and admission gates are available |
-| `CancelOperation(id)` | Requested, Admitted, Reserved, Started, or Suspended operation | operation-cancel acceptance receipt | stop any generation and terminalize the operation asynchronously |
+| `CancelOperation(id)` | Requested, Admitted, Reserved, Started, or Suspended operation | Requested returns the committed `Terminal(NotAdmitted(CancelledBeforeAdmission))`; later phases return an operation-cancel acceptance receipt | Requested finalizes synchronously with no control intent; otherwise stop any generation and terminalize asynchronously |
 | `InterruptGeneration(fence)` | exact Reserved or Started generation | generation-interrupt acceptance receipt | stop before start or join to Stopped(InterruptedResumable); retain a visible Suspended operation and foreground slot |
 | `PauseGoalOperation(goal_id, goal_revision)` | matching active or idle Goal | pause acceptance receipt | atomically persist Goal pause; if a Goal operation is active, resolve it inside runtime, stop its generation, and terminalize it; later Goal resume creates a new operation |
 | `ResumeOperation(id)` | Suspended operation or recovery-required admitted operation | fresh Generation::Reserved receipt | commit Started before spawning the new generation |
@@ -1082,12 +1053,12 @@ TerminalizationCause =
   | GoalPause
   | HostShutdown
   | ThreadClose
-  | CapabilityUnavailable
 
 PendingControlIntent =
   Interrupt { generation_fence }
   | Terminalize { cause: TerminalizationCause, operation_id }
   | ResumeStarting { generation_fence }
+  | ResumeAfterInterruptedStop { generation_fence }
   | BackgroundOnStart { operation_id, reservation_sequence }
 ```
 
@@ -1164,23 +1135,34 @@ Recovery never silently restarts external work:
 | --- | --- | --- |
 | `Requested` without `Admitted` | append `Terminal(NotAdmitted(RuntimeRestart))` through the operation finalizer | create no user item and perform no model/tool I/O |
 | replayable `Admitted` whose latest generation is Reserved but not Started | append `Generation::Stopped(NotStarted(RuntimeRestart))` and expose `RecoveryRequired` for the same operation/turn/input identities | require explicit `ResumeOperation` to reserve a fresh generation before committing Started |
-| non-replayable `Admitted` whose latest generation never Started | append `Terminal(AbortedByRuntimeRestart)` | never reconstruct or execute redacted/missing request content |
+| non-replayable `Admitted` whose latest generation never Started | append `Generation::Stopped(NotStarted(RuntimeRestart))`, then `Terminal(AbortedByRuntimeRestart)` | never reconstruct or execute redacted/missing request content |
+| Suspended with a replayable/current-live resume replacement Reserved but not Started | append `Stopped(NotStarted(RuntimeRestart))`, rebase the suspension witness to that replacement, and clear ResumeStarting | require another explicit ResumeOperation; never continue the stopped replacement |
+| Suspended with a stale/unavailable non-replayable resume replacement Reserved but not Started | append `Stopped(NotStarted(RuntimeRestart))`, then enter the Suspended recovery-abort finalizer | complete `AbortedByRuntimeRestart`; never append Terminal directly from Suspended |
 | latest durable generation is `Started` with no matching `Stopped` or `Transferred` and operation has no Terminal | append `Generation::Stopped(RuntimeRestart)` and `Terminal(AbortedByRuntimeRestart)` after recovery settlement | never automatically replay model, tool, provider, hook, or workflow work |
 | latest generation is `Stopped(InterruptedResumable)` or `Stopped(NotStarted(RuntimeRestart))`, operation has no finalization intent, and its request capsule is replayable | expose a durable Suspended/`RecoveryRequired` operation | require explicit `ResumeOperation` to reserve a fresh generation; never continue the stopped generation |
-| latest generation is resumably Stopped but its request capsule is non-replayable | append `Terminal(AbortedByRuntimeRestart)` | never reconstruct redacted/missing request content |
+| latest generation is resumably Stopped and its non-replayable live capsule is stale/unavailable | enter the Suspended recovery-abort finalizer | never reconstruct redacted/missing request content or append Terminal directly from Suspended |
 | latest generation is non-resumably Stopped or a durable finalization intent exists, but Terminal is absent | reconcile idempotent settlement receipts and complete that finalizer | never reopen the operation or rerun execution |
 | latest generation is `Transferred` without Terminal | record loss of the in-process background owner, append `Stopped(RuntimeRestart)`, and complete `Terminal(AbortedByRuntimeRestart)` | never assume a host-owned background task survived process restart; external durable workers require a separate ownership contract |
 | `Terminal` | retain the committed terminal | never append a second terminal |
+
+Materialization is pure replay and never reclassifies a historical stop against
+the new process incarnation. The table's capsule-dependent actions run only
+after a complete snapshot is rebuilt and append new fenced recovery batches.
+Every newly handled stop is committed atomically with its selected Suspended,
+suspension-rebase, or FinalizationStarted disposition.
 
 Pending interaction state may be rendered after restart. Resolving it does not
 implicitly restart execution; a separately admitted resume command is required
 when execution must continue.
 
-`Requested` and `Admitted` carry a closed replayability value. A replayable
-request capsule contains the exact typed input, configuration revision, cwd,
-workspace roots, permission/policy revision, tool schema digest, and required
-capabilities. History redaction or disabled history makes the executable
-capsule non-replayable rather than persisting forbidden input.
+Requested carries only the generation-zero admission replayability receipt.
+Each `GenerationRecord` carries the sole executable capsule for its own input,
+configuration revision, cwd, workspace roots, permission/policy revision, tool
+schema digest, required capabilities, and capability fingerprint. Generation
+zero equals the Requested receipt; a Goal continuation freezes a new capsule;
+a recovery replacement copies its stopped predecessor exactly. History
+redaction or disabled history makes that generation capsule non-replayable
+rather than persisting forbidden input.
 
 A persisted Allow receipt is valid in a recovered generation only when its
 operation, request/tool digest, cwd, roots, policy revision, executable/artifact
@@ -1208,7 +1190,7 @@ one operation finalizer; no newer foreground work is admitted.
 
 When background work settles after a successful handoff, the host sends a
 fenced background-settlement command to the owning thread's commit coordinator.
-It uses the same settlement, Terminal, and `SurfaceHub::commit` barrier but not
+It uses the same settlement, Terminal, and `SurfaceHub::commit_batch` barrier but not
 the foreground-slot mutation. Only that later barrier publishes Terminal.
 
 Clients may detach from or hide a background operation. They may not synthesize
@@ -1247,8 +1229,10 @@ owning the thread execution lease; that narrow exception is governed by the
 broker source-head CAS and response-route epoch. It grants no admission,
 execution, projection, or terminal authority.
 
-Admission writes the operation, turn, explicit input-item identity, user item,
-and initial generation reservation in one coordinator batch. A stale metadata
+Input-bearing admission writes the operation, turn, explicit input-item
+identity, pending user item, and initial generation reservation in one
+coordinator batch. A typed NotApplicable maintenance/standalone-workflow
+admission writes the operation, turn, and generation without an Item. A stale metadata
 rewrite cannot replace records appended after its expected revision. Unknown
 new records and unmigrated legacy fields are round-tripped opaquely until their
 explicit migration commits; an unrelated task/history rewrite may not erase a
@@ -1288,7 +1272,8 @@ Every authoritative fact, not only Terminal, uses one commit/projection barrier:
    `MutationIntent { request_id, kind, expected_revisions, settlement_id,
    projected_fact }`, apply the external mutation with that idempotency key,
    record/probe its receipt, then append and sync the coordinator-wrapped fact;
-3. call `SurfaceHub::commit` for that exact commit id. Retry an expected-head
+3. call `SurfaceHub::commit_batch` for that exact commit id and complete batch.
+   Retry an expected-head
    advance from the new immutable snapshot without repeating persistence;
 4. on a non-retryable projection failure, seal the hub, rematerialize a fresh
    incarnation through the durable revision containing the fact, and verify it;
@@ -1373,10 +1358,11 @@ vacuous for `ReservationFinalizer`:
    usage receipts;
 4. compute the one typed terminal outcome;
 5. append and durably sync the terminal record;
-6. call one `SurfaceHub::commit(Terminal)` linearization operation that allocates
-   the event sequence, reduces the immutable snapshot, appends retained replay,
-   enqueues the event or sticky gap to every subscriber, advances head, and
-   returns the terminal cursor;
+6. call one `SurfaceHub::commit_batch` linearization operation whose complete
+   batch contains Terminal and any paired settlement/session facts, advances to
+   the next batch-boundary cursor, reduces the immutable snapshot, appends one
+   complete retained batch, enqueues that batch or a sticky gap to every
+   subscriber, and returns the terminal batch cursor;
 7. apply only the entry mode's fenced reservation/foreground/background effect
    and recompute admission;
 8. wake operation waiters with `OperationTerminalAtCursor`.
@@ -1385,7 +1371,7 @@ Cancellation and Goal pause first perform the interaction-close/wake sequence
 described earlier, then join and enter this finalizer.
 
 There is no separate post-commit terminal broadcast. Subscriber delivery is
-part of `SurfaceHub::commit`, so a newly admitted operation cannot publish past
+part of `SurfaceHub::commit_batch`, so a newly admitted operation cannot publish past
 the prior terminal before that terminal is ordered in every still-valid lane.
 
 An expected-head advance is a normal optimistic conflict, not projection
@@ -1459,21 +1445,26 @@ Sources publish only with an unforgeable, capability-limited permit:
 - a background permit may publish only facts scoped to its durable owner token;
 - the Goal publisher may publish only post-commit changes carrying the current
   Goal store receipt;
+- after takeover, a current-owner Recovery permit may publish only a
+  RuntimeRestart Stop for its exact historical fence plus the atomic phase
+  disposition; it cannot execute, respond, admit, or publish success;
 - only the operation finalizer permit may publish Terminal.
 
-`SurfaceHub::commit` validates the permit and scope, checks the expected head,
-preflights the pure reducer against the immutable snapshot, and performs the
-single linearization described in the finalizer section. Concurrent sources
+`SurfaceHub::commit_batch` validates every permit and scope, requires the same
+complete `CommitClass` on every envelope, checks the expected batch-boundary
+head, preflights the pure reducer against the immutable snapshot, and performs
+the single linearization described in the finalizer section. Concurrent sources
 retry from the new head; stale generation or owner permits fail closed. The hub
 orders already-authoritative facts but never decides whether a command is
 allowed.
 
 ## Attach, Cursor, Replay, And Backpressure
 
-`SurfaceCursor.next_seq` is an exclusive live publication boundary. State at
-cursor `C` contains every event with `seq < C.next_seq`; applying event `seq=S`
-advances the cursor to `S + 1`. This is not the existing reserved
-`EventEnvelope.seq`.
+`SurfaceCursor.next_seq` is an exclusive complete-batch publication boundary.
+State at cursor `C` contains every event in every batch ending at or before that
+boundary. Applying a batch of `N` events spanning `[S,S+N)` atomically advances
+the cursor to `S+N`; event ordinals do not form observable intermediate state or
+attachable cursors. This is not the existing reserved `EventEnvelope.seq`.
 
 `incarnation` is an opaque random identity created whenever a hub is
 materialized or recreated, including process restart and projection reset. The
@@ -1493,12 +1484,13 @@ Cursor attach is also atomic:
    complete source revision to equal the retained `cursor_before` boundary at
    `C.next_seq`, and ensure the sequence is neither in the future nor older
    than the retained suffix;
-2. copy retained events in `[C.next_seq, H.next_seq)`;
+2. copy complete retained batches spanning `[C.next_seq, H.next_seq)`; a cursor
+   inside a batch is invalid;
 3. register live delivery beginning at event `seq = H.next_seq`;
-4. return the replay batch and subscription.
+4. return the replay batches and a batch-level subscription.
 
-The caller's existing state at cursor `C` plus replay
-`[C.next_seq, H.next_seq)` is the baseline at `H`.
+The caller's existing state at cursor `C` plus atomic replay of every complete
+batch spanning `[C.next_seq, H.next_seq)` is the baseline at `H`.
 If runtime cannot prove that baseline, it returns `SnapshotRequired`; the
 client then performs a fresh attach. Runtime never silently treats a bad cursor
 as fresh.
@@ -1509,7 +1501,8 @@ future cursor, wrong thread, or impossible recorded/ephemeral source revision is
 `InvalidCursor`; a valid thread/incarnation whose retained revision boundary has
 expired returns `SnapshotRequired`.
 
-The retained suffix is bounded by both event count and encoded byte estimate.
+The retained suffix is bounded by both event count and encoded byte estimate,
+but eviction occurs only at complete-batch boundaries.
 Each subscriber queue is bounded. On overflow runtime records one sticky gap,
 detaches that subscriber, and closes its ordered lane. The receiver drains
 already admitted events before observing `SnapshotRequired`; a separate
@@ -1558,6 +1551,13 @@ response id, and applicable operation/generation fence. Reassigning a route
 rotates the epoch and all grant tokens; a late reverse response from an earlier
 grant cannot pass even when the same attachment is selected again.
 
+A client supplies only the closed semantic answer. The attachment-bound handle
+injects all response identities/tokens plus the answer policy persisted with the
+request. For an Allow that can authorize later execution it also injects the
+persisted authority fingerprint; the actor re-derives current authority and
+compares it before commit. Clients never serialize or choose that fingerprint
+or a legacy validation policy.
+
 The actor validates all fences before changing broker state. An invalid,
 foreign, stale, or malformed response cannot remove or consume the request.
 The first committed valid response wins. For recorded threads the commit is
@@ -1589,7 +1589,7 @@ Response authority is a runtime-owned, epoch-fenced route:
 
 ```text
 InteractionResponseRoute =
-  Unassigned { epoch, unavailable_disposition }
+  Unassigned { epoch }
   | Exclusive { epoch, attachment_id }
   | SharedFirstCommitWins { epoch, attachment_ids }
 ```
@@ -1609,9 +1609,9 @@ entire grant set, so every old capability becomes stale. Background handoff
 does not silently preserve or transfer response authority: the actor recomputes
 the route and increments the epoch whenever its grant set changes.
 After process restart no prior live attachment identity is reusable: broker
-materialization advances the route epoch, restores the unavailable disposition,
-and leaves the interaction unassigned until a new capability-valid attachment
-is selected.
+materialization advances the route epoch, retains the request's separate durable
+unavailable disposition, and leaves the interaction unassigned until a new
+capability-valid attachment is selected.
 
 Every request durably selects one unavailable disposition. `FailOperation`
 closes the interaction and enters operation finalization with
@@ -1662,7 +1662,7 @@ The current production `UserAction` enum has this frozen authority matrix:
 | `UserAction` | Owner and route | Required result |
 | --- | --- | --- |
 | `Submit` | runtime `ReserveOperation(UserPrompt)` then `AdmitReserved` | Requested/admission receipt, then terminal waiter |
-| `SubmitWithMentions` | same route with closed `SurfaceInputBinding` values | same; no TUI resource expansion |
+| `SubmitWithMentions` | same route with closed `SurfaceInputBindingRequest` descriptors | same; no TUI resource expansion |
 | `SubmitWorkflowNotification` | runtime reserve/admit with durable workflow-result id as idempotency identity | one operation identity and terminal waiter |
 | `RunWorkflow` | `WorkflowControl::Launch` | committed launch/operation receipt; no local workflow owner |
 | `SetModel` | host `UpdateRuntimeSettings(SetModel, HostDefaultsAndThread?)` | post-commit host/thread settings revision; current generation remains frozen |
@@ -1740,11 +1740,14 @@ snapshot/patch and `McpCatalogQuery`; TUI never imports the writable
 uses only the attached immutable snapshot.
 
 Selecting a file, skill, plugin, MCP resource/template, or other mention creates
-a closed `SurfaceInputBinding` containing its kind, canonical opaque identity,
-observed catalog/config revision, and user-visible label. TUI passes that binding
-inside `ReserveOperation`; it never expands it into prompt text or performs the
-authoritative read. Runtime validates roots/capabilities at admission, preserves
-the typed binding in the canonical input item, and resolves content only after
+a closed `SurfaceInputBindingRequest` descriptor containing its kind, opaque
+catalog identity, observed catalog/config revision, and user-visible label. TUI
+passes that descriptor inside `ReserveOperation`; it never expands it into prompt
+text or performs the authoritative read. Runtime validates roots/capabilities at
+admission, preserves the binding request in the generation replayability capsule,
+and creates only a
+pending audit Item. It resolves content and promotes that Item to canonical
+conversation input only after
 the exact generation Started barrier under its cancellation and authority
 fence. Resolution failure is a typed operation failure. Thus remote resource
 I/O cannot occur before an operation id exists or escape cancellation.
@@ -1773,6 +1776,7 @@ Lifecycle causes are distinct:
 | ACP standard cancel | keep attachment | runtime targets the operation bound to that ACP prompt RPC, including after background handoff; it never targets a newer foreground operation |
 | embedded multi-connection ACP EOF | detach that connection's attachments and fail its local RPC waiters | operations continue or wait under runtime routing policy |
 | `orca --mode acp` stdio EOF/write failure | detach the sole connection, fail its local RPC waiters, then request host shutdown | cancel, join, and finalize all host-owned work before process exit |
+| JSONL sole-connection EOF/normal close/read/write/flush failure | close ingress, retire opaque routes/direct responders, detach, and stop/join compatibility services before requesting host shutdown | cancel, join, and finalize every host-owned thread/operation; no orphan one-shot thread or command-exec/shell/search task |
 | explicit thread close | detach after acknowledgement | cancel, join, finalize, and close that thread |
 | normal TUI process quit | stop accepting input | explicit host shutdown cancels, joins, and finalizes all owned work before terminal restoration |
 | process crash | no clean detach assumption | use the restart matrix; never auto-replay Started work |
@@ -2185,16 +2189,25 @@ The server may maintain transport request correlation, but it no longer owns:
 - runtime terminal inference;
 - raw JSONL-to-runtime semantic reconstruction.
 
-The legacy response wire currently carries only `requestId`. The adapter
-supplies its attachment capability from the connection-scoped surface handle
-and calls `RespondInteraction` with the closed
-`InteractionSelector::OpaqueRequestId` variant. Runtime atomically looks up the
-exact pending interaction and its stored response-route epoch/grant token, then
-validates its thread, kind, token, and operation/generation fence before
-consumption. The adapter derives a stable response id from connection identity,
-inbound RPC id, opaque request id, and normalized response body so an identical
-transport retry is idempotent. It stores no semantic waiter or generation
-mirror.
+A single `JsonlServerSupervisor` owns connection teardown. EOF, normal close,
+read failure, and write/flush failure all converge on the same ordered close
+sequence defined by the private contract, including bounded cleanup of the
+remaining non-surface command-exec/shell/search services before the final
+`ShutdownHost` barrier. Individual processors cannot start a second shutdown
+rail.
+
+The legacy response wire currently carries only `requestId`. For
+`user_input/respond` and `mcp_elicitation/respond`, the adapter supplies its
+attachment capability from the connection-scoped surface handle and calls the
+bound interaction responder with the closed opaque selector. For
+`permission/respond`, it MUST instead call the host-owned opaque permission
+router below; the adapter may not construct a thread selector or probe an owner.
+The selected runtime owner atomically validates the exact pending interaction,
+stored route/grant, thread, kind, token, and operation/generation fence before
+consumption. A stable response id is derived from connection identity, inbound
+RPC id, opaque request id, and normalized response body so an identical
+transport retry is idempotent. The adapter stores no semantic waiter or
+generation mirror.
 
 `permission/respond` shares one released wire method between thread interactions
 and non-thread `command/exec`. A host-owned `OpaquePermissionRouter` therefore
@@ -2211,10 +2224,22 @@ OpaquePermissionRoute =
 
 On response the router looks up but does not remove the route, delegates to the
 exact owner, and tombstones it only after that owner returns a committed or
-terminal result. Validation/persistence failure leaves the route retryable by
-the same transport response id. The adapter never probes two managers or infers
-the owner from request text; the router contains transport routing capabilities,
-not a semantic waiter.
+terminal result. A committed tombstone stores a safe permission-resolution
+receipt and a private keyed digest: the identical RPC/body identity replays that
+receipt, while a different body or RPC identity cannot consume or overwrite it.
+Validation/persistence failure leaves the published route retryable by the same
+transport response id. Repair tokens remain inside the router. The adapter never
+probes two managers or infers the owner from request text; the router contains
+transport routing capabilities, not a semantic waiter.
+
+Route registration and request publication are one closed state machine. A route
+is registered before encoding, becomes published only after `write_all + flush`
+acknowledgement, and is transport-retired on encoding/write/flush failure. That
+retirement atomically revokes a thread response grant and lets runtime reroute or
+apply the persisted unavailable disposition, or fails the exact command/exec
+service fence before execution. A response commit racing the write failure wins
+by compare-and-set and is never compensated; a possibly partial request id is
+tombstoned before the connection is sealed.
 
 If a server surface subscription gaps, behavior depends only on released
 transport correlation:
@@ -2259,6 +2284,15 @@ are not implementation choices:
   turn start commits them before Requested and freezes the resulting settings
   and policy revisions. Failure emits the existing correlated error and no
   operation fact;
+- a `permission/respond` route created by the released JSONL v0.2.50 adapter may
+  use the capability-bound legacy permission validation mode. It preserves any
+  well-formed returned profile, including values not present in the request,
+  while still validating route, fence, policy epoch, and closed value shape.
+  Native typed responders use requested-subset validation;
+- a released `mcp_elicitation/respond` accept uses its capability-bound legacy
+  opaque-content mode: any bounded closed JSON value is accepted without schema
+  validation, and omitted `contentJson` becomes `{}`. Native typed Form answers
+  remain recursively schema-checked;
 - one released turn is one `SurfaceOperation`; `turn/resume` may start a
   replacement generation under that same operation but never creates a second
   operation. Every legacy `turn_started`, including later agent-loop iterations,
