@@ -440,7 +440,13 @@ RuntimeSettingsPatch =
   SetModel
   | SetReasoning
   | SetApprovalMode
+  | SetCwd
   | SetWorkspaceRoots
+  | SetActivePermissionProfile
+  | ReplacePermissionRules
+  | ReplaceAdditionalWorkingDirectories
+  | ReplaceNetworkPermissions
+  | ApplyPermissionUpdate
 ```
 
 `ReadRuntimeSettings` returns the host-default revision plus any attached
@@ -2072,7 +2078,9 @@ The transport binding state is closed and separate from runtime operation state:
 
 ```text
 AcpPromptBindingState =
-  Bound
+  Decoded
+  | Reserved { operation_id }
+  | Bound { operation_id }
   | TerminalGated { terminal_cursor }
   | ResponseWriting
   | Completed
