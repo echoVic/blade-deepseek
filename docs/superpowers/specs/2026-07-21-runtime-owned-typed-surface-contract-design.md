@@ -1,7 +1,9 @@
 # Runtime-Owned Typed Surface Contract Design
 
 - Date: 2026-07-21
-- Status: proposed for written review
+- Status: approved; Phase 0A artifact work authorized
+- Phase gate: Phase 0B remains blocked until the frozen Phase 0A companion
+  bundle is committed and receives explicit written review by exact hashes
 - Baseline: `main@50b7698d1` (`v0.2.50`)
 - Target: the next Orca patch release, currently `v0.2.51`
 - Extends: `docs/architecture/adr/0005-runtime-host-operation-control-plane.md`
@@ -260,13 +262,15 @@ the host command authority.
 ## Closed Host Surface
 
 Clients also need a closed host facade so session discovery cannot bypass the
-thread surface. `RuntimeSurfaceHostHandle` is the only TUI/ACP/server entry for:
+thread surface. `RuntimeSurfaceHostHandle` is the only TUI/ACP/server entry for
+the following 24 host commands:
 
 ```text
 SurfaceHostCommand =
   ListSessions
   | SearchSessions
   | ReadSessionMetadata
+  | ReadSession
   | ReadThreadPage
   | CreateThread
   | OpenThread
@@ -274,6 +278,9 @@ SurfaceHostCommand =
   | ForkThread
   | ResolveRunningThread
   | ResumeLatestActiveGoal
+  | UpdateSessionMetadata
+  | QueryInputCatalog
+  | ControlJsonlTurn
   | RememberMemory
   | ReconcileMemoryMutation
   | ReadFolderTrust
@@ -287,10 +294,17 @@ SurfaceHostCommand =
 ```
 
 List/search/metadata/page reads return typed immutable catalog or history-page
-projections with stable pagination cursors. Create/load/fork/open returns a
-`RuntimeSurfaceHandle`, never `RuntimeThreadHandle` or mutable history/store
-access. The host registry is authoritative for live thread identity; the
-session catalog is authoritative for durable discovery.
+projections with stable pagination cursors. `ReadSession` returns one coherent
+session bundle at one read token; `UpdateSessionMetadata` is the only catalog
+metadata mutation; and `QueryInputCatalog` performs host/thread-context-bound
+file, directory, skill, plugin, workflow, and resource discovery without giving
+a client registry or filesystem authority. `ControlJsonlTurn` resolves a
+released JSONL turn id and commits its actor control in one host command, so the
+adapter owns neither an active-turn map nor a lookup-then-control race.
+Create/load/fork/open returns a `RuntimeSurfaceHandle`, never
+`RuntimeThreadHandle` or mutable history/store access. The host registry is
+authoritative for live thread identity; the session catalog is authoritative
+for durable discovery.
 
 Resolution rules are deterministic:
 
@@ -573,8 +587,8 @@ SurfaceEvent =
 
 Each nested patch is itself a closed enum. Phase 0A must freeze every nested
 variant and an exhaustive source-to-patch matrix for every current runtime fact
-in a separately reviewed contract artifact before RED tests or production
-implementation begin. Adding a new authoritative fact requires extending the
+in the separately reviewed two-file companion bundle before RED tests or
+production implementation begin. Adding a new authoritative fact requires extending the
 closed enum, reducer, snapshot, materializer, replay tests, and all relevant
 client mappings in the same change.
 
@@ -597,7 +611,8 @@ Ephemeral-only members are retained for live replay within one incarnation but
 are reconstructed from durable completed facts, not claimed as token-perfect
 after process restart.
 
-The surface command vocabulary is exhaustive for this release:
+The 22-variant thread surface command vocabulary is exhaustive for this
+release:
 
 ```text
 SurfaceCommand =
@@ -781,10 +796,17 @@ mutations.
 
 ### Contract-freeze gate
 
-This document fixes ownership and failure semantics, but candidate type names
-are not sufficient implementation input. Before writing RED tests, Phase 0A
-must commit and obtain written review of one companion private-contract artifact
-containing:
+This approved parent design fixes ownership and failure semantics and authorizes
+completion of Phase 0A only; candidate type names are not sufficient
+implementation input. Before writing Phase 0B RED tests, Phase 0A must freeze,
+commit, and obtain explicit written review of one two-file companion bundle:
+
+- `docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md`;
+- `docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json`.
+
+The Markdown and machine-readable manifest are one artifact. Review names the
+exact commit plus SHA-256 of both files; changing either file invalidates that
+review and reruns all Phase 0A consistency checks. Together they contain:
 
 - every nested `SurfaceEvent` variant and field, required scope, durability
   class, authoritative source, reducer transition, snapshot destination,
@@ -803,9 +825,10 @@ containing:
 The artifact may refine candidate names but may not weaken this design's sole
 authority, durability, ordering, recovery, or deletion invariants. Any open
 payload, `serde_json::Value`, wildcard match, or "implementation decides"
-entry fails Phase 0A. Phase 0B RED evidence starts only after explicit review
-of that artifact; no runtime, TUI, ACP, or JSONL production cutover may begin
-earlier.
+entry fails Phase 0A. The user's approval of this parent design does not waive
+the frozen-bundle review: Phase 0B RED evidence starts only after explicit
+review of that exact two-file artifact, and no runtime, TUI, ACP, or JSONL
+production cutover may begin earlier.
 
 ## Canonical Operation Contract
 
@@ -836,6 +859,50 @@ Generation, repeated zero or more times inside one admitted operation:
       |              +----------> Transferred -> Stopped
       +-------------------------> Stopped(NotStarted { reason })
 ```
+
+The diagram is a closed transition table, not an illustration. The only legal
+operation transitions are `Requested -> Admitted`, `Requested ->
+Terminal(NotAdmitted)`, `Admitted -> Suspended`, `Admitted -> Finalizing`,
+`Suspended -> Admitted` through an explicit resume, `Finalizing -> Terminal`,
+`Finalizing -> FinalizingDegraded`, and `FinalizingDegraded -> Finalizing` only
+through `RetryFinalization`; `Terminal` is absorbing. The only legal generation
+transitions are `Reserved -> Started`, `Reserved -> Stopped(NotStarted)`,
+`Started -> Stopped`, `Started -> Transferred`, `Transferred -> Stopped`, and
+no transition out of `Stopped`. Every omitted source/target pair is
+`IllegalTransition`, including repeated stop/transfer, `Started -> Reserved`,
+`Stopped -> Started`, and any generation patch after its operation is
+`Terminal`.
+
+The reducer also enforces these cross-field invariants:
+
+- an operation and every nested fence share one `operation_id`, thread id, and
+  thread owner epoch; the first admitted generation is id `0`, has phase
+  `Reserved`, no `started_commit`, and no `stop_reason`; later generations are
+  contiguous, have a stopped predecessor in the same operation, and retain the
+  same logical turn/input identities unless the transition is a Goal outer-turn
+  admission explicitly carrying the new identities;
+- `OperationPhase::Requested` has no logical turn, generation, terminal, or
+  terminalizing intent; `Admitted` has a foreground generation or a committed
+  suspension; `Suspended` names the exact stopped generation and its cause;
+  `Finalizing`/`FinalizingDegraded` have a fixed finalize intent; and
+  `Terminal` has exactly one terminal record and no live reservation, generation,
+  interaction, or pending control;
+- `GenerationStarted` is valid only for a matching `Reserved` generation and
+  freezes the operation's settings revision, policy epoch, replayability, and
+  capability fingerprint; `AgentLoopTurnStarted` uses a matching Started
+  generation and the next ordinal; `GenerationTransferred` carries the same
+  fence as the resulting background owner;
+- `Suspended`/`RecoveryRequired` require a preceding `Stopped` generation with
+  `InterruptedResumable` or `RuntimeRestart` (or the explicitly typed provider
+  suspension), and `ResumeOperation` must carry that exact stopped fence;
+- the terminalizer is the only code allowed to map a stopped generation to an
+  operation terminal: successful completion maps to `Succeeded`, verification
+  failure to `Failed(Verification)`, budget exhaustion to the corresponding
+  closed `BudgetExhausted` variant, cancellation/pause/shutdown to the exact
+  `Cancelled`/`Shutdown` cause, and runtime/persistence/join/panic failures to
+  their matching terminal class. `NotAdmitted` is legal only before the first
+  generation is Started; an admitted-but-Reserved generation has performed no
+  external side effect and may still settle as `NotAdmitted`.
 
 `Stopped` ends one execution attempt; it does not terminalize the operation. A
 resume reserves a fresh monotonically increasing generation under the same
@@ -868,7 +935,11 @@ never persisted merely to enable replay.
 
 Each append carries stable `(operation_id, generation_id?, transition_kind,
 commit_id)` data so retry can reconcile an ambiguous write without duplicating
-a transition.
+a transition. In the private envelope, `commit_id` is the `commit_id` nested in
+`CommitClass`, and `transition_kind` is the closed `SurfaceEvent`/patch
+discriminant. A reducer's duplicate key is therefore
+`(event_id, commit_class.commit_id)`; an event cannot be reclassified under a
+different operation, generation, or transition kind during retry.
 
 ### Goal composite operations
 
@@ -1006,9 +1077,16 @@ The actor also persists one control intent while an asynchronous stop/join is in
 flight:
 
 ```text
+TerminalizationCause =
+  UserCancel
+  | GoalPause
+  | HostShutdown
+  | ThreadClose
+  | CapabilityUnavailable
+
 PendingControlIntent =
   Interrupt { generation_fence }
-  | Terminalize { cause: Cancel | GoalPause | Shutdown, operation_id }
+  | Terminalize { cause: TerminalizationCause, operation_id }
   | ResumeStarting { generation_fence }
   | BackgroundOnStart { operation_id, reservation_sequence }
 ```
@@ -1051,9 +1129,9 @@ Control races use these deterministic rules:
 A Suspended operation remains a durable, visible foreground owner until an
 explicit resume, cancel, close, or host shutdown. Generation join may complete
 before the resume command; the actor retains the Suspended operation and does
-not race to Terminal. Released server `turn/interrupt` maps to
-`InterruptGeneration`; user intent that means stop the whole operation maps to
-`CancelOperation`.
+not race to Terminal. Released server `turn/interrupt` is resolved by
+`ControlJsonlTurn` and then commits `InterruptGeneration`; user intent that
+means stop the whole operation maps to `CancelOperation`.
 
 Requested reservations live in a bounded FIFO separate from the foreground
 slot. Each has a stable reservation sequence, lease, and `ready_for_admission`
@@ -1629,8 +1707,10 @@ surface/host routes; they cannot introduce an unclassified mutation path.
 Session replacement is `Detach` plus host `OpenThread`/`LoadThread` and `Attach`;
 explicit thread close is host `CloseThread`. Mention/fuzzy search is local only
 when it reads the attached immutable snapshot, otherwise it uses the closed host
-or MCP catalog read projection. Every mutation receives the typed receipt named
-above.
+`QueryInputCatalog` projection with an exact host/thread context. MCP catalog
+inspection may additionally use the thread-scoped `McpCatalogQuery`; neither
+path gives the TUI a writable catalog or filesystem handle. Every mutation
+receives the typed receipt named above.
 
 Phase 3 also replaces `UserAction::Remember(String)` with
 `Remember { scope: User | Project, note }`. Slash parsing may recognize the
@@ -2140,11 +2220,13 @@ If a server surface subscription gaps, behavior depends only on released
 transport correlation:
 
 - when a long-lived correlated RPC is still open, the adapter returns its
-  existing JSONL error shape, ends that RPC, and emits no post-gap update;
+  existing JSONL error shape with the exact message `thread surface snapshot
+  required; reconnect and resume the thread`, permanently retires that RPC
+  binding, and emits no post-gap update for its id;
 - when only an asynchronous event stream remains and there is no request id to
-  answer, the adapter seals and closes the connection/stream and requires the
-  existing reconnect plus thread-resume path. It never fabricates a response or
-  invents an event name.
+  answer, the adapter drains already-admitted pre-gap writes, seals and closes
+  the connection/stream, and requires the existing reconnect plus
+  `thread/resume` path. It never fabricates a response or invents an event name.
 
 Resume uses a fresh runtime snapshot and projects the baseline through existing
 compatible events. Phase 0 freezes differential fixtures only for flows actually
@@ -2153,16 +2235,63 @@ fault-injection contract tests that require existing error shapes and exact
 close ordering; they are not falsely described as a black-box `v0.2.50`
 differential case.
 
+### Frozen JSONL compatibility refinements
+
+The Phase 0A companion freezes these refinements for the Phase 5 adapter; they
+are not implementation choices:
+
+- released `thread/list`, `thread/search`, `thread/read`, turn/item page reads,
+  metadata update, start, resume, and fork map respectively to the closed host
+  catalog/read/materialization commands. `thread/read` uses one coherent
+  `ReadSession` token, and only the released metadata decoder may request the
+  stable-id `LegacyLastWriteWins` precondition;
+- `turn/interrupt`, `turn/resume`, and `turn/steer` use
+  `ControlJsonlTurn`, which performs legacy-turn lookup and actor control as one
+  runtime-owned command. The adapter retains RPC correlation only. Released
+  `v0.2.50` has no `thread/close` method: that request keeps the existing
+  unsupported-method error and never maps to host `CloseThread`;
+- `turn/start` with a thread id resolves only a live thread and never cold-loads
+  one. A busy thread takes the actor's pre-Requested immediate rejection branch
+  and preserves the existing active-turn error. Stateless submit creates one
+  ephemeral, noncatalogued, one-shot thread and emits no `thread_started`;
+- released permission-profile and permission-update values decode into closed
+  settings patches. Resume applies them in its atomic load/settings receipt;
+  turn start commits them before Requested and freezes the resulting settings
+  and policy revisions. Failure emits the existing correlated error and no
+  operation fact;
+- one released turn is one `SurfaceOperation`; `turn/resume` may start a
+  replacement generation under that same operation but never creates a second
+  operation. Every legacy `turn_started`, including later agent-loop iterations,
+  projects from `OperationPatch::AgentLoopTurnStarted`; generation Started is
+  only the once-per-generation execution barrier;
+- `turn_completed` is projected only from runtime Terminal:
+  `Succeeded -> success`, verification failure to `verification_failed`, legacy
+  approval-required failure to `approval_required`, other failure/panic/join or
+  restart abort to `failed`, cancel/shutdown to `cancelled`, and budget exhaustion
+  to `budget_exhausted`. NotAdmitted and pre-start failures retain one correlated
+  error and suppress both start and completion;
+- image, local-image, incomplete-skill, and untagged string inputs that the
+  released decoder accepted but discarded remain explicit
+  `LegacyAcceptedDropped` cases for this wire version; Phase 5 may not silently
+  claim typed support or begin rejecting them;
+- the frozen ordering corpus remains authoritative, including assistant/tool/
+  workflow item ordering, `turn_controlled` before a steer-created user item,
+  and `turn_completed` as the final frame for its RPC id. Surface-only facts use
+  `NoLegacyProjection`; the adapter invents no cursor, recovery, Goal, settings,
+  health, or capability event names.
+
 `PendingPermissionManager` currently also serves non-thread `command/exec`.
 Phase 5 splits that responsibility: thread-bound permission moves to the
 surface; command/exec retains a separate bounded, request-fenced transport
 service behind the one opaque router above unless it is independently designed
 as a host-scoped operation. Shell-manager transport is an explicit non-goal and
 is not deleted merely because the thread surface converges. Released
-thread/session list, search, metadata, page-read, start, resume, fork, and close
-operations do migrate to `RuntimeSurfaceHostHandle`; mention/fuzzy search that
-uses thread/session data uses its typed read projections rather than a server
-history owner.
+thread/session list, search, coherent read, metadata, page-read, start, resume,
+fork, and turn-control operations do migrate to `RuntimeSurfaceHostHandle`;
+mention/fuzzy search that uses thread/session data uses its typed read
+projections rather than a server history owner. Host `CloseThread` remains a
+closed command for actual clients, but is not exposed through a nonexistent
+released JSONL `thread/close` method.
 
 Legacy `EventEnvelope` serialization remains available for compatibility and
 stored history readers. It is derived from typed runtime facts and is not the
@@ -2179,13 +2308,17 @@ documented rather than hidden by normalization.
 
 ### Phase 0: Contract freeze and RED evidence
 
-- Commit this design on a clean `v0.2.50` worktree.
-- Phase 0A commits and obtains explicit written review of the companion private
-  contract artifact defined above: exact nested patches, command payloads,
-  fences/results, DTOs, source inventory, and machine-readable TUI action
-  matrix. No RED test or production implementation begins before this gate.
-- Phase 0B starts only from the reviewed contract and converts its invariants
-  into compile-time inventories and behavior tests.
+- This parent design is approved on a clean `v0.2.50` worktree, and Phase 0A
+  artifact completion is authorized.
+- Phase 0A freezes and commits the two-file companion bundle named above,
+  including exact nested patches, the 22 thread commands, the 24 host commands,
+  fences/results, DTOs, source inventory, JSONL compatibility vectors, and the
+  machine-readable TUI action matrix. It then obtains explicit written review
+  against the exact file hashes. No Phase 0B RED test or production
+  implementation begins before that review gate.
+- Phase 0B starts only from the reviewed bundle and converts its invariants
+  into compile-time inventories and behavior tests. Any post-review artifact
+  edit returns the work to Phase 0A consistency checks.
 - Convert the identified P0 deadlock, stale response consumption, terminal
   ordering, attach race, and client mirror gaps into behavior tests.
 - Prove the repo-local ACP 0.10.4 facade can preserve read order across
@@ -2310,17 +2443,23 @@ mappers. Rust visibility alone is not accepted as the boundary proof.
 
 ### Phase 5: JSONL server convergence
 
-- Move released thread/session list, search, metadata, item-page read, start,
-  resume, fork, resolve-running, and close paths onto
-  `RuntimeSurfaceHostHandle` and per-thread typed reads.
+- Move released thread/session list, search, coherent `thread/read`, metadata,
+  turn/item-page read, start, resume, fork, resolve-running, and turn-control
+  paths onto `RuntimeSurfaceHostHandle` and per-thread typed reads. The released
+  `v0.2.50` wire has no `thread/close`; preserve its unsupported-method error
+  rather than adding a compatibility mapping to host `CloseThread`.
 - Replace active-turn and thread-bound pending-interaction ownership with
-  surface commands and the opaque request-id adapter.
+  `ControlJsonlTurn`, surface commands, and the opaque request-id adapter.
 - Split non-thread command/exec permission service behind the single
   host-owned opaque permission router before deleting the shared pending
   manager.
 - Route command/exec folder-trust reads through the same durable policy epoch;
   do not retain a server-local trust cache/store path.
 - Project typed surface updates onto the released JSONL contract.
+- Preserve the frozen settings-before-Requested, one-operation/multi-generation,
+  `AgentLoopTurnStarted`, total terminal, `LegacyAcceptedDropped`, exact gap,
+  opaque-permission-router, and event-ordering refinements in the companion
+  artifact.
 - Add the frozen `v0.2.50` semantic differential corpus and gap/resume tests.
 - Preserve all existing request ids, event names, field/error shapes, and
   ordering covered by both the current suite and differential corpus.
