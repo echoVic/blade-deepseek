@@ -705,6 +705,22 @@ Attach, cursor attach, detach, snapshot-required recovery, and terminal waiting
 are handle operations with closed results; they cannot mutate execution state
 except for attachment capabilities.
 
+The facade that performs attach is itself bound to a host-issued attach
+authority: one host incarnation, thread, client role, maximum surface
+capability set, and maximum interaction-kind set. Request fields are negotiation
+input, never authority. Runtime derives the returned grant as the exact
+intersection with those ceilings and current host/thread policy; a role mismatch
+or a result without the required read capability is a closed attach denial. A
+caller cannot obtain TUI priority, cross-operation control, or an interaction
+kind merely by naming it in a request.
+
+Detach returns success only after the attachment/grant revocation CAS makes
+every old response grant unusable. If removing the attachment changes a durable
+interaction route, the route epoch and grant set are committed before the
+durable detach acknowledgement; projection failure returns a typed deferred
+result. `Detached` therefore never races a late response that can still win,
+but it does not imply that a replacement client has been selected.
+
 Unknown or malformed input fails closed at the private ingress. It cannot
 partially mutate the snapshot and cannot silently disappear when it represents
 an authoritative runtime fact.
@@ -726,6 +742,14 @@ revocation, or close/shutdown barrier repair. There is no separately selectable
 `state + retry` pair. A repair reuses the original semantic request, target, and
 commit identities and may only establish missing witnesses; it cannot enable a
 new side effect.
+
+After repair proves the missing witnesses, replaying the byte-identical original
+command before ordinary live-state validation reconstructs its command-specific
+typed value, complete acknowledgement vector, and waiter without rerunning an
+effect. The original request record is therefore retained for the repair/replay
+window. Close and shutdown additionally retain their exact typed outputs after
+the thread or host is sealed; their host-repair command returns that output
+directly because a sealed handle cannot be the sole replay path.
 
 `Uncommitted` is one of four disjoint, exhaustive error classes: invalid, stale,
 unavailable, or commit-failed. It carries no cursor, receipt, or durability
@@ -798,8 +822,16 @@ generation state machines are distinct:
 
 ```text
 Operation:
-  Requested -> Admitted -> Terminal
-  Requested ------------> Terminal(NotAdmitted)
+  Requested -> Admitted
+  Requested -> Terminal(NotAdmitted)
+  Admitted -> Suspended
+  Admitted -> Finalizing
+  Suspended -> Admitted(GenerationStarted with matching ResumeStarting)
+  Suspended -> Suspended(SuspensionRebasedAfterUnstartedResume)
+  Suspended -> Finalizing(FinalizationStarted with fixed finalize intent)
+  Finalizing -> Terminal
+  Finalizing -> FinalizingDegraded
+  FinalizingDegraded -> Terminal(RetryFinalization | terminal RetryProjection)
 
 Generation, repeated zero or more times inside one admitted operation:
   Reserved -----> Started ------> Stopped
@@ -811,12 +843,18 @@ Generation, repeated zero or more times inside one admitted operation:
 The diagram is a closed transition table, not an illustration. The only legal
 operation transitions are `Requested -> Admitted`, `Requested ->
 Terminal(NotAdmitted)`, `Admitted -> Suspended`, `Admitted -> Finalizing`,
-`Suspended -> Admitted` only when the resumed generation's `Started` commit is
-established, `Suspended -> Finalizing` through cancel/close/shutdown, an
-irrecoverable resumed-generation Started commit, or non-replayable recovery
-abort, `Finalizing -> Terminal`, `Finalizing ->
-FinalizingDegraded`, and `FinalizingDegraded -> Terminal` only through
-`RetryFinalization`; `Terminal` is absorbing. The only legal generation
+`Suspended -> Admitted` only when `GenerationStarted` is established for the
+exact generation owned by `ResumeStarting`, `Suspended -> Suspended` only when
+a matching `ResumeStarting` replacement is stopped as
+`NotStarted(Interrupted|RuntimeRestart)` and its suspension witness is atomically
+rebased, `Suspended -> Finalizing` only through
+`FinalizationStarted` with the fixed finalize intent selected by
+cancel/close/shutdown, an irrecoverable resumed-generation Started commit, or
+non-replayable recovery abort, `Finalizing -> Terminal`, `Finalizing ->
+FinalizingDegraded`, and `FinalizingDegraded -> Terminal` only when
+`RetryFinalization` establishes missing terminal persistence or settlement, or
+when `RetryProjection` establishes the projection barrier for the already
+durable Terminal fact; `Terminal` is absorbing. The only legal generation
 transitions are `Reserved -> Started`, `Reserved -> Stopped(NotStarted)`,
 `Started -> Stopped`, `Started -> Transferred`, `Transferred -> Stopped`, and
 no transition out of `Stopped`. Every omitted source/target pair is
@@ -833,8 +871,9 @@ The reducer also enforces these cross-field invariants:
   same logical turn/input identities unless the transition is a Goal outer-turn
   admission explicitly carrying the new identities;
 - `OperationPhase::Requested` has no logical turn, generation, terminal, or
-  terminalizing intent; `Admitted` has a foreground generation or a committed
-  suspension; `Suspended` names the exact stopped generation and its cause;
+  terminalizing intent; `Admitted` has one current non-stopped Reserved,
+  Started, or Transferred generation; `Suspended` names the exact stopped
+  generation and its cause;
   `Finalizing`/`FinalizingDegraded` have a fixed finalize intent; and
   `Terminal` has exactly one terminal record and no live reservation, generation,
   interaction, or pending control;
@@ -845,9 +884,13 @@ The reducer also enforces these cross-field invariants:
   generation and the next ordinal; `GenerationTransferred` carries the same
   fence as the resulting background owner;
 - `Suspended`/`RecoveryRequired` require a preceding `Stopped` generation with
-  `InterruptedResumable` or `RuntimeRestart` (or the explicitly typed provider
-  suspension), and `ResumeOperation` must carry that exact stopped fence plus a
-  durable replay capsule or current-incarnation live-resume capability;
+  `InterruptedResumable`, the explicitly typed provider suspension, or
+  `NotStarted(Interrupted|RuntimeRestart)` selected by the closed phase and
+  replayability table. The `NotStarted` form may establish an initial suspension
+  or atomically rebase a matching `ResumeStarting` replacement; bare
+  `RuntimeRestart` after Started is terminal. `ResumeOperation` must carry the
+  exact stopped fence plus a durable replay capsule or current-incarnation
+  live-resume capability;
 - the terminalizer is the only code allowed to map a stopped generation to an
   operation terminal: successful completion maps to `Succeeded`, verification
   failure to `Failed(Verification)`, budget exhaustion to the corresponding
@@ -1011,10 +1054,10 @@ prompt call:
 | --- | --- | --- | --- |
 | `ReserveOperation(intent)` | bounded reservation capacity available | operation id, admission lease, and Requested receipt; no user item | adapter may request admission or cancel by id |
 | `AdmitReserved(id)` | matching Requested with a valid lease | mark the reservation ready; return queued or Admitted plus initial Generation::Reserved receipt | actor admits the oldest ready reservation when the foreground slot and admission gates are available |
-| `CancelOperation(id)` | Requested, Admitted, Reserved, Started, or Suspended operation | Requested returns the committed `Terminal(NotAdmitted(CancelledBeforeAdmission))`; later phases return an operation-cancel acceptance receipt | Requested finalizes synchronously with no control intent; otherwise stop any generation and terminalize asynchronously |
+| `CancelOperation(id)` | any known operation from Requested through Terminal | Requested returns the committed `Terminal(NotAdmitted(CancelledBeforeAdmission))`; the first live cancel returns its control receipt and waiter; a repeated winning intent replays that result; Finalizing/FinalizingDegraded returns the existing `FinalizationPending`; Terminal returns the existing terminal | Requested finalizes synchronously with no control intent; a live operation stops its generation and terminalizes asynchronously; finalizing or terminal state never accepts a new cause |
 | `InterruptGeneration(fence)` | exact Reserved or Started generation | generation-interrupt acceptance receipt | stop before start or join to Stopped(InterruptedResumable); retain a visible Suspended operation and foreground slot |
 | `PauseGoalOperation(goal_id, goal_revision)` | matching active or idle Goal | pause acceptance receipt | atomically persist Goal pause; if a Goal operation is active, resolve it inside runtime, stop its generation, and terminalize it; later Goal resume creates a new operation |
-| `ResumeOperation(id)` | Suspended operation or recovery-required admitted operation | fresh Generation::Reserved receipt | commit Started before spawning the new generation |
+| `ResumeOperation(id)` | Suspended operation or recovery-required admitted operation | distinct ResumeStarting and Generation::Reserved receipts in one batch, an independent Generation::Started receipt, and the existing operation waiter | commit Started before spawning the new generation; `StartCommitDegraded` proves the first two receipts and names only Started as missing |
 | `TransferBackground(target)` | matching Requested/Reserved operation or active foreground generation | committed background-on-start intent or durable background-owner receipt | defer transfer until admission/Started when needed; release foreground only after the handoff barrier |
 | `RetryStartCommit(token)` | `StartCommitDegraded` with matching owner epoch, generation fence, and Started commit id | Started cursor, terminal path receipt, or explicit still-degraded result | probe/retry only the same Started transition; never allocate another generation |
 | `RetryProjection(token)` | ProjectionDegraded with matching commit id | projected cursor/remote ack or explicit retry failure | unblock only the effects authorized by the repaired fact |
@@ -1042,7 +1085,9 @@ Cancel, interrupt, and pause are not aliases:
 | Started | signal/join Stopped(Cancelled), then Terminal(Cancelled) | signal/join Stopped(InterruptedResumable), remain Suspended | reject until Stopped is committed |
 | Suspended after Stopped | Terminal(Cancelled) | AlreadyApplied | reserve the next generation and leave Suspended only after Started commits |
 | Background-owned | signal the exact background owner and terminalize after settlement | reject unless a background-specific control is explicitly supported | reject |
-| Terminal/FinalizingDegraded | AlreadyApplied or finalization receipt | stale/reject | reject or `RetryFinalization`, never resume execution |
+| Finalizing | AlreadyApplied with the existing `FinalizationPending` cursor and waiter | stale/reject | reject; never change the selected finalizer or resume execution |
+| FinalizingDegraded | AlreadyApplied with the existing `FinalizationPending` cursor and waiter | stale/reject | reject; repair only through `RetryFinalization` or terminal `RetryProjection`, never resume execution |
+| Terminal | AlreadyApplied with the existing terminal receipt | stale/reject | reject; never resume execution |
 
 The actor also persists one control intent while an asynchronous stop/join is in
 flight:
@@ -1066,7 +1111,10 @@ Control races use these deterministic rules:
 
 - the first committed `CancelOperation` or `PauseGoalOperation` fixes the
   operation's terminalizing cause; duplicates are `AlreadyApplied`, while a
-  different later terminalizing request is rejected with the winning intent;
+  different later terminalizing request is rejected with the winning intent.
+  A byte-identical duplicate replays the original acceptance receipt and waiter
+  before current-phase validation, so crossing into Finalizing cannot erase the
+  command result;
 - a pending Interrupt may be upgraded by a later exact Cancel or Goal pause.
   The upgrade is committed before the join result and changes the post-join
   action from Suspended to finalization. Interrupt, resume, steer, and transfer
@@ -1090,7 +1138,12 @@ Control races use these deterministic rules:
   generation on failure;
 - host shutdown closes admission immediately. It finishes an already committed
   operation terminalizing cause rather than rewriting it, then shutdown-cancels
-  every operation without one;
+  every operation without one. `CloseThread` and `ShutdownHost` first freeze one
+  immutable per-operation plan: an existing terminal requirement, or a
+  preallocated finalize intent plus terminal commit id and either the existing
+  winning cause or the requested ThreadClose/HostShutdown cause. Every later
+  finalizer receipt must match that plan; shutdown may not discover or substitute
+  terminal identities after signalling work;
 - `CancelSessionCurrent` exists only for a released legacy wire that carries no
   operation id. It resolves the current operation once inside the actor mailbox,
   becomes an exact `CancelOperation`, and is never reevaluated after a newer
@@ -2540,8 +2593,14 @@ after public artifact verification succeeds.
   consumption, executor spawn, or another side-effect probe;
 - a stopped generation can resume under the same operation without publishing
   an operation terminal;
+- restart of a Reserved-but-unstarted resume replacement atomically stops that
+  replacement, rebases the Suspended witness, and still requires another
+  explicit resume; no stopped replacement is continued;
 - duplicate and competing interrupt/cancel/pause/resume/transfer controls obey
   the committed-intent precedence table while join remains in flight;
+- cancellation observed after Finalizing begins replays `FinalizationPending`
+  and the original waiter without replacing the selected cause or returning a
+  command-level finalization deferment;
 - immediate cancel cannot target the following submit;
 - cancel/Goal pause acceptance is cursor-visible before command response, wakes
   interaction waiters before join, and leaves the actor command loop responsive;
@@ -2555,6 +2614,12 @@ after public artifact verification succeeds.
   active state until the later terminal barrier;
 - crash between domain settlement and terminal append reconciles receipts
   without rerunning execution;
+- repaired commands replay the original typed value, receipts, and waiter without
+  rerunning effects; close/shutdown repair returns the exact retained output even
+  after the original thread or host is sealed;
+- close/shutdown freezes every owned operation's existing terminal or exact
+  finalize-intent/terminal-commit/cause tuple before signalling work, and every
+  terminal acknowledgement matches that immutable plan;
 - restart never invokes the executor for Started-without-Terminal work;
 - restart exposes resumably Stopped replayable work only as explicit
   `RecoveryRequired`, finishes non-resumable stopped finalization, and aborts a
@@ -2571,6 +2636,8 @@ after public artifact verification succeeds.
 - terminal cannot be overtaken by subscription close;
 - slow and fast subscribers do not affect each other or runtime completion;
 - detach does not cancel work or resolve interactions;
+- an attach overclaim cannot widen the host-bound role/capability ceilings, and
+  detach cannot return success while an old response grant can still win;
 - after crash between durable append and live publication, a new-incarnation
   fresh snapshot contains the fact once; no cross-incarnation event-delivery
   exactly-once claim is made.
