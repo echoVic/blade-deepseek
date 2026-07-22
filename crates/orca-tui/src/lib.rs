@@ -38,6 +38,8 @@ mod slash_command_actions;
 mod slash_menu_actions;
 mod status_key_actions;
 mod submitted_turn;
+#[cfg(test)]
+mod surface_boundary_tests;
 mod terminal_lifecycle;
 pub mod theme;
 mod transcript_view;
