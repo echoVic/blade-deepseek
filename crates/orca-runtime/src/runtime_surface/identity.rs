@@ -912,6 +912,39 @@ pub struct SurfaceTaskFence {
     pub background_owner: Option<SurfaceBackgroundFence>,
 }
 
+#[derive(Serialize)]
+pub(super) struct CanonicalBackgroundFenceV1<'a> {
+    operation_fence: &'a SurfaceOperationFence,
+    background_owner_token: &'a [u8; 32],
+}
+
+pub(super) fn canonical_background_fence_v1(
+    fence: &SurfaceBackgroundFence,
+) -> CanonicalBackgroundFenceV1<'_> {
+    CanonicalBackgroundFenceV1 {
+        operation_fence: &fence.operation_fence,
+        background_owner_token: &fence.background_owner_token.0.0,
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct CanonicalTaskFenceV1<'a> {
+    task_id: &'a SurfaceTaskId,
+    task_revision: TaskRevision,
+    background_owner: Option<CanonicalBackgroundFenceV1<'a>>,
+}
+
+pub(super) fn canonical_task_fence_v1(fence: &SurfaceTaskFence) -> CanonicalTaskFenceV1<'_> {
+    CanonicalTaskFenceV1 {
+        task_id: &fence.task_id,
+        task_revision: fence.task_revision,
+        background_owner: fence
+            .background_owner
+            .as_ref()
+            .map(canonical_background_fence_v1),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceWorkflowFence {
     pub workflow_run_id: SurfaceWorkflowRunId,
@@ -935,6 +968,44 @@ pub enum SurfaceScope {
         goal_id: SurfaceGoalId,
         causative_generation: Option<SurfaceOperationFence>,
     },
+}
+
+#[derive(Serialize)]
+pub(super) enum CanonicalSurfaceScopeV1<'a> {
+    Thread,
+    Operation {
+        operation_id: &'a SurfaceOperationId,
+    },
+    Generation {
+        fence: &'a SurfaceOperationFence,
+    },
+    Background {
+        fence: CanonicalBackgroundFenceV1<'a>,
+    },
+    Goal {
+        goal_id: &'a SurfaceGoalId,
+        causative_generation: &'a Option<SurfaceOperationFence>,
+    },
+}
+
+pub(super) fn canonical_surface_scope_v1(scope: &SurfaceScope) -> CanonicalSurfaceScopeV1<'_> {
+    match scope {
+        SurfaceScope::Thread => CanonicalSurfaceScopeV1::Thread,
+        SurfaceScope::Operation { operation_id } => {
+            CanonicalSurfaceScopeV1::Operation { operation_id }
+        }
+        SurfaceScope::Generation { fence } => CanonicalSurfaceScopeV1::Generation { fence },
+        SurfaceScope::Background { fence } => CanonicalSurfaceScopeV1::Background {
+            fence: canonical_background_fence_v1(fence),
+        },
+        SurfaceScope::Goal {
+            goal_id,
+            causative_generation,
+        } => CanonicalSurfaceScopeV1::Goal {
+            goal_id,
+            causative_generation,
+        },
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

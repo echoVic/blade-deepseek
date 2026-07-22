@@ -82,6 +82,35 @@ pub struct AuthorityFingerprint {
     capability_digest: Sha256Digest,
 }
 
+#[derive(Serialize)]
+pub(super) struct CanonicalAuthorityFingerprintV1<'a> {
+    operation_id: &'a SurfaceOperationId,
+    request_digest: &'a Sha256Digest,
+    tool_digest: &'a Sha256Digest,
+    cwd: &'a CanonicalPath,
+    workspace_roots_digest: &'a Sha256Digest,
+    policy_epoch: PolicyEpoch,
+    executable_generation: &'a Sha256Digest,
+    artifact_generation: &'a Sha256Digest,
+    capability_digest: &'a Sha256Digest,
+}
+
+fn canonical_authority_fingerprint_v1(
+    authority: &AuthorityFingerprint,
+) -> CanonicalAuthorityFingerprintV1<'_> {
+    CanonicalAuthorityFingerprintV1 {
+        operation_id: &authority.operation_id,
+        request_digest: &authority.request_digest,
+        tool_digest: &authority.tool_digest,
+        cwd: &authority.cwd,
+        workspace_roots_digest: &authority.workspace_roots_digest,
+        policy_epoch: authority.policy_epoch,
+        executable_generation: &authority.executable_generation,
+        artifact_generation: &authority.artifact_generation,
+        capability_digest: &authority.capability_digest,
+    }
+}
+
 #[allow(dead_code)]
 impl AuthorityFingerprint {
     #[allow(clippy::too_many_arguments)]
@@ -710,6 +739,264 @@ pub enum InteractionPatch {
         background_fence: SurfaceBackgroundFence,
         route: SurfaceInteractionRoute,
     },
+}
+
+#[derive(Serialize)]
+enum CanonicalInteractionRequestV1<'a> {
+    ToolApproval {
+        tool: &'a SurfaceToolRequest,
+        description: &'a DisplayText,
+        preview: &'a Option<DisplayText>,
+        authority: CanonicalAuthorityFingerprintV1<'a>,
+    },
+    PermissionRequest {
+        tool_call_id: &'a SurfaceToolCallId,
+        reason: &'a Option<DisplayText>,
+        permissions: &'a SurfacePermissionProfile,
+        authority: CanonicalAuthorityFingerprintV1<'a>,
+    },
+    UserInput {
+        question: &'a NonEmptyText,
+        suggestions: &'a Vec<DisplayText>,
+    },
+    McpElicitation {
+        server_name: &'a NonEmptyText,
+        server_request_id: &'a NonEmptyText,
+        message: &'a DisplayText,
+        request: &'a SurfaceMcpElicitationRequest,
+    },
+    BackgroundApproval {
+        task: CanonicalTaskFenceV1<'a>,
+        tool: &'a SurfaceToolRequest,
+        authority: CanonicalAuthorityFingerprintV1<'a>,
+    },
+}
+
+fn canonical_interaction_request_v1(
+    request: &SurfaceInteractionRequest,
+) -> CanonicalInteractionRequestV1<'_> {
+    match request {
+        SurfaceInteractionRequest::ToolApproval {
+            tool,
+            description,
+            preview,
+            authority,
+        } => CanonicalInteractionRequestV1::ToolApproval {
+            tool,
+            description,
+            preview,
+            authority: canonical_authority_fingerprint_v1(authority),
+        },
+        SurfaceInteractionRequest::PermissionRequest {
+            tool_call_id,
+            reason,
+            permissions,
+            authority,
+        } => CanonicalInteractionRequestV1::PermissionRequest {
+            tool_call_id,
+            reason,
+            permissions,
+            authority: canonical_authority_fingerprint_v1(authority),
+        },
+        SurfaceInteractionRequest::UserInput {
+            question,
+            suggestions,
+        } => CanonicalInteractionRequestV1::UserInput {
+            question,
+            suggestions,
+        },
+        SurfaceInteractionRequest::McpElicitation {
+            server_name,
+            server_request_id,
+            message,
+            request,
+        } => CanonicalInteractionRequestV1::McpElicitation {
+            server_name,
+            server_request_id,
+            message,
+            request,
+        },
+        SurfaceInteractionRequest::BackgroundApproval {
+            task,
+            tool,
+            authority,
+        } => CanonicalInteractionRequestV1::BackgroundApproval {
+            task: canonical_task_fence_v1(task),
+            tool,
+            authority: canonical_authority_fingerprint_v1(authority),
+        },
+    }
+}
+
+#[derive(Serialize)]
+enum CanonicalInteractionLifecycleV1<'a> {
+    Requested,
+    Resolved {
+        receipt: &'a SurfaceInteractionResolutionReceipt,
+    },
+    Cancelled {
+        reason: &'a InteractionCancelReason,
+    },
+    Expired {
+        deadline: &'a InteractionExpiryDeadline,
+    },
+    Transferred {
+        background_fence: CanonicalBackgroundFenceV1<'a>,
+    },
+}
+
+fn canonical_interaction_lifecycle_v1(
+    lifecycle: &SurfaceInteractionLifecycle,
+) -> CanonicalInteractionLifecycleV1<'_> {
+    match lifecycle {
+        SurfaceInteractionLifecycle::Requested => CanonicalInteractionLifecycleV1::Requested,
+        SurfaceInteractionLifecycle::Resolved { receipt } => {
+            CanonicalInteractionLifecycleV1::Resolved { receipt }
+        }
+        SurfaceInteractionLifecycle::Cancelled { reason } => {
+            CanonicalInteractionLifecycleV1::Cancelled { reason }
+        }
+        SurfaceInteractionLifecycle::Expired { deadline } => {
+            CanonicalInteractionLifecycleV1::Expired { deadline }
+        }
+        SurfaceInteractionLifecycle::Transferred { background_fence } => {
+            CanonicalInteractionLifecycleV1::Transferred {
+                background_fence: canonical_background_fence_v1(background_fence),
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct CanonicalInteractionViewV1<'a> {
+    interaction_id: &'a SurfaceInteractionId,
+    revision: InteractionRevision,
+    fence: &'a SurfaceOperationFence,
+    kind: SurfaceInteractionKind,
+    request: CanonicalInteractionRequestV1<'a>,
+    route: &'a SurfaceInteractionRoute,
+    lifecycle: CanonicalInteractionLifecycleV1<'a>,
+    recovery_disposition: &'a InteractionUnavailableDisposition,
+}
+
+fn canonical_interaction_view_v1(
+    interaction: &SurfaceInteractionView,
+) -> CanonicalInteractionViewV1<'_> {
+    CanonicalInteractionViewV1 {
+        interaction_id: &interaction.interaction_id,
+        revision: interaction.revision,
+        fence: &interaction.fence,
+        kind: interaction.kind,
+        request: canonical_interaction_request_v1(&interaction.request),
+        route: &interaction.route,
+        lifecycle: canonical_interaction_lifecycle_v1(&interaction.lifecycle),
+        recovery_disposition: &interaction.recovery_disposition,
+    }
+}
+
+#[derive(Serialize)]
+pub(super) enum CanonicalInteractionPatchV1<'a> {
+    Requested {
+        interaction: CanonicalInteractionViewV1<'a>,
+    },
+    RouteChanged {
+        interaction_id: &'a SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        route: &'a SurfaceInteractionRoute,
+    },
+    Resolved {
+        interaction_id: &'a SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        receipt: &'a SurfaceInteractionResolutionReceipt,
+    },
+    Cancelled {
+        interaction_id: &'a SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        reason: &'a InteractionCancelReason,
+    },
+    Expired {
+        interaction_id: &'a SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        deadline: &'a InteractionExpiryDeadline,
+    },
+    Transferred {
+        interaction_id: &'a SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        background_fence: CanonicalBackgroundFenceV1<'a>,
+        route: &'a SurfaceInteractionRoute,
+    },
+}
+
+pub(super) fn canonical_interaction_patch_v1(
+    patch: &InteractionPatch,
+) -> CanonicalInteractionPatchV1<'_> {
+    match patch {
+        InteractionPatch::Requested { interaction } => CanonicalInteractionPatchV1::Requested {
+            interaction: canonical_interaction_view_v1(interaction),
+        },
+        InteractionPatch::RouteChanged {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            route,
+        } => CanonicalInteractionPatchV1::RouteChanged {
+            interaction_id,
+            expected_revision: *expected_revision,
+            next_revision: *next_revision,
+            route,
+        },
+        InteractionPatch::Resolved {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            receipt,
+        } => CanonicalInteractionPatchV1::Resolved {
+            interaction_id,
+            expected_revision: *expected_revision,
+            next_revision: *next_revision,
+            receipt,
+        },
+        InteractionPatch::Cancelled {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            reason,
+        } => CanonicalInteractionPatchV1::Cancelled {
+            interaction_id,
+            expected_revision: *expected_revision,
+            next_revision: *next_revision,
+            reason,
+        },
+        InteractionPatch::Expired {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            deadline,
+        } => CanonicalInteractionPatchV1::Expired {
+            interaction_id,
+            expected_revision: *expected_revision,
+            next_revision: *next_revision,
+            deadline,
+        },
+        InteractionPatch::Transferred {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            background_fence,
+            route,
+        } => CanonicalInteractionPatchV1::Transferred {
+            interaction_id,
+            expected_revision: *expected_revision,
+            next_revision: *next_revision,
+            background_fence: canonical_background_fence_v1(background_fence),
+            route,
+        },
+    }
 }
 
 #[cfg(test)]
