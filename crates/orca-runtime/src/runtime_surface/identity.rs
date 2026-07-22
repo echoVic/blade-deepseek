@@ -2,8 +2,11 @@ use orca_core::thread_identity::{ConversationItemId, TurnId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{Ordering, compiler_fence};
 
 pub const SAFE_DIAGNOSTIC_TEXT_BYTE_LIMIT: usize = 4_096;
 
@@ -88,6 +91,7 @@ impl CanonicalPath {
             || value
                 .components()
                 .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            || value.components().collect::<PathBuf>().as_os_str() != value.as_os_str()
         {
             return Err(SurfaceValueError::NonCanonical);
         }
@@ -138,7 +142,10 @@ macro_rules! canonical_string {
 }
 
 fn validate_uri(value: &str) -> Result<(), SurfaceValueError> {
-    if value.chars().any(char::is_whitespace) {
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
         return Err(SurfaceValueError::InvalidFormat);
     }
     let (scheme, remainder) = value
@@ -160,6 +167,86 @@ fn validate_uri(value: &str) -> Result<(), SurfaceValueError> {
             .unwrap_or_default();
         if authority.is_empty() && scheme != "file" {
             return Err(SurfaceValueError::InvalidFormat);
+        }
+        validate_uri_authority(scheme, authority)?;
+    } else if matches!(scheme, "http" | "https" | "ws" | "wss" | "ftp") {
+        return Err(SurfaceValueError::InvalidFormat);
+    }
+    Ok(())
+}
+
+fn validate_uri_authority(scheme: &str, authority: &str) -> Result<(), SurfaceValueError> {
+    if authority.is_empty() {
+        return Ok(());
+    }
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    if host_and_port.is_empty() {
+        return Err(SurfaceValueError::InvalidFormat);
+    }
+
+    let (host, port) = if let Some(ipv6) = host_and_port.strip_prefix('[') {
+        let close = ipv6.find(']').ok_or(SurfaceValueError::InvalidFormat)?;
+        let host = &ipv6[..close];
+        let suffix = &ipv6[close + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or(SurfaceValueError::InvalidFormat)?,
+            )
+        };
+        let parsed = Ipv6Addr::from_str(host).map_err(|_| SurfaceValueError::InvalidFormat)?;
+        if parsed.to_string() != host {
+            return Err(SurfaceValueError::NonCanonical);
+        }
+        (host, port)
+    } else {
+        let mut parts = host_and_port.rsplitn(2, ':');
+        let last = parts.next().unwrap_or_default();
+        let before = parts.next();
+        let (host, port) = match before {
+            Some(host) => (host, Some(last)),
+            None => (last, None),
+        };
+        if host.is_empty() || host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(SurfaceValueError::NonCanonical);
+        }
+        if host
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            let parsed = Ipv4Addr::from_str(host).map_err(|_| SurfaceValueError::InvalidFormat)?;
+            if parsed.to_string() != host {
+                return Err(SurfaceValueError::NonCanonical);
+            }
+        } else {
+            validate_domain(host)?;
+        }
+        (host, port)
+    };
+
+    if host.is_empty() && scheme != "file" {
+        return Err(SurfaceValueError::InvalidFormat);
+    }
+    if let Some(port) = port {
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || (port.len() > 1 && port.starts_with('0'))
+        {
+            return Err(SurfaceValueError::NonCanonical);
+        }
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| SurfaceValueError::InvalidFormat)?;
+        if matches!(
+            (scheme, port),
+            ("http", 80) | ("https", 443) | ("ws", 80) | ("wss", 443) | ("ftp", 21)
+        ) {
+            return Err(SurfaceValueError::NonCanonical);
         }
     }
     Ok(())
@@ -678,7 +765,11 @@ impl ZeroizingProcessLocalSecret {
 
 impl Drop for ZeroizingProcessLocalSecret {
     fn drop(&mut self) {
-        self.0.fill(0);
+        for byte in &mut self.0 {
+            // SAFETY: `byte` is a valid, uniquely borrowed byte in this owned buffer.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        compiler_fence(Ordering::SeqCst);
     }
 }
 

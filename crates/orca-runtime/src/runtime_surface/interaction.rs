@@ -69,17 +69,81 @@ pub enum SurfaceInteractionRoute {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthorityFingerprint {
-    pub operation_id: SurfaceOperationId,
-    pub request_digest: Sha256Digest,
-    pub tool_digest: Sha256Digest,
-    pub cwd: CanonicalPath,
-    pub workspace_roots_digest: Sha256Digest,
-    pub policy_epoch: PolicyEpoch,
-    pub executable_generation: Sha256Digest,
-    pub artifact_generation: Sha256Digest,
-    pub capability_digest: Sha256Digest,
+    operation_id: SurfaceOperationId,
+    request_digest: Sha256Digest,
+    tool_digest: Sha256Digest,
+    cwd: CanonicalPath,
+    workspace_roots_digest: Sha256Digest,
+    policy_epoch: PolicyEpoch,
+    executable_generation: Sha256Digest,
+    artifact_generation: Sha256Digest,
+    capability_digest: Sha256Digest,
+}
+
+#[allow(dead_code)]
+impl AuthorityFingerprint {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        operation_id: SurfaceOperationId,
+        request_digest: Sha256Digest,
+        tool_digest: Sha256Digest,
+        cwd: CanonicalPath,
+        workspace_roots_digest: Sha256Digest,
+        policy_epoch: PolicyEpoch,
+        executable_generation: Sha256Digest,
+        artifact_generation: Sha256Digest,
+        capability_digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            operation_id,
+            request_digest,
+            tool_digest,
+            cwd,
+            workspace_roots_digest,
+            policy_epoch,
+            executable_generation,
+            artifact_generation,
+            capability_digest,
+        }
+    }
+
+    pub fn operation_id(&self) -> &SurfaceOperationId {
+        &self.operation_id
+    }
+
+    pub fn request_digest(&self) -> &Sha256Digest {
+        &self.request_digest
+    }
+
+    pub fn tool_digest(&self) -> &Sha256Digest {
+        &self.tool_digest
+    }
+
+    pub fn cwd(&self) -> &CanonicalPath {
+        &self.cwd
+    }
+
+    pub fn workspace_roots_digest(&self) -> &Sha256Digest {
+        &self.workspace_roots_digest
+    }
+
+    pub const fn policy_epoch(&self) -> PolicyEpoch {
+        self.policy_epoch
+    }
+
+    pub fn executable_generation(&self) -> &Sha256Digest {
+        &self.executable_generation
+    }
+
+    pub fn artifact_generation(&self) -> &Sha256Digest {
+        &self.artifact_generation
+    }
+
+    pub fn capability_digest(&self) -> &Sha256Digest {
+        &self.capability_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -369,29 +433,135 @@ pub enum BrokerInteractionAnswerPolicy {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ApplicableAuthorityFingerprint {
+#[derive(Clone, Eq, PartialEq)]
+enum ApplicableAuthorityFingerprintKind {
     NotApplicable,
     Persisted { authority: AuthorityFingerprint },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct BoundInteractionResponse {
-    pub response_id: SurfaceResponseId,
-    pub answer: SurfaceClientInteractionAnswer,
-    pub policy: BrokerInteractionAnswerPolicy,
-    pub authority: ApplicableAuthorityFingerprint,
+#[derive(Clone, Eq, PartialEq)]
+pub struct ApplicableAuthorityFingerprint(ApplicableAuthorityFingerprintKind);
+
+#[allow(dead_code)]
+impl ApplicableAuthorityFingerprint {
+    pub(crate) const fn not_applicable() -> Self {
+        Self(ApplicableAuthorityFingerprintKind::NotApplicable)
+    }
+
+    pub(crate) fn persisted(authority: AuthorityFingerprint) -> Self {
+        Self(ApplicableAuthorityFingerprintKind::Persisted { authority })
+    }
+
+    pub fn authority(&self) -> Option<&AuthorityFingerprint> {
+        match &self.0 {
+            ApplicableAuthorityFingerprintKind::NotApplicable => None,
+            ApplicableAuthorityFingerprintKind::Persisted { authority } => Some(authority),
+        }
+    }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
+pub struct BoundInteractionResponse {
+    response_id: SurfaceResponseId,
+    answer: SurfaceClientInteractionAnswer,
+    policy: BrokerInteractionAnswerPolicy,
+    authority: ApplicableAuthorityFingerprint,
+}
+
+#[allow(dead_code)]
+impl BoundInteractionResponse {
+    pub(crate) fn new(
+        response_id: SurfaceResponseId,
+        answer: SurfaceClientInteractionAnswer,
+        policy: BrokerInteractionAnswerPolicy,
+        authority: ApplicableAuthorityFingerprint,
+    ) -> Self {
+        Self {
+            response_id,
+            answer,
+            policy,
+            authority,
+        }
+    }
+
+    pub fn response_id(&self) -> &SurfaceResponseId {
+        &self.response_id
+    }
+
+    pub fn answer(&self) -> &SurfaceClientInteractionAnswer {
+        &self.answer
+    }
+
+    pub fn policy(&self) -> &BrokerInteractionAnswerPolicy {
+        &self.policy
+    }
+
+    pub fn authority(&self) -> &ApplicableAuthorityFingerprint {
+        &self.authority
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ValidatedInteractionResponse {
-    pub interaction_id: SurfaceInteractionId,
-    pub response_id: SurfaceResponseId,
-    pub answer: SurfaceClientInteractionAnswer,
-    pub policy: BrokerInteractionAnswerPolicy,
-    pub authority: ApplicableAuthorityFingerprint,
-    pub route_epoch: ResponseRouteEpoch,
-    pub operation_fence: SurfaceOperationFence,
+    interaction_id: SurfaceInteractionId,
+    response_id: SurfaceResponseId,
+    answer: SurfaceClientInteractionAnswer,
+    policy: BrokerInteractionAnswerPolicy,
+    authority: ApplicableAuthorityFingerprint,
+    route_epoch: ResponseRouteEpoch,
+    operation_fence: SurfaceOperationFence,
+}
+
+#[allow(dead_code)]
+impl ValidatedInteractionResponse {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        interaction_id: SurfaceInteractionId,
+        response_id: SurfaceResponseId,
+        answer: SurfaceClientInteractionAnswer,
+        policy: BrokerInteractionAnswerPolicy,
+        authority: ApplicableAuthorityFingerprint,
+        route_epoch: ResponseRouteEpoch,
+        operation_fence: SurfaceOperationFence,
+    ) -> Self {
+        Self {
+            interaction_id,
+            response_id,
+            answer,
+            policy,
+            authority,
+            route_epoch,
+            operation_fence,
+        }
+    }
+
+    pub fn interaction_id(&self) -> &SurfaceInteractionId {
+        &self.interaction_id
+    }
+
+    pub fn response_id(&self) -> &SurfaceResponseId {
+        &self.response_id
+    }
+
+    pub fn answer(&self) -> &SurfaceClientInteractionAnswer {
+        &self.answer
+    }
+
+    pub fn policy(&self) -> &BrokerInteractionAnswerPolicy {
+        &self.policy
+    }
+
+    pub fn authority(&self) -> &ApplicableAuthorityFingerprint {
+        &self.authority
+    }
+
+    pub const fn route_epoch(&self) -> ResponseRouteEpoch {
+        self.route_epoch
+    }
+
+    pub fn operation_fence(&self) -> &SurfaceOperationFence {
+        &self.operation_fence
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

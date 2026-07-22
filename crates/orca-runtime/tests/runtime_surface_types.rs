@@ -46,8 +46,20 @@ fn primitive_wrappers_enforce_the_frozen_contract() {
     assert!(CanonicalPath::try_new(PathBuf::from("/tmp/surface")).is_ok());
     assert!(CanonicalPath::try_new(PathBuf::from("relative")).is_err());
     assert!(CanonicalPath::try_new(PathBuf::from("/tmp/../surface")).is_err());
+    assert!(CanonicalPath::try_new(PathBuf::from("/tmp/./surface")).is_err());
+    assert!(CanonicalPath::try_new(PathBuf::from("/tmp//surface")).is_err());
+    assert!(serde_json::from_value::<CanonicalPath>(serde_json::json!("/tmp//surface")).is_err());
     assert!(CanonicalUri::try_new("https://example.com/path").is_ok());
+    assert!(CanonicalUri::try_new("https://example.com:8443/path").is_ok());
     assert!(CanonicalUri::try_new("not a uri").is_err());
+    assert!(CanonicalUri::try_new("HTTPS://example.com/path").is_err());
+    assert!(CanonicalUri::try_new("https://EXAMPLE.COM/path").is_err());
+    assert!(CanonicalUri::try_new("https://example.com:443/path").is_err());
+    assert!(CanonicalUri::try_new("https://example.com:0443/path").is_err());
+    assert!(
+        serde_json::from_value::<CanonicalUri>(serde_json::json!("https://EXAMPLE.COM/path"))
+            .is_err()
+    );
     assert!(CanonicalMime::try_new("application/json").is_ok());
     assert!(CanonicalMime::try_new("Application/JSON").is_err());
     assert!(CanonicalMime::try_new("application/json; charset=utf-8").is_err());
@@ -56,6 +68,100 @@ fn primitive_wrappers_enforce_the_frozen_contract() {
     assert!(CanonicalDomainName::try_new("https://example.com").is_err());
     assert!(Rfc3339Timestamp::try_new("2026-07-22T00:00:00Z").is_ok());
     assert!(Rfc3339Timestamp::try_new("2026-07-22T08:00:00+08:00").is_err());
+}
+
+#[test]
+fn reservation_lease_has_one_canonical_v1_duration() {
+    let canonical = serde_json::json!({
+        "lease_id": SurfaceAdmissionLeaseId::try_from_bytes(uuid_v7_bytes(21)).unwrap(),
+        "operation_id": SurfaceOperationId::try_from_bytes(uuid_v7_bytes(22)).unwrap(),
+        "reservation_sequence": SequenceNumber::new(7),
+        "issuing_host_incarnation": HostIncarnation::try_from_bytes(uuid_v7_bytes(23)).unwrap(),
+        "issued_at": MonotonicInstant {
+            clock_id: HostMonotonicClockId::try_from_bytes(uuid_v7_bytes(24)).unwrap(),
+            tick: MonotonicTick::new(11),
+        },
+        "duration": SURFACE_RESERVATION_LEASE_MS,
+    });
+    let lease: ReservationLease = serde_json::from_value(canonical.clone()).unwrap();
+    assert_eq!(SURFACE_RESERVATION_LEASE_MS, 30_000);
+    assert_eq!(lease.duration().get(), SURFACE_RESERVATION_LEASE_MS);
+
+    let serialized = serde_json::to_value(&lease).unwrap();
+    assert_eq!(
+        serialized.get("duration"),
+        Some(&serde_json::json!(SURFACE_RESERVATION_LEASE_MS))
+    );
+    assert_eq!(serialized, canonical);
+
+    for invalid_duration in [0, 29_999, 30_001] {
+        let mut invalid = canonical.clone();
+        invalid["duration"] = serde_json::json!(invalid_duration);
+        assert!(
+            serde_json::from_value::<ReservationLease>(invalid).is_err(),
+            "accepted noncanonical lease duration {invalid_duration}"
+        );
+    }
+
+    let operation_source = include_str!("../src/runtime_surface/operation.rs");
+    assert!(
+        operation_source.contains("pub(crate) fn new(\n        lease_id: SurfaceAdmissionLeaseId")
+    );
+    assert!(!operation_source.contains("pub fn new(\n        lease_id: SurfaceAdmissionLeaseId"));
+}
+
+fn declaration_block<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source.find(marker).unwrap();
+    let remainder = &source[start..];
+    let end = remainder.find("\n}\n").unwrap() + 3;
+    &remainder[..end]
+}
+
+fn attributed_declaration_block<'a>(source: &'a str, marker: &str) -> &'a str {
+    let declaration = declaration_block(source, marker);
+    let declaration_start = declaration.as_ptr() as usize - source.as_ptr() as usize;
+    let attribute_start = source[..declaration_start]
+        .rfind("#[derive")
+        .unwrap_or(declaration_start);
+    &source[attribute_start..declaration_start + declaration.len()]
+}
+
+#[test]
+fn authority_and_secret_sources_keep_the_public_boundary_closed() {
+    let interaction_source = include_str!("../src/runtime_surface/interaction.rs");
+    for marker in [
+        "pub struct AuthorityFingerprint {",
+        "pub struct BoundInteractionResponse {",
+        "pub struct ValidatedInteractionResponse {",
+    ] {
+        let declaration = declaration_block(interaction_source, marker);
+        assert!(
+            !attributed_declaration_block(interaction_source, marker).contains("Debug"),
+            "Debug leaked in {marker}"
+        );
+        assert!(
+            !declaration
+                .lines()
+                .skip(1)
+                .any(|line| line.contains("pub ")),
+            "authority-bearing fields leaked in {marker}"
+        );
+    }
+    assert!(interaction_source.contains(
+        "pub struct ApplicableAuthorityFingerprint(ApplicableAuthorityFingerprintKind);"
+    ));
+    assert!(!interaction_source.contains("pub enum ApplicableAuthorityFingerprint"));
+    assert!(!interaction_source.contains(
+        "#[derive(Clone, Debug, Eq, PartialEq)]\npub struct ApplicableAuthorityFingerprint"
+    ));
+    assert!(
+        !interaction_source.contains("impl std::fmt::Debug for ApplicableAuthorityFingerprint")
+    );
+
+    let identity_source = include_str!("../src/runtime_surface/identity.rs");
+    assert!(identity_source.contains("std::ptr::write_volatile"));
+    assert!(identity_source.contains("compiler_fence(Ordering::SeqCst)"));
+    assert!(!identity_source.contains("self.0.fill(0)"));
 }
 
 #[test]
@@ -989,59 +1095,379 @@ fn every_manifest_patch_inventory_has_an_exhaustive_rust_match() {
 
 fn surface_command_name(command: &SurfaceCommand) -> &'static str {
     match command {
-        SurfaceCommand::ReserveOperation { .. } => "ReserveOperation",
-        SurfaceCommand::AdmitReserved { .. } => "AdmitReserved",
-        SurfaceCommand::CancelOperation { .. } => "CancelOperation",
-        SurfaceCommand::CancelSessionCurrent { .. } => "CancelSessionCurrent",
-        SurfaceCommand::InterruptGeneration { .. } => "InterruptGeneration",
-        SurfaceCommand::PauseGoalOperation { .. } => "PauseGoalOperation",
-        SurfaceCommand::ResumeOperation { .. } => "ResumeOperation",
-        SurfaceCommand::SteerOperation { .. } => "SteerOperation",
-        SurfaceCommand::TransferBackground { .. } => "TransferBackground",
-        SurfaceCommand::RespondInteraction { .. } => "RespondInteraction",
-        SurfaceCommand::ReconcileMutation { .. } => "ReconcileMutation",
-        SurfaceCommand::RetryStartCommit { .. } => "RetryStartCommit",
-        SurfaceCommand::RetryProjection { .. } => "RetryProjection",
-        SurfaceCommand::RetryFinalization { .. } => "RetryFinalization",
-        SurfaceCommand::ManualCompact { .. } => "ManualCompact",
-        SurfaceCommand::Backtrack { .. } => "Backtrack",
-        SurfaceCommand::TaskControl { .. } => "TaskControl",
-        SurfaceCommand::WorkflowControl { .. } => "WorkflowControl",
-        SurfaceCommand::GoalMutation { .. } => "GoalMutation",
-        SurfaceCommand::SettingsMutation { .. } => "SettingsMutation",
-        SurfaceCommand::McpCatalogQuery { .. } => "McpCatalogQuery",
-        SurfaceCommand::PinnedContextMutation { .. } => "PinnedContextMutation",
+        SurfaceCommand::ReserveOperation {
+            request_id,
+            caller,
+            intent,
+        } => {
+            let _ = (request_id, caller, intent);
+            "ReserveOperation"
+        }
+        SurfaceCommand::AdmitReserved {
+            request_id,
+            caller,
+            operation_id,
+            admission_lease_id,
+        } => {
+            let _ = (request_id, caller, operation_id, admission_lease_id);
+            "AdmitReserved"
+        }
+        SurfaceCommand::CancelOperation {
+            request_id,
+            caller,
+            operation_id,
+        } => {
+            let _ = (request_id, caller, operation_id);
+            "CancelOperation"
+        }
+        SurfaceCommand::CancelSessionCurrent {
+            request_id,
+            caller,
+            legacy_rpc_id_digest,
+        } => {
+            let _ = (request_id, caller, legacy_rpc_id_digest);
+            "CancelSessionCurrent"
+        }
+        SurfaceCommand::InterruptGeneration {
+            request_id,
+            caller,
+            fence,
+        } => {
+            let _ = (request_id, caller, fence);
+            "InterruptGeneration"
+        }
+        SurfaceCommand::PauseGoalOperation {
+            request_id,
+            caller,
+            goal_fence,
+        } => {
+            let _ = (request_id, caller, goal_fence);
+            "PauseGoalOperation"
+        }
+        SurfaceCommand::ResumeOperation {
+            request_id,
+            caller,
+            operation_id,
+            expected_last_generation,
+            resume_source,
+        } => {
+            let _ = (
+                request_id,
+                caller,
+                operation_id,
+                expected_last_generation,
+                resume_source,
+            );
+            "ResumeOperation"
+        }
+        SurfaceCommand::SteerOperation {
+            request_id,
+            caller,
+            fence,
+            input,
+        } => {
+            let _ = (request_id, caller, fence, input);
+            "SteerOperation"
+        }
+        SurfaceCommand::TransferBackground {
+            request_id,
+            caller,
+            target,
+        } => {
+            let _ = (request_id, caller, target);
+            "TransferBackground"
+        }
+        SurfaceCommand::RespondInteraction {
+            request_id,
+            caller,
+            selector,
+            response,
+        } => {
+            let _ = (request_id, caller, selector, response);
+            "RespondInteraction"
+        }
+        SurfaceCommand::ReconcileMutation { token } => {
+            let _ = token;
+            "ReconcileMutation"
+        }
+        SurfaceCommand::RetryStartCommit { token } => {
+            let _ = token;
+            "RetryStartCommit"
+        }
+        SurfaceCommand::RetryProjection { token } => {
+            let _ = token;
+            "RetryProjection"
+        }
+        SurfaceCommand::RetryFinalization { token } => {
+            let _ = token;
+            "RetryFinalization"
+        }
+        SurfaceCommand::ManualCompact {
+            request_id,
+            caller,
+            expected_context_revision,
+        } => {
+            let _ = (request_id, caller, expected_context_revision);
+            "ManualCompact"
+        }
+        SurfaceCommand::Backtrack {
+            request_id,
+            caller,
+            expected_cursor,
+            target,
+        } => {
+            let _ = (request_id, caller, expected_cursor, target);
+            "Backtrack"
+        }
+        SurfaceCommand::TaskControl {
+            request_id,
+            caller,
+            action,
+        } => {
+            let _ = (request_id, caller, action);
+            "TaskControl"
+        }
+        SurfaceCommand::WorkflowControl {
+            request_id,
+            caller,
+            action,
+        } => {
+            let _ = (request_id, caller, action);
+            "WorkflowControl"
+        }
+        SurfaceCommand::GoalMutation {
+            request_id,
+            caller,
+            action,
+        } => {
+            let _ = (request_id, caller, action);
+            "GoalMutation"
+        }
+        SurfaceCommand::SettingsMutation {
+            request_id,
+            caller,
+            host_incarnation,
+            expected_thread_revision,
+            patch,
+        } => {
+            let _ = (
+                request_id,
+                caller,
+                host_incarnation,
+                expected_thread_revision,
+                patch,
+            );
+            "SettingsMutation"
+        }
+        SurfaceCommand::McpCatalogQuery {
+            request_id,
+            caller,
+            expected_revision,
+            query,
+        } => {
+            let _ = (request_id, caller, expected_revision, query);
+            "McpCatalogQuery"
+        }
+        SurfaceCommand::PinnedContextMutation {
+            request_id,
+            caller,
+            action,
+        } => {
+            let _ = (request_id, caller, action);
+            "PinnedContextMutation"
+        }
     }
 }
 
 fn surface_host_command_name(command: &SurfaceHostCommand) -> &'static str {
     match command {
-        SurfaceHostCommand::ListSessions { .. } => "ListSessions",
-        SurfaceHostCommand::SearchSessions { .. } => "SearchSessions",
-        SurfaceHostCommand::ReadSessionMetadata { .. } => "ReadSessionMetadata",
-        SurfaceHostCommand::ReadSession { .. } => "ReadSession",
-        SurfaceHostCommand::ReadThreadPage { .. } => "ReadThreadPage",
-        SurfaceHostCommand::CreateThread { .. } => "CreateThread",
-        SurfaceHostCommand::OpenThread { .. } => "OpenThread",
-        SurfaceHostCommand::LoadThread { .. } => "LoadThread",
-        SurfaceHostCommand::ForkThread { .. } => "ForkThread",
-        SurfaceHostCommand::ResolveRunningThread { .. } => "ResolveRunningThread",
-        SurfaceHostCommand::ResumeLatestActiveGoal { .. } => "ResumeLatestActiveGoal",
-        SurfaceHostCommand::UpdateSessionMetadata { .. } => "UpdateSessionMetadata",
-        SurfaceHostCommand::QueryInputCatalog { .. } => "QueryInputCatalog",
-        SurfaceHostCommand::ControlJsonlTurn { .. } => "ControlJsonlTurn",
-        SurfaceHostCommand::RememberMemory { .. } => "RememberMemory",
-        SurfaceHostCommand::ReconcileMemoryMutation { .. } => "ReconcileMemoryMutation",
-        SurfaceHostCommand::ReadFolderTrust { .. } => "ReadFolderTrust",
-        SurfaceHostCommand::SetFolderTrust { .. } => "SetFolderTrust",
-        SurfaceHostCommand::ReconcileFolderTrustRevocation { .. } => {
+        SurfaceHostCommand::ListSessions { request_id, page } => {
+            let _ = (request_id, page);
+            "ListSessions"
+        }
+        SurfaceHostCommand::SearchSessions { request_id, search } => {
+            let _ = (request_id, search);
+            "SearchSessions"
+        }
+        SurfaceHostCommand::ReadSessionMetadata {
+            request_id,
+            thread_id,
+        } => {
+            let _ = (request_id, thread_id);
+            "ReadSessionMetadata"
+        }
+        SurfaceHostCommand::ReadSession {
+            request_id,
+            thread_id,
+            include_messages,
+            include_turns,
+        } => {
+            let _ = (request_id, thread_id, include_messages, include_turns);
+            "ReadSession"
+        }
+        SurfaceHostCommand::ReadThreadPage {
+            request_id,
+            thread_id,
+            query,
+            read_token,
+            cursor,
+            limit,
+        } => {
+            let _ = (request_id, thread_id, query, read_token, cursor, limit);
+            "ReadThreadPage"
+        }
+        SurfaceHostCommand::CreateThread { request_id, spec } => {
+            let _ = (request_id, spec);
+            "CreateThread"
+        }
+        SurfaceHostCommand::OpenThread {
+            request_id,
+            thread_id,
+            mode,
+            expected_settings_digest,
+        } => {
+            let _ = (request_id, thread_id, mode, expected_settings_digest);
+            "OpenThread"
+        }
+        SurfaceHostCommand::LoadThread {
+            request_id,
+            thread_id,
+            expected_settings_digest,
+            settings_overrides,
+            mcp_servers,
+        } => {
+            let _ = (
+                request_id,
+                thread_id,
+                expected_settings_digest,
+                settings_overrides,
+                mcp_servers,
+            );
+            "LoadThread"
+        }
+        SurfaceHostCommand::ForkThread {
+            request_id,
+            source_thread_id,
+            source_read_token,
+            title,
+            settings_overrides,
+        } => {
+            let _ = (
+                request_id,
+                source_thread_id,
+                source_read_token,
+                title,
+                settings_overrides,
+            );
+            "ForkThread"
+        }
+        SurfaceHostCommand::ResolveRunningThread {
+            request_id,
+            thread_id,
+            mode,
+        } => {
+            let _ = (request_id, thread_id, mode);
+            "ResolveRunningThread"
+        }
+        SurfaceHostCommand::ResumeLatestActiveGoal {
+            request_id,
+            expected_goal_store_revision,
+        } => {
+            let _ = (request_id, expected_goal_store_revision);
+            "ResumeLatestActiveGoal"
+        }
+        SurfaceHostCommand::UpdateSessionMetadata {
+            request_id,
+            thread_id,
+            precondition,
+            patch,
+        } => {
+            let _ = (request_id, thread_id, precondition, patch);
+            "UpdateSessionMetadata"
+        }
+        SurfaceHostCommand::QueryInputCatalog {
+            request_id,
+            context,
+            expected_revision,
+            query,
+        } => {
+            let _ = (request_id, context, expected_revision, query);
+            "QueryInputCatalog"
+        }
+        SurfaceHostCommand::ControlJsonlTurn {
+            request_id,
+            expected_thread_id,
+            legacy_turn_id,
+            action,
+        } => {
+            let _ = (request_id, expected_thread_id, legacy_turn_id, action);
+            "ControlJsonlTurn"
+        }
+        SurfaceHostCommand::RememberMemory {
+            request_id,
+            scope,
+            note,
+            pin_to_thread,
+        } => {
+            let _ = (request_id, scope, note, pin_to_thread);
+            "RememberMemory"
+        }
+        SurfaceHostCommand::ReconcileMemoryMutation { token } => {
+            let _ = token;
+            "ReconcileMemoryMutation"
+        }
+        SurfaceHostCommand::ReadFolderTrust { request_id, path } => {
+            let _ = (request_id, path);
+            "ReadFolderTrust"
+        }
+        SurfaceHostCommand::SetFolderTrust {
+            request_id,
+            path,
+            expected_trust_revision,
+            level,
+        } => {
+            let _ = (request_id, path, expected_trust_revision, level);
+            "SetFolderTrust"
+        }
+        SurfaceHostCommand::ReconcileFolderTrustRevocation { token } => {
+            let _ = token;
             "ReconcileFolderTrustRevocation"
         }
-        SurfaceHostCommand::ReadRuntimeSettings { .. } => "ReadRuntimeSettings",
-        SurfaceHostCommand::UpdateRuntimeSettings { .. } => "UpdateRuntimeSettings",
-        SurfaceHostCommand::ReconcileHostMutation { .. } => "ReconcileHostMutation",
-        SurfaceHostCommand::CloseThread { .. } => "CloseThread",
-        SurfaceHostCommand::ShutdownHost { .. } => "ShutdownHost",
+        SurfaceHostCommand::ReadRuntimeSettings {
+            request_id,
+            thread_id,
+        } => {
+            let _ = (request_id, thread_id);
+            "ReadRuntimeSettings"
+        }
+        SurfaceHostCommand::UpdateRuntimeSettings {
+            request_id,
+            target,
+            expected,
+            patch,
+        } => {
+            let _ = (request_id, target, expected, patch);
+            "UpdateRuntimeSettings"
+        }
+        SurfaceHostCommand::ReconcileHostMutation { token } => {
+            let _ = token;
+            "ReconcileHostMutation"
+        }
+        SurfaceHostCommand::CloseThread {
+            request_id,
+            thread_id,
+            expected_owner_epoch,
+        } => {
+            let _ = (request_id, thread_id, expected_owner_epoch);
+            "CloseThread"
+        }
+        SurfaceHostCommand::ShutdownHost {
+            request_id,
+            host_incarnation,
+        } => {
+            let _ = (request_id, host_incarnation);
+            "ShutdownHost"
+        }
     }
 }
 
@@ -1274,9 +1700,18 @@ fn host_commit_ack_identity_is_closed(value: &MutationCommitAck) {
 
 fn mutation_reply_name<T>(value: &MutationReply<T>) -> &'static str {
     match value {
-        MutationReply::Committed { .. } => "Committed",
-        MutationReply::Deferred { .. } => "Deferred",
-        MutationReply::Uncommitted { .. } => "Uncommitted",
+        MutationReply::Committed { mutation, value } => {
+            let _ = (mutation, value);
+            "Committed"
+        }
+        MutationReply::Deferred { mutation, partial } => {
+            let _ = (mutation, partial);
+            "Deferred"
+        }
+        MutationReply::Uncommitted { mutation } => {
+            let _ = mutation;
+            "Uncommitted"
+        }
     }
 }
 
@@ -1346,11 +1781,30 @@ fn wait_result_name(value: &WaitOperationTerminalResult) -> &'static str {
 
 fn read_result_name<T>(value: &SurfaceReadResult<T>) -> &'static str {
     match value {
-        SurfaceReadResult::Found { .. } => "Found",
-        SurfaceReadResult::NotFound { .. } => "NotFound",
-        SurfaceReadResult::Invalid { .. } => "Invalid",
-        SurfaceReadResult::Stale { .. } => "Stale",
-        SurfaceReadResult::Unavailable { .. } => "Unavailable",
+        SurfaceReadResult::Found {
+            request_id,
+            revision,
+            value,
+        } => {
+            let _ = (request_id, revision, value);
+            "Found"
+        }
+        SurfaceReadResult::NotFound { request_id, error } => {
+            let _ = (request_id, error);
+            "NotFound"
+        }
+        SurfaceReadResult::Invalid { request_id, error } => {
+            let _ = (request_id, error);
+            "Invalid"
+        }
+        SurfaceReadResult::Stale { request_id, error } => {
+            let _ = (request_id, error);
+            "Stale"
+        }
+        SurfaceReadResult::Unavailable { request_id, error } => {
+            let _ = (request_id, error);
+            "Unavailable"
+        }
     }
 }
 

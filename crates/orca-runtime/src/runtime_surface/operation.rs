@@ -1,5 +1,5 @@
 use super::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const SURFACE_RESERVATION_LEASE_MS: u64 = 30_000;
 
@@ -366,14 +366,68 @@ pub enum AdmittedInput {
     NotApplicable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReservationLease {
     pub lease_id: SurfaceAdmissionLeaseId,
     pub operation_id: SurfaceOperationId,
     pub reservation_sequence: SequenceNumber,
     pub issuing_host_incarnation: HostIncarnation,
     pub issued_at: MonotonicInstant,
-    pub duration: DurationMillis,
+    duration: DurationMillis,
+}
+
+impl ReservationLease {
+    pub(crate) fn new(
+        lease_id: SurfaceAdmissionLeaseId,
+        operation_id: SurfaceOperationId,
+        reservation_sequence: SequenceNumber,
+        issuing_host_incarnation: HostIncarnation,
+        issued_at: MonotonicInstant,
+    ) -> Self {
+        Self {
+            lease_id,
+            operation_id,
+            reservation_sequence,
+            issuing_host_incarnation,
+            issued_at,
+            duration: DurationMillis::new(SURFACE_RESERVATION_LEASE_MS),
+        }
+    }
+
+    pub const fn duration(&self) -> DurationMillis {
+        self.duration
+    }
+}
+
+impl<'de> Deserialize<'de> for ReservationLease {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireReservationLease {
+            lease_id: SurfaceAdmissionLeaseId,
+            operation_id: SurfaceOperationId,
+            reservation_sequence: SequenceNumber,
+            issuing_host_incarnation: HostIncarnation,
+            issued_at: MonotonicInstant,
+            duration: DurationMillis,
+        }
+
+        let wire = WireReservationLease::deserialize(deserializer)?;
+        if wire.duration.get() != SURFACE_RESERVATION_LEASE_MS {
+            return Err(serde::de::Error::custom(
+                "reservation lease duration must be exactly 30000 milliseconds",
+            ));
+        }
+        Ok(Self::new(
+            wire.lease_id,
+            wire.operation_id,
+            wire.reservation_sequence,
+            wire.issuing_host_incarnation,
+            wire.issued_at,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
