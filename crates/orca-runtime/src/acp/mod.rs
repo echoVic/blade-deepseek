@@ -6,6 +6,8 @@
 
 mod agent;
 mod event_map;
+#[allow(dead_code)]
+pub(crate) mod rpc_facade;
 mod transport;
 
 pub use agent::OrcaAcpAgent;
