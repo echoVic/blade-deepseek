@@ -71,6 +71,48 @@ fn primitive_wrappers_enforce_the_frozen_contract() {
 }
 
 #[test]
+fn canonical_path_unicode_wire_shape_round_trips() {
+    #[cfg(unix)]
+    let path = PathBuf::from("/tmp/orca-\u{8868}\u{9762}");
+    #[cfg(windows)]
+    let path = PathBuf::from("C:\\tmp\\orca-\u{8868}\u{9762}");
+
+    let canonical = CanonicalPath::try_new(path).unwrap();
+    let encoded = serde_json::to_value(&canonical).unwrap();
+    let decoded: CanonicalPath = serde_json::from_value(encoded).unwrap();
+
+    assert_eq!(decoded, canonical);
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_path_rejects_invalid_utf8_unix_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut bytes = b"/tmp/orca-surface-".to_vec();
+    bytes.push(0xff);
+    let path = PathBuf::from(OsString::from_vec(bytes));
+
+    assert!(path.is_absolute());
+    assert!(CanonicalPath::try_new(path).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn canonical_path_rejects_unpaired_utf16_windows_path() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut wide: Vec<u16> = "C:\\tmp\\orca-surface-".encode_utf16().collect();
+    wide.push(0xd800);
+    let path = PathBuf::from(OsString::from_wide(&wide));
+
+    assert!(path.is_absolute());
+    assert!(CanonicalPath::try_new(path).is_err());
+}
+
+#[test]
 fn canonical_uri_validates_the_complete_authority_userinfo() {
     for valid in [
         "https://user@example.com/path",

@@ -81,12 +81,19 @@ impl<'de> Deserialize<'de> for SafeDiagnosticText {
     }
 }
 
+/// An absolute, lexically normalized path with a lossless UTF-8 wire representation.
+///
+/// The frozen transparent string wire shape requires every constructed value to
+/// serialize without platform-specific byte or wide-string encoding failures.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct CanonicalPath(PathBuf);
 
 impl CanonicalPath {
     pub fn try_new(value: PathBuf) -> Result<Self, SurfaceValueError> {
+        if value.to_str().is_none() {
+            return Err(SurfaceValueError::InvalidFormat);
+        }
         if !value.is_absolute()
             || value
                 .components()
