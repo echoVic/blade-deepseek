@@ -53,6 +53,7 @@ pub(crate) mod runtime_special;
 pub mod runtime_state;
 mod runtime_steer;
 mod runtime_subagent_call;
+mod runtime_surface;
 mod runtime_tool_actor;
 mod runtime_tool_call;
 pub(crate) mod runtime_tool_scheduler;
@@ -86,6 +87,10 @@ pub mod update_check;
 pub mod workflow;
 pub mod workflow_execution;
 pub mod worktree;
+
+pub mod unstable_surface {
+    pub use crate::runtime_surface::*;
+}
 
 #[cfg(test)]
 mod tests {
