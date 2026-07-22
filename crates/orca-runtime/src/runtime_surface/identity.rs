@@ -179,9 +179,16 @@ fn validate_uri_authority(scheme: &str, authority: &str) -> Result<(), SurfaceVa
     if authority.is_empty() {
         return Ok(());
     }
-    let host_and_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, value)| value);
+    let host_and_port = match authority.split_once('@') {
+        Some((userinfo, host_and_port)) => {
+            if userinfo.is_empty() || host_and_port.is_empty() || host_and_port.contains('@') {
+                return Err(SurfaceValueError::InvalidFormat);
+            }
+            validate_uri_userinfo(userinfo)?;
+            host_and_port
+        }
+        None => authority,
+    };
     if host_and_port.is_empty() {
         return Err(SurfaceValueError::InvalidFormat);
     }
@@ -248,6 +255,57 @@ fn validate_uri_authority(scheme: &str, authority: &str) -> Result<(), SurfaceVa
         ) {
             return Err(SurfaceValueError::NonCanonical);
         }
+    }
+    Ok(())
+}
+
+fn validate_uri_userinfo(value: &str) -> Result<(), SurfaceValueError> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let Some(encoded) = bytes.get(index + 1..index + 3) else {
+                return Err(SurfaceValueError::InvalidFormat);
+            };
+            let decode_hex = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            let decoded = decode_hex(encoded[0])
+                .zip(decode_hex(encoded[1]))
+                .map(|(high, low)| high * 16 + low)
+                .ok_or(SurfaceValueError::NonCanonical)?;
+            if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'.' | b'_' | b'~') {
+                return Err(SurfaceValueError::NonCanonical);
+            }
+            index += 3;
+            continue;
+        }
+        if !byte.is_ascii_alphanumeric()
+            && !matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+            )
+        {
+            return Err(SurfaceValueError::InvalidFormat);
+        }
+        index += 1;
     }
     Ok(())
 }

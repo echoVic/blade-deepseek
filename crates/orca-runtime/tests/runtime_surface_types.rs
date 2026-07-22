@@ -71,6 +71,43 @@ fn primitive_wrappers_enforce_the_frozen_contract() {
 }
 
 #[test]
+fn canonical_uri_validates_the_complete_authority_userinfo() {
+    for valid in [
+        "https://user@example.com/path",
+        "https://user:pa%40ss@example.com:8443/path",
+    ] {
+        assert!(
+            CanonicalUri::try_new(valid).is_ok(),
+            "constructor rejected canonical userinfo: {valid}"
+        );
+        assert!(
+            serde_json::from_value::<CanonicalUri>(serde_json::json!(valid)).is_ok(),
+            "serde rejected canonical userinfo: {valid}"
+        );
+    }
+
+    for invalid in [
+        "https://@example.com/path",
+        "https://user@@example.com/path",
+        "https://user[admin]@example.com/path",
+        "https://user%@example.com/path",
+        "https://user%4@example.com/path",
+        "https://user%GG@example.com/path",
+        "https://user%4a@example.com/path",
+        "https://%75ser@example.com/path",
+    ] {
+        assert!(
+            CanonicalUri::try_new(invalid).is_err(),
+            "constructor accepted noncanonical userinfo: {invalid}"
+        );
+        assert!(
+            serde_json::from_value::<CanonicalUri>(serde_json::json!(invalid)).is_err(),
+            "serde accepted noncanonical userinfo: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn reservation_lease_has_one_canonical_v1_duration() {
     let canonical = serde_json::json!({
         "lease_id": SurfaceAdmissionLeaseId::try_from_bytes(uuid_v7_bytes(21)).unwrap(),
