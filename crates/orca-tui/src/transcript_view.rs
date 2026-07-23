@@ -259,6 +259,7 @@ struct CachedMessage {
     revision: u64,
     width: usize,
     theme: ThemeIdentity,
+    syntax_theme_revision: u64,
     force_expand: bool,
     spinner_phase: Option<u8>,
     wrapped_lines: Vec<CompactWrappedLine>,
@@ -272,12 +273,14 @@ impl CachedMessage {
         revision: u64,
         width: usize,
         theme: ThemeIdentity,
+        syntax_theme_revision: u64,
         force_expand: bool,
         spinner_phase: Option<u8>,
     ) -> bool {
         self.revision == revision
             && self.width == width
             && self.theme == theme
+            && self.syntax_theme_revision == syntax_theme_revision
             && self.force_expand == force_expand
             && self.spinner_phase == spinner_phase
     }
@@ -287,6 +290,7 @@ impl CachedMessage {
         revision: u64,
         width: usize,
         theme: ThemeIdentity,
+        syntax_theme_revision: u64,
         force_expand: bool,
         spinner_phase: Option<u8>,
     ) -> bool {
@@ -296,6 +300,7 @@ impl CachedMessage {
         if self.revision != revision
             || self.width != width
             || self.theme != theme
+            || self.syntax_theme_revision != syntax_theme_revision
             || self.force_expand != force_expand
             || self.spinner_phase.is_none()
             || self.spinner_phase == Some(spinner_phase)
@@ -332,6 +337,7 @@ pub(crate) struct TranscriptRenderCache {
     spinner_indices: BTreeSet<usize>,
     prepared_width: Option<usize>,
     prepared_theme: Option<ThemeIdentity>,
+    prepared_syntax_theme_revision: Option<u64>,
     prepared_force_expand: Option<bool>,
     prepared_spinner_phase: Option<u8>,
     #[cfg(test)]
@@ -376,7 +382,7 @@ impl TranscriptRenderCache {
     }
 
     #[cfg(test)]
-    fn last_prepare_visited(&self) -> usize {
+    pub(crate) fn last_prepare_visited(&self) -> usize {
         self.last_prepare_visited
     }
 
@@ -448,22 +454,25 @@ impl TranscriptRenderCache {
         revisions: &[u64],
         width: usize,
         theme: &Theme,
+        syntax_theme_revision: u64,
         tick: u64,
         force_expand: bool,
         mut build_message: F,
     ) where
-        F: FnMut(&ChatMessage, &Theme, usize, u64, bool) -> Vec<Line<'static>>,
+        F: FnMut(usize, &ChatMessage, &Theme, usize, u64, bool) -> Vec<Line<'static>>,
     {
         let width = width.max(1);
         let theme_identity = ThemeIdentity::from(theme);
         self.reconcile_len(messages.len());
         if self.prepared_width != Some(width)
             || self.prepared_theme != Some(theme_identity)
+            || self.prepared_syntax_theme_revision != Some(syntax_theme_revision)
             || self.prepared_force_expand != Some(force_expand)
         {
             self.dirty_indices.extend(0..messages.len());
             self.prepared_width = Some(width);
             self.prepared_theme = Some(theme_identity);
+            self.prepared_syntax_theme_revision = Some(syntax_theme_revision);
             self.prepared_force_expand = Some(force_expand);
         }
         let spinner_phase = ((tick / 2) % 10) as u8;
@@ -490,18 +499,32 @@ impl TranscriptRenderCache {
             let revision = revisions.get(index).copied().unwrap_or_default();
             let spinner_phase = message_spinner_phase(message, tick);
             if self.entries[index].as_mut().is_some_and(|cached| {
-                cached.patch_spinner(revision, width, theme_identity, force_expand, spinner_phase)
+                cached.patch_spinner(
+                    revision,
+                    width,
+                    theme_identity,
+                    syntax_theme_revision,
+                    force_expand,
+                    spinner_phase,
+                )
             }) {
                 continue;
             }
             let matches = self.entries[index].as_ref().is_some_and(|cached| {
-                cached.matches(revision, width, theme_identity, force_expand, spinner_phase)
+                cached.matches(
+                    revision,
+                    width,
+                    theme_identity,
+                    syntax_theme_revision,
+                    force_expand,
+                    spinner_phase,
+                )
             });
             if matches {
                 continue;
             }
 
-            let lines = build_message(message, theme, width, tick, force_expand);
+            let lines = build_message(index, message, theme, width, tick, force_expand);
             let ratatui_width = width.min(u16::MAX as usize) as u16;
             let wrapped_lines = lines
                 .iter()
@@ -538,6 +561,7 @@ impl TranscriptRenderCache {
                 revision,
                 width,
                 theme: theme_identity,
+                syntax_theme_revision,
                 force_expand,
                 spinner_phase,
                 wrapped_lines,
@@ -929,7 +953,7 @@ fn message_spinner_phase(message: &ChatMessage, tick: u64) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Alignment, Rect};
@@ -938,7 +962,9 @@ mod tests {
     use ratatui::widgets::{Paragraph, Widget, Wrap};
     use unicode_width::UnicodeWidthStr;
 
-    use super::{TranscriptRenderCache, viewport_paragraph, wrap_line_ratatui_compatible};
+    use super::{
+        SPINNER_FRAMES, TranscriptRenderCache, viewport_paragraph, wrap_line_ratatui_compatible,
+    };
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
     use crate::types::ChatMessage;
@@ -1007,9 +1033,10 @@ mod tests {
             &revisions,
             width as usize,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |_, _, _, _, _| source_lines.clone(),
+            |_, _, _, _, _, _| source_lines.clone(),
         );
         let viewport = cache.viewport(0, usize::MAX, visible_height);
         let mut actual = Buffer::empty(expected.area);
@@ -1034,9 +1061,10 @@ mod tests {
             &revisions,
             width,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| {
+            |_, message, _, _, _, _| {
                 let ChatMessage::System(index) = message else {
                     unreachable!()
                 };
@@ -1227,6 +1255,7 @@ mod tests {
         messages: &[ChatMessage],
         revisions: &[u64],
         width: usize,
+        syntax_theme_revision: u64,
         tick: u64,
         message_builds: &Cell<usize>,
         markdown_parses: &Cell<usize>,
@@ -1237,9 +1266,10 @@ mod tests {
             revisions,
             width,
             &theme,
+            syntax_theme_revision,
             tick,
             false,
-            |message, theme, width, tick, force_expand| {
+            |_, message, theme, width, tick, force_expand| {
                 message_builds.set(message_builds.get() + 1);
                 if matches!(message, ChatMessage::Assistant(_)) {
                     markdown_parses.set(markdown_parses.get() + 1);
@@ -1267,14 +1297,18 @@ mod tests {
         let parses = Cell::new(0);
         let mut cache = TranscriptRenderCache::default();
 
-        prepare_with_counters(&mut cache, &messages, &revisions, 40, 0, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+        );
         let _ = cache.viewport(0, 0, 4);
         assert_eq!(builds.get(), 3);
         assert_eq!(parses.get(), 2);
 
         builds.set(0);
         parses.set(0);
-        prepare_with_counters(&mut cache, &messages, &revisions, 40, 0, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+        );
         let _ = cache.viewport(0, 2, 4);
 
         assert_eq!(builds.get(), 0);
@@ -1294,7 +1328,9 @@ mod tests {
         let parses = Cell::new(0);
         let mut cache = TranscriptRenderCache::default();
 
-        prepare_with_counters(&mut cache, &messages, &revisions, 32, 0, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 32, 1, 0, &builds, &parses,
+        );
         builds.set(0);
         parses.set(0);
 
@@ -1304,10 +1340,140 @@ mod tests {
         text.push_str("ing delta");
         revisions[2] = 4;
         cache.invalidate(2);
-        prepare_with_counters(&mut cache, &messages, &revisions, 32, 0, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 32, 1, 0, &builds, &parses,
+        );
 
         assert_eq!(builds.get(), 1);
         assert_eq!(parses.get(), 1);
+    }
+
+    #[test]
+    fn syntax_theme_revision_rebuilds_highlighted_wrapped_lines_once() {
+        let messages = vec![ChatMessage::Assistant(
+            "```rust\nfn highlighted() {}\n```".to_string(),
+        )];
+        let revisions = vec![1];
+        let builds = Cell::new(0);
+        let parses = Cell::new(0);
+        let mut cache = TranscriptRenderCache::default();
+
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+        );
+        builds.set(0);
+        parses.set(0);
+
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+        );
+        assert_eq!(builds.get(), 0);
+        assert_eq!(parses.get(), 0);
+
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 2, 0, &builds, &parses,
+        );
+        assert_eq!(builds.get(), 1);
+        assert_eq!(parses.get(), 1);
+
+        builds.set(0);
+        parses.set(0);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 2, 0, &builds, &parses,
+        );
+        assert_eq!(builds.get(), 0);
+        assert_eq!(parses.get(), 0);
+        assert_eq!(cache.last_prepare_visited(), 0);
+    }
+
+    #[test]
+    fn spinner_frames_preserve_patch_byte_length_and_display_width() {
+        let expected_byte_length = SPINNER_FRAMES[0].len();
+
+        for frame in SPINNER_FRAMES {
+            assert_eq!(frame.len(), expected_byte_length);
+            assert_eq!(frame.width(), 1);
+        }
+    }
+
+    #[test]
+    fn spinner_patch_requires_matching_syntax_theme_revision() {
+        let messages = vec![ChatMessage::ToolCall {
+            id: "running".to_string(),
+            name: "read".to_string(),
+            target: None,
+            status: "running".to_string(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        }];
+        let revisions = vec![1];
+        let builds = Cell::new(0);
+        let parses = Cell::new(0);
+        let mut cache = TranscriptRenderCache::default();
+
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+        );
+        builds.set(0);
+        parses.set(0);
+
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 2, 2, &builds, &parses,
+        );
+
+        assert_eq!(builds.get(), 1);
+        assert_eq!(parses.get(), 0);
+    }
+
+    #[test]
+    fn builder_receives_initial_and_selectively_invalidated_message_indices() {
+        let messages = vec![
+            ChatMessage::System("zero".to_string()),
+            ChatMessage::System("one".to_string()),
+            ChatMessage::System("two".to_string()),
+        ];
+        let mut revisions = vec![1, 2, 3];
+        let built_indices = RefCell::new(Vec::new());
+        let mut cache = TranscriptRenderCache::default();
+        let theme = theme();
+
+        cache.prepare(
+            &messages,
+            &revisions,
+            40,
+            &theme,
+            1,
+            0,
+            false,
+            |index, message, _, _, _, _| {
+                built_indices.borrow_mut().push(index);
+                vec![Line::from(format!("{message:?}"))]
+            },
+        );
+        assert_eq!(*built_indices.borrow(), vec![0, 1, 2]);
+        assert_eq!(cache.last_prepare_visited(), messages.len());
+
+        built_indices.borrow_mut().clear();
+        revisions[1] += 1;
+        cache.invalidate(1);
+        cache.prepare(
+            &messages,
+            &revisions,
+            40,
+            &theme,
+            1,
+            0,
+            false,
+            |index, message, _, _, _, _| {
+                built_indices.borrow_mut().push(index);
+                vec![Line::from(format!("{message:?}"))]
+            },
+        );
+
+        assert_eq!(*built_indices.borrow(), vec![1]);
+        assert_eq!(cache.last_prepare_visited(), 1);
     }
 
     #[test]
@@ -1333,13 +1499,17 @@ mod tests {
         let parses = Cell::new(0);
         let mut cache = TranscriptRenderCache::default();
 
-        prepare_with_counters(&mut cache, &messages, &revisions, 40, 0, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+        );
         let before = cache.entries[1].as_ref().unwrap().wrapped_lines[0]
             .text
             .clone();
         builds.set(0);
         parses.set(0);
-        prepare_with_counters(&mut cache, &messages, &revisions, 40, 2, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 40, 1, 2, &builds, &parses,
+        );
         let after = cache.entries[1].as_ref().unwrap().wrapped_lines[0]
             .text
             .clone();
@@ -1363,9 +1533,10 @@ mod tests {
             &revisions,
             80,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| match message {
+            |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) => vec![Line::from(text.clone()), Line::from("")],
                 _ => unreachable!(),
             },
@@ -1391,9 +1562,10 @@ mod tests {
             &revisions,
             80,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| match message {
+            |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) => vec![Line::from(text.clone()), Line::from("")],
                 _ => unreachable!(),
             },
@@ -1419,9 +1591,10 @@ mod tests {
             &revisions,
             80,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| match message {
+            |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) => vec![Line::from(text.clone())],
                 _ => unreachable!(),
             },
@@ -1450,9 +1623,10 @@ mod tests {
             &revisions,
             80,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| match message {
+            |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) if text == "tall" => (0..70_000)
                     .map(|index| Line::from(format!("line {index}")))
                     .collect(),
@@ -1479,9 +1653,10 @@ mod tests {
             &revisions,
             80,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |_, _, _, _, _| {
+            |_, _, _, _, _, _| {
                 (0..70_000)
                     .map(|index| Line::from(format!("line {index}")))
                     .collect()
@@ -1509,9 +1684,10 @@ mod tests {
             &revisions,
             5,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| match message {
+            |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) if text == "wrapped" => {
                     vec![Line::from("abcdefghijklmnopqrstuvwxy")]
                 }
@@ -1541,9 +1717,10 @@ mod tests {
             &revisions,
             1,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |_, _, _, _, _| vec![Line::from(body.clone())],
+            |_, _, _, _, _, _| vec![Line::from(body.clone())],
         );
         let viewport = cache.viewport(0, 69_980, 20);
 
@@ -1565,9 +1742,10 @@ mod tests {
             &revisions,
             1,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |_, _, _, _, _| vec![Line::from(body.clone())],
+            |_, _, _, _, _, _| vec![Line::from(body.clone())],
         );
         let viewport = cache.viewport(0, 0, 20);
         let materialized_width = viewport
@@ -1595,12 +1773,16 @@ mod tests {
         let parses = Cell::new(0);
         let mut cache = TranscriptRenderCache::default();
 
-        prepare_with_counters(&mut cache, &messages, &revisions, 80, 0, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 80, 1, 0, &builds, &parses,
+        );
         let wide_height = cache.viewport(0, usize::MAX, 5).total_height;
         builds.set(0);
         parses.set(0);
 
-        prepare_with_counters(&mut cache, &messages, &revisions, 20, 0, &builds, &parses);
+        prepare_with_counters(
+            &mut cache, &messages, &revisions, 20, 1, 0, &builds, &parses,
+        );
         let narrow = cache.viewport(0, usize::MAX, 5);
 
         assert_eq!(builds.get(), 1);
