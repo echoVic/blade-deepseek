@@ -22,6 +22,7 @@ use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::workflow_types::{WorkflowInput, WorkflowOutput};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tokio::task::JoinHandle;
@@ -52,6 +53,7 @@ pub const HOST_COMMAND_CAPACITY: usize = 16;
 pub const THREAD_COMMAND_CAPACITY: usize = 16;
 pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
@@ -846,6 +848,80 @@ impl GenerationContext {
 
     pub fn drain_steer_inputs(&self) -> Vec<String> {
         self.steer_handle.drain()
+    }
+
+    pub fn user_input_handler(&self) -> Option<&dyn RuntimeUserInputHandler> {
+        self.handlers
+            .user_input_handler
+            .as_deref()
+            .map(|handler| handler as &dyn RuntimeUserInputHandler)
+    }
+
+    pub fn mcp_elicitation_handler(&self) -> Option<&(dyn McpElicitationHandler + Send + Sync)> {
+        self.handlers.mcp_elicitation_handler.as_deref()
+    }
+}
+
+struct RuntimeSurfaceUserInputHandler {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+}
+
+impl RuntimeUserInputHandler for RuntimeSurfaceUserInputHandler {
+    fn request_user_input(
+        &self,
+        request: &crate::lifecycle::RuntimeUserInputRequest,
+    ) -> io::Result<Option<String>> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceRequestUserInput {
+                fence: self.fence.clone(),
+                request: request.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime interaction mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime interaction actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime interaction actor closed while waiting for user input",
+            )
+        })?
+    }
+}
+
+struct RuntimeSurfaceMcpElicitationHandler {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+}
+
+impl McpElicitationHandler for RuntimeSurfaceMcpElicitationHandler {
+    fn handle_elicitation(
+        &self,
+        request: orca_mcp::McpElicitationRequest,
+    ) -> Result<orca_mcp::McpElicitationResponse, String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceRequestMcpElicitation {
+                fence: self.fence.clone(),
+                request,
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "runtime interaction mailbox is full".to_string(),
+                TrySendError::Closed(_) => "runtime interaction actor is unavailable".to_string(),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            "runtime interaction actor closed while waiting for MCP elicitation".to_string()
+        })?
     }
 }
 
@@ -1680,6 +1756,30 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")
     }
 
+    #[cfg(test)]
+    fn respond_surface_interaction_for_test(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        selector: surface::InteractionSelector,
+        response: surface::BoundInteractionResponse,
+    ) -> Result<
+        surface::MutationReply<surface::RespondInteractionOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::SurfaceRespondInteraction {
+            client,
+            request_id,
+            selector,
+            response,
+            reply: reply_tx,
+        })
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        receive_reply(reply_rx, "runtime thread")
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+    }
+
     pub fn shutdown(&self) -> Result<(), RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         send_thread_shutdown(
@@ -1689,7 +1789,14 @@ impl RuntimeThreadHandle {
                 reason: surface::SurfaceShutdownReason::ThreadClose,
             },
         )?;
-        receive_reply(reply_rx, "runtime thread")?
+        match receive_reply(reply_rx, "runtime thread")? {
+            ThreadShutdownAck::Complete => Ok(()),
+            ThreadShutdownAck::Retry => Err(RuntimeHostError::ThreadStartFailed {
+                message: "runtime thread shutdown is retrying a prepared terminalization"
+                    .to_string(),
+            }),
+            ThreadShutdownAck::Failed(error) => Err(error),
+        }
     }
 
     fn try_send(&self, command: ThreadCommand) -> Result<(), RuntimeHostError> {
@@ -1747,18 +1854,35 @@ impl RuntimeHost {
     pub fn start_with_background_capacity(
         background_capacity: usize,
     ) -> Result<Self, RuntimeHostError> {
-        Self::start_inner(Arc::new(LegacyThreadOperationExecutor), background_capacity)
+        Self::start_inner(
+            Arc::new(LegacyThreadOperationExecutor),
+            background_capacity,
+            surface::SurfaceHubConfig::default(),
+        )
     }
 
     pub fn start_with_executor(
         executor: Arc<dyn ThreadOperationExecutor>,
     ) -> Result<Self, RuntimeHostError> {
-        Self::start_inner(executor, HOST_BACKGROUND_TASK_CAPACITY)
+        Self::start_inner(
+            executor,
+            HOST_BACKGROUND_TASK_CAPACITY,
+            surface::SurfaceHubConfig::default(),
+        )
+    }
+
+    #[cfg(test)]
+    fn start_with_executor_and_surface_config(
+        executor: Arc<dyn ThreadOperationExecutor>,
+        surface_hub_config: surface::SurfaceHubConfig,
+    ) -> Result<Self, RuntimeHostError> {
+        Self::start_inner(executor, HOST_BACKGROUND_TASK_CAPACITY, surface_hub_config)
     }
 
     fn start_inner(
         executor: Arc<dyn ThreadOperationExecutor>,
         background_capacity: usize,
+        surface_hub_config: surface::SurfaceHubConfig,
     ) -> Result<Self, RuntimeHostError> {
         let (command_tx, command_rx) = tokio_mpsc::channel(HOST_COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -1779,6 +1903,7 @@ impl RuntimeHost {
                             command_rx,
                             executor,
                             background_capacity,
+                            surface_hub_config,
                         ));
                     }
                     Err(error) => {
@@ -1862,6 +1987,11 @@ enum HostCommand {
 }
 
 enum ThreadCommand {
+    SurfaceDetach {
+        client: surface::RuntimeSurfaceClientHandle,
+        request: surface::DetachRequest,
+        reply: SyncSender<surface::DetachResult>,
+    },
     SurfaceReserveOperation {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
@@ -1902,6 +2032,41 @@ enum ThreadCommand {
         operation_id: surface::SurfaceOperationId,
         reply: SyncSender<
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
+        >,
+    },
+    SurfaceRequestUserInput {
+        fence: surface::SurfaceOperationFence,
+        request: crate::lifecycle::RuntimeUserInputRequest,
+        reply: SyncSender<io::Result<Option<String>>>,
+    },
+    SurfaceRequestMcpElicitation {
+        fence: surface::SurfaceOperationFence,
+        request: orca_mcp::McpElicitationRequest,
+        reply: SyncSender<Result<orca_mcp::McpElicitationResponse, String>>,
+    },
+    #[cfg(test)]
+    SurfaceRespondInteraction {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        selector: surface::InteractionSelector,
+        response: surface::BoundInteractionResponse,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::RespondInteractionOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
+    SurfaceRespondInteractionById {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        interaction_id: surface::SurfaceInteractionId,
+        answer: surface::SurfaceClientInteractionAnswer,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::RespondInteractionOutput>,
+                surface::SurfaceClientCommandError,
+            >,
         >,
     },
     SurfaceRetryFinalization {
@@ -1967,15 +2132,42 @@ enum ThreadCommand {
         reply: SyncSender<Result<Option<String>, RuntimeHostError>>,
     },
     ShutdownThread {
-        reply: Option<SyncSender<Result<(), RuntimeHostError>>>,
+        reply: Option<SyncSender<ThreadShutdownAck>>,
         reason: surface::SurfaceShutdownReason,
     },
+}
+
+enum ThreadShutdownAck {
+    Complete,
+    Retry,
+    Failed(RuntimeHostError),
 }
 
 #[cfg(test)]
 struct SurfaceActorTestProbe {
     waiter_count: usize,
     legacy_completion: Option<OperationCompletion>,
+    exact_interaction_selector: Option<surface::InteractionSelector>,
+    secret_bearing_interaction_count: usize,
+    pending_capability_loss: Option<PendingCapabilityLossTestProbe>,
+    pending_terminalization: Option<PendingTerminalizationTestProbe>,
+    interaction_admission_closed: bool,
+}
+
+#[cfg(test)]
+struct PendingCapabilityLossTestProbe {
+    attachment_id: surface::SurfaceAttachmentId,
+    commit_id: surface::SurfaceCommitId,
+    cursor_after: surface::SurfaceCursor,
+    batch_digest: surface::Sha256Digest,
+}
+
+#[cfg(test)]
+struct PendingTerminalizationTestProbe {
+    commit_id: surface::SurfaceCommitId,
+    cursor_before: surface::SurfaceCursor,
+    cursor_after: surface::SurfaceCursor,
+    batch_digest: surface::Sha256Digest,
 }
 
 struct ThreadActorEntry {
@@ -1983,10 +2175,22 @@ struct ThreadActorEntry {
     join: JoinHandle<()>,
 }
 
+enum HostShutdownActorState {
+    NeedsDispatch,
+    Awaiting(mpsc::Receiver<ThreadShutdownAck>),
+    Settled,
+}
+
+struct HostShutdownActor {
+    thread_id: String,
+    state: HostShutdownActorState,
+}
+
 async fn run_host_supervisor(
     mut command_rx: tokio_mpsc::Receiver<HostCommand>,
     executor: Arc<dyn ThreadOperationExecutor>,
     background_capacity: usize,
+    surface_hub_config: surface::SurfaceHubConfig,
 ) {
     let host_incarnation =
         surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -2062,6 +2266,7 @@ async fn run_host_supervisor(
                     continue;
                 }
                 let (command_tx, actor_rx) = tokio_mpsc::channel(THREAD_COMMAND_CAPACITY);
+                let (capability_change_tx, capability_change_rx) = tokio_mpsc::channel(1);
                 let (surface_handle, resident_surface) = if let Some(surface_owner) = surface_owner
                 {
                     match bootstrap_recorded_surface(
@@ -2070,7 +2275,9 @@ async fn run_host_supervisor(
                         &actor_title,
                         host_incarnation.clone(),
                         command_tx.clone(),
+                        capability_change_tx.clone(),
                         surface_owner,
+                        surface_hub_config,
                     ) {
                         Ok((handle, resident)) => (handle, Some(resident)),
                         Err(error) => {
@@ -2101,31 +2308,97 @@ async fn run_host_supervisor(
                         background_capacity,
                         resident_surface,
                     )
-                    .run(actor_rx)
+                    .run(actor_rx, capability_change_rx)
                     .await;
                 });
                 actors.insert(thread_id, ThreadActorEntry { command_tx, join });
                 let _ = reply.send(Ok(handle));
             }
             HostCommand::Shutdown { reply } => {
-                for actor in actors.values() {
-                    let _ = actor
-                        .command_tx
-                        .send(ThreadCommand::ShutdownThread {
-                            reply: None,
-                            reason: surface::SurfaceShutdownReason::HostShutdown,
-                        })
-                        .await;
-                }
+                let mut shutdown_actors = actors
+                    .keys()
+                    .cloned()
+                    .map(|thread_id| HostShutdownActor {
+                        thread_id,
+                        state: HostShutdownActorState::NeedsDispatch,
+                    })
+                    .collect::<Vec<_>>();
+                shutdown_actors.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
                 let mut actor_error = None;
-                for (thread_id, actor) in actors.drain() {
-                    if let Err(error) = actor.join.await
-                        && actor_error.is_none()
+                while shutdown_actors
+                    .iter()
+                    .any(|actor| !matches!(actor.state, HostShutdownActorState::Settled))
+                {
+                    for shutdown_actor in &mut shutdown_actors {
+                        if !matches!(shutdown_actor.state, HostShutdownActorState::NeedsDispatch) {
+                            continue;
+                        }
+                        let actor = actors
+                            .get(&shutdown_actor.thread_id)
+                            .expect("selected runtime actor remains registered");
+                        if actor.join.is_finished() {
+                            shutdown_actor.state = HostShutdownActorState::Settled;
+                            continue;
+                        }
+                        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+                        match actor.command_tx.try_send(ThreadCommand::ShutdownThread {
+                            reply: Some(reply_tx),
+                            reason: surface::SurfaceShutdownReason::HostShutdown,
+                        }) {
+                            Ok(()) => {
+                                shutdown_actor.state = HostShutdownActorState::Awaiting(reply_rx);
+                            }
+                            Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Closed(_)) => {
+                                shutdown_actor.state = HostShutdownActorState::Settled;
+                            }
+                        }
+                    }
+                    for shutdown_actor in &mut shutdown_actors {
+                        let HostShutdownActorState::Awaiting(reply_rx) = &shutdown_actor.state
+                        else {
+                            continue;
+                        };
+                        let transition = match reply_rx.try_recv() {
+                            Ok(ThreadShutdownAck::Complete) => {
+                                Some((HostShutdownActorState::Settled, None))
+                            }
+                            Ok(ThreadShutdownAck::Retry) => {
+                                Some((HostShutdownActorState::NeedsDispatch, None))
+                            }
+                            Ok(ThreadShutdownAck::Failed(error)) => {
+                                Some((HostShutdownActorState::Settled, Some(error)))
+                            }
+                            Err(mpsc::TryRecvError::Empty) => None,
+                            Err(mpsc::TryRecvError::Disconnected) => Some((
+                                HostShutdownActorState::Settled,
+                                Some(RuntimeHostError::ResponseChannelClosed {
+                                    owner: "runtime thread",
+                                }),
+                            )),
+                        };
+                        if let Some((state, error)) = transition {
+                            shutdown_actor.state = state;
+                            if actor_error.is_none() {
+                                actor_error = error;
+                            }
+                        }
+                    }
+                    if shutdown_actors
+                        .iter()
+                        .any(|actor| !matches!(actor.state, HostShutdownActorState::Settled))
                     {
-                        actor_error = Some(RuntimeHostError::ThreadActorPanicked {
-                            thread_id,
-                            message: error.to_string(),
-                        });
+                        tokio::time::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL).await;
+                    }
+                }
+                for (thread_id, actor) in actors.drain() {
+                    if let Err(error) = actor.join.await {
+                        if actor_error.is_none() {
+                            actor_error = Some(RuntimeHostError::ThreadActorPanicked {
+                                thread_id,
+                                message: error.to_string(),
+                            });
+                        }
                     }
                 }
                 let _ = reply.send(actor_error.map_or(Ok(()), Err));
@@ -2188,6 +2461,7 @@ impl surface::InjectedRuntimeClock for HostSurfaceClock {
 
 struct ThreadSurfaceDispatcher {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    capability_change_tx: tokio_mpsc::Sender<()>,
 }
 
 impl ThreadSurfaceDispatcher {
@@ -2208,6 +2482,40 @@ impl ThreadSurfaceDispatcher {
 }
 
 impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
+    fn notify_interaction_capability_changed(&self) {
+        let _ = self.capability_change_tx.try_send(());
+    }
+
+    fn detach(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request: surface::DetachRequest,
+    ) -> surface::DetachResult {
+        let request_id = request.request_id.clone();
+        let attachment_id = client.attachment_id().clone();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if self
+            .command_tx
+            .try_send(ThreadCommand::SurfaceDetach {
+                client,
+                request,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return surface::DetachResult::StaleAttachment {
+                request_id,
+                attachment_id,
+            };
+        }
+        reply_rx
+            .recv()
+            .unwrap_or(surface::DetachResult::StaleAttachment {
+                request_id,
+                attachment_id,
+            })
+    }
+
     fn reserve_operation(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -2273,6 +2581,25 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         })
     }
 
+    fn respond_interaction_by_id(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        interaction_id: surface::SurfaceInteractionId,
+        answer: surface::SurfaceClientInteractionAnswer,
+    ) -> Result<
+        surface::MutationReply<surface::RespondInteractionOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceRespondInteractionById {
+            client,
+            request_id,
+            interaction_id,
+            answer,
+            reply,
+        })
+    }
+
     fn retry_finalization(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -2313,7 +2640,9 @@ fn bootstrap_recorded_surface(
     title: &str,
     host_incarnation: surface::HostIncarnation,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    capability_change_tx: tokio_mpsc::Sender<()>,
     surface_owner: PreparedSurfaceOwner,
+    surface_hub_config: surface::SurfaceHubConfig,
 ) -> Result<(surface::RuntimeSurfaceHandle, ResidentSurfaceState), RuntimeHostError> {
     let materialized_path = thread.session().surface_commit_path().ok_or_else(|| {
         RuntimeHostError::ThreadStartFailed {
@@ -2377,6 +2706,13 @@ fn bootstrap_recorded_surface(
             .map(|operation| operation.operation_id.clone())
             .collect::<Vec<_>>();
         for operation_id in operation_ids {
+            coordinator
+                .recover_unavailable_interactions(&operation_id, &materialization)
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!(
+                        "failed to reconcile typed interaction availability: {error:?}"
+                    ),
+                })?;
             loop {
                 let before = coordinator.state().snapshot().cursor.clone();
                 coordinator
@@ -2414,22 +2750,31 @@ fn bootstrap_recorded_surface(
             surface::SurfaceCapability::ReadSnapshot,
             surface::SurfaceCapability::SubmitOperation,
             surface::SurfaceCapability::ControlBoundOperation,
+            surface::SurfaceCapability::RespondGrantedInteraction,
             surface::SurfaceCapability::RepairThread,
         ]))
         .expect("production TUI grant is non-empty"),
         surface::NonEmptySet::try_new(BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]))
             .expect("production TUI required grant is non-empty"),
-        BTreeSet::new(),
+        BTreeSet::from([
+            surface::SurfaceInteractionKind::ToolApproval,
+            surface::SurfaceInteractionKind::PermissionRequest,
+            surface::SurfaceInteractionKind::UserInput,
+            surface::SurfaceInteractionKind::McpElicitation,
+        ]),
     );
     let hub = surface::SurfaceHub::from_authority(
         coordinator.state().snapshot().clone(),
         authority,
-        surface::SurfaceHubConfig::default(),
+        surface_hub_config,
     )
     .map_err(|error| RuntimeHostError::ThreadStartFailed {
         message: format!("failed to create typed runtime surface: {error:?}"),
     })?
-    .with_dispatcher(Arc::new(ThreadSurfaceDispatcher { command_tx }));
+    .with_dispatcher(Arc::new(ThreadSurfaceDispatcher {
+        command_tx,
+        capability_change_tx,
+    }));
     coordinator.bind_surface_hub(hub.clone()).map_err(|error| {
         RuntimeHostError::ThreadStartFailed {
             message: format!("failed to bind typed runtime surface: {error:?}"),
@@ -2444,6 +2789,11 @@ fn bootstrap_recorded_surface(
             terminals,
             pending_terminal_commits: HashMap::new(),
             waiters: HashMap::new(),
+            interactions: HashMap::new(),
+            operation_origin_attachments: HashMap::new(),
+            pending_detaches: HashMap::new(),
+            pending_capability_losses: HashMap::new(),
+            pending_terminalization: None,
         },
     ))
 }
@@ -2745,6 +3095,456 @@ struct ResidentSurfaceState {
             >,
         >,
     >,
+    interactions: HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+    operation_origin_attachments:
+        HashMap<surface::SurfaceOperationId, surface::SurfaceAttachmentId>,
+    pending_detaches: HashMap<surface::SurfaceAttachmentId, PendingSurfaceDetach>,
+    pending_capability_losses: HashMap<surface::SurfaceAttachmentId, PendingSurfaceCapabilityLoss>,
+    pending_terminalization: Option<PreparedSurfaceTerminalization>,
+}
+
+struct ResidentSurfaceInteraction {
+    record: surface::BrokerInteractionRequestRecord,
+    route: surface::BrokerInteractionResponseRoute,
+    revision: surface::InteractionRevision,
+    waiter: Option<ResidentInteractionWaiter>,
+    private_response: Option<ResidentPrivateInteractionResponse>,
+    winning_receipt: Option<surface::SurfaceInteractionResolutionReceipt>,
+    resolution_ack: Option<surface::MutationCommitAck>,
+    projected_cursor: Option<surface::SurfaceCursor>,
+    cancelled: Option<surface::InteractionCancelReason>,
+}
+
+struct ResidentPrivateInteractionResponse {
+    record: surface::BrokerInteractionResponseRecord,
+    answer: surface::SurfaceClientInteractionAnswer,
+    pending_batch: Option<surface::SurfaceCommitBatch>,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PendingSurfaceTransitionRetry {
+    PreparedTerminalization(surface::SurfaceOperationId),
+    PrivateResponse(surface::SurfaceInteractionId),
+    Detach(surface::SurfaceAttachmentId),
+    CapabilityLoss(surface::SurfaceAttachmentId),
+}
+
+#[derive(Clone)]
+struct PendingSurfaceDetach {
+    client: surface::RuntimeSurfaceClientHandle,
+    transition: PreparedSurfaceAttachmentTransition,
+    receipt: surface::DetachRevocationReceipt,
+    retry_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct PendingSurfaceCapabilityLoss {
+    transition: PreparedSurfaceAttachmentTransition,
+    retry_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct PreparedSurfaceAttachmentTransition {
+    fence: surface::SurfaceOperationFence,
+    batch: surface::SurfaceCommitBatch,
+    commit_id: surface::SurfaceCommitId,
+    affected_route_epochs: Vec<(surface::SurfaceInteractionId, surface::ResponseRouteEpoch)>,
+    interactions: Vec<PreparedSurfaceDetachInteraction>,
+}
+
+#[derive(Clone)]
+struct PreparedSurfaceTerminalization {
+    fence: surface::SurfaceOperationFence,
+    cause: surface::TerminalizationCause,
+    batch: surface::SurfaceCommitBatch,
+    interaction_ids: Vec<surface::SurfaceInteractionId>,
+    retry_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct PreparedSurfaceDetachInteraction {
+    interaction_id: surface::SurfaceInteractionId,
+    revision: surface::InteractionRevision,
+    route: surface::BrokerInteractionResponseRoute,
+    cancelled: bool,
+}
+
+struct ExactInteractionSelectorBinding {
+    expected_revision: surface::InteractionRevision,
+    response_token: surface::SurfaceResponseToken,
+    route_epoch: surface::ResponseRouteEpoch,
+    grant_token: surface::SurfaceResponseGrantToken,
+    operation_fence: surface::SurfaceOperationFence,
+}
+
+enum ResidentInteractionWaiter {
+    UserInput(SyncSender<io::Result<Option<String>>>),
+    McpElicitation(SyncSender<Result<orca_mcp::McpElicitationResponse, String>>),
+}
+
+fn random_token_bytes() -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes
+}
+
+fn keyed_interaction_response_digest(
+    token: &surface::SurfaceResponseToken,
+    answer: &surface::SurfaceClientInteractionAnswer,
+) -> surface::OpaqueToken {
+    let mut hasher = Sha256::new();
+    hasher.update(token.key_bytes());
+    hasher.update(serde_json::to_vec(answer).expect("interaction answer serializes"));
+    surface::OpaqueToken::new(hasher.finalize().into())
+}
+
+const PRIVATE_INTERACTION_ANSWER_DEPTH_LIMIT: usize = 64;
+const PRIVATE_INTERACTION_ANSWER_NODE_LIMIT: usize = 16_384;
+
+struct BoundedAnswerWriter {
+    written: u64,
+}
+
+impl io::Write for BoundedAnswerWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "answer is too large"))?;
+        if next > surface::SURFACE_COMMIT_BATCH_BYTE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "answer is too large",
+            ));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn surface_data_within_private_limits(value: &surface::SurfaceDataValue) -> bool {
+    let mut stack = vec![(value, 1_usize)];
+    let mut nodes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        if depth > PRIVATE_INTERACTION_ANSWER_DEPTH_LIMIT {
+            return false;
+        }
+        nodes = nodes.saturating_add(1);
+        if nodes > PRIVATE_INTERACTION_ANSWER_NODE_LIMIT {
+            return false;
+        }
+        match value {
+            surface::SurfaceDataValue::Array(values) => {
+                stack.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            surface::SurfaceDataValue::Object(properties) => {
+                stack.extend(
+                    properties
+                        .iter()
+                        .map(|property| (property.value.as_ref(), depth + 1)),
+                );
+            }
+            surface::SurfaceDataValue::Null
+            | surface::SurfaceDataValue::Boolean(_)
+            | surface::SurfaceDataValue::Integer(_)
+            | surface::SurfaceDataValue::Unsigned(_)
+            | surface::SurfaceDataValue::Number(_)
+            | surface::SurfaceDataValue::String(_) => {}
+        }
+    }
+    true
+}
+
+fn interaction_answer_within_private_limits(
+    answer: &surface::SurfaceClientInteractionAnswer,
+) -> bool {
+    if let surface::SurfaceClientInteractionAnswer::McpElicitation {
+        decision: surface::SurfaceMcpElicitationDecision::Accept { content },
+    } = answer
+        && !surface_data_within_private_limits(content)
+    {
+        return false;
+    }
+    serde_json::to_writer(&mut BoundedAnswerWriter { written: 0 }, answer).is_ok()
+}
+
+fn interaction_answer_kind(
+    answer: &surface::SurfaceClientInteractionAnswer,
+) -> surface::SurfaceInteractionKind {
+    match answer {
+        surface::SurfaceClientInteractionAnswer::ToolApproval { .. } => {
+            surface::SurfaceInteractionKind::ToolApproval
+        }
+        surface::SurfaceClientInteractionAnswer::PermissionRequest { .. } => {
+            surface::SurfaceInteractionKind::PermissionRequest
+        }
+        surface::SurfaceClientInteractionAnswer::UserInput { .. } => {
+            surface::SurfaceInteractionKind::UserInput
+        }
+        surface::SurfaceClientInteractionAnswer::McpElicitation { .. } => {
+            surface::SurfaceInteractionKind::McpElicitation
+        }
+        surface::SurfaceClientInteractionAnswer::BackgroundApproval { .. } => {
+            surface::SurfaceInteractionKind::BackgroundApproval
+        }
+    }
+}
+
+fn interaction_safe_projection(
+    answer: &surface::SurfaceClientInteractionAnswer,
+) -> surface::SurfaceInteractionSafeProjection {
+    match answer {
+        surface::SurfaceClientInteractionAnswer::UserInput { decision } => {
+            surface::SurfaceInteractionSafeProjection::UserInput {
+                answered: matches!(decision, surface::SurfaceUserInputDecision::Answer(_)),
+            }
+        }
+        surface::SurfaceClientInteractionAnswer::McpElicitation { decision } => {
+            surface::SurfaceInteractionSafeProjection::McpElicitation {
+                accepted: matches!(
+                    decision,
+                    surface::SurfaceMcpElicitationDecision::Accept { .. }
+                ),
+            }
+        }
+        _ => unreachable!("answer kind is installed by a runtime-owned broker"),
+    }
+}
+
+fn surface_data_from_json(value: &Value) -> Result<surface::SurfaceDataValue, String> {
+    match value {
+        Value::Null => Ok(surface::SurfaceDataValue::Null),
+        Value::Bool(value) => Ok(surface::SurfaceDataValue::Boolean(*value)),
+        Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                Ok(surface::SurfaceDataValue::Unsigned(value))
+            } else if let Some(value) = value.as_i64() {
+                surface::NegativeI64::try_new(value)
+                    .map(surface::SurfaceDataValue::Integer)
+                    .map_err(|error| format!("invalid negative integer: {error:?}"))
+            } else {
+                surface::FiniteF64::try_new(
+                    value
+                        .as_f64()
+                        .ok_or_else(|| "JSON number is not representable as f64".to_string())?,
+                )
+                .map(surface::SurfaceDataValue::Number)
+                .map_err(|error| format!("non-finite JSON number: {error:?}"))
+            }
+        }
+        Value::String(value) => Ok(surface::SurfaceDataValue::String(
+            surface::DisplayText::new(value.clone()),
+        )),
+        Value::Array(values) => values
+            .iter()
+            .map(surface_data_from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(surface::SurfaceDataValue::Array),
+        Value::Object(properties) => properties
+            .iter()
+            .map(|(name, value)| {
+                Ok(surface::SurfaceDataProperty {
+                    name: surface::DisplayText::new(name.clone()),
+                    value: Box::new(surface_data_from_json(value)?),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(surface::SurfaceDataValue::Object),
+    }
+}
+
+fn json_from_surface_data(value: &surface::SurfaceDataValue) -> Value {
+    match value {
+        surface::SurfaceDataValue::Null => Value::Null,
+        surface::SurfaceDataValue::Boolean(value) => Value::Bool(*value),
+        surface::SurfaceDataValue::Integer(value) => Value::Number(value.get().into()),
+        surface::SurfaceDataValue::Unsigned(value) => Value::Number((*value).into()),
+        surface::SurfaceDataValue::Number(value) => serde_json::Number::from_f64(value.get())
+            .map(Value::Number)
+            .expect("surface number is finite"),
+        surface::SurfaceDataValue::String(value) => Value::String(value.as_str().to_string()),
+        surface::SurfaceDataValue::Array(values) => {
+            Value::Array(values.iter().map(json_from_surface_data).collect())
+        }
+        surface::SurfaceDataValue::Object(properties) => Value::Object(
+            properties
+                .iter()
+                .map(|property| {
+                    (
+                        property.name.as_str().to_string(),
+                        json_from_surface_data(&property.value),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn interaction_route_attachments(
+    route: &surface::BrokerInteractionResponseRoute,
+) -> Vec<surface::SurfaceAttachmentId> {
+    match route {
+        surface::BrokerInteractionResponseRoute::Unassigned { .. } => Vec::new(),
+        surface::BrokerInteractionResponseRoute::Exclusive { attachment_id, .. } => {
+            vec![attachment_id.clone()]
+        }
+        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins { grants, .. } => grants
+            .as_slice()
+            .iter()
+            .map(|(attachment_id, _)| attachment_id.clone())
+            .collect(),
+    }
+}
+
+fn interaction_route_admits(
+    route: &surface::BrokerInteractionResponseRoute,
+    attachment_id: &surface::SurfaceAttachmentId,
+) -> bool {
+    match route {
+        surface::BrokerInteractionResponseRoute::Unassigned { .. } => false,
+        surface::BrokerInteractionResponseRoute::Exclusive {
+            attachment_id: expected,
+            ..
+        } => expected == attachment_id,
+        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins { grants, .. } => grants
+            .as_slice()
+            .iter()
+            .any(|(expected, _)| expected == attachment_id),
+    }
+}
+
+fn interaction_route_admits_exact(
+    route: &surface::BrokerInteractionResponseRoute,
+    attachment_id: &surface::SurfaceAttachmentId,
+    route_epoch: surface::ResponseRouteEpoch,
+    grant_token: &surface::SurfaceResponseGrantToken,
+) -> bool {
+    match route {
+        surface::BrokerInteractionResponseRoute::Unassigned { .. } => false,
+        surface::BrokerInteractionResponseRoute::Exclusive {
+            epoch,
+            attachment_id: expected_attachment,
+            grant_token: expected_grant,
+        } => {
+            *epoch == route_epoch
+                && expected_attachment == attachment_id
+                && expected_grant == grant_token
+        }
+        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins {
+            epoch, grants, ..
+        } => {
+            *epoch == route_epoch
+                && grants
+                    .as_slice()
+                    .iter()
+                    .any(|(expected_attachment, expected_grant)| {
+                        expected_attachment == attachment_id && expected_grant == grant_token
+                    })
+        }
+    }
+}
+
+fn interaction_route_epoch(
+    route: &surface::BrokerInteractionResponseRoute,
+) -> surface::ResponseRouteEpoch {
+    match route {
+        surface::BrokerInteractionResponseRoute::Unassigned { epoch }
+        | surface::BrokerInteractionResponseRoute::Exclusive { epoch, .. }
+        | surface::BrokerInteractionResponseRoute::SharedFirstCommitWins { epoch, .. } => *epoch,
+    }
+}
+
+fn exact_interaction_selectors(
+    interaction: &ResidentSurfaceInteraction,
+) -> Vec<(surface::SurfaceAttachmentId, surface::InteractionSelector)> {
+    let grants = match &interaction.route {
+        surface::BrokerInteractionResponseRoute::Unassigned { .. } => Vec::new(),
+        surface::BrokerInteractionResponseRoute::Exclusive {
+            epoch,
+            attachment_id,
+            grant_token,
+        } => vec![(attachment_id.clone(), *epoch, grant_token.clone())],
+        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins {
+            epoch, grants, ..
+        } => grants
+            .as_slice()
+            .iter()
+            .map(|(attachment_id, grant_token)| {
+                (attachment_id.clone(), *epoch, grant_token.clone())
+            })
+            .collect(),
+    };
+    grants
+        .into_iter()
+        .map(
+            |(attachment_id, response_route_epoch, response_grant_token)| {
+                (
+                    attachment_id,
+                    surface::InteractionSelector::Exact {
+                        interaction_id: interaction.record.interaction_id.clone(),
+                        expected_revision: interaction.revision,
+                        kind: interaction.record.kind,
+                        response_token: interaction.record.response_token.clone(),
+                        response_route_epoch,
+                        response_grant_token,
+                        operation_fence: interaction.record.fence.clone(),
+                    },
+                )
+            },
+        )
+        .collect()
+}
+
+#[cfg(test)]
+fn exact_interaction_selector_for_test(
+    state: &ResidentSurfaceState,
+    operation_id: &surface::SurfaceOperationId,
+) -> Option<surface::InteractionSelector> {
+    state
+        .interactions
+        .values()
+        .find(|interaction| &interaction.record.fence.operation_id == operation_id)
+        .and_then(|interaction| exact_interaction_selectors(interaction).into_iter().next())
+        .map(|(_, selector)| selector)
+}
+
+#[cfg(test)]
+fn pending_capability_loss_for_test(
+    state: &ResidentSurfaceState,
+) -> Option<PendingCapabilityLossTestProbe> {
+    state
+        .pending_capability_losses
+        .iter()
+        .min_by_key(|(attachment_id, _)| (*attachment_id).clone())
+        .map(|(attachment_id, pending)| PendingCapabilityLossTestProbe {
+            attachment_id: attachment_id.clone(),
+            commit_id: pending.transition.commit_id.clone(),
+            cursor_after: pending.transition.batch.cursor_after.clone(),
+            batch_digest: pending.transition.batch.batch_digest.clone(),
+        })
+}
+
+#[cfg(test)]
+fn pending_terminalization_for_test(
+    state: &ResidentSurfaceState,
+) -> Option<PendingTerminalizationTestProbe> {
+    state.pending_terminalization.as_ref().map(|pending| {
+        let surface::CommitClass::Recorded { commit_id, .. } = &pending.batch.commit_class else {
+            unreachable!("recorded runtime surface used ephemeral commit class")
+        };
+        PendingTerminalizationTestProbe {
+            commit_id: commit_id.clone(),
+            cursor_before: pending.batch.cursor_before.clone(),
+            cursor_after: pending.batch.cursor_after.clone(),
+            batch_digest: pending.batch.batch_digest.clone(),
+        }
+    })
 }
 
 struct PendingSurfaceTerminalCommit {
@@ -2775,6 +3575,7 @@ struct ActiveOperation {
     generation: ActiveGeneration,
     surface_operation: Option<surface::SurfaceOperationFence>,
     surface_terminalization: Option<surface::TerminalizationCause>,
+    surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
 }
 
 struct ActiveGoalControl {
@@ -3034,10 +3835,1506 @@ impl ThreadActor {
         }
     }
 
+    fn committed_interaction_mutation<T>(
+        request_id: surface::SurfaceRequestId,
+        interaction_id: surface::SurfaceInteractionId,
+        batch: &surface::SurfaceCommitBatch,
+        value: T,
+    ) -> surface::MutationReply<T> {
+        let event = &batch.events.as_slice()[0];
+        surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Interaction {
+                    thread_id: batch.cursor_after.thread_id.clone(),
+                    interaction_id,
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Interaction,
+                        event_id: event.event_id.clone(),
+                        commit_class: batch.commit_class.clone(),
+                    },
+                ])
+                .expect("interaction commit has one acknowledgement"),
+            },
+            value,
+        }
+    }
+
+    fn request_surface_user_input(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: crate::lifecycle::RuntimeUserInputRequest,
+        reply: SyncSender<io::Result<Option<String>>>,
+    ) {
+        let result = self.request_surface_user_input_inner(active, fence, &request, reply.clone());
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    fn request_surface_user_input_inner(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: &crate::lifecycle::RuntimeUserInputRequest,
+        reply: SyncSender<io::Result<Option<String>>>,
+    ) -> io::Result<()> {
+        if active.surface_operation.as_ref() != Some(&fence) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "user-input request generation fence is stale",
+            ));
+        }
+        if Self::surface_interaction_admission_closed(active) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime generation is terminalizing",
+            ));
+        }
+        surface::NonEmptyText::try_new(request.id.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty user-input id"))?;
+        let question = surface::NonEmptyText::try_new(request.question.clone()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "empty user-input question")
+        })?;
+        let preferred = self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&fence.operation_id);
+        let attachment_id = self.resident_surface.hub.select_interaction_attachment_for(
+            surface::SurfaceInteractionKind::UserInput,
+            preferred,
+        );
+        let unavailable = attachment_id.is_none();
+        let interaction_id =
+            surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let revision = surface::InteractionRevision::try_new(1).expect("one is a valid revision");
+        let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is a valid revision");
+        let response_token = surface::SurfaceResponseToken::new(random_token_bytes());
+        let response_grant_token = surface::SurfaceResponseGrantToken::new(random_token_bytes());
+        let interaction_request = surface::SurfaceInteractionRequest::UserInput {
+            question,
+            suggestions: request
+                .choices
+                .iter()
+                .cloned()
+                .map(surface::DisplayText::new)
+                .collect(),
+        };
+        let record = surface::BrokerInteractionRequestRecord {
+            thread_id: fence.thread_id.clone(),
+            interaction_id: interaction_id.clone(),
+            fence: fence.clone(),
+            kind: surface::SurfaceInteractionKind::UserInput,
+            request: interaction_request.clone(),
+            response_token,
+            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            recovery_disposition: surface::InteractionUnavailableDisposition::FailOperation,
+        };
+        let route = match attachment_id.as_ref() {
+            Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
+                epoch: route_epoch,
+                attachment_id: attachment_id.clone(),
+                grant_token: response_grant_token,
+            },
+            None => surface::BrokerInteractionResponseRoute::Unassigned { epoch: route_epoch },
+        };
+        let public_route = match attachment_id {
+            Some(attachment_id) => surface::SurfaceInteractionRoute::Exclusive {
+                epoch: route_epoch,
+                attachment_id,
+            },
+            None => surface::SurfaceInteractionRoute::Unassigned { epoch: route_epoch },
+        };
+        let view = surface::SurfaceInteractionView {
+            interaction_id: interaction_id.clone(),
+            revision,
+            fence: fence.clone(),
+            kind: record.kind,
+            request: interaction_request,
+            route: public_route,
+            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
+            recovery_disposition: record.recovery_disposition.clone(),
+        };
+        let mut events = vec![(
+            surface::SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                interaction: view,
+            }),
+        )];
+        if unavailable {
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision: revision,
+                    next_revision: surface::InteractionRevision::try_new(revision.get() + 1)
+                        .expect("interaction revision did not exhaust"),
+                    reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                }),
+            ));
+        }
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(fence.clone(), &batch)
+            .map_err(|error| {
+                io::Error::other(format!("failed to commit user-input request: {error:?}"))
+            })?;
+        if unavailable {
+            active.surface_execution_failure =
+                Some(surface::GenerationExecutionFailureClass::ClientCapabilityUnavailable);
+            let _ = reply.send(Ok(None));
+            return Ok(());
+        }
+        self.resident_surface.interactions.insert(
+            interaction_id.clone(),
+            ResidentSurfaceInteraction {
+                record,
+                route,
+                revision,
+                waiter: Some(ResidentInteractionWaiter::UserInput(reply)),
+                private_response: None,
+                winning_receipt: None,
+                resolution_ack: None,
+                projected_cursor: None,
+                cancelled: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn request_surface_mcp_elicitation(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: orca_mcp::McpElicitationRequest,
+        reply: SyncSender<Result<orca_mcp::McpElicitationResponse, String>>,
+    ) {
+        let result =
+            self.request_surface_mcp_elicitation_inner(active, fence, &request, reply.clone());
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    fn request_surface_mcp_elicitation_inner(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: &orca_mcp::McpElicitationRequest,
+        reply: SyncSender<Result<orca_mcp::McpElicitationResponse, String>>,
+    ) -> Result<(), String> {
+        if active.surface_operation.as_ref() != Some(&fence) {
+            return Err("MCP elicitation generation fence is stale".to_string());
+        }
+        if Self::surface_interaction_admission_closed(active) {
+            return Err("runtime generation is terminalizing".to_string());
+        }
+        let opaque_request_id = surface::NonEmptyText::try_new(request.id.clone())
+            .map_err(|_| "empty MCP elicitation id".to_string())?;
+        let server_name = surface::NonEmptyText::try_new(request.server_name.clone())
+            .map_err(|_| "empty MCP server name".to_string())?;
+        let requested_schema = request
+            .requested_schema
+            .as_ref()
+            .map(surface_data_from_json)
+            .transpose()?;
+        let mcp_request = match request.mode {
+            orca_mcp::McpElicitationMode::Form => surface::SurfaceMcpElicitationRequest::Form {
+                requested_schema,
+                supported_schema: None,
+            },
+            orca_mcp::McpElicitationMode::Url => surface::SurfaceMcpElicitationRequest::Url {
+                raw_url: request.url.clone().map(surface::DisplayText::new),
+                requested_schema,
+            },
+        };
+        let preferred = self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&fence.operation_id);
+        let attachment_id = self.resident_surface.hub.select_interaction_attachment_for(
+            surface::SurfaceInteractionKind::McpElicitation,
+            preferred,
+        );
+        let unavailable = attachment_id.is_none();
+        let interaction_id =
+            surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let revision = surface::InteractionRevision::try_new(1).expect("one is a valid revision");
+        let route_epoch =
+            surface::ResponseRouteEpoch::try_new(1).expect("one is a valid route epoch");
+        let interaction_request = surface::SurfaceInteractionRequest::McpElicitation {
+            server_name,
+            server_request_id: opaque_request_id.clone(),
+            message: surface::DisplayText::new(request.message.clone()),
+            request: mcp_request,
+        };
+        let record = surface::BrokerInteractionRequestRecord {
+            thread_id: fence.thread_id.clone(),
+            interaction_id: interaction_id.clone(),
+            fence: fence.clone(),
+            kind: surface::SurfaceInteractionKind::McpElicitation,
+            request: interaction_request.clone(),
+            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            recovery_disposition: surface::InteractionUnavailableDisposition::FailOperation,
+        };
+        let route = match attachment_id.as_ref() {
+            Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
+                epoch: route_epoch,
+                attachment_id: attachment_id.clone(),
+                grant_token: surface::SurfaceResponseGrantToken::new(random_token_bytes()),
+            },
+            None => surface::BrokerInteractionResponseRoute::Unassigned { epoch: route_epoch },
+        };
+        let public_route = match attachment_id {
+            Some(attachment_id) => surface::SurfaceInteractionRoute::Exclusive {
+                epoch: route_epoch,
+                attachment_id,
+            },
+            None => surface::SurfaceInteractionRoute::Unassigned { epoch: route_epoch },
+        };
+        let view = surface::SurfaceInteractionView {
+            interaction_id: interaction_id.clone(),
+            revision,
+            fence: fence.clone(),
+            kind: record.kind,
+            request: interaction_request,
+            route: public_route,
+            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
+            recovery_disposition: record.recovery_disposition.clone(),
+        };
+        let mut events = vec![(
+            surface::SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                interaction: view,
+            }),
+        )];
+        if unavailable {
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision: revision,
+                    next_revision: surface::InteractionRevision::try_new(revision.get() + 1)
+                        .expect("interaction revision did not exhaust"),
+                    reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                }),
+            ));
+        }
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(fence.clone(), &batch)
+            .map_err(|error| format!("failed to commit MCP elicitation request: {error:?}"))?;
+        if unavailable {
+            active.surface_execution_failure =
+                Some(surface::GenerationExecutionFailureClass::ClientCapabilityUnavailable);
+            let _ = reply.send(Ok(orca_mcp::McpElicitationResponse::Decline));
+            return Ok(());
+        }
+        self.resident_surface.interactions.insert(
+            interaction_id.clone(),
+            ResidentSurfaceInteraction {
+                record,
+                route,
+                revision,
+                waiter: Some(ResidentInteractionWaiter::McpElicitation(reply)),
+                private_response: None,
+                winning_receipt: None,
+                resolution_ack: None,
+                projected_cursor: None,
+                cancelled: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn respond_surface_interaction_by_id(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        interaction_id: surface::SurfaceInteractionId,
+        answer: surface::SurfaceClientInteractionAnswer,
+    ) -> Result<
+        surface::MutationReply<surface::RespondInteractionOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let interaction = self
+            .resident_surface
+            .interactions
+            .get(&interaction_id)
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        if interaction.cancelled.is_some() || interaction.winning_receipt.is_some() {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let expected_kind = interaction.record.kind;
+        if !self
+            .resident_surface
+            .hub
+            .admits_interaction_client(client, expected_kind)
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let selector = exact_interaction_selectors(interaction)
+            .into_iter()
+            .find_map(|(attachment_id, selector)| {
+                (attachment_id == *client.attachment_id()).then_some(selector)
+            })
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let response_id = interaction
+            .private_response
+            .as_ref()
+            .map(|winner| winner.record.receipt.response_id.clone())
+            .unwrap_or_else(|| {
+                surface::SurfaceResponseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7")
+            });
+        let response = surface::BoundInteractionResponse::new(
+            response_id,
+            answer,
+            surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            surface::ApplicableAuthorityFingerprint::not_applicable(),
+        );
+        self.respond_surface_interaction(client, request_id, selector, response)
+    }
+
+    fn respond_surface_interaction(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        selector: surface::InteractionSelector,
+        response: surface::BoundInteractionResponse,
+    ) -> Result<
+        surface::MutationReply<surface::RespondInteractionOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        if !self.resident_surface.pending_detaches.is_empty()
+            || !self.resident_surface.pending_capability_losses.is_empty()
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let (interaction_id, expected_kind, exact) = match selector {
+            surface::InteractionSelector::OpaqueRequestId { .. } => {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+            surface::InteractionSelector::Exact {
+                interaction_id,
+                expected_revision,
+                kind,
+                response_token,
+                response_route_epoch,
+                response_grant_token,
+                operation_fence,
+            } => (
+                interaction_id,
+                kind,
+                ExactInteractionSelectorBinding {
+                    expected_revision,
+                    response_token,
+                    route_epoch: response_route_epoch,
+                    grant_token: response_grant_token,
+                    operation_fence,
+                },
+            ),
+        };
+        let interaction = self
+            .resident_surface
+            .interactions
+            .get(&interaction_id)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        {
+            if interaction.revision != exact.expected_revision {
+                return Ok(Self::stale_interaction_response(
+                    request_id,
+                    interaction,
+                    surface::SurfaceMutationErrorCode::StaleRevision,
+                    "interaction revision is stale",
+                ));
+            }
+            if interaction.record.fence != exact.operation_fence {
+                return Ok(Self::stale_interaction_response(
+                    request_id,
+                    interaction,
+                    surface::SurfaceMutationErrorCode::StaleFence,
+                    "interaction operation fence is stale",
+                ));
+            }
+            if interaction.record.response_token != exact.response_token {
+                return Ok(Self::uncommitted_interaction_response(
+                    request_id,
+                    interaction,
+                    surface::SurfaceMutationErrorCode::WrongResponseToken,
+                    "interaction response token does not match",
+                ));
+            }
+            if interaction_route_epoch(&interaction.route) != exact.route_epoch {
+                return Ok(Self::stale_interaction_response(
+                    request_id,
+                    interaction,
+                    surface::SurfaceMutationErrorCode::StaleResponseRoute,
+                    "interaction response route is stale",
+                ));
+            }
+            if !interaction_route_admits_exact(
+                &interaction.route,
+                client.attachment_id(),
+                exact.route_epoch,
+                &exact.grant_token,
+            ) {
+                return Ok(Self::uncommitted_interaction_response(
+                    request_id,
+                    interaction,
+                    surface::SurfaceMutationErrorCode::WrongAttachment,
+                    "attachment does not hold the exact private response grant",
+                ));
+            }
+        }
+        if interaction.cancelled.is_some() {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::IllegalState,
+                "interaction is already terminal",
+            ));
+        }
+        if interaction.record.kind != expected_kind
+            || interaction_answer_kind(response.answer()) != interaction.record.kind
+        {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::WrongInteractionKind,
+                "interaction request and answer kinds do not match",
+            ));
+        }
+        if interaction.record.answer_policy != *response.policy() {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::InvalidInput,
+                "interaction answer policy does not match the persisted request",
+            ));
+        }
+        if !self
+            .resident_surface
+            .hub
+            .admits_interaction_client(client, expected_kind)
+            || !interaction_route_admits(&interaction.route, client.attachment_id())
+        {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::WrongAttachment,
+                "attachment does not hold the current interaction response grant",
+            ));
+        }
+        if !interaction_answer_within_private_limits(response.answer()) {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::InvalidInput,
+                "interaction answer exceeds private retention limits",
+            ));
+        }
+        if let Some(winning_receipt) = interaction.winning_receipt.clone() {
+            let acknowledgement = interaction
+                .resolution_ack
+                .clone()
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            return Ok(surface::MutationReply::Committed {
+                mutation: surface::CommittedMutation {
+                    request_id,
+                    target: surface::MutationTarget::Interaction {
+                        thread_id: interaction.record.thread_id.clone(),
+                        interaction_id: interaction_id.clone(),
+                    },
+                    disposition: surface::MutationDisposition::AlreadyApplied,
+                    acknowledgements: surface::NonEmptyVec::try_new(vec![acknowledgement])
+                        .expect("interaction replay has one acknowledgement"),
+                },
+                value: surface::RespondInteractionOutput {
+                    interaction_id,
+                    attempted_response_id: response.response_id().clone(),
+                    disposition: surface::RespondInteractionDisposition::AlreadyResolved {
+                        winning_receipt,
+                    },
+                    projected_cursor: interaction.projected_cursor.clone(),
+                },
+            });
+        }
+        let expected_revision = interaction.revision;
+        let next_revision = surface::InteractionRevision::try_new(expected_revision.get() + 1)
+            .expect("interaction revision did not exhaust");
+        let fence = interaction.record.fence.clone();
+        let attempted_digest = keyed_interaction_response_digest(
+            &interaction.record.response_token,
+            response.answer(),
+        );
+        let (receipt, winner_answer, attempted_private_winner) =
+            match interaction.private_response.as_ref() {
+                Some(winner) => (
+                    winner.record.receipt.clone(),
+                    winner.answer.clone(),
+                    winner.record.receipt.response_id == *response.response_id()
+                        && winner.record.keyed_response_digest == attempted_digest,
+                ),
+                None => {
+                    let receipt = surface::SurfaceInteractionResolutionReceipt {
+                        response_id: response.response_id().clone(),
+                        receipt_id: surface::SurfaceResponseReceiptId::try_from_bytes(
+                            *uuid::Uuid::now_v7().as_bytes(),
+                        )
+                        .expect("generated UUID is v7"),
+                        kind: expected_kind,
+                        safe_projection: interaction_safe_projection(response.answer()),
+                    };
+                    let private_response = ResidentPrivateInteractionResponse {
+                        record: surface::BrokerInteractionResponseRecord {
+                            receipt: receipt.clone(),
+                            payload: surface::BrokerResponsePayload::LiveOnly {
+                                incarnation: self
+                                    .resident_surface
+                                    .coordinator
+                                    .state()
+                                    .snapshot()
+                                    .cursor
+                                    .incarnation
+                                    .clone(),
+                            },
+                            keyed_response_digest: attempted_digest,
+                        },
+                        answer: response.answer().clone(),
+                        pending_batch: None,
+                        retry_at: None,
+                    };
+                    self.resident_surface
+                        .interactions
+                        .get_mut(&interaction_id)
+                        .expect("validated interaction remains resident")
+                        .private_response = Some(private_response);
+                    (receipt, response.answer().clone(), true)
+                }
+            };
+        let batch = if let Some(batch) = self
+            .resident_surface
+            .interactions
+            .get(&interaction_id)
+            .and_then(|interaction| interaction.private_response.as_ref())
+            .and_then(|private| private.pending_batch.clone())
+        {
+            batch
+        } else {
+            let batch = self.surface_event_batch_with_commit_id(
+                vec![(
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
+                        interaction_id: interaction_id.clone(),
+                        expected_revision,
+                        next_revision,
+                        receipt: receipt.clone(),
+                    }),
+                )],
+                None,
+            );
+            self.resident_surface
+                .interactions
+                .get_mut(&interaction_id)
+                .and_then(|interaction| interaction.private_response.as_mut())
+                .expect("private winner exists before public resolution")
+                .pending_batch = Some(batch.clone());
+            batch
+        };
+        if let Err(error) = self
+            .resident_surface
+            .coordinator
+            .commit_generation_batch(fence, &batch)
+        {
+            eprintln!("orca: typed interaction resolution commit failed: {error:?}");
+            self.resident_surface
+                .interactions
+                .get_mut(&interaction_id)
+                .and_then(|interaction| interaction.private_response.as_mut())
+                .expect("failed private resolution remains resident")
+                .retry_at =
+                Some(tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        self.apply_surface_interaction_resolution(&interaction_id, &winner_answer);
+        let output = surface::RespondInteractionOutput {
+            interaction_id: interaction_id.clone(),
+            attempted_response_id: response.response_id().clone(),
+            disposition: if attempted_private_winner {
+                surface::RespondInteractionDisposition::Resolved { receipt }
+            } else {
+                surface::RespondInteractionDisposition::AlreadyResolved {
+                    winning_receipt: receipt,
+                }
+            },
+            projected_cursor: Some(batch.cursor_after.clone()),
+        };
+        Ok(Self::committed_interaction_mutation(
+            request_id,
+            interaction_id,
+            &batch,
+            output,
+        ))
+    }
+
+    fn apply_surface_interaction_resolution(
+        &mut self,
+        interaction_id: &surface::SurfaceInteractionId,
+        winner_answer: &surface::SurfaceClientInteractionAnswer,
+    ) {
+        let waiter = self
+            .resident_surface
+            .interactions
+            .remove(interaction_id)
+            .expect("committed interaction remains resident")
+            .waiter;
+        if let Some(waiter) = waiter {
+            match (waiter, winner_answer) {
+                (
+                    ResidentInteractionWaiter::UserInput(waiter),
+                    surface::SurfaceClientInteractionAnswer::UserInput { decision },
+                ) => {
+                    let answer = match decision {
+                        surface::SurfaceUserInputDecision::Answer(answer) => {
+                            Some(answer.as_str().to_string())
+                        }
+                        surface::SurfaceUserInputDecision::Cancel => None,
+                    };
+                    let _ = waiter.send(Ok(answer));
+                }
+                (
+                    ResidentInteractionWaiter::McpElicitation(waiter),
+                    surface::SurfaceClientInteractionAnswer::McpElicitation { decision },
+                ) => {
+                    let response = match decision {
+                        surface::SurfaceMcpElicitationDecision::Accept { content } => {
+                            orca_mcp::McpElicitationResponse::Accept {
+                                content: json_from_surface_data(content),
+                            }
+                        }
+                        surface::SurfaceMcpElicitationDecision::Decline => {
+                            orca_mcp::McpElicitationResponse::Decline
+                        }
+                    };
+                    let _ = waiter.send(Ok(response));
+                }
+                _ => unreachable!("waiter and answer kind were validated before commit"),
+            }
+        }
+    }
+
+    fn uncommitted_interaction_response(
+        request_id: surface::SurfaceRequestId,
+        interaction: &ResidentSurfaceInteraction,
+        code: surface::SurfaceMutationErrorCode,
+        message: &'static str,
+    ) -> surface::MutationReply<surface::RespondInteractionOutput> {
+        surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Invalid {
+                request_id,
+                target: Some(surface::MutationTarget::Interaction {
+                    thread_id: interaction.record.thread_id.clone(),
+                    interaction_id: interaction.record.interaction_id.clone(),
+                }),
+                error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                    code,
+                    message: surface::DisplayText::new(message),
+                    winning_request_id: None,
+                    current_revision: Some(surface::SurfaceMutationRevision::Interaction {
+                        thread_id: interaction.record.thread_id.clone(),
+                        interaction_id: interaction.record.interaction_id.clone(),
+                        revision: interaction.revision,
+                        route_epoch: interaction_route_epoch(&interaction.route),
+                    }),
+                }),
+            },
+        }
+    }
+
+    fn stale_interaction_response(
+        request_id: surface::SurfaceRequestId,
+        interaction: &ResidentSurfaceInteraction,
+        code: surface::SurfaceMutationErrorCode,
+        message: &'static str,
+    ) -> surface::MutationReply<surface::RespondInteractionOutput> {
+        surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Stale {
+                request_id,
+                target: Some(surface::MutationTarget::Interaction {
+                    thread_id: interaction.record.thread_id.clone(),
+                    interaction_id: interaction.record.interaction_id.clone(),
+                }),
+                error: surface::StaleMutationError::new(surface::SurfaceMutationError {
+                    code,
+                    message: surface::DisplayText::new(message),
+                    winning_request_id: None,
+                    current_revision: Some(surface::SurfaceMutationRevision::Interaction {
+                        thread_id: interaction.record.thread_id.clone(),
+                        interaction_id: interaction.record.interaction_id.clone(),
+                        revision: interaction.revision,
+                        route_epoch: interaction_route_epoch(&interaction.route),
+                    }),
+                }),
+            },
+        }
+    }
+
+    fn prepare_surface_terminalization(
+        &self,
+        fence: &surface::SurfaceOperationFence,
+        request_id: surface::SurfaceRequestId,
+        cause: surface::TerminalizationCause,
+    ) -> Result<PreparedSurfaceTerminalization, surface::SurfaceClientCommandError> {
+        if self
+            .resident_surface
+            .interactions
+            .values()
+            .any(|interaction| {
+                &interaction.record.fence == fence && interaction.private_response.is_some()
+            })
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let reason = match cause {
+            surface::TerminalizationCause::HostShutdown => {
+                surface::InteractionCancelReason::HostShutdown
+            }
+            surface::TerminalizationCause::ThreadClose => {
+                surface::InteractionCancelReason::ThreadClose
+            }
+            surface::TerminalizationCause::UserCancel => {
+                surface::InteractionCancelReason::OperationCancelled {
+                    reason: surface::CancelReason::User,
+                }
+            }
+            surface::TerminalizationCause::GoalPause => {
+                surface::InteractionCancelReason::OperationCancelled {
+                    reason: surface::CancelReason::GoalPause,
+                }
+            }
+        };
+        let mut interactions = self
+            .resident_surface
+            .interactions
+            .iter()
+            .filter(|(_, interaction)| {
+                &interaction.record.fence == fence
+                    && interaction.winning_receipt.is_none()
+                    && interaction.cancelled.is_none()
+                    && interaction.private_response.is_none()
+            })
+            .map(|(interaction_id, interaction)| (interaction_id.clone(), interaction.revision))
+            .collect::<Vec<_>>();
+        interactions.sort_by_key(|(interaction_id, _)| interaction_id.clone());
+        let mut events = vec![(
+            surface::SurfaceScope::Operation {
+                operation_id: fence.operation_id.clone(),
+            },
+            surface::SurfaceEvent::Operation(surface::OperationPatch::ControlIntentCommitted {
+                operation_id: fence.operation_id.clone(),
+                request_id,
+                intent: surface::PendingControlIntent::Terminalize {
+                    operation_id: fence.operation_id.clone(),
+                    cause,
+                },
+            }),
+        )];
+        for (interaction_id, expected_revision) in &interactions {
+            let next_revision =
+                surface::InteractionRevision::try_new(expected_revision.get().saturating_add(1))
+                    .expect("interaction revision did not exhaust");
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision: *expected_revision,
+                    next_revision,
+                    reason: reason.clone(),
+                }),
+            ));
+        }
+        Ok(PreparedSurfaceTerminalization {
+            fence: fence.clone(),
+            cause,
+            batch: self.surface_event_batch_with_commit_id(events, None),
+            interaction_ids: interactions
+                .into_iter()
+                .map(|(interaction_id, _)| interaction_id)
+                .collect(),
+            retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+        })
+    }
+
+    fn apply_surface_interaction_cancellations(
+        &mut self,
+        interaction_ids: &[surface::SurfaceInteractionId],
+    ) {
+        for interaction_id in interaction_ids {
+            let waiter = self
+                .resident_surface
+                .interactions
+                .remove(interaction_id)
+                .expect("committed interaction remains resident")
+                .waiter;
+            if let Some(waiter) = waiter {
+                match waiter {
+                    ResidentInteractionWaiter::UserInput(waiter) => {
+                        let _ = waiter.send(Ok(None));
+                    }
+                    ResidentInteractionWaiter::McpElicitation(waiter) => {
+                        let _ = waiter.send(Ok(orca_mcp::McpElicitationResponse::Decline));
+                    }
+                }
+            }
+        }
+    }
+
+    fn prepare_surface_attachment_transition(
+        &self,
+        attachment_id: &surface::SurfaceAttachmentId,
+    ) -> Result<Option<PreparedSurfaceAttachmentTransition>, ()> {
+        let mut affected = self
+            .resident_surface
+            .interactions
+            .iter()
+            .filter(|(_, interaction)| {
+                interaction.winning_receipt.is_none()
+                    && interaction.cancelled.is_none()
+                    && interaction.private_response.is_none()
+                    && interaction_route_admits(&interaction.route, attachment_id)
+            })
+            .map(|(interaction_id, interaction)| {
+                (
+                    interaction_id.clone(),
+                    interaction.record.kind,
+                    interaction.record.fence.clone(),
+                    interaction.revision,
+                    interaction_route_epoch(&interaction.route),
+                )
+            })
+            .collect::<Vec<_>>();
+        affected.sort_by_key(|(interaction_id, ..)| interaction_id.clone());
+        let Some((_, _, fence, _, _)) = affected.first() else {
+            return Ok(None);
+        };
+        let fence = fence.clone();
+        if affected
+            .iter()
+            .any(|(_, _, candidate, _, _)| candidate != &fence)
+        {
+            return Err(());
+        }
+        let mut events = Vec::new();
+        let mut interactions = Vec::new();
+        let mut affected_route_epochs = Vec::new();
+        for (interaction_id, kind, _, expected_revision, current_epoch) in affected {
+            let route_revision = surface::InteractionRevision::try_new(expected_revision.get() + 1)
+                .expect("interaction revision did not exhaust");
+            let next_epoch = surface::ResponseRouteEpoch::try_new(current_epoch.get() + 1)
+                .expect("route epoch did not exhaust");
+            let fallback = self
+                .resident_surface
+                .hub
+                .select_interaction_attachment_excluding(kind, None, Some(attachment_id));
+            let (private_route, public_route, cancelled) = match fallback {
+                Some(fallback) => (
+                    surface::BrokerInteractionResponseRoute::Exclusive {
+                        epoch: next_epoch,
+                        attachment_id: fallback.clone(),
+                        grant_token: surface::SurfaceResponseGrantToken::new(random_token_bytes()),
+                    },
+                    surface::SurfaceInteractionRoute::Exclusive {
+                        epoch: next_epoch,
+                        attachment_id: fallback,
+                    },
+                    false,
+                ),
+                None => (
+                    surface::BrokerInteractionResponseRoute::Unassigned { epoch: next_epoch },
+                    surface::SurfaceInteractionRoute::Unassigned { epoch: next_epoch },
+                    true,
+                ),
+            };
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision,
+                    next_revision: route_revision,
+                    route: public_route,
+                }),
+            ));
+            let revision = if cancelled {
+                let cancelled_revision =
+                    surface::InteractionRevision::try_new(route_revision.get() + 1)
+                        .expect("interaction revision did not exhaust");
+                events.push((
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                        interaction_id: interaction_id.clone(),
+                        expected_revision: route_revision,
+                        next_revision: cancelled_revision,
+                        reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                    }),
+                ));
+                cancelled_revision
+            } else {
+                route_revision
+            };
+            affected_route_epochs.push((interaction_id.clone(), next_epoch));
+            interactions.push(PreparedSurfaceDetachInteraction {
+                interaction_id,
+                revision,
+                route: private_route,
+                cancelled,
+            });
+        }
+        let commit_id = surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+            .expect("generated UUID is v7");
+        let batch = self.surface_event_batch_with_commit_id(events, Some(commit_id.clone()));
+        Ok(Some(PreparedSurfaceAttachmentTransition {
+            fence,
+            batch,
+            commit_id,
+            affected_route_epochs,
+            interactions,
+        }))
+    }
+
+    fn apply_surface_attachment_transition(
+        &mut self,
+        active: Option<&mut ActiveOperation>,
+        transition: &PreparedSurfaceAttachmentTransition,
+    ) {
+        let mut cancelled_waiters = Vec::new();
+        for prepared in &transition.interactions {
+            if prepared.cancelled {
+                if let Some(waiter) = self
+                    .resident_surface
+                    .interactions
+                    .remove(&prepared.interaction_id)
+                    .expect("committed interaction remains resident")
+                    .waiter
+                {
+                    cancelled_waiters.push(waiter);
+                }
+            } else {
+                let interaction = self
+                    .resident_surface
+                    .interactions
+                    .get_mut(&prepared.interaction_id)
+                    .expect("committed interaction remains resident");
+                interaction.revision = prepared.revision;
+                interaction.route = prepared.route.clone();
+            }
+        }
+        if !cancelled_waiters.is_empty()
+            && let Some(active) = active
+        {
+            active.surface_execution_failure =
+                Some(surface::GenerationExecutionFailureClass::ClientCapabilityUnavailable);
+        }
+        for waiter in cancelled_waiters {
+            match waiter {
+                ResidentInteractionWaiter::UserInput(waiter) => {
+                    let _ = waiter.send(Ok(None));
+                }
+                ResidentInteractionWaiter::McpElicitation(waiter) => {
+                    let _ = waiter.send(Ok(orca_mcp::McpElicitationResponse::Decline));
+                }
+            }
+        }
+    }
+
+    fn next_invalid_surface_interaction_attachment(&self) -> Option<surface::SurfaceAttachmentId> {
+        self.resident_surface
+            .interactions
+            .iter()
+            .filter(|(_, interaction)| {
+                interaction.winning_receipt.is_none()
+                    && interaction.cancelled.is_none()
+                    && interaction.private_response.is_none()
+            })
+            .flat_map(|(interaction_id, interaction)| {
+                interaction_route_attachments(&interaction.route)
+                    .into_iter()
+                    .filter(|attachment_id| {
+                        !self
+                            .resident_surface
+                            .hub
+                            .admits_interaction_attachment(attachment_id, interaction.record.kind)
+                    })
+                    .map(|attachment_id| (interaction_id.clone(), attachment_id))
+            })
+            .min()
+            .map(|(_, attachment_id)| attachment_id)
+    }
+
+    fn reconcile_surface_interaction_capabilities(
+        &mut self,
+        mut active: Option<&mut ActiveOperation>,
+    ) {
+        if !self.resident_surface.pending_detaches.is_empty()
+            || !self.resident_surface.pending_capability_losses.is_empty()
+        {
+            return;
+        }
+        while let Some(attachment_id) = self.next_invalid_surface_interaction_attachment() {
+            let transition = match self.prepare_surface_attachment_transition(&attachment_id) {
+                Ok(Some(transition)) => transition,
+                Ok(None) | Err(()) => return,
+            };
+            if self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(transition.fence.clone(), &transition.batch)
+                .is_err()
+            {
+                eprintln!("orca: typed interaction capability-loss commit failed");
+                self.resident_surface.pending_capability_losses.insert(
+                    attachment_id,
+                    PendingSurfaceCapabilityLoss {
+                        transition,
+                        retry_at: tokio::time::Instant::now()
+                            + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                    },
+                );
+                return;
+            }
+            self.apply_surface_attachment_transition(active.as_deref_mut(), &transition);
+        }
+    }
+
+    fn next_surface_transition_retry_at(&self) -> Option<tokio::time::Instant> {
+        self.resident_surface.0.as_ref().and_then(|resident| {
+            resident
+                .pending_terminalization
+                .iter()
+                .map(|pending| pending.retry_at)
+                .chain(resident.interactions.values().filter_map(|interaction| {
+                    interaction
+                        .private_response
+                        .as_ref()
+                        .and_then(|private| private.retry_at)
+                }))
+                .chain(
+                    resident
+                        .pending_detaches
+                        .values()
+                        .map(|pending| pending.retry_at),
+                )
+                .chain(
+                    resident
+                        .pending_capability_losses
+                        .values()
+                        .map(|pending| pending.retry_at),
+                )
+                .min()
+        })
+    }
+
+    fn has_pending_surface_transition_retry(&self) -> bool {
+        self.next_surface_transition_retry_at().is_some()
+    }
+
+    fn retry_private_surface_interaction(
+        &mut self,
+        interaction_id: &surface::SurfaceInteractionId,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let (fence, batch, winner_answer) = {
+            let interaction = self
+                .resident_surface
+                .interactions
+                .get(interaction_id)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let private = interaction
+                .private_response
+                .as_ref()
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            (
+                interaction.record.fence.clone(),
+                private
+                    .pending_batch
+                    .clone()
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                private.answer.clone(),
+            )
+        };
+        if self
+            .resident_surface
+            .coordinator
+            .commit_generation_batch(fence, &batch)
+            .is_err()
+        {
+            if let Some(private) = self
+                .resident_surface
+                .interactions
+                .get_mut(interaction_id)
+                .and_then(|interaction| interaction.private_response.as_mut())
+            {
+                private.retry_at =
+                    Some(tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        self.apply_surface_interaction_resolution(interaction_id, &winner_answer);
+        Ok(())
+    }
+
+    fn drain_private_surface_interactions(
+        &mut self,
+        fence: &surface::SurfaceOperationFence,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut pending = self
+            .resident_surface
+            .interactions
+            .iter()
+            .filter_map(|(interaction_id, interaction)| {
+                (&interaction.record.fence == fence)
+                    .then_some(interaction.private_response.as_ref())
+                    .flatten()
+                    .and_then(|private| {
+                        private
+                            .pending_batch
+                            .as_ref()
+                            .map(|batch| (batch.cursor_before.next_seq, interaction_id.clone()))
+                    })
+            })
+            .collect::<Vec<_>>();
+        pending.sort();
+        for (_, interaction_id) in pending {
+            self.retry_private_surface_interaction(&interaction_id)?;
+        }
+        if self
+            .resident_surface
+            .interactions
+            .values()
+            .any(|interaction| {
+                &interaction.record.fence == fence && interaction.private_response.is_some()
+            })
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        Ok(())
+    }
+
+    fn retry_pending_surface_transition(&mut self, mut active: Option<&mut ActiveOperation>) {
+        let Some((_, retry)) =
+            self.resident_surface
+                .pending_terminalization
+                .iter()
+                .map(|pending| {
+                    (
+                        pending.retry_at,
+                        PendingSurfaceTransitionRetry::PreparedTerminalization(
+                            pending.fence.operation_id.clone(),
+                        ),
+                    )
+                })
+                .chain(self.resident_surface.interactions.iter().filter_map(
+                    |(interaction_id, interaction)| {
+                        interaction
+                            .private_response
+                            .as_ref()
+                            .and_then(|private| private.retry_at)
+                            .map(|retry_at| {
+                                (
+                                    retry_at,
+                                    PendingSurfaceTransitionRetry::PrivateResponse(
+                                        interaction_id.clone(),
+                                    ),
+                                )
+                            })
+                    },
+                ))
+                .chain(self.resident_surface.pending_detaches.iter().map(
+                    |(attachment_id, pending)| {
+                        (
+                            pending.retry_at,
+                            PendingSurfaceTransitionRetry::Detach(attachment_id.clone()),
+                        )
+                    },
+                ))
+                .chain(self.resident_surface.pending_capability_losses.iter().map(
+                    |(attachment_id, pending)| {
+                        (
+                            pending.retry_at,
+                            PendingSurfaceTransitionRetry::CapabilityLoss(attachment_id.clone()),
+                        )
+                    },
+                ))
+                .min()
+        else {
+            return;
+        };
+        if let PendingSurfaceTransitionRetry::PreparedTerminalization(operation_id) = retry {
+            let pending = self
+                .resident_surface
+                .pending_terminalization
+                .clone()
+                .expect("selected terminalization remains pending");
+            debug_assert_eq!(pending.fence.operation_id, operation_id);
+            if self
+                .resident_surface
+                .coordinator
+                .commit_actor_generation_terminalization_batch(
+                    pending.fence.clone(),
+                    &pending.batch,
+                )
+                .is_err()
+            {
+                if let Some(retained) = self.resident_surface.pending_terminalization.as_mut() {
+                    retained.retry_at =
+                        tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                }
+                return;
+            }
+            self.resident_surface.pending_terminalization = None;
+            self.apply_surface_interaction_cancellations(&pending.interaction_ids);
+            if let Some(active) = active.as_deref_mut()
+                && active.surface_operation.as_ref() == Some(&pending.fence)
+            {
+                active.surface_terminalization = Some(pending.cause);
+                active.generation.cancel.cancel();
+            }
+            return;
+        }
+        if let PendingSurfaceTransitionRetry::PrivateResponse(interaction_id) = retry {
+            if self
+                .retry_private_surface_interaction(&interaction_id)
+                .is_err()
+            {
+                return;
+            }
+            self.reconcile_surface_interaction_capabilities(active);
+            return;
+        }
+        if let PendingSurfaceTransitionRetry::Detach(attachment_id) = retry {
+            let pending = self
+                .resident_surface
+                .pending_detaches
+                .get(&attachment_id)
+                .expect("selected detach remains pending")
+                .clone();
+            if self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(
+                    pending.transition.fence.clone(),
+                    &pending.transition.batch,
+                )
+                .is_err()
+            {
+                if let Some(retained) = self
+                    .resident_surface
+                    .pending_detaches
+                    .get_mut(&attachment_id)
+                {
+                    retained.retry_at =
+                        tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                }
+                return;
+            }
+            self.resident_surface
+                .pending_detaches
+                .remove(&attachment_id);
+            self.resident_surface
+                .pending_capability_losses
+                .remove(&attachment_id);
+            self.apply_surface_attachment_transition(active.as_deref_mut(), &pending.transition);
+            let _ = self
+                .resident_surface
+                .hub
+                .finalize_detach_local(&pending.client, pending.receipt);
+            self.reconcile_surface_interaction_capabilities(active);
+            return;
+        }
+        let PendingSurfaceTransitionRetry::CapabilityLoss(attachment_id) = retry else {
+            unreachable!("private response and detach retries returned above")
+        };
+        let transition = self
+            .resident_surface
+            .pending_capability_losses
+            .get(&attachment_id)
+            .expect("selected capability loss remains pending")
+            .transition
+            .clone();
+        if self
+            .resident_surface
+            .coordinator
+            .commit_generation_batch(transition.fence.clone(), &transition.batch)
+            .is_err()
+        {
+            if let Some(pending) = self
+                .resident_surface
+                .pending_capability_losses
+                .get_mut(&attachment_id)
+            {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            }
+            return;
+        }
+        self.resident_surface
+            .pending_capability_losses
+            .remove(&attachment_id);
+        self.apply_surface_attachment_transition(active.as_deref_mut(), &transition);
+        self.reconcile_surface_interaction_capabilities(active);
+    }
+
+    fn detach_surface_attachment(
+        &mut self,
+        mut active: Option<&mut ActiveOperation>,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request: surface::DetachRequest,
+    ) -> surface::DetachResult {
+        let attachment_id = client.attachment_id().clone();
+        if !self.resident_surface.pending_capability_losses.is_empty()
+            && !self
+                .resident_surface
+                .pending_capability_losses
+                .contains_key(&attachment_id)
+        {
+            return surface::DetachResult::StaleAttachment {
+                request_id: request.request_id,
+                attachment_id,
+            };
+        }
+        if !self.resident_surface.pending_detaches.is_empty()
+            && !self
+                .resident_surface
+                .pending_detaches
+                .get(&attachment_id)
+                .is_some_and(|pending| pending.receipt.request_id == request.request_id)
+        {
+            return surface::DetachResult::StaleAttachment {
+                request_id: request.request_id,
+                attachment_id,
+            };
+        }
+        let detached = self
+            .resident_surface
+            .hub
+            .prepare_detach_local(client, request.clone());
+        let mut receipt = match detached {
+            surface::DetachResult::Detached { receipt } => receipt,
+            other => return other,
+        };
+        let pending = match self
+            .resident_surface
+            .pending_detaches
+            .get(&attachment_id)
+            .cloned()
+        {
+            Some(pending) if pending.receipt.request_id == request.request_id => pending,
+            Some(_) => {
+                return surface::DetachResult::StaleAttachment {
+                    request_id: request.request_id,
+                    attachment_id,
+                };
+            }
+            None => {
+                let retained_capability_loss = self
+                    .resident_surface
+                    .pending_capability_losses
+                    .get(&attachment_id)
+                    .map(|pending| pending.transition.clone());
+                let transition = match retained_capability_loss.map_or_else(
+                    || self.prepare_surface_attachment_transition(&attachment_id),
+                    |transition| Ok(Some(transition)),
+                ) {
+                    Ok(Some(transition)) => transition,
+                    Ok(None) => {
+                        return self
+                            .resident_surface
+                            .hub
+                            .finalize_detach_local(client, receipt);
+                    }
+                    Err(()) => {
+                        return surface::DetachResult::StaleAttachment {
+                            request_id: request.request_id,
+                            attachment_id,
+                        };
+                    }
+                };
+                receipt.affected_route_epochs = transition.affected_route_epochs.clone();
+                receipt.route_commit_id = Some(transition.commit_id.clone());
+                receipt.route_cursor = Some(transition.batch.cursor_after.clone());
+                PendingSurfaceDetach {
+                    client: client.clone(),
+                    transition,
+                    receipt,
+                    retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                }
+            }
+        };
+        if self
+            .resident_surface
+            .coordinator
+            .commit_generation_batch(pending.transition.fence.clone(), &pending.transition.batch)
+            .is_err()
+        {
+            let retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            self.resident_surface
+                .pending_capability_losses
+                .remove(&attachment_id);
+            let mut pending = pending;
+            pending.retry_at = retry_at;
+            self.resident_surface
+                .pending_detaches
+                .insert(attachment_id.clone(), pending);
+            return surface::DetachResult::StaleAttachment {
+                request_id: request.request_id,
+                attachment_id,
+            };
+        }
+        self.resident_surface
+            .pending_detaches
+            .remove(&attachment_id);
+        self.resident_surface
+            .pending_capability_losses
+            .remove(&attachment_id);
+        self.apply_surface_attachment_transition(active.as_deref_mut(), &pending.transition);
+        let result = self
+            .resident_surface
+            .hub
+            .finalize_detach_local(client, pending.receipt);
+        self.reconcile_surface_interaction_capabilities(active);
+        result
+    }
+
     fn reserve_surface_operation(
         &mut self,
         request_id: surface::SurfaceRequestId,
         intent: surface::OperationRequestIntent,
+        origin_attachment: surface::SurfaceAttachmentId,
     ) -> Result<
         surface::MutationReply<surface::ReservedOperationOutput>,
         surface::SurfaceClientCommandError,
@@ -3132,6 +5429,9 @@ impl ThreadActor {
             .coordinator
             .commit_actor_batch(&batch)
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.resident_surface
+            .operation_origin_attachments
+            .insert(operation_id.clone(), origin_attachment);
         Ok(Self::committed_surface_mutation(
             request_id,
             operation_id.clone(),
@@ -3350,7 +5650,20 @@ impl ThreadActor {
                 surface::SurfaceClientCommandError::RuntimeUnavailable
             })?;
 
-        let mut hosted_request = HostedTurnRequest::new(resolved_input.canonical_text.as_str());
+        let interaction_command_tx = self.handle.command_tx.clone();
+        let interaction_fence = fence.clone();
+        let mut hosted_request = HostedTurnRequest::new(resolved_input.canonical_text.as_str())
+            .with_generation_handlers(move |_, _| {
+                HostedGenerationHandlers::default()
+                    .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
+                    .with_mcp_elicitation_handler(Arc::new(RuntimeSurfaceMcpElicitationHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
+            });
         hosted_request.turn_id = logical_turn_id;
         hosted_request.task_id = Some(legacy_task_id);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
@@ -3691,66 +6004,86 @@ impl ThreadActor {
                 message: "typed surface operation fence is missing during finalization".to_string(),
             }
         })?;
-        let (stop_reason, terminal) = match outcome {
-            OperationOutcome::Completed(RunStatus::Success) => (
-                surface::GenerationStopReason::Completed {
-                    status: surface::GenerationCompletionStatus::Success,
+        let (stop_reason, terminal) = if let Some(class) = active.surface_execution_failure {
+            let message = surface::SafeDiagnosticText::try_new(
+                "required client capability became unavailable",
+            )
+            .expect("fixed diagnostic is bounded");
+            (
+                surface::GenerationStopReason::ExecutionFailed {
+                    class,
+                    message: message.clone(),
                 },
-                surface::OperationTerminal::Succeeded {
-                    usage: surface::UsageTotals {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_tokens: 0,
-                        estimated_cost_usd_micros: 0,
+                surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::ClientCapabilityUnavailable,
+                    message,
+                },
+            )
+        } else {
+            match outcome {
+                OperationOutcome::Completed(RunStatus::Success) => (
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::Success,
                     },
-                },
-            ),
-            OperationOutcome::Completed(RunStatus::Cancelled) => {
-                let cause = active
-                    .surface_terminalization
-                    .unwrap_or(surface::TerminalizationCause::UserCancel);
-                let terminal = match cause {
-                    surface::TerminalizationCause::HostShutdown => {
-                        surface::OperationTerminal::Shutdown {
-                            reason: surface::SurfaceShutdownReason::HostShutdown,
+                    surface::OperationTerminal::Succeeded {
+                        usage: surface::UsageTotals {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_tokens: 0,
+                            estimated_cost_usd_micros: 0,
+                        },
+                    },
+                ),
+                OperationOutcome::Completed(RunStatus::Cancelled) => {
+                    let cause = active
+                        .surface_terminalization
+                        .unwrap_or(surface::TerminalizationCause::UserCancel);
+                    let terminal = match cause {
+                        surface::TerminalizationCause::HostShutdown => {
+                            surface::OperationTerminal::Shutdown {
+                                reason: surface::SurfaceShutdownReason::HostShutdown,
+                            }
                         }
-                    }
-                    surface::TerminalizationCause::ThreadClose => {
-                        surface::OperationTerminal::Shutdown {
-                            reason: surface::SurfaceShutdownReason::ThreadClose,
+                        surface::TerminalizationCause::ThreadClose => {
+                            surface::OperationTerminal::Shutdown {
+                                reason: surface::SurfaceShutdownReason::ThreadClose,
+                            }
                         }
-                    }
-                    _ => surface::OperationTerminal::Cancelled {
-                        reason: surface::CancelReason::User,
+                        _ => surface::OperationTerminal::Cancelled {
+                            reason: surface::CancelReason::User,
+                        },
+                    };
+                    (surface::GenerationStopReason::Cancelled { cause }, terminal)
+                }
+                OperationOutcome::Panicked { message } => (
+                    surface::GenerationStopReason::Panicked {
+                        message: surface::SafeDiagnosticText::try_new(message.clone())
+                            .unwrap_or_else(|_| {
+                                surface::SafeDiagnosticText::try_new("generation panicked").unwrap()
+                            }),
                     },
-                };
-                (surface::GenerationStopReason::Cancelled { cause }, terminal)
-            }
-            OperationOutcome::Panicked { message } => (
-                surface::GenerationStopReason::Panicked {
-                    message: surface::SafeDiagnosticText::try_new(message.clone()).unwrap_or_else(
-                        |_| surface::SafeDiagnosticText::try_new("generation panicked").unwrap(),
-                    ),
-                },
-                surface::OperationTerminal::Panicked {
-                    message: surface::SafeDiagnosticText::try_new(message.clone()).unwrap_or_else(
-                        |_| surface::SafeDiagnosticText::try_new("generation panicked").unwrap(),
-                    ),
-                },
-            ),
-            _ => {
-                let message = surface::SafeDiagnosticText::try_new("foreground operation failed")
-                    .expect("fixed diagnostic is bounded");
-                (
-                    surface::GenerationStopReason::ExecutionFailed {
-                        class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
-                        message: message.clone(),
+                    surface::OperationTerminal::Panicked {
+                        message: surface::SafeDiagnosticText::try_new(message.clone())
+                            .unwrap_or_else(|_| {
+                                surface::SafeDiagnosticText::try_new("generation panicked").unwrap()
+                            }),
                     },
-                    surface::OperationTerminal::Failed {
-                        class: surface::FailureClass::RuntimeInvariant,
-                        message,
-                    },
-                )
+                ),
+                _ => {
+                    let message =
+                        surface::SafeDiagnosticText::try_new("foreground operation failed")
+                            .expect("fixed diagnostic is bounded");
+                    (
+                        surface::GenerationStopReason::ExecutionFailed {
+                            class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
+                            message: message.clone(),
+                        },
+                        surface::OperationTerminal::Failed {
+                            class: surface::FailureClass::RuntimeInvariant,
+                            message,
+                        },
+                    )
+                }
             }
         };
         let operation_id = fence.operation_id.clone();
@@ -3931,37 +6264,17 @@ impl ThreadActor {
         surface::MutationReply<surface::CancelOperationOutput>,
         surface::SurfaceClientCommandError,
     > {
-        let _fence = active
+        let fence = active
             .surface_operation
             .as_ref()
             .filter(|fence| fence.operation_id == operation_id)
             .cloned()
             .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        let original_request_id = self
-            .resident_surface
-            .coordinator
-            .state()
-            .snapshot()
-            .foreground_operation
-            .as_ref()
-            .map(|operation| operation.request_id.clone())
-            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let batch = self.surface_operation_batch(
-            &operation_id,
-            vec![surface::OperationPatch::ControlIntentCommitted {
-                operation_id: operation_id.clone(),
-                request_id: original_request_id,
-                intent: surface::PendingControlIntent::Terminalize {
-                    operation_id: operation_id.clone(),
-                    cause: surface::TerminalizationCause::UserCancel,
-                },
-            }],
-        );
-        self.resident_surface
-            .coordinator
-            .commit_actor_batch(&batch)
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        active.surface_terminalization = Some(surface::TerminalizationCause::UserCancel);
+        let batch = self.commit_surface_terminalization_batch(
+            active,
+            &fence,
+            surface::TerminalizationCause::UserCancel,
+        )?;
         active.generation.cancel.cancel();
         Ok(Self::committed_surface_mutation(
             request_id,
@@ -3980,40 +6293,76 @@ impl ThreadActor {
         active: &mut ActiveOperation,
         cause: surface::TerminalizationCause,
     ) -> Result<(), RuntimeHostError> {
-        let Some(fence) = active.surface_operation.as_ref() else {
+        let Some(fence) = active.surface_operation.clone() else {
             return Ok(());
         };
-        let operation_id = fence.operation_id.clone();
-        let original_request_id = self
-            .resident_surface
-            .coordinator
-            .state()
-            .snapshot()
-            .foreground_operation
-            .as_ref()
-            .map(|operation| operation.request_id.clone())
-            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
-                message: "typed surface foreground operation is missing".to_string(),
-            })?;
-        let batch = self.surface_operation_batch(
-            &operation_id,
-            vec![surface::OperationPatch::ControlIntentCommitted {
-                operation_id: operation_id.clone(),
-                request_id: original_request_id,
-                intent: surface::PendingControlIntent::Terminalize {
-                    operation_id: operation_id.clone(),
-                    cause,
-                },
-            }],
-        );
-        self.resident_surface
-            .coordinator
-            .commit_actor_batch(&batch)
+        self.commit_surface_terminalization_batch(active, &fence, cause)
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
                 message: format!("failed to commit typed shutdown intent: {error:?}"),
             })?;
-        active.surface_terminalization = Some(cause);
         Ok(())
+    }
+
+    fn commit_surface_terminalization_batch(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: &surface::SurfaceOperationFence,
+        cause: surface::TerminalizationCause,
+    ) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
+        if active.surface_terminalization.is_some()
+            || !self.resident_surface.pending_detaches.is_empty()
+            || !self.resident_surface.pending_capability_losses.is_empty()
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        active.surface_terminalization = Some(cause);
+        let prepared = (|| {
+            self.drain_private_surface_interactions(fence)?;
+            let original_request_id = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .foreground_operation
+                .as_ref()
+                .map(|operation| operation.request_id.clone())
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            self.prepare_surface_terminalization(fence, original_request_id, cause)
+        })();
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                active.surface_terminalization = None;
+                return Err(error);
+            }
+        };
+        match self
+            .resident_surface
+            .coordinator
+            .commit_actor_generation_terminalization_batch(fence.clone(), &prepared.batch)
+        {
+            Ok(_) => {
+                self.apply_surface_interaction_cancellations(&prepared.interaction_ids);
+                Ok(prepared.batch)
+            }
+            Err(
+                surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::CheckpointFailed)
+                | surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::PartialAppend),
+            ) => {
+                self.resident_surface.pending_terminalization = Some(prepared);
+                Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+            }
+            Err(_) => {
+                active.surface_terminalization = None;
+                Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+            }
+        }
+    }
+
+    fn surface_interaction_admission_closed(active: &ActiveOperation) -> bool {
+        active.surface_terminalization.is_some()
+            || active.surface_execution_failure.is_some()
+            || active.generation.cancel.is_cancelled()
     }
 
     fn new(
@@ -4044,11 +6393,24 @@ impl ThreadActor {
         }
     }
 
-    async fn run(mut self, mut command_rx: tokio_mpsc::Receiver<ThreadCommand>) {
+    async fn run(
+        mut self,
+        mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
+        mut capability_change_rx: tokio_mpsc::Receiver<()>,
+    ) {
         loop {
             let Some(mut active) = self.active.take() else {
+                let surface_retry_at = self.next_surface_transition_retry_at();
                 tokio::select! {
                     biased;
+                    _ = wait_for_surface_transition_retry(surface_retry_at) => {
+                        self.retry_pending_surface_transition(None);
+                    }
+                    wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
+                        if wake.is_some() {
+                            self.reconcile_surface_interaction_capabilities(None);
+                        }
+                    }
                     command = command_rx.recv() => {
                         let Some(command) = command else {
                             if self.surface_terminal_blocked.is_some() {
@@ -4058,14 +6420,25 @@ impl ThreadActor {
                             break;
                         };
                         if let ThreadCommand::ShutdownThread { reply, reason } = command {
-                            if let Some(message) = self.surface_terminal_blocked.as_ref() {
-                                if let Some(reply) = reply {
-                                    let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
-                                        message: message.clone(),
-                                    }));
+                            while self.has_pending_surface_transition_retry() {
+                                self.retry_pending_surface_transition(None);
+                                if self.has_pending_surface_transition_retry() {
+                                    tokio::time::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL).await;
                                 }
+                            }
+                            if let Some(message) = self.surface_terminal_blocked.as_ref() {
+                                let error = RuntimeHostError::ThreadStartFailed {
+                                    message: message.clone(),
+                                };
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    std::future::pending::<()>().await;
+                                    self.shutdown_background_tasks().await;
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(ThreadShutdownAck::Failed(error));
+                                    }
+                                    break;
+                                }
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(ThreadShutdownAck::Failed(error));
                                 }
                                 continue;
                             }
@@ -4077,17 +6450,21 @@ impl ThreadActor {
                                 .transpose();
                             if let Err(error) = typed_shutdown {
                                 self.surface_terminal_blocked = Some(error.to_string());
-                                if let Some(reply) = reply {
-                                    let _ = reply.send(Err(error));
-                                }
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    std::future::pending::<()>().await;
+                                    self.shutdown_background_tasks().await;
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(ThreadShutdownAck::Failed(error));
+                                    }
+                                    break;
+                                }
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(ThreadShutdownAck::Failed(error));
                                 }
                                 continue;
                             }
                             self.shutdown_background_tasks().await;
                             if let Some(reply) = reply {
-                                let _ = reply.send(Ok(()));
+                                let _ = reply.send(ThreadShutdownAck::Complete);
                             }
                             break;
                         }
@@ -4102,16 +6479,22 @@ impl ThreadActor {
                 continue;
             };
 
+            let surface_retry_at = self.next_surface_transition_retry_at();
             tokio::select! {
                 biased;
+                _ = wait_for_surface_transition_retry(surface_retry_at) => {
+                    self.retry_pending_surface_transition(Some(&mut active));
+                    self.active = Some(active);
+                }
+                wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
+                    if wake.is_some() {
+                        self.reconcile_surface_interaction_capabilities(Some(&mut active));
+                    }
+                    self.active = Some(active);
+                }
                 command = command_rx.recv() => {
                     match command {
                         Some(ThreadCommand::ShutdownThread { reply, reason }) => {
-                            command_rx.close();
-                            let pause_result = Self::pause_active_goal(
-                                &mut active,
-                                "goal run paused during runtime shutdown",
-                            );
                             let terminalization = match reason {
                                 surface::SurfaceShutdownReason::HostShutdown => {
                                     surface::TerminalizationCause::HostShutdown
@@ -4120,35 +6503,66 @@ impl ThreadActor {
                                     surface::TerminalizationCause::ThreadClose
                                 }
                             };
+                            if active.surface_terminalization.is_some() {
+                                if let Some(reply) = reply.as_ref() {
+                                    let _ = reply.send(ThreadShutdownAck::Retry);
+                                }
+                                self.active = Some(active);
+                                continue;
+                            }
                             if let Err(error) = self
                                 .commit_surface_terminalization(&mut active, terminalization)
                             {
-                                let result = (&mut active.generation.join).await;
-                                let finish_result = self.finish_generation(active, result, false);
-                                self.shutdown_background_tasks().await;
-                                if let Err(finish_error) = finish_result {
+                                if self.resident_surface.pending_terminalization.is_some() {
                                     if let Some(reply) = reply.as_ref() {
-                                        let _ = reply.send(Err(finish_error));
+                                        let _ = reply.send(ThreadShutdownAck::Retry);
                                     }
-                                    std::future::pending::<()>().await;
+                                    self.active = Some(active);
+                                    continue;
+                                }
+                                if reason == surface::SurfaceShutdownReason::HostShutdown {
+                                    command_rx.close();
+                                    active.generation.cancel.cancel();
+                                    Self::drain_closed_thread_commands(&mut command_rx);
+                                    self.resident_surface.0.take();
+                                    let _ = (&mut active.generation.join).await;
+                                    self.shutdown_background_tasks().await;
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(ThreadShutdownAck::Failed(error));
+                                    }
+                                    break;
                                 }
                                 if let Some(reply) = reply.as_ref() {
-                                    let _ = reply.send(Err(error));
+                                    let _ = reply.send(ThreadShutdownAck::Failed(error));
                                 }
-                                break;
+                                self.active = Some(active);
+                                continue;
                             }
+                            command_rx.close();
+                            let pause_result = Self::pause_active_goal(
+                                &mut active,
+                                "goal run paused during runtime shutdown",
+                            );
                             active.generation.cancel.cancel();
+                            Self::drain_closed_thread_commands(&mut command_rx);
                             let result = (&mut active.generation.join).await;
                             let finish_result = self.finish_generation(active, result, false);
                             self.shutdown_background_tasks().await;
                             if let Err(error) = finish_result {
                                 if let Some(reply) = reply.as_ref() {
-                                    let _ = reply.send(Err(error));
+                                    let _ = reply.send(ThreadShutdownAck::Failed(error));
+                                }
+                                if reason == surface::SurfaceShutdownReason::HostShutdown {
+                                    break;
                                 }
                                 std::future::pending::<()>().await;
                             }
                             if let Some(reply) = reply.as_ref() {
-                                let _ = reply.send(pause_result);
+                                let ack = match pause_result {
+                                    Ok(()) => ThreadShutdownAck::Complete,
+                                    Err(error) => ThreadShutdownAck::Failed(error),
+                                };
+                                let _ = reply.send(ack);
                             }
                             break;
                         }
@@ -4211,8 +6625,109 @@ impl ThreadActor {
         }
     }
 
+    fn drain_closed_thread_commands(command_rx: &mut tokio_mpsc::Receiver<ThreadCommand>) {
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                ThreadCommand::SurfaceDetach {
+                    client,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.send(surface::DetachResult::StaleAttachment {
+                        request_id: request.request_id,
+                        attachment_id: client.attachment_id().clone(),
+                    });
+                }
+                ThreadCommand::SurfaceReserveOperation { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceAdmitReserved { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceCancelOperation { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceWaitOperationTerminal { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceRequestUserInput { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
+                ThreadCommand::SurfaceRequestMcpElicitation { reply, .. } => {
+                    let _ = reply.send(Err("runtime thread is shutting down".to_string()));
+                }
+                #[cfg(test)]
+                ThreadCommand::SurfaceRespondInteraction { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceRespondInteractionById { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceRetryFinalization { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                #[cfg(test)]
+                ThreadCommand::SurfaceActorTestProbe { reply, .. } => drop(reply),
+                ThreadCommand::StartTurn { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::LaunchWorkflow { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::InterruptOperation { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::PauseGoalRun { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::ResumeOperation { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::SteerOperation { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::AdmitGeneration { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::ReadState { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::ReadSnapshot { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::GoalRuntime { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::MutateIdle { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::BacktrackLastUser { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::ShutdownThread { reply, .. } => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(ThreadShutdownAck::Failed(
+                            RuntimeHostError::ThreadUnavailable,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_idle_command(&mut self, command: ThreadCommand) {
         match command {
+            ThreadCommand::SurfaceDetach {
+                client,
+                request,
+                reply,
+            } => {
+                let result = self.detach_surface_attachment(None, &client, request);
+                let _ = reply.send(result);
+            }
             ThreadCommand::SurfaceReserveOperation {
                 client,
                 request_id,
@@ -4222,7 +6737,11 @@ impl ThreadActor {
                 let result = if self
                     .admits_surface_client(&client, surface::SurfaceCapability::SubmitOperation)
                 {
-                    self.reserve_surface_operation(request_id, intent)
+                    self.reserve_surface_operation(
+                        request_id,
+                        intent,
+                        client.attachment_id().clone(),
+                    )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -4273,6 +6792,42 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
             }
+            ThreadCommand::SurfaceRequestUserInput { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceRequestMcpElicitation { reply, .. } => {
+                let _ = reply.send(Err("runtime generation is not active".to_string()));
+            }
+            #[cfg(test)]
+            ThreadCommand::SurfaceRespondInteraction {
+                client,
+                request_id,
+                selector,
+                response,
+                reply,
+            } => {
+                let result =
+                    self.respond_surface_interaction(&client, request_id, selector, response);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRespondInteractionById {
+                client,
+                request_id,
+                interaction_id,
+                answer,
+                reply,
+            } => {
+                let result = self.respond_surface_interaction_by_id(
+                    &client,
+                    request_id,
+                    interaction_id,
+                    answer,
+                );
+                let _ = reply.send(result);
+            }
             ThreadCommand::SurfaceRetryFinalization {
                 client,
                 token,
@@ -4299,6 +6854,18 @@ impl ThreadActor {
                         .get(&operation_id)
                         .map_or(0, Vec::len),
                     legacy_completion: None,
+                    exact_interaction_selector: exact_interaction_selector_for_test(
+                        &self.resident_surface,
+                        &operation_id,
+                    ),
+                    secret_bearing_interaction_count: self.resident_surface.interactions.len(),
+                    pending_capability_loss: pending_capability_loss_for_test(
+                        &self.resident_surface,
+                    ),
+                    pending_terminalization: pending_terminalization_for_test(
+                        &self.resident_surface,
+                    ),
+                    interaction_admission_closed: false,
                 });
             }
             ThreadCommand::StartTurn {
@@ -4422,6 +6989,7 @@ impl ThreadActor {
                     generation,
                     surface_operation: None,
                     surface_terminalization: None,
+                    surface_execution_failure: None,
                 });
                 let _ = reply.send(Ok(OperationHandle {
                     operation_id,
@@ -4534,6 +7102,14 @@ impl ThreadActor {
     fn handle_running_command(&mut self, command: ThreadCommand, active: &mut ActiveOperation) {
         let generation = active.generation.context.fence();
         match command {
+            ThreadCommand::SurfaceDetach {
+                client,
+                request,
+                reply,
+            } => {
+                let result = self.detach_surface_attachment(Some(active), &client, request);
+                let _ = reply.send(result);
+            }
             ThreadCommand::SurfaceReserveOperation { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
@@ -4569,6 +7145,58 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
             }
+            ThreadCommand::SurfaceRequestUserInput {
+                fence,
+                request,
+                reply,
+            } => {
+                if Self::surface_interaction_admission_closed(active) {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "runtime generation is terminalizing",
+                    )));
+                } else {
+                    self.request_surface_user_input(active, fence, request, reply);
+                }
+            }
+            ThreadCommand::SurfaceRequestMcpElicitation {
+                fence,
+                request,
+                reply,
+            } => {
+                if Self::surface_interaction_admission_closed(active) {
+                    let _ = reply.send(Err("runtime generation is terminalizing".to_string()));
+                } else {
+                    self.request_surface_mcp_elicitation(active, fence, request, reply);
+                }
+            }
+            #[cfg(test)]
+            ThreadCommand::SurfaceRespondInteraction {
+                client,
+                request_id,
+                selector,
+                response,
+                reply,
+            } => {
+                let result =
+                    self.respond_surface_interaction(&client, request_id, selector, response);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRespondInteractionById {
+                client,
+                request_id,
+                interaction_id,
+                answer,
+                reply,
+            } => {
+                let result = self.respond_surface_interaction_by_id(
+                    &client,
+                    request_id,
+                    interaction_id,
+                    answer,
+                );
+                let _ = reply.send(result);
+            }
             ThreadCommand::SurfaceRetryFinalization {
                 client,
                 token,
@@ -4600,6 +7228,20 @@ impl ThreadActor {
                         .get(&operation_id)
                         .map_or(0, Vec::len),
                     legacy_completion,
+                    exact_interaction_selector: exact_interaction_selector_for_test(
+                        &self.resident_surface,
+                        &operation_id,
+                    ),
+                    secret_bearing_interaction_count: self.resident_surface.interactions.len(),
+                    pending_capability_loss: pending_capability_loss_for_test(
+                        &self.resident_surface,
+                    ),
+                    pending_terminalization: pending_terminalization_for_test(
+                        &self.resident_surface,
+                    ),
+                    interaction_admission_closed: Self::surface_interaction_admission_closed(
+                        active,
+                    ),
                 });
             }
             ThreadCommand::StartTurn { reply, .. } => {
@@ -6297,6 +8939,13 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     "operation executor panicked".to_string()
 }
 
+async fn wait_for_surface_transition_retry(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn receive_reply<T>(
     receiver: mpsc::Receiver<T>,
     owner: &'static str,
@@ -6358,6 +9007,8 @@ mod tests {
 
     const TERMINAL_FAILURE_CHILD_ENV: &str = "ORCA_RUNTIME_HOST_TERMINAL_FAILURE_CHILD";
     const PREPARED_TERMINAL_CHILD_ENV: &str = "ORCA_RUNTIME_HOST_PREPARED_TERMINAL_CHILD";
+    const PREPARED_TERMINALIZATION_RESTART_CHILD_ENV: &str =
+        "ORCA_RUNTIME_HOST_PREPARED_TERMINALIZATION_RESTART_CHILD";
     const EMPTY_THREAD_OWNER_RECOVERY_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_EMPTY_THREAD_OWNER_RECOVERY_CHILD";
     const RESERVATION_TERMINAL_FAILURE_CHILD_ENV: &str =
@@ -6367,6 +9018,61 @@ mod tests {
     struct GatedSuccessExecutor {
         entered: SyncSender<()>,
         release: Mutex<Receiver<()>>,
+    }
+
+    struct CancelAwareShutdownExecutor {
+        entered: SyncSender<()>,
+        cancel_observed: SyncSender<()>,
+        completed: SyncSender<()>,
+    }
+
+    struct QueuedInteractionShutdownExecutor {
+        entered: SyncSender<()>,
+        release_interaction: Mutex<Receiver<()>>,
+        interaction_result: SyncSender<io::Result<Option<String>>>,
+        completed: SyncSender<()>,
+    }
+
+    struct RoundRobinShutdownExecutor {
+        entered: SyncSender<String>,
+        completed: SyncSender<String>,
+    }
+
+    struct DispatchFairShutdownExecutor {
+        entered: SyncSender<String>,
+        shutdown_observed: SyncSender<String>,
+        completed: SyncSender<String>,
+        blocked_release: Mutex<Receiver<()>>,
+    }
+
+    struct ExactSelectorUserInputExecutor {
+        answer_tx: SyncSender<Option<String>>,
+    }
+
+    struct SequentialUserInputExecutor {
+        first_answer_tx: SyncSender<Option<String>>,
+        second_answer_tx: SyncSender<Option<String>>,
+        continue_second: Mutex<Receiver<()>>,
+    }
+
+    struct ImmediateSecondUserInputExecutor {
+        first_answer_tx: SyncSender<Option<String>>,
+        second_result_tx: SyncSender<io::Result<Option<String>>>,
+    }
+
+    struct SlowSubscriberUserInputExecutor {
+        entered: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+        answer_tx: SyncSender<Option<String>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExactSelectorCorruption {
+        Revision,
+        ResponseToken,
+        RouteEpoch,
+        OperationFence,
+        GrantToken,
     }
 
     struct PanicExecutor;
@@ -6401,6 +9107,250 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .recv()
                 .expect("release successful executor");
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for CancelAwareShutdownExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            self.entered.send(()).expect("report executor entry");
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.cancel_observed
+                .send(())
+                .expect("report observed cancellation");
+            thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+            self.completed.send(()).expect("report worker completion");
+            Ok(RunStatus::Cancelled.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for QueuedInteractionShutdownExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            self.entered.send(()).expect("report executor entry");
+            self.release_interaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .expect("release queued interaction");
+            let result = generation
+                .user_input_handler()
+                .expect("runtime installs typed user-input broker")
+                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
+                    id: "queued-during-host-shutdown".to_string(),
+                    question: "Reject interaction behind shutdown?".to_string(),
+                    choices: Vec::new(),
+                });
+            self.interaction_result
+                .send(result)
+                .expect("report rejected interaction");
+            thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+            self.completed.send(()).expect("report worker completion");
+            Ok(RunStatus::Cancelled.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for RoundRobinShutdownExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let label = request.prompt.clone();
+            self.entered
+                .send(label.clone())
+                .expect("report executor entry");
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+            self.completed
+                .send(label)
+                .expect("report worker completion");
+            Ok(RunStatus::Cancelled.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for DispatchFairShutdownExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let label = request.prompt.clone();
+            self.entered
+                .send(label.clone())
+                .expect("report executor entry");
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.shutdown_observed
+                .send(label.clone())
+                .expect("report shutdown cancellation");
+            if label == "blocked-actor" {
+                self.blocked_release
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv()
+                    .expect("release blocked shutdown actor");
+            }
+            thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+            self.completed
+                .send(label)
+                .expect("report worker completion");
+            Ok(RunStatus::Cancelled.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for ExactSelectorUserInputExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let answer = generation
+                .user_input_handler()
+                .expect("runtime installs typed user-input broker")
+                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
+                    id: "exact-selector-input".to_string(),
+                    question: "Accept exact selector?".to_string(),
+                    choices: Vec::new(),
+                })?;
+            self.answer_tx.send(answer).expect("report typed answer");
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for SequentialUserInputExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let handler = generation
+                .user_input_handler()
+                .expect("runtime installs typed user-input broker");
+            let first = handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
+                id: "private-input-1".to_string(),
+                question: "First private answer?".to_string(),
+                choices: Vec::new(),
+            })?;
+            self.first_answer_tx
+                .send(first)
+                .expect("report first typed answer");
+            self.continue_second
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .expect("release second typed interaction");
+            let second =
+                handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
+                    id: "private-input-2".to_string(),
+                    question: "Second private answer?".to_string(),
+                    choices: Vec::new(),
+                })?;
+            self.second_answer_tx
+                .send(second)
+                .expect("report second typed answer");
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for ImmediateSecondUserInputExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let handler = generation
+                .user_input_handler()
+                .expect("runtime installs typed user-input broker");
+            let first = handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
+                id: "cancel-private-input-1".to_string(),
+                question: "First answer before cancellation?".to_string(),
+                choices: Vec::new(),
+            })?;
+            self.first_answer_tx
+                .send(first)
+                .expect("report first typed answer");
+            let second = handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
+                id: "cancel-private-input-2".to_string(),
+                question: "Second answer after cancellation starts?".to_string(),
+                choices: Vec::new(),
+            });
+            self.second_result_tx
+                .send(second)
+                .expect("report second typed interaction result");
+            thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+            Ok(RunStatus::Cancelled.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for SlowSubscriberUserInputExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            self.entered.send(()).expect("report executor entry");
+            self.release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .expect("release user-input request");
+            let answer = generation
+                .user_input_handler()
+                .expect("runtime installs typed user-input broker")
+                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
+                    id: "slow-subscriber-input".to_string(),
+                    question: "Reroute slow responder?".to_string(),
+                    choices: Vec::new(),
+                })?;
+            self.answer_tx.send(answer).expect("report typed answer");
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
         }
@@ -6513,6 +9463,240 @@ mod tests {
             surface::AttachResult::FreshAttached { attachment } => attachment,
             _ => panic!("fresh TUI attachment failed"),
         }
+    }
+
+    fn fresh_surface_interaction_attachment(
+        handle: &surface::RuntimeSurfaceHandle,
+    ) -> surface::FreshSurfaceAttachment {
+        match handle.attach_fresh(surface::FreshAttachRequest {
+            request_id: surface_request_id(),
+            role: surface::SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::RespondGrantedInteraction,
+            ]),
+            interaction_capabilities: BTreeSet::from([surface::SurfaceInteractionKind::UserInput]),
+        }) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("fresh interaction attachment failed"),
+        }
+    }
+
+    fn collect_requested_surface_interaction(
+        receiver: &mut surface::SurfaceSubscriptionReceiver,
+    ) -> surface::SurfaceInteractionView {
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            while let Some(item) = receiver.try_recv() {
+                if let surface::SurfaceSubscriptionItem::Batch { batch } = item {
+                    for event in batch.events.as_slice() {
+                        if let surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Requested { interaction },
+                        ) = &event.event
+                        {
+                            return interaction.clone();
+                        }
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "typed interaction request was not published"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn collect_surface_interaction_route(
+        receiver: &mut surface::SurfaceSubscriptionReceiver,
+        interaction_id: &surface::SurfaceInteractionId,
+    ) -> surface::SurfaceInteractionRoute {
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            while let Some(item) = receiver.try_recv() {
+                if let surface::SurfaceSubscriptionItem::Batch { batch } = item {
+                    for event in batch.events.as_slice() {
+                        if let surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::RouteChanged {
+                                interaction_id: candidate,
+                                route,
+                                ..
+                            },
+                        ) = &event.event
+                            && candidate == interaction_id
+                        {
+                            return route.clone();
+                        }
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "typed interaction route change was not published"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn corrupt_exact_selector(
+        mut selector: surface::InteractionSelector,
+        corruption: ExactSelectorCorruption,
+    ) -> surface::InteractionSelector {
+        let surface::InteractionSelector::Exact {
+            expected_revision,
+            response_token,
+            response_route_epoch,
+            response_grant_token,
+            operation_fence,
+            ..
+        } = &mut selector
+        else {
+            panic!("actor probe returned an opaque selector")
+        };
+        match corruption {
+            ExactSelectorCorruption::Revision => {
+                *expected_revision =
+                    surface::InteractionRevision::try_new(expected_revision.get() + 1)
+                        .expect("test interaction revision did not exhaust");
+            }
+            ExactSelectorCorruption::ResponseToken => {
+                let mut bytes = *response_token.key_bytes();
+                bytes[0] ^= 0xff;
+                *response_token = surface::SurfaceResponseToken::new(bytes);
+            }
+            ExactSelectorCorruption::RouteEpoch => {
+                *response_route_epoch =
+                    surface::ResponseRouteEpoch::try_new(response_route_epoch.get() + 1)
+                        .expect("test route epoch did not exhaust");
+            }
+            ExactSelectorCorruption::OperationFence => {
+                operation_fence.generation_id =
+                    surface::SurfaceGenerationId::new(operation_fence.generation_id.get() + 1);
+            }
+            ExactSelectorCorruption::GrantToken => {
+                let mut bytes = *response_grant_token.key_bytes();
+                bytes[0] ^= 0xff;
+                *response_grant_token = surface::SurfaceResponseGrantToken::new(bytes);
+            }
+        }
+        selector
+    }
+
+    fn assert_exact_selector_rejection_is_non_consuming(
+        corruption: ExactSelectorCorruption,
+        expected_stale: bool,
+        expected_code: surface::SurfaceMutationErrorCode,
+    ) {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "validate exact interaction selector",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let _subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "request exact interaction",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let exact_selector = loop {
+            let probe = thread
+                .surface_actor_probe_for_test(operation_id.clone())
+                .expect("probe resident interaction");
+            if let Some(selector) = probe.exact_interaction_selector {
+                break selector;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "typed interaction did not become resident"
+            );
+            std::thread::yield_now();
+        };
+        let response = surface::BoundInteractionResponse::new(
+            surface::SurfaceResponseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: surface::SurfaceUserInputDecision::Answer(surface::DisplayText::new(
+                    "accepted",
+                )),
+            },
+            surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            surface::ApplicableAuthorityFingerprint::not_applicable(),
+        );
+        let rejected = thread
+            .respond_surface_interaction_for_test(
+                attachment.client.clone(),
+                surface_request_id(),
+                corrupt_exact_selector(exact_selector.clone(), corruption),
+                response.clone(),
+            )
+            .expect("actor returns typed selector rejection");
+        let (actual_stale, actual_code) = match rejected {
+            surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid { error, .. },
+            } => (false, error.error().code),
+            surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Stale { error, .. },
+            } => (true, error.error().code),
+            _ => panic!("invalid exact selector consumed or deferred the interaction"),
+        };
+        assert_eq!(actual_stale, expected_stale);
+        assert_eq!(actual_code, expected_code);
+        assert!(
+            answer_rx.try_recv().is_err(),
+            "invalid exact selector woke the native waiter"
+        );
+
+        let _ = committed_surface_value(
+            thread
+                .respond_surface_interaction_for_test(
+                    attachment.client.clone(),
+                    surface_request_id(),
+                    exact_selector,
+                    response,
+                )
+                .expect("valid exact selector remains usable"),
+        );
+        assert_eq!(
+            answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("accepted".to_string())
+        );
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait exact-selector operation terminal");
+        host.shutdown().expect("shutdown runtime host");
     }
 
     #[test]
@@ -6868,9 +10052,9 @@ mod tests {
         terminal_failure_child_check(
             matches!(
                 shutdown_rx.recv_timeout(Duration::from_millis(500)),
-                Err(mpsc::RecvTimeoutError::Timeout)
+                Ok(Err(_))
             ),
-            "host shutdown crossed reservation terminal failure barrier",
+            "host shutdown did not report the reservation terminal failure barrier",
         );
         std::process::exit(0)
     }
@@ -7345,9 +10529,9 @@ mod tests {
         terminal_failure_child_check(
             matches!(
                 shutdown_rx.recv_timeout(Duration::from_millis(500)),
-                Err(mpsc::RecvTimeoutError::Timeout)
+                Ok(Err(_))
             ),
-            "host shutdown completed through terminal commit barrier",
+            "host shutdown did not report the terminal commit barrier",
         );
         std::process::exit(0)
     }
@@ -7408,6 +10592,2660 @@ mod tests {
         ));
         host.shutdown().expect("shutdown recovered host");
         std::process::exit(0)
+    }
+
+    #[test]
+    fn exact_selector_stale_revision_is_non_consuming() {
+        assert_exact_selector_rejection_is_non_consuming(
+            ExactSelectorCorruption::Revision,
+            true,
+            surface::SurfaceMutationErrorCode::StaleRevision,
+        );
+    }
+
+    #[test]
+    fn exact_selector_wrong_response_token_is_non_consuming() {
+        assert_exact_selector_rejection_is_non_consuming(
+            ExactSelectorCorruption::ResponseToken,
+            false,
+            surface::SurfaceMutationErrorCode::WrongResponseToken,
+        );
+    }
+
+    #[test]
+    fn exact_selector_stale_route_epoch_is_non_consuming() {
+        assert_exact_selector_rejection_is_non_consuming(
+            ExactSelectorCorruption::RouteEpoch,
+            true,
+            surface::SurfaceMutationErrorCode::StaleResponseRoute,
+        );
+    }
+
+    #[test]
+    fn exact_selector_wrong_operation_fence_is_non_consuming() {
+        assert_exact_selector_rejection_is_non_consuming(
+            ExactSelectorCorruption::OperationFence,
+            true,
+            surface::SurfaceMutationErrorCode::StaleFence,
+        );
+    }
+
+    #[test]
+    fn exact_selector_wrong_grant_token_is_non_consuming() {
+        assert_exact_selector_rejection_is_non_consuming(
+            ExactSelectorCorruption::GrantToken,
+            false,
+            surface::SurfaceMutationErrorCode::WrongAttachment,
+        );
+    }
+
+    #[test]
+    fn terminal_interactions_scrub_private_resident_state_before_waiter_wake() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (first_answer_tx, first_answer_rx) = mpsc::sync_channel(1);
+        let (second_answer_tx, second_answer_rx) = mpsc::sync_channel(1);
+        let (continue_tx, continue_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(SequentialUserInputExecutor {
+            first_answer_tx,
+            second_answer_tx,
+            continue_second: Mutex::new(continue_rx),
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "scrub terminal interaction secrets",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "request sequential private interactions",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+
+        let first = collect_requested_surface_interaction(&mut subscription);
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    first.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::UserInput {
+                        decision: surface::SurfaceUserInputDecision::Answer(
+                            surface::DisplayText::new("first secret"),
+                        ),
+                    },
+                )
+                .expect("resolve first typed interaction"),
+        );
+        assert_eq!(
+            first_answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("first secret".to_string())
+        );
+        let after_first = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe after first interaction")
+            .secret_bearing_interaction_count;
+
+        continue_tx.send(()).expect("release second interaction");
+        let second = collect_requested_surface_interaction(&mut subscription);
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    second.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::UserInput {
+                        decision: surface::SurfaceUserInputDecision::Answer(
+                            surface::DisplayText::new("second secret"),
+                        ),
+                    },
+                )
+                .expect("resolve second typed interaction"),
+        );
+        assert_eq!(
+            second_answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("second secret".to_string())
+        );
+        let after_second = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe after second interaction")
+            .secret_bearing_interaction_count;
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait terminal operation");
+        host.shutdown().expect("shutdown runtime host");
+        assert_eq!(
+            after_first, 0,
+            "first terminal answer remained resident after waiter wake"
+        );
+        assert_eq!(
+            after_second, 0,
+            "sequential terminal answers accumulated resident secrets"
+        );
+    }
+
+    #[test]
+    fn failed_private_winner_append_retries_before_capability_reroute() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry retained private winner before reroute",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.private-winner-backup");
+        let surface = thread.surface();
+        let origin = fresh_surface_interaction_attachment(&surface);
+        let fallback = fresh_surface_interaction_attachment(&surface);
+        let mut origin_subscription = surface
+            .claim_subscription(&origin.subscription)
+            .expect("claim origin subscription");
+        let mut fallback_subscription = surface
+            .claim_subscription(&fallback.subscription)
+            .expect("claim fallback subscription");
+        let reserved = committed_surface_value(
+            origin
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &origin.baseline.snapshot,
+                        "retain first private winner",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            origin
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut origin_subscription);
+
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace ledger with directory");
+        let failed = origin.client.respond_interaction_by_id(
+            surface_request_id(),
+            interaction.interaction_id.clone(),
+            surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: surface::SurfaceUserInputDecision::Answer(surface::DisplayText::new(
+                    "winner",
+                )),
+            },
+        );
+        assert!(matches!(
+            failed,
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+        assert!(answer_rx.try_recv().is_err());
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+
+        drop(origin_subscription);
+        let fallback_response = fallback.client.respond_interaction_by_id(
+            surface_request_id(),
+            interaction.interaction_id.clone(),
+            surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: surface::SurfaceUserInputDecision::Answer(surface::DisplayText::new(
+                    "fallback",
+                )),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut answer = None;
+        let mut resolved_count = 0;
+        let mut route_count = 0;
+        let mut cancelled_count = 0;
+        while Instant::now() < deadline && answer.is_none() {
+            while let Some(item) = fallback_subscription.try_recv() {
+                let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                    continue;
+                };
+                for event in batch.events.as_slice() {
+                    match &event.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Resolved { interaction_id, .. },
+                        ) if interaction_id == &interaction.interaction_id => resolved_count += 1,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::RouteChanged { interaction_id, .. },
+                        ) if interaction_id == &interaction.interaction_id => route_count += 1,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Cancelled { interaction_id, .. },
+                        ) if interaction_id == &interaction.interaction_id => cancelled_count += 1,
+                        _ => {}
+                    }
+                }
+            }
+            answer = answer_rx.try_recv().ok();
+            std::thread::yield_now();
+        }
+        let secret_count_before_cleanup = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe retained private winner")
+            .secret_bearing_interaction_count;
+        if answer.is_none() {
+            let _ = fallback
+                .client
+                .cancel_operation(surface_request_id(), operation_id.clone());
+        }
+        let terminal = fallback
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait terminal operation");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(answer, Some(Some("winner".to_string())));
+        assert!(matches!(
+            fallback_response,
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        ));
+        assert_eq!(resolved_count, 1);
+        assert_eq!(route_count, 0);
+        assert_eq!(cancelled_count, 0);
+        assert_eq!(secret_count_before_cleanup, 0);
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_running_drains_failed_private_winner_before_cancel_intent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(2);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "drain retained private winner before cancellation",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.private-winner-cancel-backup");
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "retain winner before cancellation",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace ledger with directory");
+        let failed = attachment.client.respond_interaction_by_id(
+            surface_request_id(),
+            interaction.interaction_id.clone(),
+            surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: surface::SurfaceUserInputDecision::Answer(surface::DisplayText::new(
+                    "winner",
+                )),
+            },
+        );
+        assert!(matches!(
+            failed,
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+        assert!(answer_rx.try_recv().is_err());
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+
+        let cancel = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone())
+            .expect("cancel running operation after retained winner");
+        assert!(matches!(
+            cancel,
+            surface::MutationReply::Committed {
+                value: surface::CancelOperationOutput::Accepted { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("winner".to_string())
+        );
+        assert!(answer_rx.try_recv().is_err(), "winner waiter woke twice");
+
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut resolved_count = 0;
+        let mut cancelled_count = 0;
+        while Instant::now() < deadline && resolved_count == 0 {
+            while let Some(item) = subscription.try_recv() {
+                let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                    continue;
+                };
+                for event in batch.events.as_slice() {
+                    match &event.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Resolved { interaction_id, .. },
+                        ) if interaction_id == &interaction.interaction_id => resolved_count += 1,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Cancelled { interaction_id, .. },
+                        ) if interaction_id == &interaction.interaction_id => cancelled_count += 1,
+                        _ => {}
+                    }
+                }
+            }
+            std::thread::yield_now();
+        }
+        let secret_count = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe cancelled operation")
+            .secret_bearing_interaction_count;
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait cancelled operation terminal");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(resolved_count, 1);
+        assert_eq!(cancelled_count, 0);
+        assert_eq!(secret_count, 0);
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_running_commits_control_intent_and_interaction_cancel_atomically() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "atomically cancel pending interaction",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.atomic-cancel-backup");
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "atomically cancel this interaction",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace ledger with directory");
+        let failed_cancel = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        assert!(matches!(
+            failed_cancel,
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+        assert!(answer_rx.try_recv().is_err());
+        assert_eq!(
+            thread
+                .surface_actor_probe_for_test(operation_id.clone())
+                .expect("probe retained interaction")
+                .secret_bearing_interaction_count,
+            1
+        );
+        assert!(subscription.try_recv().is_none());
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+
+        let cancel = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone())
+            .expect("retry running cancellation");
+        assert!(matches!(
+            cancel,
+            surface::MutationReply::Committed {
+                value: surface::CancelOperationOutput::Accepted { .. },
+                ..
+            }
+        ));
+        assert_eq!(answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), None);
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut control_count = 0;
+        let mut cancelled_count = 0;
+        let mut atomic_batch = false;
+        while Instant::now() < deadline && (control_count == 0 || cancelled_count == 0) {
+            while let Some(item) = subscription.try_recv() {
+                let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                    continue;
+                };
+                let has_control = batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::ControlIntentCommitted {
+                                operation_id: candidate,
+                                intent: surface::PendingControlIntent::Terminalize { .. },
+                                ..
+                            }
+                        ) if candidate == &operation_id
+                    )
+                });
+                let has_cancelled = batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Cancelled { interaction_id, .. }
+                        ) if interaction_id == &interaction.interaction_id
+                    )
+                });
+                control_count += usize::from(has_control);
+                cancelled_count += usize::from(has_cancelled);
+                atomic_batch |= has_control && has_cancelled;
+            }
+            std::thread::yield_now();
+        }
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait cancelled operation terminal");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(control_count, 1);
+        assert_eq!(cancelled_count, 1);
+        assert!(
+            atomic_batch,
+            "cancel intent and interaction settlement split"
+        );
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_checkpoint_failure_retries_exact_prepared_terminalization() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry exact prepared cancellation",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "cancel through prepared checkpoint failure",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(transcript_path);
+        assert!(matches!(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), operation_id.clone()),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+        assert!(answer_rx.try_recv().is_err());
+        let retained = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe retained terminalization");
+        assert!(retained.interaction_admission_closed);
+        assert_eq!(retained.secret_bearing_interaction_count, 1);
+        let retained = retained
+            .pending_terminalization
+            .expect("checkpoint failure discarded prepared terminalization");
+
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let mut control_count = 0;
+        let mut cancelled_count = 0;
+        let mut exact_batch = false;
+        while Instant::now() < deadline && (control_count == 0 || cancelled_count == 0) {
+            while let Some(item) = subscription.try_recv() {
+                let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                    continue;
+                };
+                let has_control = batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::ControlIntentCommitted {
+                                operation_id: candidate,
+                                intent: surface::PendingControlIntent::Terminalize {
+                                    cause: surface::TerminalizationCause::UserCancel,
+                                    ..
+                                },
+                                ..
+                            }
+                        ) if candidate == &operation_id
+                    )
+                });
+                let has_cancelled = batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Cancelled { interaction_id, .. }
+                        ) if interaction_id == &interaction.interaction_id
+                    )
+                });
+                if has_control || has_cancelled {
+                    let surface::CommitClass::Recorded { commit_id, .. } = &batch.commit_class
+                    else {
+                        unreachable!("recorded runtime surface used ephemeral commit class")
+                    };
+                    exact_batch |= has_control
+                        && has_cancelled
+                        && commit_id == &retained.commit_id
+                        && batch.cursor_after == retained.cursor_after
+                        && batch.batch_digest == retained.batch_digest;
+                }
+                control_count += usize::from(has_control);
+                cancelled_count += usize::from(has_cancelled);
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), None);
+        assert!(
+            answer_rx.try_recv().is_err(),
+            "terminalization waiter woke twice"
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait cancelled operation terminal");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(control_count, 1);
+        assert_eq!(cancelled_count, 1);
+        assert!(exact_batch, "retry replaced the retained prepared batch");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+    }
+
+    type PreparedTerminalizationRestartFixture = (
+        String,
+        surface::SurfaceOperationId,
+        surface::SurfaceInteractionId,
+        surface::SurfaceCommitId,
+        surface::SurfaceCursor,
+        surface::SurfaceCursor,
+        surface::Sha256Digest,
+    );
+
+    fn prepared_terminalization_restart_fixture_path() -> PathBuf {
+        PathBuf::from(
+            std::env::var_os("ORCA_HOME").expect("prepared terminalization restart ORCA_HOME"),
+        )
+        .join("runtime-host-prepared-terminalization-restart.json")
+    }
+
+    #[test]
+    fn prepared_combined_terminalization_recovers_with_exact_authority_after_restart() {
+        if let Some(phase) = std::env::var_os(PREPARED_TERMINALIZATION_RESTART_CHILD_ENV) {
+            match phase.to_string_lossy().as_ref() {
+                "failure" => run_prepared_terminalization_restart_failure_child(),
+                "recovery" => run_prepared_terminalization_restart_recovery_child(),
+                phase => panic!("unknown prepared terminalization restart phase: {phase}"),
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        for phase in ["failure", "recovery"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    "runtime_host::tests::prepared_combined_terminalization_recovers_with_exact_authority_after_restart",
+                )
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(PREPARED_TERMINALIZATION_RESTART_CHILD_ENV, phase)
+                .env("ORCA_HOME", home.path())
+                .status()
+                .expect("start prepared terminalization restart child");
+            assert!(
+                status.success(),
+                "prepared terminalization restart child failed during {phase}"
+            );
+        }
+    }
+
+    fn run_prepared_terminalization_restart_failure_child() -> ! {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, _answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "leave prepared terminalization for restart",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "restart prepared cancellation",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(transcript_path);
+        if !matches!(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), operation_id.clone()),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ) {
+            std::process::exit(101);
+        }
+        let pending = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe prepared terminalization")
+            .pending_terminalization
+            .expect("checkpoint failure retained prepared terminalization");
+        std::fs::write(
+            prepared_terminalization_restart_fixture_path(),
+            serde_json::to_vec(&(
+                thread.thread_id().to_string(),
+                operation_id,
+                interaction.interaction_id,
+                pending.commit_id,
+                pending.cursor_before,
+                pending.cursor_after,
+                pending.batch_digest,
+            ))
+            .unwrap(),
+        )
+        .expect("write prepared terminalization restart fixture");
+        std::process::exit(0)
+    }
+
+    fn run_prepared_terminalization_restart_recovery_child() -> ! {
+        let (
+            thread_id,
+            operation_id,
+            interaction_id,
+            commit_id,
+            cursor_before,
+            cursor_after,
+            batch_digest,
+        ): PreparedTerminalizationRestartFixture = serde_json::from_slice(
+            &std::fs::read(prepared_terminalization_restart_fixture_path())
+                .expect("read prepared terminalization restart fixture"),
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("start recovery runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(thread_id.clone()),
+                ),
+                "recover prepared terminalization",
+            )
+            .expect("resume prepared terminalization");
+        let attachment = fresh_surface_attachment(&thread.surface());
+        let operation = attachment
+            .baseline
+            .snapshot
+            .foreground_operation
+            .iter()
+            .chain(attachment.baseline.snapshot.queued_operations.iter())
+            .chain(attachment.baseline.snapshot.operation_history.iter())
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("recovered operation remains visible");
+        let interaction = attachment
+            .baseline
+            .snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == interaction_id)
+            .expect("recovered interaction remains visible");
+        assert!(matches!(operation.phase, surface::OperationPhase::Terminal));
+        assert!(matches!(
+            interaction.lifecycle,
+            surface::SurfaceInteractionLifecycle::Cancelled {
+                reason: surface::InteractionCancelReason::OperationCancelled {
+                    reason: surface::CancelReason::User,
+                },
+            }
+        ));
+
+        let transcript_path = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load recovered runtime thread")
+            .path;
+        let ledger = surface::JsonlSurfaceCommitLedger::new(transcript_path, cursor_before.clone());
+        let recovered = ledger
+            .recover_batches()
+            .expect("read recovered surface batches");
+        assert!(recovered.prepared.is_none());
+        let exact = recovered
+            .committed
+            .iter()
+            .filter(|batch| {
+                matches!(
+                    &batch.commit_class,
+                    surface::CommitClass::Recorded { commit_id: candidate, .. }
+                        if candidate == &commit_id
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].cursor_before, cursor_before);
+        assert_eq!(exact[0].cursor_after, cursor_after);
+        assert_eq!(exact[0].batch_digest, batch_digest);
+        let terminalization_count = recovered
+            .committed
+            .iter()
+            .flat_map(|batch| batch.events.as_slice())
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::ControlIntentCommitted {
+                            operation_id: candidate,
+                            intent: surface::PendingControlIntent::Terminalize { .. },
+                            ..
+                        }
+                    ) if candidate == &operation_id
+                )
+            })
+            .count();
+        assert_eq!(terminalization_count, 1);
+        host.shutdown().expect("shutdown recovered runtime host");
+        std::process::exit(0)
+    }
+
+    #[test]
+    fn unavailable_responder_is_one_atomic_batch_and_append_failure_is_invisible() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "atomically settle unavailable responder",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim observer subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "request unavailable input atomically",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait failed operation terminal");
+        assert_eq!(answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), None);
+        let mut interaction_id = None;
+        let mut requested_count = 0;
+        let mut cancelled_count = 0;
+        let mut atomic_batch = false;
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            let requested = batch
+                .events
+                .as_slice()
+                .iter()
+                .find_map(|event| match &event.event {
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                        interaction,
+                    }) => Some(interaction.interaction_id.clone()),
+                    _ => None,
+                });
+            let cancelled = batch
+                .events
+                .as_slice()
+                .iter()
+                .find_map(|event| match &event.event {
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                        interaction_id,
+                        reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                        ..
+                    }) => Some(interaction_id.clone()),
+                    _ => None,
+                });
+            requested_count += usize::from(requested.is_some());
+            cancelled_count += usize::from(cancelled.is_some());
+            if requested.is_some() {
+                interaction_id = requested.clone();
+            }
+            atomic_batch |= requested.is_some() && requested == cancelled;
+        }
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(requested_count, 1);
+        assert_eq!(cancelled_count, 1);
+        assert!(
+            atomic_batch,
+            "unavailable responder settlement split batches"
+        );
+        assert!(snapshot.interactions.iter().any(|interaction| {
+            Some(&interaction.interaction_id) == interaction_id.as_ref()
+                && matches!(
+                    interaction.lifecycle,
+                    surface::SurfaceInteractionLifecycle::Cancelled {
+                        reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                    }
+                )
+        }));
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(
+                    value.terminal,
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::ClientCapabilityUnavailable,
+                        ..
+                    }
+                )
+        ));
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start failure runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "hide failed unavailable responder batch",
+            )
+            .expect("start failure runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim failure observer subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "fail unavailable interaction append",
+                    ),
+                )
+                .expect("reserve failure operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        surface::JsonlSurfaceCommitLedger::inject_interaction_request_append_failure_once(
+            transcript_path,
+        );
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit failure operation"),
+        );
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait append-failed operation terminal");
+        assert!(answer_rx.try_recv().is_err());
+        let interaction_event_count = std::iter::from_fn(|| subscription.try_recv())
+            .filter_map(|item| match item {
+                surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
+                surface::SurfaceSubscriptionItem::Gap { .. }
+                | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
+            })
+            .flat_map(|batch| batch.events.as_slice().to_vec())
+            .filter(|event| matches!(event.event, surface::SurfaceEvent::Interaction(_)))
+            .count();
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        host.shutdown().expect("shutdown failure runtime host");
+        assert_eq!(interaction_event_count, 0);
+        assert!(snapshot.interactions.is_empty());
+    }
+
+    #[test]
+    fn accepted_cancel_rejects_interaction_requested_after_private_winner_wakes() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (first_answer_tx, first_answer_rx) = mpsc::sync_channel(1);
+        let (second_result_tx, second_result_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ImmediateSecondUserInputExecutor {
+            first_answer_tx,
+            second_result_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "reject interaction after cancellation begins",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.cancel-admission-backup");
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "cancel after the first winner",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let first = collect_requested_surface_interaction(&mut subscription);
+
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace ledger with directory");
+        assert!(matches!(
+            attachment.client.respond_interaction_by_id(
+                surface_request_id(),
+                first.interaction_id.clone(),
+                surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: surface::SurfaceUserInputDecision::Answer(surface::DisplayText::new(
+                        "winner"
+                    ),),
+                },
+            ),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+
+        let cancel = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone())
+            .expect("cancel after retained winner");
+        assert!(matches!(
+            cancel,
+            surface::MutationReply::Committed {
+                value: surface::CancelOperationOutput::Accepted { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            first_answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("winner".to_string())
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut second_requested = None;
+        let mut first_resolved_count = 0;
+        let mut second_result = None;
+        while Instant::now() < deadline && second_result.is_none() {
+            while let Some(item) = subscription.try_recv() {
+                let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                    continue;
+                };
+                for event in batch.events.as_slice() {
+                    match &event.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Resolved { interaction_id, .. },
+                        ) if interaction_id == &first.interaction_id => first_resolved_count += 1,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Requested { interaction },
+                        ) if interaction.interaction_id != first.interaction_id => {
+                            second_requested = Some(interaction.interaction_id.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            second_result = second_result_rx.try_recv().ok();
+            if second_result.is_none() {
+                std::thread::yield_now();
+            }
+        }
+        if let Some(interaction_id) = second_requested.as_ref() {
+            let _ = attachment.client.respond_interaction_by_id(
+                surface_request_id(),
+                interaction_id.clone(),
+                surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: surface::SurfaceUserInputDecision::Cancel,
+                },
+            );
+            second_result =
+                second_result.or_else(|| second_result_rx.recv_timeout(SURFACE_TEST_TIMEOUT).ok());
+        }
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait cancelled operation terminal");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(first_resolved_count, 1);
+        assert!(
+            second_requested.is_none(),
+            "second interaction was admitted"
+        );
+        assert!(matches!(second_result, Some(Err(_))));
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn thread_close_append_failure_restores_gate_and_retries_without_joining_waiter() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry thread close after atomic append failure",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.thread-close-atomic-backup");
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "close with a pending interaction",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+        let completion = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe active operation")
+            .legacy_completion
+            .expect("typed operation retains legacy completion");
+
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace ledger with directory");
+        let started = Instant::now();
+        assert!(thread.shutdown().is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "failed close waited for the blocked generation"
+        );
+        assert!(answer_rx.try_recv().is_err());
+        assert!(completion.try_terminal().is_none());
+        assert_eq!(
+            thread
+                .surface_actor_probe_for_test(operation_id.clone())
+                .expect("probe restored active operation")
+                .secret_bearing_interaction_count,
+            1
+        );
+        assert!(subscription.try_recv().is_none());
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+
+        thread.shutdown().expect("retry thread close");
+        assert_eq!(answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), None);
+        assert!(completion.wait_timeout(SURFACE_TEST_TIMEOUT).is_some());
+        let mut atomic_batch = false;
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            let has_close = batch.events.as_slice().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::ControlIntentCommitted {
+                            intent: surface::PendingControlIntent::Terminalize {
+                                cause: surface::TerminalizationCause::ThreadClose,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                )
+            });
+            let has_cancelled = batch.events.as_slice().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Interaction(
+                        surface::InteractionPatch::Cancelled { interaction_id, .. }
+                    ) if interaction_id == &interaction.interaction_id
+                )
+            });
+            atomic_batch |= has_close && has_cancelled;
+        }
+        host.shutdown().expect("shutdown runtime host");
+        assert!(atomic_batch);
+    }
+
+    #[test]
+    fn host_shutdown_acknowledges_after_prepared_terminalization_retry() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "ack host shutdown after prepared retry",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim interaction subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "shutdown with a pending interaction",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut subscription);
+        let completion = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe active operation")
+            .legacy_completion
+            .expect("typed operation retains legacy completion");
+
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(transcript_path);
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let shutdown = shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host shutdown hung after one prepared checkpoint failure");
+        assert!(shutdown.is_ok(), "host shutdown returned {shutdown:?}");
+        assert_eq!(answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), None);
+        assert!(answer_rx.try_recv().is_err(), "shutdown waiter woke twice");
+        assert!(completion.wait_timeout(SURFACE_TEST_TIMEOUT).is_some());
+
+        let mut control_count = 0;
+        let mut cancelled_count = 0;
+        let mut atomic_batch = false;
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            let has_control = batch.events.as_slice().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::ControlIntentCommitted {
+                            operation_id: candidate,
+                            intent: surface::PendingControlIntent::Terminalize {
+                                cause: surface::TerminalizationCause::HostShutdown,
+                                ..
+                            },
+                            ..
+                        }
+                    ) if candidate == &operation_id
+                )
+            });
+            let has_cancelled = batch.events.as_slice().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Interaction(
+                        surface::InteractionPatch::Cancelled {
+                            interaction_id,
+                            reason: surface::InteractionCancelReason::HostShutdown,
+                            ..
+                        }
+                    ) if interaction_id == &interaction.interaction_id
+                )
+            });
+            control_count += usize::from(has_control);
+            cancelled_count += usize::from(has_cancelled);
+            atomic_batch |= has_control && has_cancelled;
+        }
+        assert_eq!(control_count, 1);
+        assert_eq!(cancelled_count, 1);
+        assert!(atomic_batch);
+    }
+
+    #[test]
+    fn host_shutdown_retries_prepared_actor_without_blocking_later_actor_cleanup() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(2);
+        let host = RuntimeHost::start_with_executor(Arc::new(RoundRobinShutdownExecutor {
+            entered: entered_tx,
+            completed: completed_tx,
+        }))
+        .expect("start runtime host");
+        let mut threads = vec![
+            host.start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "first shutdown actor",
+            )
+            .expect("start first runtime thread"),
+            host.start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "second shutdown actor",
+            )
+            .expect("start second runtime thread"),
+        ];
+        threads.sort_by_key(|thread| thread.thread_id().to_string());
+        let retrying = threads.remove(0);
+        let later = threads.remove(0);
+
+        for (thread, prompt) in [(&retrying, "retrying-actor"), (&later, "later-actor")] {
+            let attachment = fresh_surface_attachment(&thread.surface());
+            let reserved = committed_surface_value(
+                attachment
+                    .client
+                    .reserve_operation(
+                        surface_request_id(),
+                        surface_user_turn_intent(&attachment.baseline.snapshot, prompt),
+                    )
+                    .expect("reserve typed operation"),
+            );
+            let _ = committed_surface_value(
+                attachment
+                    .client
+                    .admit_reserved(
+                        surface_request_id(),
+                        reserved.operation_id,
+                        reserved.lease.lease_id,
+                    )
+                    .expect("admit typed operation"),
+            );
+        }
+        let entered = [
+            entered_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("first executor did not start"),
+            entered_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("second executor did not start"),
+        ];
+        assert!(entered.contains(&"retrying-actor".to_string()));
+        assert!(entered.contains(&"later-actor".to_string()));
+
+        let transcript_path = SessionStore::new()
+            .load_session(retrying.thread_id())
+            .expect("load retrying runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.shutdown-fairness-backup");
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(
+            transcript_path.clone(),
+        );
+        let (initial_shutdown_tx, initial_shutdown_rx) = mpsc::sync_channel(1);
+        send_thread_shutdown(
+            &retrying.command_tx,
+            ThreadCommand::ShutdownThread {
+                reply: Some(initial_shutdown_tx),
+                reason: surface::SurfaceShutdownReason::HostShutdown,
+            },
+        )
+        .expect("request initial retrying shutdown");
+        assert!(matches!(
+            initial_shutdown_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("retrying actor did not acknowledge prepared failure"),
+            ThreadShutdownAck::Retry
+        ));
+        std::fs::rename(&transcript_path, &backup_path).expect("hide retrying ledger");
+        std::fs::create_dir(&transcript_path).expect("replace retrying ledger with directory");
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let later_completed_before_recovery = completed_rx.recv_timeout(Duration::from_millis(500));
+        let later_closed_deadline = Instant::now() + Duration::from_millis(500);
+        while later_completed_before_recovery.is_ok()
+            && !later.command_tx.is_closed()
+            && Instant::now() < later_closed_deadline
+        {
+            std::thread::yield_now();
+        }
+        let later_closed_before_recovery = later.command_tx.is_closed();
+
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore retrying ledger");
+        let shutdown = shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host shutdown did not finish after retry recovery");
+        assert!(shutdown.is_ok(), "host shutdown returned {shutdown:?}");
+        assert_eq!(
+            later_completed_before_recovery.expect("later actor was starved by retrying actor"),
+            "later-actor"
+        );
+        assert!(
+            later_closed_before_recovery,
+            "later actor was not joined before retrying actor recovered"
+        );
+    }
+
+    #[test]
+    fn host_shutdown_dispatches_to_later_actor_before_blocked_actor_ack() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let (shutdown_observed_tx, shutdown_observed_rx) = mpsc::sync_channel(2);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(2);
+        let (blocked_release_tx, blocked_release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(DispatchFairShutdownExecutor {
+            entered: entered_tx,
+            shutdown_observed: shutdown_observed_tx,
+            completed: completed_tx,
+            blocked_release: Mutex::new(blocked_release_rx),
+        }))
+        .expect("start runtime host");
+        let mut threads = vec![
+            host.start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "first shutdown actor",
+            )
+            .expect("start first runtime thread"),
+            host.start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "second shutdown actor",
+            )
+            .expect("start second runtime thread"),
+        ];
+        threads.sort_by_key(|thread| thread.thread_id().to_string());
+        let blocked = threads.remove(0);
+        let later = threads.remove(0);
+
+        for (thread, prompt) in [(&blocked, "blocked-actor"), (&later, "later-actor")] {
+            let attachment = fresh_surface_attachment(&thread.surface());
+            let reserved = committed_surface_value(
+                attachment
+                    .client
+                    .reserve_operation(
+                        surface_request_id(),
+                        surface_user_turn_intent(&attachment.baseline.snapshot, prompt),
+                    )
+                    .expect("reserve typed operation"),
+            );
+            let _ = committed_surface_value(
+                attachment
+                    .client
+                    .admit_reserved(
+                        surface_request_id(),
+                        reserved.operation_id,
+                        reserved.lease.lease_id,
+                    )
+                    .expect("admit typed operation"),
+            );
+        }
+        let entered = [
+            entered_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("first executor did not start"),
+            entered_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("second executor did not start"),
+        ];
+        assert!(entered.contains(&"blocked-actor".to_string()));
+        assert!(entered.contains(&"later-actor".to_string()));
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let first_shutdown_observed = shutdown_observed_rx.recv_timeout(SURFACE_TEST_TIMEOUT);
+        let second_shutdown_observed =
+            shutdown_observed_rx.recv_timeout(Duration::from_millis(500));
+        let later_completed = completed_rx.recv_timeout(Duration::from_millis(500));
+        let later_closed_deadline = Instant::now() + Duration::from_millis(500);
+        while !later.command_tx.is_closed() && Instant::now() < later_closed_deadline {
+            std::thread::yield_now();
+        }
+        let later_closed = later.command_tx.is_closed();
+        let host_waited_for_blocked_actor = shutdown_rx.try_recv().is_err();
+
+        blocked_release_tx
+            .send(())
+            .expect("release blocked shutdown actor");
+        let shutdown = shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host shutdown did not finish after releasing blocked actor");
+
+        let shutdown_observed = [
+            first_shutdown_observed.expect("no actor received shutdown"),
+            second_shutdown_observed
+                .expect("later actor was starved before blocked actor acknowledged"),
+        ];
+        assert!(shutdown_observed.contains(&"blocked-actor".to_string()));
+        assert!(shutdown_observed.contains(&"later-actor".to_string()));
+        assert_eq!(
+            later_completed
+                .expect("later actor did not complete before blocked actor acknowledged"),
+            "later-actor"
+        );
+        assert!(
+            later_closed,
+            "later actor command receiver stayed open before blocked actor acknowledged"
+        );
+        assert!(
+            host_waited_for_blocked_actor,
+            "host shutdown returned before blocked actor acknowledged"
+        );
+        assert!(shutdown.is_ok(), "host shutdown returned {shutdown:?}");
+    }
+
+    #[test]
+    fn host_shutdown_preprepare_failure_cancels_and_joins_generation_before_returning_error() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (cancel_observed_tx, cancel_observed_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(CancelAwareShutdownExecutor {
+            entered: entered_tx,
+            cancel_observed: cancel_observed_tx,
+            completed: completed_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "fail host shutdown before prepare",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.host-shutdown-backup");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim operation subscription");
+        let initial_cursor = attachment.baseline.cursor.clone();
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "cancel generation after failed host shutdown prepare",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("executor did not start");
+        let completion = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe active operation")
+            .legacy_completion
+            .expect("typed operation retains legacy completion");
+
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace ledger with directory");
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let shutdown = shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("host shutdown hung after pre-prepare failure");
+        assert!(shutdown.is_err());
+        cancel_observed_rx
+            .try_recv()
+            .expect("shutdown returned before the generation observed cancellation");
+        completed_rx
+            .try_recv()
+            .expect("shutdown returned before the blocking generation completed");
+        assert!(completion.try_terminal().is_none());
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            assert!(!batch.events.as_slice().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal { record })
+                        if record.operation_id == operation_id
+                )
+            }));
+        }
+        let recovered = surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+            .recover_batches()
+            .expect("recover surface batches after failed shutdown");
+        assert!(!recovered
+            .committed
+            .iter()
+            .flat_map(|batch| batch.events.as_slice())
+            .any(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal { record })
+                        if record.operation_id == operation_id
+                )
+            }));
+    }
+
+    #[test]
+    fn host_shutdown_preprepare_failure_rejects_buffered_interaction_before_join() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (interaction_result_tx, interaction_result_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(QueuedInteractionShutdownExecutor {
+            entered: entered_tx,
+            release_interaction: Mutex::new(release_rx),
+            interaction_result: interaction_result_tx,
+            completed: completed_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "reject buffered interaction during failed shutdown",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let backup_path = transcript_path.with_extension("jsonl.host-shutdown-buffer-backup");
+        let attachment = fresh_surface_attachment(&thread.surface());
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "queue interaction behind host shutdown",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("executor did not start");
+
+        let (barrier_tx, barrier_rx) = mpsc::sync_channel(0);
+        thread
+            .command_tx
+            .try_send(ThreadCommand::SurfaceActorTestProbe {
+                operation_id,
+                reply: barrier_tx,
+            })
+            .expect("enqueue actor barrier");
+        let barrier_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while thread.command_tx.capacity() != THREAD_COMMAND_CAPACITY {
+            assert!(
+                Instant::now() < barrier_deadline,
+                "actor did not enter barrier"
+            );
+            std::thread::yield_now();
+        }
+
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace ledger with directory");
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let shutdown_queued_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while thread.command_tx.capacity() != THREAD_COMMAND_CAPACITY - 1 {
+            assert!(
+                Instant::now() < shutdown_queued_deadline,
+                "host shutdown was not queued behind actor barrier"
+            );
+            std::thread::yield_now();
+        }
+        release_tx.send(()).expect("release second interaction");
+        let interaction_queued_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while thread.command_tx.capacity() != THREAD_COMMAND_CAPACITY - 2 {
+            assert!(
+                Instant::now() < interaction_queued_deadline,
+                "interaction was not queued behind host shutdown"
+            );
+            std::thread::yield_now();
+        }
+        let _ = barrier_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("release actor barrier");
+
+        let shutdown = shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("host shutdown hung on buffered interaction");
+        assert!(shutdown.is_err());
+        let interaction_error = interaction_result_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("buffered interaction did not receive rejection")
+            .expect_err("buffered interaction was accepted during shutdown");
+        assert_eq!(interaction_error.kind(), io::ErrorKind::NotConnected);
+        completed_rx
+            .try_recv()
+            .expect("shutdown returned before queued-interaction worker completed");
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+    }
+
+    #[test]
+    fn slow_exclusive_responder_rotates_route_before_fallback_can_wake_waiter() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor_and_surface_config(
+            Arc::new(SlowSubscriberUserInputExecutor {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                answer_tx,
+            }),
+            surface::SurfaceHubConfig {
+                subscriber_event_limit: 7,
+                ..surface::SurfaceHubConfig::default()
+            },
+        )
+        .expect("start runtime host with bounded subscriber lane");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "reroute slow interaction responder",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let origin = fresh_surface_interaction_attachment(&surface);
+        let mut origin_subscription = surface
+            .claim_subscription(&origin.subscription)
+            .expect("claim origin subscription");
+        let reserved = committed_surface_value(
+            origin
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &origin.baseline.snapshot,
+                        "overflow origin interaction lane",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            origin
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("executor did not reach request gate");
+
+        let fallback = fresh_surface_interaction_attachment(&surface);
+        let mut fallback_subscription = surface
+            .claim_subscription(&fallback.subscription)
+            .expect("claim fallback subscription");
+        release_tx.send(()).expect("release user-input request");
+        let interaction = collect_requested_surface_interaction(&mut fallback_subscription);
+        assert!(
+            matches!(
+                interaction.route,
+                surface::SurfaceInteractionRoute::Exclusive {
+                    ref attachment_id,
+                    ..
+                } if attachment_id == &origin.attachment_id
+            ),
+            "origin retired before request: queued durable events={}, initial route={:?}",
+            fallback
+                .baseline
+                .cursor
+                .next_seq
+                .get()
+                .saturating_sub(origin.baseline.cursor.next_seq.get()),
+            interaction.route
+        );
+        let route = collect_surface_interaction_route(
+            &mut fallback_subscription,
+            &interaction.interaction_id,
+        );
+        assert!(matches!(
+            route,
+            surface::SurfaceInteractionRoute::Exclusive {
+                ref attachment_id,
+                epoch,
+            } if attachment_id == &fallback.attachment_id
+                && epoch == surface::ResponseRouteEpoch::try_new(2).unwrap()
+        ));
+        assert!(answer_rx.try_recv().is_err());
+        let _ = committed_surface_value(
+            fallback
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction.interaction_id.clone(),
+                    surface::SurfaceClientInteractionAnswer::UserInput {
+                        decision: surface::SurfaceUserInputDecision::Answer(
+                            surface::DisplayText::new("fallback"),
+                        ),
+                    },
+                )
+                .expect("fallback response after slow-lane reroute"),
+        );
+        assert_eq!(
+            answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("fallback".to_string())
+        );
+        let saw_slow_gap = std::iter::from_fn(|| origin_subscription.try_recv()).any(|item| {
+            matches!(
+                item,
+                surface::SurfaceSubscriptionItem::Gap {
+                    required: surface::SnapshotRequired {
+                        reason: surface::SnapshotRequiredReason::SlowSubscriber,
+                        ..
+                    },
+                }
+            )
+        });
+        assert!(
+            saw_slow_gap,
+            "origin lane did not retire as a slow subscriber"
+        );
+        let _ = fallback
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait terminal operation");
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn capability_loss_append_failure_retries_under_sustained_command_traffic() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry capability-loss route commit",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let surface = thread.surface();
+        let origin = fresh_surface_interaction_attachment(&surface);
+        let fallback = fresh_surface_interaction_attachment(&surface);
+        let mut origin_subscription = surface
+            .claim_subscription(&origin.subscription)
+            .expect("claim origin subscription");
+        let mut fallback_subscription = surface
+            .claim_subscription(&fallback.subscription)
+            .expect("claim fallback subscription");
+        let reserved = committed_surface_value(
+            origin
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &origin.baseline.snapshot,
+                        "retry capability loss internally",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            origin
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut origin_subscription);
+        surface::JsonlSurfaceCommitLedger::inject_interaction_route_append_failure_once(
+            transcript_path,
+        );
+        drop(origin_subscription);
+
+        let pending = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe retained capability-loss transition")
+            .pending_capability_loss;
+        let traffic_deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < traffic_deadline {
+            let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
+            match thread
+                .command_tx
+                .try_send(ThreadCommand::SurfaceActorTestProbe {
+                    operation_id: operation_id.clone(),
+                    reply: reply_tx,
+                }) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => panic!("runtime command mailbox closed"),
+            }
+        }
+        let probe_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let after_traffic = loop {
+            match thread.surface_actor_probe_for_test(operation_id.clone()) {
+                Ok(probe) => break probe,
+                Err(RuntimeHostError::MailboxFull { .. }) if Instant::now() < probe_deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("probe after sustained command traffic failed: {error}"),
+            }
+        };
+        assert!(
+            after_traffic.pending_capability_loss.is_none(),
+            "expired capability-loss retry was starved by command traffic"
+        );
+        let automatic_deadline = Instant::now() + Duration::from_millis(750);
+        let mut automatic_route = None;
+        let mut automatic_commit = None;
+        while Instant::now() < automatic_deadline && automatic_route.is_none() {
+            while let Some(item) = fallback_subscription.try_recv() {
+                if let surface::SurfaceSubscriptionItem::Batch { batch } = item {
+                    for event in batch.events.as_slice() {
+                        if let surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::RouteChanged {
+                                interaction_id,
+                                route,
+                                ..
+                            },
+                        ) = &event.event
+                            && interaction_id == &interaction.interaction_id
+                        {
+                            automatic_route = Some(route.clone());
+                            automatic_commit = Some((
+                                batch.commit_class.clone(),
+                                batch.cursor_after.clone(),
+                                batch.batch_digest.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            std::thread::yield_now();
+        }
+        if automatic_route.is_none() {
+            let _ = surface.detach(
+                &origin.client,
+                surface::DetachRequest {
+                    request_id: surface_request_id(),
+                },
+            );
+            let _ = collect_surface_interaction_route(
+                &mut fallback_subscription,
+                &interaction.interaction_id,
+            );
+        }
+
+        for _ in 0..32 {
+            let churn = fresh_surface_interaction_attachment(&surface);
+            let churn_subscription = surface
+                .claim_subscription(&churn.subscription)
+                .expect("claim churn subscription");
+            drop(churn_subscription);
+        }
+        let _ = committed_surface_value(
+            fallback
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction.interaction_id.clone(),
+                    surface::SurfaceClientInteractionAnswer::UserInput {
+                        decision: surface::SurfaceUserInputDecision::Answer(
+                            surface::DisplayText::new("fallback"),
+                        ),
+                    },
+                )
+                .expect("respond after capability-loss retry"),
+        );
+        assert_eq!(
+            answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("fallback".to_string())
+        );
+        let duplicate_route_commits = std::iter::from_fn(|| fallback_subscription.try_recv())
+            .filter_map(|item| match item {
+                surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
+                surface::SurfaceSubscriptionItem::Gap { .. }
+                | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
+            })
+            .map(|batch| {
+                batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            &event.event,
+                            surface::SurfaceEvent::Interaction(
+                                surface::InteractionPatch::RouteChanged {
+                                    interaction_id,
+                                    ..
+                                }
+                            ) if interaction_id == &interaction.interaction_id
+                        )
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        let _ = fallback
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait terminal operation");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(
+            matches!(
+                automatic_route,
+                Some(surface::SurfaceInteractionRoute::Exclusive {
+                    ref attachment_id,
+                    epoch,
+                }) if attachment_id == &fallback.attachment_id
+                    && epoch == surface::ResponseRouteEpoch::try_new(2).unwrap()
+            ),
+            "capability-loss retry required an external command"
+        );
+        let pending = pending.expect("failed capability-loss transition was not retained");
+        assert_eq!(pending.attachment_id, origin.attachment_id);
+        let (commit_class, cursor_after, batch_digest) =
+            automatic_commit.expect("automatic route commit identity was not observed");
+        assert!(matches!(
+            commit_class,
+            surface::CommitClass::Recorded { commit_id, .. } if commit_id == pending.commit_id
+        ));
+        assert_eq!(cursor_after, pending.cursor_after);
+        assert_eq!(batch_digest, pending.batch_digest);
+        assert_eq!(
+            duplicate_route_commits, 0,
+            "duplicate loss hints committed another route transition"
+        );
+    }
+
+    #[test]
+    fn capability_change_wake_is_bounded_outside_full_command_mailbox() {
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(1);
+        let (capability_change_tx, mut capability_change_rx) = tokio_mpsc::channel(1);
+        let dispatcher = ThreadSurfaceDispatcher {
+            command_tx: command_tx.clone(),
+            capability_change_tx,
+        };
+        let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
+        command_tx
+            .blocking_send(ThreadCommand::SurfaceActorTestProbe {
+                operation_id: surface::SurfaceOperationId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                reply: reply_tx,
+            })
+            .expect("fill runtime command mailbox");
+
+        for _ in 0..1_024 {
+            surface::RuntimeSurfaceCommandDispatcher::notify_interaction_capability_changed(
+                &dispatcher,
+            );
+        }
+
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ThreadCommand::SurfaceActorTestProbe { .. })
+        ));
+        assert!(command_rx.try_recv().is_err());
+        assert_eq!(capability_change_rx.try_recv(), Ok(()));
+        assert!(capability_change_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn distinct_capability_loss_is_reconciled_after_retained_retry() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "reconcile queued capability losses",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let surface = thread.surface();
+        let origin = fresh_surface_interaction_attachment(&surface);
+        let fallback = fresh_surface_interaction_attachment(&surface);
+        let observer = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        );
+        let mut origin_subscription = surface
+            .claim_subscription(&origin.subscription)
+            .expect("claim origin subscription");
+        let fallback_subscription = surface
+            .claim_subscription(&fallback.subscription)
+            .expect("claim fallback subscription");
+        let mut observer_subscription = surface
+            .claim_subscription(&observer.subscription)
+            .expect("claim observer subscription");
+        let reserved = committed_surface_value(
+            origin
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &origin.baseline.snapshot,
+                        "reconcile both lost responders",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            origin
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut origin_subscription);
+        surface::JsonlSurfaceCommitLedger::inject_interaction_route_append_failure_once(
+            transcript_path,
+        );
+        drop(origin_subscription);
+
+        let pending = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe retained origin capability-loss transition")
+            .pending_capability_loss
+            .expect("failed origin capability-loss transition was not retained");
+        assert_eq!(pending.attachment_id, origin.attachment_id);
+        drop(fallback_subscription);
+
+        let automatic_deadline = Instant::now() + Duration::from_millis(750);
+        let mut automatic_answer = None;
+        let mut origin_retry_commit = None;
+        let mut route_change_count = 0;
+        let mut cancellation_count = 0;
+        while Instant::now() < automatic_deadline && automatic_answer.is_none() {
+            while let Some(item) = observer_subscription.try_recv() {
+                let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                    continue;
+                };
+                for event in batch.events.as_slice() {
+                    match &event.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::RouteChanged {
+                                interaction_id,
+                                route,
+                                ..
+                            },
+                        ) if interaction_id == &interaction.interaction_id => {
+                            route_change_count += 1;
+                            if matches!(
+                                route,
+                                surface::SurfaceInteractionRoute::Exclusive {
+                                    attachment_id,
+                                    epoch,
+                                } if attachment_id == &fallback.attachment_id
+                                    && *epoch == surface::ResponseRouteEpoch::try_new(2).unwrap()
+                            ) {
+                                origin_retry_commit = Some((
+                                    batch.commit_class.clone(),
+                                    batch.cursor_after.clone(),
+                                    batch.batch_digest.clone(),
+                                ));
+                            }
+                        }
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Cancelled {
+                                interaction_id,
+                                reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                                ..
+                            },
+                        ) if interaction_id == &interaction.interaction_id => {
+                            cancellation_count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            automatic_answer = answer_rx.try_recv().ok();
+            std::thread::yield_now();
+        }
+        let reconciled_without_external_hint = automatic_answer.is_some();
+        if automatic_answer.is_none() {
+            let _ = surface.detach(
+                &fallback.client,
+                surface::DetachRequest {
+                    request_id: surface_request_id(),
+                },
+            );
+            automatic_answer = Some(
+                answer_rx
+                    .recv_timeout(SURFACE_TEST_TIMEOUT)
+                    .expect("cleanup capability-loss hint did not wake waiter"),
+            );
+        }
+        while let Some(item) = observer_subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            for event in batch.events.as_slice() {
+                match &event.event {
+                    surface::SurfaceEvent::Interaction(
+                        surface::InteractionPatch::RouteChanged {
+                            interaction_id,
+                            route,
+                            ..
+                        },
+                    ) if interaction_id == &interaction.interaction_id => {
+                        route_change_count += 1;
+                        if matches!(
+                            route,
+                            surface::SurfaceInteractionRoute::Exclusive {
+                                attachment_id,
+                                epoch,
+                            } if attachment_id == &fallback.attachment_id
+                                && *epoch == surface::ResponseRouteEpoch::try_new(2).unwrap()
+                        ) {
+                            origin_retry_commit = Some((
+                                batch.commit_class.clone(),
+                                batch.cursor_after.clone(),
+                                batch.batch_digest.clone(),
+                            ));
+                        }
+                    }
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                        interaction_id,
+                        reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                        ..
+                    }) if interaction_id == &interaction.interaction_id => {
+                        cancellation_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for _ in 0..32 {
+            let churn = fresh_surface_interaction_attachment(&surface);
+            let churn_subscription = surface
+                .claim_subscription(&churn.subscription)
+                .expect("claim churn subscription");
+            drop(churn_subscription);
+        }
+        let _ = thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("barrier after duplicate capability-loss hints");
+        let duplicate_events = std::iter::from_fn(|| observer_subscription.try_recv())
+            .filter_map(|item| match item {
+                surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
+                surface::SurfaceSubscriptionItem::Gap { .. }
+                | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
+            })
+            .flat_map(|batch| batch.events.as_slice().to_vec())
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    surface::SurfaceEvent::Interaction(
+                        surface::InteractionPatch::RouteChanged { interaction_id, .. }
+                            | surface::InteractionPatch::Cancelled { interaction_id, .. }
+                    ) if interaction_id == &interaction.interaction_id
+                )
+            })
+            .count();
+        let _ = observer
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait terminal operation");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(
+            reconciled_without_external_hint,
+            "fallback capability loss was dropped while origin retry was retained"
+        );
+        assert_eq!(automatic_answer, Some(None));
+        let (commit_class, cursor_after, batch_digest) =
+            origin_retry_commit.expect("origin retry route-to-fallback batch was not observed");
+        assert!(matches!(
+            commit_class,
+            surface::CommitClass::Recorded { commit_id, .. } if commit_id == pending.commit_id
+        ));
+        assert_eq!(cursor_after, pending.cursor_after);
+        assert_eq!(batch_digest, pending.batch_digest);
+        assert_eq!(route_change_count, 2);
+        assert_eq!(cancellation_count, 1);
+        assert_eq!(duplicate_events, 0);
+    }
+
+    #[test]
+    fn detach_append_failure_finalizes_without_client_retry() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "detach append failure retries internally",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded runtime thread")
+            .path;
+        let surface = thread.surface();
+        let origin = fresh_surface_interaction_attachment(&surface);
+        let fallback = fresh_surface_interaction_attachment(&surface);
+        let mut origin_subscription = surface
+            .claim_subscription(&origin.subscription)
+            .expect("claim origin subscription");
+        let mut fallback_subscription = surface
+            .claim_subscription(&fallback.subscription)
+            .expect("claim fallback subscription");
+        let reserved = committed_surface_value(
+            origin
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &origin.baseline.snapshot,
+                        "detach after capability-loss append failure",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            origin
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let interaction = collect_requested_surface_interaction(&mut origin_subscription);
+        surface::JsonlSurfaceCommitLedger::inject_interaction_route_append_failure_once(
+            transcript_path,
+        );
+        let detach_request = surface::DetachRequest {
+            request_id: surface_request_id(),
+        };
+        let initial = surface.detach(&origin.client, detach_request.clone());
+        assert!(matches!(
+            initial,
+            surface::DetachResult::StaleAttachment { .. }
+        ));
+        let automatic_deadline = Instant::now() + Duration::from_millis(750);
+        let mut automatic_route = None;
+        while Instant::now() < automatic_deadline && automatic_route.is_none() {
+            while let Some(item) = fallback_subscription.try_recv() {
+                if let surface::SurfaceSubscriptionItem::Batch { batch } = item {
+                    for event in batch.events.as_slice() {
+                        if let surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::RouteChanged {
+                                interaction_id: candidate,
+                                route,
+                                ..
+                            },
+                        ) = &event.event
+                            && candidate == &interaction.interaction_id
+                        {
+                            automatic_route = Some(route.clone());
+                        }
+                    }
+                }
+            }
+            std::thread::yield_now();
+        }
+        let finalized_without_client_retry = automatic_route.is_some();
+        if automatic_route.is_none() {
+            let _ = surface.detach(&origin.client, detach_request.clone());
+            automatic_route = Some(collect_surface_interaction_route(
+                &mut fallback_subscription,
+                &interaction.interaction_id,
+            ));
+        }
+        let already_detached = surface.detach(
+            &origin.client,
+            surface::DetachRequest {
+                request_id: surface_request_id(),
+            },
+        );
+        let _ = committed_surface_value(
+            fallback
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::UserInput {
+                        decision: surface::SurfaceUserInputDecision::Answer(
+                            surface::DisplayText::new("fallback"),
+                        ),
+                    },
+                )
+                .expect("fallback response after reconciled detach"),
+        );
+        assert_eq!(
+            answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("fallback".to_string())
+        );
+        let _ = fallback
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait terminal operation");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(
+            finalized_without_client_retry,
+            "detach append failure required an explicit client retry"
+        );
+        assert!(matches!(
+            automatic_route,
+            Some(surface::SurfaceInteractionRoute::Exclusive {
+                attachment_id,
+                epoch,
+            }) if attachment_id == fallback.attachment_id
+                && epoch == surface::ResponseRouteEpoch::try_new(2).unwrap()
+        ));
+        assert!(matches!(
+            already_detached,
+            surface::DetachResult::AlreadyDetached { .. }
+        ));
     }
 
     #[test]

@@ -59,6 +59,7 @@ struct SurfaceHubState {
 
 struct SurfaceSubscriber {
     grant: SurfaceAttachmentGrant,
+    interaction_kinds: BTreeSet<SurfaceInteractionKind>,
     queue: VecDeque<QueuedSubscriptionItem>,
     queued_events: u64,
     queued_bytes: u64,
@@ -89,6 +90,7 @@ enum QueuedSubscriptionItem {
 pub struct SurfaceSubscriptionReceiver {
     hub: Weak<Mutex<SurfaceHubState>>,
     attachment_id: SurfaceAttachmentId,
+    dispatcher: Option<Arc<dyn RuntimeSurfaceCommandDispatcher>>,
 }
 
 impl SurfaceSubscriptionReceiver {
@@ -112,9 +114,19 @@ impl Drop for SurfaceSubscriptionReceiver {
         let Some(hub) = self.hub.upgrade() else {
             return;
         };
-        let mut state = lock(&hub);
-        state.subscriptions.remove(&self.attachment_id);
-        state.retired_subscriptions.remove(&self.attachment_id);
+        let lost = {
+            let mut state = lock(&hub);
+            state
+                .subscriptions
+                .remove(&self.attachment_id)
+                .or_else(|| state.retired_subscriptions.remove(&self.attachment_id))
+                .map(|_| self.attachment_id.clone())
+        };
+        if lost.is_some() {
+            if let Some(dispatcher) = self.dispatcher.as_ref() {
+                dispatcher.notify_interaction_capability_changed();
+            }
+        }
     }
 }
 
@@ -128,6 +140,7 @@ impl SurfaceHub {
             SurfaceCapability::ReadSnapshot,
             SurfaceCapability::SubmitOperation,
             SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::RespondGrantedInteraction,
             SurfaceCapability::RepairThread,
         ]))
         .expect("fixed TUI surface capabilities are non-empty");
@@ -140,7 +153,12 @@ impl SurfaceHub {
             SurfaceAttachmentRole::Tui,
             maximum_capabilities,
             required_capabilities,
-            BTreeSet::from([SurfaceInteractionKind::UserInput]),
+            BTreeSet::from([
+                SurfaceInteractionKind::ToolApproval,
+                SurfaceInteractionKind::PermissionRequest,
+                SurfaceInteractionKind::UserInput,
+                SurfaceInteractionKind::McpElicitation,
+            ]),
         );
         Self::from_authority(snapshot, authority, config)
     }
@@ -311,6 +329,7 @@ impl SurfaceHub {
         Some(SurfaceSubscriptionReceiver {
             hub: Arc::downgrade(&self.inner),
             attachment_id: attachment_id.clone(),
+            dispatcher: self.dispatcher.clone(),
         })
     }
 
@@ -320,23 +339,28 @@ impl SurfaceHub {
         batch: &SurfaceCommitBatch,
     ) {
         let batch = Arc::new(SharedSurfaceBatch::new(batch.clone()));
-        let mut state = lock(&self.inner);
-        if state.snapshot.cursor != batch.batch.cursor_before
-            || snapshot.cursor != batch.batch.cursor_after
-        {
-            signal_gap(
-                &mut state,
-                SnapshotRequiredReason::ReplayHole,
-                snapshot.cursor.clone(),
-            );
-            state.snapshot = snapshot;
-            clear_retained(&mut state);
-            state.replay_hole = true;
-            return;
-        }
-        retain_batch(&mut state, batch.clone(), self.config);
-        publish_batch(&mut state, batch, self.config);
-        state.snapshot = snapshot;
+        let lost = {
+            let mut state = lock(&self.inner);
+            if state.snapshot.cursor != batch.batch.cursor_before
+                || snapshot.cursor != batch.batch.cursor_after
+            {
+                let lost = signal_gap(
+                    &mut state,
+                    SnapshotRequiredReason::ReplayHole,
+                    snapshot.cursor.clone(),
+                );
+                state.snapshot = snapshot;
+                clear_retained(&mut state);
+                state.replay_hole = true;
+                lost
+            } else {
+                retain_batch(&mut state, batch.clone(), self.config);
+                let lost = publish_batch(&mut state, batch, self.config);
+                state.snapshot = snapshot;
+                lost
+            }
+        };
+        self.notify_interaction_capability_change(!lost.is_empty());
     }
 
     pub(crate) fn repair_committed(
@@ -350,53 +374,64 @@ impl SurfaceHub {
             .map(SharedSurfaceBatch::new)
             .map(Arc::new)
             .collect::<Vec<_>>();
-        let mut state = lock(&self.inner);
-        if state.snapshot.cursor == snapshot.cursor {
-            if state.retained.is_empty() {
-                let mut expected = snapshot.cursor.clone();
-                let mut suffix = Vec::new();
-                for batch in committed.iter().rev() {
-                    if batch.batch.cursor_after == expected {
-                        suffix.push(batch);
-                        expected = batch.batch.cursor_before.clone();
+        let lost = {
+            let mut state = lock(&self.inner);
+            let mut lost = Vec::new();
+            if state.snapshot.cursor == snapshot.cursor {
+                if state.retained.is_empty() {
+                    let mut expected = snapshot.cursor.clone();
+                    let mut suffix = Vec::new();
+                    for batch in committed.iter().rev() {
+                        if batch.batch.cursor_after == expected {
+                            suffix.push(batch);
+                            expected = batch.batch.cursor_before.clone();
+                        }
+                    }
+                    for batch in suffix.into_iter().rev() {
+                        retain_batch(&mut state, batch.clone(), self.config);
                     }
                 }
-                for batch in suffix.into_iter().rev() {
+            } else {
+                let mut current = state.snapshot.cursor.clone();
+                let mut repaired_any = false;
+                for batch in committed {
+                    if batch.batch.cursor_after.next_seq.get() <= current.next_seq.get() {
+                        continue;
+                    }
+                    if batch.batch.cursor_before != current {
+                        continue;
+                    }
                     retain_batch(&mut state, batch.clone(), self.config);
+                    lost.extend(publish_batch(&mut state, batch.clone(), self.config));
+                    current = batch.batch.cursor_after.clone();
+                    repaired_any = true;
+                    if current == snapshot.cursor {
+                        break;
+                    }
+                }
+                if !repaired_any || current != snapshot.cursor {
+                    lost.extend(signal_gap(
+                        &mut state,
+                        SnapshotRequiredReason::ReplayHole,
+                        snapshot.cursor.clone(),
+                    ));
+                    clear_retained(&mut state);
+                    state.replay_hole = true;
                 }
             }
             state.snapshot = snapshot;
             state.ready = true;
-            return;
-        }
-        let mut current = state.snapshot.cursor.clone();
-        let mut repaired_any = false;
-        for batch in committed {
-            if batch.batch.cursor_after.next_seq.get() <= current.next_seq.get() {
-                continue;
-            }
-            if batch.batch.cursor_before != current {
-                continue;
-            }
-            retain_batch(&mut state, batch.clone(), self.config);
-            publish_batch(&mut state, batch.clone(), self.config);
-            current = batch.batch.cursor_after.clone();
-            repaired_any = true;
-            if current == snapshot.cursor {
-                break;
+            lost
+        };
+        self.notify_interaction_capability_change(!lost.is_empty());
+    }
+
+    fn notify_interaction_capability_change(&self, changed: bool) {
+        if changed {
+            if let Some(dispatcher) = self.dispatcher.as_ref() {
+                dispatcher.notify_interaction_capability_changed();
             }
         }
-        if !repaired_any || current != snapshot.cursor {
-            signal_gap(
-                &mut state,
-                SnapshotRequiredReason::ReplayHole,
-                snapshot.cursor.clone(),
-            );
-            clear_retained(&mut state);
-            state.replay_hole = true;
-        }
-        state.snapshot = snapshot;
-        state.ready = true;
     }
 
     pub fn detach(
@@ -404,7 +439,29 @@ impl SurfaceHub {
         client: &RuntimeSurfaceClientHandle,
         request: DetachRequest,
     ) -> DetachResult {
-        let mut state = lock(&self.inner);
+        if let Some(dispatcher) = self.dispatcher.as_ref() {
+            return dispatcher.detach(client.clone(), request);
+        }
+        self.detach_local(client, request)
+    }
+
+    pub(crate) fn detach_local(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+        request: DetachRequest,
+    ) -> DetachResult {
+        match self.prepare_detach_local(client, request) {
+            DetachResult::Detached { receipt } => self.finalize_detach_local(client, receipt),
+            other => other,
+        }
+    }
+
+    pub(crate) fn prepare_detach_local(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+        request: DetachRequest,
+    ) -> DetachResult {
+        let state = lock(&self.inner);
         let attachment_id = client.attachment_id();
         if !client.belongs_to(
             &self.scope,
@@ -421,9 +478,9 @@ impl SurfaceHub {
         }
         let grant = state
             .subscriptions
-            .remove(attachment_id)
-            .or_else(|| state.retired_subscriptions.remove(attachment_id))
-            .map(|subscriber| subscriber.grant)
+            .get(attachment_id)
+            .or_else(|| state.retired_subscriptions.get(attachment_id))
+            .map(|subscriber| subscriber.grant.clone())
             .unwrap_or_else(|| client.grant().clone());
         let receipt = DetachRevocationReceipt {
             request_id: request.request_id,
@@ -433,6 +490,45 @@ impl SurfaceHub {
             route_commit_id: None,
             route_cursor: None,
         };
+        DetachResult::Detached { receipt }
+    }
+
+    pub(crate) fn finalize_detach_local(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+        receipt: DetachRevocationReceipt,
+    ) -> DetachResult {
+        let mut state = lock(&self.inner);
+        let attachment_id = client.attachment_id();
+        if receipt.attachment_id != *attachment_id
+            || !client.belongs_to(
+                &self.scope,
+                &state.snapshot.thread.thread_id,
+                self.authority.host_incarnation(),
+            )
+        {
+            return DetachResult::StaleAttachment {
+                request_id: receipt.request_id,
+                attachment_id: attachment_id.clone(),
+            };
+        }
+        if let Some(receipt) = client.detached_receipt() {
+            return DetachResult::AlreadyDetached { receipt };
+        }
+        let grant = state
+            .subscriptions
+            .get(attachment_id)
+            .or_else(|| state.retired_subscriptions.get(attachment_id))
+            .map(|subscriber| subscriber.grant.clone())
+            .unwrap_or_else(|| client.grant().clone());
+        if grant_digest(&grant) != receipt.revoked_grant_digest {
+            return DetachResult::StaleAttachment {
+                request_id: receipt.request_id,
+                attachment_id: attachment_id.clone(),
+            };
+        }
+        state.subscriptions.remove(attachment_id);
+        state.retired_subscriptions.remove(attachment_id);
         match client.remember_detached(receipt.clone()) {
             Ok(()) => DetachResult::Detached { receipt },
             Err(receipt) => DetachResult::AlreadyDetached { receipt },
@@ -455,6 +551,101 @@ impl SurfaceHub {
                 .subscriptions
                 .get(client.attachment_id())
                 .is_some_and(|subscriber| &subscriber.grant == client.grant())
+    }
+
+    pub(crate) fn select_interaction_attachment_for(
+        &self,
+        kind: SurfaceInteractionKind,
+        preferred: Option<&SurfaceAttachmentId>,
+    ) -> Option<SurfaceAttachmentId> {
+        self.select_interaction_attachment_excluding(kind, preferred, None)
+    }
+
+    pub(crate) fn select_interaction_attachment_excluding(
+        &self,
+        kind: SurfaceInteractionKind,
+        preferred: Option<&SurfaceAttachmentId>,
+        excluded: Option<&SurfaceAttachmentId>,
+    ) -> Option<SurfaceAttachmentId> {
+        let state = lock(&self.inner);
+        let eligible = |subscriber: &SurfaceSubscriber| {
+            subscriber.claimed
+                && subscriber
+                    .grant
+                    .capabilities
+                    .as_set()
+                    .contains(&SurfaceCapability::RespondGrantedInteraction)
+                && subscriber.interaction_kinds.contains(&kind)
+        };
+        preferred
+            .filter(|attachment_id| excluded != Some(*attachment_id))
+            .and_then(|attachment_id| {
+                state
+                    .subscriptions
+                    .get(attachment_id)
+                    .filter(|subscriber| eligible(subscriber))
+                    .map(|_| attachment_id.clone())
+            })
+            .or_else(|| {
+                state
+                    .subscriptions
+                    .iter()
+                    .filter(|(attachment_id, _)| excluded != Some(*attachment_id))
+                    .filter(|(_, subscriber)| eligible(subscriber))
+                    .min_by_key(|(attachment_id, subscriber)| {
+                        (
+                            interaction_role_priority(subscriber.grant.role),
+                            subscriber.grant.granted_at.next_seq,
+                            (*attachment_id).clone(),
+                        )
+                    })
+                    .map(|(attachment_id, _)| attachment_id.clone())
+            })
+    }
+
+    pub(crate) fn admits_interaction_client(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+        kind: SurfaceInteractionKind,
+    ) -> bool {
+        let state = lock(&self.inner);
+        client.belongs_to(
+            &self.scope,
+            &state.snapshot.thread.thread_id,
+            self.authority.host_incarnation(),
+        ) && client.detached_receipt().is_none()
+            && state
+                .subscriptions
+                .get(client.attachment_id())
+                .is_some_and(|subscriber| {
+                    &subscriber.grant == client.grant()
+                        && subscriber
+                            .grant
+                            .capabilities
+                            .as_set()
+                            .contains(&SurfaceCapability::RespondGrantedInteraction)
+                        && subscriber.interaction_kinds.contains(&kind)
+                })
+    }
+
+    pub(crate) fn admits_interaction_attachment(
+        &self,
+        attachment_id: &SurfaceAttachmentId,
+        kind: SurfaceInteractionKind,
+    ) -> bool {
+        let state = lock(&self.inner);
+        state
+            .subscriptions
+            .get(attachment_id)
+            .is_some_and(|subscriber| {
+                subscriber.claimed
+                    && subscriber
+                        .grant
+                        .capabilities
+                        .as_set()
+                        .contains(&SurfaceCapability::RespondGrantedInteraction)
+                    && subscriber.interaction_kinds.contains(&kind)
+            })
     }
 
     pub(crate) fn thread_id(&self) -> SurfaceThreadId {
@@ -536,6 +727,7 @@ impl SurfaceHub {
             attachment_id.clone(),
             SurfaceSubscriber {
                 grant: capabilities.grant.clone(),
+                interaction_kinds: capabilities.interaction_kinds.clone(),
                 queue: VecDeque::new(),
                 queued_events: 0,
                 queued_bytes: 0,
@@ -544,6 +736,15 @@ impl SurfaceHub {
             },
         );
         (attachment_id, client, subscription, capabilities)
+    }
+}
+
+fn interaction_role_priority(role: SurfaceAttachmentRole) -> u8 {
+    match role {
+        SurfaceAttachmentRole::Tui => 0,
+        SurfaceAttachmentRole::Acp => 1,
+        SurfaceAttachmentRole::Jsonl => 2,
+        SurfaceAttachmentRole::InternalCompatibility => 3,
     }
 }
 
@@ -690,7 +891,7 @@ fn publish_batch(
     state: &mut SurfaceHubState,
     batch: Arc<SharedSurfaceBatch>,
     config: SurfaceHubConfig,
-) {
+) -> Vec<SurfaceAttachmentId> {
     let retained_from = state
         .retained
         .front()
@@ -712,7 +913,8 @@ fn publish_batch(
             overflowed.push(attachment_id.clone());
         }
     }
-    retire_subscriptions(state, overflowed);
+    retire_subscriptions(state, &overflowed);
+    overflowed
 }
 
 fn enqueue_batch(
@@ -762,7 +964,11 @@ fn retain_batch(
     }
 }
 
-fn signal_gap(state: &mut SurfaceHubState, reason: SnapshotRequiredReason, head: SurfaceCursor) {
+fn signal_gap(
+    state: &mut SurfaceHubState,
+    reason: SnapshotRequiredReason,
+    head: SurfaceCursor,
+) -> Vec<SurfaceAttachmentId> {
     let retained_from = state
         .retained
         .front()
@@ -779,15 +985,16 @@ fn signal_gap(state: &mut SurfaceHubState, reason: SnapshotRequiredReason, head:
         subscriber.gapped = true;
         gapped.push(attachment_id.clone());
     }
-    retire_subscriptions(state, gapped);
+    retire_subscriptions(state, &gapped);
+    gapped
 }
 
-fn retire_subscriptions(state: &mut SurfaceHubState, attachment_ids: Vec<SurfaceAttachmentId>) {
+fn retire_subscriptions(state: &mut SurfaceHubState, attachment_ids: &[SurfaceAttachmentId]) {
     for attachment_id in attachment_ids {
         if let Some(subscriber) = state.subscriptions.remove(&attachment_id) {
             state
                 .retired_subscriptions
-                .insert(attachment_id, subscriber);
+                .insert(attachment_id.clone(), subscriber);
         }
     }
 }
@@ -867,18 +1074,19 @@ mod tests {
 
     fn subscriber(seed: u8, cursor: &SurfaceCursor) -> SurfaceSubscriber {
         let attachment_id = SurfaceAttachmentId::try_from_bytes(uuid_v7_bytes(seed)).unwrap();
-        SurfaceSubscriber {
-            grant: SurfaceAttachmentGrant {
-                attachment_id,
-                host_incarnation: HostIncarnation::try_from_bytes(uuid_v7_bytes(seed + 1)).unwrap(),
-                role: SurfaceAttachmentRole::Tui,
-                capabilities: NonEmptySet::try_new(BTreeSet::from([
-                    SurfaceCapability::ReadSnapshot,
-                ]))
+        let host_incarnation = HostIncarnation::try_from_bytes(uuid_v7_bytes(seed + 1)).unwrap();
+        let grant = SurfaceAttachmentGrant {
+            attachment_id: attachment_id.clone(),
+            host_incarnation: host_incarnation.clone(),
+            role: SurfaceAttachmentRole::Tui,
+            capabilities: NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot]))
                 .unwrap(),
-                granted_at: cursor.clone(),
-                expires_at: None,
-            },
+            granted_at: cursor.clone(),
+            expires_at: None,
+        };
+        SurfaceSubscriber {
+            grant: grant.clone(),
+            interaction_kinds: BTreeSet::new(),
             queue: VecDeque::new(),
             queued_events: 0,
             queued_bytes: 0,
@@ -1034,5 +1242,112 @@ mod tests {
             DetachResult::Detached { .. }
         ));
         assert!(!hub.admits_client(&attachment.client));
+    }
+
+    #[test]
+    fn interaction_routing_requires_a_claimed_live_subscription() {
+        let snapshot = reducer_snapshot();
+        let capabilities = NonEmptySet::try_new(BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::RespondGrantedInteraction,
+        ]))
+        .unwrap();
+        let authority = SurfaceAttachAuthority::new(
+            HostIncarnation::try_from_bytes(uuid_v7_bytes(223)).unwrap(),
+            snapshot.thread.thread_id.clone(),
+            SurfaceAttachmentRole::Tui,
+            capabilities.clone(),
+            NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot])).unwrap(),
+            BTreeSet::from([SurfaceInteractionKind::UserInput]),
+        );
+        let hub =
+            SurfaceHub::from_authority(snapshot.clone(), authority, Default::default()).unwrap();
+        hub.repair_committed(Arc::new(snapshot), &[]);
+        let attachment = match hub.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::try_from_bytes(uuid_v7_bytes(224)).unwrap(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: capabilities.as_set().clone(),
+            interaction_capabilities: BTreeSet::from([SurfaceInteractionKind::UserInput]),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("fresh interaction attach failed"),
+        };
+
+        assert_eq!(
+            hub.select_interaction_attachment_for(SurfaceInteractionKind::UserInput, None),
+            None
+        );
+        let _receiver = hub
+            .claim_subscription(&attachment.subscription)
+            .expect("claim subscription once");
+        assert_eq!(
+            hub.select_interaction_attachment_for(
+                SurfaceInteractionKind::UserInput,
+                Some(&attachment.attachment_id),
+            ),
+            Some(attachment.attachment_id)
+        );
+    }
+
+    #[test]
+    fn interaction_routing_fallback_uses_grant_order_before_attachment_id() {
+        let snapshot = reducer_snapshot();
+        let capabilities = NonEmptySet::try_new(BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::RespondGrantedInteraction,
+        ]))
+        .unwrap();
+        let authority = SurfaceAttachAuthority::new(
+            HostIncarnation::try_from_bytes(uuid_v7_bytes(230)).unwrap(),
+            snapshot.thread.thread_id.clone(),
+            SurfaceAttachmentRole::Tui,
+            capabilities.clone(),
+            NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot])).unwrap(),
+            BTreeSet::from([SurfaceInteractionKind::UserInput]),
+        );
+        let hub =
+            SurfaceHub::from_authority(snapshot.clone(), authority, Default::default()).unwrap();
+        hub.repair_committed(Arc::new(snapshot.clone()), &[]);
+        let attach = || match hub.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: capabilities.as_set().clone(),
+            interaction_capabilities: BTreeSet::from([SurfaceInteractionKind::UserInput]),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("fresh interaction attach failed"),
+        };
+        let lower_id = attach();
+        let higher_id = attach();
+        let _lower_receiver = hub.claim_subscription(&lower_id.subscription).unwrap();
+        let _higher_receiver = hub.claim_subscription(&higher_id.subscription).unwrap();
+        let (lower_id, higher_id) = if lower_id.attachment_id < higher_id.attachment_id {
+            (lower_id.attachment_id, higher_id.attachment_id)
+        } else {
+            (higher_id.attachment_id, lower_id.attachment_id)
+        };
+        {
+            let mut state = lock(&hub.inner);
+            state
+                .subscriptions
+                .get_mut(&lower_id)
+                .unwrap()
+                .grant
+                .granted_at
+                .next_seq = SequenceNumber::new(10);
+            state
+                .subscriptions
+                .get_mut(&higher_id)
+                .unwrap()
+                .grant
+                .granted_at
+                .next_seq = SequenceNumber::new(1);
+        }
+
+        assert_eq!(
+            hub.select_interaction_attachment_for(SurfaceInteractionKind::UserInput, None),
+            Some(higher_id),
+            "earlier grant order wins even when its attachment id sorts later"
+        );
     }
 }

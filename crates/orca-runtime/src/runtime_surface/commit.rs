@@ -175,9 +175,21 @@ enum OwnerLeaseAuthority<'owner> {
 
 enum BatchCommitAuthority<'permit> {
     Single(&'permit SurfacePublisherPermit),
+    ActorGenerationTerminalization {
+        actor: &'permit SurfacePublisherPermit,
+        generation: &'permit SurfacePublisherPermit,
+    },
     LiveGenerationStop {
         generation: &'permit SurfacePublisherPermit,
         finalizer: &'permit SurfacePublisherPermit,
+    },
+}
+
+enum RecoveredBatchAuthority {
+    Single(SurfacePublisherPermit),
+    ActorGenerationTerminalization {
+        actor: SurfacePublisherPermit,
+        generation: SurfacePublisherPermit,
     },
 }
 
@@ -384,8 +396,21 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
             coordinator.next_sequence = batch.cursor_after.next_seq.get();
             coordinator.incomplete = Some(batch.clone());
             coordinator.recovered_prepared = Some(batch.clone());
-            let permit = coordinator.issue_exact_recovered_permit(&batch)?;
-            coordinator.commit_batch(&permit, &batch)?;
+            match coordinator.issue_exact_recovered_authority(&batch)? {
+                RecoveredBatchAuthority::Single(permit) => {
+                    coordinator.commit_batch(&permit, &batch)?;
+                }
+                RecoveredBatchAuthority::ActorGenerationTerminalization { actor, generation } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ActorGenerationTerminalization {
+                            actor: &actor,
+                            generation: &generation,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+            }
         }
         Ok(coordinator)
     }
@@ -445,6 +470,26 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             BatchCommitAuthority::LiveGenerationStop {
                 generation: &generation,
                 finalizer: &finalizer,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_actor_generation_terminalization_batch(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let generation = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActorGenerationTerminalization {
+                actor: &actor,
+                generation: &generation,
             },
             batch,
             None,
@@ -540,7 +585,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                                 .iter()
                                 .any(|interaction| {
                                     interaction.fence == generation.fence
-                                        && matches!(
+                                        && (matches!(
                                             &interaction.lifecycle,
                                             super::SurfaceInteractionLifecycle::Expired { .. }
                                                 | super::SurfaceInteractionLifecycle::Cancelled {
@@ -548,7 +593,22 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                                                         super::InteractionCancelReason::CapabilityUnavailable
                                                         | super::InteractionCancelReason::ExpiryAuthorityUnavailable { .. },
                                                 }
-                                        )
+                                        ) || (matches!(
+                                            materialization_class,
+                                            RecoveryMaterialization::ColdOwnerTakeover
+                                        ) && matches!(
+                                            interaction.lifecycle,
+                                            super::SurfaceInteractionLifecycle::Resolved { .. }
+                                        ) && matches!(
+                                            interaction.kind,
+                                            super::SurfaceInteractionKind::ToolApproval
+                                                | super::SurfaceInteractionKind::PermissionRequest
+                                                | super::SurfaceInteractionKind::UserInput
+                                                | super::SurfaceInteractionKind::McpElicitation
+                                        ) && matches!(
+                                            interaction.recovery_disposition,
+                                            super::InteractionUnavailableDisposition::FailOperation
+                                        )))
                                 }),
                         }
                     }
@@ -626,6 +686,60 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         materialization: &super::MaterializationCause,
     ) -> Result<RecoveryAction, SurfaceCommitError> {
         self.recover_operation_inner(operation_id, materialization, None)
+    }
+
+    pub fn recover_unavailable_interactions(
+        &mut self,
+        operation_id: &super::SurfaceOperationId,
+        materialization: &super::MaterializationCause,
+    ) -> Result<(), SurfaceCommitError> {
+        if self
+            .recovery_action(operation_id, materialization)
+            .is_none()
+        {
+            return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+        }
+        self.materialize_cold_owner_takeover(materialization)?;
+        let interactions = self
+            .state
+            .snapshot()
+            .interactions
+            .iter()
+            .filter(|interaction| {
+                interaction.fence.operation_id == *operation_id
+                    && matches!(
+                        interaction.lifecycle,
+                        super::SurfaceInteractionLifecycle::Requested
+                    )
+                    && matches!(
+                        interaction.recovery_disposition,
+                        super::InteractionUnavailableDisposition::FailOperation
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for interaction in interactions {
+            let next_revision = super::InteractionRevision::try_new(
+                interaction
+                    .revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+            )
+            .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            let batch = self.interaction_recovery_batch(
+                interaction.fence.clone(),
+                super::InteractionPatch::Cancelled {
+                    interaction_id: interaction.interaction_id,
+                    expected_revision: interaction.revision,
+                    next_revision,
+                    reason: super::InteractionCancelReason::CapabilityUnavailable,
+                },
+            )?;
+            let permit = self.issue_recovery_permit(interaction.fence);
+            self.commit_batch(&permit, &batch)?;
+        }
+        Ok(())
     }
 
     pub fn recover_operation_with_settlement_store<S: super::ExternalSettlementStore>(
@@ -1081,18 +1195,42 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         permit
     }
 
-    fn issue_exact_recovered_permit(
+    fn issue_exact_recovered_authority(
         &mut self,
         batch: &SurfaceCommitBatch,
-    ) -> Result<SurfacePublisherPermit, SurfaceCommitError> {
+    ) -> Result<RecoveredBatchAuthority, SurfaceCommitError> {
         let actor = self.actor_control_permit.clone();
         if permit_authorizes(&self.issued_permits, &actor, batch, self.owner_epoch)
             && finalizer_background_scope_matches_state(&self.state, &actor, batch)
         {
-            return Ok(actor);
+            return Ok(RecoveredBatchAuthority::Single(actor));
         }
 
         let events = batch.events.as_slice();
+        if let Some(SurfaceScope::Generation {
+            fence: historical_fence,
+        }) = events.get(1).map(|event| &event.scope)
+        {
+            let generation = SurfacePublisherPermit::Generation {
+                permit_id: next_permit_id(),
+                fence: historical_fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(generation.clone());
+            if actor_generation_terminalization_authorized(
+                &issued,
+                &actor,
+                &generation,
+                batch,
+                self.owner_epoch,
+            ) {
+                let generation = self.register_permit(generation);
+                return Ok(RecoveredBatchAuthority::ActorGenerationTerminalization {
+                    actor,
+                    generation,
+                });
+            }
+        }
         let first = &events[0];
         let candidate = match (&first.scope, &first.event) {
             (
@@ -1179,7 +1317,9 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         {
             return Err(SurfaceCommitError::StalePublisherPermit);
         }
-        Ok(self.register_permit(candidate))
+        Ok(RecoveredBatchAuthority::Single(
+            self.register_permit(candidate),
+        ))
     }
 
     fn recovery_generation<'a>(
@@ -1354,6 +1494,63 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         Ok(batch)
     }
 
+    fn interaction_recovery_batch(
+        &self,
+        fence: super::SurfaceOperationFence,
+        patch: super::InteractionPatch,
+    ) -> Result<SurfaceCommitBatch, SurfaceCommitError> {
+        let cursor_before = self.state.snapshot().cursor.clone();
+        let durable_revision = match cursor_before.source_revision {
+            super::CursorSourceRevision::Recorded { durable_revision } => {
+                super::DurableRevision::try_new(
+                    durable_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                )
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?
+            }
+            super::CursorSourceRevision::Ephemeral { .. } => {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: self.owner_epoch,
+            durable_revision,
+            commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+        };
+        let event = super::SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Generation { fence },
+            event: super::SurfaceEvent::Interaction(patch),
+        };
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: cursor_before.clone(),
+            cursor_after: super::SurfaceCursor {
+                next_seq: super::SequenceNumber::new(
+                    cursor_before
+                        .next_seq
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                ),
+                source_revision: super::CursorSourceRevision::Recorded { durable_revision },
+                ..cursor_before
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: super::Sha256Digest::new([0; 32]),
+            events: super::NonEmptyVec::try_new(vec![event])
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        };
+        batch.batch_digest = super::canonical_batch_digest(&batch);
+        Ok(batch)
+    }
+
     pub fn commit_batch(
         &mut self,
         permit: &SurfacePublisherPermit,
@@ -1410,6 +1607,15 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             BatchCommitAuthority::Single(permit) => {
                 permit_authorizes(&self.issued_permits, permit, batch, self.owner_epoch)
                     && finalizer_background_scope_matches_state(&self.state, permit, batch)
+            }
+            BatchCommitAuthority::ActorGenerationTerminalization { actor, generation } => {
+                actor_generation_terminalization_authorized(
+                    &self.issued_permits,
+                    actor,
+                    generation,
+                    batch,
+                    self.owner_epoch,
+                )
             }
             BatchCommitAuthority::LiveGenerationStop {
                 generation,
@@ -1698,6 +1904,91 @@ fn permit_authorizes(
     }
 }
 
+fn actor_generation_terminalization_authorized(
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    generation_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(generation_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_owner_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Generation { fence, .. },
+    ) = (actor_permit, generation_permit)
+    else {
+        return false;
+    };
+    if *actor_owner_epoch != owner_epoch
+        || thread_id != &fence.thread_id
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let Some((intent, settlements)) = batch.events.as_slice().split_first() else {
+        return false;
+    };
+    let cause = match (&intent.scope, &intent.event) {
+        (
+            SurfaceScope::Operation {
+                operation_id: scoped_operation,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::ControlIntentCommitted {
+                operation_id,
+                intent:
+                    super::PendingControlIntent::Terminalize {
+                        operation_id: intent_operation,
+                        cause,
+                    },
+                ..
+            }),
+        ) if scoped_operation == &fence.operation_id
+            && operation_id == &fence.operation_id
+            && intent_operation == &fence.operation_id =>
+        {
+            *cause
+        }
+        _ => return false,
+    };
+    settlements
+        .iter()
+        .all(|event| match (&event.scope, &event.event) {
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
+                    reason, ..
+                }),
+            ) if scope == fence => matches!(
+                (cause, reason),
+                (
+                    super::TerminalizationCause::HostShutdown,
+                    super::InteractionCancelReason::HostShutdown,
+                ) | (
+                    super::TerminalizationCause::ThreadClose,
+                    super::InteractionCancelReason::ThreadClose,
+                ) | (
+                    super::TerminalizationCause::UserCancel,
+                    super::InteractionCancelReason::OperationCancelled {
+                        reason: super::CancelReason::User,
+                    },
+                ) | (
+                    super::TerminalizationCause::GoalPause,
+                    super::InteractionCancelReason::OperationCancelled {
+                        reason: super::CancelReason::GoalPause,
+                    },
+                )
+            ),
+            _ => false,
+        })
+}
+
 fn live_generation_stop_disposition_authorized(
     issued_permits: &[SurfacePublisherPermit],
     generation_permit: &SurfacePublisherPermit,
@@ -1879,6 +2170,18 @@ fn recovery_batch_authorized(
     batch: &SurfaceCommitBatch,
 ) -> bool {
     let events = batch.events.as_slice();
+    if let [event] = events {
+        return matches!(
+            (&event.scope, &event.event),
+            (
+                SurfaceScope::Generation { fence },
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
+                    reason: super::InteractionCancelReason::CapabilityUnavailable,
+                    ..
+                }),
+            ) if fence == historical_fence
+        );
+    }
     let stops = events
         .iter()
         .filter(|event| recovery_generation_stop_authorized(historical_fence, event))
@@ -3369,6 +3672,106 @@ mod tests {
             &goal,
             ThreadOwnerEpoch::new(1),
         ));
+    }
+
+    #[test]
+    fn actor_generation_terminalization_requires_matching_interaction_cancel_reason() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let fence = test_operation_fence(113);
+        let actor = SurfacePublisherPermit::ActorControl {
+            permit_id: super::super::SurfacePublisherPermitId::new([31; 32]),
+            thread_id: thread_id(),
+            owner_epoch: ThreadOwnerEpoch::new(1),
+        };
+        let generation = SurfacePublisherPermit::Generation {
+            permit_id: super::super::SurfacePublisherPermitId::new([32; 32]),
+            fence: fence.clone(),
+        };
+        let issued = vec![actor.clone(), generation.clone()];
+        let cases = [
+            (
+                super::super::TerminalizationCause::UserCancel,
+                super::super::InteractionCancelReason::OperationCancelled {
+                    reason: super::super::CancelReason::User,
+                },
+            ),
+            (
+                super::super::TerminalizationCause::GoalPause,
+                super::super::InteractionCancelReason::OperationCancelled {
+                    reason: super::super::CancelReason::GoalPause,
+                },
+            ),
+            (
+                super::super::TerminalizationCause::HostShutdown,
+                super::super::InteractionCancelReason::HostShutdown,
+            ),
+            (
+                super::super::TerminalizationCause::ThreadClose,
+                super::super::InteractionCancelReason::ThreadClose,
+            ),
+        ];
+
+        for (cause_index, (cause, _)) in cases.iter().enumerate() {
+            for (reason_index, (_, reason)) in cases.iter().enumerate() {
+                let operation_id = fence.operation_id.clone();
+                let batch = test_batch_with_events(
+                    &state,
+                    vec![
+                        (
+                            SurfaceScope::Operation {
+                                operation_id: operation_id.clone(),
+                            },
+                            super::super::SurfaceEvent::Operation(
+                                super::super::OperationPatch::ControlIntentCommitted {
+                                    operation_id: operation_id.clone(),
+                                    request_id: super::super::SurfaceRequestId::try_from_bytes(
+                                        uuid_v7_bytes(130),
+                                    )
+                                    .unwrap(),
+                                    intent: super::super::PendingControlIntent::Terminalize {
+                                        operation_id: operation_id.clone(),
+                                        cause: *cause,
+                                    },
+                                },
+                            ),
+                        ),
+                        (
+                            SurfaceScope::Generation {
+                                fence: fence.clone(),
+                            },
+                            super::super::SurfaceEvent::Interaction(
+                                super::super::InteractionPatch::Cancelled {
+                                    interaction_id:
+                                        super::super::SurfaceInteractionId::try_from_bytes(
+                                            uuid_v7_bytes(131),
+                                        )
+                                        .unwrap(),
+                                    expected_revision: super::super::InteractionRevision::try_new(
+                                        1,
+                                    )
+                                    .unwrap(),
+                                    next_revision: super::super::InteractionRevision::try_new(2)
+                                        .unwrap(),
+                                    reason: reason.clone(),
+                                },
+                            ),
+                        ),
+                    ],
+                );
+
+                assert_eq!(
+                    actor_generation_terminalization_authorized(
+                        &issued,
+                        &actor,
+                        &generation,
+                        &batch,
+                        ThreadOwnerEpoch::new(1),
+                    ),
+                    cause_index == reason_index,
+                    "cause {cause:?} with cancellation {reason:?}",
+                );
+            }
+        }
     }
 
     #[test]

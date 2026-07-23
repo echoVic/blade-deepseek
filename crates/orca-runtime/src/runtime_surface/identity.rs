@@ -764,6 +764,10 @@ macro_rules! opaque_token_wrapper {
             pub(crate) const fn new(value: [u8; 32]) -> Self {
                 Self(OpaqueToken::new(value))
             }
+
+            pub(crate) const fn key_bytes(&self) -> &[u8; 32] {
+                &self.0.0
+            }
         }
     )+};
 }

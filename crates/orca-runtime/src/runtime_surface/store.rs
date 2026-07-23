@@ -2472,6 +2472,10 @@ pub struct JsonlSurfaceCommitLedger {
 #[cfg(test)]
 static TERMINAL_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
+static INTERACTION_ROUTE_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static INTERACTION_REQUEST_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
 static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -2649,6 +2653,24 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_interaction_route_append_failure_once(path: impl Into<PathBuf>) {
+        INTERACTION_ROUTE_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_interaction_request_append_failure_once(path: impl Into<PathBuf>) {
+        INTERACTION_REQUEST_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_terminal_checkpoint_failure_once(path: impl Into<PathBuf>) {
         TERMINAL_CHECKPOINT_FAILURES
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -2674,11 +2696,49 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    fn take_interaction_route_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let changes_route = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Interaction(InteractionPatch::RouteChanged { .. })
+            )
+        });
+        changes_route
+            && INTERACTION_ROUTE_APPEND_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+    }
+
+    #[cfg(test)]
+    fn take_interaction_request_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let requests_interaction = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Interaction(InteractionPatch::Requested { .. })
+            )
+        });
+        requests_interaction
+            && INTERACTION_REQUEST_APPEND_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+    }
+
+    #[cfg(test)]
     fn arm_terminal_checkpoint_failure(&self, batch: &SurfaceCommitBatch) {
         let is_terminal = batch.events.as_slice().iter().any(|event| {
             matches!(
                 &event.event,
-                SurfaceEvent::Operation(OperationPatch::Terminal { .. })
+                SurfaceEvent::Operation(
+                    OperationPatch::Terminal { .. }
+                        | OperationPatch::ControlIntentCommitted {
+                            intent: super::PendingControlIntent::Terminalize { .. },
+                            ..
+                        }
+                )
             )
         });
         if is_terminal
@@ -2759,6 +2819,14 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
     ) -> Result<DurableBatchReceipt, SurfaceLedgerError> {
         #[cfg(test)]
         if self.take_terminal_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_interaction_route_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_interaction_request_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
         let (commit_id, durable_revision) = match &batch.commit_class {

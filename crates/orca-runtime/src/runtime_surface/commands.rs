@@ -246,6 +246,10 @@ pub enum SurfaceClientCommandError {
 }
 
 pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
+    fn notify_interaction_capability_changed(&self);
+
+    fn detach(&self, client: RuntimeSurfaceClientHandle, request: DetachRequest) -> DetachResult;
+
     fn reserve_operation(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -274,6 +278,14 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         request_id: SurfaceRequestId,
         operation_id: SurfaceOperationId,
     ) -> Result<WaitOperationTerminalResult, SurfaceClientCommandError>;
+
+    fn respond_interaction_by_id(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        interaction_id: SurfaceInteractionId,
+        answer: SurfaceClientInteractionAnswer,
+    ) -> Result<MutationReply<RespondInteractionOutput>, SurfaceClientCommandError>;
 
     fn retry_finalization(
         &self,
@@ -355,6 +367,28 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .wait_operation_terminal(self.clone(), request_id, operation_id)
+    }
+
+    pub fn respond_interaction(
+        &self,
+        _request_id: SurfaceRequestId,
+        _opaque_request_id: NonEmptyText,
+        _expected_kind: SurfaceInteractionKind,
+        _answer: SurfaceClientInteractionAnswer,
+    ) -> Result<MutationReply<RespondInteractionOutput>, SurfaceClientCommandError> {
+        Err(SurfaceClientCommandError::Unauthorized)
+    }
+
+    pub fn respond_interaction_by_id(
+        &self,
+        request_id: SurfaceRequestId,
+        interaction_id: SurfaceInteractionId,
+        answer: SurfaceClientInteractionAnswer,
+    ) -> Result<MutationReply<RespondInteractionOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .respond_interaction_by_id(self.clone(), request_id, interaction_id, answer)
     }
 
     pub fn retry_finalization(
@@ -3176,6 +3210,20 @@ impl RuntimeSurfaceHandle {
         self.hub.as_ref()?.claim_subscription(handle)
     }
 
+    pub fn detach(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+        request: DetachRequest,
+    ) -> DetachResult {
+        match self.hub.as_ref() {
+            Some(hub) => hub.detach(client, request),
+            None => DetachResult::StaleAttachment {
+                request_id: request.request_id,
+                attachment_id: client.attachment_id().clone(),
+            },
+        }
+    }
+
     pub(crate) fn host_incarnation(&self) -> &HostIncarnation {
         &self.host_incarnation
     }
@@ -4038,6 +4086,46 @@ mod closed_command_domain_tests {
             } => {
                 let _ = (thread_id, persistence, operation_terminals, closed_cursor);
             }
+        }
+    }
+
+    #[test]
+    fn unknown_opaque_interaction_ids_do_not_allocate_client_response_state() {
+        let attachment_id = SurfaceAttachmentId::try_from_bytes(uuid_v7_bytes(201)).unwrap();
+        let thread_id = thread_id(202);
+        let host_incarnation = host_incarnation(203);
+        let client = RuntimeSurfaceClientHandle::new(
+            attachment_id.clone(),
+            thread_id,
+            host_incarnation.clone(),
+            SurfaceAttachmentGrant {
+                attachment_id,
+                host_incarnation,
+                role: SurfaceAttachmentRole::Tui,
+                capabilities: NonEmptySet::try_new(BTreeSet::from([
+                    SurfaceCapability::ReadSnapshot,
+                    SurfaceCapability::RespondGrantedInteraction,
+                ]))
+                .unwrap(),
+                granted_at: cursor(204),
+                expires_at: None,
+            },
+            None,
+            Arc::new(()),
+        );
+
+        for index in 0..1_024 {
+            assert!(matches!(
+                client.respond_interaction(
+                    request_id((index % 200) as u8),
+                    NonEmptyText::try_new(format!("unknown-{index}")).unwrap(),
+                    SurfaceInteractionKind::UserInput,
+                    SurfaceClientInteractionAnswer::UserInput {
+                        decision: SurfaceUserInputDecision::Cancel,
+                    },
+                ),
+                Err(SurfaceClientCommandError::Unauthorized)
+            ));
         }
     }
 
