@@ -5,8 +5,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::syntax_highlight::{
-    MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINES, StyledSourceLine, content_within_limits,
-    highlighter_for_path,
+    LineHighlighter, MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINES, StyledSourceLine, SyntaxTheme,
+    content_within_limits, highlighter_for_path,
 };
 use crate::theme::Theme;
 
@@ -61,6 +61,88 @@ pub(crate) struct ParsedDiff {
 }
 
 pub(crate) type RefinedDiffStyles = HashMap<usize, StyledSourceLine>;
+
+/// Worker-facing entry point; callers with a `ParsedDiff` must use this ambiguity guard.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn compute_parsed_diff_file_scoped_styles(
+    path: &Path,
+    file_text: &str,
+    parsed: &ParsedDiff,
+    theme: SyntaxTheme,
+) -> Option<RefinedDiffStyles> {
+    if parsed.has_multiple_files {
+        return None;
+    }
+    compute_file_scoped_styles(path, file_text, &parsed.hunks, theme)
+}
+
+fn compute_file_scoped_styles(
+    path: &Path,
+    file_text: &str,
+    hunks: &[DiffHunk],
+    theme: SyntaxTheme,
+) -> Option<RefinedDiffStyles> {
+    compute_file_scoped_styles_with(path, file_text, hunks, theme, |highlighter, text| {
+        highlighter.highlight_line(text)
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn compute_file_scoped_styles_with(
+    path: &Path,
+    file_text: &str,
+    hunks: &[DiffHunk],
+    theme: SyntaxTheme,
+    mut highlight_line: impl FnMut(&mut LineHighlighter, &str) -> Option<StyledSourceLine>,
+) -> Option<RefinedDiffStyles> {
+    if !content_within_limits(file_text) {
+        return None;
+    }
+
+    let mut expected = HashMap::new();
+    for line in hunks.iter().flat_map(DiffHunk::source_lines) {
+        if !matches!(line.kind, DiffLineKind::Context | DiffLineKind::Insert) {
+            continue;
+        }
+        let line_number = line.new_line.filter(|line_number| *line_number > 0)?;
+        if let Some(existing) = expected.insert(line_number, line.content.as_str())
+            && existing != line.content
+        {
+            return None;
+        }
+    }
+
+    if expected.is_empty() {
+        return Some(RefinedDiffStyles::new());
+    }
+
+    let max_needed = expected.keys().copied().max()?;
+    let mut highlighter = highlighter_for_path(path, theme)?;
+    let mut refined = RefinedDiffStyles::with_capacity(expected.len());
+
+    for (line_index, source_line) in file_text.split_inclusive('\n').enumerate() {
+        let line_number = line_index + 1;
+        if line_number > max_needed {
+            break;
+        }
+        let text = source_line
+            .strip_suffix('\n')
+            .map_or(source_line, |text| text.strip_suffix('\r').unwrap_or(text));
+        let expected_text = expected.get(&line_number);
+        if expected_text.is_some_and(|expected_text| *expected_text != text) {
+            return None;
+        }
+        let spans = highlight_line(&mut highlighter, text)?;
+        if expected_text.is_some() {
+            refined.insert(line_number, spans);
+        }
+        if line_number == max_needed {
+            break;
+        }
+    }
+
+    (refined.len() == expected.len()).then_some(refined)
+}
 
 struct HunkBuilder {
     hunk: DiffHunk,
@@ -519,7 +601,9 @@ mod tests {
     use ratatui::text::{Line, Span};
 
     use super::{
-        DiffHunkEntry, DiffLineKind, RefinedDiffStyles, parse_unified_diff, render_unified_diff,
+        DiffHunk, DiffHunkEntry, DiffLineKind, DiffSourceLine, RefinedDiffStyles,
+        compute_file_scoped_styles, compute_parsed_diff_file_scoped_styles, parse_unified_diff,
+        render_parsed_diff, render_unified_diff,
     };
     use crate::syntax_highlight::{
         MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINE_BYTES, MAX_HIGHLIGHT_LINES, StyledSourceLine,
@@ -717,6 +801,45 @@ mod tests {
             diff.lines()
                 .map(|line| format!("    {line}"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parsed_diff_file_scoped_styles_reject_multiple_files() {
+        let theme = dark_theme();
+        let file_text = "value = 1\n";
+        let parsed = parse_unified_diff(
+            "\
+--- a/first.py
++++ b/first.py
+@@ -1 +1 @@
+ value = 1
+--- a/second.py
++++ b/second.py
+@@ -1 +1 @@
+ value = 1
+",
+        );
+
+        assert!(parsed.has_multiple_files);
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("first.py"),
+                file_text,
+                &parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_some(),
+            "low-level hunk API intentionally has no ParsedDiff ambiguity guard"
+        );
+        assert!(
+            compute_parsed_diff_file_scoped_styles(
+                Path::new("first.py"),
+                file_text,
+                &parsed,
+                theme.syntax_theme,
+            )
+            .is_none()
         );
     }
 
@@ -1274,6 +1397,454 @@ mod tests {
                 .style
                 .fg,
             Some(ratatui::style::Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn full_file_python_scope_warms_refined_field_styles_from_line_one() {
+        let theme = dark_theme();
+        let file_text = "\
+class Item:
+    \"\"\"Summary.
+    \"\"\"
+    field = 1
+";
+        let diff = "\
+--- a/item.py
++++ b/item.py
+@@ -3,2 +3,2 @@
+     \"\"\"
+-    field = 0
++    field = 1
+";
+        let parsed = parse_unified_diff(diff);
+
+        let refined = compute_file_scoped_styles(
+            Path::new("item.py"),
+            file_text,
+            &parsed.hunks,
+            theme.syntax_theme,
+        )
+        .expect("verified full-file styles");
+        let cold = render_parsed_diff(&parsed, &theme, None);
+        let warm = render_parsed_diff(&parsed, &theme, Some(&refined));
+        let cold_field = find_rendered_line(&cold, "+    field = 1");
+        let warm_field = find_rendered_line(&warm, "+    field = 1");
+        let direct = highlight_sequence(
+            "item.py",
+            &[
+                "class Item:",
+                "    \"\"\"Summary.",
+                "    \"\"\"",
+                "    field = 1",
+            ],
+            &theme,
+        );
+
+        assert_eq!(refined.len(), 2);
+        assert!(refined.contains_key(&3));
+        assert!(refined.contains_key(&4));
+        assert_ne!(warm_field.spans[1..], cold_field.spans[1..]);
+        assert_eq!(refined.get(&4), Some(&direct[3]));
+        assert_eq!(warm_field.spans[1..], direct[3]);
+    }
+
+    #[test]
+    fn file_text_drift_rejects_the_entire_full_file_style_map() {
+        let theme = dark_theme();
+        let parsed = parse_unified_diff(
+            "\
+--- a/item.py
++++ b/item.py
+@@ -3,2 +3,2 @@
+     \"\"\"
+-    field = 0
++    field = 1
+",
+        );
+        let drifted_file_text = "\
+class Item:
+    \"\"\"Summary.
+    \"\"\"
+    field = 2
+";
+
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("item.py"),
+                drifted_file_text,
+                &parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_refinement_preserves_delete_line_spans() {
+        let theme = dark_theme();
+        let file_text = "\
+class Item:
+    \"\"\"Summary.
+    \"\"\"
+    field = 1
+";
+        let parsed = parse_unified_diff(
+            "\
+--- a/item.py
++++ b/item.py
+@@ -3,2 +3,2 @@
+     \"\"\"
+-    field = 0
++    field = 1
+",
+        );
+        let refined = compute_file_scoped_styles(
+            Path::new("item.py"),
+            file_text,
+            &parsed.hunks,
+            theme.syntax_theme,
+        )
+        .expect("verified full-file styles");
+
+        let cold = render_parsed_diff(&parsed, &theme, None);
+        let warm = render_parsed_diff(&parsed, &theme, Some(&refined));
+
+        assert_eq!(
+            find_rendered_line(&warm, "-    field = 0").spans,
+            find_rendered_line(&cold, "-    field = 0").spans
+        );
+    }
+
+    #[test]
+    fn full_file_duplicate_new_lines_reject_conflicts_and_dedupe_identical_text() {
+        let theme = dark_theme();
+        let conflicting = parse_unified_diff(
+            "\
+--- a/value.py
++++ b/value.py
+@@ -1 +1 @@
+ value = 1
+@@ -1 +1 @@
+ value = 2
+",
+        );
+        let identical = parse_unified_diff(
+            "\
+--- a/value.py
++++ b/value.py
+@@ -1 +1 @@
+ value = 1
+@@ -1 +1 @@
+ value = 1
+",
+        );
+
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.py"),
+                "value = 1\n",
+                &conflicting.hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+
+        let deduped = compute_file_scoped_styles(
+            Path::new("value.py"),
+            "value = 1\n",
+            &identical.hunks,
+            theme.syntax_theme,
+        )
+        .expect("identical duplicate");
+        assert_eq!(deduped.len(), 1);
+        assert!(deduped.contains_key(&1));
+    }
+
+    #[test]
+    fn full_file_invalid_new_line_none_is_rejected() {
+        let theme = dark_theme();
+        let hunks = vec![DiffHunk {
+            header: "@@ -1 +1 @@".to_owned(),
+            entries: vec![DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Context,
+                old_line: Some(1),
+                new_line: None,
+                content: "value = 1".to_owned(),
+            })],
+        }];
+
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.py"),
+                "value = 1\n",
+                &hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_invalid_new_line_zero_is_rejected() {
+        let theme = dark_theme();
+        let hunks = vec![DiffHunk {
+            header: "@@ -0,0 +0 @@".to_owned(),
+            entries: vec![DiffHunkEntry::Source(DiffSourceLine {
+                kind: DiffLineKind::Insert,
+                old_line: None,
+                new_line: Some(0),
+                content: "value = 1".to_owned(),
+            })],
+        }];
+
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.py"),
+                "value = 1\n",
+                &hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_invalid_new_line_mixed_with_valid_rejects_entire_map() {
+        let theme = dark_theme();
+        let hunks = vec![DiffHunk {
+            header: "@@ -1,2 +1,2 @@".to_owned(),
+            entries: vec![
+                DiffHunkEntry::Source(DiffSourceLine {
+                    kind: DiffLineKind::Insert,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "value = 1".to_owned(),
+                }),
+                DiffHunkEntry::Source(DiffSourceLine {
+                    kind: DiffLineKind::Context,
+                    old_line: Some(2),
+                    new_line: None,
+                    content: "ignored = 2".to_owned(),
+                }),
+            ],
+        }];
+
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.py"),
+                "value = 1\nignored = 2\n",
+                &hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_missing_expected_line_beyond_eof_is_rejected() {
+        let theme = dark_theme();
+        let parsed = parse_unified_diff(
+            "\
+--- a/value.py
++++ b/value.py
+@@ -2 +2 @@
+ expected = 2
+",
+        );
+
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.py"),
+                "only_line = 1\n",
+                &parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_delete_only_hunks_produce_an_empty_style_map() {
+        let theme = dark_theme();
+        let parsed = parse_unified_diff(
+            "\
+--- a/value.py
++++ /dev/null
+@@ -1 +0,0 @@
+-removed = 1
+",
+        );
+
+        let refined = compute_file_scoped_styles(
+            Path::new("value.py"),
+            "",
+            &parsed.hunks,
+            theme.syntax_theme,
+        )
+        .expect("delete-only diff");
+
+        assert!(refined.is_empty());
+    }
+
+    #[test]
+    fn full_file_guardrails_reject_total_bytes_above_limit() {
+        let theme = dark_theme();
+        let source_line = "x".repeat(MAX_HIGHLIGHT_LINE_BYTES - 1);
+        let parsed = parse_unified_diff(&format!(
+            "--- /dev/null\n+++ b/value.rs\n@@ -0,0 +1 @@\n+{source_line}\n"
+        ));
+        let exact_bytes =
+            format!("{source_line}\n").repeat(MAX_HIGHLIGHT_BYTES / MAX_HIGHLIGHT_LINE_BYTES);
+        let over_bytes =
+            format!("{source_line}\n").repeat(MAX_HIGHLIGHT_BYTES / MAX_HIGHLIGHT_LINE_BYTES + 1);
+
+        assert_eq!(exact_bytes.len(), MAX_HIGHLIGHT_BYTES);
+        assert_eq!(exact_bytes.lines().count(), 128);
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.rs"),
+                &exact_bytes,
+                &parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_some()
+        );
+        assert!(over_bytes.len() > MAX_HIGHLIGHT_BYTES);
+        assert!(over_bytes.lines().count() < MAX_HIGHLIGHT_LINES);
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.rs"),
+                &over_bytes,
+                &parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_guardrails_reject_lines_above_byte_limit() {
+        let theme = dark_theme();
+        let exact_line = "x".repeat(MAX_HIGHLIGHT_LINE_BYTES);
+        let exact_parsed = parse_unified_diff(&format!(
+            "--- /dev/null\n+++ b/value.rs\n@@ -0,0 +1 @@\n+{exact_line}\n"
+        ));
+        let overlong_line = "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1);
+        let overlong_parsed = parse_unified_diff(&format!(
+            "--- /dev/null\n+++ b/value.rs\n@@ -0,0 +1 @@\n+{overlong_line}\n"
+        ));
+
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.rs"),
+                &exact_line,
+                &exact_parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_some()
+        );
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.rs"),
+                &overlong_line,
+                &overlong_parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_guardrails_reject_too_many_lines() {
+        let theme = dark_theme();
+        let parsed = parse_unified_diff(
+            "\
+--- /dev/null
++++ b/value.rs
+@@ -0,0 +1 @@
++x
+",
+        );
+        let mut over_lines = "x\n".repeat(MAX_HIGHLIGHT_LINES);
+        over_lines.push('x');
+
+        assert_eq!(over_lines.lines().count(), MAX_HIGHLIGHT_LINES + 1);
+        assert!(
+            compute_file_scoped_styles(
+                Path::new("value.rs"),
+                &over_lines,
+                &parsed.hunks,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn full_file_walk_stops_immediately_after_the_highest_needed_line() {
+        let theme = dark_theme();
+        let parsed = parse_unified_diff(
+            "\
+--- a/value.py
++++ b/value.py
+@@ -2 +2 @@
+ wanted = 2
+",
+        );
+        let pathological_tail = "\"\"\"unterminated content after the requested range";
+        let file_text = format!("prefix = 1\nwanted = 2\n{pathological_tail}\n");
+        let mut highlighted_lines = 0usize;
+
+        let refined = super::compute_file_scoped_styles_with(
+            Path::new("value.py"),
+            &file_text,
+            &parsed.hunks,
+            theme.syntax_theme,
+            |highlighter, text| {
+                assert_ne!(text, pathological_tail);
+                highlighted_lines += 1;
+                highlighter.highlight_line(text)
+            },
+        )
+        .expect("bounded full-file pass");
+
+        assert_eq!(highlighted_lines, 2);
+        assert_eq!(refined.len(), 1);
+        assert!(refined.contains_key(&2));
+    }
+
+    #[test]
+    fn full_file_styles_preserve_whitespace_and_strip_structural_crlf() {
+        let theme = dark_theme();
+        let parsed = parse_unified_diff(concat!(
+            "--- a/value.py\r\n",
+            "+++ b/value.py\r\n",
+            "@@ -1,2 +1,2 @@\r\n",
+            " value = 1\r\n",
+            "     field = 2  \r\n",
+        ));
+        let refined = compute_file_scoped_styles(
+            Path::new("value.py"),
+            "value = 1\r\n    field = 2  ",
+            &parsed.hunks,
+            theme.syntax_theme,
+        )
+        .expect("CRLF full-file styles");
+
+        assert_eq!(refined.len(), 2);
+        assert_eq!(
+            refined[&2]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    field = 2  "
+        );
+        assert!(
+            refined
+                .values()
+                .flatten()
+                .all(|span| !span.content.contains('\r'))
         );
     }
 }
