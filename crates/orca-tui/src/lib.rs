@@ -14,6 +14,7 @@ pub mod commands;
 mod composer_input_actions;
 mod composer_textarea;
 pub mod diff;
+mod diff_highlight;
 mod display_text;
 mod frame_scheduler;
 mod global_actions;
