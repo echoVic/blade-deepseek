@@ -6,6 +6,7 @@ use super::{
     SurfaceReducerError, SurfaceReducerState, SurfaceScope, ThreadOwnerEpoch, preflight_batch,
     reduce_batch,
 };
+use std::collections::VecDeque;
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum SurfaceCommitError {
@@ -56,6 +57,81 @@ struct ColdOwnerTakeoverAuthority {
     recoverable_operations: Vec<super::SurfaceOperationId>,
 }
 
+#[derive(Default)]
+struct BoundedPublicationSuffix {
+    batches: VecDeque<SurfaceCommitBatch>,
+    encoded_bytes: VecDeque<u64>,
+    events: u64,
+    bytes: u64,
+}
+
+impl BoundedPublicationSuffix {
+    fn from_committed(committed: Vec<SurfaceCommitBatch>) -> Self {
+        let mut suffix = Self::default();
+        let mut expected_after = None;
+        for batch in committed.into_iter().rev() {
+            if expected_after
+                .as_ref()
+                .is_some_and(|expected| expected != &batch.cursor_after)
+            {
+                break;
+            }
+            let batch_events = batch.event_count as u64;
+            let batch_bytes = super::canonical_batch_encoded_bytes(&batch);
+            if suffix.events.saturating_add(batch_events) > super::SURFACE_RETAINED_EVENT_LIMIT
+                || suffix.bytes.saturating_add(batch_bytes) > super::SURFACE_RETAINED_BYTE_LIMIT
+            {
+                break;
+            }
+            expected_after = Some(batch.cursor_before.clone());
+            suffix.events += batch_events;
+            suffix.bytes += batch_bytes;
+            suffix.batches.push_front(batch);
+            suffix.encoded_bytes.push_front(batch_bytes);
+        }
+        suffix
+    }
+
+    fn push(&mut self, batch: &SurfaceCommitBatch) {
+        if self
+            .batches
+            .back()
+            .is_some_and(|previous| previous.cursor_after != batch.cursor_before)
+        {
+            self.clear();
+        }
+        let batch_bytes = super::canonical_batch_encoded_bytes(batch);
+        self.events = self.events.saturating_add(batch.event_count as u64);
+        self.bytes = self.bytes.saturating_add(batch_bytes);
+        self.batches.push_back(batch.clone());
+        self.encoded_bytes.push_back(batch_bytes);
+        while self.events > super::SURFACE_RETAINED_EVENT_LIMIT
+            || self.bytes > super::SURFACE_RETAINED_BYTE_LIMIT
+        {
+            let Some(expired) = self.batches.pop_front() else {
+                break;
+            };
+            let expired_bytes = self
+                .encoded_bytes
+                .pop_front()
+                .expect("publication bytes track every retained batch");
+            self.events = self.events.saturating_sub(expired.event_count as u64);
+            self.bytes = self.bytes.saturating_sub(expired_bytes);
+        }
+    }
+
+    fn make_contiguous(&mut self) -> &[SurfaceCommitBatch] {
+        self.batches.make_contiguous()
+    }
+
+    fn clear(&mut self) {
+        self.batches.clear();
+        self.encoded_bytes.clear();
+        self.events = 0;
+        self.bytes = 0;
+    }
+}
+
 impl ColdOwnerTakeoverAuthority {
     fn authorizes(
         &self,
@@ -87,6 +163,8 @@ impl ColdOwnerTakeoverAuthority {
 pub struct RuntimeCommitCoordinator<'owner, L> {
     ledger: L,
     state: SurfaceReducerState,
+    surface_hub: Option<super::SurfaceHub>,
+    recovered_publications: BoundedPublicationSuffix,
     owner_lease: &'owner ExclusiveOwnerLease,
     owner_epoch: ThreadOwnerEpoch,
     actor_control_permit: SurfacePublisherPermit,
@@ -176,6 +254,8 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         Ok(Self {
             ledger,
             state,
+            surface_hub: None,
+            recovered_publications: BoundedPublicationSuffix::default(),
             owner_lease,
             owner_epoch: ThreadOwnerEpoch::new(owner_lease.owner_epoch()),
             issued_permits: vec![actor_control_permit.clone()],
@@ -203,9 +283,11 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
         let recovered = ledger
             .recover_batches()
             .map_err(SurfaceCommitError::Ledger)?;
+        let committed = recovered.committed;
+        let prepared = recovered.prepared;
         let current_owner_epoch = ThreadOwnerEpoch::new(owner_lease.owner_epoch());
         let mut materialized_takeover = None;
-        for batch in &recovered.committed {
+        for batch in &committed {
             let candidate_takeover =
                 materialized_takeover_authority(&state, batch, current_owner_epoch);
             state = match reduce_batch(SurfaceReduceMode::Rematerialization, &state, batch) {
@@ -222,9 +304,11 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
 
         let cold_takeover_authority =
             recovered_cold_takeover_authority(&state, current_owner_epoch, materialized_takeover);
+        let recovered_publications = BoundedPublicationSuffix::from_committed(committed);
         let mut coordinator = Self::new_with_owner_lease(ledger, state, owner_lease)?;
+        coordinator.recovered_publications = recovered_publications;
         coordinator.cold_takeover_authority = cold_takeover_authority;
-        if let Some(batch) = recovered.prepared {
+        if let Some(batch) = prepared {
             match reduce_batch(
                 SurfaceReduceMode::Rematerialization,
                 &coordinator.state,
@@ -296,6 +380,24 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
 
     pub fn state(&self) -> &SurfaceReducerState {
         &self.state
+    }
+
+    pub fn bind_surface_hub(
+        &mut self,
+        hub: super::SurfaceHub,
+    ) -> Result<(), super::SurfaceHubBindError> {
+        if self.surface_hub.is_some() {
+            return Err(super::SurfaceHubBindError::AlreadyBound);
+        }
+        if hub.thread_id() != self.state.snapshot().thread.thread_id {
+            return Err(super::SurfaceHubBindError::WrongThread);
+        }
+        let snapshot = std::sync::Arc::new(self.state.snapshot().clone());
+        let publications = self.recovered_publications.make_contiguous();
+        hub.repair_committed(snapshot, publications);
+        self.surface_hub = Some(hub);
+        self.recovered_publications.clear();
+        Ok(())
     }
 
     pub fn next_sequence(&self) -> u64 {
@@ -1299,6 +1401,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         if self.recovered_prepared.as_ref() == Some(batch) {
             self.recovered_prepared = None;
         }
+        if let Some(hub) = &self.surface_hub {
+            hub.apply_committed(std::sync::Arc::new(self.state.snapshot().clone()), batch);
+        } else {
+            self.recovered_publications.push(batch);
+        }
         Ok(SurfaceCommitApplied { receipt })
     }
 
@@ -1347,6 +1454,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.state = state;
         self.pending_projection = None;
         self.incomplete = None;
+        if let Some(hub) = &self.surface_hub {
+            hub.apply_committed(std::sync::Arc::new(self.state.snapshot().clone()), &batch);
+        } else {
+            self.recovered_publications.push(&batch);
+        }
         Ok(SurfaceCommitApplied { receipt })
     }
 
@@ -3383,5 +3495,53 @@ mod tests {
         coordinator.retry_projection(&token).unwrap();
         assert_eq!(coordinator.ledger().writes, 2);
         assert_eq!(coordinator.state().snapshot().cursor.next_seq.get(), 1);
+    }
+
+    #[test]
+    fn unbound_publication_suffix_is_latest_contiguous_and_budget_bounded() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let template = test_batch(&state);
+        let mut committed = Vec::new();
+        let mut cursor = template.cursor_before.clone();
+        for index in 0..10_u64 {
+            let mut batch = template.clone();
+            batch.cursor_before = cursor.clone();
+            batch.cursor_after = super::super::SurfaceCursor {
+                next_seq: super::super::SequenceNumber::new(
+                    cursor.next_seq.get() + super::super::SURFACE_COMMIT_BATCH_EVENT_LIMIT,
+                ),
+                ..cursor.clone()
+            };
+            batch.event_count = super::super::SURFACE_COMMIT_BATCH_EVENT_LIMIT as u32;
+            batch.batch_digest = digest(index as u8);
+            cursor = batch.cursor_after.clone();
+            committed.push(batch);
+        }
+        let expected_first = committed[2].batch_digest.clone();
+
+        let suffix = BoundedPublicationSuffix::from_committed(committed);
+
+        assert_eq!(suffix.batches.len(), 8);
+        assert_eq!(suffix.events, super::super::SURFACE_RETAINED_EVENT_LIMIT);
+        assert!(suffix.bytes <= super::super::SURFACE_RETAINED_BYTE_LIMIT);
+        assert_eq!(suffix.batches.front().unwrap().batch_digest, expected_first);
+
+        let mut disconnected = Vec::new();
+        let mut first = template.clone();
+        first.cursor_after.next_seq = super::super::SequenceNumber::new(1);
+        let mut tail_first = template.clone();
+        tail_first.cursor_before.next_seq = super::super::SequenceNumber::new(5);
+        tail_first.cursor_after.next_seq = super::super::SequenceNumber::new(6);
+        let mut tail_second = template;
+        tail_second.cursor_before = tail_first.cursor_after.clone();
+        tail_second.cursor_after.next_seq = super::super::SequenceNumber::new(7);
+        disconnected.extend([first, tail_first, tail_second]);
+
+        let suffix = BoundedPublicationSuffix::from_committed(disconnected);
+        assert_eq!(suffix.batches.len(), 2);
+        assert_eq!(
+            suffix.batches.front().unwrap().cursor_before.next_seq.get(),
+            5
+        );
     }
 }

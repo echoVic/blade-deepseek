@@ -1,6 +1,6 @@
 use super::*;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const SURFACE_COMMIT_BATCH_EVENT_LIMIT: u64 = 1_024;
 pub const SURFACE_COMMIT_BATCH_BYTE_LIMIT: u64 = 8_388_608;
@@ -162,6 +162,30 @@ impl SurfaceAttachAuthority {
             maximum_interaction_kinds,
         }
     }
+
+    pub(crate) fn host_incarnation(&self) -> &HostIncarnation {
+        &self.host_incarnation
+    }
+
+    pub(crate) fn thread_id(&self) -> &SurfaceThreadId {
+        &self.thread_id
+    }
+
+    pub(crate) fn role(&self) -> SurfaceAttachmentRole {
+        self.role
+    }
+
+    pub(crate) fn maximum_capabilities(&self) -> &NonEmptySet<SurfaceCapability> {
+        &self.maximum_capabilities
+    }
+
+    pub(crate) fn required_capabilities(&self) -> &NonEmptySet<SurfaceCapability> {
+        &self.required_capabilities
+    }
+
+    pub(crate) fn maximum_interaction_kinds(&self) -> &Set<SurfaceInteractionKind> {
+        &self.maximum_interaction_kinds
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,12 +196,33 @@ pub enum AttachDeniedReason {
 
 #[allow(dead_code)]
 #[derive(Clone)]
-pub struct SurfaceSubscriptionHandle(Arc<()>);
+pub struct SurfaceSubscriptionHandle(Arc<SurfaceSubscriptionLease>);
+
+struct SurfaceSubscriptionLease {
+    attachment_id: SurfaceAttachmentId,
+    reclaim: Box<dyn Fn(&SurfaceAttachmentId) + Send + Sync>,
+}
+
+impl Drop for SurfaceSubscriptionLease {
+    fn drop(&mut self) {
+        (self.reclaim)(&self.attachment_id);
+    }
+}
 
 #[allow(dead_code)]
 impl SurfaceSubscriptionHandle {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(()))
+    pub(crate) fn new(
+        attachment_id: SurfaceAttachmentId,
+        reclaim: impl Fn(&SurfaceAttachmentId) + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(SurfaceSubscriptionLease {
+            attachment_id,
+            reclaim: Box::new(reclaim),
+        }))
+    }
+
+    pub(crate) fn attachment_id(&self) -> &SurfaceAttachmentId {
+        &self.0.attachment_id
     }
 }
 
@@ -189,6 +234,8 @@ pub struct RuntimeSurfaceClientHandle {
     host_incarnation: HostIncarnation,
     capabilities: SurfaceAttachmentGrant,
     connection_id: Option<SurfaceConnectionId>,
+    hub_scope: Arc<()>,
+    detached_receipt: Arc<Mutex<Option<DetachRevocationReceipt>>>,
 }
 
 #[allow(dead_code)]
@@ -199,6 +246,7 @@ impl RuntimeSurfaceClientHandle {
         host_incarnation: HostIncarnation,
         capabilities: SurfaceAttachmentGrant,
         connection_id: Option<SurfaceConnectionId>,
+        hub_scope: Arc<()>,
     ) -> Self {
         Self {
             attachment_id,
@@ -206,7 +254,51 @@ impl RuntimeSurfaceClientHandle {
             host_incarnation,
             capabilities,
             connection_id,
+            hub_scope,
+            detached_receipt: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn attachment_id(&self) -> &SurfaceAttachmentId {
+        &self.attachment_id
+    }
+
+    pub(crate) fn grant(&self) -> &SurfaceAttachmentGrant {
+        &self.capabilities
+    }
+
+    pub(crate) fn belongs_to(
+        &self,
+        hub_scope: &Arc<()>,
+        thread_id: &SurfaceThreadId,
+        host_incarnation: &HostIncarnation,
+    ) -> bool {
+        Arc::ptr_eq(&self.hub_scope, hub_scope)
+            && &self.thread_id == thread_id
+            && &self.host_incarnation == host_incarnation
+            && self.attachment_id == self.capabilities.attachment_id
+    }
+
+    pub(crate) fn detached_receipt(&self) -> Option<DetachRevocationReceipt> {
+        self.detached_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn remember_detached(
+        &self,
+        receipt: DetachRevocationReceipt,
+    ) -> Result<(), DetachRevocationReceipt> {
+        let mut detached = self
+            .detached_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = detached.as_ref() {
+            return Err(existing.clone());
+        }
+        *detached = Some(receipt);
+        Ok(())
     }
 }
 
@@ -2927,11 +3019,25 @@ impl RuntimeSurfaceHandle {
         thread_id: SurfaceThreadId,
         authority: SurfaceAttachAuthority,
     ) -> Self {
+        debug_assert_eq!(&host_incarnation, authority.host_incarnation());
+        debug_assert_eq!(&thread_id, authority.thread_id());
         Self {
             host_incarnation,
             thread_id,
             authority,
         }
+    }
+
+    pub(crate) fn host_incarnation(&self) -> &HostIncarnation {
+        &self.host_incarnation
+    }
+
+    pub(crate) fn thread_id(&self) -> &SurfaceThreadId {
+        &self.thread_id
+    }
+
+    pub(crate) fn authority(&self) -> &SurfaceAttachAuthority {
+        &self.authority
     }
 }
 

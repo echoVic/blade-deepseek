@@ -1,5 +1,6 @@
 mod commands;
 mod commit;
+mod hub;
 mod identity;
 mod interaction;
 mod operation;
@@ -9,6 +10,7 @@ mod store;
 
 pub use commands::*;
 pub use commit::*;
+pub use hub::*;
 pub use identity::*;
 pub use interaction::*;
 pub use operation::*;
