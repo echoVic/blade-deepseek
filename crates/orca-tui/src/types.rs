@@ -2535,6 +2535,8 @@ mod tests {
 
     #[test]
     fn retaining_messages_rebases_watermarks_and_cache_entries() {
+        use std::cell::RefCell;
+
         let mut state = state();
         state.push_message(ChatMessage::User("keep before".to_string()));
         state.push_message(ChatMessage::System("remove before".to_string()));
@@ -2547,9 +2549,10 @@ mod tests {
             &state.message_revisions,
             40,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| vec![ratatui::text::Line::from(format!("{message:?}"))],
+            |_, message, _, _, _, _| vec![ratatui::text::Line::from(format!("{message:?}"))],
         );
         assert_eq!(state.transcript_render_cache.populated_len(), 3);
 
@@ -2563,6 +2566,25 @@ mod tests {
         assert_eq!(state.flushed_count, 1);
         assert_eq!(state.transcript_render_cache.len(), 2);
         assert_eq!(state.transcript_render_cache.populated_len(), 2);
+
+        state.touch_message(1);
+        let built_indices = RefCell::new(Vec::new());
+        state.transcript_render_cache.prepare(
+            &state.messages,
+            &state.message_revisions,
+            40,
+            &theme,
+            theme.syntax_theme_revision,
+            0,
+            false,
+            |index, message, _, _, _, _| {
+                built_indices.borrow_mut().push(index);
+                vec![ratatui::text::Line::from(format!("{message:?}"))]
+            },
+        );
+
+        assert_eq!(*built_indices.borrow(), vec![1]);
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1);
     }
 
     #[test]
@@ -3132,9 +3154,10 @@ mod tests {
             &state.message_revisions,
             40,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |message, _, _, _, _| match message {
+            |_, message, _, _, _, _| match message {
                 ChatMessage::Assistant(text) => vec![ratatui::text::Line::from(text.clone())],
                 _ => unreachable!(),
             },

@@ -496,9 +496,10 @@ mod tests {
             &state.message_revisions,
             20,
             &theme,
+            theme.syntax_theme_revision,
             0,
             false,
-            |_, _, _, _, _| vec![Line::from("hello world")],
+            |_, _, _, _, _, _| vec![Line::from("hello world")],
         );
         state.transcript_area = Some(Rect::new(0, 0, 20, 5));
         state.viewport_base_row = 0;

@@ -456,9 +456,10 @@ pub(crate) fn render_live_messages(
             &welcome_revisions,
             width,
             theme,
+            theme.syntax_theme_revision,
             state.tick,
             false,
-            |_, _, _, _, _| lines.clone(),
+            |_, _, _, _, _, _| lines.clone(),
         );
         let requested_scroll = if state.auto_scroll {
             usize::MAX
@@ -489,9 +490,10 @@ pub(crate) fn render_live_messages(
         &state.message_revisions,
         width,
         theme,
+        theme.syntax_theme_revision,
         state.tick,
         false,
-        |message, theme, width, tick, force_expand| {
+        |_, message, theme, width, tick, force_expand| {
             build_lines_for_messages(
                 std::slice::from_ref(message),
                 theme,
