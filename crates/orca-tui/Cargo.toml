@@ -24,6 +24,8 @@ pulldown-cmark = { workspace = true }
 unicode-width = { workspace = true }
 dirs = { workspace = true }
 crossbeam-channel = { workspace = true }
+syntect = { workspace = true }
+two-face = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

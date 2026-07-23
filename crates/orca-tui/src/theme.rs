@@ -2,6 +2,8 @@ use ratatui::style::Color;
 
 use orca_core::config::ThemeName;
 
+use crate::syntax_highlight::SyntaxTheme;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub border: Color,
@@ -17,10 +19,19 @@ pub struct Theme {
     pub diff_remove: Color,
     /// Background for the mouse text selection in the transcript.
     pub selection_bg: Color,
+    pub(crate) syntax_theme: SyntaxTheme,
+    pub(crate) syntax_theme_revision: u64,
 }
 
 impl Theme {
     pub fn named(name: ThemeName) -> Self {
+        let syntax_theme = match name {
+            ThemeName::Dark => SyntaxTheme::OneHalfDark,
+            ThemeName::Light => SyntaxTheme::OneHalfLight,
+            ThemeName::Solarized => SyntaxTheme::SolarizedDark,
+            ThemeName::Catppuccin => SyntaxTheme::CatppuccinMocha,
+        };
+
         match name {
             // DeepSeek-blue truecolor palette. Brand accent #4D6BFE drives
             // borders, selection, and the user prompt.
@@ -38,6 +49,8 @@ impl Theme {
                 diff_remove: Color::Rgb(214, 81, 81),
                 // Muted brand blue: keeps every foreground legible.
                 selection_bg: Color::Rgb(46, 62, 132),
+                syntax_theme,
+                syntax_theme_revision: syntax_theme.revision(),
             },
             ThemeName::Light => Self {
                 border: Color::Rgb(58, 86, 230),
@@ -52,6 +65,8 @@ impl Theme {
                 diff_add: Color::Rgb(31, 142, 86),
                 diff_remove: Color::Rgb(196, 52, 52),
                 selection_bg: Color::Rgb(198, 210, 250),
+                syntax_theme,
+                syntax_theme_revision: syntax_theme.revision(),
             },
             ThemeName::Solarized => Self {
                 border: Color::Rgb(38, 139, 210),
@@ -67,6 +82,8 @@ impl Theme {
                 diff_remove: Color::Rgb(220, 50, 47),
                 // base02, Solarized's canonical selection background.
                 selection_bg: Color::Rgb(7, 54, 66),
+                syntax_theme,
+                syntax_theme_revision: syntax_theme.revision(),
             },
             ThemeName::Catppuccin => Self {
                 border: Color::Rgb(203, 166, 247),
@@ -82,7 +99,33 @@ impl Theme {
                 diff_remove: Color::Rgb(243, 139, 168),
                 // surface2 from the Mocha palette.
                 selection_bg: Color::Rgb(88, 91, 112),
+                syntax_theme,
+                syntax_theme_revision: syntax_theme.revision(),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use orca_core::config::ThemeName;
+
+    use super::Theme;
+    use crate::syntax_highlight::SyntaxTheme;
+
+    #[test]
+    fn named_themes_map_to_matching_syntax_themes_and_revisions() {
+        let cases = [
+            (ThemeName::Dark, SyntaxTheme::OneHalfDark),
+            (ThemeName::Light, SyntaxTheme::OneHalfLight),
+            (ThemeName::Solarized, SyntaxTheme::SolarizedDark),
+            (ThemeName::Catppuccin, SyntaxTheme::CatppuccinMocha),
+        ];
+
+        for (name, syntax_theme) in cases {
+            let theme = Theme::named(name);
+            assert_eq!(theme.syntax_theme, syntax_theme);
+            assert_eq!(theme.syntax_theme_revision, syntax_theme.revision());
         }
     }
 }
