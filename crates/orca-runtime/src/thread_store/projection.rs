@@ -17,9 +17,21 @@ use crate::tool_item_projection::{
 };
 
 use super::types::{
-    SessionSummary, StoredConversationRecord, StoredMessage, StoredThreadItem, StoredThreadSummary,
-    StoredThreadTurn, TurnItemsView,
+    SessionRecord, SessionSummary, StoredConversationRecord, StoredMessage, StoredThreadItem,
+    StoredThreadSummary, StoredThreadTurn, TurnItemsView,
 };
+
+pub(crate) fn is_surface_coordinator_record(record: &SessionRecord) -> bool {
+    matches!(
+        record,
+        SessionRecord::SurfaceCommitPrepared { .. }
+            | SessionRecord::SurfaceCommitCommitted { .. }
+            | SessionRecord::SurfaceOwnerEpoch { .. }
+            | SessionRecord::SurfaceFinalizeIntent { .. }
+            | SessionRecord::SurfaceSettlement { .. }
+            | SessionRecord::SurfaceShutdownBarrier { .. }
+    )
+}
 
 pub(crate) fn message_to_thread_json(message: &Message) -> Value {
     match message {

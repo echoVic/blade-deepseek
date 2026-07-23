@@ -1,0 +1,3098 @@
+use super::*;
+use crate::thread_store::JsonlThreadStore;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SurfaceLedgerError {
+    AppendFailed,
+    PartialAppend,
+    CheckpointFailed,
+    CommitIdentityConflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableBatchReceipt {
+    pub commit_id: SurfaceCommitId,
+    pub durable_revision: DurableRevision,
+    pub event_count: u32,
+    pub batch_digest: Sha256Digest,
+    pub cursor_after: SurfaceCursor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedSurfaceCommit {
+    pub commit_id: SurfaceCommitId,
+    pub event_count: u32,
+    pub batch_digest: Sha256Digest,
+    pub cursor_before: SurfaceCursor,
+    pub cursor_after: SurfaceCursor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitProbe {
+    Absent,
+    Prepared(PreparedSurfaceCommit),
+    Present(DurableBatchReceipt),
+    Conflict,
+}
+
+pub trait SurfaceCommitLedger {
+    fn append_complete_batch(
+        &mut self,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<DurableBatchReceipt, SurfaceLedgerError>;
+
+    fn checkpoint(&mut self, receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError>;
+
+    fn probe_commit(&self, commit_id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe;
+}
+
+#[derive(Clone, PartialEq)]
+pub struct RecoveredSurfaceBatches {
+    pub committed: Vec<SurfaceCommitBatch>,
+    pub prepared: Option<SurfaceCommitBatch>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredBackgroundFenceV1 {
+    operation_fence: SurfaceOperationFence,
+    background_owner_token: [u8; 32],
+}
+
+impl StoredBackgroundFenceV1 {
+    fn from_live(fence: &SurfaceBackgroundFence) -> Result<Self, SurfaceLedgerError> {
+        let value = serde_json::to_value(canonical_background_fence_v1(fence))
+            .map_err(|_| SurfaceLedgerError::AppendFailed)?;
+        serde_json::from_value(value).map_err(|_| SurfaceLedgerError::AppendFailed)
+    }
+
+    fn into_live(self) -> SurfaceBackgroundFence {
+        SurfaceBackgroundFence {
+            operation_fence: self.operation_fence,
+            background_owner_token: SurfaceBackgroundOwnerToken::new(self.background_owner_token),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredScopeV1 {
+    Thread,
+    Operation {
+        operation_id: SurfaceOperationId,
+    },
+    Generation {
+        fence: SurfaceOperationFence,
+    },
+    Background {
+        fence: StoredBackgroundFenceV1,
+    },
+    Goal {
+        goal_id: SurfaceGoalId,
+        causative_generation: Option<SurfaceOperationFence>,
+    },
+}
+
+impl StoredScopeV1 {
+    fn from_live(scope: &SurfaceScope) -> Result<Self, SurfaceLedgerError> {
+        Ok(match scope {
+            SurfaceScope::Thread => Self::Thread,
+            SurfaceScope::Operation { operation_id } => Self::Operation {
+                operation_id: operation_id.clone(),
+            },
+            SurfaceScope::Generation { fence } => Self::Generation {
+                fence: fence.clone(),
+            },
+            SurfaceScope::Background { fence } => Self::Background {
+                fence: StoredBackgroundFenceV1::from_live(fence)?,
+            },
+            SurfaceScope::Goal {
+                goal_id,
+                causative_generation,
+            } => Self::Goal {
+                goal_id: goal_id.clone(),
+                causative_generation: causative_generation.clone(),
+            },
+        })
+    }
+
+    fn into_live(self) -> SurfaceScope {
+        match self {
+            Self::Thread => SurfaceScope::Thread,
+            Self::Operation { operation_id } => SurfaceScope::Operation { operation_id },
+            Self::Generation { fence } => SurfaceScope::Generation { fence },
+            Self::Background { fence } => SurfaceScope::Background {
+                fence: fence.into_live(),
+            },
+            Self::Goal {
+                goal_id,
+                causative_generation,
+            } => SurfaceScope::Goal {
+                goal_id,
+                causative_generation,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredOperationPatchV1 {
+    Requested {
+        operation: OperationRecord,
+    },
+    ReservationQueueChanged {
+        operation_id: SurfaceOperationId,
+        reservation_sequence: SequenceNumber,
+        ready_for_admission: bool,
+        queue_position: u32,
+    },
+    Admitted {
+        operation_id: SurfaceOperationId,
+        logical_turn_id: SurfaceTurnId,
+        input: AdmittedInput,
+        first_generation: GenerationRecord,
+    },
+    InputBindingsResolved {
+        fence: SurfaceOperationFence,
+        input_item_id: SurfaceItemId,
+        fact: SurfaceResolvedInputFact,
+    },
+    InputBindingsFailed {
+        fence: SurfaceOperationFence,
+        input_item_id: SurfaceItemId,
+        code: InputResolutionErrorCode,
+        message: SafeDiagnosticText,
+    },
+    ControlIntentCommitted {
+        operation_id: SurfaceOperationId,
+        request_id: SurfaceRequestId,
+        intent: PendingControlIntent,
+    },
+    GenerationReserved {
+        generation: GenerationRecord,
+    },
+    GenerationStarted {
+        fence: SurfaceOperationFence,
+        witness: GenerationStartedWitness,
+    },
+    AgentLoopTurnStarted {
+        turn: SurfaceAgentLoopTurn,
+    },
+    ModelRouteSelected {
+        fence: SurfaceOperationFence,
+        requested_model: NonEmptyText,
+        actual_model: NonEmptyText,
+        reason: NonEmptyText,
+    },
+    VerificationStarted {
+        fence: SurfaceOperationFence,
+        verification_id: UuidV7,
+        command: NonEmptyText,
+    },
+    VerificationCompleted {
+        fence: SurfaceOperationFence,
+        verification_id: UuidV7,
+        result: SurfaceVerificationResult,
+    },
+    GenerationStopped {
+        fence: SurfaceOperationFence,
+        reason: GenerationStopReason,
+        usage_delta: UsageTotals,
+    },
+    GenerationTransferred {
+        fence: SurfaceOperationFence,
+        background_fence: StoredBackgroundFenceV1,
+        task_id: Option<SurfaceTaskId>,
+    },
+    Suspended {
+        operation_id: SurfaceOperationId,
+        cause: SuspensionCause,
+    },
+    SuspensionRebasedAfterUnstartedResume {
+        operation_id: SurfaceOperationId,
+        previous_cause: SuspensionCause,
+        replacement_fence: SurfaceOperationFence,
+        rebased_cause: SuspensionCause,
+    },
+    RecoveryRequired {
+        operation_id: SurfaceOperationId,
+        last_generation: SurfaceGenerationId,
+    },
+    FinalizationStarted {
+        operation_id: SurfaceOperationId,
+        finalize_intent_id: SurfaceFinalizeIntentId,
+        terminal_commit_id: SurfaceCommitId,
+        selected_cause: OperationFinalizationCause,
+        suspended_cause: Option<SuspendedFinalizationCause>,
+        expected_settlements: Vec<SurfaceSettlementId>,
+    },
+    FinalizationSettlementRecorded {
+        operation_id: SurfaceOperationId,
+        finalize_intent_id: SurfaceFinalizeIntentId,
+        receipt: SurfaceSettlementReceipt,
+    },
+    FinalizationDegraded {
+        operation_id: SurfaceOperationId,
+        finalize_intent_id: SurfaceFinalizeIntentId,
+        cause: FinalizationDegradedCause,
+        last_error: DisplayText,
+    },
+    Terminal {
+        record: OperationTerminalRecord,
+    },
+}
+
+impl StoredOperationPatchV1 {
+    fn from_live(patch: &OperationPatch) -> Result<Self, SurfaceLedgerError> {
+        Ok(match patch {
+            OperationPatch::Requested { operation } => Self::Requested {
+                operation: operation.clone(),
+            },
+            OperationPatch::ReservationQueueChanged {
+                operation_id,
+                reservation_sequence,
+                ready_for_admission,
+                queue_position,
+            } => Self::ReservationQueueChanged {
+                operation_id: operation_id.clone(),
+                reservation_sequence: *reservation_sequence,
+                ready_for_admission: *ready_for_admission,
+                queue_position: *queue_position,
+            },
+            OperationPatch::Admitted {
+                operation_id,
+                logical_turn_id,
+                input,
+                first_generation,
+            } => Self::Admitted {
+                operation_id: operation_id.clone(),
+                logical_turn_id: logical_turn_id.clone(),
+                input: input.clone(),
+                first_generation: first_generation.clone(),
+            },
+            OperationPatch::InputBindingsResolved {
+                fence,
+                input_item_id,
+                fact,
+            } => Self::InputBindingsResolved {
+                fence: fence.clone(),
+                input_item_id: input_item_id.clone(),
+                fact: fact.clone(),
+            },
+            OperationPatch::InputBindingsFailed {
+                fence,
+                input_item_id,
+                code,
+                message,
+            } => Self::InputBindingsFailed {
+                fence: fence.clone(),
+                input_item_id: input_item_id.clone(),
+                code: *code,
+                message: message.clone(),
+            },
+            OperationPatch::ControlIntentCommitted {
+                operation_id,
+                request_id,
+                intent,
+            } => Self::ControlIntentCommitted {
+                operation_id: operation_id.clone(),
+                request_id: request_id.clone(),
+                intent: intent.clone(),
+            },
+            OperationPatch::GenerationReserved { generation } => Self::GenerationReserved {
+                generation: generation.clone(),
+            },
+            OperationPatch::GenerationStarted { fence, witness } => Self::GenerationStarted {
+                fence: fence.clone(),
+                witness: witness.clone(),
+            },
+            OperationPatch::AgentLoopTurnStarted { turn } => {
+                Self::AgentLoopTurnStarted { turn: turn.clone() }
+            }
+            OperationPatch::ModelRouteSelected {
+                fence,
+                requested_model,
+                actual_model,
+                reason,
+            } => Self::ModelRouteSelected {
+                fence: fence.clone(),
+                requested_model: requested_model.clone(),
+                actual_model: actual_model.clone(),
+                reason: reason.clone(),
+            },
+            OperationPatch::VerificationStarted {
+                fence,
+                verification_id,
+                command,
+            } => Self::VerificationStarted {
+                fence: fence.clone(),
+                verification_id: verification_id.clone(),
+                command: command.clone(),
+            },
+            OperationPatch::VerificationCompleted {
+                fence,
+                verification_id,
+                result,
+            } => Self::VerificationCompleted {
+                fence: fence.clone(),
+                verification_id: verification_id.clone(),
+                result: result.clone(),
+            },
+            OperationPatch::GenerationStopped {
+                fence,
+                reason,
+                usage_delta,
+            } => Self::GenerationStopped {
+                fence: fence.clone(),
+                reason: reason.clone(),
+                usage_delta: usage_delta.clone(),
+            },
+            OperationPatch::GenerationTransferred {
+                fence,
+                background_fence,
+                task_id,
+            } => Self::GenerationTransferred {
+                fence: fence.clone(),
+                background_fence: StoredBackgroundFenceV1::from_live(background_fence)?,
+                task_id: task_id.clone(),
+            },
+            OperationPatch::Suspended {
+                operation_id,
+                cause,
+            } => Self::Suspended {
+                operation_id: operation_id.clone(),
+                cause: cause.clone(),
+            },
+            OperationPatch::SuspensionRebasedAfterUnstartedResume {
+                operation_id,
+                previous_cause,
+                replacement_fence,
+                rebased_cause,
+            } => Self::SuspensionRebasedAfterUnstartedResume {
+                operation_id: operation_id.clone(),
+                previous_cause: previous_cause.clone(),
+                replacement_fence: replacement_fence.clone(),
+                rebased_cause: rebased_cause.clone(),
+            },
+            OperationPatch::RecoveryRequired {
+                operation_id,
+                last_generation,
+            } => Self::RecoveryRequired {
+                operation_id: operation_id.clone(),
+                last_generation: *last_generation,
+            },
+            OperationPatch::FinalizationStarted {
+                operation_id,
+                finalize_intent_id,
+                terminal_commit_id,
+                selected_cause,
+                suspended_cause,
+                expected_settlements,
+            } => Self::FinalizationStarted {
+                operation_id: operation_id.clone(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                terminal_commit_id: terminal_commit_id.clone(),
+                selected_cause: selected_cause.clone(),
+                suspended_cause: suspended_cause.clone(),
+                expected_settlements: expected_settlements.clone(),
+            },
+            OperationPatch::FinalizationSettlementRecorded {
+                operation_id,
+                finalize_intent_id,
+                receipt,
+            } => Self::FinalizationSettlementRecorded {
+                operation_id: operation_id.clone(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                receipt: receipt.clone(),
+            },
+            OperationPatch::FinalizationDegraded {
+                operation_id,
+                finalize_intent_id,
+                cause,
+                last_error,
+            } => Self::FinalizationDegraded {
+                operation_id: operation_id.clone(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                cause: cause.clone(),
+                last_error: last_error.clone(),
+            },
+            OperationPatch::Terminal { record } => Self::Terminal {
+                record: record.clone(),
+            },
+        })
+    }
+
+    fn into_live(self) -> OperationPatch {
+        match self {
+            Self::Requested { operation } => OperationPatch::Requested { operation },
+            Self::ReservationQueueChanged {
+                operation_id,
+                reservation_sequence,
+                ready_for_admission,
+                queue_position,
+            } => OperationPatch::ReservationQueueChanged {
+                operation_id,
+                reservation_sequence,
+                ready_for_admission,
+                queue_position,
+            },
+            Self::Admitted {
+                operation_id,
+                logical_turn_id,
+                input,
+                first_generation,
+            } => OperationPatch::Admitted {
+                operation_id,
+                logical_turn_id,
+                input,
+                first_generation,
+            },
+            Self::InputBindingsResolved {
+                fence,
+                input_item_id,
+                fact,
+            } => OperationPatch::InputBindingsResolved {
+                fence,
+                input_item_id,
+                fact,
+            },
+            Self::InputBindingsFailed {
+                fence,
+                input_item_id,
+                code,
+                message,
+            } => OperationPatch::InputBindingsFailed {
+                fence,
+                input_item_id,
+                code,
+                message,
+            },
+            Self::ControlIntentCommitted {
+                operation_id,
+                request_id,
+                intent,
+            } => OperationPatch::ControlIntentCommitted {
+                operation_id,
+                request_id,
+                intent,
+            },
+            Self::GenerationReserved { generation } => {
+                OperationPatch::GenerationReserved { generation }
+            }
+            Self::GenerationStarted { fence, witness } => {
+                OperationPatch::GenerationStarted { fence, witness }
+            }
+            Self::AgentLoopTurnStarted { turn } => OperationPatch::AgentLoopTurnStarted { turn },
+            Self::ModelRouteSelected {
+                fence,
+                requested_model,
+                actual_model,
+                reason,
+            } => OperationPatch::ModelRouteSelected {
+                fence,
+                requested_model,
+                actual_model,
+                reason,
+            },
+            Self::VerificationStarted {
+                fence,
+                verification_id,
+                command,
+            } => OperationPatch::VerificationStarted {
+                fence,
+                verification_id,
+                command,
+            },
+            Self::VerificationCompleted {
+                fence,
+                verification_id,
+                result,
+            } => OperationPatch::VerificationCompleted {
+                fence,
+                verification_id,
+                result,
+            },
+            Self::GenerationStopped {
+                fence,
+                reason,
+                usage_delta,
+            } => OperationPatch::GenerationStopped {
+                fence,
+                reason,
+                usage_delta,
+            },
+            Self::GenerationTransferred {
+                fence,
+                background_fence,
+                task_id,
+            } => OperationPatch::GenerationTransferred {
+                fence,
+                background_fence: background_fence.into_live(),
+                task_id,
+            },
+            Self::Suspended {
+                operation_id,
+                cause,
+            } => OperationPatch::Suspended {
+                operation_id,
+                cause,
+            },
+            Self::SuspensionRebasedAfterUnstartedResume {
+                operation_id,
+                previous_cause,
+                replacement_fence,
+                rebased_cause,
+            } => OperationPatch::SuspensionRebasedAfterUnstartedResume {
+                operation_id,
+                previous_cause,
+                replacement_fence,
+                rebased_cause,
+            },
+            Self::RecoveryRequired {
+                operation_id,
+                last_generation,
+            } => OperationPatch::RecoveryRequired {
+                operation_id,
+                last_generation,
+            },
+            Self::FinalizationStarted {
+                operation_id,
+                finalize_intent_id,
+                terminal_commit_id,
+                selected_cause,
+                suspended_cause,
+                expected_settlements,
+            } => OperationPatch::FinalizationStarted {
+                operation_id,
+                finalize_intent_id,
+                terminal_commit_id,
+                selected_cause,
+                suspended_cause,
+                expected_settlements,
+            },
+            Self::FinalizationSettlementRecorded {
+                operation_id,
+                finalize_intent_id,
+                receipt,
+            } => OperationPatch::FinalizationSettlementRecorded {
+                operation_id,
+                finalize_intent_id,
+                receipt,
+            },
+            Self::FinalizationDegraded {
+                operation_id,
+                finalize_intent_id,
+                cause,
+                last_error,
+            } => OperationPatch::FinalizationDegraded {
+                operation_id,
+                finalize_intent_id,
+                cause,
+                last_error,
+            },
+            Self::Terminal { record } => OperationPatch::Terminal { record },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredTaskV1 {
+    task_id: SurfaceTaskId,
+    revision: TaskRevision,
+    task_type: SurfaceTaskType,
+    status: SurfaceTaskStatus,
+    backgrounded: bool,
+    description: DisplayText,
+    created_at: UnixMillis,
+    started_at: Option<UnixMillis>,
+    completed_at: Option<UnixMillis>,
+    parent_operation: Option<SurfaceOperationId>,
+    background_fence: Option<StoredBackgroundFenceV1>,
+    workflow_run_id: Option<SurfaceWorkflowRunId>,
+    subagent_id: Option<SurfaceSubagentId>,
+    pending_interaction_id: Option<SurfaceInteractionId>,
+    usage: Option<UsageTotals>,
+    result: Option<DisplayText>,
+    error: Option<DisplayText>,
+}
+
+impl StoredTaskV1 {
+    fn from_live(task: &SurfaceTask) -> Result<Self, SurfaceLedgerError> {
+        Ok(Self {
+            task_id: task.task_id.clone(),
+            revision: task.revision,
+            task_type: task.task_type,
+            status: task.status,
+            backgrounded: task.backgrounded,
+            description: task.description.clone(),
+            created_at: task.created_at,
+            started_at: task.started_at,
+            completed_at: task.completed_at,
+            parent_operation: task.parent_operation.clone(),
+            background_fence: task
+                .background_fence
+                .as_ref()
+                .map(StoredBackgroundFenceV1::from_live)
+                .transpose()?,
+            workflow_run_id: task.workflow_run_id.clone(),
+            subagent_id: task.subagent_id.clone(),
+            pending_interaction_id: task.pending_interaction_id.clone(),
+            usage: task.usage.clone(),
+            result: task.result.clone(),
+            error: task.error.clone(),
+        })
+    }
+
+    fn into_live(self) -> SurfaceTask {
+        SurfaceTask {
+            task_id: self.task_id,
+            revision: self.revision,
+            task_type: self.task_type,
+            status: self.status,
+            backgrounded: self.backgrounded,
+            description: self.description,
+            created_at: self.created_at,
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            parent_operation: self.parent_operation,
+            background_fence: self
+                .background_fence
+                .map(StoredBackgroundFenceV1::into_live),
+            workflow_run_id: self.workflow_run_id,
+            subagent_id: self.subagent_id,
+            pending_interaction_id: self.pending_interaction_id,
+            usage: self.usage,
+            result: self.result,
+            error: self.error,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredTaskPatchV1 {
+    Upserted {
+        expected_revision: Option<TaskRevision>,
+        task: StoredTaskV1,
+    },
+    StatusChanged {
+        task_id: SurfaceTaskId,
+        expected_revision: TaskRevision,
+        next_revision: TaskRevision,
+        status: SurfaceTaskStatus,
+        completed_at: Option<UnixMillis>,
+        result: Option<DisplayText>,
+        error: Option<DisplayText>,
+    },
+    OwnershipChanged {
+        task_id: SurfaceTaskId,
+        expected_revision: TaskRevision,
+        next_revision: TaskRevision,
+        backgrounded: bool,
+        background_fence: Option<StoredBackgroundFenceV1>,
+    },
+    Reconciled {
+        source_revision: TaskRevision,
+        tasks: Vec<StoredTaskV1>,
+    },
+}
+
+impl StoredTaskPatchV1 {
+    fn from_live(patch: &TaskPatch) -> Result<Self, SurfaceLedgerError> {
+        Ok(match patch {
+            TaskPatch::Upserted {
+                expected_revision,
+                task,
+            } => Self::Upserted {
+                expected_revision: *expected_revision,
+                task: StoredTaskV1::from_live(task)?,
+            },
+            TaskPatch::StatusChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                status,
+                completed_at,
+                result,
+                error,
+            } => Self::StatusChanged {
+                task_id: task_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                status: *status,
+                completed_at: *completed_at,
+                result: result.clone(),
+                error: error.clone(),
+            },
+            TaskPatch::OwnershipChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                backgrounded,
+                background_fence,
+            } => Self::OwnershipChanged {
+                task_id: task_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                backgrounded: *backgrounded,
+                background_fence: background_fence
+                    .as_ref()
+                    .map(StoredBackgroundFenceV1::from_live)
+                    .transpose()?,
+            },
+            TaskPatch::Reconciled {
+                source_revision,
+                tasks,
+            } => Self::Reconciled {
+                source_revision: *source_revision,
+                tasks: tasks
+                    .iter()
+                    .map(StoredTaskV1::from_live)
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+        })
+    }
+
+    fn into_live(self) -> TaskPatch {
+        match self {
+            Self::Upserted {
+                expected_revision,
+                task,
+            } => TaskPatch::Upserted {
+                expected_revision,
+                task: task.into_live(),
+            },
+            Self::StatusChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                status,
+                completed_at,
+                result,
+                error,
+            } => TaskPatch::StatusChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                status,
+                completed_at,
+                result,
+                error,
+            },
+            Self::OwnershipChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                backgrounded,
+                background_fence,
+            } => TaskPatch::OwnershipChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                backgrounded,
+                background_fence: background_fence.map(StoredBackgroundFenceV1::into_live),
+            },
+            Self::Reconciled {
+                source_revision,
+                tasks,
+            } => TaskPatch::Reconciled {
+                source_revision,
+                tasks: tasks.into_iter().map(StoredTaskV1::into_live).collect(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredAuthorityFingerprintV1 {
+    operation_id: SurfaceOperationId,
+    request_digest: Sha256Digest,
+    tool_digest: Sha256Digest,
+    cwd: CanonicalPath,
+    workspace_roots_digest: Sha256Digest,
+    policy_epoch: PolicyEpoch,
+    executable_generation: Sha256Digest,
+    artifact_generation: Sha256Digest,
+    capability_digest: Sha256Digest,
+}
+
+impl StoredAuthorityFingerprintV1 {
+    fn from_live(authority: &AuthorityFingerprint) -> Self {
+        Self {
+            operation_id: authority.operation_id().clone(),
+            request_digest: authority.request_digest().clone(),
+            tool_digest: authority.tool_digest().clone(),
+            cwd: authority.cwd().clone(),
+            workspace_roots_digest: authority.workspace_roots_digest().clone(),
+            policy_epoch: authority.policy_epoch(),
+            executable_generation: authority.executable_generation().clone(),
+            artifact_generation: authority.artifact_generation().clone(),
+            capability_digest: authority.capability_digest().clone(),
+        }
+    }
+
+    fn into_live(self) -> AuthorityFingerprint {
+        AuthorityFingerprint::new(
+            self.operation_id,
+            self.request_digest,
+            self.tool_digest,
+            self.cwd,
+            self.workspace_roots_digest,
+            self.policy_epoch,
+            self.executable_generation,
+            self.artifact_generation,
+            self.capability_digest,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredTaskFenceV1 {
+    task_id: SurfaceTaskId,
+    task_revision: TaskRevision,
+    background_owner: Option<StoredBackgroundFenceV1>,
+}
+
+impl StoredTaskFenceV1 {
+    fn from_live(fence: &SurfaceTaskFence) -> Result<Self, SurfaceLedgerError> {
+        Ok(Self {
+            task_id: fence.task_id.clone(),
+            task_revision: fence.task_revision,
+            background_owner: fence
+                .background_owner
+                .as_ref()
+                .map(StoredBackgroundFenceV1::from_live)
+                .transpose()?,
+        })
+    }
+
+    fn into_live(self) -> SurfaceTaskFence {
+        SurfaceTaskFence {
+            task_id: self.task_id,
+            task_revision: self.task_revision,
+            background_owner: self
+                .background_owner
+                .map(StoredBackgroundFenceV1::into_live),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredInteractionRequestV1 {
+    ToolApproval {
+        tool: SurfaceToolRequest,
+        description: DisplayText,
+        preview: Option<DisplayText>,
+        authority: StoredAuthorityFingerprintV1,
+    },
+    PermissionRequest {
+        tool_call_id: SurfaceToolCallId,
+        reason: Option<DisplayText>,
+        permissions: SurfacePermissionProfile,
+        authority: StoredAuthorityFingerprintV1,
+    },
+    UserInput {
+        question: NonEmptyText,
+        suggestions: Vec<DisplayText>,
+    },
+    McpElicitation {
+        server_name: NonEmptyText,
+        server_request_id: NonEmptyText,
+        message: DisplayText,
+        request: SurfaceMcpElicitationRequest,
+    },
+    BackgroundApproval {
+        task: StoredTaskFenceV1,
+        tool: SurfaceToolRequest,
+        authority: StoredAuthorityFingerprintV1,
+    },
+}
+
+impl StoredInteractionRequestV1 {
+    fn from_live(request: &SurfaceInteractionRequest) -> Result<Self, SurfaceLedgerError> {
+        Ok(match request {
+            SurfaceInteractionRequest::ToolApproval {
+                tool,
+                description,
+                preview,
+                authority,
+            } => Self::ToolApproval {
+                tool: tool.clone(),
+                description: description.clone(),
+                preview: preview.clone(),
+                authority: StoredAuthorityFingerprintV1::from_live(authority),
+            },
+            SurfaceInteractionRequest::PermissionRequest {
+                tool_call_id,
+                reason,
+                permissions,
+                authority,
+            } => Self::PermissionRequest {
+                tool_call_id: tool_call_id.clone(),
+                reason: reason.clone(),
+                permissions: permissions.clone(),
+                authority: StoredAuthorityFingerprintV1::from_live(authority),
+            },
+            SurfaceInteractionRequest::UserInput {
+                question,
+                suggestions,
+            } => Self::UserInput {
+                question: question.clone(),
+                suggestions: suggestions.clone(),
+            },
+            SurfaceInteractionRequest::McpElicitation {
+                server_name,
+                server_request_id,
+                message,
+                request,
+            } => Self::McpElicitation {
+                server_name: server_name.clone(),
+                server_request_id: server_request_id.clone(),
+                message: message.clone(),
+                request: request.clone(),
+            },
+            SurfaceInteractionRequest::BackgroundApproval {
+                task,
+                tool,
+                authority,
+            } => Self::BackgroundApproval {
+                task: StoredTaskFenceV1::from_live(task)?,
+                tool: tool.clone(),
+                authority: StoredAuthorityFingerprintV1::from_live(authority),
+            },
+        })
+    }
+
+    fn into_live(self) -> SurfaceInteractionRequest {
+        match self {
+            Self::ToolApproval {
+                tool,
+                description,
+                preview,
+                authority,
+            } => SurfaceInteractionRequest::ToolApproval {
+                tool,
+                description,
+                preview,
+                authority: authority.into_live(),
+            },
+            Self::PermissionRequest {
+                tool_call_id,
+                reason,
+                permissions,
+                authority,
+            } => SurfaceInteractionRequest::PermissionRequest {
+                tool_call_id,
+                reason,
+                permissions,
+                authority: authority.into_live(),
+            },
+            Self::UserInput {
+                question,
+                suggestions,
+            } => SurfaceInteractionRequest::UserInput {
+                question,
+                suggestions,
+            },
+            Self::McpElicitation {
+                server_name,
+                server_request_id,
+                message,
+                request,
+            } => SurfaceInteractionRequest::McpElicitation {
+                server_name,
+                server_request_id,
+                message,
+                request,
+            },
+            Self::BackgroundApproval {
+                task,
+                tool,
+                authority,
+            } => SurfaceInteractionRequest::BackgroundApproval {
+                task: task.into_live(),
+                tool,
+                authority: authority.into_live(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredInteractionLifecycleV1 {
+    Requested,
+    Resolved {
+        receipt: SurfaceInteractionResolutionReceipt,
+    },
+    Cancelled {
+        reason: InteractionCancelReason,
+    },
+    Expired {
+        deadline: InteractionExpiryDeadline,
+    },
+    Transferred {
+        background_fence: StoredBackgroundFenceV1,
+    },
+}
+
+impl StoredInteractionLifecycleV1 {
+    fn from_live(lifecycle: &SurfaceInteractionLifecycle) -> Result<Self, SurfaceLedgerError> {
+        Ok(match lifecycle {
+            SurfaceInteractionLifecycle::Requested => Self::Requested,
+            SurfaceInteractionLifecycle::Resolved { receipt } => Self::Resolved {
+                receipt: receipt.clone(),
+            },
+            SurfaceInteractionLifecycle::Cancelled { reason } => Self::Cancelled {
+                reason: reason.clone(),
+            },
+            SurfaceInteractionLifecycle::Expired { deadline } => Self::Expired {
+                deadline: deadline.clone(),
+            },
+            SurfaceInteractionLifecycle::Transferred { background_fence } => Self::Transferred {
+                background_fence: StoredBackgroundFenceV1::from_live(background_fence)?,
+            },
+        })
+    }
+
+    fn into_live(self) -> SurfaceInteractionLifecycle {
+        match self {
+            Self::Requested => SurfaceInteractionLifecycle::Requested,
+            Self::Resolved { receipt } => SurfaceInteractionLifecycle::Resolved { receipt },
+            Self::Cancelled { reason } => SurfaceInteractionLifecycle::Cancelled { reason },
+            Self::Expired { deadline } => SurfaceInteractionLifecycle::Expired { deadline },
+            Self::Transferred { background_fence } => SurfaceInteractionLifecycle::Transferred {
+                background_fence: background_fence.into_live(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredInteractionViewV1 {
+    interaction_id: SurfaceInteractionId,
+    revision: InteractionRevision,
+    fence: SurfaceOperationFence,
+    kind: SurfaceInteractionKind,
+    request: StoredInteractionRequestV1,
+    route: SurfaceInteractionRoute,
+    lifecycle: StoredInteractionLifecycleV1,
+    recovery_disposition: InteractionUnavailableDisposition,
+}
+
+impl StoredInteractionViewV1 {
+    fn from_live(interaction: &SurfaceInteractionView) -> Result<Self, SurfaceLedgerError> {
+        Ok(Self {
+            interaction_id: interaction.interaction_id.clone(),
+            revision: interaction.revision,
+            fence: interaction.fence.clone(),
+            kind: interaction.kind,
+            request: StoredInteractionRequestV1::from_live(&interaction.request)?,
+            route: interaction.route.clone(),
+            lifecycle: StoredInteractionLifecycleV1::from_live(&interaction.lifecycle)?,
+            recovery_disposition: interaction.recovery_disposition.clone(),
+        })
+    }
+
+    fn into_live(self) -> SurfaceInteractionView {
+        SurfaceInteractionView {
+            interaction_id: self.interaction_id,
+            revision: self.revision,
+            fence: self.fence,
+            kind: self.kind,
+            request: self.request.into_live(),
+            route: self.route,
+            lifecycle: self.lifecycle.into_live(),
+            recovery_disposition: self.recovery_disposition,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredInteractionPatchV1 {
+    Requested {
+        interaction: StoredInteractionViewV1,
+    },
+    RouteChanged {
+        interaction_id: SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        route: SurfaceInteractionRoute,
+    },
+    Resolved {
+        interaction_id: SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        receipt: SurfaceInteractionResolutionReceipt,
+    },
+    Cancelled {
+        interaction_id: SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        reason: InteractionCancelReason,
+    },
+    Expired {
+        interaction_id: SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        deadline: InteractionExpiryDeadline,
+    },
+    Transferred {
+        interaction_id: SurfaceInteractionId,
+        expected_revision: InteractionRevision,
+        next_revision: InteractionRevision,
+        background_fence: StoredBackgroundFenceV1,
+        route: SurfaceInteractionRoute,
+    },
+}
+
+impl StoredInteractionPatchV1 {
+    fn from_live(patch: &InteractionPatch) -> Result<Self, SurfaceLedgerError> {
+        Ok(match patch {
+            InteractionPatch::Requested { interaction } => Self::Requested {
+                interaction: StoredInteractionViewV1::from_live(interaction)?,
+            },
+            InteractionPatch::RouteChanged {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                route,
+            } => Self::RouteChanged {
+                interaction_id: interaction_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                route: route.clone(),
+            },
+            InteractionPatch::Resolved {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                receipt,
+            } => Self::Resolved {
+                interaction_id: interaction_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                receipt: receipt.clone(),
+            },
+            InteractionPatch::Cancelled {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                reason,
+            } => Self::Cancelled {
+                interaction_id: interaction_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                reason: reason.clone(),
+            },
+            InteractionPatch::Expired {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                deadline,
+            } => Self::Expired {
+                interaction_id: interaction_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                deadline: deadline.clone(),
+            },
+            InteractionPatch::Transferred {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                background_fence,
+                route,
+            } => Self::Transferred {
+                interaction_id: interaction_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                background_fence: StoredBackgroundFenceV1::from_live(background_fence)?,
+                route: route.clone(),
+            },
+        })
+    }
+
+    fn into_live(self) -> InteractionPatch {
+        match self {
+            Self::Requested { interaction } => InteractionPatch::Requested {
+                interaction: interaction.into_live(),
+            },
+            Self::RouteChanged {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                route,
+            } => InteractionPatch::RouteChanged {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                route,
+            },
+            Self::Resolved {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                receipt,
+            } => InteractionPatch::Resolved {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                receipt,
+            },
+            Self::Cancelled {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                reason,
+            } => InteractionPatch::Cancelled {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                reason,
+            },
+            Self::Expired {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                deadline,
+            } => InteractionPatch::Expired {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                deadline,
+            },
+            Self::Transferred {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                background_fence,
+                route,
+            } => InteractionPatch::Transferred {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                background_fence: background_fence.into_live(),
+                route,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredSurfaceEventV1 {
+    Operation(StoredOperationPatchV1),
+    Item(ItemPatch),
+    Assistant(AssistantPatch),
+    Tool(ToolPatch),
+    Plan(SurfacePlanSnapshot),
+    Usage(SurfaceUsageSnapshot),
+    Context(SurfaceContextSnapshot),
+    Interaction(StoredInteractionPatchV1),
+    Task(StoredTaskPatchV1),
+    Workflow(WorkflowPatch),
+    Subagent(SubagentPatch),
+    Goal(GoalPatchEnvelope),
+    Settings(SettingsPatch),
+    McpCatalog(McpCatalogPatch),
+    PinnedContext(PinnedContextPatch),
+    Session(SessionPatch),
+}
+
+impl StoredSurfaceEventV1 {
+    fn from_live(event: &SurfaceEvent) -> Result<Self, SurfaceLedgerError> {
+        Ok(match event {
+            SurfaceEvent::Operation(patch) => {
+                Self::Operation(StoredOperationPatchV1::from_live(patch)?)
+            }
+            SurfaceEvent::Item(patch) => Self::Item(patch.clone()),
+            SurfaceEvent::Assistant(patch) => Self::Assistant(patch.clone()),
+            SurfaceEvent::Tool(patch) => Self::Tool(patch.clone()),
+            SurfaceEvent::Plan(snapshot) => Self::Plan(snapshot.clone()),
+            SurfaceEvent::Usage(snapshot) => Self::Usage(snapshot.clone()),
+            SurfaceEvent::Context(snapshot) => Self::Context(snapshot.clone()),
+            SurfaceEvent::Interaction(patch) => {
+                Self::Interaction(StoredInteractionPatchV1::from_live(patch)?)
+            }
+            SurfaceEvent::Task(patch) => Self::Task(StoredTaskPatchV1::from_live(patch)?),
+            SurfaceEvent::Workflow(patch) => Self::Workflow(patch.clone()),
+            SurfaceEvent::Subagent(patch) => Self::Subagent(patch.clone()),
+            SurfaceEvent::Goal(patch) => Self::Goal(patch.clone()),
+            SurfaceEvent::Settings(patch) => Self::Settings(patch.clone()),
+            SurfaceEvent::McpCatalog(patch) => Self::McpCatalog(patch.clone()),
+            SurfaceEvent::PinnedContext(patch) => Self::PinnedContext(patch.clone()),
+            SurfaceEvent::Session(patch) => Self::Session(patch.clone()),
+        })
+    }
+
+    fn into_live(self) -> SurfaceEvent {
+        match self {
+            Self::Operation(patch) => SurfaceEvent::Operation(patch.into_live()),
+            Self::Item(patch) => SurfaceEvent::Item(patch),
+            Self::Assistant(patch) => SurfaceEvent::Assistant(patch),
+            Self::Tool(patch) => SurfaceEvent::Tool(patch),
+            Self::Plan(snapshot) => SurfaceEvent::Plan(snapshot),
+            Self::Usage(snapshot) => SurfaceEvent::Usage(snapshot),
+            Self::Context(snapshot) => SurfaceEvent::Context(snapshot),
+            Self::Interaction(patch) => SurfaceEvent::Interaction(patch.into_live()),
+            Self::Task(patch) => SurfaceEvent::Task(patch.into_live()),
+            Self::Workflow(patch) => SurfaceEvent::Workflow(patch),
+            Self::Subagent(patch) => SurfaceEvent::Subagent(patch),
+            Self::Goal(patch) => SurfaceEvent::Goal(patch),
+            Self::Settings(patch) => SurfaceEvent::Settings(patch),
+            Self::McpCatalog(patch) => SurfaceEvent::McpCatalog(patch),
+            Self::PinnedContext(patch) => SurfaceEvent::PinnedContext(patch),
+            Self::Session(patch) => SurfaceEvent::Session(patch),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredSurfaceEventEnvelopeV1 {
+    ordinal: u32,
+    event_id: SurfaceEventId,
+    commit_class: CommitClass,
+    scope: StoredScopeV1,
+    event: StoredSurfaceEventV1,
+}
+
+impl StoredSurfaceEventEnvelopeV1 {
+    fn from_live(envelope: &SurfaceEventEnvelope) -> Result<Self, SurfaceLedgerError> {
+        Ok(Self {
+            ordinal: envelope.ordinal,
+            event_id: envelope.event_id.clone(),
+            commit_class: envelope.commit_class.clone(),
+            scope: StoredScopeV1::from_live(&envelope.scope)?,
+            event: StoredSurfaceEventV1::from_live(&envelope.event)?,
+        })
+    }
+
+    fn into_live(self) -> SurfaceEventEnvelope {
+        SurfaceEventEnvelope {
+            ordinal: self.ordinal,
+            event_id: self.event_id,
+            commit_class: self.commit_class,
+            scope: self.scope.into_live(),
+            event: self.event.into_live(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct StoredSurfaceCommitBatchV1 {
+    version: u8,
+    cursor_before: SurfaceCursor,
+    cursor_after: SurfaceCursor,
+    commit_class: CommitClass,
+    event_count: u32,
+    batch_digest: Sha256Digest,
+    events: Vec<StoredSurfaceEventEnvelopeV1>,
+}
+
+impl StoredSurfaceCommitBatchV1 {
+    pub(crate) fn from_live(batch: &SurfaceCommitBatch) -> Result<Self, SurfaceLedgerError> {
+        Ok(Self {
+            version: 1,
+            cursor_before: batch.cursor_before.clone(),
+            cursor_after: batch.cursor_after.clone(),
+            commit_class: batch.commit_class.clone(),
+            event_count: batch.event_count,
+            batch_digest: batch.batch_digest.clone(),
+            events: batch
+                .events
+                .as_slice()
+                .iter()
+                .map(StoredSurfaceEventEnvelopeV1::from_live)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    pub(crate) fn into_live(self) -> Result<SurfaceCommitBatch, SurfaceLedgerError> {
+        if self.version != 1 {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        let events = NonEmptyVec::try_new(
+            self.events
+                .into_iter()
+                .map(StoredSurfaceEventEnvelopeV1::into_live)
+                .collect(),
+        )
+        .map_err(|_| SurfaceLedgerError::AppendFailed)?;
+        let batch = SurfaceCommitBatch {
+            cursor_before: self.cursor_before,
+            cursor_after: self.cursor_after,
+            commit_class: self.commit_class,
+            event_count: self.event_count,
+            batch_digest: self.batch_digest,
+            events,
+        };
+        match preflight_batch(&batch) {
+            SurfaceCommitBatchPreflightResult::Ready {
+                event_count,
+                batch_digest,
+                ..
+            } if event_count == batch.event_count && batch_digest == batch.batch_digest => {
+                Ok(batch)
+            }
+            _ => Err(SurfaceLedgerError::AppendFailed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredShutdownBarrierRecordV1 {
+    version: u8,
+    plan: StoredShutdownBarrierPlanV1,
+    settled: Vec<StoredShutdownAckV1>,
+    state: StoredShutdownBarrierStateV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownBarrierPlanV1 {
+    CloseThread {
+        request_id: SurfaceRequestId,
+        host_incarnation: HostIncarnation,
+        thread: StoredShutdownThreadPlanV1,
+        barrier_id: SurfaceSettlementId,
+        closing_commit_id: SurfaceCommitId,
+        plan_digest: Sha256Digest,
+    },
+    ShutdownHost {
+        request_id: SurfaceRequestId,
+        host_incarnation: HostIncarnation,
+        threads: Vec<StoredShutdownThreadPlanV1>,
+        barrier_id: SurfaceSettlementId,
+        closing_commit_id: SurfaceCommitId,
+        final_host_lifecycle: StoredHostReceiptAckRequirementV1,
+        plan_digest: Sha256Digest,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownThreadPlanV1 {
+    Recorded {
+        thread_id: SurfaceThreadId,
+        owner_epoch: ThreadOwnerEpoch,
+        operations: Vec<StoredShutdownOperationPlanV1>,
+        session_closed: StoredThreadCursorAckRequirementV1,
+        catalog_closed: StoredHostReceiptAckRequirementV1,
+    },
+    Ephemeral {
+        thread_id: SurfaceThreadId,
+        owner_epoch: ThreadOwnerEpoch,
+        persistence: StoredEphemeralThreadPersistenceV1,
+        operations: Vec<StoredShutdownOperationPlanV1>,
+        session_closed: StoredThreadCursorAckRequirementV1,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredEphemeralThreadPersistenceV1 {
+    NonCataloguedOneShot {
+        close_after: FirstOperationCompletionPolicy,
+    },
+    Attached,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownOperationPlanV1 {
+    ExistingTerminal {
+        operation_id: SurfaceOperationId,
+        finalize_intent_id: SurfaceFinalizeIntentId,
+        terminal_commit_id: SurfaceCommitId,
+        requirement: StoredOperationTerminalAckRequirementV1,
+    },
+    PlannedFinalization {
+        operation_id: SurfaceOperationId,
+        source_phase: StoredShutdownOperationSourcePhaseV1,
+        finalize_intent_id: SurfaceFinalizeIntentId,
+        terminal_commit_id: SurfaceCommitId,
+        selected_cause: StoredShutdownSelectedCauseV1,
+        expected_settlements: Vec<SurfaceSettlementId>,
+        requirement: StoredOperationTerminalAckRequirementV1,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownOperationSourcePhaseV1 {
+    Requested,
+    AdmittedReserved,
+    AdmittedStarted,
+    Suspended,
+    BackgroundOwned,
+    Finalizing,
+    FinalizingDegraded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownSelectedCauseV1 {
+    ExistingWinning { cause: OperationFinalizationCause },
+    Requested { host_shutdown: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredThreadCursorAckRequirementV1 {
+    thread_id: SurfaceThreadId,
+    family: SurfaceFactFamily,
+    event_id: SurfaceEventId,
+    commit_id: SurfaceCommitId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredOperationTerminalAckRequirementV1 {
+    thread_id: SurfaceThreadId,
+    thread_owner_epoch: ThreadOwnerEpoch,
+    operation_id: SurfaceOperationId,
+    terminal_commit_id: SurfaceCommitId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredHostReceiptAckRequirementV1 {
+    host_incarnation: HostIncarnation,
+    identity: StoredShutdownHostRequirementIdentityV1,
+    commit_id: SurfaceCommitId,
+    receipt_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownHostRequirementIdentityV1 {
+    SessionCatalog {
+        thread_id: Option<SurfaceThreadId>,
+        revision: SessionCatalogRevision,
+    },
+    HostLifecycle {
+        host_incarnation: HostIncarnation,
+        revision: HostLifecycleRevision,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownBarrierStateV1 {
+    Closing,
+    Closed {
+        retained_output: StoredRetainedShutdownOutputV1,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredRetainedShutdownOutputV1 {
+    CloseThread {
+        output: StoredClosedThreadReceiptV1,
+    },
+    ShutdownHost {
+        host_incarnation: HostIncarnation,
+        host_receipt: StoredHostShutdownReceiptV1,
+        closed_threads: Vec<StoredClosedThreadReceiptV1>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredClosedThreadReceiptV1 {
+    Recorded {
+        thread_id: SurfaceThreadId,
+        operation_terminals: Vec<StoredOperationTerminalAtCursorV1>,
+        closed_cursor: SurfaceCursor,
+        catalog_receipt: StoredSessionCatalogReceiptV1,
+    },
+    Ephemeral {
+        thread_id: SurfaceThreadId,
+        persistence: StoredEphemeralThreadPersistenceV1,
+        operation_terminals: Vec<StoredOperationTerminalAtCursorV1>,
+        closed_cursor: SurfaceCursor,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredOperationTerminalAtCursorV1 {
+    operation_id: SurfaceOperationId,
+    terminal: OperationTerminal,
+    cursor: SurfaceCursor,
+    commit_class: CommitClass,
+    batch_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredSessionCatalogReceiptV1 {
+    catalog_revision: SessionCatalogRevision,
+    thread_id: Option<SurfaceThreadId>,
+    action: StoredSessionCatalogActionV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredSessionCatalogActionV1 {
+    Created,
+    Opened,
+    Loaded,
+    Forked,
+    Closed,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredHostShutdownReceiptV1 {
+    host_incarnation: HostIncarnation,
+    lifecycle_revision: HostLifecycleRevision,
+    barrier_id: SurfaceSettlementId,
+    shutdown_commit_id: SurfaceCommitId,
+    closed_at: UnixMillis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum StoredShutdownAckV1 {
+    ThreadLocalCursor {
+        cursor: SurfaceCursor,
+        family: SurfaceFactFamily,
+        event_id: SurfaceEventId,
+        commit_class: CommitClass,
+    },
+    OperationTerminal {
+        thread_id: SurfaceThreadId,
+        thread_owner_epoch: ThreadOwnerEpoch,
+        operation_id: SurfaceOperationId,
+        value: StoredOperationTerminalAtCursorV1,
+    },
+    SessionCatalog {
+        host_incarnation: HostIncarnation,
+        thread_id: Option<SurfaceThreadId>,
+        revision: SessionCatalogRevision,
+        receipt: StoredSessionCatalogReceiptV1,
+        commit_id: SurfaceCommitId,
+        receipt_digest: Sha256Digest,
+    },
+    HostLifecycle {
+        host_incarnation: HostIncarnation,
+        revision: HostLifecycleRevision,
+        receipt: StoredHostShutdownReceiptV1,
+        commit_id: SurfaceCommitId,
+        receipt_digest: Sha256Digest,
+    },
+}
+
+impl StoredShutdownBarrierRecordV1 {
+    pub(crate) fn from_live(record: &ShutdownBarrierRecord) -> Result<Self, SurfaceLedgerError> {
+        Ok(Self {
+            version: 1,
+            plan: StoredShutdownBarrierPlanV1::from_live(&record.plan)?,
+            settled: record
+                .settled
+                .iter()
+                .map(StoredShutdownAckV1::from_live)
+                .collect::<Result<Vec<_>, _>>()?,
+            state: StoredShutdownBarrierStateV1::from_live(&record.state)?,
+        })
+    }
+
+    pub(crate) fn into_live(self) -> Result<ShutdownBarrierRecord, SurfaceLedgerError> {
+        if self.version != 1 {
+            return Err(SurfaceLedgerError::CommitIdentityConflict);
+        }
+        let record = ShutdownBarrierRecord {
+            plan: self.plan.into_live(),
+            settled: self
+                .settled
+                .into_iter()
+                .map(StoredShutdownAckV1::into_live)
+                .collect(),
+            state: self.state.into_live(),
+        };
+        ImmutableShutdownLedger::from_durable_record(record.clone())
+            .map_err(|_| SurfaceLedgerError::CommitIdentityConflict)?;
+        Ok(record)
+    }
+
+    pub(crate) fn barrier_id(&self) -> &SurfaceSettlementId {
+        match &self.plan {
+            StoredShutdownBarrierPlanV1::CloseThread { barrier_id, .. }
+            | StoredShutdownBarrierPlanV1::ShutdownHost { barrier_id, .. } => barrier_id,
+        }
+    }
+
+    pub(crate) fn plan_digest(&self) -> &Sha256Digest {
+        match &self.plan {
+            StoredShutdownBarrierPlanV1::CloseThread { plan_digest, .. }
+            | StoredShutdownBarrierPlanV1::ShutdownHost { plan_digest, .. } => plan_digest,
+        }
+    }
+}
+
+impl StoredShutdownBarrierPlanV1 {
+    fn from_live(plan: &ShutdownBarrierPlan) -> Result<Self, SurfaceLedgerError> {
+        Ok(match plan {
+            ShutdownBarrierPlan::CloseThread {
+                request_id,
+                host_incarnation,
+                thread,
+                barrier_id,
+                closing_commit_id,
+                plan_digest,
+            } => Self::CloseThread {
+                request_id: request_id.clone(),
+                host_incarnation: host_incarnation.clone(),
+                thread: StoredShutdownThreadPlanV1::from_live(thread)?,
+                barrier_id: barrier_id.clone(),
+                closing_commit_id: closing_commit_id.clone(),
+                plan_digest: plan_digest.clone(),
+            },
+            ShutdownBarrierPlan::ShutdownHost {
+                request_id,
+                host_incarnation,
+                threads,
+                barrier_id,
+                closing_commit_id,
+                final_host_lifecycle,
+                plan_digest,
+            } => Self::ShutdownHost {
+                request_id: request_id.clone(),
+                host_incarnation: host_incarnation.clone(),
+                threads: threads
+                    .iter()
+                    .map(StoredShutdownThreadPlanV1::from_live)
+                    .collect::<Result<Vec<_>, _>>()?,
+                barrier_id: barrier_id.clone(),
+                closing_commit_id: closing_commit_id.clone(),
+                final_host_lifecycle: StoredHostReceiptAckRequirementV1::from_live(
+                    final_host_lifecycle,
+                )?,
+                plan_digest: plan_digest.clone(),
+            },
+        })
+    }
+
+    fn into_live(self) -> ShutdownBarrierPlan {
+        match self {
+            Self::CloseThread {
+                request_id,
+                host_incarnation,
+                thread,
+                barrier_id,
+                closing_commit_id,
+                plan_digest,
+            } => ShutdownBarrierPlan::CloseThread {
+                request_id,
+                host_incarnation,
+                thread: thread.into_live(),
+                barrier_id,
+                closing_commit_id,
+                plan_digest,
+            },
+            Self::ShutdownHost {
+                request_id,
+                host_incarnation,
+                threads,
+                barrier_id,
+                closing_commit_id,
+                final_host_lifecycle,
+                plan_digest,
+            } => ShutdownBarrierPlan::ShutdownHost {
+                request_id,
+                host_incarnation,
+                threads: threads
+                    .into_iter()
+                    .map(StoredShutdownThreadPlanV1::into_live)
+                    .collect(),
+                barrier_id,
+                closing_commit_id,
+                final_host_lifecycle: final_host_lifecycle.into_live(),
+                plan_digest,
+            },
+        }
+    }
+}
+
+impl StoredShutdownThreadPlanV1 {
+    fn from_live(plan: &ShutdownThreadPlan) -> Result<Self, SurfaceLedgerError> {
+        Ok(match plan {
+            ShutdownThreadPlan::Recorded {
+                thread_id,
+                owner_epoch,
+                operations,
+                session_closed,
+                catalog_closed,
+            } => Self::Recorded {
+                thread_id: thread_id.clone(),
+                owner_epoch: *owner_epoch,
+                operations: operations
+                    .iter()
+                    .map(StoredShutdownOperationPlanV1::from_live)
+                    .collect::<Result<Vec<_>, _>>()?,
+                session_closed: session_closed.into(),
+                catalog_closed: StoredHostReceiptAckRequirementV1::from_live(catalog_closed)?,
+            },
+            ShutdownThreadPlan::Ephemeral {
+                thread_id,
+                owner_epoch,
+                persistence,
+                operations,
+                session_closed,
+            } => Self::Ephemeral {
+                thread_id: thread_id.clone(),
+                owner_epoch: *owner_epoch,
+                persistence: StoredEphemeralThreadPersistenceV1::from_live(persistence),
+                operations: operations
+                    .iter()
+                    .map(StoredShutdownOperationPlanV1::from_live)
+                    .collect::<Result<Vec<_>, _>>()?,
+                session_closed: session_closed.into(),
+            },
+        })
+    }
+
+    fn into_live(self) -> ShutdownThreadPlan {
+        match self {
+            Self::Recorded {
+                thread_id,
+                owner_epoch,
+                operations,
+                session_closed,
+                catalog_closed,
+            } => ShutdownThreadPlan::Recorded {
+                thread_id,
+                owner_epoch,
+                operations: operations
+                    .into_iter()
+                    .map(StoredShutdownOperationPlanV1::into_live)
+                    .collect(),
+                session_closed: session_closed.into(),
+                catalog_closed: catalog_closed.into_live(),
+            },
+            Self::Ephemeral {
+                thread_id,
+                owner_epoch,
+                persistence,
+                operations,
+                session_closed,
+            } => ShutdownThreadPlan::Ephemeral {
+                thread_id,
+                owner_epoch,
+                persistence: persistence.into_live(),
+                operations: operations
+                    .into_iter()
+                    .map(StoredShutdownOperationPlanV1::into_live)
+                    .collect(),
+                session_closed: session_closed.into(),
+            },
+        }
+    }
+}
+
+impl StoredEphemeralThreadPersistenceV1 {
+    fn from_live(value: &EphemeralThreadPersistence) -> Self {
+        match value {
+            EphemeralThreadPersistence::EphemeralNonCataloguedOneShot { close_after } => {
+                Self::NonCataloguedOneShot {
+                    close_after: *close_after,
+                }
+            }
+            EphemeralThreadPersistence::EphemeralAttached => Self::Attached,
+        }
+    }
+
+    fn into_live(self) -> EphemeralThreadPersistence {
+        match self {
+            Self::NonCataloguedOneShot { close_after } => {
+                EphemeralThreadPersistence::EphemeralNonCataloguedOneShot { close_after }
+            }
+            Self::Attached => EphemeralThreadPersistence::EphemeralAttached,
+        }
+    }
+}
+
+impl StoredShutdownOperationPlanV1 {
+    fn from_live(value: &ShutdownOperationPlan) -> Result<Self, SurfaceLedgerError> {
+        Ok(match value {
+            ShutdownOperationPlan::ExistingTerminal {
+                operation_id,
+                finalize_intent_id,
+                terminal_commit_id,
+                requirement,
+            } => Self::ExistingTerminal {
+                operation_id: operation_id.clone(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                terminal_commit_id: terminal_commit_id.clone(),
+                requirement: requirement.into(),
+            },
+            ShutdownOperationPlan::PlannedFinalization {
+                operation_id,
+                source_phase,
+                finalize_intent_id,
+                terminal_commit_id,
+                selected_cause,
+                expected_settlements,
+                requirement,
+            } => Self::PlannedFinalization {
+                operation_id: operation_id.clone(),
+                source_phase: (*source_phase).into(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                terminal_commit_id: terminal_commit_id.clone(),
+                selected_cause: StoredShutdownSelectedCauseV1::from_live(selected_cause),
+                expected_settlements: expected_settlements.clone(),
+                requirement: requirement.into(),
+            },
+        })
+    }
+
+    fn into_live(self) -> ShutdownOperationPlan {
+        match self {
+            Self::ExistingTerminal {
+                operation_id,
+                finalize_intent_id,
+                terminal_commit_id,
+                requirement,
+            } => ShutdownOperationPlan::ExistingTerminal {
+                operation_id,
+                finalize_intent_id,
+                terminal_commit_id,
+                requirement: requirement.into(),
+            },
+            Self::PlannedFinalization {
+                operation_id,
+                source_phase,
+                finalize_intent_id,
+                terminal_commit_id,
+                selected_cause,
+                expected_settlements,
+                requirement,
+            } => ShutdownOperationPlan::PlannedFinalization {
+                operation_id,
+                source_phase: source_phase.into(),
+                finalize_intent_id,
+                terminal_commit_id,
+                selected_cause: selected_cause.into_live(),
+                expected_settlements,
+                requirement: requirement.into(),
+            },
+        }
+    }
+}
+
+impl From<ShutdownOperationSourcePhase> for StoredShutdownOperationSourcePhaseV1 {
+    fn from(value: ShutdownOperationSourcePhase) -> Self {
+        match value {
+            ShutdownOperationSourcePhase::Requested => Self::Requested,
+            ShutdownOperationSourcePhase::AdmittedReserved => Self::AdmittedReserved,
+            ShutdownOperationSourcePhase::AdmittedStarted => Self::AdmittedStarted,
+            ShutdownOperationSourcePhase::Suspended => Self::Suspended,
+            ShutdownOperationSourcePhase::BackgroundOwned => Self::BackgroundOwned,
+            ShutdownOperationSourcePhase::Finalizing => Self::Finalizing,
+            ShutdownOperationSourcePhase::FinalizingDegraded => Self::FinalizingDegraded,
+        }
+    }
+}
+
+impl From<StoredShutdownOperationSourcePhaseV1> for ShutdownOperationSourcePhase {
+    fn from(value: StoredShutdownOperationSourcePhaseV1) -> Self {
+        match value {
+            StoredShutdownOperationSourcePhaseV1::Requested => Self::Requested,
+            StoredShutdownOperationSourcePhaseV1::AdmittedReserved => Self::AdmittedReserved,
+            StoredShutdownOperationSourcePhaseV1::AdmittedStarted => Self::AdmittedStarted,
+            StoredShutdownOperationSourcePhaseV1::Suspended => Self::Suspended,
+            StoredShutdownOperationSourcePhaseV1::BackgroundOwned => Self::BackgroundOwned,
+            StoredShutdownOperationSourcePhaseV1::Finalizing => Self::Finalizing,
+            StoredShutdownOperationSourcePhaseV1::FinalizingDegraded => Self::FinalizingDegraded,
+        }
+    }
+}
+
+impl StoredShutdownSelectedCauseV1 {
+    fn from_live(value: &ShutdownSelectedCause) -> Self {
+        match value {
+            ShutdownSelectedCause::ExistingWinning { cause } => Self::ExistingWinning {
+                cause: cause.clone(),
+            },
+            ShutdownSelectedCause::Requested { cause } => Self::Requested {
+                host_shutdown: *cause == ShutdownRequestCause::HostShutdown,
+            },
+        }
+    }
+
+    fn into_live(self) -> ShutdownSelectedCause {
+        match self {
+            Self::ExistingWinning { cause } => ShutdownSelectedCause::ExistingWinning { cause },
+            Self::Requested { host_shutdown } => ShutdownSelectedCause::Requested {
+                cause: if host_shutdown {
+                    ShutdownRequestCause::HostShutdown
+                } else {
+                    ShutdownRequestCause::ThreadClose
+                },
+            },
+        }
+    }
+}
+
+impl From<&ThreadCursorAckRequirement> for StoredThreadCursorAckRequirementV1 {
+    fn from(value: &ThreadCursorAckRequirement) -> Self {
+        Self {
+            thread_id: value.thread_id.clone(),
+            family: value.family,
+            event_id: value.event_id.clone(),
+            commit_id: value.commit_id.clone(),
+        }
+    }
+}
+
+impl From<StoredThreadCursorAckRequirementV1> for ThreadCursorAckRequirement {
+    fn from(value: StoredThreadCursorAckRequirementV1) -> Self {
+        Self {
+            thread_id: value.thread_id,
+            family: value.family,
+            event_id: value.event_id,
+            commit_id: value.commit_id,
+        }
+    }
+}
+
+impl From<&OperationTerminalAckRequirement> for StoredOperationTerminalAckRequirementV1 {
+    fn from(value: &OperationTerminalAckRequirement) -> Self {
+        Self {
+            thread_id: value.thread_id.clone(),
+            thread_owner_epoch: value.thread_owner_epoch,
+            operation_id: value.operation_id.clone(),
+            terminal_commit_id: value.terminal_commit_id.clone(),
+        }
+    }
+}
+
+impl From<StoredOperationTerminalAckRequirementV1> for OperationTerminalAckRequirement {
+    fn from(value: StoredOperationTerminalAckRequirementV1) -> Self {
+        Self {
+            thread_id: value.thread_id,
+            thread_owner_epoch: value.thread_owner_epoch,
+            operation_id: value.operation_id,
+            terminal_commit_id: value.terminal_commit_id,
+        }
+    }
+}
+
+impl StoredHostReceiptAckRequirementV1 {
+    fn from_live(value: &HostReceiptAckRequirement) -> Result<Self, SurfaceLedgerError> {
+        let identity = match &value.identity {
+            HostReceiptRequirementIdentity::SessionCatalog {
+                thread_id,
+                revision,
+            } => StoredShutdownHostRequirementIdentityV1::SessionCatalog {
+                thread_id: thread_id.clone(),
+                revision: *revision,
+            },
+            HostReceiptRequirementIdentity::HostLifecycle {
+                host_incarnation,
+                revision,
+            } => StoredShutdownHostRequirementIdentityV1::HostLifecycle {
+                host_incarnation: host_incarnation.clone(),
+                revision: *revision,
+            },
+            _ => return Err(SurfaceLedgerError::CommitIdentityConflict),
+        };
+        Ok(Self {
+            host_incarnation: value.host_incarnation.clone(),
+            identity,
+            commit_id: value.commit_id.clone(),
+            receipt_digest: value.receipt_digest.clone(),
+        })
+    }
+
+    fn into_live(self) -> HostReceiptAckRequirement {
+        let identity = match self.identity {
+            StoredShutdownHostRequirementIdentityV1::SessionCatalog {
+                thread_id,
+                revision,
+            } => HostReceiptRequirementIdentity::SessionCatalog {
+                thread_id,
+                revision,
+            },
+            StoredShutdownHostRequirementIdentityV1::HostLifecycle {
+                host_incarnation,
+                revision,
+            } => HostReceiptRequirementIdentity::HostLifecycle {
+                host_incarnation,
+                revision,
+            },
+        };
+        HostReceiptAckRequirement {
+            host_incarnation: self.host_incarnation,
+            identity,
+            commit_id: self.commit_id,
+            receipt_digest: self.receipt_digest,
+        }
+    }
+}
+
+impl StoredShutdownBarrierStateV1 {
+    fn from_live(value: &ShutdownBarrierState) -> Result<Self, SurfaceLedgerError> {
+        Ok(match value {
+            ShutdownBarrierState::Closing => Self::Closing,
+            ShutdownBarrierState::Closed { retained_output } => Self::Closed {
+                retained_output: StoredRetainedShutdownOutputV1::from_live(retained_output)?,
+            },
+        })
+    }
+
+    fn into_live(self) -> ShutdownBarrierState {
+        match self {
+            Self::Closing => ShutdownBarrierState::Closing,
+            Self::Closed { retained_output } => ShutdownBarrierState::Closed {
+                retained_output: retained_output.into_live(),
+            },
+        }
+    }
+}
+
+impl StoredRetainedShutdownOutputV1 {
+    fn from_live(value: &RetainedShutdownOutput) -> Result<Self, SurfaceLedgerError> {
+        Ok(match value {
+            RetainedShutdownOutput::CloseThread { output } => Self::CloseThread {
+                output: StoredClosedThreadReceiptV1::from_live(output),
+            },
+            RetainedShutdownOutput::ShutdownHost { output } => Self::ShutdownHost {
+                host_incarnation: output.host_incarnation.clone(),
+                host_receipt: StoredHostShutdownReceiptV1::from_live(&output.host_receipt),
+                closed_threads: output
+                    .closed_threads
+                    .iter()
+                    .map(StoredClosedThreadReceiptV1::from_live)
+                    .collect(),
+            },
+        })
+    }
+
+    fn into_live(self) -> RetainedShutdownOutput {
+        match self {
+            Self::CloseThread { output } => RetainedShutdownOutput::CloseThread {
+                output: output.into_live(),
+            },
+            Self::ShutdownHost {
+                host_incarnation,
+                host_receipt,
+                closed_threads,
+            } => RetainedShutdownOutput::ShutdownHost {
+                output: ShutdownHostOutput {
+                    host_incarnation,
+                    host_receipt: host_receipt.into_live(),
+                    closed_threads: closed_threads
+                        .into_iter()
+                        .map(StoredClosedThreadReceiptV1::into_live)
+                        .collect(),
+                },
+            },
+        }
+    }
+}
+
+impl StoredClosedThreadReceiptV1 {
+    fn from_live(value: &ClosedThreadReceipt) -> Self {
+        match value {
+            ClosedThreadReceipt::Recorded {
+                thread_id,
+                operation_terminals,
+                closed_cursor,
+                catalog_receipt,
+            } => Self::Recorded {
+                thread_id: thread_id.clone(),
+                operation_terminals: operation_terminals
+                    .iter()
+                    .map(StoredOperationTerminalAtCursorV1::from_live)
+                    .collect(),
+                closed_cursor: closed_cursor.clone(),
+                catalog_receipt: StoredSessionCatalogReceiptV1::from_live(catalog_receipt),
+            },
+            ClosedThreadReceipt::Ephemeral {
+                thread_id,
+                persistence,
+                operation_terminals,
+                closed_cursor,
+            } => Self::Ephemeral {
+                thread_id: thread_id.clone(),
+                persistence: StoredEphemeralThreadPersistenceV1::from_live(persistence),
+                operation_terminals: operation_terminals
+                    .iter()
+                    .map(StoredOperationTerminalAtCursorV1::from_live)
+                    .collect(),
+                closed_cursor: closed_cursor.clone(),
+            },
+        }
+    }
+
+    fn into_live(self) -> ClosedThreadReceipt {
+        match self {
+            Self::Recorded {
+                thread_id,
+                operation_terminals,
+                closed_cursor,
+                catalog_receipt,
+            } => ClosedThreadReceipt::Recorded {
+                thread_id,
+                operation_terminals: operation_terminals
+                    .into_iter()
+                    .map(StoredOperationTerminalAtCursorV1::into_live)
+                    .collect(),
+                closed_cursor,
+                catalog_receipt: catalog_receipt.into_live(),
+            },
+            Self::Ephemeral {
+                thread_id,
+                persistence,
+                operation_terminals,
+                closed_cursor,
+            } => ClosedThreadReceipt::Ephemeral {
+                thread_id,
+                persistence: persistence.into_live(),
+                operation_terminals: operation_terminals
+                    .into_iter()
+                    .map(StoredOperationTerminalAtCursorV1::into_live)
+                    .collect(),
+                closed_cursor,
+            },
+        }
+    }
+}
+
+impl StoredOperationTerminalAtCursorV1 {
+    fn from_live(value: &OperationTerminalAtCursor) -> Self {
+        Self {
+            operation_id: value.operation_id.clone(),
+            terminal: value.terminal.clone(),
+            cursor: value.cursor.clone(),
+            commit_class: value.commit_class.clone(),
+            batch_digest: value.batch_digest.clone(),
+        }
+    }
+
+    fn into_live(self) -> OperationTerminalAtCursor {
+        OperationTerminalAtCursor {
+            operation_id: self.operation_id,
+            terminal: self.terminal,
+            cursor: self.cursor,
+            commit_class: self.commit_class,
+            batch_digest: self.batch_digest,
+        }
+    }
+}
+
+impl StoredSessionCatalogReceiptV1 {
+    fn from_live(value: &SurfaceSessionCatalogReceipt) -> Self {
+        Self {
+            catalog_revision: value.catalog_revision,
+            thread_id: value.thread_id.clone(),
+            action: value.action.into(),
+        }
+    }
+
+    fn into_live(self) -> SurfaceSessionCatalogReceipt {
+        SurfaceSessionCatalogReceipt {
+            catalog_revision: self.catalog_revision,
+            thread_id: self.thread_id,
+            action: self.action.into(),
+        }
+    }
+}
+
+impl From<SurfaceSessionCatalogAction> for StoredSessionCatalogActionV1 {
+    fn from(value: SurfaceSessionCatalogAction) -> Self {
+        match value {
+            SurfaceSessionCatalogAction::Created => Self::Created,
+            SurfaceSessionCatalogAction::Opened => Self::Opened,
+            SurfaceSessionCatalogAction::Loaded => Self::Loaded,
+            SurfaceSessionCatalogAction::Forked => Self::Forked,
+            SurfaceSessionCatalogAction::Closed => Self::Closed,
+            SurfaceSessionCatalogAction::Removed => Self::Removed,
+        }
+    }
+}
+
+impl From<StoredSessionCatalogActionV1> for SurfaceSessionCatalogAction {
+    fn from(value: StoredSessionCatalogActionV1) -> Self {
+        match value {
+            StoredSessionCatalogActionV1::Created => Self::Created,
+            StoredSessionCatalogActionV1::Opened => Self::Opened,
+            StoredSessionCatalogActionV1::Loaded => Self::Loaded,
+            StoredSessionCatalogActionV1::Forked => Self::Forked,
+            StoredSessionCatalogActionV1::Closed => Self::Closed,
+            StoredSessionCatalogActionV1::Removed => Self::Removed,
+        }
+    }
+}
+
+impl StoredHostShutdownReceiptV1 {
+    fn from_live(value: &SurfaceHostShutdownReceipt) -> Self {
+        Self {
+            host_incarnation: value.host_incarnation.clone(),
+            lifecycle_revision: value.lifecycle_revision,
+            barrier_id: value.barrier_id.clone(),
+            shutdown_commit_id: value.shutdown_commit_id.clone(),
+            closed_at: value.closed_at,
+        }
+    }
+
+    fn into_live(self) -> SurfaceHostShutdownReceipt {
+        SurfaceHostShutdownReceipt {
+            host_incarnation: self.host_incarnation,
+            lifecycle_revision: self.lifecycle_revision,
+            barrier_id: self.barrier_id,
+            shutdown_commit_id: self.shutdown_commit_id,
+            stage: SurfaceHostShutdownStage::Last,
+            closed_at: self.closed_at,
+        }
+    }
+}
+
+impl StoredShutdownAckV1 {
+    fn from_live(value: &MutationCommitAck) -> Result<Self, SurfaceLedgerError> {
+        Ok(match value {
+            MutationCommitAck::ThreadLocalCursor {
+                cursor,
+                family,
+                event_id,
+                commit_class,
+            } => Self::ThreadLocalCursor {
+                cursor: cursor.clone(),
+                family: *family,
+                event_id: event_id.clone(),
+                commit_class: commit_class.clone(),
+            },
+            MutationCommitAck::OperationTerminalAck {
+                thread_id,
+                thread_owner_epoch,
+                operation_id,
+                value,
+            } => Self::OperationTerminal {
+                thread_id: thread_id.clone(),
+                thread_owner_epoch: *thread_owner_epoch,
+                operation_id: operation_id.clone(),
+                value: StoredOperationTerminalAtCursorV1::from_live(value),
+            },
+            MutationCommitAck::HostCommitAck {
+                host_incarnation,
+                identity:
+                    HostReceiptIdentityPair::SessionCatalog {
+                        thread_id,
+                        revision,
+                        receipt,
+                    },
+                commit_id,
+                receipt_digest,
+            } => Self::SessionCatalog {
+                host_incarnation: host_incarnation.clone(),
+                thread_id: thread_id.clone(),
+                revision: *revision,
+                receipt: StoredSessionCatalogReceiptV1::from_live(receipt),
+                commit_id: commit_id.clone(),
+                receipt_digest: receipt_digest.clone(),
+            },
+            MutationCommitAck::HostCommitAck {
+                host_incarnation,
+                identity:
+                    HostReceiptIdentityPair::HostLifecycle {
+                        host_incarnation: identity_host,
+                        revision,
+                        receipt,
+                    },
+                commit_id,
+                receipt_digest,
+            } if identity_host == host_incarnation => Self::HostLifecycle {
+                host_incarnation: host_incarnation.clone(),
+                revision: *revision,
+                receipt: StoredHostShutdownReceiptV1::from_live(receipt),
+                commit_id: commit_id.clone(),
+                receipt_digest: receipt_digest.clone(),
+            },
+            _ => return Err(SurfaceLedgerError::CommitIdentityConflict),
+        })
+    }
+
+    fn into_live(self) -> MutationCommitAck {
+        match self {
+            Self::ThreadLocalCursor {
+                cursor,
+                family,
+                event_id,
+                commit_class,
+            } => MutationCommitAck::ThreadLocalCursor {
+                cursor,
+                family,
+                event_id,
+                commit_class,
+            },
+            Self::OperationTerminal {
+                thread_id,
+                thread_owner_epoch,
+                operation_id,
+                value,
+            } => MutationCommitAck::OperationTerminalAck {
+                thread_id,
+                thread_owner_epoch,
+                operation_id,
+                value: value.into_live(),
+            },
+            Self::SessionCatalog {
+                host_incarnation,
+                thread_id,
+                revision,
+                receipt,
+                commit_id,
+                receipt_digest,
+            } => MutationCommitAck::HostCommitAck {
+                host_incarnation,
+                identity: HostReceiptIdentityPair::SessionCatalog {
+                    thread_id,
+                    revision,
+                    receipt: receipt.into_live(),
+                },
+                commit_id,
+                receipt_digest,
+            },
+            Self::HostLifecycle {
+                host_incarnation,
+                revision,
+                receipt,
+                commit_id,
+                receipt_digest,
+            } => MutationCommitAck::HostCommitAck {
+                identity: HostReceiptIdentityPair::HostLifecycle {
+                    host_incarnation: host_incarnation.clone(),
+                    revision,
+                    receipt: receipt.into_live(),
+                },
+                host_incarnation,
+                commit_id,
+                receipt_digest,
+            },
+        }
+    }
+}
+
+pub struct JsonlSurfaceCommitLedger {
+    path: PathBuf,
+    cursor_template: SurfaceCursor,
+    store: JsonlThreadStore,
+}
+
+pub struct JsonlSurfaceControlLedger {
+    path: PathBuf,
+    store: JsonlThreadStore,
+}
+
+impl JsonlSurfaceControlLedger {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            store: JsonlThreadStore::new(),
+        }
+    }
+
+    pub fn persist_owner_epoch(&self, owner_epoch: u64) -> Result<(), SurfaceLedgerError> {
+        self.store
+            .append_surface_owner_epoch(&self.path, owner_epoch)
+            .map_err(|_| SurfaceLedgerError::AppendFailed)
+    }
+
+    pub fn persist_finalize_intent(
+        &self,
+        intent: &DurableFinalizeIntent,
+    ) -> Result<(), SurfaceLedgerError> {
+        if let Some(existing) = self
+            .store
+            .probe_surface_finalize_intent(&self.path, &intent.finalize_intent_id)
+            .map_err(|_| SurfaceLedgerError::AppendFailed)?
+        {
+            return if existing == intent.expected_settlements {
+                Ok(())
+            } else {
+                Err(SurfaceLedgerError::CommitIdentityConflict)
+            };
+        }
+        self.store
+            .append_surface_finalize_intent(
+                &self.path,
+                intent.finalize_intent_id.clone(),
+                intent.expected_settlements.clone(),
+            )
+            .map_err(|_| SurfaceLedgerError::AppendFailed)
+    }
+
+    pub fn load_finalize_intent(
+        &self,
+        intent_id: &super::SurfaceFinalizeIntentId,
+    ) -> Result<Option<DurableFinalizeIntent>, SurfaceLedgerError> {
+        self.store
+            .probe_surface_finalize_intent(&self.path, intent_id)
+            .map_err(|_| SurfaceLedgerError::AppendFailed)?
+            .map(|expected_settlements| {
+                DurableFinalizeIntent::new(intent_id.clone(), expected_settlements)
+                    .map_err(|_| SurfaceLedgerError::CommitIdentityConflict)
+            })
+            .transpose()
+    }
+
+    pub fn persist_settlement(
+        &self,
+        receipt: &super::SurfaceSettlementReceipt,
+    ) -> Result<(), SurfaceLedgerError> {
+        self.store
+            .append_surface_settlement(
+                &self.path,
+                canonical_id(&receipt.settlement_id),
+                receipt.receipt_digest.as_bytes().to_vec(),
+            )
+            .map_err(|_| SurfaceLedgerError::AppendFailed)
+    }
+
+    pub fn persist_shutdown_barrier(
+        &self,
+        shutdown: &mut ImmutableShutdownLedger,
+    ) -> Result<(), SurfaceLedgerError> {
+        let record = shutdown
+            .durable_record()
+            .cloned()
+            .ok_or(SurfaceLedgerError::CommitIdentityConflict)?;
+        ImmutableShutdownLedger::from_durable_record(record.clone())
+            .map_err(|_| SurfaceLedgerError::CommitIdentityConflict)?;
+        let stored = StoredShutdownBarrierRecordV1::from_live(&record)?;
+        let id = canonical_id(stored.barrier_id());
+        let plan_digest = stored.plan_digest().clone();
+        if let Some((existing_digest, existing_stored)) = self
+            .store
+            .probe_surface_control_record(&self.path, "shutdown", &id)
+            .map_err(|_| SurfaceLedgerError::AppendFailed)?
+        {
+            if existing_digest.as_slice() != plan_digest.as_bytes() {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+            let existing = existing_stored.into_live()?;
+            if existing == record {
+                shutdown
+                    .mark_plan_durable(&record.plan)
+                    .map_err(|_| SurfaceLedgerError::CommitIdentityConflict)?;
+                return Ok(());
+            }
+            let legal_progress = existing.plan == record.plan
+                && matches!(existing.state, ShutdownBarrierState::Closing)
+                && existing
+                    .settled
+                    .iter()
+                    .all(|ack| record.settled.contains(ack));
+            if !legal_progress {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+        }
+        self.store
+            .append_surface_shutdown_barrier(
+                &self.path,
+                id,
+                plan_digest.as_bytes().to_vec(),
+                stored,
+            )
+            .map_err(|_| SurfaceLedgerError::AppendFailed)?;
+        shutdown
+            .mark_plan_durable(&record.plan)
+            .map_err(|_| SurfaceLedgerError::CommitIdentityConflict)
+    }
+
+    pub fn load_shutdown_barrier(
+        &self,
+        barrier_id: &SurfaceSettlementId,
+    ) -> Result<Option<ImmutableShutdownLedger>, SurfaceLedgerError> {
+        let id = canonical_id(barrier_id);
+        self.store
+            .probe_surface_control_record(&self.path, "shutdown", &id)
+            .map_err(|_| SurfaceLedgerError::AppendFailed)?
+            .map(|(outer_digest, stored)| {
+                if stored.barrier_id() != barrier_id
+                    || outer_digest.as_slice() != stored.plan_digest().as_bytes()
+                {
+                    return Err(SurfaceLedgerError::CommitIdentityConflict);
+                }
+                ImmutableShutdownLedger::from_durable_record(stored.into_live()?)
+                    .map_err(|_| SurfaceLedgerError::CommitIdentityConflict)
+            })
+            .transpose()
+    }
+}
+
+fn canonical_id<T: serde::Serialize>(id: &T) -> String {
+    serde_json::to_value(id)
+        .expect("surface id serializes")
+        .as_str()
+        .expect("surface id is a string")
+        .to_owned()
+}
+
+impl JsonlSurfaceCommitLedger {
+    pub fn new(path: impl Into<PathBuf>, cursor_template: SurfaceCursor) -> Self {
+        Self {
+            path: path.into(),
+            cursor_template,
+            store: JsonlThreadStore::new(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn id_string(id: &SurfaceCommitId) -> String {
+        serde_json::to_value(id)
+            .expect("surface commit id serializes")
+            .as_str()
+            .expect("surface commit id is a string")
+            .to_owned()
+    }
+
+    fn io_error(_: std::io::Error) -> SurfaceLedgerError {
+        SurfaceLedgerError::AppendFailed
+    }
+
+    pub fn recover_batches(&self) -> Result<RecoveredSurfaceBatches, SurfaceLedgerError> {
+        let stored = self
+            .store
+            .load_surface_commit_batches(&self.path)
+            .map_err(Self::io_error)?;
+        let mut committed = Vec::new();
+        let mut prepared = None;
+        let mut previous_cursor_after = None;
+        for (is_committed, stored_batch) in stored {
+            let batch = stored_batch.into_live()?;
+            if batch.cursor_before.thread_id != self.cursor_template.thread_id
+                || previous_cursor_after.as_ref().map_or_else(
+                    || batch.cursor_before.incarnation != self.cursor_template.incarnation,
+                    |cursor| cursor != &batch.cursor_before,
+                )
+            {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+            previous_cursor_after = Some(batch.cursor_after.clone());
+            if is_committed {
+                if prepared.is_some() {
+                    return Err(SurfaceLedgerError::CommitIdentityConflict);
+                }
+                committed.push(batch);
+            } else if prepared.replace(batch).is_some() {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+        }
+        Ok(RecoveredSurfaceBatches {
+            committed,
+            prepared,
+        })
+    }
+}
+
+impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
+    fn append_complete_batch(
+        &mut self,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<DurableBatchReceipt, SurfaceLedgerError> {
+        let (commit_id, durable_revision) = match &batch.commit_class {
+            CommitClass::Recorded {
+                commit_id,
+                durable_revision,
+                ..
+            } => (commit_id.clone(), *durable_revision),
+            CommitClass::Ephemeral { .. } => return Err(SurfaceLedgerError::AppendFailed),
+        };
+        let id = Self::id_string(&commit_id);
+        if let Some((committed, count, digest, _cursor_before, cursor_after, revision)) = self
+            .store
+            .probe_surface_commit(&self.path, &id)
+            .map_err(Self::io_error)?
+        {
+            if count != batch.event_count
+                || digest.as_slice() != batch.batch_digest.as_bytes()
+                || cursor_after != batch.cursor_after.next_seq.get()
+                || revision != durable_revision.get()
+            {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+            let _ = committed;
+            return Ok(DurableBatchReceipt {
+                commit_id,
+                durable_revision,
+                event_count: batch.event_count,
+                batch_digest: batch.batch_digest.clone(),
+                cursor_after: batch.cursor_after.clone(),
+            });
+        }
+        self.store
+            .append_surface_commit_prepared(
+                &self.path,
+                id,
+                batch.event_count,
+                batch.batch_digest.as_bytes().to_vec(),
+                batch.cursor_before.next_seq.get(),
+                batch.cursor_after.next_seq.get(),
+                durable_revision.get(),
+                StoredSurfaceCommitBatchV1::from_live(batch)?,
+            )
+            .map_err(Self::io_error)?;
+        Ok(DurableBatchReceipt {
+            commit_id,
+            durable_revision,
+            event_count: batch.event_count,
+            batch_digest: batch.batch_digest.clone(),
+            cursor_after: batch.cursor_after.clone(),
+        })
+    }
+
+    fn checkpoint(&mut self, receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError> {
+        self.store
+            .append_surface_commit_committed(
+                &self.path,
+                Self::id_string(&receipt.commit_id),
+                receipt.event_count,
+                receipt.batch_digest.as_bytes().to_vec(),
+                receipt.cursor_after.next_seq.get(),
+                receipt.durable_revision.get(),
+            )
+            .map_err(|_| SurfaceLedgerError::CheckpointFailed)
+    }
+
+    fn probe_commit(&self, commit_id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe {
+        let Ok(found) = self
+            .store
+            .probe_surface_commit(&self.path, &Self::id_string(commit_id))
+        else {
+            return CommitProbe::Absent;
+        };
+        let Some((
+            committed,
+            event_count,
+            stored_digest,
+            cursor_before,
+            cursor_after,
+            durable_revision,
+        )) = found
+        else {
+            return CommitProbe::Absent;
+        };
+        if stored_digest.as_slice() != digest.as_bytes() {
+            return CommitProbe::Conflict;
+        }
+        let Ok(durable_revision) = DurableRevision::try_new(durable_revision) else {
+            return CommitProbe::Conflict;
+        };
+        let cursor = SurfaceCursor {
+            next_seq: super::SequenceNumber::new(cursor_after),
+            source_revision: CursorSourceRevision::Recorded { durable_revision },
+            ..self.cursor_template.clone()
+        };
+        if committed {
+            CommitProbe::Present(DurableBatchReceipt {
+                commit_id: commit_id.clone(),
+                durable_revision,
+                event_count,
+                batch_digest: digest.clone(),
+                cursor_after: cursor,
+            })
+        } else {
+            CommitProbe::Prepared(PreparedSurfaceCommit {
+                commit_id: commit_id.clone(),
+                event_count,
+                batch_digest: digest.clone(),
+                cursor_before: SurfaceCursor {
+                    next_seq: super::SequenceNumber::new(cursor_before),
+                    ..self.cursor_template.clone()
+                },
+                cursor_after: cursor,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettlementError {
+    EmptyIntent,
+    DuplicateSettlement,
+    StoreUnavailable,
+    AmbiguousResult,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableFinalizeIntent {
+    pub finalize_intent_id: super::SurfaceFinalizeIntentId,
+    pub expected_settlements: Vec<super::SurfaceSettlementId>,
+}
+
+impl DurableFinalizeIntent {
+    pub fn new(
+        finalize_intent_id: super::SurfaceFinalizeIntentId,
+        expected_settlements: Vec<super::SurfaceSettlementId>,
+    ) -> Result<Self, SettlementError> {
+        if expected_settlements.is_empty() {
+            return Err(SettlementError::EmptyIntent);
+        }
+        let unique = expected_settlements
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if unique.len() != expected_settlements.len() {
+            return Err(SettlementError::DuplicateSettlement);
+        }
+        Ok(Self {
+            finalize_intent_id,
+            expected_settlements,
+        })
+    }
+}
+
+pub trait ExternalSettlementStore {
+    fn probe(&self, id: &super::SurfaceSettlementId) -> Option<super::SurfaceSettlementReceipt>;
+
+    fn apply_idempotent(
+        &mut self,
+        id: &super::SurfaceSettlementId,
+    ) -> Result<super::SurfaceSettlementReceipt, SettlementError>;
+}
+
+pub fn reconcile_finalize_intent<S: ExternalSettlementStore + ?Sized>(
+    intent: &DurableFinalizeIntent,
+    store: &mut S,
+) -> Result<Vec<super::SurfaceSettlementReceipt>, SettlementError> {
+    let mut receipts = Vec::with_capacity(intent.expected_settlements.len());
+    for settlement_id in &intent.expected_settlements {
+        let receipt = match store.probe(settlement_id) {
+            Some(receipt) => receipt,
+            None => store.apply_idempotent(settlement_id)?,
+        };
+        if receipt.settlement_id != *settlement_id {
+            return Err(SettlementError::AmbiguousResult);
+        }
+        receipts.push(receipt);
+    }
+    Ok(receipts)
+}
+
+pub trait InjectedRuntimeClock {
+    fn clock_id(&self) -> super::HostMonotonicClockId;
+    fn monotonic_tick(&self) -> u64;
+    fn wall_clock_ms(&self) -> i64;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerLeaseKind {
+    Thread,
+    Policy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnerLeaseError {
+    AlreadyOwned,
+    DurableEpochUnavailable,
+    EpochExhausted,
+    IdentityMismatch,
+}
+
+pub struct ExclusiveOwnerLease {
+    lock_file: File,
+    epoch_path: PathBuf,
+    owner_epoch: u64,
+    kind: OwnerLeaseKind,
+    thread_id: Option<super::SurfaceThreadId>,
+    diagnostic_clock_id: super::HostMonotonicClockId,
+    diagnostic_tick: u64,
+    diagnostic_wall_ms: i64,
+}
+
+impl ExclusiveOwnerLease {
+    pub fn acquire(
+        lock_path: impl Into<PathBuf>,
+        epoch_path: impl Into<PathBuf>,
+        kind: OwnerLeaseKind,
+        clock: &impl InjectedRuntimeClock,
+    ) -> Result<Self, OwnerLeaseError> {
+        Self::acquire_bound(lock_path, epoch_path, kind, None, clock)
+    }
+
+    pub fn acquire_thread(
+        lock_path: impl Into<PathBuf>,
+        epoch_path: impl Into<PathBuf>,
+        thread_id: super::SurfaceThreadId,
+        clock: &impl InjectedRuntimeClock,
+    ) -> Result<Self, OwnerLeaseError> {
+        Self::acquire_bound(
+            lock_path,
+            epoch_path,
+            OwnerLeaseKind::Thread,
+            Some(thread_id),
+            clock,
+        )
+    }
+
+    fn acquire_bound(
+        lock_path: impl Into<PathBuf>,
+        epoch_path: impl Into<PathBuf>,
+        kind: OwnerLeaseKind,
+        thread_id: Option<super::SurfaceThreadId>,
+        clock: &impl InjectedRuntimeClock,
+    ) -> Result<Self, OwnerLeaseError> {
+        let lock_path = lock_path.into();
+        let epoch_path = epoch_path.into();
+        if !lease_paths_match(&lock_path, &epoch_path) {
+            return Err(OwnerLeaseError::IdentityMismatch);
+        }
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+        }
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+        try_lock_exclusive(&lock_file)?;
+
+        let epoch_result = advance_owner_epoch(&epoch_path);
+        let owner_epoch = match epoch_result {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                unlock_exclusive(&lock_file);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            lock_file,
+            epoch_path,
+            owner_epoch,
+            kind,
+            thread_id,
+            diagnostic_clock_id: clock.clock_id(),
+            diagnostic_tick: clock.monotonic_tick(),
+            diagnostic_wall_ms: clock.wall_clock_ms(),
+        })
+    }
+
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+
+    pub fn kind(&self) -> OwnerLeaseKind {
+        self.kind
+    }
+
+    pub fn has_authority(&self, _clock: &impl InjectedRuntimeClock) -> bool {
+        self.has_current_authority()
+    }
+
+    pub(crate) fn has_current_authority(&self) -> bool {
+        read_owner_epoch(&self.epoch_path).is_ok_and(|epoch| epoch == self.owner_epoch)
+    }
+
+    pub(crate) fn authorizes_thread(&self, thread_id: &super::SurfaceThreadId) -> bool {
+        self.kind == OwnerLeaseKind::Thread
+            && self.thread_id.as_ref() == Some(thread_id)
+            && self.has_current_authority()
+    }
+
+    pub fn diagnostic_observation(&self) -> (&super::HostMonotonicClockId, u64, i64) {
+        (
+            &self.diagnostic_clock_id,
+            self.diagnostic_tick,
+            self.diagnostic_wall_ms,
+        )
+    }
+}
+
+impl Drop for ExclusiveOwnerLease {
+    fn drop(&mut self) {
+        unlock_exclusive(&self.lock_file);
+    }
+}
+
+fn read_owner_epoch(path: &Path) -> Result<u64, OwnerLeaseError> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut value = String::new();
+    File::open(path)
+        .and_then(|mut file| file.read_to_string(&mut value))
+        .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)
+}
+
+fn advance_owner_epoch(path: &Path) -> Result<u64, OwnerLeaseError> {
+    let parent = path
+        .parent()
+        .ok_or(OwnerLeaseError::DurableEpochUnavailable)?;
+    std::fs::create_dir_all(parent).map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+    let next = read_owner_epoch(path)?
+        .checked_add(1)
+        .ok_or(OwnerLeaseError::EpochExhausted)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(OwnerLeaseError::DurableEpochUnavailable)?;
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::now_v7().as_simple()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+        write!(file, "{next}\n").map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+        file.sync_all()
+            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+        drop(file);
+        std::fs::rename(&temp_path, path).map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| OwnerLeaseError::DurableEpochUnavailable)?;
+        Ok(next)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp_path);
+    }
+    result
+}
+
+fn lease_paths_match(lock_path: &Path, epoch_path: &Path) -> bool {
+    lock_path.parent() == epoch_path.parent()
+        && lock_path.file_stem().is_some()
+        && lock_path.file_stem() == epoch_path.file_stem()
+        && lock_path
+            .extension()
+            .is_some_and(|extension| extension == "lock")
+        && epoch_path
+            .extension()
+            .is_some_and(|extension| extension == "epoch")
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> Result<(), OwnerLeaseError> {
+    use std::os::fd::AsRawFd;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    unsafe {
+        if owner_flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) == 0 {
+            Ok(())
+        } else {
+            Err(OwnerLeaseError::AlreadyOwned)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock_exclusive(file: &File) {
+    use std::os::fd::AsRawFd;
+    const LOCK_UN: i32 = 8;
+    unsafe {
+        let _ = owner_flock(file.as_raw_fd(), LOCK_UN);
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "flock"]
+    fn owner_flock(fd: i32, operation: i32) -> i32;
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &File) -> Result<(), OwnerLeaseError> {
+    Err(OwnerLeaseError::DurableEpochUnavailable)
+}
+
+#[cfg(not(unix))]
+fn unlock_exclusive(_file: &File) {}

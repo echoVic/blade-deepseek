@@ -128,6 +128,43 @@ pub(crate) enum SessionRecord {
     EventSequenceReserved { next_seq: u64 },
     #[serde(rename = "event.semantic")]
     SemanticEvent { event: EventEnvelope },
+    #[serde(rename = "runtime.surface_commit.prepared")]
+    SurfaceCommitPrepared {
+        commit_id: String,
+        event_count: u32,
+        batch_digest: Vec<u8>,
+        cursor_before: u64,
+        cursor_after: u64,
+        durable_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<crate::runtime_surface::StoredSurfaceCommitBatchV1>,
+    },
+    #[serde(rename = "runtime.surface_commit.committed")]
+    SurfaceCommitCommitted {
+        commit_id: String,
+        event_count: u32,
+        batch_digest: Vec<u8>,
+        cursor_after: u64,
+        durable_revision: u64,
+    },
+    #[serde(rename = "runtime.surface_owner_epoch")]
+    SurfaceOwnerEpoch { owner_epoch: u64 },
+    #[serde(rename = "runtime.surface_finalize_intent")]
+    SurfaceFinalizeIntent {
+        finalize_intent_id: crate::runtime_surface::SurfaceFinalizeIntentId,
+        expected_settlements: Vec<crate::runtime_surface::SurfaceSettlementId>,
+    },
+    #[serde(rename = "runtime.surface_settlement")]
+    SurfaceSettlement {
+        settlement_id: String,
+        receipt_digest: Vec<u8>,
+    },
+    #[serde(rename = "runtime.surface_shutdown_barrier")]
+    SurfaceShutdownBarrier {
+        barrier_id: String,
+        plan_digest: Vec<u8>,
+        record: crate::runtime_surface::StoredShutdownBarrierRecordV1,
+    },
     #[serde(rename = "plan.state")]
     PlanState {
         explanation: Option<String>,

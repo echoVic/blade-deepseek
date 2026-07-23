@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +29,80 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
     write_record_line(&mut file, record)?;
     file.flush()?;
     unlock_file(&file)
+}
+
+pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    lock_file(&file)?;
+    let result = (|| {
+        repair_incomplete_final_record(&mut file)?;
+        write_record_line(&mut file, record)?;
+        file.flush()?;
+        file.sync_data()
+    })();
+    let unlock = unlock_file(&file);
+    result.and(unlock)
+}
+
+fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        file.seek(SeekFrom::End(0))?;
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::End(-1))?;
+    let mut final_byte = [0; 1];
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] == b'\n' {
+        file.seek(SeekFrom::End(0))?;
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(&mut *file);
+    let mut line = Vec::new();
+    let mut line_start = 0_u64;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line_start = line_start
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("JSONL offset overflow"))?;
+            continue;
+        }
+        break;
+    }
+    drop(reader);
+
+    match serde_json::from_slice::<SessionRecord>(&line) {
+        Ok(_) => {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+        }
+        Err(error) if error.classify() == serde_json::error::Category::Eof => {
+            file.set_len(line_start)?;
+            file.seek(SeekFrom::End(0))?;
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid complete final JSONL record: {error}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
@@ -287,6 +361,12 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
                 }
                 semantic_events.push(event);
             }
+            SessionRecord::SurfaceCommitPrepared { .. }
+            | SessionRecord::SurfaceCommitCommitted { .. }
+            | SessionRecord::SurfaceOwnerEpoch { .. }
+            | SessionRecord::SurfaceFinalizeIntent { .. }
+            | SessionRecord::SurfaceSettlement { .. }
+            | SessionRecord::SurfaceShutdownBarrier { .. } => {}
             SessionRecord::PlanState { explanation, plan } => {
                 let all_done = !plan.is_empty()
                     && plan.iter().all(|item| item.status == PlanStatus::Completed);
@@ -376,6 +456,12 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         | SessionRecord::UsageBaseline(_)
         | SessionRecord::EventSequenceReserved { .. } => {}
         SessionRecord::SemanticEvent { event } => redact_json_value(&mut event.payload),
+        SessionRecord::SurfaceCommitPrepared { .. }
+        | SessionRecord::SurfaceCommitCommitted { .. }
+        | SessionRecord::SurfaceOwnerEpoch { .. }
+        | SessionRecord::SurfaceSettlement { .. } => {}
+        SessionRecord::SurfaceFinalizeIntent { .. }
+        | SessionRecord::SurfaceShutdownBarrier { .. } => {}
         SessionRecord::PlanState { explanation, plan } => {
             if let Some(explanation) = explanation {
                 redact_string_in_place(explanation);

@@ -659,6 +659,15 @@ impl SurfaceReducerState {
     pub fn snapshot(&self) -> &SurfaceSnapshot {
         &self.snapshot
     }
+
+    pub(crate) fn finalization_degraded_cause(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<&FinalizationDegradedCause> {
+        self.degraded_finalizations
+            .get(operation_id)
+            .map(|proof| &proof.cause)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -860,10 +869,30 @@ fn validate_cursor_and_commit(
 ) -> Result<(), SurfaceReduceResult> {
     let before = &batch.cursor_before;
     let after = &batch.cursor_after;
+    let cold_owner_takeover = matches!(
+        (
+            &batch.commit_class,
+            batch.events.as_slice(),
+        ),
+        (
+            CommitClass::Recorded {
+                thread_owner_epoch,
+                ..
+            },
+            [SurfaceEventEnvelope {
+                scope: SurfaceScope::Thread,
+                event: SurfaceEvent::Session(SessionPatch::OwnerEpochChanged { previous, next }),
+                ..
+            }]
+        ) if *previous == state.snapshot.thread.owner_epoch
+            && previous < next
+            && next == thread_owner_epoch
+            && after.incarnation != before.incarnation
+    );
     if state.snapshot.cursor != *before
         || before.thread_id != state.snapshot.thread.thread_id
         || after.thread_id != before.thread_id
-        || after.incarnation != before.incarnation
+        || (after.incarnation != before.incarnation && !cold_owner_takeover)
         || after.next_seq.get()
             != before
                 .next_seq
@@ -888,7 +917,7 @@ fn validate_cursor_and_commit(
                 durable_revision: cursor_revision,
             },
         ) => {
-            *thread_owner_epoch == state.snapshot.thread.owner_epoch
+            (*thread_owner_epoch == state.snapshot.thread.owner_epoch || cold_owner_takeover)
                 && durable_revision == cursor_revision
         }
         (
@@ -2594,13 +2623,21 @@ fn apply_session_patch(
             Ok(())
         }
         SessionPatch::OwnerEpochChanged { previous, next } => {
+            let recorded_owner_matches = matches!(
+                &envelope.commit_class,
+                CommitClass::Recorded {
+                    thread_owner_epoch,
+                    ..
+                } if thread_owner_epoch == next
+            );
             if snapshot.thread.owner_epoch != *previous
-                || previous.get().checked_add(1) != Some(next.get())
+                || previous >= next
+                || !recorded_owner_matches
             {
                 return Err(event_error(
                     envelope,
                     SurfaceReducerErrorCode::StaleRevision,
-                    "thread owner epoch is not contiguous",
+                    "thread owner epoch transition is not authorized",
                 ));
             }
             snapshot.thread.owner_epoch = *next;
@@ -5360,7 +5397,12 @@ fn apply_operation_patch(
                     Some(GenerationStopReason::InterruptedResumable)
                 ) | (
                     SuspensionCause::RecoveryRequired { .. },
-                    Some(GenerationStopReason::RuntimeRestart)
+                    Some(
+                        GenerationStopReason::RuntimeRestart
+                            | GenerationStopReason::NotStarted {
+                                reason: NotStartedReason::RuntimeRestart,
+                            },
+                    )
                 ) | (
                     SuspensionCause::ProviderSuspended { .. },
                     Some(GenerationStopReason::ProviderSuspended)
@@ -7576,18 +7618,18 @@ fn goal_patch_id(patch: &GoalPatch) -> &SurfaceGoalId {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
+    pub(crate) fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
         let mut bytes = [seed; 16];
         bytes[6] = 0x70 | (seed & 0x0f);
         bytes[8] = 0x80 | (seed & 0x3f);
         bytes
     }
 
-    fn thread_id() -> SurfaceThreadId {
+    pub(crate) fn thread_id() -> SurfaceThreadId {
         SurfaceThreadId::try_from_bytes([1; 16]).unwrap()
     }
 
@@ -7604,7 +7646,7 @@ mod tests {
         }
     }
 
-    fn digest(seed: u8) -> Sha256Digest {
+    pub(crate) fn digest(seed: u8) -> Sha256Digest {
         Sha256Digest::new([seed; 32])
     }
 
@@ -7704,7 +7746,7 @@ mod tests {
         }))
     }
 
-    fn reducer_snapshot() -> SurfaceSnapshot {
+    pub(crate) fn reducer_snapshot() -> SurfaceSnapshot {
         let incarnation = SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(5)).unwrap();
         let path = CanonicalPath::try_new(std::path::PathBuf::from("/tmp/orca-surface")).unwrap();
         let usage = UsageTotals {
