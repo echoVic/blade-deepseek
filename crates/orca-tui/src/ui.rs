@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -19,6 +19,7 @@ use orca_runtime::history::SessionSummary;
 
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::shortcuts::{self, ShortcutScope};
+use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
 use crate::transcript_view::viewport_paragraph;
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
@@ -1399,7 +1400,7 @@ fn append_message_lines(
             ]));
         }
         ChatMessage::Assistant(text) => {
-            let md_lines = render_markdown(text, width);
+            let md_lines = render_markdown(text, width, theme);
             for line in md_lines {
                 lines.push(line);
             }
@@ -1634,11 +1635,10 @@ fn append_proposed_plan_lines(
             .fg(theme.approval)
             .add_modifier(Modifier::BOLD),
     )]));
-    for line in render_markdown(text, width.saturating_sub(2)) {
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default().fg(theme.muted)),
-            Span::styled(line.to_string(), Style::default().fg(theme.text)),
-        ]));
+    for mut line in render_markdown(text, width.saturating_sub(2), theme) {
+        line.spans
+            .insert(0, Span::styled("  ", Style::default().fg(theme.muted)));
+        lines.push(line);
     }
     lines.push(Line::from(""));
 }
@@ -2980,14 +2980,38 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, _theme
     }
 }
 
-fn render_markdown(input: &str, width: usize) -> Vec<Line<'static>> {
+struct PendingCodeBlock {
+    language: Option<String>,
+    source: String,
+}
+
+fn append_code_block(lines: &mut Vec<Line<'static>>, pending: PendingCodeBlock, theme: &Theme) {
+    let highlighted = pending
+        .language
+        .as_deref()
+        .and_then(|language| highlight_code(&pending.source, language, theme.syntax_theme));
+
+    if let Some(highlighted) = highlighted {
+        for mut source_line in highlighted {
+            source_line.insert(0, Span::raw("  "));
+            lines.push(Line::from(source_line));
+        }
+    } else {
+        let style = Style::default().fg(Color::Gray);
+        for source_line in pending.source.lines() {
+            lines.push(Line::from(Span::styled(format!("  {source_line}"), style)));
+        }
+    }
+}
+
+fn render_markdown(input: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(input, opts);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default().fg(Color::White)];
-    let mut in_code_block = false;
+    let mut pending_code_block: Option<PendingCodeBlock> = None;
     let mut list_depth: u16 = 0;
 
     // Table buffering state
@@ -2997,6 +3021,20 @@ fn render_markdown(input: &str, width: usize) -> Vec<Line<'static>> {
     let mut current_cell = String::new();
 
     for event in parser {
+        if let Some(pending) = pending_code_block.as_mut() {
+            match event {
+                Event::Text(text) => pending.source.push_str(&text),
+                Event::End(TagEnd::CodeBlock) => {
+                    let pending = pending_code_block
+                        .take()
+                        .expect("pending code block exists");
+                    append_code_block(&mut lines, pending, theme);
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         // When inside a table, buffer content instead of rendering immediately
         if in_table {
             match event {
@@ -3052,9 +3090,16 @@ fn render_markdown(input: &str, width: usize) -> Vec<Line<'static>> {
                     let base = *style_stack.last().unwrap_or(&Style::default());
                     style_stack.push(base.add_modifier(Modifier::ITALIC));
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     flush_line(&mut current_spans, &mut lines);
-                    in_code_block = true;
+                    let language = match kind {
+                        CodeBlockKind::Fenced(info) => Some(info.into_string()),
+                        CodeBlockKind::Indented => None,
+                    };
+                    pending_code_block = Some(PendingCodeBlock {
+                        language,
+                        source: String::new(),
+                    });
                 }
                 Tag::List(_) => {
                     list_depth += 1;
@@ -3081,9 +3126,6 @@ fn render_markdown(input: &str, width: usize) -> Vec<Line<'static>> {
                 TagEnd::Strong | TagEnd::Emphasis => {
                     style_stack.pop();
                 }
-                TagEnd::CodeBlock => {
-                    in_code_block = false;
-                }
                 TagEnd::Paragraph => {
                     flush_line(&mut current_spans, &mut lines);
                 }
@@ -3100,19 +3142,8 @@ fn render_markdown(input: &str, width: usize) -> Vec<Line<'static>> {
                 _ => {}
             },
             Event::Text(text) => {
-                let style = if in_code_block {
-                    Style::default().fg(Color::Gray)
-                } else {
-                    *style_stack.last().unwrap_or(&Style::default())
-                };
-                if in_code_block {
-                    for code_line in text.lines() {
-                        current_spans.push(Span::styled(format!("  {code_line}"), style));
-                        flush_line(&mut current_spans, &mut lines);
-                    }
-                } else {
-                    current_spans.push(Span::styled(text.to_string(), style));
-                }
+                let style = *style_stack.last().unwrap_or(&Style::default());
+                current_spans.push(Span::styled(text.to_string(), style));
             }
             Event::Code(code) => {
                 current_spans.push(Span::styled(
@@ -3422,7 +3453,239 @@ mod tests {
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_runtime::history::SessionSummary;
+    use std::collections::HashSet;
     use std::time::{Duration, Instant};
+
+    fn foregrounds(line: &Line<'static>) -> HashSet<Color> {
+        line.spans.iter().filter_map(|span| span.style.fg).collect()
+    }
+
+    fn rendered_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn fenced_rust_code_preserves_text_and_uses_token_foregrounds() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let input = "```rust,no_run\nfn main() { let message = \"hello\"; }\n```";
+
+        let lines = render_markdown(input, 80, &theme);
+        let code_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("fn main"))
+            .expect("rendered Rust source");
+
+        assert_eq!(
+            code_line.to_string(),
+            "  fn main() { let message = \"hello\"; }"
+        );
+        assert!(foregrounds(code_line).len() >= 2);
+    }
+
+    #[test]
+    fn unknown_and_oversized_fences_keep_plain_gray_code_style() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let unknown = render_markdown("```not-a-real-language\nunknown_call();\n```", 80, &theme);
+        let unknown_line = unknown
+            .iter()
+            .find(|line| line.to_string().contains("unknown_call"))
+            .expect("unknown-language source");
+
+        assert_eq!(unknown_line.to_string(), "  unknown_call();");
+        assert!(
+            unknown_line
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(Color::Gray))
+        );
+
+        let source = "x".repeat(crate::syntax_highlight::MAX_HIGHLIGHT_BYTES + 1);
+        let oversized = render_markdown(&format!("```rust\n{source}\n```"), usize::MAX, &theme);
+        let oversized_line = oversized
+            .iter()
+            .find(|line| line.to_string().len() > source.len())
+            .expect("oversized Rust source");
+
+        assert_eq!(oversized_line.to_string(), format!("  {source}"));
+        assert!(
+            oversized_line
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(Color::Gray))
+        );
+    }
+
+    #[test]
+    fn proposed_plan_keeps_markdown_code_span_styles() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut lines = Vec::new();
+
+        append_proposed_plan_lines(
+            &mut lines,
+            "```rust\nfn main() { let message = \"hello\"; }\n```",
+            80,
+            &theme,
+        );
+
+        let code_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("fn main"))
+            .expect("prefixed Rust source");
+        assert_eq!(
+            code_line.to_string(),
+            "    fn main() { let message = \"hello\"; }"
+        );
+        let markdown_foregrounds = code_line
+            .spans
+            .iter()
+            .skip(1)
+            .filter_map(|span| span.style.fg)
+            .collect::<HashSet<_>>();
+        assert!(markdown_foregrounds.len() >= 2);
+    }
+
+    #[test]
+    fn multiline_rust_code_preserves_state_across_text_events() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let input = "```rust\r\n/* comment starts\r\n\r\ncomment continues */\r\nlet message = r#\"first\r\nsecond\"#;\r\n```";
+        let mut in_code_block = false;
+        let mut code_text_events = 0;
+        for event in Parser::new_ext(input, Options::empty()) {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+                Event::Text(_) if in_code_block => code_text_events += 1,
+                Event::End(TagEnd::CodeBlock) => in_code_block = false,
+                _ => {}
+            }
+        }
+        assert!(
+            code_text_events >= 2,
+            "fixture must exercise multiple code-block Text events"
+        );
+
+        let lines = render_markdown(input, 80, &theme);
+        let text = rendered_text(&lines);
+
+        assert_eq!(
+            text,
+            vec![
+                "  /* comment starts",
+                "  ",
+                "  comment continues */",
+                "  let message = r#\"first",
+                "  second\"#;",
+            ]
+        );
+        let opening_comment = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("comment starts"))
+            .expect("opening comment span")
+            .style
+            .fg;
+        let continued_comment = lines[2]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("comment continues"))
+            .expect("continued comment span")
+            .style
+            .fg;
+        assert_eq!(continued_comment, opening_comment);
+        let opening_string = lines[3]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("first"))
+            .expect("opening raw string span")
+            .style
+            .fg;
+        let continued_string = lines[4]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("second"))
+            .expect("continued raw string span")
+            .style
+            .fg;
+        assert_eq!(continued_string, opening_string);
+        assert_ne!(continued_string, continued_comment);
+    }
+
+    #[test]
+    fn gray_code_fallback_preserves_source_boundaries() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let cases = [
+            (
+                "unknown empty",
+                Some("not-a-real-language"),
+                "",
+                Vec::<&str>::new(),
+            ),
+            ("indented empty", None, "", Vec::new()),
+            (
+                "unknown internal blank",
+                Some("not-a-real-language"),
+                "alpha\n\nbeta\n",
+                vec!["  alpha", "  ", "  beta"],
+            ),
+            (
+                "indented leading indentation",
+                None,
+                "  alpha\n",
+                vec!["    alpha"],
+            ),
+            (
+                "unknown CRLF endings",
+                Some("not-a-real-language"),
+                "alpha\r\nbeta\r\n",
+                vec!["  alpha", "  beta"],
+            ),
+            (
+                "indented terminal newline",
+                None,
+                "alpha\nbeta\n",
+                vec!["  alpha", "  beta"],
+            ),
+        ];
+
+        for (name, language, source, expected) in cases {
+            let mut lines = Vec::new();
+            append_code_block(
+                &mut lines,
+                PendingCodeBlock {
+                    language: language.map(str::to_owned),
+                    source: source.to_owned(),
+                },
+                &theme,
+            );
+
+            assert_eq!(rendered_text(&lines), expected, "{name}");
+            for line in &lines {
+                let text = line.to_string();
+                let source_text = text.strip_prefix("  ").expect("code indentation");
+                if !source_text.is_empty() {
+                    assert!(
+                        line.spans
+                            .iter()
+                            .all(|span| span.style.fg == Some(Color::Gray)),
+                        "{name}: non-empty fallback content must remain gray"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_code_keeps_magenta_style() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let lines = render_markdown("Use `cargo test` now.", 80, &theme);
+        let inline = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "`cargo test`")
+            .expect("inline code span");
+
+        assert_eq!(inline.style.fg, Some(Color::Magenta));
+    }
 
     #[test]
     fn welcome_lines_use_configured_app_version() {
