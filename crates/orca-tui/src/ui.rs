@@ -1461,7 +1461,7 @@ fn append_message_lines(
                 append_tool_output_lines(lines, out, *expanded, force_expand, theme);
             }
             if let Some(diff) = diff {
-                append_diff_lines(lines, diff, theme);
+                append_diff_lines(lines, diff, theme, None);
             }
         }
         ChatMessage::PlanUpdate { explanation, plan } => {
@@ -1727,29 +1727,15 @@ fn append_subagent_lines(
     )));
 }
 
-fn append_diff_lines(lines: &mut Vec<Line<'static>>, diff: &str, theme: &Theme) {
-    let mut diff_lines = diff.lines();
-    for line in diff_lines.by_ref().take(80) {
-        let color = if line.starts_with('+') && !line.starts_with("+++") {
-            theme.diff_add
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            theme.diff_remove
-        } else if line.starts_with("@@") {
-            theme.border
-        } else {
-            theme.muted
-        };
-        lines.push(Line::from(Span::styled(
-            format!("    {line}"),
-            Style::default().fg(color),
-        )));
-    }
-    if diff_lines.next().is_some() {
-        lines.push(Line::from(Span::styled(
-            "    [... diff truncated ...]",
-            Style::default().fg(theme.muted),
-        )));
-    }
+fn append_diff_lines(
+    lines: &mut Vec<Line<'static>>,
+    diff: &str,
+    theme: &Theme,
+    refined: Option<&crate::diff_highlight::RefinedDiffStyles>,
+) {
+    lines.extend(crate::diff_highlight::render_unified_diff(
+        diff, theme, refined,
+    ));
 }
 
 fn append_tool_output_lines(
