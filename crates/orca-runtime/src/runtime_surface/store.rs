@@ -2,9 +2,13 @@ use super::*;
 use crate::thread_store::JsonlThreadStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SurfaceLedgerError {
@@ -2465,6 +2469,13 @@ pub struct JsonlSurfaceCommitLedger {
     store: JsonlThreadStore,
 }
 
+#[cfg(test)]
+static TERMINAL_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
 pub struct JsonlSurfaceControlLedger {
     path: PathBuf,
     store: JsonlThreadStore,
@@ -2628,6 +2639,72 @@ impl JsonlSurfaceCommitLedger {
         &self.path
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_terminal_append_failure_once(path: impl Into<PathBuf>) {
+        TERMINAL_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_terminal_checkpoint_failure_once(path: impl Into<PathBuf>) {
+        TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
+    fn take_terminal_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let is_terminal = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::Terminal { .. })
+            )
+        });
+        is_terminal
+            && TERMINAL_APPEND_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+    }
+
+    #[cfg(test)]
+    fn arm_terminal_checkpoint_failure(&self, batch: &SurfaceCommitBatch) {
+        let is_terminal = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::Terminal { .. })
+            )
+        });
+        if is_terminal
+            && TERMINAL_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+        {
+            PENDING_TERMINAL_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone());
+        }
+    }
+
+    #[cfg(test)]
+    fn take_pending_terminal_checkpoint_failure(&self) -> bool {
+        PENDING_TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path)
+    }
+
     fn id_string(id: &SurfaceCommitId) -> String {
         serde_json::to_value(id)
             .expect("surface commit id serializes")
@@ -2680,6 +2757,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         &mut self,
         batch: &SurfaceCommitBatch,
     ) -> Result<DurableBatchReceipt, SurfaceLedgerError> {
+        #[cfg(test)]
+        if self.take_terminal_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
         let (commit_id, durable_revision) = match &batch.commit_class {
             CommitClass::Recorded {
                 commit_id,
@@ -2722,16 +2803,23 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
                 StoredSurfaceCommitBatchV1::from_live(batch)?,
             )
             .map_err(Self::io_error)?;
-        Ok(DurableBatchReceipt {
+        let receipt = DurableBatchReceipt {
             commit_id,
             durable_revision,
             event_count: batch.event_count,
             batch_digest: batch.batch_digest.clone(),
             cursor_after: batch.cursor_after.clone(),
-        })
+        };
+        #[cfg(test)]
+        self.arm_terminal_checkpoint_failure(batch);
+        Ok(receipt)
     }
 
     fn checkpoint(&mut self, receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError> {
+        #[cfg(test)]
+        if self.take_pending_terminal_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
         self.store
             .append_surface_commit_committed(
                 &self.path,

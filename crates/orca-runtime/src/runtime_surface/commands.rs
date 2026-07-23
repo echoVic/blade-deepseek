@@ -236,6 +236,50 @@ pub struct RuntimeSurfaceClientHandle {
     connection_id: Option<SurfaceConnectionId>,
     hub_scope: Arc<()>,
     detached_receipt: Arc<Mutex<Option<DetachRevocationReceipt>>>,
+    dispatcher: Option<Arc<dyn RuntimeSurfaceCommandDispatcher>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceClientCommandError {
+    RuntimeUnavailable,
+    Unauthorized,
+}
+
+pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
+    fn reserve_operation(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        intent: OperationRequestIntent,
+    ) -> Result<MutationReply<ReservedOperationOutput>, SurfaceClientCommandError>;
+
+    fn admit_reserved(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+        admission_lease_id: SurfaceAdmissionLeaseId,
+    ) -> Result<MutationReply<AdmissionOutput>, SurfaceClientCommandError>;
+
+    fn cancel_operation(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+    ) -> Result<MutationReply<CancelOperationOutput>, SurfaceClientCommandError>;
+
+    fn wait_operation_terminal(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+    ) -> Result<WaitOperationTerminalResult, SurfaceClientCommandError>;
+
+    fn retry_finalization(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        token: RetryFinalizationToken,
+    ) -> Result<MutationReply<OperationTerminalAtCursor>, SurfaceClientCommandError>;
 }
 
 #[allow(dead_code)]
@@ -256,7 +300,71 @@ impl RuntimeSurfaceClientHandle {
             connection_id,
             hub_scope,
             detached_receipt: Arc::new(Mutex::new(None)),
+            dispatcher: None,
         }
+    }
+
+    pub(crate) fn with_dispatcher(
+        mut self,
+        dispatcher: Option<Arc<dyn RuntimeSurfaceCommandDispatcher>>,
+    ) -> Self {
+        self.dispatcher = dispatcher;
+        self
+    }
+
+    pub fn reserve_operation(
+        &self,
+        request_id: SurfaceRequestId,
+        intent: OperationRequestIntent,
+    ) -> Result<MutationReply<ReservedOperationOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .reserve_operation(self.clone(), request_id, intent)
+    }
+
+    pub fn admit_reserved(
+        &self,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+        admission_lease_id: SurfaceAdmissionLeaseId,
+    ) -> Result<MutationReply<AdmissionOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .admit_reserved(self.clone(), request_id, operation_id, admission_lease_id)
+    }
+
+    pub fn cancel_operation(
+        &self,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+    ) -> Result<MutationReply<CancelOperationOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .cancel_operation(self.clone(), request_id, operation_id)
+    }
+
+    pub fn wait_operation_terminal(
+        &self,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+    ) -> Result<WaitOperationTerminalResult, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .wait_operation_terminal(self.clone(), request_id, operation_id)
+    }
+
+    pub fn retry_finalization(
+        &self,
+        token: RetryFinalizationToken,
+    ) -> Result<MutationReply<OperationTerminalAtCursor>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .retry_finalization(self.clone(), token)
     }
 
     pub(crate) fn attachment_id(&self) -> &SurfaceAttachmentId {
@@ -1318,6 +1426,18 @@ impl RetryFinalizationToken {
             expected_thread_owner_epoch,
             missing_set_digest,
         }
+    }
+
+    pub(crate) fn request_id(&self) -> &SurfaceRequestId {
+        &self.request_id
+    }
+
+    pub(crate) fn thread_id(&self) -> &SurfaceThreadId {
+        &self.thread_id
+    }
+
+    pub(crate) fn operation_id(&self) -> &SurfaceOperationId {
+        &self.operation_id
     }
 }
 
@@ -3010,6 +3130,7 @@ pub struct RuntimeSurfaceHandle {
     host_incarnation: HostIncarnation,
     thread_id: SurfaceThreadId,
     authority: SurfaceAttachAuthority,
+    hub: Option<SurfaceHub>,
 }
 
 #[allow(dead_code)]
@@ -3025,7 +3146,34 @@ impl RuntimeSurfaceHandle {
             host_incarnation,
             thread_id,
             authority,
+            hub: None,
         }
+    }
+
+    pub(crate) fn from_hub(hub: SurfaceHub) -> Self {
+        let authority = hub.authority().clone();
+        Self {
+            host_incarnation: authority.host_incarnation().clone(),
+            thread_id: authority.thread_id().clone(),
+            authority,
+            hub: Some(hub),
+        }
+    }
+
+    pub fn attach_fresh(&self, request: FreshAttachRequest) -> AttachResult {
+        self.hub.as_ref().map_or(
+            AttachResult::Unavailable {
+                reason: SurfaceUnavailableReason::RuntimeUnavailable,
+            },
+            |hub| hub.attach_fresh(request),
+        )
+    }
+
+    pub fn claim_subscription(
+        &self,
+        handle: &SurfaceSubscriptionHandle,
+    ) -> Option<SurfaceSubscriptionReceiver> {
+        self.hub.as_ref()?.claim_subscription(handle)
     }
 
     pub(crate) fn host_incarnation(&self) -> &HostIncarnation {

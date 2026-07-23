@@ -60,6 +60,23 @@ impl RuntimeThread {
         Ok(Self::from_session(session))
     }
 
+    pub(crate) fn start_with_prepared_history(
+        config: &RunConfig,
+        title: impl Into<String>,
+        preloaded: Option<SessionTranscript>,
+        mcp_registry: McpRegistry,
+        prepared_record_meta: Option<crate::thread_store::SessionMeta>,
+    ) -> io::Result<Self> {
+        let session = InteractiveSession::new_with_prepared_history(
+            config,
+            &title.into(),
+            preloaded,
+            mcp_registry,
+            prepared_record_meta,
+        )?;
+        Ok(Self::from_session(session))
+    }
+
     fn from_session(session: InteractiveSession) -> Self {
         let thread_id = session
             .session_id()

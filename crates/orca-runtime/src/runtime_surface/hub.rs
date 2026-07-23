@@ -40,9 +40,10 @@ pub enum SurfaceHubBindError {
 #[derive(Clone)]
 pub struct SurfaceHub {
     inner: Arc<Mutex<SurfaceHubState>>,
-    surface: RuntimeSurfaceHandle,
+    authority: SurfaceAttachAuthority,
     scope: Arc<()>,
     config: SurfaceHubConfig,
+    dispatcher: Option<Arc<dyn RuntimeSurfaceCommandDispatcher>>,
 }
 
 struct SurfaceHubState {
@@ -126,6 +127,8 @@ impl SurfaceHub {
         let maximum_capabilities = NonEmptySet::try_new(BTreeSet::from([
             SurfaceCapability::ReadSnapshot,
             SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::RepairThread,
         ]))
         .expect("fixed TUI surface capabilities are non-empty");
         let required_capabilities =
@@ -139,20 +142,14 @@ impl SurfaceHub {
             required_capabilities,
             BTreeSet::from([SurfaceInteractionKind::UserInput]),
         );
-        let surface = RuntimeSurfaceHandle::new(
-            host_incarnation,
-            snapshot.thread.thread_id.clone(),
-            authority,
-        );
-        Self::from_runtime_surface(snapshot, surface, config)
+        Self::from_authority(snapshot, authority, config)
     }
 
-    pub(crate) fn from_runtime_surface(
+    pub(crate) fn from_authority(
         snapshot: SurfaceSnapshot,
-        surface: RuntimeSurfaceHandle,
+        authority: SurfaceAttachAuthority,
         config: SurfaceHubConfig,
     ) -> Result<Self, SurfaceHubCreateError> {
-        let authority = surface.authority();
         let maximum_capabilities = authority.maximum_capabilities();
         let required_capabilities = authority.required_capabilities();
         if !required_capabilities
@@ -167,10 +164,8 @@ impl SurfaceHub {
         {
             return Err(SurfaceHubCreateError::ReadSnapshotNotRequired);
         }
-        if surface.thread_id() != &snapshot.thread.thread_id
-            || surface.thread_id() != &snapshot.cursor.thread_id
-            || surface.host_incarnation() != authority.host_incarnation()
-            || surface.thread_id() != authority.thread_id()
+        if authority.thread_id() != &snapshot.thread.thread_id
+            || authority.thread_id() != &snapshot.cursor.thread_id
         {
             return Err(SurfaceHubCreateError::WrongThread);
         }
@@ -185,10 +180,19 @@ impl SurfaceHub {
                 subscriptions: BTreeMap::new(),
                 retired_subscriptions: BTreeMap::new(),
             })),
-            surface,
+            authority,
             scope: Arc::new(()),
             config,
+            dispatcher: None,
         })
+    }
+
+    pub(crate) fn with_dispatcher(
+        mut self,
+        dispatcher: Arc<dyn RuntimeSurfaceCommandDispatcher>,
+    ) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
     }
 
     pub fn attach_fresh(&self, request: FreshAttachRequest) -> AttachResult {
@@ -405,7 +409,7 @@ impl SurfaceHub {
         if !client.belongs_to(
             &self.scope,
             &state.snapshot.thread.thread_id,
-            self.surface.authority().host_incarnation(),
+            self.authority.host_incarnation(),
         ) {
             return DetachResult::StaleAttachment {
                 request_id: request.request_id,
@@ -445,7 +449,7 @@ impl SurfaceHub {
         client.belongs_to(
             &self.scope,
             &state.snapshot.thread.thread_id,
-            self.surface.authority().host_incarnation(),
+            self.authority.host_incarnation(),
         ) && client.detached_receipt().is_none()
             && state
                 .subscriptions
@@ -454,7 +458,11 @@ impl SurfaceHub {
     }
 
     pub(crate) fn thread_id(&self) -> SurfaceThreadId {
-        self.surface.thread_id().clone()
+        self.authority.thread_id().clone()
+    }
+
+    pub(crate) fn authority(&self) -> &SurfaceAttachAuthority {
+        &self.authority
     }
 
     fn authorize(
@@ -464,7 +472,7 @@ impl SurfaceHub {
         requested_interactions: &BTreeSet<SurfaceInteractionKind>,
         granted_at: &SurfaceCursor,
     ) -> Result<SurfaceAttachmentCapabilities, AttachDeniedReason> {
-        let authority = self.surface.authority();
+        let authority = &self.authority;
         if role != authority.role() {
             return Err(AttachDeniedReason::RoleMismatch);
         }
@@ -513,11 +521,12 @@ impl SurfaceHub {
         let client = RuntimeSurfaceClientHandle::new(
             attachment_id.clone(),
             state.snapshot.thread.thread_id.clone(),
-            self.surface.authority().host_incarnation().clone(),
+            self.authority.host_incarnation().clone(),
             capabilities.grant.clone(),
             None,
             self.scope.clone(),
-        );
+        )
+        .with_dispatcher(self.dispatcher.clone());
         let hub = Arc::downgrade(&self.inner);
         let subscription =
             SurfaceSubscriptionHandle::new(attachment_id.clone(), move |attachment_id| {
@@ -996,12 +1005,7 @@ mod tests {
                 capabilities.clone(),
                 BTreeSet::new(),
             );
-            let surface = RuntimeSurfaceHandle::new(
-                host_incarnation,
-                snapshot.thread.thread_id.clone(),
-                authority,
-            );
-            SurfaceHub::from_runtime_surface(snapshot.clone(), surface, SurfaceHubConfig::default())
+            SurfaceHub::from_authority(snapshot.clone(), authority, SurfaceHubConfig::default())
                 .unwrap()
         };
         let hub = make_hub();

@@ -270,16 +270,23 @@ pub fn create_fork_meta(
 }
 
 pub(crate) fn session_path(session_id: &str, timestamp: DateTime<Utc>) -> io::Result<PathBuf> {
+    let path = prospective_session_path(session_id, timestamp);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    Ok(path)
+}
+
+pub(crate) fn prospective_session_path(session_id: &str, timestamp: DateTime<Utc>) -> PathBuf {
     let dir = sessions_dir()
         .join(format!("{:04}", timestamp.year()))
         .join(format!("{:02}", timestamp.month()))
         .join(format!("{:02}", timestamp.day()));
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!(
+    dir.join(format!(
         "session-{}-{}.jsonl",
         timestamp.format("%Y-%m-%dT%H-%M-%S"),
         session_id
-    )))
+    ))
 }
 
 fn title_from_prompt(prompt: &str) -> String {

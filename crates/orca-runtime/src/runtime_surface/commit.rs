@@ -133,16 +133,13 @@ impl BoundedPublicationSuffix {
 }
 
 impl ColdOwnerTakeoverAuthority {
-    fn authorizes(
+    fn authorizes_transition(
         &self,
-        operation_id: &super::SurfaceOperationId,
         snapshot: &super::SurfaceSnapshot,
         new_incarnation: &super::SurfaceIncarnation,
         new_owner_epoch: &ThreadOwnerEpoch,
     ) -> bool {
-        if new_owner_epoch != &self.current_owner_epoch
-            || !self.recoverable_operations.contains(operation_id)
-        {
+        if new_owner_epoch != &self.current_owner_epoch {
             return false;
         }
         match &self.new_incarnation {
@@ -158,6 +155,39 @@ impl ColdOwnerTakeoverAuthority {
             }
         }
     }
+
+    fn authorizes(
+        &self,
+        operation_id: &super::SurfaceOperationId,
+        snapshot: &super::SurfaceSnapshot,
+        new_incarnation: &super::SurfaceIncarnation,
+        new_owner_epoch: &ThreadOwnerEpoch,
+    ) -> bool {
+        self.recoverable_operations.contains(operation_id)
+            && self.authorizes_transition(snapshot, new_incarnation, new_owner_epoch)
+    }
+}
+
+enum OwnerLeaseAuthority<'owner> {
+    Borrowed(&'owner ExclusiveOwnerLease),
+    Owned(ExclusiveOwnerLease),
+}
+
+enum BatchCommitAuthority<'permit> {
+    Single(&'permit SurfacePublisherPermit),
+    LiveGenerationStop {
+        generation: &'permit SurfacePublisherPermit,
+        finalizer: &'permit SurfacePublisherPermit,
+    },
+}
+
+impl OwnerLeaseAuthority<'_> {
+    fn lease(&self) -> &ExclusiveOwnerLease {
+        match self {
+            Self::Borrowed(lease) => lease,
+            Self::Owned(lease) => lease,
+        }
+    }
 }
 
 pub struct RuntimeCommitCoordinator<'owner, L> {
@@ -165,7 +195,7 @@ pub struct RuntimeCommitCoordinator<'owner, L> {
     state: SurfaceReducerState,
     surface_hub: Option<super::SurfaceHub>,
     recovered_publications: BoundedPublicationSuffix,
-    owner_lease: &'owner ExclusiveOwnerLease,
+    owner_lease: OwnerLeaseAuthority<'owner>,
     owner_epoch: ThreadOwnerEpoch,
     actor_control_permit: SurfacePublisherPermit,
     issued_permits: Vec<SurfacePublisherPermit>,
@@ -242,14 +272,24 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         state: SurfaceReducerState,
         owner_lease: &'owner ExclusiveOwnerLease,
     ) -> Result<Self, SurfaceCommitError> {
-        if !owner_lease.authorizes_thread(&state.snapshot().thread.thread_id) {
+        Self::new_with_authority(ledger, state, OwnerLeaseAuthority::Borrowed(owner_lease))
+    }
+
+    fn new_with_authority(
+        ledger: L,
+        state: SurfaceReducerState,
+        owner_lease: OwnerLeaseAuthority<'owner>,
+    ) -> Result<Self, SurfaceCommitError> {
+        let lease = owner_lease.lease();
+        if !lease.authorizes_thread(&state.snapshot().thread.thread_id) {
             return Err(SurfaceCommitError::StaleOwnerEpoch);
         }
         let next_sequence = state.snapshot().cursor.next_seq.get();
+        let owner_epoch = ThreadOwnerEpoch::new(lease.owner_epoch());
         let actor_control_permit = SurfacePublisherPermit::ActorControl {
             permit_id: next_permit_id(),
             thread_id: state.snapshot().thread.thread_id.clone(),
-            owner_epoch: ThreadOwnerEpoch::new(owner_lease.owner_epoch()),
+            owner_epoch,
         };
         Ok(Self {
             ledger,
@@ -257,7 +297,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             surface_hub: None,
             recovered_publications: BoundedPublicationSuffix::default(),
             owner_lease,
-            owner_epoch: ThreadOwnerEpoch::new(owner_lease.owner_epoch()),
+            owner_epoch,
             issued_permits: vec![actor_control_permit.clone()],
             actor_control_permit,
             next_sequence,
@@ -271,13 +311,32 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
     }
 }
 
+impl<L: SurfaceCommitLedger> RuntimeCommitCoordinator<'static, L> {
+    pub fn new_with_owned_lease(
+        ledger: L,
+        state: SurfaceReducerState,
+        owner_lease: ExclusiveOwnerLease,
+    ) -> Result<Self, SurfaceCommitError> {
+        Self::new_with_authority(ledger, state, OwnerLeaseAuthority::Owned(owner_lease))
+    }
+}
+
 impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
     pub fn recover(
         ledger: JsonlSurfaceCommitLedger,
-        mut state: SurfaceReducerState,
+        state: SurfaceReducerState,
         owner_lease: &'owner ExclusiveOwnerLease,
     ) -> Result<Self, SurfaceCommitError> {
-        if !owner_lease.authorizes_thread(&state.snapshot().thread.thread_id) {
+        Self::recover_with_authority(ledger, state, OwnerLeaseAuthority::Borrowed(owner_lease))
+    }
+
+    fn recover_with_authority(
+        ledger: JsonlSurfaceCommitLedger,
+        mut state: SurfaceReducerState,
+        owner_lease: OwnerLeaseAuthority<'owner>,
+    ) -> Result<Self, SurfaceCommitError> {
+        let lease = owner_lease.lease();
+        if !lease.authorizes_thread(&state.snapshot().thread.thread_id) {
             return Err(SurfaceCommitError::StaleOwnerEpoch);
         }
         let recovered = ledger
@@ -285,7 +344,7 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
             .map_err(SurfaceCommitError::Ledger)?;
         let committed = recovered.committed;
         let prepared = recovered.prepared;
-        let current_owner_epoch = ThreadOwnerEpoch::new(owner_lease.owner_epoch());
+        let current_owner_epoch = ThreadOwnerEpoch::new(lease.owner_epoch());
         let mut materialized_takeover = None;
         for batch in &committed {
             let candidate_takeover =
@@ -305,7 +364,7 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
         let cold_takeover_authority =
             recovered_cold_takeover_authority(&state, current_owner_epoch, materialized_takeover);
         let recovered_publications = BoundedPublicationSuffix::from_committed(committed);
-        let mut coordinator = Self::new_with_owner_lease(ledger, state, owner_lease)?;
+        let mut coordinator = Self::new_with_authority(ledger, state, owner_lease)?;
         coordinator.recovered_publications = recovered_publications;
         coordinator.cold_takeover_authority = cold_takeover_authority;
         if let Some(batch) = prepared {
@@ -329,6 +388,16 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
             coordinator.commit_batch(&permit, &batch)?;
         }
         Ok(coordinator)
+    }
+}
+
+impl RuntimeCommitCoordinator<'static, JsonlSurfaceCommitLedger> {
+    pub fn recover_with_owned_lease(
+        ledger: JsonlSurfaceCommitLedger,
+        state: SurfaceReducerState,
+        owner_lease: ExclusiveOwnerLease,
+    ) -> Result<Self, SurfaceCommitError> {
+        Self::recover_with_authority(ledger, state, OwnerLeaseAuthority::Owned(owner_lease))
     }
 }
 
@@ -358,6 +427,28 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             fence,
         });
         self.commit_batch(&permit, batch)
+    }
+
+    pub(crate) fn commit_live_generation_stop_disposition_batch(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        operation_id: super::SurfaceOperationId,
+        finalize_intent_id: super::SurfaceFinalizeIntentId,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let generation = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        let finalizer = self.issue_finalizer_permit(operation_id, finalize_intent_id);
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::LiveGenerationStop {
+                generation: &generation,
+                finalizer: &finalizer,
+            },
+            batch,
+            None,
+        )
     }
 
     pub fn commit_finalizer_batch(
@@ -555,7 +646,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         let action = self
             .recovery_action(operation_id, materialization)
             .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
-        self.materialize_cold_owner_takeover(operation_id, materialization)?;
+        self.materialize_cold_owner_takeover(materialization)?;
         let operation = self
             .state
             .snapshot()
@@ -862,9 +953,8 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         }
     }
 
-    fn materialize_cold_owner_takeover(
+    pub(crate) fn materialize_cold_owner_takeover(
         &mut self,
-        operation_id: &super::SurfaceOperationId,
         materialization: &super::MaterializationCause,
     ) -> Result<(), SurfaceCommitError> {
         let super::MaterializationCause::ColdOwnerTakeover {
@@ -882,7 +972,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 .cold_takeover_authority
                 .as_ref()
                 .is_some_and(|authority| {
-                    authority.authorizes(operation_id, snapshot, new_incarnation, new_owner_epoch)
+                    authority.authorizes_transition(snapshot, new_incarnation, new_owner_epoch)
                 }) {
                 Ok(())
             } else {
@@ -893,7 +983,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             .cold_takeover_authority
             .as_ref()
             .is_some_and(|authority| {
-                authority.authorizes(operation_id, snapshot, new_incarnation, new_owner_epoch)
+                authority.authorizes_transition(snapshot, new_incarnation, new_owner_epoch)
             })
             || new_owner_epoch != &self.owner_epoch
             || snapshot.thread.owner_epoch >= *new_owner_epoch
@@ -1287,8 +1377,22 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         batch: &SurfaceCommitBatch,
         projection_context: Option<&SurfaceProjectionContext>,
     ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::Single(permit),
+            batch,
+            projection_context,
+        )
+    }
+
+    fn commit_batch_with_authority(
+        &mut self,
+        authority: BatchCommitAuthority<'_>,
+        batch: &SurfaceCommitBatch,
+        projection_context: Option<&SurfaceProjectionContext>,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
         if !self
             .owner_lease
+            .lease()
             .authorizes_thread(&self.state.snapshot().thread.thread_id)
         {
             return Err(SurfaceCommitError::StaleOwnerEpoch);
@@ -1302,9 +1406,25 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 Err(SurfaceCommitError::CursorRangeAlreadyConsumed)
             };
         }
-        if !permit_authorizes(&self.issued_permits, permit, batch, self.owner_epoch)
-            || !finalizer_background_scope_matches_state(&self.state, permit, batch)
-        {
+        let authorized = match authority {
+            BatchCommitAuthority::Single(permit) => {
+                permit_authorizes(&self.issued_permits, permit, batch, self.owner_epoch)
+                    && finalizer_background_scope_matches_state(&self.state, permit, batch)
+            }
+            BatchCommitAuthority::LiveGenerationStop {
+                generation,
+                finalizer,
+            } => {
+                live_generation_stop_disposition_authorized(
+                    &self.issued_permits,
+                    generation,
+                    finalizer,
+                    batch,
+                    self.owner_epoch,
+                ) && finalizer_background_scope_matches_state(&self.state, finalizer, batch)
+            }
+        };
+        if !authorized {
             return Err(SurfaceCommitError::StalePublisherPermit);
         }
         if matches!(
@@ -1425,6 +1545,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
     ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
         if !self
             .owner_lease
+            .lease()
             .authorizes_thread(&self.state.snapshot().thread.thread_id)
         {
             return Err(SurfaceCommitError::StaleOwnerEpoch);
@@ -1508,14 +1629,13 @@ fn permit_authorizes(
             thread_id == &batch.cursor_before.thread_id
                 && *permit_epoch == owner_epoch
                 && batch.cursor_after.thread_id == *thread_id
-                && batch.events.as_slice().iter().all(|event| {
+                && (batch.events.as_slice().iter().all(|event| {
                     !matches!(
                         &event.scope,
                         SurfaceScope::Generation { .. }
                             | SurfaceScope::Background { .. }
                             | SurfaceScope::Goal { .. }
-                    )
-                        && !matches!(&event.event, super::SurfaceEvent::Goal(_))
+                    ) && !matches!(&event.event, super::SurfaceEvent::Goal(_))
                         && !matches!(
                             &event.event,
                             super::SurfaceEvent::Operation(
@@ -1525,7 +1645,7 @@ fn permit_authorizes(
                                     | super::OperationPatch::Terminal { .. }
                             )
                         )
-                })
+                }) || actor_control_admission_pair_authorized(batch))
         }
         SurfacePublisherPermit::Generation { fence, .. } => batch
             .events
@@ -1576,6 +1696,116 @@ fn permit_authorizes(
                 && recovery_batch_authorized(historical_fence, batch)
         }
     }
+}
+
+fn live_generation_stop_disposition_authorized(
+    issued_permits: &[SurfacePublisherPermit],
+    generation_permit: &SurfacePublisherPermit,
+    finalizer_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(generation_permit) || !issued_permits.contains(finalizer_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::Generation { fence, .. },
+        SurfacePublisherPermit::Finalizer {
+            operation_id,
+            finalize_intent_id,
+            owner_epoch: finalizer_owner_epoch,
+            ..
+        },
+    ) = (generation_permit, finalizer_permit)
+    else {
+        return false;
+    };
+    if *finalizer_owner_epoch != owner_epoch || operation_id != &fence.operation_id {
+        return false;
+    }
+    let [stop, finalization] = batch.events.as_slice() else {
+        return false;
+    };
+    let stop_reason = match (&stop.scope, &stop.event) {
+        (
+            SurfaceScope::Generation { fence: scope },
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+                fence: patch_fence,
+                reason,
+                ..
+            }),
+        ) if scope == fence && patch_fence == fence => reason,
+        _ => return false,
+    };
+    matches!(
+        (&finalization.scope, &finalization.event),
+        (
+            SurfaceScope::Operation {
+                operation_id: scoped_operation,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::FinalizationStarted {
+                operation_id: patch_operation,
+                finalize_intent_id: patch_intent,
+                selected_cause: super::OperationFinalizationCause::GenerationStop(selected_reason),
+                suspended_cause: None,
+                ..
+            }),
+        ) if scoped_operation == operation_id
+            && patch_operation == operation_id
+            && patch_intent == finalize_intent_id
+            && selected_reason == stop_reason
+    )
+}
+
+fn actor_control_admission_pair_authorized(batch: &SurfaceCommitBatch) -> bool {
+    let [admission, item] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Operation {
+            operation_id: scoped_operation,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::Admitted {
+            operation_id,
+            logical_turn_id,
+            input:
+                super::AdmittedInput::PendingUser {
+                    item_id,
+                    presentation,
+                    correlation_id,
+                },
+            first_generation,
+        }),
+    ) = (&admission.scope, &admission.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Generation { fence },
+        super::SurfaceEvent::Item(super::ItemPatch::Added {
+            item:
+                super::SurfaceItem::UserMessage {
+                    id,
+                    turn_id,
+                    input:
+                        super::SurfaceUserInputState::Pending {
+                            presentation: item_presentation,
+                            correlation_id: item_correlation,
+                        },
+                    pinned: false,
+                    origin: super::SurfaceItemOrigin::UserInput,
+                },
+        }),
+    ) = (&item.scope, &item.event)
+    else {
+        return false;
+    };
+    scoped_operation == operation_id
+        && fence == &first_generation.fence
+        && id == item_id
+        && turn_id == logical_turn_id
+        && item_presentation == presentation
+        && item_correlation == correlation_id
 }
 
 fn finalizer_event_authorized(
@@ -1674,7 +1904,7 @@ fn recovery_generation_stop_authorized(
     historical_fence: &super::SurfaceOperationFence,
     event: &super::SurfaceEventEnvelope,
 ) -> bool {
-    matches!(
+    let exact_scope = matches!(
         (&event.scope, &event.event),
         (
             SurfaceScope::Generation { fence },
@@ -1692,7 +1922,22 @@ fn recovery_generation_stop_authorized(
                 ..
             }),
         ) if &fence.operation_fence == historical_fence && patch_fence == historical_fence
-    )
+    );
+    exact_scope
+        && matches!(
+            &event.event,
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+                reason: super::GenerationStopReason::RuntimeRestart
+                    | super::GenerationStopReason::NotStarted {
+                        reason: super::NotStartedReason::RuntimeRestart,
+                    }
+                    | super::GenerationStopReason::ExecutionFailed {
+                        class: super::GenerationExecutionFailureClass::ClientCapabilityUnavailable,
+                        ..
+                    },
+                ..
+            })
+        )
 }
 
 fn recovery_event_authorized(
@@ -3445,6 +3690,54 @@ mod tests {
             }])
             .unwrap();
         batch.batch_digest = super::super::canonical_batch_digest(&batch);
+
+        assert!(!permit_authorizes(
+            std::slice::from_ref(&permit),
+            &permit,
+            &batch,
+            ThreadOwnerEpoch::new(1),
+        ));
+    }
+
+    #[test]
+    fn recovery_permit_rejects_live_completed_stop_and_finalizer() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let fence = test_operation_fence(121);
+        let finalize_intent_id =
+            super::super::SurfaceFinalizeIntentId::try_from_bytes(uuid_v7_bytes(122)).unwrap();
+        let batch = test_batch_with_events(
+            &state,
+            vec![
+                (
+                    SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    super::super::SurfaceEvent::Operation(
+                        super::super::OperationPatch::GenerationStopped {
+                            fence: fence.clone(),
+                            reason: super::super::GenerationStopReason::Completed {
+                                status: super::super::GenerationCompletionStatus::Success,
+                            },
+                            usage_delta: zero_usage(),
+                        },
+                    ),
+                ),
+                (
+                    SurfaceScope::Operation {
+                        operation_id: fence.operation_id.clone(),
+                    },
+                    super::super::SurfaceEvent::Operation(finalization_started(
+                        fence.operation_id.clone(),
+                        finalize_intent_id,
+                    )),
+                ),
+            ],
+        );
+        let permit = SurfacePublisherPermit::Recovery {
+            permit_id: super::super::SurfacePublisherPermitId::new([10; 32]),
+            current_owner_epoch: ThreadOwnerEpoch::new(1),
+            historical_fence: fence,
+        };
 
         assert!(!permit_authorizes(
             std::slice::from_ref(&permit),

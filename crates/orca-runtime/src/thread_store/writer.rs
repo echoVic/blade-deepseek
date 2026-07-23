@@ -778,6 +778,10 @@ fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
 }
 
 impl SessionWriter {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn start(
         cwd: &Path,
         provider: &str,

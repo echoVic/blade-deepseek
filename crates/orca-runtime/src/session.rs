@@ -187,6 +187,16 @@ impl InteractiveSession {
         preloaded: Option<SessionTranscript>,
         mcp_registry: McpRegistry,
     ) -> io::Result<Self> {
+        Self::new_with_prepared_history(config, prompt_for_title, preloaded, mcp_registry, None)
+    }
+
+    pub(crate) fn new_with_prepared_history(
+        config: &RunConfig,
+        prompt_for_title: &str,
+        preloaded: Option<SessionTranscript>,
+        mcp_registry: McpRegistry,
+        prepared_record_meta: Option<SessionMeta>,
+    ) -> io::Result<Self> {
         let cwd = config
             .cwd
             .clone()
@@ -260,29 +270,34 @@ impl InteractiveSession {
                 None => None,
             },
             HistoryMode::Record => {
-                match store.create_live_thread_with_permissions(
-                    &cwd,
-                    config.provider.as_str(),
-                    config.model.as_history_value(),
-                    prompt_for_title,
-                    config.active_permission_profile.clone(),
-                    config.approval_mode,
-                    config.permission_rules.clone(),
-                    config.additional_working_directories.clone(),
-                ) {
-                    Ok(mut thread) => {
-                        if let Err(error) = thread.append_items(&conversation.messages) {
-                            eprintln!("orca: warning: history write failed: {error}");
-                            None
-                        } else {
-                            let (thread_id, writer) = thread.into_thread_id_and_writer();
-                            session_id = Some(thread_id);
-                            Some(writer)
+                if let Some(meta) = prepared_record_meta {
+                    session_id = Some(meta.session_id.clone());
+                    start_writer_with_messages(&store, meta, &conversation)
+                } else {
+                    match store.create_live_thread_with_permissions(
+                        &cwd,
+                        config.provider.as_str(),
+                        config.model.as_history_value(),
+                        prompt_for_title,
+                        config.active_permission_profile.clone(),
+                        config.approval_mode,
+                        config.permission_rules.clone(),
+                        config.additional_working_directories.clone(),
+                    ) {
+                        Ok(mut thread) => {
+                            if let Err(error) = thread.append_items(&conversation.messages) {
+                                eprintln!("orca: warning: history write failed: {error}");
+                                None
+                            } else {
+                                let (thread_id, writer) = thread.into_thread_id_and_writer();
+                                session_id = Some(thread_id);
+                                Some(writer)
+                            }
                         }
-                    }
-                    Err(error) => {
-                        eprintln!("orca: warning: failed to initialize history: {error}");
-                        None
+                        Err(error) => {
+                            eprintln!("orca: warning: failed to initialize history: {error}");
+                            None
+                        }
                     }
                 }
             }
@@ -353,6 +368,12 @@ impl InteractiveSession {
             .as_ref()
             .cloned()
             .map(|writer| (self.next_event_seq, writer))
+    }
+
+    pub(crate) fn surface_commit_path(&self) -> Option<std::path::PathBuf> {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.path().to_path_buf())
     }
 
     pub fn completion_error(&self) -> Option<&str> {
