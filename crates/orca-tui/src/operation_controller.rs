@@ -29,6 +29,7 @@ struct HostedOperationState {
 struct HostedOperationInner {
     active: Option<Arc<OperationHandle>>,
     surface_active: Option<SurfaceActiveOperation>,
+    surface_activation_armed: bool,
     interrupt_requested: bool,
     background_requested: bool,
     shutdown: bool,
@@ -56,7 +57,7 @@ impl TuiOperationController {
             if let Some(operation) = hosted.active.clone() {
                 operation
             } else {
-                if cancel_surface_or_shutdown(&mut hosted) {
+                if cancel_surface_or_shutdown(&mut hosted) || !hosted.surface_activation_armed {
                     return None;
                 }
                 hosted.interrupt_requested = true;
@@ -142,6 +143,35 @@ impl TuiOperationController {
         self.lock_hosted().shutdown
     }
 
+    pub(crate) fn begin_surface_activation(&self) -> io::Result<bool> {
+        let mut hosted = self.lock_hosted();
+        if hosted.shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "TUI operation controller is shutting down",
+            ));
+        }
+        if hosted.surface_activation_armed {
+            return Ok(false);
+        }
+        if hosted.active.is_some() || hosted.surface_active.is_some() {
+            return Err(io::Error::other("TUI operation is still active"));
+        }
+        hosted.surface_activation_armed = true;
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
+        Ok(true)
+    }
+
+    pub(crate) fn cancel_surface_activation(&self) {
+        let mut hosted = self.lock_hosted();
+        hosted.surface_activation_armed = false;
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
+    }
+
     pub(crate) fn install_hosted(&self, operation: Arc<OperationHandle>) -> io::Result<()> {
         let operation_id = operation.id();
         {
@@ -170,6 +200,7 @@ impl TuiOperationController {
         }
         let interrupt_requested = hosted.interrupt_requested;
         let background_requested = hosted.background_requested;
+        hosted.surface_activation_armed = false;
         hosted.interrupt_requested = false;
         hosted.background_requested = false;
         hosted.active = Some(Arc::clone(&operation));
@@ -225,6 +256,7 @@ impl TuiOperationController {
         if hosted.active.as_ref().map(|operation| operation.id()) == Some(operation_id) {
             hosted.active = None;
         }
+        hosted.surface_activation_armed = false;
         hosted.interrupt_requested = false;
         hosted.background_requested = false;
         drop(hosted);
@@ -326,6 +358,7 @@ impl TuiOperationController {
                 interactions: HashMap::new(),
             });
             let requested = hosted.interrupt_requested;
+            hosted.surface_activation_armed = false;
             hosted.interrupt_requested = false;
             requested
         };
@@ -349,6 +382,7 @@ impl TuiOperationController {
         {
             hosted.surface_active = None;
         }
+        hosted.surface_activation_armed = false;
         hosted.interrupt_requested = false;
         drop(hosted);
         self.hosted.changed.notify_all();

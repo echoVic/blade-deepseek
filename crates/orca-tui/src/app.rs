@@ -349,8 +349,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             match handle_key_event_preflight(
                                 *key,
                                 &mut state,
-                                &mut config,
-                                &shared_config,
+                                &config,
                                 &action_tx,
                                 || clear_terminal_scrollback(&mut terminal),
                             )? {
@@ -836,8 +835,7 @@ mod tests {
     #[test]
     fn esc_clears_mouse_selection_before_other_esc_semantics() {
         let (mut state, _rx) = test_state();
-        let mut config = test_config(HistoryMode::Record);
-        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let config = test_config(HistoryMode::Record);
         let (action_tx, _action_rx) = mpsc::unbounded();
 
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
@@ -853,8 +851,7 @@ mod tests {
         let flow = handle_key_event_preflight(
             crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
             &mut state,
-            &mut config,
-            &shared_config,
+            &config,
             &action_tx,
             || Ok(()),
         )
@@ -867,8 +864,7 @@ mod tests {
         let flow = handle_key_event_preflight(
             crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
             &mut state,
-            &mut config,
-            &shared_config,
+            &config,
             &action_tx,
             || Ok(()),
         )
@@ -5015,6 +5011,10 @@ pub(crate) fn run_hosted_operation(
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
+    let activation_armed = match request.operation_kind() {
+        HostedOperationKind::GoalRun => false,
+        _ => controller.begin_surface_activation()?,
+    };
     let operation_kind = request.operation_kind().clone();
     let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
     let pending_interactions =
@@ -5053,6 +5053,9 @@ pub(crate) fn run_hosted_operation(
     let operation = match thread.start_turn_with_config(request, io::sink(), config) {
         Ok(operation) => Arc::new(operation),
         Err(error) => {
+            if activation_armed {
+                controller.cancel_surface_activation();
+            }
             send_hosted_operation_terminal_failure(event_tx, &operation_kind);
             return Err(io::Error::other(error.to_string()));
         }

@@ -168,11 +168,32 @@ fn route_action(
             }
         },
         UserAction::Cancel => return false,
-        action => match enqueue_action(action, command_tx, backlog, backlog_capacity) {
-            EnqueueResult::Queued => {}
-            EnqueueResult::Disconnected => return false,
-            EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
-        },
+        action => {
+            let arms_surface_activation = matches!(
+                &action,
+                UserAction::Submit(_)
+                    | UserAction::SubmitWithMentions { .. }
+                    | UserAction::SubmitWorkflowNotification(_)
+                    | UserAction::Compact
+                    | UserAction::GoalResume
+                    | UserAction::ResolveBackgroundApproval { .. }
+            );
+            let armed_here = if arms_surface_activation {
+                controller.begin_surface_activation().unwrap_or(false)
+            } else {
+                false
+            };
+            match enqueue_action(action, command_tx, backlog, backlog_capacity) {
+                EnqueueResult::Queued => {}
+                EnqueueResult::Disconnected => return false,
+                EnqueueResult::Overflow(action) => {
+                    if armed_here {
+                        controller.cancel_surface_activation();
+                    }
+                    reject_overflowed_action(event_tx, action);
+                }
+            }
+        }
     }
     true
 }

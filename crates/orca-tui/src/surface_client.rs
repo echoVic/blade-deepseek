@@ -36,6 +36,30 @@ struct SurfaceRunGuard<'a> {
     cancel_on_drop: bool,
 }
 
+struct SurfaceActivationGuard<'a> {
+    controller: &'a TuiOperationController,
+    armed: bool,
+}
+
+impl<'a> SurfaceActivationGuard<'a> {
+    fn begin(controller: &'a TuiOperationController) -> io::Result<Self> {
+        let armed = controller.begin_surface_activation()?;
+        Ok(Self { controller, armed })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SurfaceActivationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.controller.cancel_surface_activation();
+        }
+    }
+}
+
 impl<'a> SurfaceRunGuard<'a> {
     fn new(
         surface: &'a RuntimeSurfaceHandle,
@@ -153,6 +177,7 @@ fn run_typed(
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
+    let mut activation = SurfaceActivationGuard::begin(controller)?;
     let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
@@ -269,6 +294,7 @@ fn run_typed(
         }
     }
     controller.install_surface(attachment.client.clone(), operation_id.clone())?;
+    activation.disarm();
     guard.controller_installed();
 
     let result = drain_operation(
@@ -674,6 +700,61 @@ mod tests {
             TuiHostedOperationOutcome::Turn { status } if status == "cancelled"
         ));
         assert!(!controller.has_surface_active());
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_late_interrupt_does_not_cancel_next_turn() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed late interrupt")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (first_event_tx, _first_event_rx) = mpsc::unbounded();
+        let first = run_through_dispatch(
+            &thread,
+            HostedTurnRequest::new("first completed turn"),
+            config.clone(),
+            &controller,
+            &first_event_tx,
+        )
+        .expect("first typed turn");
+        assert!(matches!(
+            first,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+
+        controller.interrupt_current();
+
+        let (second_event_tx, second_event_rx) = mpsc::unbounded();
+        let second = run_through_dispatch(
+            &thread,
+            HostedTurnRequest::new("second turn after late interrupt"),
+            config,
+            &controller,
+            &second_event_tx,
+        )
+        .expect("second typed turn");
+        assert!(matches!(
+            second,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        assert!(second_event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
 
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");

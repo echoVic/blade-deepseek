@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::{Arc, Mutex};
 
 use crossbeam_channel as mpsc;
 
@@ -21,8 +20,7 @@ pub(crate) enum KeyEventFlow {
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,
-    config: &mut RunConfig,
-    shared_config: &Arc<Mutex<RunConfig>>,
+    config: &RunConfig,
     action_tx: &mpsc::Sender<UserAction>,
     clear_terminal: F,
 ) -> io::Result<KeyEventFlow>
@@ -58,7 +56,7 @@ where
             AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
         )
     {
-        cycle_approval_mode(config, shared_config, state);
+        cycle_approval_mode(config, state, action_tx);
         return Ok(KeyEventFlow::Continue);
     }
 
