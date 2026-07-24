@@ -2,7 +2,6 @@ use crossbeam_channel as mpsc;
 use std::io;
 use std::time::{Duration, Instant};
 
-use crate::operation_controller::TuiOperationInterrupt;
 use crate::shortcuts::GlobalShortcut;
 use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
 
@@ -15,7 +14,6 @@ pub(crate) fn handle_global_shortcut<F>(
     shortcut: GlobalShortcut,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
-    operation: &impl TuiOperationInterrupt,
     clear_terminal: F,
 ) -> io::Result<GlobalShortcutFlow>
 where
@@ -30,7 +28,6 @@ where
                     | AppStatus::WaitingApproval
                     | AppStatus::WaitingUserInput
             ) {
-                operation.interrupt_current();
                 let _ = action_tx.send(UserAction::Interrupt);
                 return Ok(GlobalShortcutFlow::Continue);
             }
@@ -71,7 +68,6 @@ mod tests {
 
     use super::handle_global_shortcut;
     use crate::shortcuts::GlobalShortcut;
-    use crate::test_support::TestOperationInterrupt;
     use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
 
     #[test]
@@ -84,18 +80,10 @@ mod tests {
             "/tmp".to_string(),
         );
         state.set_status(AppStatus::Compacting);
-        let operation = TestOperationInterrupt::default();
 
-        handle_global_shortcut(
-            GlobalShortcut::Cancel,
-            &mut state,
-            &action_tx,
-            &operation,
-            || Ok(()),
-        )
-        .expect("cancel compaction");
+        handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &action_tx, || Ok(()))
+            .expect("cancel compaction");
 
-        assert_eq!(operation.call_count(), 1);
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -110,19 +98,12 @@ mod tests {
                 "/tmp".to_string(),
             );
             state.set_status(status);
-            let operation = TestOperationInterrupt::default();
 
-            let flow = handle_global_shortcut(
-                GlobalShortcut::Cancel,
-                &mut state,
-                &action_tx,
-                &operation,
-                || Ok(()),
-            )
-            .expect("interrupt pending interaction");
+            let flow =
+                handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &action_tx, || Ok(()))
+                    .expect("interrupt pending interaction");
 
             assert!(matches!(flow, super::GlobalShortcutFlow::Continue));
-            assert_eq!(operation.call_count(), 1);
             assert!(state.last_ctrl_c.is_none());
             assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
         }
@@ -137,27 +118,16 @@ mod tests {
             "model".to_string(),
             "/tmp".to_string(),
         );
-        let operation = TestOperationInterrupt::default();
 
-        let first = handle_global_shortcut(
-            GlobalShortcut::Cancel,
-            &mut state,
-            &action_tx,
-            &operation,
-            || Ok(()),
-        )
-        .unwrap();
+        let first =
+            handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &action_tx, || Ok(()))
+                .unwrap();
         assert!(matches!(first, super::GlobalShortcutFlow::Continue));
         assert!(action_rx.try_recv().is_err());
 
-        let second = handle_global_shortcut(
-            GlobalShortcut::Cancel,
-            &mut state,
-            &action_tx,
-            &operation,
-            || Ok(()),
-        )
-        .unwrap();
+        let second =
+            handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &action_tx, || Ok(()))
+                .unwrap();
 
         assert!(matches!(second, super::GlobalShortcutFlow::Exit(130)));
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Cancel)));
@@ -176,13 +146,9 @@ mod tests {
         assert_eq!(state.message_revisions.len(), 1);
         assert_eq!(state.transcript_render_cache.len(), 1);
 
-        handle_global_shortcut(
-            GlobalShortcut::ClearScreen,
-            &mut state,
-            &action_tx,
-            &TestOperationInterrupt::default(),
-            || Ok(()),
-        )
+        handle_global_shortcut(GlobalShortcut::ClearScreen, &mut state, &action_tx, || {
+            Ok(())
+        })
         .expect("clear screen");
 
         assert!(state.messages.is_empty());

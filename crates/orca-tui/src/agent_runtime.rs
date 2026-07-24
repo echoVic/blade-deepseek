@@ -77,6 +77,7 @@ impl TuiAgentRuntime {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn controller(&self) -> &TuiOperationController {
         &self.controller
     }

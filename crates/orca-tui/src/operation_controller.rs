@@ -11,10 +11,6 @@ use crate::interaction_broker::TuiInteractionBroker;
 use crate::interaction_broker::TuiInteractionWaiter;
 use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 
-pub(crate) trait TuiOperationInterrupt {
-    fn interrupt_current(&self);
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct TuiOperationController {
     hosted: Arc<HostedOperationState>,
@@ -47,6 +43,7 @@ impl TuiOperationController {
             surface_ids: Arc::new(OperationIdAllocator::default()),
         }
     }
+    #[cfg(test)]
     pub(crate) fn current_id(&self) -> Option<OperationId> {
         self.lock_hosted()
             .active
@@ -253,12 +250,6 @@ impl TuiOperationController {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-impl TuiOperationInterrupt for TuiOperationController {
-    fn interrupt_current(&self) {
-        let _ = TuiOperationController::interrupt_current(self);
     }
 }
 

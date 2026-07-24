@@ -57,7 +57,6 @@ pub use app::run_tui;
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
 
@@ -76,9 +75,7 @@ pub(crate) mod test_support {
     use orca_runtime::thread::RuntimeThread;
 
     use crate::interaction_broker::TuiInteractionBroker;
-    use crate::operation_controller::{
-        TuiOperationController, TuiOperationInterrupt, TuiTurnControl,
-    };
+    use crate::operation_controller::{TuiOperationController, TuiTurnControl};
 
     static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -86,23 +83,6 @@ pub(crate) mod test_support {
         PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[derive(Clone, Default)]
-    pub(crate) struct TestOperationInterrupt {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl TestOperationInterrupt {
-        pub(crate) fn call_count(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    impl TuiOperationInterrupt for TestOperationInterrupt {
-        fn interrupt_current(&self) {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-        }
     }
 
     struct HostedControlExecutor {

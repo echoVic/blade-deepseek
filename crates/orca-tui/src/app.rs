@@ -331,7 +331,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         &mut config,
                                         &shared_config,
                                         &action_tx,
-                                        agent_runtime.controller(),
                                         &preloaded_transcript,
                                         &mut textarea,
                                         &mut vim_state,
@@ -353,7 +352,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut config,
                                 &shared_config,
                                 &action_tx,
-                                agent_runtime.controller(),
                                 || clear_terminal_scrollback(&mut terminal),
                             )? {
                                 KeyEventFlow::Continue => return Ok(None),
@@ -368,7 +366,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut config,
                                 &shared_config,
                                 &action_tx,
-                                agent_runtime.controller(),
                                 &preloaded_transcript,
                                 &mut textarea,
                                 &mut vim_state,
@@ -842,7 +839,6 @@ mod tests {
         let mut config = test_config(HistoryMode::Record);
         let shared_config = Arc::new(Mutex::new(config.clone()));
         let (action_tx, _action_rx) = mpsc::unbounded();
-        let operation = crate::test_support::TestOperationInterrupt::default();
 
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
         let head = crate::selection::SelectionPos { row: 2, col: 5 };
@@ -860,7 +856,6 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &operation,
             || Ok(()),
         )
         .expect("preflight");
@@ -875,12 +870,10 @@ mod tests {
             &mut config,
             &shared_config,
             &action_tx,
-            &operation,
             || Ok(()),
         )
         .expect("preflight");
         assert!(matches!(flow, KeyEventFlow::Unhandled));
-        assert_eq!(operation.call_count(), 0);
     }
 
     #[test]
@@ -1992,20 +1985,17 @@ mod tests {
         let (mut state, action_rx) = test_state();
         state.status = AppStatus::Running;
         let action_tx = state.event_tx.clone();
-        let operation = crate::test_support::TestOperationInterrupt::default();
 
         crate::running_actions::handle_running_shortcut(
             crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
             &mut state,
             &action_tx,
-            &operation,
         );
 
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::BackgroundCurrentTurn)
         ));
-        assert_eq!(operation.call_count(), 0);
         assert_eq!(state.status, AppStatus::Idle);
     }
 
