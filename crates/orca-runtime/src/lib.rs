@@ -54,6 +54,26 @@ pub mod runtime_state;
 mod runtime_steer;
 mod runtime_subagent_call;
 mod runtime_surface;
+
+pub mod surface {
+    pub use crate::runtime_surface::{
+        AdmissionOutput, AssistantChannel, AssistantPatch, AttachResult, ByteCount, ByteOffset,
+        CancelOperationOutput, CommitClass, CompactionState, ContextRevision, CursorSourceRevision,
+        DetachRequest, DetachResult, DisplayText, DurableRevision, FailureClass,
+        FreshAttachRequest, FreshSurfaceAttachment, MutationReply, NonEmptyVec, OperationPatch,
+        OperationTerminal, ProviderReplayHealth, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
+        SequenceNumber, Set, Sha256Digest, SnapshotAtCursor, SurfaceAssistantStream,
+        SurfaceAssistantStreamState, SurfaceAttachmentRole, SurfaceCapability,
+        SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceCommitBatch,
+        SurfaceCommitId, SurfaceCompletedModelResponse, SurfaceContextSnapshot, SurfaceCursor,
+        SurfaceEvent, SurfaceEventEnvelope, SurfaceEventId, SurfaceFileChange, SurfaceIncarnation,
+        SurfaceInteractionId, SurfaceInteractionKind, SurfaceOperationId, SurfacePlanStatus,
+        SurfaceRequestId, SurfaceScope, SurfaceShutdownReason, SurfaceSnapshot, SurfaceStreamId,
+        SurfaceSubscriptionHandle, SurfaceSubscriptionItem, SurfaceSubscriptionReceiver,
+        SurfaceThreadId, SurfaceToolResultKind, ThreadOwnerEpoch, ToolPatch,
+        WaitOperationTerminalResult,
+    };
+}
 mod runtime_tool_actor;
 mod runtime_tool_call;
 pub(crate) mod runtime_tool_scheduler;

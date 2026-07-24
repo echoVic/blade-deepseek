@@ -199,6 +199,7 @@ pub enum TuiEvent {
     },
     ReasoningDelta(String),
     MessageDelta(String),
+    AssistantResponseCompleted(Option<String>, Option<String>),
     ToolRequested {
         id: String,
         name: String,
@@ -1164,7 +1165,6 @@ impl AppState {
         let last = self.workflow_panel.tasks.len().saturating_sub(1);
         self.workflow_panel.selected = (self.workflow_panel.selected + 1).min(last);
     }
-
     pub fn open_selected_background_approval_dialog(&mut self) -> bool {
         let Some(task) = self.workflow_panel.tasks.get(self.workflow_panel.selected) else {
             return false;
@@ -1496,6 +1496,12 @@ impl AppState {
                     return;
                 }
                 self.handle_message_delta(&text);
+            }
+            TuiEvent::AssistantResponseCompleted(message, reasoning) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                self.reconcile_assistant_response(message.as_deref(), reasoning.as_deref());
             }
             TuiEvent::ToolRequested { id, name, target } => {
                 if self.suppress_background_main_session_output {
@@ -2006,6 +2012,42 @@ impl AppState {
         if let Some(ChatMessage::Reasoning(text)) = self.messages.get(index) {
             let text = text.clone();
             self.replace_message(index, ChatMessage::Assistant(text));
+        }
+    }
+
+    fn reconcile_assistant_response(&mut self, message: Option<&str>, reasoning: Option<&str>) {
+        let last_user = self
+            .messages
+            .iter()
+            .rposition(|item| matches!(item, ChatMessage::User(_)));
+        if let Some(last_user) = last_user {
+            let old_messages = std::mem::take(&mut self.messages);
+            self.messages = old_messages
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    if index <= last_user
+                        || !matches!(
+                            item,
+                            ChatMessage::Reasoning(_)
+                                | ChatMessage::Assistant(_)
+                                | ChatMessage::ProposedPlan(_)
+                        )
+                    {
+                        Some(item)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        self.proposed_plan_parser = ProposedPlanStreamParser::default();
+        if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+            self.messages
+                .push(ChatMessage::Reasoning(reasoning.to_string()));
+        }
+        if let Some(message) = message.filter(|text| !text.is_empty()) {
+            self.handle_message_delta(message);
         }
     }
 

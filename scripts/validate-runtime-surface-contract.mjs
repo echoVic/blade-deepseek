@@ -735,7 +735,7 @@ const BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256 = new Map([
   ["crates/orca-tui/src/types.rs:clear_messages", "5cda88c94e6601f2707b73f0faae255acc19e644e826f02b14b293310f0171e3"],
   ["crates/orca-tui/src/types.rs:load_input_history", "2a3ff85622fead59fa1741adbadcf9bef43e17295c3bbc7fce081640a66553ef"],
   ["crates/orca-tui/src/types.rs:append_input_history", "25aa6ffa36a7cb1ba514d054f715c15821126d97fc519abfbe2a4a62d339174f"],
-  ["crates/orca-tui/src/types.rs:update", "f7460423da4ea1d1e0d573ae7db0a003b6d64fca4d833d156d6d90d18b778ef6"],
+  ["crates/orca-tui/src/types.rs:update", "d4bf5de3b910e07e1955859d4c3d0e768e7502d0d980dcfd4387a3a60dcb094e"],
   ["crates/orca-tui/src/ui.rs:render_markdown", "82a2db5cec2e638d93105e1d8bd19f1accf51e14458c05c0adcc2e07d0ccbbb9"],
   ["crates/orca-tui/src/ui.rs:render_table_as_records", "19c22351863dcfa582b38b37441aada9e28d55a267a5dcfb38d58986167cf593"],
 ]);
