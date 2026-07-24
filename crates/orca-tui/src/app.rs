@@ -1891,14 +1891,12 @@ mod tests {
             let host_handle = host.handle();
             host.shutdown().unwrap();
             let mut thread = None;
-            let mut pending_pinned_context = Vec::new();
 
             handle_hosted_submitted_turn(
                 SubmittedTurn::user("retry me".to_string()),
                 &config,
                 &preloaded,
                 &mut thread,
-                &mut pending_pinned_context,
                 &event_tx,
                 &controller,
                 &pending,
@@ -1921,6 +1919,70 @@ mod tests {
                     .map(|transcript| transcript.meta.session_id.as_str()),
                 Some("preserved-session")
             );
+        });
+    }
+
+    #[test]
+    fn remember_without_thread_commits_through_typed_surface() {
+        with_orca_home(|home| {
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(home.to_path_buf());
+            let preloaded = Arc::new(Mutex::new(None));
+            let event_tx = mpsc::unbounded().0;
+            let registry = orca_mcp::initialize_registry(&[]);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+            let host_handle = host.handle();
+            let mut thread = None;
+
+            ensure_hosted_thread(
+                &mut thread,
+                &host_handle,
+                &config,
+                &preloaded,
+                "remembered context",
+                &registry,
+                &event_tx,
+            )
+            .expect("runtime-owned thread starts for remember");
+            let runtime_thread = thread.as_ref().expect("thread is initialized");
+            let typed_thread = runtime_thread.typed_surface();
+            crate::surface_client::add_pinned_context(
+                &typed_thread,
+                "[Pinned remembered note]\nprefer durable runtime ownership",
+            )
+            .expect("typed pinned context mutation");
+
+            let attachment = match typed_thread.surface().attach_fresh(
+                orca_runtime::surface::FreshAttachRequest {
+                    request_id: orca_runtime::surface::SurfaceRequestId::new(),
+                    role: orca_runtime::surface::SurfaceAttachmentRole::Tui,
+                    requested_capabilities: std::collections::BTreeSet::from([
+                        orca_runtime::surface::SurfaceCapability::ReadSnapshot,
+                    ]),
+                    interaction_capabilities: std::collections::BTreeSet::new(),
+                },
+            ) {
+                orca_runtime::surface::AttachResult::FreshAttached { attachment } => attachment,
+                _ => panic!("typed pinned context attach failed"),
+            };
+            assert!(
+                attachment
+                    .baseline
+                    .snapshot
+                    .pinned_context
+                    .entries
+                    .iter()
+                    .any(|entry| entry.content.as_str().contains("durable runtime ownership"))
+            );
+            typed_thread.surface().detach(
+                &attachment.client,
+                orca_runtime::surface::DetachRequest {
+                    request_id: orca_runtime::surface::SurfaceRequestId::new(),
+                },
+            );
+
+            thread.unwrap().shutdown().unwrap();
+            host.shutdown().unwrap();
         });
     }
 
@@ -4494,7 +4556,6 @@ fn hosted_tui_controller_loop(
     host: RuntimeHostHandle,
 ) {
     let mut thread: Option<RuntimeThreadHandle> = None;
-    let mut pending_pinned_context = Vec::new();
     let mut pending_actions = VecDeque::new();
 
     loop {
@@ -4511,7 +4572,6 @@ fn hosted_tui_controller_loop(
                 &config,
                 &preloaded,
                 &mut thread,
-                &mut pending_pinned_context,
                 &event_tx,
                 &controller,
                 &pending_workflow_notifications,
@@ -4524,7 +4584,6 @@ fn hosted_tui_controller_loop(
                     &config,
                     &preloaded,
                     &mut thread,
-                    &mut pending_pinned_context,
                     &event_tx,
                     &controller,
                     &pending_workflow_notifications,
@@ -4538,7 +4597,6 @@ fn hosted_tui_controller_loop(
                     &config,
                     &preloaded,
                     &mut thread,
-                    &mut pending_pinned_context,
                     &event_tx,
                     &controller,
                     &pending_workflow_notifications,
@@ -4555,7 +4613,6 @@ fn hosted_tui_controller_loop(
                     &preloaded,
                     &format!("Run saved workflow `{name}`"),
                     &mcp_registry,
-                    &mut pending_pinned_context,
                     &event_tx,
                 ) {
                     send_hosted_action_failure(&event_tx, error);
@@ -4600,6 +4657,21 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::Remember(note)) => {
                 let context = format!("[Pinned remembered note]\n{}", note.trim());
+                if thread.is_none() {
+                    let cfg = config.lock().unwrap().clone();
+                    if let Err(error) = ensure_hosted_thread(
+                        &mut thread,
+                        &host,
+                        &cfg,
+                        &preloaded,
+                        "Remembered context",
+                        &mcp_registry,
+                        &event_tx,
+                    ) {
+                        let _ = event_tx.send(TuiEvent::Error(error));
+                        continue;
+                    }
+                }
                 if let Some(runtime_thread) = thread.as_ref() {
                     let typed_thread = runtime_thread.typed_surface();
                     if let Err(error) =
@@ -4607,8 +4679,6 @@ fn hosted_tui_controller_loop(
                     {
                         let _ = event_tx.send(TuiEvent::Error(error.to_string()));
                     }
-                } else {
-                    pending_pinned_context.push(context);
                 }
             }
             Ok(UserAction::Compact) => {
@@ -4701,7 +4771,6 @@ fn hosted_tui_controller_loop(
                     &preloaded,
                     &objective,
                     &mcp_registry,
-                    &mut pending_pinned_context,
                     &event_tx,
                 ) {
                     send_hosted_action_failure(&event_tx, error);
@@ -4922,7 +4991,6 @@ fn ensure_hosted_thread(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     title: &str,
     mcp_registry: &orca_mcp::McpRegistry,
-    pending_pinned_context: &mut Vec<String>,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
     if thread.is_none() {
@@ -4939,15 +5007,6 @@ fn ensure_hosted_thread(
         notify_recovered_background_approvals_for_tui(&started.task_registry(), event_tx);
         *thread = Some(started);
     }
-    if let Some(runtime_thread) = thread.as_ref() {
-        while let Some(context) = pending_pinned_context.first().cloned() {
-            let typed_thread = runtime_thread.typed_surface();
-            if let Err(error) = crate::surface_client::add_pinned_context(&typed_thread, &context) {
-                return Err(error.to_string());
-            }
-            pending_pinned_context.remove(0);
-        }
-    }
     Ok(())
 }
 
@@ -4957,7 +5016,6 @@ fn handle_hosted_submitted_turn(
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     thread: &mut Option<RuntimeThreadHandle>,
-    pending_pinned_context: &mut Vec<String>,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
@@ -4978,7 +5036,6 @@ fn handle_hosted_submitted_turn(
         preloaded,
         &title_seed,
         mcp_registry,
-        pending_pinned_context,
         event_tx,
     ) {
         send_submission_error(event_tx, rejection_prompt.as_deref(), error);
