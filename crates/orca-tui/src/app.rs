@@ -1,7 +1,7 @@
 use crossbeam_channel as mpsc;
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -104,10 +104,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let backend = CrosstermBackend::new(stdout);
 
+    let workspace_root = syntax_workspace_root(&config);
     let (event_tx, pending_event_rx) = tui_event_channel();
     let (action_tx, action_rx) = user_action_channel();
-    let mut mention_search =
-        MentionSearchManager::new_roots(mention_search_roots(&config), event_tx.clone());
+    let mut mention_search = MentionSearchManager::new_roots(
+        mention_search_roots(&config, &workspace_root),
+        event_tx.clone(),
+    );
     let pending_workflow_notifications: bridge::PendingWorkflowNotifications =
         bridge::PendingWorkflowNotifications::new();
 
@@ -127,14 +130,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Vec::new()
     };
 
-    let cwd_display = config
-        .cwd
-        .as_deref()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-        .display()
-        .to_string();
-    let cwd_display = shorten_home(&cwd_display);
+    let cwd_display = shorten_home(&workspace_root.display().to_string());
 
     let mut state = AppState::new(
         action_tx.clone(),
@@ -419,7 +415,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             },
         )?;
         let mention_enabled = MentionSearchManager::is_enabled(&state);
-        mention_search.set_roots(mention_search_roots(&config), &mut state);
+        mention_search.set_roots(mention_search_roots(&config, &workspace_root), &mut state);
         let text = textarea_text(&textarea);
         let cursor = textarea_cursor_byte_index(&textarea);
         state.mention_bindings.reconcile(&text);
@@ -451,7 +447,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     Ok(exit_code)
 }
 
-fn mention_search_roots(config: &RunConfig) -> Vec<PathBuf> {
+fn mention_search_roots(config: &RunConfig, workspace_fallback: &Path) -> Vec<PathBuf> {
     config
         .runtime_workspace_roots
         .as_ref()
@@ -462,9 +458,36 @@ fn mention_search_roots(config: &RunConfig) -> Vec<PathBuf> {
                 config
                     .cwd
                     .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+                    .unwrap_or_else(|| workspace_fallback.into()),
             ]
         })
+}
+
+fn syntax_workspace_root(config: &RunConfig) -> PathBuf {
+    config
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+fn configure_tui_syntax_state(
+    state: &mut AppState,
+    workspace_root: PathBuf,
+    syntax_theme: crate::syntax_highlight::SyntaxTheme,
+) {
+    state.configure_syntax_highlighting(workspace_root, syntax_theme);
+}
+
+fn configure_and_preload_tui_state(
+    state: &mut AppState,
+    workspace_root: PathBuf,
+    syntax_theme: crate::syntax_highlight::SyntaxTheme,
+    messages: impl IntoIterator<Item = ChatMessage>,
+) {
+    configure_tui_syntax_state(state, workspace_root, syntax_theme);
+    for message in messages {
+        state.push_message(message);
+    }
 }
 
 fn shorten_home(path: &str) -> String {
@@ -711,6 +734,138 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn syntax_workspace_root_preserves_real_configured_path() {
+        let directory = tempdir().expect("syntax workspace");
+        let mut config = test_config(HistoryMode::Disabled);
+        config.cwd = Some(directory.path().to_path_buf());
+
+        assert_eq!(
+            syntax_workspace_root(&config),
+            directory.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn mention_search_roots_reuse_captured_workspace_fallback() {
+        let directory = tempdir().expect("captured mention workspace");
+        let mut config = test_config(HistoryMode::Disabled);
+        config.cwd = None;
+
+        assert_eq!(
+            mention_search_roots(&config, directory.path()),
+            vec![directory.path().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn startup_configures_exact_workspace_before_replay_without_starting_runtime() {
+        let directory = tempdir().expect("startup syntax workspace");
+        let theme = Theme::named(ThemeName::Light);
+        let (mut state, _rx) = test_state();
+        let historical = ChatMessage::ToolCall {
+            id: "historical-edit".to_string(),
+            name: "edit".to_string(),
+            target: Some("src/item.py".to_string()),
+            status: "completed".to_string(),
+            output: None,
+            diff: Some(
+                "--- a/src/item.py\n+++ b/src/item.py\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            ),
+            kind: None,
+            expanded: false,
+        };
+
+        configure_and_preload_tui_state(
+            &mut state,
+            directory.path().to_path_buf(),
+            theme.syntax_theme,
+            [historical],
+        );
+
+        assert_eq!(
+            state.syntax_workspace_root_for_test(),
+            Some(directory.path())
+        );
+        assert_eq!(
+            state.syntax_theme_for_test(),
+            crate::syntax_highlight::SyntaxTheme::OneHalfLight
+        );
+        assert_eq!(state.messages.len(), 1);
+        assert!(!state.edit_highlight_runtime_started_for_test());
+        assert_eq!(state.pending_edit_highlight_count_for_test(), 0);
+    }
+
+    #[test]
+    fn startup_configuration_reuses_captured_workspace_after_cwd_changes() {
+        struct CurrentDirGuard(PathBuf);
+
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).expect("restore current directory");
+            }
+        }
+
+        let _lock = crate::test_support::lock_process_env();
+        let original = std::env::current_dir().expect("original current directory");
+        let workspace_a = tempdir().expect("workspace A");
+        let workspace_b = tempdir().expect("workspace B");
+        let _restore = CurrentDirGuard(original);
+        std::env::set_current_dir(workspace_a.path()).expect("set workspace A");
+        let mut config = test_config(HistoryMode::Disabled);
+        config.cwd = None;
+        let captured_workspace = syntax_workspace_root(&config);
+        std::env::set_current_dir(workspace_b.path()).expect("set workspace B");
+        let theme = Theme::named(ThemeName::Catppuccin);
+        let (mut state, _rx) = test_state();
+
+        configure_tui_syntax_state(&mut state, captured_workspace.clone(), theme.syntax_theme);
+
+        assert_eq!(
+            state.syntax_workspace_root_for_test(),
+            Some(captured_workspace.as_path())
+        );
+        assert_eq!(
+            state.syntax_theme_for_test(),
+            crate::syntax_highlight::SyntaxTheme::CatppuccinMocha
+        );
+    }
+
+    #[test]
+    fn syntax_workspace_root_uses_current_dir_when_config_cwd_is_none() {
+        struct CurrentDirGuard(PathBuf);
+
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).expect("restore current directory");
+            }
+        }
+
+        let _lock = crate::test_support::lock_process_env();
+        let original = std::env::current_dir().expect("original current directory");
+        let directory = tempdir().expect("fallback syntax workspace");
+        let _restore = CurrentDirGuard(original);
+        std::env::set_current_dir(directory.path()).expect("set fallback current directory");
+        let mut config = test_config(HistoryMode::Disabled);
+        config.cwd = None;
+        let theme = Theme::named(ThemeName::Dark);
+        let (mut state, _rx) = test_state();
+        let expected_workspace = syntax_workspace_root(&config);
+
+        assert_eq!(
+            expected_workspace,
+            directory
+                .path()
+                .canonicalize()
+                .expect("canonical fallback workspace")
+        );
+        configure_tui_syntax_state(&mut state, expected_workspace.clone(), theme.syntax_theme);
+        assert_eq!(
+            state.syntax_workspace_root_for_test(),
+            Some(expected_workspace.as_path())
+        );
     }
 
     fn test_pending_workflow_notifications() -> bridge::PendingWorkflowNotifications {

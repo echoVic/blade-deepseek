@@ -1,5 +1,6 @@
 use crossbeam_channel as mpsc;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,6 +19,12 @@ use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 use orca_runtime::surface::{RuntimeSurfaceThreadHandle, SurfaceOperationId};
 
 use crate::display_text::truncate_to_display_width;
+#[cfg(test)]
+use crate::edit_highlight_worker::DrainResults;
+use crate::edit_highlight_worker::{
+    EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
+};
+use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
 use crate::transcript_view::TranscriptRenderCache;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
@@ -113,6 +120,194 @@ fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
         ));
     }
     parts.join(" · ")
+}
+
+fn normalize_diff_relative_path(path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(component) => normalized.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+#[derive(Clone, Copy)]
+struct DiffRange {
+    start: usize,
+    count: usize,
+}
+
+fn parse_diff_range(token: &str, marker: char) -> Option<DiffRange> {
+    let coordinates = token.strip_prefix(marker)?;
+    let mut parts = coordinates.split(',');
+    let start = parts.next()?.parse::<usize>().ok()?;
+    let count = match parts.next() {
+        Some(count) => count.parse().ok()?,
+        None => 1,
+    };
+    (parts.next().is_none()).then_some(DiffRange { start, count })
+}
+
+fn unified_diff_header_path(header: &str) -> &str {
+    let path = header.split_once('\t').map_or(header, |(path, _)| path);
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+fn parse_hunk_ranges(header: &str) -> Option<(DiffRange, DiffRange)> {
+    let mut tokens = header.split_whitespace();
+    if tokens.next()? != "@@" {
+        return None;
+    }
+    let old_range = parse_diff_range(tokens.next()?, '-')?;
+    let new_range = parse_diff_range(tokens.next()?, '+')?;
+    if tokens.next()? != "@@"
+        || (old_range.count > 0 && old_range.start == 0)
+        || (new_range.count > 0 && new_range.start == 0)
+    {
+        return None;
+    }
+    Some((old_range, new_range))
+}
+
+fn unified_diff_structure_is_valid(diff: &str, target: &Path) -> bool {
+    use std::collections::HashSet;
+
+    let lines = diff.lines().collect::<Vec<_>>();
+    let Some(old_header) = lines.first().and_then(|line| line.strip_prefix("--- ")) else {
+        return false;
+    };
+    let Some(new_header) = lines.get(1).and_then(|line| line.strip_prefix("+++ ")) else {
+        return false;
+    };
+    let old_path = unified_diff_header_path(old_header);
+    let new_path = unified_diff_header_path(new_header);
+    let old_is_null = old_path == "/dev/null";
+    let new_is_null = new_path == "/dev/null";
+    if old_is_null && new_is_null {
+        return false;
+    }
+    if (!old_is_null && normalize_diff_relative_path(old_path).is_none())
+        || (!new_is_null && normalize_diff_relative_path(new_path).as_deref() != Some(target))
+        || (new_is_null && normalize_diff_relative_path(old_path).as_deref() != Some(target))
+    {
+        return false;
+    }
+
+    let mut index = 2;
+    let mut saw_hunk = false;
+    let mut previous_old_end = None;
+    let mut previous_new_end = None;
+    let mut hunk_ranges = HashSet::new();
+    while index < lines.len() {
+        let Some((old_range, new_range)) = parse_hunk_ranges(lines[index]) else {
+            return false;
+        };
+        if (old_range.count == 0 && new_range.count == 0)
+            || (old_is_null && (old_range.start != 0 || old_range.count != 0))
+            || (new_is_null && (new_range.start != 0 || new_range.count != 0))
+        {
+            return false;
+        }
+        let Some(old_end) = old_range.start.checked_add(old_range.count) else {
+            return false;
+        };
+        let Some(new_end) = new_range.start.checked_add(new_range.count) else {
+            return false;
+        };
+        if !hunk_ranges.insert((
+            old_range.start,
+            old_range.count,
+            new_range.start,
+            new_range.count,
+        )) || previous_old_end.is_some_and(|end| old_range.start < end)
+            || previous_new_end.is_some_and(|end| new_range.start < end)
+        {
+            return false;
+        }
+        previous_old_end = Some(old_end);
+        previous_new_end = Some(new_end);
+        let mut old_remaining = old_range.count;
+        let mut new_remaining = new_range.count;
+        saw_hunk = true;
+        index += 1;
+        let mut previous_was_source = false;
+        while old_remaining > 0 || new_remaining > 0 {
+            let Some(line) = lines.get(index) else {
+                return false;
+            };
+            match line.as_bytes().first() {
+                Some(b' ') if old_remaining > 0 && new_remaining > 0 => {
+                    old_remaining -= 1;
+                    new_remaining -= 1;
+                    previous_was_source = true;
+                }
+                Some(b'-') if old_remaining > 0 => {
+                    old_remaining -= 1;
+                    previous_was_source = true;
+                }
+                Some(b'+') if new_remaining > 0 => {
+                    new_remaining -= 1;
+                    previous_was_source = true;
+                }
+                Some(b'\\') if *line == "\\ No newline at end of file" && previous_was_source => {
+                    previous_was_source = false;
+                    index += 1;
+                    continue;
+                }
+                _ => return false,
+            }
+            index += 1;
+            if lines.get(index) == Some(&"\\ No newline at end of file") {
+                index += 1;
+                previous_was_source = false;
+            }
+        }
+        if lines.get(index) == Some(&"\\ No newline at end of file") {
+            if !previous_was_source {
+                return false;
+            }
+            index += 1;
+        }
+        if lines
+            .get(index)
+            .is_some_and(|line| line.starts_with("--- ") || line.starts_with("+++ "))
+        {
+            return false;
+        }
+    }
+    saw_hunk
+}
+
+fn parsed_diff_has_valid_new_side(parsed: &crate::diff_highlight::ParsedDiff) -> bool {
+    let mut new_side_lines = parsed
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.source_lines())
+        .filter(|line| {
+            matches!(
+                line.kind,
+                crate::diff_highlight::DiffLineKind::Context
+                    | crate::diff_highlight::DiffLineKind::Insert
+            )
+        });
+    new_side_lines
+        .next()
+        .is_some_and(|line| line.new_line.is_some_and(|line_number| line_number > 0))
+        && new_side_lines.all(|line| line.new_line.is_some_and(|line_number| line_number > 0))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -621,6 +816,19 @@ impl MentionPopupState {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AppliedDiffHighlight {
+    pub(crate) tool_id: String,
+    pub(crate) display_path: String,
+    pub(crate) styles: Arc<crate::diff_highlight::RefinedDiffStyles>,
+}
+
+#[cfg(test)]
+type EditHighlightRuntimeFactory = fn() -> std::io::Result<EditHighlightRuntime>;
+
+#[cfg(test)]
+type EditHighlightDrain = fn(&mut EditHighlightRuntime) -> DrainResults;
+
 pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) message_revisions: Vec<u64>,
@@ -711,6 +919,14 @@ pub struct AppState {
     /// Composer (input box) outer rect from the last render, `None` while
     /// the composer is hidden.
     pub input_area: Option<ratatui::layout::Rect>,
+    workspace_root: Option<PathBuf>,
+    pub(crate) syntax_theme: SyntaxTheme,
+    edit_highlight_runtime: Option<EditHighlightRuntime>,
+    pub(crate) applied_diff_highlights: HashMap<u64, AppliedDiffHighlight>,
+    #[cfg(test)]
+    edit_highlight_runtime_factory: EditHighlightRuntimeFactory,
+    #[cfg(test)]
+    edit_highlight_drain: Option<EditHighlightDrain>,
     /// A mouse drag is adjusting the composer's own text selection.
     pub composer_mouse_selecting: bool,
     /// Messages that arrived below the viewport while auto-follow was
@@ -825,9 +1041,340 @@ impl AppState {
             jump_to_bottom_area: None,
             frame_area: None,
             input_area: None,
+            workspace_root: None,
+            syntax_theme: SyntaxTheme::OneHalfDark,
+            edit_highlight_runtime: None,
+            applied_diff_highlights: HashMap::new(),
+            #[cfg(test)]
+            edit_highlight_runtime_factory: EditHighlightRuntime::new,
+            #[cfg(test)]
+            edit_highlight_drain: None,
             composer_mouse_selecting: false,
             unseen_messages: 0,
         }
+    }
+
+    pub(crate) fn configure_syntax_highlighting(
+        &mut self,
+        workspace_root: PathBuf,
+        syntax_theme: SyntaxTheme,
+    ) {
+        self.workspace_root = Some(workspace_root);
+        self.syntax_theme = syntax_theme;
+        self.edit_highlight_runtime = None;
+        self.applied_diff_highlights.clear();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn edit_highlight_needs_tick(&self) -> bool {
+        self.edit_highlight_runtime
+            .as_ref()
+            .is_some_and(EditHighlightRuntime::has_pending)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn poll_edit_highlight_results(&mut self) -> bool {
+        let Some(runtime) = self.edit_highlight_runtime.as_mut() else {
+            return false;
+        };
+        #[cfg(test)]
+        let drained = match self.edit_highlight_drain {
+            Some(drain) => drain(runtime),
+            None => runtime.drain_results(),
+        };
+        #[cfg(not(test))]
+        let drained = runtime.drain_results();
+
+        let mut redraw = false;
+        for result in drained.results {
+            redraw |= self.apply_edit_highlight_result(result);
+        }
+        if drained.disconnected {
+            self.edit_highlight_runtime = None;
+        }
+        redraw
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn refined_diff_styles(
+        &self,
+        message_index: usize,
+        tool_id: &str,
+    ) -> Option<&crate::diff_highlight::RefinedDiffStyles> {
+        let revision = *self.message_revisions.get(message_index)?;
+        let ChatMessage::ToolCall { id, .. } = self.messages.get(message_index)? else {
+            return None;
+        };
+        let highlight = self.applied_diff_highlights.get(&revision)?;
+        (id == tool_id && highlight.tool_id == tool_id).then_some(highlight.styles.as_ref())
+    }
+
+    fn new_edit_highlight_runtime(&self) -> std::io::Result<EditHighlightRuntime> {
+        #[cfg(test)]
+        {
+            (self.edit_highlight_runtime_factory)()
+        }
+        #[cfg(not(test))]
+        {
+            EditHighlightRuntime::new()
+        }
+    }
+
+    fn resolve_edit_target(&self, target: &str) -> Option<(PathBuf, String)> {
+        let target_path = Path::new(target);
+        if target_path.as_os_str().is_empty() || target_path.is_absolute() {
+            return None;
+        }
+        let configured_workspace = self.workspace_root.as_ref()?;
+        let resolved_path =
+            orca_tools::resolve_workspace_path(configured_workspace, Some(target)).ok()?;
+        let display_path = resolved_path
+            .strip_prefix(configured_workspace)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if display_path.is_empty() {
+            return None;
+        }
+        let workspace_root = configured_workspace.canonicalize().ok()?;
+        if !workspace_root.is_dir() {
+            return None;
+        }
+        let absolute_path = resolved_path.canonicalize().ok()?;
+        if !absolute_path.starts_with(&workspace_root) || !absolute_path.is_file() {
+            return None;
+        }
+        Some((absolute_path, display_path))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn edit_target_matches_job(&self, target: &str, job: &EditHighlightJob) -> bool {
+        self.resolve_edit_target(target)
+            .is_some_and(|(absolute_path, display_path)| {
+                absolute_path == job.absolute_path && display_path == job.display_path
+            })
+    }
+
+    fn submit_edit_highlight_for_message(&mut self, message_index: usize) {
+        self.reconcile_message_tracking();
+        let Some(ChatMessage::ToolCall {
+            id,
+            target: Some(target),
+            status,
+            diff: Some(diff),
+            ..
+        }) = self.messages.get(message_index)
+        else {
+            return;
+        };
+        if status != "completed" || diff.trim().is_empty() {
+            return;
+        }
+
+        let parsed = crate::diff_highlight::parse_unified_diff(diff);
+        let Some(destination_path) = parsed.destination_path.as_deref() else {
+            return;
+        };
+        let Some((absolute_path, display_path)) = self.resolve_edit_target(target) else {
+            return;
+        };
+        let Some(normalized_destination) = normalize_diff_relative_path(destination_path) else {
+            return;
+        };
+        if parsed.has_multiple_files
+            || !unified_diff_structure_is_valid(diff, Path::new(&display_path))
+            || normalized_destination != Path::new(&display_path)
+            || !parsed_diff_has_valid_new_side(&parsed)
+            || highlighter_for_path(&normalized_destination, self.syntax_theme).is_none()
+        {
+            return;
+        }
+
+        let Some(message_revision) = self.message_revisions.get(message_index).copied() else {
+            return;
+        };
+        let tool_id = id.clone();
+
+        if self.edit_highlight_runtime.is_none() {
+            let Ok(runtime) = self.new_edit_highlight_runtime() else {
+                return;
+            };
+            self.edit_highlight_runtime = Some(runtime);
+        }
+        let runtime = self
+            .edit_highlight_runtime
+            .as_mut()
+            .expect("edit highlight runtime initialized");
+        let job = EditHighlightJob {
+            job_id: runtime.allocate_job_id(),
+            tool_id,
+            message_index,
+            message_revision,
+            syntax_theme_revision: self.syntax_theme.revision(),
+            syntax_theme: self.syntax_theme,
+            absolute_path,
+            display_path,
+            parsed,
+        };
+        if !runtime.submit(job) {
+            self.edit_highlight_runtime = None;
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn apply_edit_highlight_result(&mut self, result: EditHighlightResult) -> bool {
+        let Some(runtime) = self.edit_highlight_runtime.as_mut() else {
+            return false;
+        };
+        if !runtime.pending_matches(&result.job) || !runtime.finish_pending(&result.job) {
+            return false;
+        }
+        let EditHighlightOutcome::Ready { styles } = result.outcome else {
+            return false;
+        };
+
+        let job = result.job;
+        if self.syntax_theme != job.syntax_theme
+            || self.syntax_theme.revision() != job.syntax_theme_revision
+            || self.message_revisions.get(job.message_index).copied() != Some(job.message_revision)
+        {
+            return false;
+        }
+        let Some(ChatMessage::ToolCall {
+            id,
+            target: Some(target),
+            status,
+            diff: Some(diff),
+            ..
+        }) = self.messages.get(job.message_index)
+        else {
+            return false;
+        };
+        if id != &job.tool_id || status != "completed" {
+            return false;
+        }
+        let current_parsed = crate::diff_highlight::parse_unified_diff(diff);
+        let Some(current_destination) = current_parsed.destination_path.as_deref() else {
+            return false;
+        };
+        let Some(normalized_destination) = normalize_diff_relative_path(current_destination) else {
+            return false;
+        };
+        if current_parsed != job.parsed
+            || normalized_destination.to_string_lossy().replace('\\', "/") != job.display_path
+            || !self.edit_target_matches_job(target, &job)
+        {
+            return false;
+        }
+
+        if !self.touch_message(job.message_index) {
+            return false;
+        }
+        let Some(applied_revision) = self.message_revisions.get(job.message_index).copied() else {
+            return false;
+        };
+        self.applied_diff_highlights.insert(
+            applied_revision,
+            AppliedDiffHighlight {
+                tool_id: job.tool_id,
+                display_path: job.display_path,
+                styles,
+            },
+        );
+        true
+    }
+
+    fn clear_pending_edit_highlights(&mut self) {
+        if let Some(runtime) = self.edit_highlight_runtime.as_mut() {
+            runtime.clear_pending();
+        }
+    }
+
+    fn remove_applied_highlight_for_message(&mut self, index: usize) {
+        if matches!(self.messages.get(index), Some(ChatMessage::ToolCall { .. }))
+            && let Some(revision) = self.message_revisions.get(index)
+        {
+            self.applied_diff_highlights.remove(revision);
+        }
+    }
+
+    fn remove_applied_highlights_for_tool_id(&mut self, tool_id: &str) {
+        self.applied_diff_highlights
+            .retain(|_, highlight| highlight.tool_id != tool_id);
+    }
+
+    fn prune_applied_diff_highlights(&mut self) {
+        let present_revisions = self
+            .messages
+            .iter()
+            .zip(&self.message_revisions)
+            .filter_map(|(message, revision)| match message {
+                ChatMessage::ToolCall { id, .. } => Some((*revision, id.as_str())),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        self.applied_diff_highlights.retain(|revision, highlight| {
+            present_revisions
+                .get(revision)
+                .is_some_and(|tool_id| *tool_id == highlight.tool_id)
+        });
+    }
+
+    #[cfg(test)]
+    fn pending_edit_highlight_count(&self) -> usize {
+        self.edit_highlight_runtime
+            .as_ref()
+            .map_or(0, EditHighlightRuntime::pending_count)
+    }
+
+    #[cfg(test)]
+    fn successful_edit_highlight_submit_count(&self) -> usize {
+        self.edit_highlight_runtime
+            .as_ref()
+            .map_or(0, EditHighlightRuntime::successful_submit_count)
+    }
+
+    #[cfg(test)]
+    fn pending_edit_highlight_job(&self, tool_id: &str) -> Option<EditHighlightJob> {
+        self.edit_highlight_runtime.as_ref()?.pending_job(tool_id)
+    }
+
+    #[cfg(test)]
+    fn edit_highlight_runtime_started(&self) -> bool {
+        self.edit_highlight_runtime.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn syntax_workspace_root_for_test(&self) -> Option<&Path> {
+        self.workspace_root.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn syntax_theme_for_test(&self) -> SyntaxTheme {
+        self.syntax_theme
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edit_highlight_runtime_started_for_test(&self) -> bool {
+        self.edit_highlight_runtime.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_edit_highlight_count_for_test(&self) -> usize {
+        self.pending_edit_highlight_count()
+    }
+
+    #[cfg(test)]
+    fn set_edit_highlight_runtime_factory_for_test(
+        &mut self,
+        factory: EditHighlightRuntimeFactory,
+    ) {
+        self.edit_highlight_runtime_factory = factory;
+    }
+
+    #[cfg(test)]
+    fn set_edit_highlight_drain_for_test(&mut self, drain: Option<EditHighlightDrain>) {
+        self.edit_highlight_drain = drain;
     }
 
     /// Map a mouse position to transcript content space; `None` outside the
@@ -1000,6 +1547,15 @@ impl AppState {
 
     pub(crate) fn push_message(&mut self, message: ChatMessage) {
         self.reconcile_message_tracking();
+        if let ChatMessage::ToolCall { id, .. } = &message {
+            let reused_tool_id = self.messages.iter().any(
+                |existing| matches!(existing, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == id),
+            );
+            self.remove_applied_highlights_for_tool_id(id);
+            if reused_tool_id {
+                self.clear_pending_edit_highlights();
+            }
+        }
         let revision = self.allocate_message_revision();
         self.messages.push(message);
         self.message_revisions.push(revision);
@@ -1014,6 +1570,8 @@ impl AppState {
 
     pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
         self.messages = messages.into_iter().collect();
+        self.applied_diff_highlights.clear();
+        self.clear_pending_edit_highlights();
         self.reset_message_tracking();
         self.finalized_count = 0;
         self.flushed_count = 0;
@@ -1025,6 +1583,8 @@ impl AppState {
         self.messages.clear();
         self.message_revisions.clear();
         self.transcript_render_cache.clear();
+        self.applied_diff_highlights.clear();
+        self.clear_pending_edit_highlights();
         self.finalized_count = 0;
         self.flushed_count = 0;
         self.unseen_messages = 0;
@@ -1035,12 +1595,14 @@ impl AppState {
         self.reconcile_message_tracking();
         if len < self.messages.len() {
             self.invalidate_selection();
+            self.clear_pending_edit_highlights();
         }
         self.messages.truncate(len);
         self.message_revisions.truncate(len);
         self.transcript_render_cache.truncate(len);
         self.finalized_count = self.finalized_count.min(len);
         self.flushed_count = self.flushed_count.min(len);
+        self.prune_applied_diff_highlights();
     }
 
     pub(crate) fn replace_message(&mut self, index: usize, message: ChatMessage) -> bool {
@@ -1048,6 +1610,7 @@ impl AppState {
         if index >= self.messages.len() {
             return false;
         }
+        self.remove_applied_highlight_for_message(index);
         self.messages[index] = message;
         self.touch_message(index);
         true
@@ -1059,6 +1622,7 @@ impl AppState {
         mutate: impl FnOnce(&mut ChatMessage) -> R,
     ) -> Option<R> {
         self.reconcile_message_tracking();
+        self.remove_applied_highlight_for_message(index);
         let result = mutate(self.messages.get_mut(index)?);
         self.touch_message(index);
         Some(result)
@@ -1069,6 +1633,11 @@ impl AppState {
         if index >= self.message_revisions.len() {
             return false;
         }
+        let old_revision = self.message_revisions[index];
+        if let Some(runtime) = self.edit_highlight_runtime.as_mut() {
+            runtime.cancel_pending_for_message(index, old_revision);
+        }
+        self.remove_applied_highlight_for_message(index);
         // Rewriting any message but the tail can change its height and shift
         // every row below it. Tail rewrites (streaming deltas) leave earlier
         // rows in place, so a selection above the stream stays valid.
@@ -1090,6 +1659,7 @@ impl AppState {
         let mut retained_finalized = 0;
         let mut retained_flushed = 0;
         let mut retained_mask = Vec::with_capacity(messages.len());
+        let mut removed_tool_revisions = Vec::new();
         for (index, (message, revision)) in messages.into_iter().zip(revisions).enumerate() {
             let retain = keep(&message);
             retained_mask.push(retain);
@@ -1098,12 +1668,19 @@ impl AppState {
                 retained_flushed += usize::from(index < flushed_count);
                 self.messages.push(message);
                 self.message_revisions.push(revision);
+            } else if matches!(message, ChatMessage::ToolCall { .. }) {
+                removed_tool_revisions.push(revision);
             }
         }
         self.transcript_render_cache.retain(&retained_mask);
         self.finalized_count = retained_finalized;
         self.flushed_count = retained_flushed;
         if retained_mask.iter().any(|retain| !retain) {
+            for revision in removed_tool_revisions {
+                self.applied_diff_highlights.remove(&revision);
+            }
+            self.clear_pending_edit_highlights();
+            self.prune_applied_diff_highlights();
             self.invalidate_selection();
         }
     }
@@ -1682,10 +2259,17 @@ impl AppState {
                 if name == "subagent" {
                     return;
                 }
-                let updated = if let Some(index) = self.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
-                })
-                {
+                let message_index = if let Some(index) = self.messages.iter().rposition(|message| {
+                    matches!(
+                        message,
+                        ChatMessage::ToolCall {
+                            id: existing_id,
+                            status,
+                            ..
+                        } if existing_id == &id
+                            && matches!(status.as_str(), "running" | "receiving")
+                    )
+                }) {
                     self.mutate_message(index, |message| {
                         let ChatMessage::ToolCall {
                             id: existing_id,
@@ -1710,25 +2294,27 @@ impl AppState {
                         *existing_diff = diff.clone();
                         *existing_kind = kind.clone();
                     });
-                    true
+                    index
                 } else {
-                    false
-                };
-                if !updated {
+                    let index = self.messages.len();
                     self.push_message(ChatMessage::ToolCall {
-                        id,
-                        name,
+                        id: id.clone(),
+                        name: name.clone(),
                         target: None,
-                        status,
+                        status: status.clone(),
                         output: if output.is_empty() {
                             None
                         } else {
-                            Some(output)
+                            Some(output.clone())
                         },
-                        diff,
-                        kind,
+                        diff: diff.clone(),
+                        kind: kind.clone(),
                         expanded: false,
                     });
+                    index
+                };
+                if status == "completed" {
+                    self.submit_edit_highlight_for_message(message_index);
                 }
             }
             TuiEvent::PlanUpdated { explanation, plan } => {
@@ -2464,6 +3050,19 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    #[test]
+    fn fresh_app_state_has_default_syntax_highlight_state() {
+        let state = state();
+
+        assert!(state.workspace_root.is_none());
+        assert_eq!(
+            state.syntax_theme,
+            crate::syntax_highlight::SyntaxTheme::OneHalfDark
+        );
+        assert!(state.edit_highlight_runtime.is_none());
+        assert!(state.applied_diff_highlights.is_empty());
     }
 
     fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
@@ -4779,5 +5378,1672 @@ mod tests {
         state.enter_running();
         assert_eq!(state.status, AppStatus::Running);
         assert_eq!(state.running_started_at, Some(started_at));
+    }
+
+    const EDIT_DIFF: &str = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+";
+
+    fn configured_edit_state() -> (tempfile::TempDir, AppState) {
+        let directory = tempfile::tempdir().expect("edit workspace");
+        std::fs::create_dir_all(directory.path().join("src")).expect("source directory");
+        std::fs::write(directory.path().join("src/item.py"), "value = 2\n")
+            .expect("post-edit file");
+        let mut state = state();
+        state.configure_syntax_highlighting(
+            directory.path().to_path_buf(),
+            crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+        );
+        (directory, state)
+    }
+
+    fn submit_live_edit(state: &mut AppState, id: &str, target: &str, diff: &str) {
+        state.update(TuiEvent::ToolRequested {
+            id: id.to_string(),
+            name: "edit".to_string(),
+            target: Some(target.to_string()),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: id.to_string(),
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: format!("edited {target}"),
+            diff: Some(diff.to_string()),
+            kind: None,
+        });
+    }
+
+    fn state_with_submitted_edit_job() -> (
+        tempfile::TempDir,
+        AppState,
+        crate::edit_highlight_worker::EditHighlightJob,
+    ) {
+        let (directory, mut state) = configured_edit_state();
+        submit_live_edit(&mut state, "edit-1", "src/item.py", EDIT_DIFF);
+        let job = state
+            .pending_edit_highlight_job("edit-1")
+            .expect("pending edit highlight job");
+        (directory, state, job)
+    }
+
+    fn ready_result(
+        job: crate::edit_highlight_worker::EditHighlightJob,
+    ) -> crate::edit_highlight_worker::EditHighlightResult {
+        use ratatui::style::{Color, Style};
+        use ratatui::text::Span;
+
+        let styles = crate::diff_highlight::RefinedDiffStyles::from([(
+            1,
+            vec![Span::styled(
+                "value = 2".to_string(),
+                Style::default().fg(Color::Magenta),
+            )],
+        )]);
+        crate::edit_highlight_worker::EditHighlightResult {
+            job,
+            outcome: crate::edit_highlight_worker::EditHighlightOutcome::Ready {
+                styles: Arc::new(styles),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn real_alias_edit_state() -> (
+        tempfile::TempDir,
+        AppState,
+        crate::edit_highlight_worker::EditHighlightJob,
+    ) {
+        use std::os::unix::fs::symlink;
+
+        let (directory, mut state) = configured_edit_state();
+        let alias = directory.path().join("src/alias.py");
+        symlink(directory.path().join("src/item.py"), &alias).expect("initial alias");
+        let request = orca_core::tool_types::ToolRequest {
+            id: "alias-edit".to_string(),
+            name: orca_core::tool_types::ToolName::Edit,
+            action: orca_core::approval_types::ActionKind::Write,
+            target: Some("src/alias.py".to_string()),
+            raw_arguments: Some(
+                r#"{"path":"src/alias.py","old_text":"value = 2","new_text":"value = 3"}"#
+                    .to_string(),
+            ),
+        };
+        let result = orca_tools::edit::execute(&request, directory.path());
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+        let preview = result
+            .file_change_preview
+            .as_deref()
+            .expect("committed alias preview");
+        let orca_core::tool_types::FileChangePreview::UnifiedDiff { text: diff, .. } = preview
+        else {
+            panic!("alias edit should produce unified diff");
+        };
+        state.update(TuiEvent::ToolRequested {
+            id: request.id.clone(),
+            name: "edit".to_string(),
+            target: request.target.clone(),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: request.id,
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: result.output.unwrap_or_default(),
+            diff: Some(diff.clone()),
+            kind: None,
+        });
+        let job = state
+            .pending_edit_highlight_job("alias-edit")
+            .expect("real alias edit pending job");
+        (directory, state, job)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_edit_producer_keeps_symlink_alias_as_job_display_path() {
+        let (directory, state, job) = real_alias_edit_state();
+
+        assert_eq!(
+            job.absolute_path,
+            directory
+                .path()
+                .join("src/item.py")
+                .canonicalize()
+                .expect("canonical item path")
+        );
+        assert_eq!(job.display_path, "src/alias.py");
+        assert_eq!(job.parsed.destination_path.as_deref(), Some("src/alias.py"));
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ready_result_applies_while_symlink_alias_identity_is_unchanged() {
+        let (_directory, mut state, job) = real_alias_edit_state();
+
+        assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn successful_live_edit_submits_one_versioned_highlight_job() {
+        let (directory, mut state) = configured_edit_state();
+
+        state.update(TuiEvent::ToolRequested {
+            id: "edit-1".to_string(),
+            name: "edit".to_string(),
+            target: Some("src/item.py".to_string()),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "edit-1".to_string(),
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: "edited src/item.py".to_string(),
+            diff: Some(EDIT_DIFF.to_string()),
+            kind: None,
+        });
+
+        let job = state
+            .pending_edit_highlight_job("edit-1")
+            .expect("pending job");
+        assert!(state.edit_highlight_needs_tick());
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+        assert_eq!(state.successful_edit_highlight_submit_count(), 1);
+        assert_eq!(job.tool_id, "edit-1");
+        assert_eq!(job.message_index, 0);
+        assert_eq!(job.message_revision, state.message_revisions[0]);
+        assert_eq!(
+            job.syntax_theme_revision,
+            crate::syntax_highlight::SyntaxTheme::OneHalfDark.revision()
+        );
+        assert_eq!(
+            job.syntax_theme,
+            crate::syntax_highlight::SyntaxTheme::OneHalfDark
+        );
+        assert_eq!(
+            job.absolute_path,
+            directory
+                .path()
+                .join("src/item.py")
+                .canonicalize()
+                .expect("canonical target")
+        );
+        assert_eq!(job.display_path, "src/item.py");
+        assert_eq!(
+            job.parsed,
+            crate::diff_highlight::parse_unified_diff(EDIT_DIFF)
+        );
+    }
+
+    #[test]
+    fn completion_only_tool_row_has_no_target_and_submits_no_job() {
+        let (_directory, mut state) = configured_edit_state();
+
+        state.update(TuiEvent::ToolCompleted {
+            id: "edit-1".to_string(),
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: "edited src/item.py".to_string(),
+            diff: Some(EDIT_DIFF.to_string()),
+            kind: None,
+        });
+
+        assert!(matches!(
+            state.messages.first(),
+            Some(ChatMessage::ToolCall { target: None, .. })
+        ));
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn replayed_history_messages_never_submit_jobs() {
+        let (_directory, mut state) = configured_edit_state();
+        let historical = ChatMessage::ToolCall {
+            id: "historical-edit".to_string(),
+            name: "edit".to_string(),
+            target: Some("src/item.py".to_string()),
+            status: "completed".to_string(),
+            output: None,
+            diff: Some(EDIT_DIFF.to_string()),
+            kind: None,
+            expanded: false,
+        };
+
+        state.push_message(historical.clone());
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+
+        state.replace_messages([historical]);
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn ineligible_live_edits_do_not_start_runtime_or_submit_jobs() {
+        fn assert_ineligible(
+            configure: impl FnOnce(&tempfile::TempDir, &mut AppState) -> (String, String, String),
+        ) {
+            let (directory, mut state) = configured_edit_state();
+            let (status, target, diff) = configure(&directory, &mut state);
+            state.update(TuiEvent::ToolRequested {
+                id: "edit-ineligible".to_string(),
+                name: "edit".to_string(),
+                target: Some(target),
+            });
+            state.update(TuiEvent::ToolCompleted {
+                id: "edit-ineligible".to_string(),
+                name: "edit".to_string(),
+                status,
+                output: String::new(),
+                diff: Some(diff),
+                kind: None,
+            });
+            assert_eq!(state.pending_edit_highlight_count(), 0);
+            assert!(!state.edit_highlight_runtime_started());
+        }
+
+        assert_ineligible(|_, _| {
+            (
+                "failed".to_string(),
+                "src/item.py".to_string(),
+                EDIT_DIFF.into(),
+            )
+        });
+        assert_ineligible(|_, _| {
+            (
+                "cancelled".to_string(),
+                "src/item.py".to_string(),
+                EDIT_DIFF.into(),
+            )
+        });
+        assert_ineligible(|_, _| {
+            (
+                "completed".to_string(),
+                "src/item.py".to_string(),
+                " \n".to_string(),
+            )
+        });
+        assert_ineligible(|directory, _| {
+            std::fs::write(directory.path().join("src/item.unknown"), "value = 2\n")
+                .expect("unknown syntax file");
+            (
+                "completed".to_string(),
+                "src/item.unknown".to_string(),
+                EDIT_DIFF.replace("item.py", "item.unknown"),
+            )
+        });
+        assert_ineligible(|_, _| {
+            (
+                "completed".to_string(),
+                "src/item.py".to_string(),
+                format!("{EDIT_DIFF}--- a/src/other.py\n+++ b/src/other.py\n@@ -1 +1 @@\n-a\n+b\n"),
+            )
+        });
+        assert_ineligible(|directory, _| {
+            std::fs::write(directory.path().join("src/item.py"), "").expect("empty post-edit file");
+            (
+                "completed".to_string(),
+                "src/item.py".to_string(),
+                "--- a/src/item.py\n+++ b/src/item.py\n@@ -1 +0,0 @@\n-value = 1\n".to_string(),
+            )
+        });
+        assert_ineligible(|directory, _| {
+            let outside = directory.path().parent().unwrap().join("outside-item.py");
+            std::fs::write(&outside, "value = 2\n").expect("outside file");
+            (
+                "completed".to_string(),
+                "../outside-item.py".to_string(),
+                EDIT_DIFF.replace("src/item.py", "../outside-item.py"),
+            )
+        });
+        assert_ineligible(|directory, _| {
+            std::fs::remove_file(directory.path().join("src/item.py")).expect("remove source file");
+            std::fs::create_dir(directory.path().join("src/item.py"))
+                .expect("file-shaped directory");
+            (
+                "completed".to_string(),
+                "src/item.py".to_string(),
+                EDIT_DIFF.into(),
+            )
+        });
+    }
+
+    #[test]
+    fn live_edit_without_configured_workspace_submits_no_job() {
+        let mut state = state();
+
+        submit_live_edit(&mut state, "no-workspace", "src/item.py", EDIT_DIFF);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn incomplete_unified_diff_is_rejected_before_runtime_spawn() {
+        let (_directory, mut state) = configured_edit_state();
+        let incomplete = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+";
+
+        submit_live_edit(&mut state, "incomplete", "src/item.py", incomplete);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn extra_source_line_after_completed_hunk_is_rejected_before_runtime_spawn() {
+        let (_directory, mut state) = configured_edit_state();
+        let malformed = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
++unexpected = 3
+";
+
+        submit_live_edit(&mut state, "malformed", "src/item.py", malformed);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn missing_file_header_pair_is_rejected_before_runtime_spawn() {
+        let (_directory, mut state) = configured_edit_state();
+        let malformed = "\
++++ b/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+";
+
+        submit_live_edit(&mut state, "missing-header", "src/item.py", malformed);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn valid_rename_diff_uses_destination_target_and_submits_job() {
+        let (_directory, mut state) = configured_edit_state();
+        let renamed = "\
+--- a/src/old.py
++++ b/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+";
+
+        submit_live_edit(&mut state, "rename", "src/item.py", renamed);
+
+        let job = state
+            .pending_edit_highlight_job("rename")
+            .expect("rename destination job");
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+        assert_eq!(job.display_path, "src/item.py");
+    }
+
+    #[test]
+    fn valid_added_file_diff_uses_destination_target_and_submits_job() {
+        let (_directory, mut state) = configured_edit_state();
+        let added = "\
+--- /dev/null
++++ b/src/item.py
+@@ -0,0 +1 @@
++value = 2
+";
+
+        submit_live_edit(&mut state, "add", "src/item.py", added);
+
+        let job = state
+            .pending_edit_highlight_job("add")
+            .expect("added file destination job");
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+        assert_eq!(job.display_path, "src/item.py");
+    }
+
+    #[test]
+    fn dev_null_requires_zero_start_and_zero_count() {
+        let (_directory, mut state) = configured_edit_state();
+        let invalid_add = "\
+--- /dev/null
++++ b/src/item.py
+@@ -1,0 +1 @@
++value = 2
+";
+        let invalid_delete = "\
+--- a/src/item.py
++++ /dev/null
+@@ -1 +1,0 @@
+-value = 1
+";
+
+        submit_live_edit(&mut state, "invalid-null-add", "src/item.py", invalid_add);
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!unified_diff_structure_is_valid(
+            invalid_add,
+            Path::new("src/item.py")
+        ));
+        assert!(!unified_diff_structure_is_valid(
+            invalid_delete,
+            Path::new("src/item.py")
+        ));
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn in_workspace_parent_component_normalizes_and_submits_job() {
+        let (directory, mut state) = configured_edit_state();
+        std::fs::write(directory.path().join("item.py"), "value = 2\n")
+            .expect("normalized post-edit file");
+        let diff = "\
+--- a/item.py
++++ b/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+";
+
+        submit_live_edit(&mut state, "normalized", "src/../item.py", diff);
+
+        let job = state
+            .pending_edit_highlight_job("normalized")
+            .expect("normalized target job");
+        assert_eq!(job.display_path, "item.py");
+        assert_eq!(
+            job.absolute_path,
+            directory
+                .path()
+                .join("item.py")
+                .canonicalize()
+                .expect("canonical normalized target")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_edit_producer_lexically_normalizes_symlink_parent_target() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, mut state) = configured_edit_state();
+        let outside = tempfile::tempdir().expect("outside root");
+        symlink(outside.path(), directory.path().join("link")).expect("outside symlink");
+        let request = orca_core::tool_types::ToolRequest {
+            id: "parent-edit".to_string(),
+            name: orca_core::tool_types::ToolName::Edit,
+            action: orca_core::approval_types::ActionKind::Write,
+            target: Some("link/../src/item.py".to_string()),
+            raw_arguments: Some(
+                r#"{"path":"link/../src/item.py","old_text":"value = 2","new_text":"value = 3"}"#
+                    .to_string(),
+            ),
+        };
+        let result = orca_tools::edit::execute(&request, directory.path());
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+        let preview = result
+            .file_change_preview
+            .as_deref()
+            .expect("committed parent preview");
+        let orca_core::tool_types::FileChangePreview::UnifiedDiff { text: diff, .. } = preview
+        else {
+            panic!("parent edit should produce unified diff");
+        };
+        state.update(TuiEvent::ToolRequested {
+            id: request.id.clone(),
+            name: "edit".to_string(),
+            target: request.target.clone(),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: request.id,
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: result.output.unwrap_or_default(),
+            diff: Some(diff.clone()),
+            kind: None,
+        });
+
+        let job = state
+            .pending_edit_highlight_job("parent-edit")
+            .expect("parent edit pending job");
+        assert_eq!(
+            job.absolute_path,
+            directory
+                .path()
+                .join("src/item.py")
+                .canonicalize()
+                .expect("canonical item")
+        );
+        assert_eq!(job.display_path, "src/item.py");
+        assert_eq!(job.parsed.destination_path.as_deref(), Some("src/item.py"));
+    }
+
+    #[test]
+    fn real_edit_producer_allows_parent_reentry_into_same_workspace() {
+        let (directory, mut state) = configured_edit_state();
+        let workspace_name = directory
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 workspace name");
+        let target = format!("../{workspace_name}/src/item.py");
+        let request = orca_core::tool_types::ToolRequest {
+            id: "parent-reentry-edit".to_string(),
+            name: orca_core::tool_types::ToolName::Edit,
+            action: orca_core::approval_types::ActionKind::Write,
+            target: Some(target.clone()),
+            raw_arguments: Some(format!(
+                r#"{{"path":"{target}","old_text":"value = 2","new_text":"value = 3"}}"#
+            )),
+        };
+        let result = orca_tools::edit::execute(&request, directory.path());
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+        let preview = result
+            .file_change_preview
+            .as_deref()
+            .expect("committed parent-reentry preview");
+        let orca_core::tool_types::FileChangePreview::UnifiedDiff { text: diff, .. } = preview
+        else {
+            panic!("parent-reentry edit should produce unified diff");
+        };
+        let parsed = crate::diff_highlight::parse_unified_diff(diff);
+        assert_eq!(parsed.destination_path.as_deref(), Some("src/item.py"));
+        state.update(TuiEvent::ToolRequested {
+            id: request.id.clone(),
+            name: "edit".to_string(),
+            target: request.target.clone(),
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: request.id,
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: result.output.unwrap_or_default(),
+            diff: Some(diff.clone()),
+            kind: None,
+        });
+
+        let job = state
+            .pending_edit_highlight_job("parent-reentry-edit")
+            .expect("parent-reentry pending job");
+        assert_eq!(
+            job.absolute_path,
+            directory
+                .path()
+                .join("src/item.py")
+                .canonicalize()
+                .expect("canonical item")
+        );
+        assert_eq!(job.display_path, "src/item.py");
+        assert_eq!(job.parsed.destination_path.as_deref(), Some("src/item.py"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_target_resolution_matches_tool_resolution_table() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, state) = configured_edit_state();
+        std::fs::write(directory.path().join("item.py"), "value = 2\n").expect("root item");
+        symlink(
+            directory.path().join("src/item.py"),
+            directory.path().join("src/alias.py"),
+        )
+        .expect("alias symlink");
+        let outside = tempfile::tempdir().expect("outside root");
+        std::fs::create_dir(outside.path().join("child")).expect("outside child");
+        std::fs::write(outside.path().join("escaped.py"), "value = 2\n").expect("outside file");
+        symlink(
+            outside.path().join("child"),
+            directory.path().join("linked"),
+        )
+        .expect("outside child symlink");
+
+        let workspace_name = directory
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 workspace name");
+        let parent_reentry = format!("../{workspace_name}/src/item.py");
+        let cases = vec![
+            ("src/item.py".to_string(), Some("src/item.py")),
+            ("src/../item.py".to_string(), Some("item.py")),
+            ("src/alias.py".to_string(), Some("src/alias.py")),
+            (parent_reentry, Some("src/item.py")),
+            ("../escaped.py".to_string(), None),
+            ("linked/escaped.py".to_string(), None),
+        ];
+
+        for (target, expected_display) in cases {
+            let tool_path = orca_tools::resolve_workspace_path(directory.path(), Some(&target))
+                .ok()
+                .filter(|path| path.is_file())
+                .and_then(|path| path.canonicalize().ok());
+            let app_path = state.resolve_edit_target(&target);
+            assert_eq!(app_path.is_some(), tool_path.is_some(), "{target}");
+            if let (Some((app_absolute, display)), Some(tool_absolute)) = (app_path, tool_path) {
+                assert_eq!(app_absolute, tool_absolute, "{target}");
+                assert_eq!(
+                    display,
+                    expected_display.expect("expected display"),
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reversed_file_headers_are_rejected_before_runtime_spawn() {
+        let (_directory, mut state) = configured_edit_state();
+        let reversed = "\
++++ b/src/item.py
+--- a/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+";
+
+        submit_live_edit(&mut state, "reversed", "src/item.py", reversed);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn arbitrary_in_hunk_and_trailing_metadata_are_rejected() {
+        for (id, diff) in [
+            (
+                "leading-metadata",
+                "\
+arbitrary metadata
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+",
+            ),
+            (
+                "in-hunk-metadata",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+arbitrary metadata
+ shared = 3
+",
+            ),
+            (
+                "trailing-metadata",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+arbitrary metadata
+",
+            ),
+        ] {
+            let (_directory, mut state) = configured_edit_state();
+
+            submit_live_edit(&mut state, id, "src/item.py", diff);
+
+            assert_eq!(state.pending_edit_highlight_count(), 0, "{id}");
+            assert!(!state.edit_highlight_runtime_started(), "{id}");
+        }
+    }
+
+    #[test]
+    fn standard_no_newline_metadata_and_header_timestamps_are_allowed() {
+        let (_directory, mut state) = configured_edit_state();
+        let diff = "\
+--- a/src/item.py\t2026-07-24 10:00:00
++++ b/src/item.py\t2026-07-24 10:01:00
+@@ -1 +1 @@
+-value = 1
+\\ No newline at end of file
++value = 2
+\\ No newline at end of file
+";
+
+        submit_live_edit(&mut state, "standard-metadata", "src/item.py", diff);
+
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+        assert!(
+            state
+                .pending_edit_highlight_job("standard-metadata")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn zero_new_side_coordinate_is_rejected_before_runtime_spawn() {
+        let (_directory, mut state) = configured_edit_state();
+        let invalid = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -0,0 +0,1 @@
++value = 2
+";
+
+        submit_live_edit(&mut state, "zero-new-line", "src/item.py", invalid);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn positive_count_with_zero_start_is_rejected_before_runtime_spawn() {
+        let (_directory, mut state) = configured_edit_state();
+        let invalid = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -0 +1 @@
+-value = 1
++value = 2
+";
+
+        submit_live_edit(&mut state, "zero-old-start", "src/item.py", invalid);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn positive_start_zero_count_mid_file_insertion_is_eligible() {
+        let (directory, mut state) = configured_edit_state();
+        std::fs::write(
+            directory.path().join("src/item.py"),
+            "first = 1\nvalue = 2\n",
+        )
+        .expect("post-insert file");
+        let insertion = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,0 +2 @@ fn context
++value = 2
+";
+
+        submit_live_edit(&mut state, "mid-insert", "src/item.py", insertion);
+
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+        assert!(state.pending_edit_highlight_job("mid-insert").is_some());
+    }
+
+    #[test]
+    fn empty_zero_width_hunk_is_rejected_before_runtime_spawn() {
+        let (_directory, mut state) = configured_edit_state();
+        let diff = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,0 +1,0 @@
+@@ -1 +1 @@
+-value = 1
++value = 2
+";
+
+        submit_live_edit(&mut state, "empty-hunk", "src/item.py", diff);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn duplicate_backward_and_overlapping_hunks_are_rejected() {
+        let cases = [
+            (
+                "duplicate-hunk",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1 @@
+-old = 1
++value = 2
+@@ -1 +1 @@
+-old = 1
++value = 2
+",
+            ),
+            (
+                "backward-hunk",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -3 +3 @@
+-old = 3
++new = 3
+@@ -1 +1 @@
+-old = 1
++value = 2
+",
+            ),
+            (
+                "old-overlap",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,2 +1 @@
+-old = 1
+-old = 2
++new = 1
+@@ -2 +2 @@
+-old = 2
++value = 2
+",
+            ),
+            (
+                "new-overlap",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1,2 @@
+-old = 1
++new = 1
++value = 2
+@@ -2 +2 @@
+-old = 2
++value = 2
+",
+            ),
+        ];
+
+        for (id, diff) in cases {
+            let (_directory, mut state) = configured_edit_state();
+
+            submit_live_edit(&mut state, id, "src/item.py", diff);
+
+            assert_eq!(state.pending_edit_highlight_count(), 0, "{id}");
+            assert!(!state.edit_highlight_runtime_started(), "{id}");
+        }
+    }
+
+    #[test]
+    fn overflowing_hunk_endpoint_is_rejected() {
+        let (_directory, mut state) = configured_edit_state();
+        let diff = format!(
+            "--- a/src/item.py\n+++ b/src/item.py\n@@ -{},2 +1,2 @@\n-old = 1\n-old = 2\n+value = 2\n+new = 2\n",
+            usize::MAX
+        );
+
+        submit_live_edit(&mut state, "overflowing-hunk", "src/item.py", &diff);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn two_non_overlapping_hunks_with_function_context_are_eligible() {
+        let (directory, mut state) = configured_edit_state();
+        std::fs::write(
+            directory.path().join("src/item.py"),
+            "first = 1\nvalue = 2\nthird = 3\nvalue = 4\n",
+        )
+        .expect("two-hunk post-edit file");
+        let diff = "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,2 +1,2 @@ first section
+ first = 1
+-old = 1
++value = 2
+@@ -3,2 +3,2 @@ second section
+ third = 3
+-old = 2
++value = 4
+";
+
+        submit_live_edit(&mut state, "two-hunks", "src/item.py", diff);
+
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+        assert!(state.pending_edit_highlight_job("two-hunks").is_some());
+    }
+
+    #[test]
+    fn dev_null_counts_correlate_and_delete_only_stays_ineligible() {
+        let (_directory, mut state) = configured_edit_state();
+        let malformed_add = "\
+--- /dev/null
++++ b/src/item.py
+@@ -1 +1 @@
+-old
++value = 2
+";
+        let delete = "\
+--- a/src/item.py
++++ /dev/null
+@@ -1 +0,0 @@
+-value = 1
+";
+
+        submit_live_edit(&mut state, "malformed-add", "src/item.py", malformed_add);
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!unified_diff_structure_is_valid(
+            malformed_add,
+            Path::new("src/item.py")
+        ));
+
+        assert!(unified_diff_structure_is_valid(
+            delete,
+            Path::new("src/item.py")
+        ));
+        submit_live_edit(&mut state, "delete", "src/item.py", delete);
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn absolute_empty_mismatch_and_symlink_escape_targets_are_rejected() {
+        let (directory, mut state) = configured_edit_state();
+        let absolute = directory.path().join("src/item.py");
+        submit_live_edit(
+            &mut state,
+            "absolute",
+            absolute.to_str().expect("utf-8 absolute path"),
+            EDIT_DIFF,
+        );
+        assert!(state.pending_edit_highlight_job("absolute").is_none());
+        assert!(!state.edit_highlight_runtime_started());
+
+        submit_live_edit(&mut state, "empty", "", EDIT_DIFF);
+        assert!(state.pending_edit_highlight_job("empty").is_none());
+        assert!(!state.edit_highlight_runtime_started());
+
+        submit_live_edit(
+            &mut state,
+            "mismatch",
+            "src/item.py",
+            &EDIT_DIFF.replace("src/item.py", "src/other.py"),
+        );
+        assert!(state.pending_edit_highlight_job("mismatch").is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let alias_parent = tempfile::tempdir().expect("workspace alias parent");
+            let workspace_alias = alias_parent.path().join("workspace");
+            symlink(directory.path(), &workspace_alias).expect("workspace symlink");
+            state.configure_syntax_highlighting(
+                workspace_alias,
+                crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+            );
+            let outside = tempfile::tempdir().expect("outside directory");
+            std::fs::write(outside.path().join("escaped.py"), "value = 2\n").expect("outside file");
+            symlink(outside.path(), directory.path().join("linked")).expect("outside symlink");
+            submit_live_edit(
+                &mut state,
+                "symlink-ancestor",
+                "linked/escaped.py",
+                &EDIT_DIFF.replace("src/item.py", "linked/escaped.py"),
+            );
+            assert!(!state.edit_highlight_runtime_started());
+        }
+    }
+
+    #[test]
+    fn targetless_tool_request_and_completion_submit_no_job() {
+        let (_directory, mut state) = configured_edit_state();
+        state.update(TuiEvent::ToolRequested {
+            id: "targetless".to_string(),
+            name: "edit".to_string(),
+            target: None,
+        });
+        state.update(TuiEvent::ToolCompleted {
+            id: "targetless".to_string(),
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: "edited".to_string(),
+            diff: Some(EDIT_DIFF.to_string()),
+            kind: None,
+        });
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn completion_with_only_settled_reused_id_pushes_targetless_row() {
+        for old_status in ["completed", "failed"] {
+            let (_directory, mut state) = configured_edit_state();
+            state.push_message(ChatMessage::ToolCall {
+                id: "reused".to_string(),
+                name: "edit".to_string(),
+                target: Some("src/item.py".to_string()),
+                status: old_status.to_string(),
+                output: Some("old output".to_string()),
+                diff: Some(EDIT_DIFF.to_string()),
+                kind: None,
+                expanded: false,
+            });
+
+            state.update(TuiEvent::ToolCompleted {
+                id: "reused".to_string(),
+                name: "edit".to_string(),
+                status: "completed".to_string(),
+                output: "new output".to_string(),
+                diff: Some(EDIT_DIFF.to_string()),
+                kind: None,
+            });
+
+            assert_eq!(state.messages.len(), 2, "{old_status}");
+            assert!(matches!(
+                &state.messages[0],
+                ChatMessage::ToolCall {
+                    target: Some(target),
+                    status,
+                    output: Some(output),
+                    ..
+                } if target == "src/item.py" && status == old_status && output == "old output"
+            ));
+            assert!(matches!(
+                &state.messages[1],
+                ChatMessage::ToolCall {
+                    target: None,
+                    status,
+                    output: Some(output),
+                    ..
+                } if status == "completed" && output == "new output"
+            ));
+            assert_eq!(state.pending_edit_highlight_count(), 0);
+            assert!(!state.edit_highlight_runtime_started());
+        }
+    }
+
+    #[test]
+    fn injected_worker_spawn_failure_is_silent_and_leaves_no_pending_state() {
+        fn fail_runtime() -> std::io::Result<crate::edit_highlight_worker::EditHighlightRuntime> {
+            Err(std::io::Error::other("injected spawn failure"))
+        }
+
+        let (_directory, mut state) = configured_edit_state();
+        state.set_edit_highlight_runtime_factory_for_test(fail_runtime);
+        submit_live_edit(&mut state, "edit-1", "src/item.py", EDIT_DIFF);
+
+        assert_eq!(state.messages.len(), 1);
+        assert!(matches!(
+            state.messages.first(),
+            Some(ChatMessage::ToolCall { id, .. }) if id == "edit-1"
+        ));
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
+    fn exact_ready_result_touches_only_matching_message_and_stores_arc_map() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        state.push_message(ChatMessage::System("unrelated".to_string()));
+        let revisions_before = state.message_revisions.clone();
+        let result = ready_result(job.clone());
+        let expected_styles = match &result.outcome {
+            crate::edit_highlight_worker::EditHighlightOutcome::Ready { styles } => {
+                Arc::clone(styles)
+            }
+            crate::edit_highlight_worker::EditHighlightOutcome::Failed => unreachable!(),
+        };
+
+        assert!(state.apply_edit_highlight_result(result));
+        assert_ne!(
+            state.message_revisions[job.message_index],
+            revisions_before[job.message_index]
+        );
+        assert_eq!(
+            state.message_revisions[job.message_index + 1],
+            revisions_before[job.message_index + 1]
+        );
+        assert!(Arc::ptr_eq(
+            state
+                .applied_diff_highlights
+                .get(&state.message_revisions[job.message_index])
+                .map(|highlight| &highlight.styles)
+                .expect("applied styles"),
+            &expected_styles
+        ));
+        assert_eq!(
+            state.applied_diff_highlights[&state.message_revisions[job.message_index]].tool_id,
+            job.tool_id
+        );
+        assert_eq!(
+            state.applied_diff_highlights[&state.message_revisions[job.message_index]].display_path,
+            job.display_path
+        );
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_some()
+        );
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+    }
+
+    #[test]
+    fn failed_result_finishes_pending_without_touching_or_noise() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        let revisions_before = state.message_revisions.clone();
+        let messages_before = state.messages.len();
+
+        assert!(!state.apply_edit_highlight_result(
+            crate::edit_highlight_worker::EditHighlightResult {
+                job: job.clone(),
+                outcome: crate::edit_highlight_worker::EditHighlightOutcome::Failed,
+            }
+        ));
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_none()
+        );
+        assert_eq!(state.message_revisions, revisions_before);
+        assert_eq!(state.messages.len(), messages_before);
+    }
+
+    #[test]
+    fn stale_edit_highlight_identity_is_rejected_without_touching_message() {
+        type Mutation =
+            Box<dyn Fn(&mut AppState, &mut crate::edit_highlight_worker::EditHighlightJob)>;
+        let mutations: Vec<Mutation> = vec![
+            Box::new(|state, job| {
+                state.touch_message(job.message_index);
+            }),
+            Box::new(|_, job| job.job_id += 1),
+            Box::new(|_, job| job.message_index += 1),
+            Box::new(|_, job| job.tool_id = "other-tool".to_string()),
+            Box::new(|_, job| job.absolute_path = PathBuf::from("/other/item.py")),
+            Box::new(|_, job| job.display_path = "src/other.py".to_string()),
+            Box::new(|state, _| {
+                state.syntax_theme = crate::syntax_highlight::SyntaxTheme::OneHalfLight;
+            }),
+            Box::new(|_, job| {
+                job.syntax_theme_revision =
+                    crate::syntax_highlight::SyntaxTheme::OneHalfLight.revision();
+            }),
+            Box::new(|state, job| {
+                let ChatMessage::ToolCall { diff, .. } = &mut state.messages[job.message_index]
+                else {
+                    unreachable!();
+                };
+                *diff = Some(EDIT_DIFF.replace("value = 2", "value = 3"));
+            }),
+            Box::new(|state, job| {
+                let ChatMessage::ToolCall { target, .. } = &mut state.messages[job.message_index]
+                else {
+                    unreachable!();
+                };
+                *target = Some("src/other.py".to_string());
+            }),
+        ];
+
+        for mutate in mutations {
+            let (_directory, mut state, mut job) = state_with_submitted_edit_job();
+            mutate(&mut state, &mut job);
+            let revisions_before = state.message_revisions.clone();
+
+            assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+            assert!(
+                state
+                    .refined_diff_styles(job.message_index, &job.tool_id)
+                    .is_none()
+            );
+            assert_eq!(state.message_revisions, revisions_before);
+        }
+    }
+
+    #[test]
+    fn ready_result_rejects_current_failed_status_without_touching() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        let ChatMessage::ToolCall { status, .. } = &mut state.messages[job.message_index] else {
+            unreachable!();
+        };
+        *status = "failed".to_string();
+        let revisions = state.message_revisions.clone();
+
+        assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert_eq!(state.message_revisions, revisions);
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ready_result_rejects_current_row_tool_id_and_finishes_pending() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        let ChatMessage::ToolCall { id, .. } = &mut state.messages[job.message_index] else {
+            unreachable!();
+        };
+        *id = "different-current-id".to_string();
+        let revisions = state.message_revisions.clone();
+
+        assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert_eq!(state.message_revisions, revisions);
+        assert!(state.applied_diff_highlights.is_empty());
+    }
+
+    #[test]
+    fn ready_result_rejects_current_diff_destination_mismatch() {
+        let (directory, mut state, job) = state_with_submitted_edit_job();
+        std::fs::write(directory.path().join("src/other.py"), "value = 2\n")
+            .expect("other post-edit file");
+        let ChatMessage::ToolCall { diff, .. } = &mut state.messages[job.message_index] else {
+            unreachable!();
+        };
+        *diff = Some(EDIT_DIFF.replace("src/item.py", "src/other.py"));
+        let revisions = state.message_revisions.clone();
+
+        assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert_eq!(state.message_revisions, revisions);
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ready_result_rejects_retargeted_symlink_on_apply_path() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, mut state, job) = real_alias_edit_state();
+        std::fs::write(directory.path().join("src/other.py"), "value = 2\n")
+            .expect("other post-edit file");
+        let alias = directory.path().join("src/alias.py");
+        assert_eq!(job.display_path, "src/alias.py");
+        std::fs::remove_file(&alias).expect("remove initial alias");
+        symlink(directory.path().join("src/other.py"), &alias).expect("retarget alias");
+        let revisions = state.message_revisions.clone();
+
+        assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert_eq!(state.message_revisions, revisions);
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_result_does_not_remove_newer_pending_job_for_same_tool() {
+        let (_directory, mut state, stale_job) = state_with_submitted_edit_job();
+        submit_live_edit(&mut state, "edit-1", "src/item.py", EDIT_DIFF);
+        let newer_job = state
+            .pending_edit_highlight_job("edit-1")
+            .expect("newer pending job");
+        assert_ne!(stale_job.job_id, newer_job.job_id);
+
+        assert!(!state.apply_edit_highlight_result(ready_result(stale_job)));
+        assert_eq!(
+            state
+                .pending_edit_highlight_job("edit-1")
+                .expect("newer job preserved")
+                .job_id,
+            newer_job.job_id
+        );
+    }
+
+    #[test]
+    fn touch_mutate_and_replace_cancel_only_their_exact_pending_message() {
+        for action in ["touch", "mutate", "replace"] {
+            let (_directory, mut state) = configured_edit_state();
+            submit_live_edit(&mut state, "edit-a", "src/item.py", EDIT_DIFF);
+            let job_a = state
+                .pending_edit_highlight_job("edit-a")
+                .expect("pending A");
+            submit_live_edit(&mut state, "edit-b", "src/item.py", EDIT_DIFF);
+            let job_b = state
+                .pending_edit_highlight_job("edit-b")
+                .expect("pending B");
+            assert_eq!(state.pending_edit_highlight_count(), 2);
+
+            match action {
+                "touch" => {
+                    assert!(state.touch_message(job_a.message_index));
+                }
+                "mutate" => {
+                    state
+                        .mutate_message(job_a.message_index, |message| {
+                            let ChatMessage::ToolCall { expanded, .. } = message else {
+                                unreachable!();
+                            };
+                            *expanded = true;
+                        })
+                        .expect("mutate A");
+                }
+                "replace" => {
+                    let replacement = state.messages[job_a.message_index].clone();
+                    assert!(state.replace_message(job_a.message_index, replacement));
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                state.pending_edit_highlight_job("edit-a").is_none(),
+                "{action}"
+            );
+            assert_eq!(
+                state
+                    .pending_edit_highlight_job("edit-b")
+                    .expect("unrelated B remains")
+                    .job_id,
+                job_b.job_id,
+                "{action}"
+            );
+            assert_eq!(state.pending_edit_highlight_count(), 1, "{action}");
+            assert!(state.edit_highlight_needs_tick(), "{action}");
+            assert!(state.apply_edit_highlight_result(ready_result(job_b.clone())));
+            assert!(
+                state
+                    .refined_diff_styles(job_b.message_index, &job_b.tool_id)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_non_tool_message_keeps_unrelated_edit_pending() {
+        let (_directory, mut state) = configured_edit_state();
+        state.push_message(ChatMessage::Reasoning("old".to_string()));
+        submit_live_edit(&mut state, "edit-a", "src/item.py", EDIT_DIFF);
+        let job = state
+            .pending_edit_highlight_job("edit-a")
+            .expect("pending edit");
+
+        assert!(state.replace_message(0, ChatMessage::Reasoning("new".to_string())));
+
+        assert_eq!(
+            state
+                .pending_edit_highlight_job("edit-a")
+                .expect("edit pending survives")
+                .job_id,
+            job.job_id
+        );
+        assert!(state.edit_highlight_needs_tick());
+        assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn disconnected_worker_is_abandoned_silently_and_next_edit_respawns() {
+        fn disconnected(
+            _runtime: &mut crate::edit_highlight_worker::EditHighlightRuntime,
+        ) -> crate::edit_highlight_worker::DrainResults {
+            crate::edit_highlight_worker::DrainResults {
+                results: Vec::new(),
+                disconnected: true,
+            }
+        }
+
+        let (_directory, mut state, _job) = state_with_submitted_edit_job();
+        let revisions_before = state.message_revisions.clone();
+        let messages_before = state.messages.len();
+        state.set_edit_highlight_drain_for_test(Some(disconnected));
+
+        assert!(!state.poll_edit_highlight_results());
+        assert!(!state.edit_highlight_runtime_started());
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert_eq!(state.message_revisions, revisions_before);
+        assert_eq!(state.messages.len(), messages_before);
+
+        state.set_edit_highlight_drain_for_test(None);
+        submit_live_edit(&mut state, "edit-2", "src/item.py", EDIT_DIFF);
+        assert!(state.edit_highlight_runtime_started());
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+    }
+
+    #[test]
+    fn tool_touch_mutate_and_replace_remove_applied_map_before_revision_change() {
+        for action in ["touch", "mutate", "replace"] {
+            let (_directory, mut state, job) = state_with_submitted_edit_job();
+            assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
+            let revision = state.message_revisions[job.message_index];
+
+            match action {
+                "touch" => {
+                    state.touch_message(job.message_index);
+                }
+                "mutate" => {
+                    state.mutate_message(job.message_index, |message| {
+                        let ChatMessage::ToolCall { expanded, .. } = message else {
+                            unreachable!();
+                        };
+                        *expanded = true;
+                    });
+                }
+                "replace" => {
+                    let replacement = state.messages[job.message_index].clone();
+                    state.replace_message(job.message_index, replacement);
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(state.message_revisions[job.message_index] > revision);
+            assert!(
+                state
+                    .refined_diff_styles(job.message_index, &job.tool_id)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn message_lifecycle_prunes_applied_maps_and_pending_jobs() {
+        for action in ["clear", "replace", "truncate", "retain"] {
+            let (_directory, mut state, job) = state_with_submitted_edit_job();
+            assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
+            submit_live_edit(&mut state, "edit-2", "src/item.py", EDIT_DIFF);
+            assert_eq!(state.pending_edit_highlight_count(), 1);
+
+            match action {
+                "clear" => state.clear_messages(),
+                "replace" => state.replace_messages([ChatMessage::System("new".to_string())]),
+                "truncate" => state.truncate_messages(job.message_index),
+                "retain" => state
+                    .retain_messages(|message| !matches!(message, ChatMessage::ToolCall { .. })),
+                _ => unreachable!(),
+            }
+
+            assert!(
+                state
+                    .refined_diff_styles(job.message_index, &job.tool_id)
+                    .is_none()
+            );
+            assert_eq!(state.pending_edit_highlight_count(), 0);
+        }
+    }
+
+    #[test]
+    fn retained_reindexing_clears_all_pending_jobs_conservatively() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        state
+            .messages
+            .insert(0, ChatMessage::System("remove".to_string()));
+        state.reconcile_message_tracking();
+        assert_eq!(state.pending_edit_highlight_count(), 1);
+
+        state.retain_messages(
+            |message| !matches!(message, ChatMessage::System(text) if text == "remove"),
+        );
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        let revisions = state.message_revisions.clone();
+        assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert_eq!(state.message_revisions, revisions);
+        assert!(
+            state
+                .refined_diff_styles(job.message_index, &job.tool_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn removed_message_result_and_reused_identity_never_inherit_styles() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        state.clear_messages();
+        state.push_message(ChatMessage::ToolCall {
+            id: job.tool_id.clone(),
+            name: "edit".to_string(),
+            target: Some(job.display_path.clone()),
+            status: "completed".to_string(),
+            output: None,
+            diff: Some(EDIT_DIFF.to_string()),
+            kind: None,
+            expanded: false,
+        });
+
+        assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert!(state.refined_diff_styles(0, &job.tool_id).is_none());
+    }
+
+    #[test]
+    fn direct_push_with_reused_tool_id_does_not_inherit_applied_styles() {
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
+
+        state.push_message(ChatMessage::ToolCall {
+            id: job.tool_id.clone(),
+            name: "edit".to_string(),
+            target: Some(job.display_path.clone()),
+            status: "running".to_string(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        });
+
+        assert!(state.refined_diff_styles(0, &job.tool_id).is_none());
+        assert!(state.refined_diff_styles(1, &job.tool_id).is_none());
+    }
+
+    #[test]
+    fn duplicate_tool_id_map_is_bound_to_exact_message_revision() {
+        let (_directory, mut state) = configured_edit_state();
+        state.push_message(ChatMessage::ToolCall {
+            id: "duplicate".to_string(),
+            name: "edit".to_string(),
+            target: Some("src/item.py".to_string()),
+            status: "completed".to_string(),
+            output: Some("older".to_string()),
+            diff: Some(EDIT_DIFF.to_string()),
+            kind: None,
+            expanded: false,
+        });
+        submit_live_edit(&mut state, "duplicate", "src/item.py", EDIT_DIFF);
+        let job = state
+            .pending_edit_highlight_job("duplicate")
+            .expect("newer duplicate job");
+        assert_eq!(job.message_index, 1);
+
+        assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
+        assert!(state.refined_diff_styles(0, "duplicate").is_none());
+        assert!(state.refined_diff_styles(1, "duplicate").is_some());
+
+        state.truncate_messages(1);
+
+        assert!(state.refined_diff_styles(0, "duplicate").is_none());
+        assert!(state.applied_diff_highlights.is_empty());
+    }
+
+    #[test]
+    fn partial_prune_keeps_unrelated_applied_revision() {
+        let (_directory, mut state) = configured_edit_state();
+        submit_live_edit(&mut state, "edit-a", "src/item.py", EDIT_DIFF);
+        let job_a = state
+            .pending_edit_highlight_job("edit-a")
+            .expect("pending A");
+        submit_live_edit(&mut state, "edit-b", "src/item.py", EDIT_DIFF);
+        let job_b = state
+            .pending_edit_highlight_job("edit-b")
+            .expect("pending B");
+        assert!(state.apply_edit_highlight_result(ready_result(job_a)));
+        assert!(state.apply_edit_highlight_result(ready_result(job_b)));
+        assert!(state.refined_diff_styles(0, "edit-a").is_some());
+        assert!(state.refined_diff_styles(1, "edit-b").is_some());
+
+        state.truncate_messages(1);
+
+        assert!(state.refined_diff_styles(0, "edit-a").is_some());
+        assert_eq!(state.applied_diff_highlights.len(), 1);
+    }
+
+    #[test]
+    fn reused_tool_id_live_submission_applies_only_to_new_row() {
+        let (_directory, mut state, first_job) = state_with_submitted_edit_job();
+        assert!(state.apply_edit_highlight_result(ready_result(first_job)));
+        assert!(state.refined_diff_styles(0, "edit-1").is_some());
+
+        submit_live_edit(&mut state, "edit-1", "src/item.py", EDIT_DIFF);
+        let new_job = state
+            .pending_edit_highlight_job("edit-1")
+            .expect("new reused job");
+        assert_eq!(new_job.message_index, 1);
+        assert!(state.apply_edit_highlight_result(ready_result(new_job)));
+
+        assert!(state.refined_diff_styles(0, "edit-1").is_none());
+        assert!(state.refined_diff_styles(1, "edit-1").is_some());
+    }
+
+    #[test]
+    fn disconnected_job_sender_drops_runtime_without_noise_or_extra_revision() {
+        fn disconnected_runtime()
+        -> std::io::Result<crate::edit_highlight_worker::EditHighlightRuntime> {
+            Ok(crate::edit_highlight_worker::EditHighlightRuntime::disconnected_for_test())
+        }
+
+        let (_directory, mut state) = configured_edit_state();
+        state.set_edit_highlight_runtime_factory_for_test(disconnected_runtime);
+        state.update(TuiEvent::ToolRequested {
+            id: "send-failure".to_string(),
+            name: "edit".to_string(),
+            target: Some("src/item.py".to_string()),
+        });
+        let revision_before_completion = state.message_revisions[0];
+
+        state.update(TuiEvent::ToolCompleted {
+            id: "send-failure".to_string(),
+            name: "edit".to_string(),
+            status: "completed".to_string(),
+            output: "edited src/item.py".to_string(),
+            diff: Some(EDIT_DIFF.to_string()),
+            kind: None,
+        });
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(
+            state.message_revisions[0],
+            revision_before_completion.saturating_add(1)
+        );
+        assert!(matches!(
+            &state.messages[0],
+            ChatMessage::ToolCall {
+                status,
+                output: Some(output),
+                ..
+            } if status == "completed" && output == "edited src/item.py"
+        ));
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert_eq!(state.successful_edit_highlight_submit_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
     }
 }
