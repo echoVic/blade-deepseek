@@ -26,6 +26,7 @@ use crate::lifecycle::{
     run_status_from_tool_status,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_surface::RuntimeProviderResponseIngress;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::{
     ToolInvocation, apply_pre_tool_outcome, approval_request_for_invocation,
@@ -40,6 +41,35 @@ use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
 const DEFAULT_TOOL_MAX_TURNS: u32 = 128;
+
+#[derive(Debug)]
+struct RuntimeSemanticCommitFailure {
+    message: String,
+}
+
+impl std::fmt::Display for RuntimeSemanticCommitFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RuntimeSemanticCommitFailure {}
+
+pub(crate) fn semantic_commit_failure(error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        RuntimeSemanticCommitFailure {
+            message: error.to_string(),
+        },
+    )
+}
+
+pub(crate) fn is_semantic_commit_failure(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RuntimeSemanticCommitFailure>())
+        .is_some()
+}
 
 pub(crate) struct ToolExecutionContext<'a> {
     cwd: &'a Path,
@@ -61,6 +91,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
+    provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
     extension_registry: Option<&'a ExtensionRegistry>,
     extension_stores: Option<RuntimeExtensionStores<'a>>,
     goal_runtime: Option<GoalRuntimeHandle>,
@@ -78,6 +109,7 @@ pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
     pub(crate) approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
     pub(crate) cancel: &'a CancelToken,
     pub(crate) emit_deltas: bool,
+    pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
 }
 
 struct PreToolHookExecution {
@@ -153,6 +185,7 @@ impl<'a> ToolExecutionContext<'a> {
             permission_handler: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
+            provider_response_ingress: None,
             extension_registry: None,
             extension_stores: None,
             goal_runtime: None,
@@ -216,6 +249,14 @@ impl<'a> ToolExecutionContext<'a> {
         mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     ) -> Self {
         self.mcp_elicitation_handler = mcp_elicitation_handler;
+        self
+    }
+
+    pub(crate) fn with_provider_response_ingress(
+        mut self,
+        provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
+    ) -> Self {
+        self.provider_response_ingress = provider_response_ingress;
         self
     }
 
@@ -434,6 +475,7 @@ impl ToolExecutionActor {
             permission_handler,
             user_input_handler,
             mcp_elicitation_handler,
+            provider_response_ingress,
             extension_registry,
             extension_stores,
             goal_runtime,
@@ -459,11 +501,18 @@ impl ToolExecutionActor {
                     &mut event_error,
                     emit_tool_call_requested(events, sink, tool_request),
                 );
-                retain_first_io_error(
-                    &mut event_error,
-                    emit_tool_call_completed(events, sink, tool_request, &result),
-                );
             }
+            retain_first_io_error(
+                &mut event_error,
+                publish_tool_call_completed(
+                    events,
+                    sink,
+                    tool_request,
+                    &result,
+                    emit_deltas,
+                    provider_response_ingress,
+                ),
+            );
             return Ok(ToolExecutionCompletion::from_pair_with_event_error(
                 (RunStatus::Failed, result),
                 event_error,
@@ -485,6 +534,7 @@ impl ToolExecutionActor {
             approval_handler,
             cancel,
             emit_deltas,
+            provider_response_ingress,
         });
         match (approval_execution.outcome, approval_execution.event_error) {
             (Some(outcome), event_error) => {
@@ -507,11 +557,18 @@ impl ToolExecutionActor {
                         &mut event_error,
                         emit_tool_call_requested(events, sink, tool_request),
                     );
-                    retain_first_io_error(
-                        &mut event_error,
-                        emit_tool_call_completed(events, sink, tool_request, &result),
-                    );
                 }
+                retain_first_io_error(
+                    &mut event_error,
+                    publish_tool_call_completed(
+                        events,
+                        sink,
+                        tool_request,
+                        &result,
+                        emit_deltas,
+                        provider_response_ingress,
+                    ),
+                );
                 return Ok(ToolExecutionCompletion::from_pair_with_event_error(
                     (RunStatus::Failed, result),
                     event_error,
@@ -537,7 +594,14 @@ impl ToolExecutionActor {
                 );
                 retain_first_io_error(
                     &mut event_error,
-                    emit_tool_call_completed(events, sink, tool_request, &result),
+                    publish_tool_call_completed(
+                        events,
+                        sink,
+                        tool_request,
+                        &result,
+                        emit_deltas,
+                        provider_response_ingress,
+                    ),
                 );
                 return Ok(ToolExecutionCompletion::from_pair_with_event_error(
                     (RunStatus::Failed, result),
@@ -556,6 +620,7 @@ impl ToolExecutionActor {
             &cwd_display,
             mcp_registry,
             emit_deltas,
+            provider_response_ingress,
             Some(cancel),
         );
         let invocation = match hook_execution.outcome {
@@ -580,12 +645,17 @@ impl ToolExecutionActor {
                 None,
             );
             let mut event_error = hook_execution.event_error;
-            if emit_deltas {
-                retain_first_io_error(
-                    &mut event_error,
-                    emit_tool_call_completed(events, sink, tool_request, &result),
-                );
-            }
+            retain_first_io_error(
+                &mut event_error,
+                publish_tool_call_completed(
+                    events,
+                    sink,
+                    tool_request,
+                    &result,
+                    emit_deltas,
+                    provider_response_ingress,
+                ),
+            );
             return Ok(ToolExecutionCompletion::from_pair_with_event_error(
                 (RunStatus::Failed, result),
                 event_error,
@@ -661,9 +731,15 @@ impl ToolExecutionActor {
             hooks,
             &cwd_display,
             emit_deltas,
+            provider_response_ingress,
             Some(cancel),
         );
-        if dispatch_event_error.is_some() {
+        if !completion
+            .event_error
+            .as_ref()
+            .is_some_and(is_semantic_commit_failure)
+            && dispatch_event_error.is_some()
+        {
             completion.event_error = dispatch_event_error;
         }
         completion.disposition = dispatch.disposition;
@@ -685,6 +761,7 @@ impl ToolExecutionActor {
             approval_handler,
             cancel,
             emit_deltas,
+            provider_response_ingress,
         } = context;
 
         if tool_request.name == tool_types::ToolName::RequestPermissions {
@@ -718,6 +795,7 @@ impl ToolExecutionActor {
                             sink,
                             tool_request,
                             emit_deltas,
+                            provider_response_ingress,
                             event_error,
                             "tool dispatch stopped because approval events could not be delivered",
                         );
@@ -730,6 +808,7 @@ impl ToolExecutionActor {
                             sink,
                             tool_request,
                             emit_deltas,
+                            provider_response_ingress,
                             event_error,
                             "tool dispatch stopped before interactive approval because the request event could not be delivered",
                         );
@@ -758,6 +837,7 @@ impl ToolExecutionActor {
                                 sink,
                                 tool_request,
                                 emit_deltas,
+                                provider_response_ingress,
                                 event_error,
                                 RunStatus::Cancelled,
                                 result,
@@ -769,6 +849,7 @@ impl ToolExecutionActor {
                                 sink,
                                 tool_request,
                                 emit_deltas,
+                                provider_response_ingress,
                                 event_error,
                                 &format!(
                                     "interactive approval failed before tool dispatch: {error}"
@@ -793,6 +874,7 @@ impl ToolExecutionActor {
                                 sink,
                                 tool_request,
                                 emit_deltas,
+                                provider_response_ingress,
                                 event_error,
                                 RunStatus::ApprovalRequired,
                                 result,
@@ -805,6 +887,7 @@ impl ToolExecutionActor {
                                 sink,
                                 tool_request,
                                 emit_deltas,
+                                provider_response_ingress,
                                 event_error,
                                 "tool dispatch stopped because the approval resolution event could not be delivered",
                             );
@@ -815,6 +898,7 @@ impl ToolExecutionActor {
                                 sink,
                                 tool_request,
                                 emit_deltas,
+                                provider_response_ingress,
                                 event_error,
                                 "interactive approval did not resolve before tool dispatch",
                             );
@@ -833,6 +917,7 @@ impl ToolExecutionActor {
                         sink,
                         tool_request,
                         emit_deltas,
+                        provider_response_ingress,
                         event_error,
                         RunStatus::ApprovalRequired,
                         result,
@@ -845,6 +930,7 @@ impl ToolExecutionActor {
                         sink,
                         tool_request,
                         emit_deltas,
+                        provider_response_ingress,
                         event_error,
                         "tool dispatch stopped because approval events could not be delivered",
                     );
@@ -865,6 +951,7 @@ impl ToolExecutionActor {
         cwd_display: &str,
         mcp_registry: &McpRegistry,
         emit_deltas: bool,
+        provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
         cancel: Option<&CancelToken>,
     ) -> PreToolHookExecution {
         let mut event_error = None;
@@ -872,12 +959,17 @@ impl ToolExecutionActor {
             match self.run_pre_tool_hook(hooks, cwd_display, tool_request, cancel) {
                 Ok(outcome) => outcome,
                 Err(result) => {
-                    if emit_deltas {
-                        retain_first_io_error(
-                            &mut event_error,
-                            emit_tool_call_completed(events, sink, tool_request, &result),
-                        );
-                    }
+                    retain_first_io_error(
+                        &mut event_error,
+                        publish_tool_call_completed(
+                            events,
+                            sink,
+                            tool_request,
+                            &result,
+                            emit_deltas,
+                            provider_response_ingress,
+                        ),
+                    );
                     let status = run_status_from_tool_status(result.status);
                     return PreToolHookExecution {
                         outcome: Err((status, result)),
@@ -892,12 +984,17 @@ impl ToolExecutionActor {
             },
             Err(error) => {
                 let result = error.into_result();
-                if emit_deltas {
-                    retain_first_io_error(
-                        &mut event_error,
-                        emit_tool_call_completed(events, sink, tool_request, &result),
-                    );
-                }
+                retain_first_io_error(
+                    &mut event_error,
+                    publish_tool_call_completed(
+                        events,
+                        sink,
+                        tool_request,
+                        &result,
+                        emit_deltas,
+                        provider_response_ingress,
+                    ),
+                );
                 PreToolHookExecution {
                     outcome: Err((RunStatus::Failed, result)),
                     event_error,
@@ -915,14 +1012,22 @@ impl ToolExecutionActor {
         hooks: &HookRunner,
         cwd_display: &str,
         emit_deltas: bool,
+        provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
         cancel: Option<&CancelToken>,
     ) -> ToolExecutionCompletion {
         let mut event_error = None;
+        retain_first_io_error(
+            &mut event_error,
+            publish_tool_call_completed(
+                events,
+                sink,
+                execution_request,
+                result,
+                emit_deltas,
+                provider_response_ingress,
+            ),
+        );
         if emit_deltas {
-            retain_first_io_error(
-                &mut event_error,
-                emit_tool_call_completed(events, sink, execution_request, result),
-            );
             if execution_request.name == tool_types::ToolName::UpdatePlan
                 && result.status == tool_types::ToolStatus::Completed
             {
@@ -960,6 +1065,7 @@ fn failed_approval_gate_before_start<W: io::Write>(
     sink: &mut EventSink<W>,
     tool_request: &tool_types::ToolRequest,
     emit_deltas: bool,
+    provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
     event_error: Option<io::Error>,
     reason: &str,
 ) -> ApprovalGateExecution {
@@ -969,6 +1075,7 @@ fn failed_approval_gate_before_start<W: io::Write>(
         sink,
         tool_request,
         emit_deltas,
+        provider_response_ingress,
         event_error,
         RunStatus::Failed,
         result,
@@ -980,6 +1087,7 @@ fn finish_approval_gate_terminal<W: io::Write>(
     sink: &mut EventSink<W>,
     tool_request: &tool_types::ToolRequest,
     emit_deltas: bool,
+    provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
     mut event_error: Option<io::Error>,
     status: RunStatus,
     result: tool_types::ToolResult,
@@ -989,11 +1097,18 @@ fn finish_approval_gate_terminal<W: io::Write>(
             &mut event_error,
             emit_tool_call_requested(events, sink, tool_request),
         );
-        retain_first_io_error(
-            &mut event_error,
-            emit_tool_call_completed(events, sink, tool_request, &result),
-        );
     }
+    retain_first_io_error(
+        &mut event_error,
+        publish_tool_call_completed(
+            events,
+            sink,
+            tool_request,
+            &result,
+            emit_deltas,
+            provider_response_ingress,
+        ),
+    );
     ApprovalGateExecution {
         outcome: Some((status, result)),
         event_error,
@@ -1036,19 +1151,30 @@ fn emit_tool_call_requested(
     sink.emit(event)
 }
 
-fn emit_tool_call_completed(
+fn publish_tool_call_completed(
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
     request: &tool_types::ToolRequest,
     result: &tool_types::ToolResult,
+    emit_deltas: bool,
+    provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
 ) -> io::Result<()> {
-    let event = RuntimeTaskActor::tool_call_completed_event_for(events, request, result);
-    sink.emit(event)
+    if let Some(ingress) = provider_response_ingress {
+        ingress
+            .commit_tool_result(result)
+            .map_err(semantic_commit_failure)?;
+    }
+    if emit_deltas {
+        let event = RuntimeTaskActor::tool_call_completed_event_for(events, request, result);
+        sink.emit(event)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use orca_core::approval_rules::{PermissionRule, PermissionRules};
@@ -1069,7 +1195,7 @@ mod tests {
 
     use super::{
         ToolApprovalGateContext, ToolExecutionActor, ToolExecutionContext,
-        policy_for_tool_execution, tool_call_outcome_for_result,
+        policy_for_tool_execution, publish_tool_call_completed, tool_call_outcome_for_result,
     };
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::cost::CostTracker;
@@ -1083,7 +1209,79 @@ mod tests {
         RuntimeUserInputHandler, RuntimeUserInputRequest, TurnPermissionOverlay,
     };
     use crate::memory::MemoryBlock;
+    use crate::model_response::RuntimeModelResponse;
+    use crate::runtime_surface::RuntimeProviderResponseIngress;
     use crate::tasks::TaskRegistry;
+
+    #[derive(Debug)]
+    struct RecordingSemanticIngress {
+        committed: Arc<AtomicBool>,
+    }
+
+    impl RuntimeProviderResponseIngress for RecordingSemanticIngress {
+        fn commit_response(&self, _response: &RuntimeModelResponse) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_tool_results(&self, _results: &[ToolResult]) -> io::Result<()> {
+            self.committed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct DurableCommitAwareWriter {
+        committed: Arc<AtomicBool>,
+    }
+
+    impl io::Write for DurableCommitAwareWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if !self.committed.load(Ordering::SeqCst) {
+                return Err(io::Error::other(
+                    "legacy tool terminal became visible before durable commit",
+                ));
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_tool_completion_commits_before_legacy_visibility() {
+        let committed = Arc::new(AtomicBool::new(false));
+        let ingress = RecordingSemanticIngress {
+            committed: Arc::clone(&committed),
+        };
+        let mut events = EventFactory::new("typed-tool-terminal-order".to_string());
+        let mut sink = EventSink::new(
+            DurableCommitAwareWriter {
+                committed: Arc::clone(&committed),
+            },
+            OutputFormat::Jsonl,
+        );
+        let request = ToolRequest {
+            id: "tool-order-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("printf durable".to_string()),
+            raw_arguments: Some(r#"{"command":"printf durable"}"#.to_string()),
+        };
+        let result = ToolResult::completed(&request, "durable".to_string(), false);
+
+        publish_tool_call_completed(
+            &mut events,
+            &mut sink,
+            &request,
+            &result,
+            true,
+            Some(&ingress),
+        )
+        .unwrap();
+
+        assert!(committed.load(Ordering::SeqCst));
+    }
 
     fn config_with_permission_rules(permission_rules: PermissionRules) -> RunConfig {
         RunConfig {
@@ -1207,6 +1405,7 @@ mod tests {
             ".",
             false,
             None,
+            None,
         );
         assert_eq!(completion.status, RunStatus::Cancelled);
         assert!(completion.event_error.is_none());
@@ -1226,6 +1425,7 @@ mod tests {
             &hooks,
             ".",
             false,
+            None,
             None,
         );
         assert_eq!(completion.status, RunStatus::Failed);
@@ -1272,6 +1472,7 @@ mod tests {
             ".",
             &mcp_registry,
             false,
+            None,
             Some(&cancel),
         );
         assert!(execution.event_error.is_none());
@@ -1325,6 +1526,7 @@ mod tests {
             approval_handler: None,
             cancel: &cancel,
             emit_deltas: true,
+            provider_response_ingress: None,
         });
 
         assert!(execution.outcome.is_none());

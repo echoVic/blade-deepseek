@@ -2347,6 +2347,7 @@ mod tests {
                 cancel: &cancel,
                 output_truncation: tool_types::ToolOutputTruncation::default(),
                 max_parallel: 2,
+                provider_response_ingress: None,
             },
         )
         .unwrap()
@@ -2536,6 +2537,7 @@ mod tests {
             approval_handler: None,
             cancel: &cancel,
             emit_deltas: true,
+            provider_response_ingress: None,
         });
 
         assert!(execution.outcome.is_none());

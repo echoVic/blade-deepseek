@@ -20,7 +20,7 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::model::ModelSelection;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_config::SubagentConfig;
-use orca_core::tool_types::{ToolName, ToolRequest};
+use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::{McpElicitationMode, McpElicitationRequest, McpElicitationResponse};
 use orca_runtime::lifecycle::RuntimeUserInputRequest;
 use orca_runtime::model_response::RuntimeModelResponse;
@@ -43,6 +43,7 @@ const INTERACTION_RESTART_CHILD: &str = "ORCA_INTERACTION_RESTART_CHILD";
 const RESOLVED_INTERACTION_RESTART_CHILD: &str = "ORCA_RESOLVED_INTERACTION_RESTART_CHILD";
 const EFFECT_APPROVAL_RESTART_CHILD: &str = "ORCA_EFFECT_APPROVAL_RESTART_CHILD";
 const RESOLVED_EFFECT_APPROVAL_RESTART_CHILD: &str = "ORCA_RESOLVED_EFFECT_APPROVAL_RESTART_CHILD";
+const TOOL_COMPLETION_RESTART_CHILD: &str = "ORCA_TOOL_COMPLETION_RESTART_CHILD";
 
 struct UserInputExecutor {
     answer_tx: mpsc::SyncSender<Option<String>>,
@@ -79,6 +80,16 @@ struct BlockingResolvedUserInputExecutor {
 struct ToolApprovalExecutor {
     resolution_tx: mpsc::SyncSender<ApprovalResolution>,
 }
+
+struct ToolCompletionExecutor;
+
+struct FailedToolCompletionExecutor;
+
+struct WrongToolCompletionExecutor;
+
+struct NonShellToolCompletionExecutor;
+
+struct ReadonlyBatchCompletionExecutor;
 
 struct PermissionExecutor {
     response_tx: mpsc::SyncSender<RuntimePermissionResponse>,
@@ -129,6 +140,33 @@ fn provider_response_for_tool(
     )
 }
 
+fn provider_response_for_tools(
+    requests: &[ToolRequest],
+    turn_id: orca_core::thread_identity::TurnId,
+) -> RuntimeModelResponse {
+    RuntimeModelResponse::new(
+        ProviderResponse {
+            steps: requests
+                .iter()
+                .cloned()
+                .map(ProviderStep::ToolCall)
+                .collect(),
+            assistant_content: Some("I need to read two inputs.".to_string()),
+            assistant_reasoning: None,
+            tool_calls: requests
+                .iter()
+                .map(|request| RawToolCall {
+                    id: request.id.clone(),
+                    function_name: request.name.as_str().to_string(),
+                    arguments: request.raw_arguments.clone().unwrap_or_default(),
+                })
+                .collect(),
+            usage: None,
+        },
+        turn_id,
+    )
+}
+
 impl ThreadOperationExecutor for ToolApprovalExecutor {
     fn run_turn(
         &self,
@@ -163,6 +201,168 @@ impl ThreadOperationExecutor for ToolApprovalExecutor {
                 &tool,
             )?;
         self.resolution_tx.send(resolution).unwrap();
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for ToolCompletionExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = effect_tool_request();
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        ingress.commit_response(&provider_response_for_tool(
+            &tool,
+            request.turn_id().clone(),
+        ))?;
+        ingress.commit_tool_result(&ToolResult::completed(
+            &tool,
+            "owned output".to_string(),
+            false,
+        ))?;
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for FailedToolCompletionExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = effect_tool_request();
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        ingress.commit_response(&provider_response_for_tool(
+            &tool,
+            request.turn_id().clone(),
+        ))?;
+        ingress.commit_tool_result(&ToolResult::failed_after_start(
+            &tool,
+            "effect failed",
+            Some(17),
+        ))?;
+        thread.lifecycle_mut().finish_task(RunStatus::Failed);
+        Ok(RunStatus::Failed.into())
+    }
+}
+
+impl ThreadOperationExecutor for WrongToolCompletionExecutor {
+    fn run_turn(
+        &self,
+        _thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = effect_tool_request();
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        ingress.commit_response(&provider_response_for_tool(
+            &tool,
+            request.turn_id().clone(),
+        ))?;
+        let mut wrong_tool = tool.clone();
+        wrong_tool.id = "effect-other".to_string();
+        ingress.commit_tool_result(&ToolResult::completed(
+            &wrong_tool,
+            "must not commit".to_string(),
+            false,
+        ))?;
+        unreachable!("wrong tool completion must be rejected")
+    }
+}
+
+impl ThreadOperationExecutor for NonShellToolCompletionExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = ToolRequest {
+            id: "read-1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("notes.txt".to_string()),
+            raw_arguments: Some(r#"{"path":"notes.txt"}"#.to_string()),
+        };
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        ingress.commit_response(&provider_response_for_tool(
+            &tool,
+            request.turn_id().clone(),
+        ))?;
+        ingress.commit_tool_result(&ToolResult::completed(&tool, "notes".to_string(), false))?;
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for ReadonlyBatchCompletionExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let requests = [
+            ToolRequest {
+                id: "read-batch-1".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("one.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"one.txt"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "read-batch-2".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("two.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"two.txt"}"#.to_string()),
+            },
+        ];
+        let turn_request = request.thread_turn_request(generation);
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        ingress.commit_response(&provider_response_for_tools(
+            &requests,
+            request.turn_id().clone(),
+        ))?;
+        ingress.commit_tool_results(&[
+            ToolResult::completed(&requests[0], "one".to_string(), false),
+            ToolResult::completed(&requests[1], "two".to_string(), false),
+        ])?;
         thread.lifecycle_mut().finish_task(RunStatus::Success);
         Ok(RunStatus::Success.into())
     }
@@ -437,6 +637,429 @@ fn provider_response_commits_tool_request_before_approval_can_publish() {
         WaitOperationTerminalResult::Terminal { .. }
     ));
     host.shutdown().unwrap();
+}
+
+#[test]
+fn tool_completion_and_result_item_commit_before_operation_terminal() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(ToolCompletionExecutor))
+        .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned tool completion",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "complete exact tool"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    let tool = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == SurfaceToolCallId::try_new("effect-1").unwrap())
+        .expect("completed tool remains projected");
+    let result = tool.result.as_ref().expect("tool terminal is durable");
+    assert_eq!(
+        result.output.as_ref().map(DisplayText::as_str),
+        Some("owned output")
+    );
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::ToolResultMessage {
+            tool_call_id,
+            content,
+            terminal,
+            ..
+        } if tool_call_id == &result.tool_call_id
+            && content.as_str() == "owned output"
+            && terminal == &result.terminal
+    )));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn failed_tool_completion_preserves_exact_terminal_facts() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(FailedToolCompletionExecutor)).unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned failed tool completion",
+        )
+        .unwrap();
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "fail exact tool"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    let result = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == SurfaceToolCallId::try_new("effect-1").unwrap())
+        .and_then(|tool| tool.result.as_ref())
+        .expect("failed tool terminal is durable");
+    assert!(matches!(
+        result.terminal.kind,
+        SurfaceToolResultKind::Failed
+    ));
+    assert_eq!(
+        result.error.as_ref().map(DisplayText::as_str),
+        Some("effect failed")
+    );
+    assert_eq!(result.exit_code, Some(17));
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::ToolResultMessage {
+            tool_call_id,
+            content,
+            terminal,
+            ..
+        } if tool_call_id == &result.tool_call_id
+            && content.as_str() == "effect failed"
+            && terminal == &result.terminal
+    )));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn tool_completion_rejects_uncommitted_tool_identity() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(WrongToolCompletionExecutor)).unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "reject wrong tool completion",
+        )
+        .unwrap();
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "reject wrong tool"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    let tool = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == SurfaceToolCallId::try_new("effect-1").unwrap())
+        .expect("provider tool request remains durable");
+    assert!(tool.result.is_none());
+    assert!(!snapshot.tools.iter().any(|tool| {
+        tool.request.tool_call_id == SurfaceToolCallId::try_new("effect-other").unwrap()
+    }));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn non_shell_completion_drops_generic_core_exit_code() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(NonShellToolCompletionExecutor)).unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned read completion",
+        )
+        .unwrap();
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "read exact tool"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    let result = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == SurfaceToolCallId::try_new("read-1").unwrap())
+        .and_then(|tool| tool.result.as_ref())
+        .expect("read terminal is durable");
+    assert_eq!(result.exit_code, None);
+    assert_eq!(
+        result.output.as_ref().map(DisplayText::as_str),
+        Some("notes")
+    );
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn completed_tool_lifecycle_recovers_without_generation_reexecution() {
+    if std::env::var_os(TOOL_COMPLETION_RESTART_CHILD).is_some() {
+        run_tool_completion_restart_child();
+    }
+    with_orca_home(|home| {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("completed_tool_lifecycle_recovers_without_generation_reexecution")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(TOOL_COMPLETION_RESTART_CHILD, "1")
+            .env("ORCA_HOME", home)
+            .status()
+            .expect("start completed tool restart fixture");
+        assert!(status.success(), "completed tool restart child failed");
+        let thread_id: String = serde_json::from_slice(
+            &fs::read(home.join("runtime-surface-tool-completion-restart.json")).unwrap(),
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host
+            .start_thread(
+                test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "recover completed tool lifecycle",
+            )
+            .unwrap();
+        let snapshot = fresh_snapshot(&thread.surface());
+        let result = snapshot
+            .tools
+            .iter()
+            .find(|tool| {
+                tool.request.tool_call_id == SurfaceToolCallId::try_new("effect-1").unwrap()
+            })
+            .and_then(|tool| tool.result.as_ref())
+            .expect("completed tool recovered from durable surface ledger");
+        assert_eq!(
+            result.output.as_ref().map(DisplayText::as_str),
+            Some("owned output")
+        );
+        assert!(snapshot.items.iter().any(|item| matches!(
+            item,
+            SurfaceItem::ToolResultMessage {
+                tool_call_id,
+                content,
+                terminal,
+                ..
+            } if tool_call_id == &result.tool_call_id
+                && content.as_str() == "owned output"
+                && terminal == &result.terminal
+        )));
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn readonly_results_commit_as_one_atomic_semantic_batch() {
+    with_orca_home(|_| {
+        let cwd = tempfile::tempdir().unwrap();
+        let host =
+            RuntimeHost::start_with_executor(Arc::new(ReadonlyBatchCompletionExecutor)).unwrap();
+        let thread = host
+            .start_thread(
+                test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "runtime-owned readonly batch completion",
+            )
+            .unwrap();
+        let surface = thread.surface();
+        let attachment = fresh_interaction_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .unwrap();
+        let reserved = committed_value(
+            attachment
+                .client
+                .reserve_operation(
+                    request_id(),
+                    user_turn_intent(&attachment.baseline.snapshot, "read two exact tools"),
+                )
+                .unwrap(),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_value(
+            attachment
+                .client
+                .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+                .unwrap(),
+        );
+        assert!(matches!(
+            attachment
+                .client
+                .wait_operation_terminal(request_id(), operation_id)
+                .unwrap(),
+            WaitOperationTerminalResult::Terminal { .. }
+        ));
+
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let completion_batch = loop {
+            if let Some(SurfaceSubscriptionItem::Batch { batch }) = subscription.try_recv() {
+                let completed = batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            &event.event,
+                            SurfaceEvent::Tool(ToolPatch::Completed { .. })
+                        )
+                    })
+                    .count();
+                if completed == 2 {
+                    break batch;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "readonly completion batch was not published"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            completion_batch
+                .events
+                .as_slice()
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    SurfaceEvent::Item(ItemPatch::Added {
+                        item: SurfaceItem::ToolResultMessage { .. },
+                    })
+                ))
+                .count(),
+            2
+        );
+        let snapshot = fresh_snapshot(&surface);
+        assert_eq!(
+            snapshot
+                .tools
+                .iter()
+                .filter(|tool| tool.result.is_some())
+                .count(),
+            2
+        );
+        host.shutdown().unwrap();
+    });
+}
+
+fn run_tool_completion_restart_child() -> ! {
+    let home = PathBuf::from(std::env::var_os("ORCA_HOME").expect("restart child ORCA_HOME"));
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(ToolCompletionExecutor)).unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "completed tool restart fixture",
+        )
+        .unwrap();
+    let thread_id = thread.thread_id();
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(
+                    &attachment.baseline.snapshot,
+                    "persist exact tool completion",
+                ),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+    fs::write(
+        home.join("runtime-surface-tool-completion-restart.json"),
+        serde_json::to_vec(&thread_id).unwrap(),
+    )
+    .unwrap();
+    std::process::exit(0)
 }
 
 #[test]

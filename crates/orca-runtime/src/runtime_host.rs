@@ -1050,6 +1050,32 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
             )
         })?
     }
+
+    fn commit_tool_results(&self, results: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceCommitToolResults {
+                fence: self.fence.clone(),
+                results: results.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime semantic ingress mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime semantic ingress actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime semantic ingress actor closed before commit acknowledgement",
+            )
+        })?
+    }
 }
 
 struct LegacyThreadOperationExecutor;
@@ -2164,6 +2190,11 @@ enum ThreadCommand {
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
         response: crate::model_response::RuntimeModelResponse,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceCommitToolResults {
+        fence: surface::SurfaceOperationFence,
+        results: Vec<orca_core::tool_types::ToolResult>,
         reply: SyncSender<io::Result<()>>,
     },
     SurfaceRequestToolApproval {
@@ -4393,6 +4424,172 @@ impl ThreadActor {
             .map_err(|error| {
                 io::Error::other(format!(
                     "failed to commit provider response semantic batch: {error:?}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn commit_surface_tool_results(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        results: &[orca_core::tool_types::ToolResult],
+    ) -> io::Result<()> {
+        if active.surface_operation.as_ref() != Some(&fence) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tool result generation fence is stale",
+            ));
+        }
+        if results.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tool completion batch is empty",
+            ));
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
+        let generation = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == fence)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
+        let scope = surface::SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let mut seen = BTreeSet::new();
+        let mut events = Vec::with_capacity(results.len() * 2);
+        for result in results {
+            let tool_call_id = surface::SurfaceToolCallId::try_new(result.id.clone())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
+            if !seen.insert(tool_call_id.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tool completion batch repeats a tool call id",
+                ));
+            }
+            let tool = snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.request.tool_call_id == tool_call_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tool completion lacks a committed provider tool identity",
+                    )
+                })?;
+            if tool.request.turn_id != generation.logical_turn_id
+                || tool.request.name.as_str() != result.name.as_str()
+                || tool.result.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "tool completion differs from the active committed provider tool",
+                ));
+            }
+
+            let kind = match result.kind {
+                orca_core::tool_types::ToolResultKind::Success
+                | orca_core::tool_types::ToolResultKind::Empty
+                | orca_core::tool_types::ToolResultKind::NoMatches
+                | orca_core::tool_types::ToolResultKind::Truncated => {
+                    surface::SurfaceToolResultKind::Success
+                }
+                orca_core::tool_types::ToolResultKind::PermissionDenied => {
+                    surface::SurfaceToolResultKind::Denied
+                }
+                orca_core::tool_types::ToolResultKind::InvalidInput => {
+                    surface::SurfaceToolResultKind::InvalidArguments
+                }
+                orca_core::tool_types::ToolResultKind::RuntimeError => {
+                    surface::SurfaceToolResultKind::Failed
+                }
+                orca_core::tool_types::ToolResultKind::Cancelled => {
+                    surface::SurfaceToolResultKind::Cancelled
+                }
+                orca_core::tool_types::ToolResultKind::Indeterminate => {
+                    surface::SurfaceToolResultKind::ExternalEffectAmbiguous
+                }
+            };
+            let source = match result.source {
+                orca_core::tool_types::ToolTerminalSource::Observed => {
+                    surface::ToolTerminalSource::Observed
+                }
+                orca_core::tool_types::ToolTerminalSource::CompatibilityRepair => {
+                    surface::ToolTerminalSource::CompatibilityRepair
+                }
+            };
+            let invocation_started = match result.started {
+                orca_core::tool_types::ToolInvocationStarted::Yes => {
+                    surface::ToolInvocationStarted::Yes
+                }
+                orca_core::tool_types::ToolInvocationStarted::No => {
+                    surface::ToolInvocationStarted::No
+                }
+                orca_core::tool_types::ToolInvocationStarted::Unknown => {
+                    surface::ToolInvocationStarted::Unknown
+                }
+            };
+            let terminal = surface::SurfaceToolTerminal {
+                kind,
+                source,
+                invocation_started,
+            };
+            let output = result.output.clone().map(surface::DisplayText::new);
+            let error = result.error.clone().map(surface::DisplayText::new);
+            let content = output
+                .clone()
+                .or_else(|| error.clone())
+                .unwrap_or_else(|| surface::DisplayText::new("(no output)"));
+            let (output, error) = if output.is_none() && error.is_none() {
+                if matches!(terminal.kind, surface::SurfaceToolResultKind::Success) {
+                    (Some(content.clone()), None)
+                } else {
+                    (None, Some(content.clone()))
+                }
+            } else {
+                (output, error)
+            };
+            let completed = surface::SurfaceToolResult {
+                tool_call_id: tool_call_id.clone(),
+                name: tool.request.name.clone(),
+                terminal: terminal.clone(),
+                output,
+                error,
+                exit_code: if matches!(tool.request.action, surface::SurfaceToolAction::Shell) {
+                    result.exit_code
+                } else {
+                    None
+                },
+                truncated: result.truncated,
+                file_change: None,
+            };
+            events.push((
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::Completed { result: completed }),
+            ));
+            events.push((
+                scope.clone(),
+                surface::SurfaceEvent::Item(surface::ItemPatch::Added {
+                    item: surface::SurfaceItem::ToolResultMessage {
+                        id: surface::SurfaceItemId::new(),
+                        turn_id: tool.request.turn_id.clone(),
+                        tool_call_id,
+                        content,
+                        terminal,
+                        pinned: false,
+                    },
+                }),
+            ));
+        }
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(fence, &batch)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to commit tool completion semantic batch: {error:?}"
                 ))
             })?;
         Ok(())
@@ -7753,6 +7950,12 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
+                ThreadCommand::SurfaceCommitToolResults { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceRequestToolApproval { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -7908,6 +8111,12 @@ impl ThreadActor {
                 }
             }
             ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceCommitToolResults { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "runtime generation is not active",
@@ -8284,6 +8493,14 @@ impl ThreadActor {
                 reply,
             } => {
                 let result = self.commit_surface_provider_response(active, fence, &response);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCommitToolResults {
+                fence,
+                results,
+                reply,
+            } => {
+                let result = self.commit_surface_tool_results(active, fence, &results);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceRequestToolApproval {
