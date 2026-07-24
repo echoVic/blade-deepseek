@@ -1,15 +1,15 @@
-use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
+use std::{collections::HashMap, io};
 
-use orca_core::cancel::{CancelToken, OperationId};
+use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_runtime::provider_stream::RuntimeProviderSuspensionControl;
 use orca_runtime::runtime_host::PauseGoalRunResult;
 use orca_runtime::runtime_host::{InterruptOperationResult, OperationHandle};
 
 use crate::interaction_broker::TuiInteractionBroker;
 use crate::interaction_broker::TuiInteractionWaiter;
-use crate::types::TuiInteractionKind;
+use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 
 pub(crate) trait TuiOperationInterrupt {
     fn interrupt_current(&self);
@@ -20,6 +20,7 @@ pub(crate) struct TuiOperationController {
     hosted: Arc<HostedOperationState>,
     broker: TuiInteractionBroker,
     background_current: Arc<Mutex<Option<OperationId>>>,
+    surface_ids: Arc<OperationIdAllocator>,
 }
 
 #[derive(Debug, Default)]
@@ -43,10 +44,9 @@ impl TuiOperationController {
             hosted: Arc::new(HostedOperationState::default()),
             broker,
             background_current: Arc::new(Mutex::new(None)),
+            surface_ids: Arc::new(OperationIdAllocator::default()),
         }
     }
-
-    #[cfg(test)]
     pub(crate) fn current_id(&self) -> Option<OperationId> {
         self.lock_hosted()
             .active
@@ -331,6 +331,8 @@ impl TuiOperationController {
             hosted.surface_active = Some(SurfaceActiveOperation {
                 client: client.clone(),
                 operation_id: operation_id.clone(),
+                ui_operation_id: self.surface_ids.allocate(),
+                interactions: HashMap::new(),
             });
             let requested = hosted.interrupt_requested;
             hosted.interrupt_requested = false;
@@ -361,6 +363,156 @@ impl TuiOperationController {
         self.hosted.changed.notify_all();
     }
 
+    pub(crate) fn register_surface_interaction(
+        &self,
+        interaction: &orca_runtime::unstable_surface::SurfaceInteractionView,
+    ) -> Option<TuiEvent> {
+        let mut hosted = self.lock_hosted();
+        let active = hosted.surface_active.as_mut()?;
+        if active.operation_id != interaction.fence.operation_id {
+            return None;
+        }
+        let request_id = format!("{:?}", interaction.interaction_id);
+        let (kind, event, permissions) = match &interaction.request {
+            orca_runtime::unstable_surface::SurfaceInteractionRequest::ToolApproval {
+                tool,
+                description,
+                preview,
+                ..
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::Approval,
+                );
+                (
+                    TuiInteractionKind::Approval,
+                    TuiEvent::ApprovalNeeded {
+                        key,
+                        tool: tool.name.as_str().to_string(),
+                        target: tool.target.as_ref().map(|value| value.as_str().to_string()),
+                        preview: preview
+                            .as_ref()
+                            .or(Some(description))
+                            .map(|value| value.as_str().to_string()),
+                    },
+                    None,
+                )
+            }
+            orca_runtime::unstable_surface::SurfaceInteractionRequest::PermissionRequest {
+                tool_call_id,
+                reason,
+                permissions,
+                ..
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::Permission,
+                );
+                let tool = tool_call_id.as_str().to_string();
+                (
+                    TuiInteractionKind::Permission,
+                    TuiEvent::PermissionApprovalNeeded {
+                        key,
+                        tool,
+                        target: None,
+                        preview: reason.as_ref().map(|value| value.as_str().to_string()),
+                        permission_kind: permission_kind(permissions),
+                    },
+                    Some(permissions.clone()),
+                )
+            }
+            _ => return None,
+        };
+        let key = match &event {
+            TuiEvent::ApprovalNeeded { key, .. }
+            | TuiEvent::PermissionApprovalNeeded { key, .. } => key.clone(),
+            _ => return None,
+        };
+        active
+            .interactions
+            .entry(key)
+            .or_insert(SurfaceInteractionBinding {
+                client: active.client.clone(),
+                interaction_id: interaction.interaction_id.clone(),
+                kind,
+                permissions,
+            });
+        Some(event)
+    }
+
+    pub(crate) fn respond_surface_interaction(
+        &self,
+        key: &TuiInteractionKey,
+        response: &TuiInteractionResponse,
+    ) -> io::Result<bool> {
+        let binding = {
+            let hosted = self.lock_hosted();
+            hosted
+                .surface_active
+                .as_ref()
+                .and_then(|active| active.interactions.get(key).cloned())
+        };
+        let Some(binding) = binding else {
+            return Ok(false);
+        };
+        let answer = match (binding.kind, response) {
+            (TuiInteractionKind::Approval, TuiInteractionResponse::Approval(approved)) => {
+                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::ToolApproval {
+                    decision: if *approved {
+                        orca_runtime::unstable_surface::SurfaceAllowDeny::Allow
+                    } else {
+                        orca_runtime::unstable_surface::SurfaceAllowDeny::Deny
+                    },
+                }
+            }
+            (TuiInteractionKind::Permission, TuiInteractionResponse::Permission(approved)) => {
+                let permissions = binding
+                    .permissions
+                    .clone()
+                    .ok_or_else(|| io::Error::other("typed TUI permission profile is missing"))?;
+                let decision = if *approved {
+                    orca_runtime::unstable_surface::SurfacePermissionClientDecision::Allow {
+                        scope: orca_runtime::unstable_surface::PermissionGrantScope::Turn,
+                        permissions,
+                        strict_auto_review: false,
+                    }
+                } else {
+                    orca_runtime::unstable_surface::SurfacePermissionClientDecision::Deny {
+                        scope: orca_runtime::unstable_surface::PermissionGrantScope::Turn,
+                        permissions,
+                        strict_auto_review: false,
+                    }
+                };
+                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                    decision,
+                }
+            }
+            _ => return Ok(false),
+        };
+        match binding.client.respond_interaction_by_id(
+            orca_runtime::surface::SurfaceRequestId::new(),
+            binding.interaction_id,
+            answer,
+        ) {
+            Ok(orca_runtime::surface::MutationReply::Committed { .. }) => {
+                let mut hosted = self.lock_hosted();
+                if let Some(active) = hosted.surface_active.as_mut() {
+                    active.interactions.remove(key);
+                }
+                Ok(true)
+            }
+            Ok(orca_runtime::surface::MutationReply::Deferred { .. })
+            | Ok(orca_runtime::surface::MutationReply::Uncommitted { .. }) => Err(
+                io::Error::other("typed TUI interaction response was not committed"),
+            ),
+            Err(error) => Err(io::Error::other(format!(
+                "typed TUI interaction response failed: {error:?}"
+            ))),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn has_surface_active(&self) -> bool {
         self.lock_hosted().surface_active.is_some()
@@ -371,6 +523,16 @@ impl TuiOperationController {
 struct SurfaceActiveOperation {
     client: orca_runtime::surface::RuntimeSurfaceClientHandle,
     operation_id: orca_runtime::surface::SurfaceOperationId,
+    ui_operation_id: OperationId,
+    interactions: HashMap<TuiInteractionKey, SurfaceInteractionBinding>,
+}
+
+#[derive(Clone)]
+struct SurfaceInteractionBinding {
+    client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+    interaction_id: orca_runtime::surface::SurfaceInteractionId,
+    kind: TuiInteractionKind,
+    permissions: Option<orca_runtime::unstable_surface::SurfacePermissionProfile>,
 }
 
 impl std::fmt::Debug for SurfaceActiveOperation {
@@ -395,6 +557,34 @@ fn cancel_surface_if_active(hosted: &mut HostedOperationInner) -> bool {
 
 fn cancel_surface_or_shutdown(hosted: &mut HostedOperationInner) -> bool {
     cancel_surface_if_active(hosted) || hosted.shutdown
+}
+
+fn permission_kind(
+    profile: &orca_runtime::unstable_surface::SurfacePermissionProfile,
+) -> orca_runtime::runtime_permission::RuntimePermissionRequestKind {
+    if profile
+        .network
+        .as_ref()
+        .is_some_and(|network| network.enabled == Some(true) || !network.domains.is_empty())
+    {
+        return orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock;
+    }
+    if profile
+        .file_system
+        .as_ref()
+        .and_then(|filesystem| filesystem.write.as_ref())
+        .is_some_and(|paths| !paths.is_empty())
+    {
+        return orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite;
+    }
+    profile
+        .shell
+        .as_ref()
+        .and_then(|shell| shell.unsandboxed.then_some(()))
+        .map(|_| {
+            orca_runtime::runtime_permission::RuntimePermissionRequestKind::UnsandboxedShellRetry
+        })
+        .unwrap_or(orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite)
 }
 
 #[cfg(test)]

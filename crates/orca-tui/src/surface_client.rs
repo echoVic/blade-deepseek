@@ -12,7 +12,8 @@ use orca_runtime::surface::{
     OperationPatch, OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
     ReplayabilityRequest, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, SurfaceAttachmentRole,
     SurfaceCapability, SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock,
-    SurfaceOperationId, SurfaceRequestId, SurfaceSubscriptionItem, WaitOperationTerminalResult,
+    SurfaceInteractionKind, SurfaceOperationId, SurfaceRequestId, SurfaceSubscriptionItem,
+    WaitOperationTerminalResult,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -117,8 +118,12 @@ fn run_typed(
             SurfaceCapability::ReadSnapshot,
             SurfaceCapability::SubmitOperation,
             SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::RespondGrantedInteraction,
         ]),
-        interaction_capabilities: BTreeSet::new(),
+        interaction_capabilities: BTreeSet::from([
+            SurfaceInteractionKind::ToolApproval,
+            SurfaceInteractionKind::PermissionRequest,
+        ]),
     }) {
         AttachResult::FreshAttached { attachment } => attachment,
         AttachResult::Denied { .. } => {
@@ -265,6 +270,20 @@ fn drain_operation(
                                 if &record.operation_id == operation_id
                         )
                     });
+                    for envelope in batch.events.as_slice() {
+                        if let SurfaceEvent::Interaction(
+                            orca_runtime::unstable_surface::InteractionPatch::Requested {
+                                interaction,
+                            },
+                        ) = &envelope.event
+                        {
+                            if let Some(event) =
+                                controller.register_surface_interaction(interaction)
+                            {
+                                let _ = event_tx.send(event);
+                            }
+                        }
+                    }
                     match projection.reduce_typed_batch(&batch) {
                         Ok(events) => {
                             for event in events {
@@ -546,6 +565,136 @@ mod tests {
             TuiHostedOperationOutcome::Turn { status } if status == "cancelled"
         ));
         assert!(!controller.has_surface_active());
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_ordinary_turn_routes_tool_approval_through_runtime_surface() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed TUI approval")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let worker_controller = controller.clone();
+        let worker_thread = thread.clone();
+        let worker_config = config.clone();
+        let worker_event_tx = event_tx.clone();
+        let worker = std::thread::spawn(move || {
+            run_through_dispatch(
+                &worker_thread,
+                HostedTurnRequest::new("bash printf canonical-approval"),
+                worker_config,
+                &worker_controller,
+                &worker_event_tx,
+            )
+        });
+        let key = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event")
+            {
+                TuiEvent::ApprovalNeeded { key, .. } => break key,
+                _ => {}
+            }
+        };
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::types::TuiInteractionResponse::Approval(true)
+                )
+                .expect("typed approval response")
+        );
+        let outcome = worker
+            .join()
+            .expect("typed approval worker")
+            .expect("typed approval");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        assert!(event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_ordinary_turn_routes_permission_through_runtime_surface() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed TUI permission")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let worker_controller = controller.clone();
+        let worker_thread = thread.clone();
+        let worker_config = config.clone();
+        let worker_event_tx = event_tx.clone();
+        let worker = std::thread::spawn(move || {
+            run_through_dispatch(
+                &worker_thread,
+                HostedTurnRequest::new("request_network_permissions_then_done example.com"),
+                worker_config,
+                &worker_controller,
+                &worker_event_tx,
+            )
+        });
+        let key = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("permission event")
+            {
+                TuiEvent::PermissionApprovalNeeded { key, .. } => break key,
+                _ => {}
+            }
+        };
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::types::TuiInteractionResponse::Permission(true)
+                )
+                .expect("typed permission response")
+        );
+        let outcome = worker
+            .join()
+            .expect("typed permission worker")
+            .expect("typed permission");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        assert!(event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
 
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");

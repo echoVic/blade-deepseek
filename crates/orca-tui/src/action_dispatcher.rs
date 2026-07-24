@@ -138,7 +138,15 @@ fn route_action(
 ) -> bool {
     match action {
         UserAction::RespondToInteraction { key, response } => {
-            let _ = controller.broker().respond(&key, response);
+            match controller.respond_surface_interaction(&key, &response) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = controller.broker().respond(&key, response);
+                }
+                Err(error) => {
+                    let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
+                }
+            }
         }
         UserAction::Interrupt => {
             controller.interrupt_current();
