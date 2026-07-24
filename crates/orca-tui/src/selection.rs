@@ -454,6 +454,30 @@ mod tests {
     }
 
     #[test]
+    fn selection_background_preserves_multiple_syntax_foregrounds() {
+        let line = Line::from(vec![
+            Span::styled("let", Style::default().fg(Color::Magenta)),
+            Span::styled(" value = ", Style::default().fg(Color::White)),
+            Span::styled("\"hello\"", Style::default().fg(Color::Green)),
+        ]);
+
+        let highlighted = apply_selection_to_line(line, 0, None, SEL_BG);
+
+        let foregrounds: Vec<Option<Color>> =
+            highlighted.spans.iter().map(|span| span.style.fg).collect();
+        assert_eq!(
+            foregrounds,
+            vec![Some(Color::Magenta), Some(Color::White), Some(Color::Green),]
+        );
+        assert!(
+            highlighted
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(SEL_BG))
+        );
+    }
+
+    #[test]
     fn apply_selection_open_end_highlights_through_end_of_line() {
         let line = Line::from(Span::raw("abcdef"));
         let highlighted = apply_selection_to_line(line, 3, None, SEL_BG);

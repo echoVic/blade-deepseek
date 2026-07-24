@@ -558,7 +558,7 @@ pub(crate) fn render_parsed_diff(
 ) -> Vec<Line<'static>> {
     let syntax_eligible = syntax_is_eligible(parsed);
     let syntax_path = syntax_eligible
-        .then(|| parsed.destination_path.as_deref())
+        .then_some(parsed.destination_path.as_deref())
         .flatten();
     let refined = syntax_eligible.then_some(refined).flatten();
 
