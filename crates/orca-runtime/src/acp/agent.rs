@@ -16,10 +16,11 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, Error, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::event_sink::EventObserver;
@@ -43,7 +44,9 @@ use crate::surface::{
 };
 
 use super::event_map;
-use crate::runtime_surface::{SurfaceItem, SurfaceToolAction};
+use crate::runtime_surface::{
+    SurfaceItem, SurfacePlanPriority, SurfacePlanStatus, SurfaceToolAction, SurfaceToolViewState,
+};
 
 /// Per-session runtime state held on the single-threaded ACP task.
 struct SessionEntry {
@@ -513,8 +516,10 @@ fn replay_surface_snapshot(
             return Err("ACP history snapshot unavailable".to_string());
         }
     };
+    let cleanup = SurfaceAttachmentGuard::new(surface, attachment.client.clone());
     for item in attachment.baseline.snapshot.items.iter() {
         let update = match item {
+            SurfaceItem::UserMessage { input, .. } => replay_user_update(input),
             SurfaceItem::AssistantMessage { text, .. } => Some(SessionUpdate::AgentMessageChunk(
                 agent_client_protocol::ContentChunk::new(ContentBlock::from(
                     text.as_str().to_string(),
@@ -525,22 +530,160 @@ fn replay_surface_snapshot(
                     ContentBlock::from(content.as_str().to_string()),
                 )),
             ),
-            SurfaceItem::UserMessage { .. }
-            | SurfaceItem::SystemMessage { .. }
-            | SurfaceItem::AssistantPlan { .. }
-            | SurfaceItem::ToolResultMessage { .. } => None,
+            SurfaceItem::AssistantPlan { .. } => None,
+            SurfaceItem::ToolResultMessage { .. } => None,
+            SurfaceItem::SystemMessage { .. } => None,
         };
         if let Some(update) = update {
             let _ = note_tx.send(SessionNotification::new(session_id.clone(), update));
         }
     }
-    let _ = surface.detach(
-        &attachment.client,
-        crate::surface::DetachRequest {
-            request_id: SurfaceRequestId::new(),
-        },
+    let known_tool_ids = attachment
+        .baseline
+        .snapshot
+        .tools
+        .iter()
+        .map(|tool| tool.request.tool_call_id.clone())
+        .collect::<HashSet<_>>();
+    for tool in attachment.baseline.snapshot.tools.iter() {
+        let call = ToolCall::new(
+            ToolCallId::new(tool.request.tool_call_id.as_str().to_string()),
+            tool_call_title(&tool.request),
+        )
+        .kind(tool_kind(tool.request.action))
+        .status(match tool.state {
+            SurfaceToolViewState::Requested => ToolCallStatus::Pending,
+            SurfaceToolViewState::Running => ToolCallStatus::InProgress,
+            SurfaceToolViewState::Completed => tool
+                .result
+                .as_ref()
+                .map(|result| tool_status(result.terminal.kind))
+                .unwrap_or(ToolCallStatus::Completed),
+        })
+        .raw_input(serde_json::from_str(tool.request.raw_arguments.as_str()).ok());
+        let _ = note_tx.send(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ToolCall(call),
+        ));
+        if let Some(result) = tool.result.as_ref() {
+            let output = result
+                .output
+                .as_ref()
+                .or(result.error.as_ref())
+                .map(|value| value.as_str().to_string())
+                .or_else(|| {
+                    (!tool.streamed_output.as_str().is_empty())
+                        .then(|| tool.streamed_output.as_str().to_string())
+                });
+            let mut fields = ToolCallUpdateFields::new().status(tool_status(result.terminal.kind));
+            if let Some(output) = output {
+                fields = fields.content(vec![ToolCallContent::from(ContentBlock::from(output))]);
+            }
+            let _ = note_tx.send(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    ToolCallId::new(tool.request.tool_call_id.as_str().to_string()),
+                    fields,
+                )),
+            ));
+        }
+    }
+    for item in attachment.baseline.snapshot.items.iter() {
+        let SurfaceItem::ToolResultMessage {
+            tool_call_id,
+            content,
+            terminal,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if known_tool_ids.contains(tool_call_id) {
+            continue;
+        }
+        let _ = note_tx.send(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                ToolCallId::new(tool_call_id.as_str().to_string()),
+                ToolCallUpdateFields::new()
+                    .status(tool_status(terminal.kind))
+                    .content(vec![ToolCallContent::from(ContentBlock::from(
+                        content.as_str().to_string(),
+                    ))]),
+            )),
+        ));
+    }
+    let plan = Plan::new(
+        attachment
+            .baseline
+            .snapshot
+            .plan
+            .items
+            .iter()
+            .map(|item| {
+                PlanEntry::new(
+                    item.step.as_str(),
+                    match item.priority {
+                        SurfacePlanPriority::Low => PlanEntryPriority::Low,
+                        SurfacePlanPriority::Medium => PlanEntryPriority::Medium,
+                        SurfacePlanPriority::High => PlanEntryPriority::High,
+                    },
+                    match item.status {
+                        SurfacePlanStatus::Pending => PlanEntryStatus::Pending,
+                        SurfacePlanStatus::InProgress => PlanEntryStatus::InProgress,
+                        SurfacePlanStatus::Completed => PlanEntryStatus::Completed,
+                    },
+                )
+            })
+            .collect(),
     );
+    let _ = note_tx.send(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::Plan(plan),
+    ));
+    cleanup.disarm();
     Ok(())
+}
+
+fn replay_user_update(
+    input: &crate::runtime_surface::SurfaceUserInputState,
+) -> Option<SessionUpdate> {
+    let text = match input {
+        crate::runtime_surface::SurfaceUserInputState::Pending { presentation, .. }
+        | crate::runtime_surface::SurfaceUserInputState::ResolutionFailed {
+            presentation, ..
+        } => match presentation {
+            crate::runtime_surface::SurfaceInputPresentation::Visible { text } => {
+                Some(text.as_str().to_string())
+            }
+            crate::runtime_surface::SurfaceInputPresentation::Redacted => None,
+        },
+        crate::runtime_surface::SurfaceUserInputState::Resolved { fact } => match fact {
+            crate::runtime_surface::SurfaceResolvedInputFact::Replayable { input, .. } => {
+                Some(input.canonical_text.as_str().to_string())
+            }
+            crate::runtime_surface::SurfaceResolvedInputFact::NonReplayable {
+                presentation,
+                ..
+            } => match presentation {
+                crate::runtime_surface::SurfaceInputPresentation::Visible { text } => {
+                    Some(text.as_str().to_string())
+                }
+                crate::runtime_surface::SurfaceInputPresentation::Redacted => None,
+            },
+        },
+    }?;
+    Some(SessionUpdate::UserMessageChunk(
+        agent_client_protocol::ContentChunk::new(ContentBlock::from(text)),
+    ))
+}
+
+fn tool_status(kind: SurfaceToolResultKind) -> ToolCallStatus {
+    if kind == SurfaceToolResultKind::Success {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
+    }
 }
 
 fn prepare_surface_prompt(
