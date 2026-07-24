@@ -950,4 +950,86 @@ mod tests {
             None => unsafe { std::env::remove_var("ORCA_HOME") },
         }
     }
+
+    #[test]
+    fn typed_cancelled_turn_restarts_and_next_turn_commits() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed cancellation restart source")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (result_tx, result_rx) = mpsc::bounded(1);
+        let run_thread = thread.clone();
+        let run_controller = controller.clone();
+        let run_config = config.clone();
+        let worker = std::thread::spawn(move || {
+            let result = run_through_dispatch(
+                &run_thread,
+                HostedTurnRequest::new("mock_stream_delay_ms 5000"),
+                run_config,
+                &run_controller,
+                &event_tx,
+            );
+            let _ = result_tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !controller.has_surface_active() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(controller.has_surface_active());
+        controller.interrupt_current();
+
+        let cancelled = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled terminal")
+            .expect("cancelled typed turn");
+        worker.join().expect("cancelled worker");
+        assert!(matches!(
+            cancelled,
+            TuiHostedOperationOutcome::Turn { status } if status == "cancelled"
+        ));
+        let thread_id = thread.thread_id().to_string();
+        thread.shutdown().expect("source thread shutdown");
+        host.shutdown().expect("source host shutdown");
+
+        let mut resumed_config = config;
+        resumed_config.history_mode = HistoryMode::Resume(thread_id);
+        let resumed_host = RuntimeHost::start().expect("resumed runtime host");
+        let resumed_thread = resumed_host
+            .start_thread(resumed_config.clone(), "typed cancellation restart resumed")
+            .expect("resumed runtime thread");
+        let resumed_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (resumed_event_tx, resumed_event_rx) = mpsc::unbounded();
+        let resumed = run_through_dispatch(
+            &resumed_thread,
+            HostedTurnRequest::new("after cancellation restart"),
+            resumed_config,
+            &resumed_controller,
+            &resumed_event_tx,
+        )
+        .expect("resumed typed turn");
+        assert!(matches!(
+            resumed,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        assert!(resumed_event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
+
+        resumed_thread.shutdown().expect("resumed thread shutdown");
+        resumed_host.shutdown().expect("resumed host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
 }
