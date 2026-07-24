@@ -192,6 +192,7 @@ impl<'a> RuntimeTurnRequestContext<'a> {
             continuation: self.turn_context.continuation.take(),
             steer_handle: self.turn_context.steer_handle,
             provider_suspension_control: self.turn_context.provider_suspension_control,
+            provider_response_ingress: self.turn_context.provider_response_ingress,
         };
         Self { turn_context }
     }

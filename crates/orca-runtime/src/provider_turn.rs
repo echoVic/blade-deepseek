@@ -505,6 +505,9 @@ impl RuntimeProviderResponseStep {
             batch_child_executor,
         } = executors;
         let step_snapshot = step_context.snapshot();
+        if let Some(ingress) = step_snapshot.turn_context.provider_response_ingress() {
+            ingress.commit_response(&response)?;
+        }
         let completed_response = response.completed();
         let response = response.response;
         if response.tool_calls.is_empty() {

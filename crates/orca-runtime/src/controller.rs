@@ -41,6 +41,7 @@ use crate::runtime_host::{
     HostedTurnRequest, OperationHandle, OperationOutcome, OperationTerminal, RuntimeHost,
     RuntimeHostError,
 };
+use crate::runtime_surface::RuntimeProviderResponseIngress;
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts};
 use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
 #[cfg(test)]
@@ -247,6 +248,7 @@ pub struct ThreadTurnRequest {
     event_observer: Option<Arc<dyn EventObserver>>,
     continuation: Option<RuntimeTurnContinuation>,
     provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
+    provider_response_ingress: Option<Arc<dyn RuntimeProviderResponseIngress>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -631,7 +633,8 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         } else {
             loop_context
         }
-        .with_provider_suspension_control(request.provider_suspension_control());
+        .with_provider_suspension_control(request.provider_suspension_control())
+        .with_provider_response_ingress(request.provider_response_ingress());
         let turn_result = (|| -> io::Result<AgentLoopOutcome> {
             run_agent_loop(
                 config,
@@ -800,6 +803,7 @@ impl ThreadTurnRequest {
             event_observer: None,
             continuation: None,
             provider_suspension_control: None,
+            provider_response_ingress: None,
         }
     }
 
@@ -933,6 +937,14 @@ impl ThreadTurnRequest {
         self
     }
 
+    pub fn with_provider_response_ingress(
+        mut self,
+        ingress: Arc<dyn RuntimeProviderResponseIngress>,
+    ) -> Self {
+        self.provider_response_ingress = Some(ingress);
+        self
+    }
+
     pub fn with_continuation(mut self, continuation: RuntimeTurnContinuation) -> Self {
         self.continuation = Some(continuation);
         self.prompt_placement = ThreadTurnPromptPlacement::ExistingTurn;
@@ -968,6 +980,10 @@ impl ThreadTurnRequest {
 
     pub fn event_observer(&self) -> Option<&Arc<dyn EventObserver>> {
         self.event_observer.as_ref()
+    }
+
+    pub fn provider_response_ingress(&self) -> Option<&dyn RuntimeProviderResponseIngress> {
+        self.provider_response_ingress.as_deref()
     }
 
     pub fn continuation(&self) -> Option<&RuntimeTurnContinuation> {

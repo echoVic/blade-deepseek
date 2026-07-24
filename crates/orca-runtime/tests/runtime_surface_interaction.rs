@@ -7,21 +7,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use orca_core::approval_types::ApprovalMode;
+use orca_core::approval_types::{
+    ActionKind, ApprovalDecision, ApprovalMode, ApprovalRequest, ApprovalResolution,
+};
 use orca_core::cancel::CancelToken;
 use orca_core::config::{
     HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig,
     WorkflowConfig,
 };
+use orca_core::conversation::RawToolCall;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::model::ModelSelection;
+use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_config::SubagentConfig;
+use orca_core::tool_types::{ToolName, ToolRequest};
 use orca_mcp::{McpElicitationMode, McpElicitationRequest, McpElicitationResponse};
 use orca_runtime::lifecycle::RuntimeUserInputRequest;
+use orca_runtime::model_response::RuntimeModelResponse;
+use orca_runtime::protocol::{
+    PermissionGrantScope as RuntimePermissionGrantScope, PermissionResponseDecision,
+    RequestFileSystemPermissions, RequestPermissionProfile,
+};
 use orca_runtime::runtime_host::{
     GenerationContext, HostedTurnRequest, RuntimeHost, ThreadOperationExecutor,
     ThreadOperationOutcome,
 };
+use orca_runtime::runtime_permission::{RuntimePermissionRequest, RuntimePermissionResponse};
 use orca_runtime::thread::RuntimeThread;
 use orca_runtime::unstable_surface::*;
 
@@ -30,6 +41,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 const INTERACTION_RESTART_CHILD: &str = "ORCA_INTERACTION_RESTART_CHILD";
 const RESOLVED_INTERACTION_RESTART_CHILD: &str = "ORCA_RESOLVED_INTERACTION_RESTART_CHILD";
+const EFFECT_APPROVAL_RESTART_CHILD: &str = "ORCA_EFFECT_APPROVAL_RESTART_CHILD";
+const RESOLVED_EFFECT_APPROVAL_RESTART_CHILD: &str = "ORCA_RESOLVED_EFFECT_APPROVAL_RESTART_CHILD";
 
 struct UserInputExecutor {
     answer_tx: mpsc::SyncSender<Option<String>>,
@@ -61,6 +74,178 @@ struct CrossKindReuseExecutor {
 
 struct BlockingResolvedUserInputExecutor {
     answer_tx: mpsc::SyncSender<Option<String>>,
+}
+
+struct ToolApprovalExecutor {
+    resolution_tx: mpsc::SyncSender<ApprovalResolution>,
+}
+
+struct PermissionExecutor {
+    response_tx: mpsc::SyncSender<RuntimePermissionResponse>,
+    tool: ToolRequest,
+}
+
+struct BlockingResolvedToolApprovalExecutor {
+    resolution_tx: mpsc::SyncSender<ApprovalResolution>,
+}
+
+fn effect_tool_request() -> ToolRequest {
+    ToolRequest {
+        id: "effect-1".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some("printf owned".to_string()),
+        raw_arguments: Some(r#"{"command":"printf owned"}"#.to_string()),
+    }
+}
+
+fn permission_tool_request() -> ToolRequest {
+    ToolRequest {
+        id: "permission-1".to_string(),
+        name: ToolName::RequestPermissions,
+        action: ActionKind::Read,
+        target: None,
+        raw_arguments: Some("{}".to_string()),
+    }
+}
+
+fn provider_response_for_tool(
+    request: &ToolRequest,
+    turn_id: orca_core::thread_identity::TurnId,
+) -> RuntimeModelResponse {
+    RuntimeModelResponse::new(
+        ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(request.clone())],
+            assistant_content: Some("I need to use a tool.".to_string()),
+            assistant_reasoning: Some("The requested action is required.".to_string()),
+            tool_calls: vec![RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            }],
+            usage: None,
+        },
+        turn_id,
+    )
+}
+
+impl ThreadOperationExecutor for ToolApprovalExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = effect_tool_request();
+        turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs provider response ingress")
+            .commit_response(&provider_response_for_tool(
+                &tool,
+                request.turn_id().clone(),
+            ))?;
+        let resolution = turn_request
+            .approval_handler()
+            .expect("typed generation installs runtime-owned approval broker")
+            .resolve_interactive(
+                &ApprovalRequest {
+                    id: "approval-effect-1".to_string(),
+                    action: ActionKind::Shell,
+                    description: "run effect-bearing command".to_string(),
+                    tool: Some(tool.name.as_str().to_string()),
+                    target: tool.target.clone(),
+                    preview: None,
+                },
+                &tool,
+            )?;
+        self.resolution_tx.send(resolution).unwrap();
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for PermissionExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = self.tool.clone();
+        turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs provider response ingress")
+            .commit_response(&provider_response_for_tool(
+                &tool,
+                request.turn_id().clone(),
+            ))?;
+        let response = turn_request
+            .permission_handler()
+            .expect("typed generation installs runtime-owned permission broker")
+            .request_permissions(&RuntimePermissionRequest {
+                id: tool.id.clone(),
+                reason: Some("write generated output".to_string()),
+                permissions: RequestPermissionProfile {
+                    file_system: Some(RequestFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![PathBuf::from("/workspace/output")]),
+                        entries: None,
+                    }),
+                    network: None,
+                    shell: None,
+                },
+            })?;
+        self.response_tx.send(response).unwrap();
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for BlockingResolvedToolApprovalExecutor {
+    fn run_turn(
+        &self,
+        _thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = effect_tool_request();
+        turn_request
+            .provider_response_ingress()
+            .unwrap()
+            .commit_response(&provider_response_for_tool(
+                &tool,
+                request.turn_id().clone(),
+            ))?;
+        let resolution = turn_request
+            .approval_handler()
+            .unwrap()
+            .resolve_interactive(
+                &ApprovalRequest {
+                    id: "approval-effect-1".to_string(),
+                    action: ActionKind::Shell,
+                    description: "run effect-bearing command".to_string(),
+                    tool: Some(tool.name.as_str().to_string()),
+                    target: tool.target.clone(),
+                    preview: None,
+                },
+                &tool,
+            )?;
+        self.resolution_tx.send(resolution).unwrap();
+        std::thread::park();
+        unreachable!("restart fixture exits while effect generation is blocked")
+    }
 }
 
 impl ThreadOperationExecutor for BlockingResolvedUserInputExecutor {
@@ -178,6 +363,300 @@ impl ThreadOperationExecutor for UserInputExecutor {
         thread.lifecycle_mut().finish_task(status);
         Ok(status.into())
     }
+}
+
+#[test]
+fn provider_response_commits_tool_request_before_approval_can_publish() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (resolution_tx, resolution_rx) = mpsc::sync_channel(1);
+    let host = RuntimeHost::start_with_executor(Arc::new(ToolApprovalExecutor { resolution_tx }))
+        .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned tool approval",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("claim subscription once");
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "approve exact effect"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+
+    let interaction = collect_effect_interaction(
+        &mut subscription,
+        SurfaceInteractionKind::ToolApproval,
+        "effect-1",
+    );
+    assert!(resolution_rx.try_recv().is_err());
+    assert!(matches!(
+        interaction.request,
+        SurfaceInteractionRequest::ToolApproval { ref tool, .. }
+            if tool.tool_call_id == SurfaceToolCallId::try_new("effect-1").unwrap()
+                && tool.target.as_ref().map(DisplayText::as_str) == Some("printf owned")
+    ));
+
+    let _ = committed_value(
+        attachment
+            .client
+            .respond_interaction_by_id(
+                request_id(),
+                interaction.interaction_id,
+                SurfaceClientInteractionAnswer::ToolApproval {
+                    decision: SurfaceAllowDeny::Allow,
+                },
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        resolution_rx.recv_timeout(TEST_TIMEOUT).unwrap().decision,
+        ApprovalDecision::Allow
+    );
+    let terminal = attachment
+        .client
+        .wait_operation_terminal(request_id(), operation_id)
+        .unwrap();
+    assert!(matches!(
+        terminal,
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn native_permission_allow_cannot_widen_requested_profile() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    let host = RuntimeHost::start_with_executor(Arc::new(PermissionExecutor {
+        response_tx,
+        tool: permission_tool_request(),
+    }))
+    .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned permission request",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("claim subscription once");
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "grant exact permission"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+
+    let interaction = collect_effect_interaction(
+        &mut subscription,
+        SurfaceInteractionKind::PermissionRequest,
+        "permission-1",
+    );
+    let requested = match &interaction.request {
+        SurfaceInteractionRequest::PermissionRequest { permissions, .. } => permissions.clone(),
+        _ => panic!("expected permission request"),
+    };
+    assert!(response_rx.try_recv().is_err());
+
+    let widened = SurfacePermissionProfile {
+        file_system: Some(SurfaceFileSystemPermissionProfile {
+            read: None,
+            write: Some(vec![
+                SurfacePermissionPathLabel(DisplayText::new("/workspace/output")),
+                SurfacePermissionPathLabel(DisplayText::new("/workspace/secret")),
+            ]),
+        }),
+        network: None,
+        shell: None,
+    };
+    let rejected = attachment
+        .client
+        .respond_interaction_by_id(
+            request_id(),
+            interaction.interaction_id.clone(),
+            SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: SurfacePermissionClientDecision::Allow {
+                    scope: PermissionGrantScope::Turn,
+                    permissions: widened,
+                    strict_auto_review: false,
+                },
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        MutationReply::Uncommitted {
+            mutation: UncommittedMutation::Invalid { ref error, .. },
+        } if error.error().code == SurfaceMutationErrorCode::InvalidInput
+    ));
+    assert!(response_rx.try_recv().is_err());
+
+    let session_rejected = attachment
+        .client
+        .respond_interaction_by_id(
+            request_id(),
+            interaction.interaction_id.clone(),
+            SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: SurfacePermissionClientDecision::Allow {
+                    scope: PermissionGrantScope::Session,
+                    permissions: requested.clone(),
+                    strict_auto_review: false,
+                },
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        session_rejected,
+        MutationReply::Uncommitted {
+            mutation: UncommittedMutation::Invalid { ref error, .. },
+        } if error.error().code == SurfaceMutationErrorCode::InvalidInput
+    ));
+    assert!(response_rx.try_recv().is_err());
+
+    let _ = committed_value(
+        attachment
+            .client
+            .respond_interaction_by_id(
+                request_id(),
+                interaction.interaction_id,
+                SurfaceClientInteractionAnswer::PermissionRequest {
+                    decision: SurfacePermissionClientDecision::Allow {
+                        scope: PermissionGrantScope::Turn,
+                        permissions: requested,
+                        strict_auto_review: false,
+                    },
+                },
+            )
+            .unwrap(),
+    );
+    let response = response_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert_eq!(response.decision, PermissionResponseDecision::Allow);
+    assert_eq!(response.scope, RuntimePermissionGrantScope::Turn);
+    assert_eq!(
+        response
+            .permissions
+            .file_system
+            .and_then(|profile| profile.write)
+            .unwrap(),
+        vec![PathBuf::from("/workspace/output")]
+    );
+    let terminal = attachment
+        .client
+        .wait_operation_terminal(request_id(), operation_id)
+        .unwrap();
+    assert!(matches!(
+        terminal,
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn sandbox_permission_is_bound_to_the_exact_effect_tool() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    let host = RuntimeHost::start_with_executor(Arc::new(PermissionExecutor {
+        response_tx,
+        tool: effect_tool_request(),
+    }))
+    .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned sandbox permission request",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("claim subscription once");
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(
+                    &attachment.baseline.snapshot,
+                    "grant exact sandbox permission",
+                ),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+
+    let interaction = collect_effect_interaction(
+        &mut subscription,
+        SurfaceInteractionKind::PermissionRequest,
+        "effect-1",
+    );
+    let requested = match &interaction.request {
+        SurfaceInteractionRequest::PermissionRequest { permissions, .. } => permissions.clone(),
+        _ => panic!("expected permission request"),
+    };
+    let _ = committed_value(
+        attachment
+            .client
+            .respond_interaction_by_id(
+                request_id(),
+                interaction.interaction_id,
+                SurfaceClientInteractionAnswer::PermissionRequest {
+                    decision: SurfacePermissionClientDecision::Allow {
+                        scope: PermissionGrantScope::Turn,
+                        permissions: requested,
+                        strict_auto_review: false,
+                    },
+                },
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        response_rx.recv_timeout(TEST_TIMEOUT).unwrap().decision,
+        PermissionResponseDecision::Allow
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+    host.shutdown().unwrap();
 }
 
 #[test]
@@ -459,6 +938,234 @@ fn cold_recovery_fails_operation_when_resolved_live_only_payload_is_lost() {
         ));
         host.shutdown().unwrap();
     });
+}
+
+#[test]
+fn cold_recovery_rematerializes_provider_tool_before_cancelling_unavailable_approval() {
+    if std::env::var_os(EFFECT_APPROVAL_RESTART_CHILD).is_some() {
+        run_effect_approval_restart_child();
+    }
+    with_orca_home(|home| {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "cold_recovery_rematerializes_provider_tool_before_cancelling_unavailable_approval",
+            )
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(EFFECT_APPROVAL_RESTART_CHILD, "1")
+            .env("ORCA_HOME", home)
+            .status()
+            .expect("start pending effect approval restart fixture");
+        assert!(status.success());
+        let (thread_id, interaction_id): (String, SurfaceInteractionId) = serde_json::from_slice(
+            &fs::read(home.join("runtime-surface-effect-approval-restart.json")).unwrap(),
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host
+            .start_thread(
+                test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "recover pending effect approval",
+            )
+            .unwrap();
+        let snapshot = fresh_snapshot(&thread.surface());
+        let interaction = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == interaction_id)
+            .unwrap();
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| {
+                tool.request.tool_call_id == SurfaceToolCallId::try_new("effect-1").unwrap()
+            })
+            .expect("provider tool identity rematerialized before recovery settlement");
+        let terminal = snapshot
+            .operation_history
+            .iter()
+            .find_map(|operation| operation.terminal.as_ref())
+            .unwrap();
+        assert!(tool.request.source_response_id.is_some());
+        assert!(matches!(
+            interaction.lifecycle,
+            SurfaceInteractionLifecycle::Cancelled {
+                reason: InteractionCancelReason::CapabilityUnavailable,
+            }
+        ));
+        assert!(matches!(
+            terminal.terminal,
+            OperationTerminal::Failed {
+                class: FailureClass::ClientCapabilityUnavailable,
+                ..
+            }
+        ));
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn cold_recovery_fails_closed_after_effect_allow_loses_live_only_waiter() {
+    if std::env::var_os(RESOLVED_EFFECT_APPROVAL_RESTART_CHILD).is_some() {
+        run_resolved_effect_approval_restart_child();
+    }
+    with_orca_home(|home| {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("cold_recovery_fails_closed_after_effect_allow_loses_live_only_waiter")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(RESOLVED_EFFECT_APPROVAL_RESTART_CHILD, "1")
+            .env("ORCA_HOME", home)
+            .status()
+            .expect("start resolved effect approval restart fixture");
+        assert!(status.success());
+        let (thread_id, interaction_id): (String, SurfaceInteractionId) = serde_json::from_slice(
+            &fs::read(home.join("runtime-surface-resolved-effect-approval-restart.json")).unwrap(),
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host
+            .start_thread(
+                test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "recover resolved effect approval",
+            )
+            .unwrap();
+        let snapshot = fresh_snapshot(&thread.surface());
+        let interaction = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == interaction_id)
+            .unwrap();
+        let terminal = snapshot
+            .operation_history
+            .iter()
+            .find_map(|operation| operation.terminal.as_ref())
+            .unwrap();
+        assert!(matches!(
+            interaction.lifecycle,
+            SurfaceInteractionLifecycle::Resolved { .. }
+        ));
+        assert!(matches!(
+            terminal.terminal,
+            OperationTerminal::Failed {
+                class: FailureClass::ClientCapabilityUnavailable,
+                ..
+            }
+        ));
+        host.shutdown().unwrap();
+    });
+}
+
+fn run_effect_approval_restart_child() -> ! {
+    let cwd = tempfile::tempdir().unwrap();
+    let (resolution_tx, _resolution_rx) = mpsc::sync_channel(1);
+    let host =
+        RuntimeHost::start_with_executor(Arc::new(ToolApprovalExecutor { resolution_tx })).unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "persist pending effect approval",
+        )
+        .unwrap();
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .unwrap();
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "pending effect"),
+            )
+            .unwrap(),
+    );
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), reserved.operation_id, reserved.lease.lease_id)
+            .unwrap(),
+    );
+    let interaction = collect_effect_interaction(
+        &mut subscription,
+        SurfaceInteractionKind::ToolApproval,
+        "effect-1",
+    );
+    let home = PathBuf::from(std::env::var_os("ORCA_HOME").unwrap());
+    fs::write(
+        home.join("runtime-surface-effect-approval-restart.json"),
+        serde_json::to_vec(&(thread.thread_id().to_string(), interaction.interaction_id)).unwrap(),
+    )
+    .unwrap();
+    std::process::exit(0)
+}
+
+fn run_resolved_effect_approval_restart_child() -> ! {
+    let cwd = tempfile::tempdir().unwrap();
+    let (resolution_tx, resolution_rx) = mpsc::sync_channel(1);
+    let host = RuntimeHost::start_with_executor(Arc::new(BlockingResolvedToolApprovalExecutor {
+        resolution_tx,
+    }))
+    .unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "persist resolved effect approval",
+        )
+        .unwrap();
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .unwrap();
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "resolved effect"),
+            )
+            .unwrap(),
+    );
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), reserved.operation_id, reserved.lease.lease_id)
+            .unwrap(),
+    );
+    let interaction = collect_effect_interaction(
+        &mut subscription,
+        SurfaceInteractionKind::ToolApproval,
+        "effect-1",
+    );
+    let _ = committed_value(
+        attachment
+            .client
+            .respond_interaction_by_id(
+                request_id(),
+                interaction.interaction_id.clone(),
+                SurfaceClientInteractionAnswer::ToolApproval {
+                    decision: SurfaceAllowDeny::Allow,
+                },
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        resolution_rx.recv_timeout(TEST_TIMEOUT).unwrap().decision,
+        ApprovalDecision::Allow
+    );
+    let home = PathBuf::from(std::env::var_os("ORCA_HOME").unwrap());
+    fs::write(
+        home.join("runtime-surface-resolved-effect-approval-restart.json"),
+        serde_json::to_vec(&(thread.thread_id().to_string(), interaction.interaction_id)).unwrap(),
+    )
+    .unwrap();
+    std::process::exit(0)
 }
 
 fn run_resolved_interaction_restart_child() -> ! {
@@ -1711,6 +2418,62 @@ fn collect_requested_interaction(
         assert!(
             Instant::now() < deadline,
             "durable interaction request was not published"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn collect_effect_interaction(
+    receiver: &mut SurfaceSubscriptionReceiver,
+    kind: SurfaceInteractionKind,
+    tool_call_id: &str,
+) -> SurfaceInteractionView {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut semantic_committed = false;
+    loop {
+        while let Some(item) = receiver.try_recv() {
+            if let SurfaceSubscriptionItem::Batch { batch } = item {
+                let mut response = None;
+                let mut requested_tool = None;
+                let mut interaction = None;
+                for (index, event) in batch.events.as_slice().iter().enumerate() {
+                    match &event.event {
+                        SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted {
+                            response: completed,
+                        }) => response = Some((index, completed.response_id.clone())),
+                        SurfaceEvent::Tool(ToolPatch::Requested { request })
+                            if request.tool_call_id
+                                == SurfaceToolCallId::try_new(tool_call_id).unwrap() =>
+                        {
+                            requested_tool = Some((index, request.source_response_id.clone()));
+                        }
+                        SurfaceEvent::Interaction(InteractionPatch::Requested {
+                            interaction: requested,
+                        }) if requested.kind == kind => interaction = Some(requested.clone()),
+                        _ => {}
+                    }
+                }
+                if response.is_some() || requested_tool.is_some() {
+                    let (response_index, response_id) =
+                        response.expect("response completion and tool request must be atomic");
+                    let (tool_index, source_response_id) = requested_tool
+                        .expect("response completion and tool request must be atomic");
+                    assert!(response_index < tool_index);
+                    assert_eq!(source_response_id.as_ref(), Some(&response_id));
+                    semantic_committed = true;
+                }
+                if let Some(interaction) = interaction {
+                    assert!(
+                        semantic_committed,
+                        "effect-bearing interaction published before durable tool identity"
+                    );
+                    return interaction;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "effect-bearing interaction was not published"
         );
         std::thread::sleep(Duration::from_millis(5));
     }

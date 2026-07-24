@@ -470,6 +470,10 @@ impl ToolExecutionActor {
             ));
         }
 
+        let approval_bound_request = approval_request_for_invocation(&invocation)
+            .filter(|approval| agent_common::requires_approval(approval.action))
+            .map(|_| invocation.effective.clone());
+
         let approval_execution = self.handle_approval(ToolApprovalGateContext {
             config,
             events,
@@ -563,6 +567,30 @@ impl ToolExecutionActor {
                 ));
             }
         };
+        if approval_bound_request.as_ref().is_some_and(|approved| {
+            approved.id != invocation.effective.id
+                || approved.name.as_str() != invocation.effective.name.as_str()
+                || approved.action != invocation.effective.action
+                || approved.target != invocation.effective.target
+                || approved.raw_arguments != invocation.effective.raw_arguments
+        }) {
+            let result = tool_types::ToolResult::failed_before_start(
+                tool_request,
+                "pre-tool hook changed an approval-relevant request after its authority was evaluated",
+                None,
+            );
+            let mut event_error = hook_execution.event_error;
+            if emit_deltas {
+                retain_first_io_error(
+                    &mut event_error,
+                    emit_tool_call_completed(events, sink, tool_request, &result),
+                );
+            }
+            return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                (RunStatus::Failed, result),
+                event_error,
+            ));
+        }
         let execution_request = &invocation.effective;
         if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
             registry.on_tool_start(ToolStartInput {
@@ -1523,6 +1551,73 @@ mod tests {
                 "finish:thread-1:turn-1:read-file:Completed"
             ]
         );
+    }
+
+    #[test]
+    fn approval_relevant_pre_tool_mutation_fails_before_dispatch() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let marker = cwd.path().join("mutated-effect");
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let request = ToolRequest {
+            id: "approved-effect".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("true".to_string()),
+            raw_arguments: Some(r#"{"command":"true"}"#.to_string()),
+        };
+        let hook_output = serde_json::json!({
+            "action": "modify",
+            "modified_target": format!("touch {}", marker.display()),
+        })
+        .to_string();
+        let hooks = HookRunner::new(vec![HookConfig {
+            event: HookEvent::PreToolUse,
+            command: format!("printf '%s' '{}'", hook_output),
+            tool: Some("bash".to_string()),
+        }]);
+        let policy = policy_for_tool_execution(&config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = orca_core::cancel::CancelToken::new();
+        let task_registry = TaskRegistry::new("hook-mutation-authority".to_string());
+        let mut background_workflows = Vec::new();
+        let mut permission_overlay = TurnPermissionOverlay::default();
+        let context = ToolExecutionContext::new(cwd.path(), 0, false, &policy)
+            .with_services(&instructions, &memory, &registry, &hooks)
+            .with_runtime(
+                &mut cost_tracker,
+                &cancel,
+                &task_registry,
+                &mut background_workflows,
+                None,
+            )
+            .with_permission_overlay(&mut permission_overlay);
+        let mut events = EventFactory::new("hook-mutation-authority".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+
+        let (status, result) = actor
+            .execute(
+                &config,
+                &mut events,
+                &mut sink,
+                &request,
+                context,
+                unused_child_executor,
+                unused_child_executor,
+            )
+            .expect("mutation must fail as a normal tool terminal");
+
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(
+            result.terminal().started,
+            orca_core::tool_types::ToolInvocationStarted::No
+        );
+        assert!(!marker.exists(), "mutated effect must never reach dispatch");
     }
 
     #[test]

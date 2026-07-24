@@ -713,6 +713,69 @@ fn active_generation_state() -> (SurfaceReducerState, GenerationRecord) {
     )
 }
 
+#[test]
+fn provider_response_rejects_an_extra_unpaired_tool_request() {
+    let (initial, generation) = active_generation_state();
+    let response_id = UuidV7::try_from_bytes(uuid_v7_bytes(41_202)).unwrap();
+    let paired = SurfaceToolRequest {
+        tool_call_id: SurfaceToolCallId::try_new("paired").unwrap(),
+        source_response_id: Some(response_id.clone()),
+        turn_id: generation.logical_turn_id.clone(),
+        name: NonEmptyText::try_new("bash").unwrap(),
+        action: SurfaceToolAction::Shell,
+        target: None,
+        raw_arguments: DisplayText::new("{}"),
+        arguments_digest: digest(44),
+    };
+    let extra = SurfaceToolRequest {
+        tool_call_id: SurfaceToolCallId::try_new("extra").unwrap(),
+        source_response_id: Some(response_id.clone()),
+        turn_id: generation.logical_turn_id.clone(),
+        name: NonEmptyText::try_new("write_file").unwrap(),
+        action: SurfaceToolAction::Write,
+        target: Some(DisplayText::new("/tmp/extra")),
+        raw_arguments: DisplayText::new("{\"path\":\"/tmp/extra\"}"),
+        arguments_digest: digest(45),
+    };
+    let invalid = batch(
+        &initial,
+        41_203,
+        vec![
+            (
+                generation_scope(&generation),
+                SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted {
+                    response: SurfaceCompletedModelResponse {
+                        response_id,
+                        turn_id: generation.logical_turn_id.clone(),
+                        message_item: None,
+                        reasoning_item: None,
+                        plan_item: None,
+                        tool_calls: vec![SurfaceRawToolCall {
+                            id: paired.tool_call_id.clone(),
+                            name: paired.name.clone(),
+                            raw_arguments: paired.raw_arguments.clone(),
+                            arguments_digest: paired.arguments_digest.clone(),
+                        }],
+                    },
+                }),
+            ),
+            (
+                generation_scope(&generation),
+                SurfaceEvent::Tool(ToolPatch::Requested { request: paired }),
+            ),
+            (
+                generation_scope(&generation),
+                SurfaceEvent::Tool(ToolPatch::Requested { request: extra }),
+            ),
+        ],
+    );
+
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &initial, &invalid),
+        SurfaceReducerErrorCode::InvalidOrdering,
+    );
+}
+
 fn state_with_capability_call(
     kind: SurfaceCapabilityCallKind,
     call_state: SurfaceCapabilityCallState,
@@ -1738,7 +1801,7 @@ fn item_assistant_tool_and_interaction_families_reduce_closed_state() {
     let tool_call_id = SurfaceToolCallId::try_new("tool-13").unwrap();
     let request = SurfaceToolRequest {
         tool_call_id: tool_call_id.clone(),
-        source_response_id: Some(response_id),
+        source_response_id: None,
         turn_id: active_generation.logical_turn_id.clone(),
         name: NonEmptyText::try_new("bash").unwrap(),
         action: SurfaceToolAction::Shell,

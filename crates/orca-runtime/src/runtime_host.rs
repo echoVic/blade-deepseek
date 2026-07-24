@@ -18,7 +18,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::task_types::TaskStatus;
 use orca_core::thread_identity::TurnId;
-use orca_core::thread_item_projection::ModelResponseIdentity;
+use orca_core::thread_item_projection::{CompletedModelItem, ModelResponseIdentity};
 use orca_core::workflow_types::{WorkflowInput, WorkflowOutput};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 use serde_json::Value;
@@ -92,6 +92,7 @@ pub struct HostedGenerationHandlers {
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
+    provider_response_ingress: Option<Arc<dyn surface::RuntimeProviderResponseIngress>>,
 }
 
 impl fmt::Debug for HostedGenerationHandlers {
@@ -108,6 +109,10 @@ impl fmt::Debug for HostedGenerationHandlers {
             .field(
                 "provider_suspension_control",
                 &self.provider_suspension_control.is_some(),
+            )
+            .field(
+                "provider_response_ingress",
+                &self.provider_response_ingress.is_some(),
             )
             .finish()
     }
@@ -151,6 +156,14 @@ impl HostedGenerationHandlers {
         control: Arc<dyn RuntimeProviderSuspensionControl>,
     ) -> Self {
         self.provider_suspension_control = Some(control);
+        self
+    }
+
+    pub fn with_provider_response_ingress(
+        mut self,
+        ingress: Arc<dyn surface::RuntimeProviderResponseIngress>,
+    ) -> Self {
+        self.provider_response_ingress = Some(ingress);
         self
     }
 }
@@ -654,6 +667,9 @@ impl HostedTurnRequest {
         if let Some(control) = generation.handlers.provider_suspension_control.clone() {
             request = request.with_provider_suspension_control(control);
         }
+        if let Some(ingress) = generation.handlers.provider_response_ingress.clone() {
+            request = request.with_provider_response_ingress(ingress);
+        }
         if let Some(task_id) = self.main_session_task_id.as_deref() {
             request = request.with_main_session_task_id(task_id);
         }
@@ -903,6 +919,80 @@ struct RuntimeSurfaceMcpElicitationHandler {
     fence: surface::SurfaceOperationFence,
 }
 
+struct RuntimeSurfaceApprovalHandler {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+}
+
+impl RuntimeApprovalHandler for RuntimeSurfaceApprovalHandler {
+    fn resolve_interactive(
+        &self,
+        approval: &orca_core::approval_types::ApprovalRequest,
+        request: &orca_core::tool_types::ToolRequest,
+    ) -> io::Result<orca_core::approval_types::ApprovalResolution> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceRequestToolApproval {
+                fence: self.fence.clone(),
+                approval: approval.clone(),
+                request: request.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime interaction mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime interaction actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime interaction actor closed while waiting for tool approval",
+            )
+        })?
+    }
+}
+
+struct RuntimeSurfacePermissionHandler {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+}
+
+impl RuntimePermissionRequestHandler for RuntimeSurfacePermissionHandler {
+    fn request_permissions(
+        &self,
+        request: &crate::runtime_permission::RuntimePermissionRequest,
+    ) -> io::Result<crate::runtime_permission::RuntimePermissionResponse> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceRequestPermission {
+                fence: self.fence.clone(),
+                request: request.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime interaction mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime interaction actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime interaction actor closed while waiting for permission response",
+            )
+        })?
+    }
+}
+
 impl McpElicitationHandler for RuntimeSurfaceMcpElicitationHandler {
     fn handle_elicitation(
         &self,
@@ -921,6 +1011,43 @@ impl McpElicitationHandler for RuntimeSurfaceMcpElicitationHandler {
             })?;
         reply_rx.recv().map_err(|_| {
             "runtime interaction actor closed while waiting for MCP elicitation".to_string()
+        })?
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeSurfaceProviderResponseIngress {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+}
+
+impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseIngress {
+    fn commit_response(
+        &self,
+        response: &crate::model_response::RuntimeModelResponse,
+    ) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceCommitProviderResponse {
+                fence: self.fence.clone(),
+                response: response.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime semantic ingress mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime semantic ingress actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime semantic ingress actor closed before commit acknowledgement",
+            )
         })?
     }
 }
@@ -2033,6 +2160,22 @@ enum ThreadCommand {
         reply: SyncSender<
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
+    },
+    SurfaceCommitProviderResponse {
+        fence: surface::SurfaceOperationFence,
+        response: crate::model_response::RuntimeModelResponse,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceRequestToolApproval {
+        fence: surface::SurfaceOperationFence,
+        approval: orca_core::approval_types::ApprovalRequest,
+        request: orca_core::tool_types::ToolRequest,
+        reply: SyncSender<io::Result<orca_core::approval_types::ApprovalResolution>>,
+    },
+    SurfaceRequestPermission {
+        fence: surface::SurfaceOperationFence,
+        request: crate::runtime_permission::RuntimePermissionRequest,
+        reply: SyncSender<io::Result<crate::runtime_permission::RuntimePermissionResponse>>,
     },
     SurfaceRequestUserInput {
         fence: surface::SurfaceOperationFence,
@@ -3179,6 +3322,11 @@ struct ExactInteractionSelectorBinding {
 }
 
 enum ResidentInteractionWaiter {
+    ToolApproval {
+        approval_id: String,
+        waiter: SyncSender<io::Result<orca_core::approval_types::ApprovalResolution>>,
+    },
+    Permission(SyncSender<io::Result<crate::runtime_permission::RuntimePermissionResponse>>),
     UserInput(SyncSender<io::Result<Option<String>>>),
     McpElicitation(SyncSender<Result<orca_mcp::McpElicitationResponse, String>>),
 }
@@ -3198,6 +3346,209 @@ fn keyed_interaction_response_digest(
     hasher.update(token.key_bytes());
     hasher.update(serde_json::to_vec(answer).expect("interaction answer serializes"));
     surface::OpaqueToken::new(hasher.finalize().into())
+}
+
+fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    surface::Sha256Digest::new(hasher.finalize().into())
+}
+
+fn surface_tool_action(
+    action: orca_core::approval_types::ActionKind,
+) -> surface::SurfaceToolAction {
+    match action {
+        orca_core::approval_types::ActionKind::Read => surface::SurfaceToolAction::Read,
+        orca_core::approval_types::ActionKind::Write => surface::SurfaceToolAction::Write,
+        orca_core::approval_types::ActionKind::Network => surface::SurfaceToolAction::Network,
+        orca_core::approval_types::ActionKind::Agent => surface::SurfaceToolAction::Agent,
+        orca_core::approval_types::ActionKind::Shell => surface::SurfaceToolAction::Shell,
+    }
+}
+
+fn surface_permission_paths(
+    paths: Option<Vec<std::path::PathBuf>>,
+) -> io::Result<Option<Vec<surface::SurfacePermissionPathLabel>>> {
+    paths
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| {
+                    path.to_str()
+                        .map(|path| {
+                            surface::SurfacePermissionPathLabel(surface::DisplayText::new(path))
+                        })
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "permission path is not lossless UTF-8",
+                            )
+                        })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn surface_permission_profile_from_runtime(
+    profile: crate::protocol::RequestPermissionProfile,
+) -> io::Result<surface::SurfacePermissionProfile> {
+    let profile = profile.normalize_file_system_entries();
+    let file_system = profile
+        .file_system
+        .map(|permissions| {
+            Ok::<surface::SurfaceFileSystemPermissionProfile, io::Error>(
+                surface::SurfaceFileSystemPermissionProfile {
+                    read: surface_permission_paths(permissions.read)?,
+                    write: surface_permission_paths(permissions.write)?,
+                },
+            )
+        })
+        .transpose()?;
+    let network = profile.network.map(|permissions| {
+        let mut domains = permissions.domains.into_iter().collect::<Vec<_>>();
+        domains.sort_by(|left, right| left.0.cmp(&right.0));
+        surface::SurfacePermissionNetworkProfile {
+            enabled: permissions.enabled,
+            domains: domains
+                .into_iter()
+                .map(|(domain, access)| {
+                    (
+                        surface::SurfacePermissionDomainPattern(surface::DisplayText::new(domain)),
+                        match access {
+                            orca_core::config::PermissionProfileNetworkAccess::Allow => {
+                                surface::SurfaceAllowDeny::Allow
+                            }
+                            orca_core::config::PermissionProfileNetworkAccess::Deny => {
+                                surface::SurfaceAllowDeny::Deny
+                            }
+                        },
+                    )
+                })
+                .collect(),
+        }
+    });
+    let shell = profile
+        .shell
+        .map(|permissions| surface::SurfaceShellPermissionProfile {
+            unsandboxed: permissions.unsandboxed,
+        });
+    Ok(surface::SurfacePermissionProfile {
+        file_system,
+        network,
+        shell,
+    })
+}
+
+fn runtime_permission_profile_from_surface(
+    profile: &surface::SurfacePermissionProfile,
+) -> crate::protocol::RequestPermissionProfile {
+    let file_system = profile.file_system.as_ref().map(|permissions| {
+        crate::protocol::RequestFileSystemPermissions {
+            read: permissions.read.as_ref().map(|paths| {
+                paths
+                    .iter()
+                    .map(|path| std::path::PathBuf::from(path.0.as_str()))
+                    .collect()
+            }),
+            write: permissions.write.as_ref().map(|paths| {
+                paths
+                    .iter()
+                    .map(|path| std::path::PathBuf::from(path.0.as_str()))
+                    .collect()
+            }),
+            entries: None,
+        }
+    });
+    let network =
+        profile
+            .network
+            .as_ref()
+            .map(|permissions| crate::protocol::RequestNetworkPermissions {
+                enabled: permissions.enabled,
+                domains: permissions
+                    .domains
+                    .iter()
+                    .map(|(domain, access)| {
+                        (
+                            domain.0.as_str().to_string(),
+                            match access {
+                                surface::SurfaceAllowDeny::Allow => {
+                                    orca_core::config::PermissionProfileNetworkAccess::Allow
+                                }
+                                surface::SurfaceAllowDeny::Deny => {
+                                    orca_core::config::PermissionProfileNetworkAccess::Deny
+                                }
+                            },
+                        )
+                    })
+                    .collect(),
+            });
+    let shell =
+        profile
+            .shell
+            .as_ref()
+            .map(|permissions| crate::protocol::RequestShellPermissions {
+                unsandboxed: permissions.unsandboxed,
+            });
+    crate::protocol::RequestPermissionProfile {
+        file_system,
+        network,
+        shell,
+    }
+}
+
+fn permission_path_subset(
+    candidate: Option<&Vec<surface::SurfacePermissionPathLabel>>,
+    requested: Option<&Vec<surface::SurfacePermissionPathLabel>>,
+) -> bool {
+    candidate.is_none_or(|candidate| {
+        let requested = requested
+            .into_iter()
+            .flatten()
+            .map(|path| path.0.as_str())
+            .collect::<BTreeSet<_>>();
+        candidate
+            .iter()
+            .all(|path| requested.contains(path.0.as_str()))
+    })
+}
+
+fn surface_permission_profile_is_subset(
+    candidate: &surface::SurfacePermissionProfile,
+    requested: &surface::SurfacePermissionProfile,
+) -> bool {
+    let file_system_subset = candidate.file_system.as_ref().is_none_or(|candidate| {
+        requested.file_system.as_ref().is_some_and(|requested| {
+            permission_path_subset(candidate.read.as_ref(), requested.read.as_ref())
+                && permission_path_subset(candidate.write.as_ref(), requested.write.as_ref())
+        })
+    });
+    let network_subset = candidate.network.as_ref().is_none_or(|candidate| {
+        requested.network.as_ref().is_some_and(|requested| {
+            let enabled_subset = match candidate.enabled {
+                None | Some(false) => true,
+                Some(true) => requested.enabled == Some(true),
+            };
+            let requested_domains = requested
+                .domains
+                .iter()
+                .map(|(domain, access)| (domain.0.as_str(), *access))
+                .collect::<HashMap<_, _>>();
+            enabled_subset
+                && candidate.domains.iter().all(|(domain, access)| {
+                    requested_domains.get(domain.0.as_str()) == Some(access)
+                })
+        })
+    });
+    let shell_subset = candidate.shell.as_ref().is_none_or(|candidate| {
+        !candidate.unsandboxed
+            || requested
+                .shell
+                .as_ref()
+                .is_some_and(|requested| requested.unsandboxed)
+    });
+    file_system_subset && network_subset && shell_subset
 }
 
 const PRIVATE_INTERACTION_ANSWER_DEPTH_LIMIT: usize = 64;
@@ -3296,10 +3647,73 @@ fn interaction_answer_kind(
     }
 }
 
+fn interaction_answer_authority(
+    request: &surface::SurfaceInteractionRequest,
+    answer: &surface::SurfaceClientInteractionAnswer,
+) -> surface::ApplicableAuthorityFingerprint {
+    match (request, answer) {
+        (
+            surface::SurfaceInteractionRequest::ToolApproval { authority, .. },
+            surface::SurfaceClientInteractionAnswer::ToolApproval {
+                decision: surface::SurfaceAllowDeny::Allow,
+            },
+        )
+        | (
+            surface::SurfaceInteractionRequest::PermissionRequest { authority, .. },
+            surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: surface::SurfacePermissionClientDecision::Allow { .. },
+            },
+        )
+        | (
+            surface::SurfaceInteractionRequest::BackgroundApproval { authority, .. },
+            surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                decision: surface::SurfaceAllowDeny::Allow,
+            },
+        ) => surface::ApplicableAuthorityFingerprint::persisted(authority.clone()),
+        _ => surface::ApplicableAuthorityFingerprint::not_applicable(),
+    }
+}
+
+fn interaction_answer_authority_matches(
+    request: &surface::SurfaceInteractionRequest,
+    answer: &surface::SurfaceClientInteractionAnswer,
+    actual: &surface::ApplicableAuthorityFingerprint,
+) -> bool {
+    interaction_answer_authority(request, answer).authority() == actual.authority()
+}
+
 fn interaction_safe_projection(
     answer: &surface::SurfaceClientInteractionAnswer,
 ) -> surface::SurfaceInteractionSafeProjection {
     match answer {
+        surface::SurfaceClientInteractionAnswer::ToolApproval { decision } => {
+            surface::SurfaceInteractionSafeProjection::ToolApproval {
+                allowed: *decision == surface::SurfaceAllowDeny::Allow,
+            }
+        }
+        surface::SurfaceClientInteractionAnswer::PermissionRequest { decision } => {
+            let (decision, scope, strict_auto_review) = match decision {
+                surface::SurfacePermissionClientDecision::Allow {
+                    scope,
+                    strict_auto_review,
+                    ..
+                } => (
+                    surface::SurfaceAllowDeny::Allow,
+                    *scope,
+                    *strict_auto_review,
+                ),
+                surface::SurfacePermissionClientDecision::Deny {
+                    scope,
+                    strict_auto_review,
+                    ..
+                } => (surface::SurfaceAllowDeny::Deny, *scope, *strict_auto_review),
+            };
+            surface::SurfaceInteractionSafeProjection::PermissionRequest {
+                decision,
+                scope,
+                strict_auto_review,
+            }
+        }
         surface::SurfaceClientInteractionAnswer::UserInput { decision } => {
             surface::SurfaceInteractionSafeProjection::UserInput {
                 answered: matches!(decision, surface::SurfaceUserInputDecision::Answer(_)),
@@ -3313,7 +3727,11 @@ fn interaction_safe_projection(
                 ),
             }
         }
-        _ => unreachable!("answer kind is installed by a runtime-owned broker"),
+        surface::SurfaceClientInteractionAnswer::BackgroundApproval { decision } => {
+            surface::SurfaceInteractionSafeProjection::BackgroundApproval {
+                allowed: *decision == surface::SurfaceAllowDeny::Allow,
+            }
+        }
     }
 }
 
@@ -3806,6 +4224,180 @@ impl ThreadActor {
         batch
     }
 
+    fn commit_surface_provider_response(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        response: &crate::model_response::RuntimeModelResponse,
+    ) -> io::Result<()> {
+        if active.surface_operation.as_ref() != Some(&fence) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider response generation fence is stale",
+            ));
+        }
+        if Self::surface_interaction_admission_closed(active) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime generation is terminalizing",
+            ));
+        }
+
+        let completed = response.completed();
+        let response_uuid = completed
+            .identity
+            .item_ids
+            .conversation_item_id
+            .as_str()
+            .strip_prefix("item_")
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider response identity is not UUIDv7-backed",
+                )
+            })?;
+        let response_id =
+            surface::UuidV7::try_from_bytes(*response_uuid.as_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider response identity is not UUIDv7-backed",
+                )
+            })?;
+
+        let mut message_item = None;
+        let mut reasoning_item = None;
+        let mut plan_item = None;
+        for item in completed.completed_items() {
+            match item {
+                CompletedModelItem::AgentMessage { id, text } => {
+                    message_item = Some(surface::SurfaceAssistantMessageItem {
+                        id,
+                        turn_id: completed.identity.turn_id.clone(),
+                        text: surface::DisplayText::new(text),
+                        pinned: false,
+                    });
+                }
+                CompletedModelItem::Reasoning {
+                    id,
+                    summary,
+                    content,
+                } => {
+                    reasoning_item = Some(surface::SurfaceAssistantReasoningItem {
+                        id,
+                        turn_id: completed.identity.turn_id.clone(),
+                        summary: surface::DisplayText::new(summary),
+                        content: surface::DisplayText::new(content),
+                        pinned: false,
+                    });
+                }
+                CompletedModelItem::Plan { id, text } => {
+                    plan_item = Some(surface::SurfaceAssistantPlanItem {
+                        id,
+                        turn_id: completed.identity.turn_id.clone(),
+                        text: surface::DisplayText::new(text),
+                        pinned: false,
+                    });
+                }
+            }
+        }
+
+        let mut requests_by_id = HashMap::new();
+        for step in &response.response.steps {
+            if let ProviderStep::ToolCall(request) = step
+                && requests_by_id
+                    .insert(request.id.clone(), request.clone())
+                    .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider response repeats a tool call id",
+                ));
+            }
+        }
+        if requests_by_id.len() != completed.tool_calls.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provider response tool metadata is incomplete",
+            ));
+        }
+
+        let mut raw_tool_calls = Vec::with_capacity(completed.tool_calls.len());
+        let mut tool_requests = Vec::with_capacity(completed.tool_calls.len());
+        for raw_call in &completed.tool_calls {
+            let request = requests_by_id.get(&raw_call.id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider response lacks the executable tool request",
+                )
+            })?;
+            let raw_arguments = request.raw_arguments.clone().unwrap_or_default();
+            if request.name.as_str() != raw_call.function_name
+                || raw_arguments != raw_call.arguments
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider response tool identity differs from executable request",
+                ));
+            }
+            let tool_call_id = surface::SurfaceToolCallId::try_new(raw_call.id.clone())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
+            let name = surface::NonEmptyText::try_new(raw_call.function_name.clone())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool name"))?;
+            let arguments_digest = surface_sha256(raw_call.arguments.as_bytes());
+            raw_tool_calls.push(surface::SurfaceRawToolCall {
+                id: tool_call_id.clone(),
+                name: name.clone(),
+                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
+                arguments_digest: arguments_digest.clone(),
+            });
+            tool_requests.push(surface::SurfaceToolRequest {
+                tool_call_id,
+                source_response_id: Some(response_id.clone()),
+                turn_id: completed.identity.turn_id.clone(),
+                name,
+                action: surface_tool_action(request.action),
+                target: request.target.clone().map(surface::DisplayText::new),
+                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
+                arguments_digest,
+            });
+        }
+
+        let completed_response = surface::SurfaceCompletedModelResponse {
+            response_id,
+            turn_id: completed.identity.turn_id.clone(),
+            message_item,
+            reasoning_item,
+            plan_item,
+            tool_calls: raw_tool_calls,
+        };
+        let scope = surface::SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let mut events = vec![(
+            scope.clone(),
+            surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseCompleted {
+                response: completed_response,
+            }),
+        )];
+        events.extend(tool_requests.into_iter().map(|request| {
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }),
+            )
+        }));
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(fence, &batch)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to commit provider response semantic batch: {error:?}"
+                ))
+            })?;
+        Ok(())
+    }
+
     fn committed_surface_mutation<T>(
         request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
@@ -3861,6 +4453,366 @@ impl ThreadActor {
                 .expect("interaction commit has one acknowledgement"),
             },
             value,
+        }
+    }
+
+    fn surface_operation_record<'a>(
+        snapshot: &'a surface::SurfaceSnapshot,
+        operation_id: &surface::SurfaceOperationId,
+    ) -> Option<&'a surface::OperationRecord> {
+        snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| operation.operation_id == *operation_id)
+    }
+
+    fn surface_tool_for_runtime_request(
+        snapshot: &surface::SurfaceSnapshot,
+        fence: &surface::SurfaceOperationFence,
+        request: &orca_core::tool_types::ToolRequest,
+    ) -> io::Result<surface::SurfaceToolRequest> {
+        let tool_call_id = surface::SurfaceToolCallId::try_new(request.id.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
+        let operation = Self::surface_operation_record(snapshot, &fence.operation_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
+        let generation = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == *fence)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == tool_call_id)
+            .map(|tool| tool.request.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tool interaction lacks a committed provider tool identity",
+                )
+            })?;
+        let raw_arguments = request.raw_arguments.clone().unwrap_or_default();
+        if tool.source_response_id.is_none()
+            || tool.turn_id != generation.logical_turn_id
+            || tool.name.as_str() != request.name.as_str()
+            || tool.action != surface_tool_action(request.action)
+            || tool.target.as_ref().map(surface::DisplayText::as_str) != request.target.as_deref()
+            || tool.raw_arguments.as_str() != raw_arguments
+            || tool.arguments_digest != surface_sha256(raw_arguments.as_bytes())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tool interaction differs from the committed provider request",
+            ));
+        }
+        Ok(tool)
+    }
+
+    fn surface_authority_for_tool(
+        snapshot: &surface::SurfaceSnapshot,
+        fence: &surface::SurfaceOperationFence,
+        tool: &surface::SurfaceToolRequest,
+    ) -> io::Result<surface::AuthorityFingerprint> {
+        let operation = Self::surface_operation_record(snapshot, &fence.operation_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
+        let generation = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == *fence)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
+        let surface::Replayability::Replayable {
+            request_digest: Some(request_digest),
+            cwd,
+            workspace_roots,
+            policy_epoch,
+            tool_schema_digest,
+            ..
+        } = &generation.replayability
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "effect-bearing interactions require a replayable generation authority",
+            ));
+        };
+        if *policy_epoch != operation.intent.policy_epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "effect-bearing interaction policy epoch is stale",
+            ));
+        }
+        let executable_generation = surface_sha256(
+            &serde_json::to_vec(tool)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        );
+        let workspace_roots_digest = surface_sha256(
+            &serde_json::to_vec(workspace_roots)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        );
+        Ok(surface::AuthorityFingerprint::new(
+            fence.operation_id.clone(),
+            request_digest.clone(),
+            tool_schema_digest.clone(),
+            cwd.clone(),
+            workspace_roots_digest,
+            *policy_epoch,
+            executable_generation,
+            tool.arguments_digest.clone(),
+            generation.capability_fingerprint.clone(),
+        ))
+    }
+
+    fn commit_surface_effect_interaction_request(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        kind: surface::SurfaceInteractionKind,
+        request: surface::SurfaceInteractionRequest,
+    ) -> io::Result<
+        Option<(
+            surface::SurfaceInteractionId,
+            surface::BrokerInteractionRequestRecord,
+            surface::BrokerInteractionResponseRoute,
+            surface::InteractionRevision,
+        )>,
+    > {
+        if active.surface_operation.as_ref() != Some(&fence) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "effect interaction generation fence is stale",
+            ));
+        }
+        if Self::surface_interaction_admission_closed(active) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime generation is terminalizing",
+            ));
+        }
+        let preferred = self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&fence.operation_id);
+        let attachment_id = self
+            .resident_surface
+            .hub
+            .select_interaction_attachment_for(kind, preferred);
+        let unavailable = attachment_id.is_none();
+        let interaction_id =
+            surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let revision = surface::InteractionRevision::try_new(1).expect("one is valid");
+        let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is valid");
+        let record = surface::BrokerInteractionRequestRecord {
+            thread_id: fence.thread_id.clone(),
+            interaction_id: interaction_id.clone(),
+            fence: fence.clone(),
+            kind,
+            request: request.clone(),
+            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            recovery_disposition: surface::InteractionUnavailableDisposition::FailOperation,
+        };
+        let route = match attachment_id.as_ref() {
+            Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
+                epoch: route_epoch,
+                attachment_id: attachment_id.clone(),
+                grant_token: surface::SurfaceResponseGrantToken::new(random_token_bytes()),
+            },
+            None => surface::BrokerInteractionResponseRoute::Unassigned { epoch: route_epoch },
+        };
+        let public_route = match attachment_id {
+            Some(attachment_id) => surface::SurfaceInteractionRoute::Exclusive {
+                epoch: route_epoch,
+                attachment_id,
+            },
+            None => surface::SurfaceInteractionRoute::Unassigned { epoch: route_epoch },
+        };
+        let view = surface::SurfaceInteractionView {
+            interaction_id: interaction_id.clone(),
+            revision,
+            fence: fence.clone(),
+            kind,
+            request,
+            route: public_route,
+            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
+            recovery_disposition: record.recovery_disposition.clone(),
+        };
+        let mut events = vec![(
+            surface::SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                interaction: view,
+            }),
+        )];
+        if unavailable {
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision: revision,
+                    next_revision: surface::InteractionRevision::try_new(revision.get() + 1)
+                        .expect("interaction revision did not exhaust"),
+                    reason: surface::InteractionCancelReason::CapabilityUnavailable,
+                }),
+            ));
+        }
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(fence, &batch)
+            .map_err(|error| {
+                io::Error::other(format!("failed to commit effect interaction: {error:?}"))
+            })?;
+        if unavailable {
+            active.surface_execution_failure =
+                Some(surface::GenerationExecutionFailureClass::ClientCapabilityUnavailable);
+            return Ok(None);
+        }
+        Ok(Some((interaction_id, record, route, revision)))
+    }
+
+    fn request_surface_tool_approval(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        approval: orca_core::approval_types::ApprovalRequest,
+        request: orca_core::tool_types::ToolRequest,
+        reply: SyncSender<io::Result<orca_core::approval_types::ApprovalResolution>>,
+    ) {
+        let result = (|| -> io::Result<()> {
+            let snapshot = self.resident_surface.coordinator.state().snapshot();
+            let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool)?;
+            let interaction_request = surface::SurfaceInteractionRequest::ToolApproval {
+                tool,
+                description: surface::DisplayText::new(approval.description.clone()),
+                preview: approval.preview.clone().map(surface::DisplayText::new),
+                authority,
+            };
+            let Some((interaction_id, record, route, revision)) = self
+                .commit_surface_effect_interaction_request(
+                    active,
+                    fence,
+                    surface::SurfaceInteractionKind::ToolApproval,
+                    interaction_request,
+                )?
+            else {
+                let _ = reply.send(Ok(orca_core::approval_types::ApprovalResolution {
+                    id: approval.id,
+                    decision: orca_core::approval_types::ApprovalDecision::Deny,
+                    reason: "no runtime surface can answer tool approval".to_string(),
+                }));
+                return Ok(());
+            };
+            self.resident_surface.interactions.insert(
+                interaction_id,
+                ResidentSurfaceInteraction {
+                    record,
+                    route,
+                    revision,
+                    waiter: Some(ResidentInteractionWaiter::ToolApproval {
+                        approval_id: approval.id,
+                        waiter: reply.clone(),
+                    }),
+                    private_response: None,
+                    winning_receipt: None,
+                    resolution_ack: None,
+                    projected_cursor: None,
+                    cancelled: None,
+                },
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    fn request_surface_permission(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: crate::runtime_permission::RuntimePermissionRequest,
+        reply: SyncSender<io::Result<crate::runtime_permission::RuntimePermissionResponse>>,
+    ) {
+        let result = (|| -> io::Result<()> {
+            let snapshot = self.resident_surface.coordinator.state().snapshot();
+            let tool_call_id =
+                surface::SurfaceToolCallId::try_new(request.id.clone()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "empty permission request id")
+                })?;
+            let tool_request = snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.request.tool_call_id == tool_call_id)
+                .map(|tool| tool.request.clone())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "permission interaction lacks a committed provider tool identity",
+                    )
+                })?;
+            let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
+            let generation = operation
+                .generations
+                .iter()
+                .find(|generation| generation.fence == fence)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "generation missing"))?;
+            if tool_request.source_response_id.is_none()
+                || tool_request.turn_id != generation.logical_turn_id
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "permission request is not bound to the current provider tool",
+                ));
+            }
+            let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool_request)?;
+            let permissions = surface_permission_profile_from_runtime(request.permissions.clone())?;
+            let interaction_request = surface::SurfaceInteractionRequest::PermissionRequest {
+                tool_call_id: tool_request.tool_call_id,
+                reason: request.reason.clone().map(surface::DisplayText::new),
+                permissions,
+                authority,
+            };
+            let Some((interaction_id, record, route, revision)) = self
+                .commit_surface_effect_interaction_request(
+                    active,
+                    fence,
+                    surface::SurfaceInteractionKind::PermissionRequest,
+                    interaction_request,
+                )?
+            else {
+                let _ = reply.send(Ok(crate::runtime_permission::RuntimePermissionResponse {
+                    decision: crate::protocol::PermissionResponseDecision::Deny,
+                    scope: crate::protocol::PermissionGrantScope::Turn,
+                    permissions: request.permissions,
+                    strict_auto_review: false,
+                }));
+                return Ok(());
+            };
+            self.resident_surface.interactions.insert(
+                interaction_id,
+                ResidentSurfaceInteraction {
+                    record,
+                    route,
+                    revision,
+                    waiter: Some(ResidentInteractionWaiter::Permission(reply.clone())),
+                    private_response: None,
+                    winning_receipt: None,
+                    resolution_ack: None,
+                    projected_cursor: None,
+                    cancelled: None,
+                },
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
         }
     }
 
@@ -4205,11 +5157,12 @@ impl ThreadActor {
                 surface::SurfaceResponseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                     .expect("generated UUID is v7")
             });
+        let authority = interaction_answer_authority(&interaction.record.request, &answer);
         let response = surface::BoundInteractionResponse::new(
             response_id,
             answer,
             surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            surface::ApplicableAuthorityFingerprint::not_applicable(),
+            authority,
         );
         self.respond_surface_interaction(client, request_id, selector, response)
     }
@@ -4330,6 +5283,48 @@ impl ThreadActor {
                 surface::SurfaceMutationErrorCode::InvalidInput,
                 "interaction answer policy does not match the persisted request",
             ));
+        }
+        if !interaction_answer_authority_matches(
+            &interaction.record.request,
+            response.answer(),
+            response.authority(),
+        ) {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::WrongAuthorityFingerprint,
+                "interaction response authority does not match the persisted request",
+            ));
+        }
+        if let (
+            surface::SurfaceInteractionRequest::PermissionRequest {
+                permissions: requested,
+                ..
+            },
+            surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                decision:
+                    surface::SurfacePermissionClientDecision::Allow {
+                        scope, permissions, ..
+                    },
+            },
+        ) = (&interaction.record.request, response.answer())
+        {
+            if *scope == surface::PermissionGrantScope::Session {
+                return Ok(Self::uncommitted_interaction_response(
+                    request_id,
+                    interaction,
+                    surface::SurfaceMutationErrorCode::InvalidInput,
+                    "session permission grants require runtime settings ownership",
+                ));
+            }
+            if !surface_permission_profile_is_subset(permissions, requested) {
+                return Ok(Self::uncommitted_interaction_response(
+                    request_id,
+                    interaction,
+                    surface::SurfaceMutationErrorCode::InvalidInput,
+                    "permission response exceeds the persisted requested profile",
+                ));
+            }
         }
         if !self
             .resident_surface
@@ -4511,6 +5506,70 @@ impl ThreadActor {
             .waiter;
         if let Some(waiter) = waiter {
             match (waiter, winner_answer) {
+                (
+                    ResidentInteractionWaiter::ToolApproval {
+                        approval_id,
+                        waiter,
+                    },
+                    surface::SurfaceClientInteractionAnswer::ToolApproval { decision },
+                ) => {
+                    let (decision, reason) = match decision {
+                        surface::SurfaceAllowDeny::Allow => (
+                            orca_core::approval_types::ApprovalDecision::Allow,
+                            "approved through runtime surface",
+                        ),
+                        surface::SurfaceAllowDeny::Deny => (
+                            orca_core::approval_types::ApprovalDecision::Deny,
+                            "denied through runtime surface",
+                        ),
+                    };
+                    let _ = waiter.send(Ok(orca_core::approval_types::ApprovalResolution {
+                        id: approval_id,
+                        decision,
+                        reason: reason.to_string(),
+                    }));
+                }
+                (
+                    ResidentInteractionWaiter::Permission(waiter),
+                    surface::SurfaceClientInteractionAnswer::PermissionRequest { decision },
+                ) => {
+                    let (decision, scope, permissions, strict_auto_review) = match decision {
+                        surface::SurfacePermissionClientDecision::Allow {
+                            scope,
+                            permissions,
+                            strict_auto_review,
+                        } => (
+                            crate::protocol::PermissionResponseDecision::Allow,
+                            scope,
+                            permissions,
+                            strict_auto_review,
+                        ),
+                        surface::SurfacePermissionClientDecision::Deny {
+                            scope,
+                            permissions,
+                            strict_auto_review,
+                        } => (
+                            crate::protocol::PermissionResponseDecision::Deny,
+                            scope,
+                            permissions,
+                            strict_auto_review,
+                        ),
+                    };
+                    let scope = match scope {
+                        surface::PermissionGrantScope::Turn => {
+                            crate::protocol::PermissionGrantScope::Turn
+                        }
+                        surface::PermissionGrantScope::Session => {
+                            crate::protocol::PermissionGrantScope::Session
+                        }
+                    };
+                    let _ = waiter.send(Ok(crate::runtime_permission::RuntimePermissionResponse {
+                        decision,
+                        scope,
+                        permissions: runtime_permission_profile_from_surface(permissions),
+                        strict_auto_review: *strict_auto_review,
+                    }));
+                }
                 (
                     ResidentInteractionWaiter::UserInput(waiter),
                     surface::SurfaceClientInteractionAnswer::UserInput { decision },
@@ -4701,6 +5760,18 @@ impl ThreadActor {
                 .waiter;
             if let Some(waiter) = waiter {
                 match waiter {
+                    ResidentInteractionWaiter::ToolApproval { waiter, .. } => {
+                        let _ = waiter.send(Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "tool approval was cancelled before resolution",
+                        )));
+                    }
+                    ResidentInteractionWaiter::Permission(waiter) => {
+                        let _ = waiter.send(Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "permission request was cancelled before resolution",
+                        )));
+                    }
                     ResidentInteractionWaiter::UserInput(waiter) => {
                         let _ = waiter.send(Ok(None));
                     }
@@ -4863,6 +5934,18 @@ impl ThreadActor {
         }
         for waiter in cancelled_waiters {
             match waiter {
+                ResidentInteractionWaiter::ToolApproval { waiter, .. } => {
+                    let _ = waiter.send(Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "tool approval capability became unavailable",
+                    )));
+                }
+                ResidentInteractionWaiter::Permission(waiter) => {
+                    let _ = waiter.send(Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "permission capability became unavailable",
+                    )));
+                }
                 ResidentInteractionWaiter::UserInput(waiter) => {
                     let _ = waiter.send(Ok(None));
                 }
@@ -5655,6 +6738,20 @@ impl ThreadActor {
         let mut hosted_request = HostedTurnRequest::new(resolved_input.canonical_text.as_str())
             .with_generation_handlers(move |_, _| {
                 HostedGenerationHandlers::default()
+                    .with_provider_response_ingress(Arc::new(
+                        RuntimeSurfaceProviderResponseIngress {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        },
+                    ))
+                    .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
+                    .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
                     .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
@@ -6650,6 +7747,24 @@ impl ThreadActor {
                 ThreadCommand::SurfaceWaitOperationTerminal { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
+                ThreadCommand::SurfaceRequestToolApproval { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
+                ThreadCommand::SurfaceRequestPermission { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceRequestUserInput { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -6791,6 +7906,24 @@ impl ThreadActor {
                 } else {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
+            }
+            ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceRequestToolApproval { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceRequestPermission { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
             }
             ThreadCommand::SurfaceRequestUserInput { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
@@ -7144,6 +8277,29 @@ impl ThreadActor {
                 } else {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
+            }
+            ThreadCommand::SurfaceCommitProviderResponse {
+                fence,
+                response,
+                reply,
+            } => {
+                let result = self.commit_surface_provider_response(active, fence, &response);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRequestToolApproval {
+                fence,
+                approval,
+                request,
+                reply,
+            } => {
+                self.request_surface_tool_approval(active, fence, approval, request, reply);
+            }
+            ThreadCommand::SurfaceRequestPermission {
+                fence,
+                request,
+                reply,
+            } => {
+                self.request_surface_permission(active, fence, request, reply);
             }
             ThreadCommand::SurfaceRequestUserInput {
                 fence,

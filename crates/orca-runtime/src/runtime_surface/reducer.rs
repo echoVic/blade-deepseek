@@ -3771,6 +3771,29 @@ fn apply_tool_patch(
                 )
             })?;
             require_event_scope_owns_generation(snapshot, envelope, &fence)?;
+            if let Some(source_response_id) = request.source_response_id.as_ref() {
+                let paired = batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response })
+                            if &response.response_id == source_response_id
+                                && response.turn_id == request.turn_id
+                                && response.tool_calls.iter().any(|raw_call| {
+                                    raw_call.id == request.tool_call_id
+                                        && raw_call.name == request.name
+                                        && raw_call.raw_arguments == request.raw_arguments
+                                        && raw_call.arguments_digest == request.arguments_digest
+                                })
+                    )
+                });
+                if !paired {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::InvalidOrdering,
+                        "provider tool request lacks its matching response in the same batch",
+                    ));
+                }
+            }
             if snapshot
                 .tools
                 .iter()
@@ -4231,8 +4254,16 @@ fn interaction_authority_matches(
                 && authority.policy_epoch() == *policy_epoch
                 && authority.tool_digest() == tool_schema_digest
         }
-        Replayability::NonReplayable { .. } => true,
+        Replayability::NonReplayable { .. } => false,
     }
+}
+
+fn interaction_tool_authority_matches(
+    tool: &SurfaceToolRequest,
+    authority: &AuthorityFingerprint,
+) -> bool {
+    authority.executable_generation() == &sha256(&serde_json::to_vec(tool).unwrap_or_default())
+        && authority.artifact_generation() == &tool.arguments_digest
 }
 
 fn interaction_tool_matches(
@@ -4263,6 +4294,7 @@ fn interaction_request_matches_snapshot(
         } => {
             interaction_tool_matches(snapshot, &interaction.fence, tool)
                 && interaction_authority_matches(snapshot, &interaction.fence, authority)
+                && interaction_tool_authority_matches(tool, authority)
         }
         SurfaceInteractionRequest::PermissionRequest {
             tool_call_id,
@@ -4276,6 +4308,7 @@ fn interaction_request_matches_snapshot(
                 generation_fence_for_turn(snapshot, &tool.request.turn_id).as_ref()
                     == Some(&interaction.fence)
                     && interaction_authority_matches(snapshot, &interaction.fence, authority)
+                    && interaction_tool_authority_matches(&tool.request, authority)
             }),
         SurfaceInteractionRequest::BackgroundApproval {
             task,
@@ -4285,6 +4318,7 @@ fn interaction_request_matches_snapshot(
             interaction_task_fence_matches(snapshot, task)
                 && interaction_tool_matches(snapshot, &interaction.fence, tool)
                 && interaction_authority_matches(snapshot, &interaction.fence, authority)
+                && interaction_tool_authority_matches(tool, authority)
         }
         SurfaceInteractionRequest::UserInput { .. }
         | SurfaceInteractionRequest::McpElicitation { .. } => true,
@@ -8118,6 +8152,100 @@ pub(crate) mod tests {
                     kind: SurfaceInteractionKind::ToolApproval,
                     request: SurfaceInteractionRequest::ToolApproval {
                         tool: forged_tool,
+                        description: DisplayText::new("run tests"),
+                        preview: None,
+                        authority,
+                    },
+                    route: SurfaceInteractionRoute::Unassigned {
+                        epoch: ResponseRouteEpoch::try_new(1).unwrap(),
+                    },
+                    lifecycle: SurfaceInteractionLifecycle::Requested,
+                    recovery_disposition: InteractionUnavailableDisposition::FailOperation,
+                },
+            }),
+        );
+
+        assert!(matches!(
+            reduce_batch(SurfaceReduceMode::Live, &initial, &invalid),
+            SurfaceReduceResult::Rejected {
+                error: SurfaceReducerError {
+                    code: SurfaceReducerErrorCode::IllegalTransition,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_approval_rejects_a_wrong_executable_authority_generation() {
+        let mut operation = started_operation();
+        let request_digest = digest(57);
+        let tool_schema_digest = digest(58);
+        let cwd = reducer_snapshot().settings.effective.cwd.clone();
+        let workspace_roots = vec![cwd.clone()];
+        let replayability = Replayability::Replayable {
+            capsule_digest: digest(59),
+            request: None,
+            request_digest: Some(request_digest.clone()),
+            cwd: cwd.clone(),
+            workspace_roots: workspace_roots.clone(),
+            settings_revision: SettingsRevision::try_new(1).unwrap(),
+            policy_epoch: operation.intent.policy_epoch,
+            tool_schema_digest: tool_schema_digest.clone(),
+        };
+        operation.intent.initial_replayability = replayability.clone();
+        operation.generations[0].replayability = replayability;
+        let generation = operation.generations[0].clone();
+        let tool = SurfaceToolRequest {
+            tool_call_id: SurfaceToolCallId::try_new("persisted-effect").unwrap(),
+            source_response_id: None,
+            turn_id: generation.logical_turn_id.clone(),
+            name: NonEmptyText::try_new("bash").unwrap(),
+            action: SurfaceToolAction::Shell,
+            target: Some(DisplayText::new("cargo test")),
+            raw_arguments: DisplayText::new("{}"),
+            arguments_digest: digest(60),
+        };
+        let authority = AuthorityFingerprint::new(
+            operation.operation_id.clone(),
+            request_digest,
+            tool_schema_digest,
+            cwd,
+            sha256(&serde_json::to_vec(&workspace_roots).unwrap()),
+            operation.intent.policy_epoch,
+            digest(61),
+            tool.arguments_digest.clone(),
+            generation.capability_fingerprint.clone(),
+        );
+        let mut snapshot = reducer_snapshot();
+        snapshot.foreground_operation = Some(operation);
+        snapshot.tools.push(SurfaceToolView {
+            request: tool.clone(),
+            state: SurfaceToolViewState::Requested,
+            arguments_bytes: ByteCount::new(2),
+            output_bytes: ByteCount::new(0),
+            streamed_output: DisplayText::new(""),
+            streamed_output_truncated: false,
+            result: None,
+            capability_calls: Vec::new(),
+            terminal_leases: Vec::new(),
+        });
+        let initial = SurfaceReducerState::new(snapshot);
+        let invalid = reducer_batch(
+            &initial,
+            63,
+            SurfaceScope::Generation {
+                fence: generation.fence.clone(),
+            },
+            SurfaceEvent::Interaction(InteractionPatch::Requested {
+                interaction: SurfaceInteractionView {
+                    interaction_id: SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(64))
+                        .unwrap(),
+                    revision: InteractionRevision::try_new(1).unwrap(),
+                    fence: generation.fence,
+                    kind: SurfaceInteractionKind::ToolApproval,
+                    request: SurfaceInteractionRequest::ToolApproval {
+                        tool,
                         description: DisplayText::new("run tests"),
                         preview: None,
                         authority,
