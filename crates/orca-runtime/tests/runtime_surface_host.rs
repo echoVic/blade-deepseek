@@ -44,6 +44,35 @@ fn closed_host_facade_starts_a_typed_thread_surface() {
     host.shutdown().expect("shutdown runtime host");
 }
 
+#[test]
+fn thread_facade_issues_a_distinct_acp_surface_authority() {
+    let cwd = tempdir().expect("temp cwd");
+    let host = RuntimeHost::start().expect("runtime host");
+    let thread = host
+        .surface_handle()
+        .start_thread(test_config(cwd.path().to_path_buf()), "ACP facade")
+        .expect("typed thread");
+    let surface = thread.acp_surface().expect("ACP surface");
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Acp,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("unexpected ACP attachment result"),
+    };
+    assert_eq!(
+        attachment.capabilities.grant.role,
+        SurfaceAttachmentRole::Acp
+    );
+    host.shutdown().expect("shutdown runtime host");
+}
+
 fn test_config(cwd: std::path::PathBuf) -> RunConfig {
     RunConfig {
         app_version: "test".to_string(),

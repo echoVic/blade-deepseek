@@ -1751,6 +1751,33 @@ impl RuntimeThreadHandle {
         self.surface.clone()
     }
 
+    pub(crate) fn acp_surface(&self) -> Option<surface::RuntimeSurfaceHandle> {
+        let authority = surface::SurfaceAttachAuthority::new(
+            self.surface.host_incarnation().clone(),
+            self.surface.thread_id().clone(),
+            surface::SurfaceAttachmentRole::Acp,
+            surface::NonEmptySet::try_new(BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::RespondGrantedInteraction,
+                surface::SurfaceCapability::RepairThread,
+            ]))
+            .expect("ACP surface grant is non-empty"),
+            surface::NonEmptySet::try_new(BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+            ]))
+            .expect("ACP surface required grant is non-empty"),
+            BTreeSet::from([
+                surface::SurfaceInteractionKind::ToolApproval,
+                surface::SurfaceInteractionKind::PermissionRequest,
+                surface::SurfaceInteractionKind::UserInput,
+                surface::SurfaceInteractionKind::McpElicitation,
+            ]),
+        );
+        self.surface.with_authority(authority)
+    }
+
     pub fn start_turn<W>(
         &self,
         request: HostedTurnRequest,

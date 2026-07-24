@@ -45,6 +45,10 @@ impl RuntimeSurfaceThreadHandle {
     pub fn surface(&self) -> RuntimeSurfaceHandle {
         self.runtime.surface()
     }
+
+    pub fn acp_surface(&self) -> Option<RuntimeSurfaceHandle> {
+        self.runtime.acp_surface()
+    }
 }
 
 impl RuntimeThreadHandle {

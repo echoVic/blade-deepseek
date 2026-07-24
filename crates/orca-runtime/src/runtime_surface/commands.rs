@@ -3275,6 +3275,11 @@ impl RuntimeSurfaceHandle {
     pub(crate) fn authority(&self) -> &SurfaceAttachAuthority {
         &self.authority
     }
+
+    pub(crate) fn with_authority(&self, authority: SurfaceAttachAuthority) -> Option<Self> {
+        let hub = self.hub.as_ref()?.with_authority(authority).ok()?;
+        Some(Self::from_hub(hub))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

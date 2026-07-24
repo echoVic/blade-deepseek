@@ -214,6 +214,38 @@ impl SurfaceHub {
         self
     }
 
+    pub(crate) fn with_authority(
+        &self,
+        authority: SurfaceAttachAuthority,
+    ) -> Result<Self, SurfaceHubCreateError> {
+        let maximum_capabilities = authority.maximum_capabilities();
+        let required_capabilities = authority.required_capabilities();
+        if !required_capabilities
+            .as_set()
+            .is_subset(maximum_capabilities.as_set())
+        {
+            return Err(SurfaceHubCreateError::RequiredCapabilitiesExceedMaximum);
+        }
+        if !required_capabilities
+            .as_set()
+            .contains(&SurfaceCapability::ReadSnapshot)
+        {
+            return Err(SurfaceHubCreateError::ReadSnapshotNotRequired);
+        }
+        if authority.thread_id() != &self.thread_id()
+            || authority.host_incarnation() != self.authority.host_incarnation()
+        {
+            return Err(SurfaceHubCreateError::WrongThread);
+        }
+        Ok(Self {
+            inner: self.inner.clone(),
+            authority,
+            scope: self.scope.clone(),
+            config: self.config,
+            dispatcher: self.dispatcher.clone(),
+        })
+    }
+
     pub fn attach_fresh(&self, request: FreshAttachRequest) -> AttachResult {
         let mut state = lock(&self.inner);
         if !state.ready {
