@@ -14,12 +14,16 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, Error, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ProtocolVersion, SessionId, SessionNotification, SessionUpdate, StopReason,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
+    SessionNotification, SessionUpdate, StopReason, ToolCallId, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::event_sink::EventObserver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::runtime_host::{
     HostedTurnRequest, OperationHandle, OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle,
@@ -28,10 +32,12 @@ use crate::runtime_host::{
 use crate::surface::{
     AssistantPatch, AttachResult, DisplayText, FreshAttachRequest, MutationReply, NonEmptyText,
     NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
-    OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
-    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle,
-    SurfaceAttachmentRole, SurfaceCapability, SurfaceEvent, SurfaceInputRequest,
-    SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId, SurfaceRequestId,
+    OperationSettingsPreparation, OperationTerminal, PermissionGrantScope, ReplayabilityRequest,
+    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SurfaceAllowDeny,
+    SurfaceAttachmentRole, SurfaceCapability, SurfaceClientInteractionAnswer, SurfaceEvent,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceInteractionRequest, SurfaceInteractionView, SurfaceOperationId,
+    SurfacePermissionClientDecision, SurfacePermissionProfile, SurfaceRequestId,
     SurfaceSubscriptionItem, ToolPatch, WaitOperationTerminalResult,
 };
 
@@ -79,6 +85,39 @@ pub struct OrcaAcpAgent {
     base_config: RunConfig,
     note_tx: UnboundedSender<SessionNotification>,
     state: Rc<RefCell<AgentState>>,
+    client_bridge: Option<Arc<AcpClientBridge>>,
+}
+
+pub(crate) struct AcpClientBridge {
+    request_tx: UnboundedSender<AcpPermissionRequest>,
+}
+
+pub(crate) struct AcpPermissionRequest {
+    pub request: RequestPermissionRequest,
+    pub reply: std_mpsc::SyncSender<Result<RequestPermissionResponse, String>>,
+}
+
+impl AcpClientBridge {
+    pub(crate) fn new() -> (Arc<Self>, UnboundedReceiver<AcpPermissionRequest>) {
+        let (request_tx, request_rx) = unbounded_channel();
+        (Arc::new(Self { request_tx }), request_rx)
+    }
+
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, String> {
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.request_tx
+            .send(AcpPermissionRequest {
+                request,
+                reply: reply_tx,
+            })
+            .map_err(|_| "ACP client permission bridge is closed".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "ACP client permission response was dropped")?
+    }
 }
 
 impl OrcaAcpAgent {
@@ -93,6 +132,7 @@ impl OrcaAcpAgent {
             base_config,
             note_tx,
             state: Rc::new(RefCell::new(AgentState::default())),
+            client_bridge: None,
         }
     }
 
@@ -107,7 +147,13 @@ impl OrcaAcpAgent {
             base_config,
             note_tx,
             state: Rc::new(RefCell::new(AgentState::default())),
+            client_bridge: None,
         }
+    }
+
+    pub(crate) fn with_client_bridge(mut self, bridge: Arc<AcpClientBridge>) -> Self {
+        self.client_bridge = Some(bridge);
+        self
     }
 
     /// Builds a per-session config from the base config with the session cwd
@@ -131,8 +177,9 @@ impl OrcaAcpAgent {
         let prompt = flatten_prompt(&args.prompt)
             .map_err(|message| Error::invalid_params().data(message))?;
         let session_id = args.session_id.clone();
+        let client_bridge = self.client_bridge.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            prepare_surface_prompt(&surface, &session_id, &prompt)
+            prepare_surface_prompt(&surface, &session_id, &prompt, client_bridge)
         })
         .await
         .map_err(Error::into_internal_error)?
@@ -176,6 +223,7 @@ struct PreparedSurfacePrompt {
     client: RuntimeSurfaceClientHandle,
     operation_id: SurfaceOperationId,
     subscription: crate::surface::SurfaceSubscriptionReceiver,
+    client_bridge: Option<Arc<AcpClientBridge>>,
 }
 
 /// Flattens ACP content blocks into a single prompt string.
@@ -270,6 +318,7 @@ fn prepare_surface_prompt(
     surface: &RuntimeSurfaceHandle,
     session_id: &SessionId,
     prompt: &str,
+    client_bridge: Option<Arc<AcpClientBridge>>,
 ) -> Result<PreparedSurfacePrompt, String> {
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
@@ -352,6 +401,115 @@ fn prepare_surface_prompt(
         client: attachment.client,
         operation_id,
         subscription,
+        client_bridge,
+    })
+}
+
+#[derive(Clone)]
+enum AcpPermissionTarget {
+    ToolApproval,
+    PermissionRequest {
+        permissions: SurfacePermissionProfile,
+    },
+}
+
+fn build_permission_request(
+    session_id: &SessionId,
+    interaction: &SurfaceInteractionView,
+) -> Result<(RequestPermissionRequest, AcpPermissionTarget), String> {
+    let (tool_call_id, title, target) = match &interaction.request {
+        SurfaceInteractionRequest::ToolApproval {
+            tool, description, ..
+        } => (
+            tool.tool_call_id.as_str().to_string(),
+            description.as_str().to_string(),
+            AcpPermissionTarget::ToolApproval,
+        ),
+        SurfaceInteractionRequest::PermissionRequest {
+            tool_call_id,
+            permissions,
+            ..
+        } => (
+            tool_call_id.as_str().to_string(),
+            "Permission requested".to_string(),
+            AcpPermissionTarget::PermissionRequest {
+                permissions: permissions.clone(),
+            },
+        ),
+        SurfaceInteractionRequest::UserInput { .. }
+        | SurfaceInteractionRequest::McpElicitation { .. }
+        | SurfaceInteractionRequest::BackgroundApproval { .. } => {
+            return Err("ACP client bridge does not support this interaction kind".to_string());
+        }
+    };
+    let fields = ToolCallUpdateFields::new().title(title);
+    let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id), fields);
+    let options = vec![
+        PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
+        PermissionOption::new(
+            "allow_always",
+            "Allow for session",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            "reject_once",
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            "reject_always",
+            "Reject for session",
+            PermissionOptionKind::RejectAlways,
+        ),
+    ];
+    Ok((
+        RequestPermissionRequest::new(session_id.clone(), tool_call, options),
+        target,
+    ))
+}
+
+fn permission_answer(
+    response: RequestPermissionResponse,
+    target: AcpPermissionTarget,
+) -> Result<SurfaceClientInteractionAnswer, String> {
+    let (allow, scope) = match response.outcome {
+        RequestPermissionOutcome::Cancelled => (false, PermissionGrantScope::Turn),
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
+            match option_id.to_string().as_str() {
+                "allow_once" => (true, PermissionGrantScope::Turn),
+                "allow_always" => (true, PermissionGrantScope::Session),
+                "reject_once" => (false, PermissionGrantScope::Turn),
+                "reject_always" => (false, PermissionGrantScope::Session),
+                other => return Err(format!("unknown ACP permission option '{other}'")),
+            }
+        }
+        _ => return Err("unsupported ACP permission outcome".to_string()),
+    };
+    Ok(match target {
+        AcpPermissionTarget::ToolApproval => SurfaceClientInteractionAnswer::ToolApproval {
+            decision: if allow {
+                SurfaceAllowDeny::Allow
+            } else {
+                SurfaceAllowDeny::Deny
+            },
+        },
+        AcpPermissionTarget::PermissionRequest { permissions } => {
+            SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: if allow {
+                    SurfacePermissionClientDecision::Allow {
+                        scope,
+                        permissions,
+                        strict_auto_review: false,
+                    }
+                } else {
+                    SurfacePermissionClientDecision::Deny {
+                        scope,
+                        permissions,
+                        strict_auto_review: false,
+                    }
+                },
+            }
+        }
     })
 }
 
@@ -376,7 +534,12 @@ fn drain_surface_prompt(
                 SurfaceSubscriptionItem::Batch { batch } => {
                     last_cursor = Some(batch.cursor_after.clone());
                     for envelope in batch.events.as_slice() {
-                        emit_surface_event(&session_id, &note_tx, &envelope.event);
+                        project_surface_event(
+                            &mut prepared,
+                            &session_id,
+                            &note_tx,
+                            &envelope.event,
+                        )?;
                     }
                 }
                 SurfaceSubscriptionItem::Gap { .. } => {
@@ -411,7 +574,12 @@ fn drain_surface_prompt(
                         SurfaceSubscriptionItem::Batch { batch } => {
                             reached_terminal_cursor = batch.cursor_after == terminal_cursor;
                             for envelope in batch.events.as_slice() {
-                                emit_surface_event(&session_id, &note_tx, &envelope.event);
+                                project_surface_event(
+                                    &mut prepared,
+                                    &session_id,
+                                    &note_tx,
+                                    &envelope.event,
+                                )?;
                             }
                         }
                         SurfaceSubscriptionItem::Gap { .. } => {
@@ -504,6 +672,43 @@ fn emit_surface_event(
     if let Some(update) = update {
         let _ = note_tx.send(SessionNotification::new(session_id.clone(), update));
     }
+}
+
+fn project_surface_event(
+    prepared: &mut PreparedSurfacePrompt,
+    session_id: &SessionId,
+    note_tx: &UnboundedSender<SessionNotification>,
+    event: &SurfaceEvent,
+) -> Result<(), String> {
+    if let SurfaceEvent::Interaction(crate::surface::InteractionPatch::Requested { interaction }) =
+        event
+    {
+        let Some(bridge) = prepared.client_bridge.as_ref() else {
+            let _ = prepared
+                .client
+                .cancel_operation(SurfaceRequestId::new(), prepared.operation_id.clone());
+            return Err("ACP interaction requires a connected client bridge".to_string());
+        };
+        let (request, target) = build_permission_request(session_id, interaction)?;
+        let response = bridge.request_permission(request)?;
+        let answer = permission_answer(response, target)?;
+        match prepared.client.respond_interaction_by_id(
+            SurfaceRequestId::new(),
+            interaction.interaction_id.clone(),
+            answer,
+        ) {
+            Ok(MutationReply::Committed { .. }) => {}
+            Ok(MutationReply::Deferred { .. }) => {
+                return Err("ACP interaction response was deferred".to_string());
+            }
+            Ok(MutationReply::Uncommitted { .. }) => {
+                return Err("ACP interaction response did not commit".to_string());
+            }
+            Err(error) => return Err(format!("ACP interaction response failed: {error:?}")),
+        }
+    }
+    emit_surface_event(session_id, note_tx, event);
+    Ok(())
 }
 
 /// Resolves the ACP stop reason from a completed operation, honoring an
