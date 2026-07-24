@@ -5,11 +5,12 @@
 //! projected to `session/update` notifications via [`event_map`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
@@ -17,8 +18,8 @@ use agent_client_protocol::{
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification, SessionUpdate, StopReason, ToolCallId, ToolCallUpdate,
-    ToolCallUpdateFields,
+    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::event_sink::EventObserver;
@@ -30,19 +31,19 @@ use crate::runtime_host::{
     RuntimeThreadStartRequest,
 };
 use crate::surface::{
-    AssistantPatch, AttachResult, DisplayText, FreshAttachRequest, MutationReply, NonEmptyText,
-    NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
+    AcpRequestId, AssistantPatch, AttachResult, DisplayText, FreshAttachRequest, MutationReply,
+    NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
     OperationSettingsPreparation, OperationTerminal, PermissionGrantScope, ReplayabilityRequest,
-    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SurfaceAllowDeny,
-    SurfaceAttachmentRole, SurfaceCapability, SurfaceClientInteractionAnswer, SurfaceEvent,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
+    SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceClientInteractionAnswer,
+    SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
     SurfaceInteractionRequest, SurfaceInteractionView, SurfaceOperationId,
     SurfacePermissionClientDecision, SurfacePermissionProfile, SurfaceRequestId,
-    SurfaceSubscriptionItem, ToolPatch, WaitOperationTerminalResult,
+    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch, WaitOperationTerminalResult,
 };
 
 use super::event_map;
-use crate::runtime_surface::SurfaceItem;
+use crate::runtime_surface::{SurfaceItem, SurfaceToolAction};
 
 /// Per-session runtime state held on the single-threaded ACP task.
 struct SessionEntry {
@@ -52,6 +53,7 @@ struct SessionEntry {
     current_op: Option<Arc<OperationHandle>>,
     current_surface_op: Option<(RuntimeSurfaceClientHandle, SurfaceOperationId)>,
     cancel_requested: bool,
+    next_prompt_seq: u64,
 }
 
 #[derive(Default)]
@@ -90,33 +92,161 @@ pub struct OrcaAcpAgent {
 
 pub(crate) struct AcpClientBridge {
     request_tx: UnboundedSender<AcpPermissionRequest>,
+    state: Mutex<AcpClientBridgeState>,
+    next_key: AtomicU64,
+}
+
+struct AcpClientBridgeState {
+    pending: HashMap<
+        String,
+        std_mpsc::SyncSender<Result<RequestPermissionResponse, AcpPermissionWaitError>>,
+    >,
+    cancelled_sessions: HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AcpPermissionWaitError {
+    Cancelled,
+    BridgeClosed,
+    ResponseDropped,
+    Client(String),
 }
 
 pub(crate) struct AcpPermissionRequest {
     pub request: RequestPermissionRequest,
-    pub reply: std_mpsc::SyncSender<Result<RequestPermissionResponse, String>>,
+    pub key: String,
 }
 
 impl AcpClientBridge {
     pub(crate) fn new() -> (Arc<Self>, UnboundedReceiver<AcpPermissionRequest>) {
         let (request_tx, request_rx) = unbounded_channel();
-        (Arc::new(Self { request_tx }), request_rx)
+        (
+            Arc::new(Self {
+                request_tx,
+                state: Mutex::new(AcpClientBridgeState {
+                    pending: HashMap::new(),
+                    cancelled_sessions: HashSet::new(),
+                }),
+                next_key: AtomicU64::new(1),
+            }),
+            request_rx,
+        )
     }
 
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
-    ) -> Result<RequestPermissionResponse, String> {
+    ) -> Result<RequestPermissionResponse, AcpPermissionWaitError> {
+        let key = format!(
+            "{}\0{}",
+            request.session_id,
+            self.next_key.fetch_add(1, Ordering::Relaxed)
+        );
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        let session_id = request.session_id.to_string();
+        let mut state = self
+            .state
+            .lock()
+            .expect("ACP permission bridge mutex is not poisoned");
+        if state.cancelled_sessions.contains(&session_id) {
+            return Err(AcpPermissionWaitError::Cancelled);
+        }
+        state.pending.insert(key.clone(), reply_tx);
+        drop(state);
         self.request_tx
             .send(AcpPermissionRequest {
                 request,
-                reply: reply_tx,
+                key: key.clone(),
             })
-            .map_err(|_| "ACP client permission bridge is closed".to_string())?;
-        reply_rx
+            .map_err(|_| {
+                self.state
+                    .lock()
+                    .expect("ACP permission bridge mutex is not poisoned")
+                    .pending
+                    .remove(&key);
+                AcpPermissionWaitError::BridgeClosed
+            })?;
+        let result = reply_rx
             .recv()
-            .map_err(|_| "ACP client permission response was dropped")?
+            .map_err(|_| AcpPermissionWaitError::ResponseDropped)?;
+        self.state
+            .lock()
+            .expect("ACP permission bridge mutex is not poisoned")
+            .pending
+            .remove(&key);
+        result
+    }
+
+    pub(crate) fn begin_session(&self, session_id: &SessionId) {
+        self.state
+            .lock()
+            .expect("ACP permission bridge mutex is not poisoned")
+            .cancelled_sessions
+            .remove(&session_id.to_string());
+    }
+
+    pub(crate) fn cancel_session(&self, session_id: &SessionId) {
+        let prefix = format!("{}\0", session_id);
+        let pending = {
+            let mut pending = self
+                .state
+                .lock()
+                .expect("ACP permission bridge mutex is not poisoned");
+            pending.cancelled_sessions.insert(session_id.to_string());
+            let keys = pending
+                .pending
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| pending.pending.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for reply in pending {
+            let _ = reply.send(Err(AcpPermissionWaitError::Cancelled));
+        }
+    }
+
+    pub(crate) fn complete_permission(
+        &self,
+        key: &str,
+        result: Result<RequestPermissionResponse, AcpPermissionWaitError>,
+    ) {
+        let reply = self
+            .state
+            .lock()
+            .expect("ACP permission bridge mutex is not poisoned")
+            .pending
+            .remove(key);
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
+        }
+    }
+
+    pub(crate) fn is_pending(&self, key: &str) -> bool {
+        self.state
+            .lock()
+            .expect("ACP permission bridge mutex is not poisoned")
+            .pending
+            .contains_key(key)
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        let pending = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("ACP permission bridge mutex is not poisoned");
+            state
+                .pending
+                .drain()
+                .map(|(_, reply)| reply)
+                .collect::<Vec<_>>()
+        };
+        for reply in pending {
+            let _ = reply.send(Err(AcpPermissionWaitError::Cancelled));
+        }
     }
 }
 
@@ -174,12 +304,25 @@ impl OrcaAcpAgent {
         args: PromptRequest,
         surface: RuntimeSurfaceHandle,
     ) -> Result<PromptResponse, Error> {
+        if let Some(bridge) = self.client_bridge.as_ref() {
+            bridge.begin_session(&args.session_id);
+        }
         let prompt = flatten_prompt(&args.prompt)
             .map_err(|message| Error::invalid_params().data(message))?;
         let session_id = args.session_id.clone();
         let client_bridge = self.client_bridge.clone();
+        let inbound_seq = {
+            let mut state = self.state.borrow_mut();
+            let entry = state
+                .sessions
+                .get_mut(&args.session_id)
+                .ok_or_else(Error::invalid_params)?;
+            let sequence = entry.next_prompt_seq;
+            entry.next_prompt_seq = entry.next_prompt_seq.saturating_add(1);
+            sequence
+        };
         let prepared = tokio::task::spawn_blocking(move || {
-            prepare_surface_prompt(&surface, &session_id, &prompt, client_bridge)
+            prepare_surface_prompt(&surface, &session_id, &prompt, inbound_seq, client_bridge)
         })
         .await
         .map_err(Error::into_internal_error)?
@@ -214,7 +357,17 @@ impl OrcaAcpAgent {
         let result = result
             .map_err(Error::into_internal_error)?
             .map_err(|message| Error::internal_error().data(message))?;
-        Ok(PromptResponse::new(result))
+        let cancelled = self
+            .state
+            .borrow()
+            .sessions
+            .get(&args.session_id)
+            .is_some_and(|entry| entry.cancel_requested);
+        Ok(PromptResponse::new(if cancelled {
+            StopReason::Cancelled
+        } else {
+            result
+        }))
     }
 }
 
@@ -224,6 +377,82 @@ struct PreparedSurfacePrompt {
     operation_id: SurfaceOperationId,
     subscription: crate::surface::SurfaceSubscriptionReceiver,
     client_bridge: Option<Arc<AcpClientBridge>>,
+    tool_outputs: HashMap<String, ToolOutputAccumulator>,
+    detached: bool,
+}
+
+#[derive(Default)]
+struct ToolOutputAccumulator {
+    text: String,
+    next_offset: u64,
+}
+
+impl PreparedSurfacePrompt {
+    fn detach_once(&mut self) {
+        if self.detached {
+            return;
+        }
+        let _ = self.surface.detach(
+            &self.client,
+            crate::surface::DetachRequest {
+                request_id: SurfaceRequestId::new(),
+            },
+        );
+        self.detached = true;
+    }
+}
+
+impl Drop for PreparedSurfacePrompt {
+    fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
+        let _ = self
+            .client
+            .cancel_operation(SurfaceRequestId::new(), self.operation_id.clone());
+        self.detach_once();
+    }
+}
+
+struct SurfaceAttachmentGuard<'a> {
+    surface: &'a RuntimeSurfaceHandle,
+    client: RuntimeSurfaceClientHandle,
+    operation_id: Option<SurfaceOperationId>,
+    armed: bool,
+}
+
+impl<'a> SurfaceAttachmentGuard<'a> {
+    fn new(surface: &'a RuntimeSurfaceHandle, client: RuntimeSurfaceClientHandle) -> Self {
+        Self {
+            surface,
+            client,
+            operation_id: None,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SurfaceAttachmentGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(operation_id) = self.operation_id.take() {
+            let _ = self
+                .client
+                .cancel_operation(SurfaceRequestId::new(), operation_id);
+        }
+        let _ = self.surface.detach(
+            &self.client,
+            crate::surface::DetachRequest {
+                request_id: SurfaceRequestId::new(),
+            },
+        );
+    }
 }
 
 /// Flattens ACP content blocks into a single prompt string.
@@ -318,6 +547,7 @@ fn prepare_surface_prompt(
     surface: &RuntimeSurfaceHandle,
     session_id: &SessionId,
     prompt: &str,
+    inbound_seq: u64,
     client_bridge: Option<Arc<AcpClientBridge>>,
 ) -> Result<PreparedSurfacePrompt, String> {
     let attachment = match surface.attach_fresh(FreshAttachRequest {
@@ -332,8 +562,6 @@ fn prepare_surface_prompt(
         interaction_capabilities: std::collections::BTreeSet::from([
             SurfaceInteractionKind::ToolApproval,
             SurfaceInteractionKind::PermissionRequest,
-            SurfaceInteractionKind::UserInput,
-            SurfaceInteractionKind::McpElicitation,
         ]),
     }) {
         AttachResult::FreshAttached { attachment } => attachment,
@@ -346,6 +574,7 @@ fn prepare_surface_prompt(
             return Err("ACP surface attachment unavailable".to_string());
         }
     };
+    let mut cleanup = SurfaceAttachmentGuard::new(surface, attachment.client.clone());
     let subscription = surface
         .claim_subscription(&attachment.subscription)
         .ok_or_else(|| "ACP surface subscription unavailable".to_string())?;
@@ -358,9 +587,10 @@ fn prepare_surface_prompt(
     let intent = OperationRequestIntent {
         correlation: OperationIngressCorrelation::AcpPrompt {
             session_id,
-            inbound_seq: crate::surface::SequenceNumber::new(1),
-            rpc_request_id: crate::surface::AcpRequestId::String(
-                NonEmptyText::try_new("prompt").expect("static ACP request id is non-empty"),
+            inbound_seq: SequenceNumber::new(inbound_seq),
+            rpc_request_id: AcpRequestId::String(
+                NonEmptyText::try_new(format!("prompt-{}", uuid::Uuid::new_v4()))
+                    .map_err(|error| format!("invalid ACP request id: {error}"))?,
             ),
         },
         kind: OperationKind::UserTurn,
@@ -382,6 +612,7 @@ fn prepare_surface_prompt(
         }
     };
     let operation_id = reserved.operation_id.clone();
+    cleanup.operation_id = Some(operation_id.clone());
     match attachment
         .client
         .admit_reserved(
@@ -396,12 +627,15 @@ fn prepare_surface_prompt(
             return Err("ACP surface admission did not commit".to_string());
         }
     }
+    cleanup.disarm();
     Ok(PreparedSurfacePrompt {
         surface: surface.clone(),
         client: attachment.client,
         operation_id,
         subscription,
         client_bridge,
+        tool_outputs: HashMap::new(),
+        detached: false,
     })
 }
 
@@ -604,12 +838,7 @@ fn drain_surface_prompt(
             }
         }
     }
-    let _ = prepared.surface.detach(
-        &prepared.client,
-        crate::surface::DetachRequest {
-            request_id: SurfaceRequestId::new(),
-        },
-    );
+    prepared.detach_once();
     match terminal {
         WaitOperationTerminalResult::Terminal { value } => terminal_to_stop_reason(&value.terminal),
         WaitOperationTerminalResult::TerminalCommitFailure { .. }
@@ -648,6 +877,7 @@ fn emit_surface_event(
     session_id: &SessionId,
     note_tx: &UnboundedSender<SessionNotification>,
     event: &SurfaceEvent,
+    tool_outputs: &mut HashMap<String, ToolOutputAccumulator>,
 ) {
     let update = match event {
         SurfaceEvent::Assistant(AssistantPatch::Delta { text, .. }) => Some(
@@ -662,11 +892,71 @@ fn emit_surface_event(
                 ))
             })
         }
-        SurfaceEvent::Tool(ToolPatch::OutputDelta { chunk, .. }) => Some(
-            SessionUpdate::AgentMessageChunk(agent_client_protocol::ContentChunk::new(
-                ContentBlock::from(chunk.as_str().to_string()),
-            )),
-        ),
+        SurfaceEvent::Tool(ToolPatch::Requested { request }) => Some(SessionUpdate::ToolCall(
+            ToolCall::new(
+                ToolCallId::new(request.tool_call_id.as_str().to_string()),
+                tool_call_title(request),
+            )
+            .kind(tool_kind(request.action))
+            .status(ToolCallStatus::Pending)
+            .raw_input(serde_json::from_str(request.raw_arguments.as_str()).ok()),
+        )),
+        SurfaceEvent::Tool(ToolPatch::OutputDelta {
+            tool_call_id,
+            offset,
+            chunk,
+        }) => {
+            let output = tool_outputs
+                .entry(tool_call_id.as_str().to_string())
+                .or_default();
+            let start = offset.get();
+            if start > output.next_offset {
+                return;
+            }
+            let overlap = output.next_offset.saturating_sub(start) as usize;
+            if overlap >= chunk.as_str().len() || !chunk.as_str().is_char_boundary(overlap) {
+                return;
+            }
+            output.text.push_str(&chunk.as_str()[overlap..]);
+            output.next_offset = start + chunk.as_str().len() as u64;
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                ToolCallId::new(tool_call_id.as_str().to_string()),
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![ToolCallContent::from(ContentBlock::from(
+                        output.text.clone(),
+                    ))]),
+            )))
+        }
+        SurfaceEvent::Tool(ToolPatch::Completed { result }) => {
+            let output = result
+                .output
+                .as_ref()
+                .or(result.error.as_ref())
+                .map(|text| text.as_str().to_string());
+            let accumulated = tool_outputs
+                .entry(result.tool_call_id.as_str().to_string())
+                .or_default();
+            if let Some(output) = output {
+                accumulated.next_offset = output.len() as u64;
+                accumulated.text = output;
+            }
+            let status = if result.terminal.kind == SurfaceToolResultKind::Success {
+                ToolCallStatus::Completed
+            } else {
+                ToolCallStatus::Failed
+            };
+            let mut fields = ToolCallUpdateFields::new().status(status);
+            if !accumulated.text.is_empty() {
+                fields = fields.content(vec![ToolCallContent::from(ContentBlock::from(
+                    accumulated.text.clone(),
+                ))]);
+            }
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                ToolCallId::new(result.tool_call_id.as_str().to_string()),
+                fields,
+            )))
+        }
         _ => None,
     };
     if let Some(update) = update {
@@ -684,14 +974,34 @@ fn project_surface_event(
         event
     {
         let Some(bridge) = prepared.client_bridge.as_ref() else {
-            let _ = prepared
-                .client
-                .cancel_operation(SurfaceRequestId::new(), prepared.operation_id.clone());
+            cancel_surface_operation(prepared)?;
             return Err("ACP interaction requires a connected client bridge".to_string());
         };
-        let (request, target) = build_permission_request(session_id, interaction)?;
-        let response = bridge.request_permission(request)?;
-        let answer = permission_answer(response, target)?;
+        let (request, target) = match build_permission_request(session_id, interaction) {
+            Ok(value) => value,
+            Err(error) => {
+                cancel_surface_operation(prepared)?;
+                return Err(error);
+            }
+        };
+        let response = match bridge.request_permission(request) {
+            Ok(response) => response,
+            Err(AcpPermissionWaitError::Cancelled) => {
+                let _ = cancel_surface_operation(prepared);
+                return Ok(());
+            }
+            Err(error) => {
+                cancel_surface_operation(prepared)?;
+                return Err(format!("ACP permission request failed: {error:?}"));
+            }
+        };
+        let answer = match permission_answer(response, target) {
+            Ok(answer) => answer,
+            Err(error) => {
+                let _ = cancel_surface_operation(prepared);
+                return Err(error);
+            }
+        };
         match prepared.client.respond_interaction_by_id(
             SurfaceRequestId::new(),
             interaction.interaction_id.clone(),
@@ -699,16 +1009,52 @@ fn project_surface_event(
         ) {
             Ok(MutationReply::Committed { .. }) => {}
             Ok(MutationReply::Deferred { .. }) => {
+                let _ = cancel_surface_operation(prepared);
                 return Err("ACP interaction response was deferred".to_string());
             }
             Ok(MutationReply::Uncommitted { .. }) => {
+                let _ = cancel_surface_operation(prepared);
                 return Err("ACP interaction response did not commit".to_string());
             }
-            Err(error) => return Err(format!("ACP interaction response failed: {error:?}")),
+            Err(error) => {
+                let _ = cancel_surface_operation(prepared);
+                return Err(format!("ACP interaction response failed: {error:?}"));
+            }
         }
     }
-    emit_surface_event(session_id, note_tx, event);
+    emit_surface_event(session_id, note_tx, event, &mut prepared.tool_outputs);
     Ok(())
+}
+
+fn tool_call_title(request: &crate::runtime_surface::SurfaceToolRequest) -> String {
+    request
+        .target
+        .as_ref()
+        .map(|target| format!("{}: {}", request.name.as_str(), target.as_str()))
+        .unwrap_or_else(|| request.name.as_str().to_string())
+}
+
+fn tool_kind(action: SurfaceToolAction) -> ToolKind {
+    match action {
+        SurfaceToolAction::Read => ToolKind::Read,
+        SurfaceToolAction::Write => ToolKind::Edit,
+        SurfaceToolAction::Network => ToolKind::Fetch,
+        SurfaceToolAction::Agent => ToolKind::Think,
+        SurfaceToolAction::Shell => ToolKind::Execute,
+    }
+}
+
+fn cancel_surface_operation(prepared: &PreparedSurfacePrompt) -> Result<(), String> {
+    match prepared
+        .client
+        .cancel_operation(SurfaceRequestId::new(), prepared.operation_id.clone())
+        .map_err(|error| format!("ACP surface cancellation failed: {error:?}"))?
+    {
+        MutationReply::Committed { .. } | MutationReply::Deferred { .. } => Ok(()),
+        MutationReply::Uncommitted { .. } => {
+            Err("ACP surface cancellation did not commit".to_string())
+        }
+    }
 }
 
 /// Resolves the ACP stop reason from a completed operation, honoring an
@@ -791,12 +1137,16 @@ impl Agent for OrcaAcpAgent {
                 current_op: None,
                 current_surface_op: None,
                 cancel_requested: false,
+                next_prompt_seq: 1,
             },
         );
         Ok(NewSessionResponse::new(session_id))
     }
 
     async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+        if self.state.borrow().sessions.contains_key(&args.session_id) {
+            return Err(Error::invalid_params().data("ACP session is already loaded"));
+        }
         let selector = args.session_id.to_string();
         let transcript = tokio::task::spawn_blocking(move || orca_runtime_history_load(&selector))
             .await
@@ -846,6 +1196,7 @@ impl Agent for OrcaAcpAgent {
                 current_op: None,
                 current_surface_op: None,
                 cancel_requested: false,
+                next_prompt_seq: 1,
             },
         );
         Ok(LoadSessionResponse::new())
@@ -936,6 +1287,9 @@ impl Agent for OrcaAcpAgent {
         if let Some(op) = op {
             let _ = op.interrupt();
         }
+        if let Some(bridge) = self.client_bridge.as_ref() {
+            bridge.cancel_session(&args.session_id);
+        }
         if let Some((client, operation_id)) = surface_op {
             let _ = client.cancel_operation(SurfaceRequestId::new(), operation_id);
         }
@@ -946,4 +1300,141 @@ impl Agent for OrcaAcpAgent {
 /// Loads a session transcript by selector, reusing the runtime history layer.
 fn orca_runtime_history_load(selector: &str) -> io::Result<crate::thread_store::SessionTranscript> {
     crate::history::load_session(selector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_surface::{
+        SurfaceEvent, SurfaceToolRequest, SurfaceToolResult, SurfaceToolTerminal,
+        ToolInvocationStarted, ToolTerminalSource,
+    };
+    use orca_core::thread_identity::TurnId;
+
+    fn permission_request(session_id: &str, tool_call_id: &str) -> RequestPermissionRequest {
+        RequestPermissionRequest::new(
+            SessionId::new(session_id),
+            ToolCallUpdate::new(ToolCallId::new(tool_call_id), ToolCallUpdateFields::new()),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn permission_cancel_before_registration_is_not_lost() {
+        let (bridge, _requests) = AcpClientBridge::new();
+        let session_id = SessionId::new("cancel-before-register");
+        bridge.cancel_session(&session_id);
+
+        let result =
+            bridge.request_permission(permission_request("cancel-before-register", "tool-1"));
+        assert_eq!(result, Err(AcpPermissionWaitError::Cancelled));
+    }
+
+    #[test]
+    fn permission_cancel_wakes_waiter_and_does_not_reuse_key() {
+        let (bridge, mut requests) = AcpClientBridge::new();
+        let session_id = SessionId::new("cancel-waiter");
+        let waiter_bridge = Arc::clone(&bridge);
+        let waiter = std::thread::spawn(move || {
+            waiter_bridge.request_permission(permission_request("cancel-waiter", "tool-1"))
+        });
+        let request = requests
+            .blocking_recv()
+            .expect("permission request is queued");
+        assert!(bridge.is_pending(&request.key));
+        bridge.cancel_session(&session_id);
+        assert_eq!(
+            waiter.join().expect("permission waiter joins"),
+            Err(AcpPermissionWaitError::Cancelled)
+        );
+        assert!(!bridge.is_pending(&request.key));
+    }
+
+    #[test]
+    fn tool_events_project_as_typed_acp_updates() {
+        let request = SurfaceToolRequest {
+            tool_call_id: crate::runtime_surface::SurfaceToolCallId::try_new("tool-typed").unwrap(),
+            source_response_id: None,
+            turn_id: TurnId::new(),
+            name: NonEmptyText::try_new("shell").unwrap(),
+            action: SurfaceToolAction::Shell,
+            target: Some(DisplayText::new("cargo test")),
+            raw_arguments: DisplayText::new(r#"{"command":"cargo test"}"#),
+            arguments_digest: crate::runtime_surface::Sha256Digest::new([0; 32]),
+        };
+        let (note_tx, mut note_rx) = unbounded_channel();
+        let mut tool_outputs = HashMap::new();
+        emit_surface_event(
+            &SessionId::new("typed-tools"),
+            &note_tx,
+            &SurfaceEvent::Tool(ToolPatch::Requested {
+                request: request.clone(),
+            }),
+            &mut tool_outputs,
+        );
+        let update = note_rx.try_recv().expect("tool request update");
+        match update.update {
+            SessionUpdate::ToolCall(call) => {
+                assert_eq!(call.kind, ToolKind::Execute);
+                assert_eq!(call.status, ToolCallStatus::Pending);
+                assert_eq!(call.title, "shell: cargo test");
+                assert!(call.raw_input.is_some());
+            }
+            other => panic!("expected typed tool call, got {other:?}"),
+        }
+
+        emit_surface_event(
+            &SessionId::new("typed-tools"),
+            &note_tx,
+            &SurfaceEvent::Tool(ToolPatch::OutputDelta {
+                tool_call_id: request.tool_call_id.clone(),
+                offset: crate::runtime_surface::ByteOffset::new(0),
+                chunk: DisplayText::new("done"),
+            }),
+            &mut tool_outputs,
+        );
+        let _ = note_rx.try_recv().expect("tool output update");
+        emit_surface_event(
+            &SessionId::new("typed-tools"),
+            &note_tx,
+            &SurfaceEvent::Tool(ToolPatch::OutputDelta {
+                tool_call_id: request.tool_call_id.clone(),
+                offset: crate::runtime_surface::ByteOffset::new(0),
+                chunk: DisplayText::new("done"),
+            }),
+            &mut tool_outputs,
+        );
+        assert!(
+            note_rx.try_recv().is_err(),
+            "duplicate output must be suppressed"
+        );
+        emit_surface_event(
+            &SessionId::new("typed-tools"),
+            &note_tx,
+            &SurfaceEvent::Tool(ToolPatch::Completed {
+                result: SurfaceToolResult {
+                    tool_call_id: request.tool_call_id,
+                    name: request.name,
+                    terminal: SurfaceToolTerminal {
+                        kind: SurfaceToolResultKind::Success,
+                        source: ToolTerminalSource::Observed,
+                        invocation_started: ToolInvocationStarted::Yes,
+                    },
+                    output: Some(DisplayText::new("done")),
+                    error: None,
+                    exit_code: Some(0),
+                    truncated: false,
+                    file_change: None,
+                },
+            }),
+            &mut tool_outputs,
+        );
+        let update = note_rx.try_recv().expect("tool completion update");
+        match update.update {
+            SessionUpdate::ToolCallUpdate(update) => {
+                assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+            }
+            other => panic!("expected typed tool completion, got {other:?}"),
+        }
+    }
 }

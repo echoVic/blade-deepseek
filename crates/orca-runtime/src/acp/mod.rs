@@ -47,7 +47,7 @@ pub fn run(config: RunConfig) -> i32 {
         let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
         let (client_bridge, mut permission_rx) = AcpClientBridge::new();
         let agent = OrcaAcpAgent::new_typed(surface_host, config, note_tx)
-            .with_client_bridge(client_bridge);
+            .with_client_bridge(client_bridge.clone());
 
         let (incoming, outgoing) = transport::stdio();
         let (conn, io_task) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
@@ -64,20 +64,32 @@ pub fn run(config: RunConfig) -> i32 {
         });
 
         let permission_conn = Rc::clone(&conn);
+        let permission_bridge = std::sync::Arc::clone(&client_bridge);
         tokio::task::spawn_local(async move {
             while let Some(request) = permission_rx.recv().await {
-                let result = permission_conn
-                    .request_permission(request.request)
-                    .await
-                    .map_err(|error| format!("ACP permission request failed: {error:?}"));
-                let _ = request.reply.send(result);
+                if !permission_bridge.is_pending(&request.key) {
+                    continue;
+                }
+                let connection = Rc::clone(&permission_conn);
+                let bridge = std::sync::Arc::clone(&permission_bridge);
+                tokio::task::spawn_local(async move {
+                    let result = connection
+                        .request_permission(request.request)
+                        .await
+                        .map_err(|error| {
+                            crate::acp::agent::AcpPermissionWaitError::Client(format!("{error:?}"))
+                        });
+                    bridge.complete_permission(&request.key, result);
+                });
             }
         });
 
-        match io_task.await {
+        let exit_code = match io_task.await {
             Ok(()) => 0,
             Err(_) => 1,
-        }
+        };
+        client_bridge.cancel_all();
+        exit_code
     });
 
     drop(host);
