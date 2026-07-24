@@ -2007,11 +2007,13 @@ impl fmt::Debug for RuntimeThreadHandle {
 pub struct RuntimeHost {
     command_tx: tokio_mpsc::Sender<HostCommand>,
     supervisor: Option<thread::JoinHandle<()>>,
+    host_incarnation: surface::HostIncarnation,
 }
 
 #[derive(Clone)]
 pub struct RuntimeHostHandle {
     command_tx: tokio_mpsc::Sender<HostCommand>,
+    host_incarnation: surface::HostIncarnation,
 }
 
 impl RuntimeHostHandle {
@@ -2028,6 +2030,10 @@ impl RuntimeHostHandle {
         request: RuntimeThreadStartRequest,
     ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
         start_thread_with_sender(&self.command_tx, request)
+    }
+
+    pub(crate) fn host_incarnation(&self) -> &surface::HostIncarnation {
+        &self.host_incarnation
     }
 }
 
@@ -2069,6 +2075,10 @@ impl RuntimeHost {
         background_capacity: usize,
         surface_hub_config: surface::SurfaceHubConfig,
     ) -> Result<Self, RuntimeHostError> {
+        let host_incarnation =
+            surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated host incarnation is v7");
+        let supervisor_host_incarnation = host_incarnation.clone();
         let (command_tx, command_rx) = tokio_mpsc::channel(HOST_COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let supervisor = thread::Builder::new()
@@ -2089,6 +2099,7 @@ impl RuntimeHost {
                             executor,
                             background_capacity,
                             surface_hub_config,
+                            supervisor_host_incarnation,
                         ));
                     }
                     Err(error) => {
@@ -2104,6 +2115,7 @@ impl RuntimeHost {
             Ok(Ok(())) => Ok(Self {
                 command_tx,
                 supervisor: Some(supervisor),
+                host_incarnation,
             }),
             Ok(Err(error)) | Err(error) => {
                 let _ = supervisor.join();
@@ -2130,6 +2142,7 @@ impl RuntimeHost {
     pub fn handle(&self) -> RuntimeHostHandle {
         RuntimeHostHandle {
             command_tx: self.command_tx.clone(),
+            host_incarnation: self.host_incarnation.clone(),
         }
     }
 
@@ -2415,10 +2428,8 @@ async fn run_host_supervisor(
     executor: Arc<dyn ThreadOperationExecutor>,
     background_capacity: usize,
     surface_hub_config: surface::SurfaceHubConfig,
+    host_incarnation: surface::HostIncarnation,
 ) {
-    let host_incarnation =
-        surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-            .expect("generated UUID is v7");
     let mut actors = HashMap::<String, ThreadActorEntry>::new();
     while let Some(command) = command_rx.recv().await {
         match command {

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
@@ -3161,6 +3162,7 @@ pub struct RuntimeSurfaceHostHandle {
     host_incarnation: HostIncarnation,
     grant: NonEmptySet<SurfaceCapability>,
     connection_id: Option<SurfaceConnectionId>,
+    pub(crate) runtime: Option<crate::runtime_host::RuntimeHostHandle>,
 }
 
 #[allow(dead_code)]
@@ -3174,6 +3176,24 @@ impl RuntimeSurfaceHostHandle {
             host_incarnation,
             grant,
             connection_id,
+            runtime: None,
+        }
+    }
+
+    pub(crate) fn from_runtime(runtime: crate::runtime_host::RuntimeHostHandle) -> Self {
+        Self {
+            host_incarnation: runtime.host_incarnation().clone(),
+            grant: NonEmptySet::try_new(BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::SubmitOperation,
+                SurfaceCapability::ControlBoundOperation,
+                SurfaceCapability::ManageThreadSettings,
+                SurfaceCapability::RespondGrantedInteraction,
+                SurfaceCapability::RepairThread,
+            ]))
+            .expect("runtime surface host grant is non-empty"),
+            connection_id: None,
+            runtime: Some(runtime),
         }
     }
 }

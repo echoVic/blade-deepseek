@@ -1,5 +1,6 @@
 mod commands;
 mod commit;
+mod host;
 mod hub;
 mod identity;
 mod ingress;
@@ -11,6 +12,7 @@ mod store;
 
 pub use commands::*;
 pub use commit::*;
+pub use host::*;
 pub use hub::*;
 pub use identity::*;
 pub use ingress::*;
