@@ -423,11 +423,83 @@ impl TuiOperationController {
                     Some(permissions.clone()),
                 )
             }
+            orca_runtime::unstable_surface::SurfaceInteractionRequest::UserInput {
+                question,
+                suggestions,
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::UserInput,
+                );
+                (
+                    TuiInteractionKind::UserInput,
+                    TuiEvent::UserInputRequested {
+                        key,
+                        question: question.as_str().to_string(),
+                        choices: suggestions
+                            .iter()
+                            .map(|value| value.as_str().to_string())
+                            .collect(),
+                    },
+                    None,
+                )
+            }
+            orca_runtime::unstable_surface::SurfaceInteractionRequest::McpElicitation {
+                server_name,
+                message,
+                request,
+                ..
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::McpElicitation,
+                );
+                let (mode, url, requested_schema_json) = match request {
+                    orca_runtime::unstable_surface::SurfaceMcpElicitationRequest::Form {
+                        requested_schema,
+                        ..
+                    } => (
+                        orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Form,
+                        None,
+                        requested_schema.as_ref().map(|value| {
+                            serde_json::to_string(value)
+                                .expect("surface MCP schema is serializable")
+                        }),
+                    ),
+                    orca_runtime::unstable_surface::SurfaceMcpElicitationRequest::Url {
+                        raw_url,
+                        requested_schema,
+                    } => (
+                        orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Url,
+                        raw_url.as_ref().map(|value| value.as_str().to_string()),
+                        requested_schema.as_ref().map(|value| {
+                            serde_json::to_string(value)
+                                .expect("surface MCP schema is serializable")
+                        }),
+                    ),
+                };
+                (
+                    TuiInteractionKind::McpElicitation,
+                    TuiEvent::McpElicitationRequested {
+                        key,
+                        server_name: server_name.as_str().to_string(),
+                        mode,
+                        message: message.as_str().to_string(),
+                        url,
+                        requested_schema_json,
+                    },
+                    None,
+                )
+            }
             _ => return None,
         };
         let key = match &event {
             TuiEvent::ApprovalNeeded { key, .. }
-            | TuiEvent::PermissionApprovalNeeded { key, .. } => key.clone(),
+            | TuiEvent::PermissionApprovalNeeded { key, .. }
+            | TuiEvent::UserInputRequested { key, .. }
+            | TuiEvent::McpElicitationRequested { key, .. } => key.clone(),
             _ => return None,
         };
         active
@@ -486,6 +558,38 @@ impl TuiOperationController {
                     }
                 };
                 orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                    decision,
+                }
+            }
+            (TuiInteractionKind::UserInput, TuiInteractionResponse::UserInput(answer)) => {
+                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: orca_runtime::unstable_surface::SurfaceUserInputDecision::Answer(
+                        orca_runtime::unstable_surface::DisplayText::new(answer.clone()),
+                    ),
+                }
+            }
+            (
+                TuiInteractionKind::McpElicitation,
+                TuiInteractionResponse::McpElicitation {
+                    accepted,
+                    content_json,
+                },
+            ) => {
+                let decision = if *accepted {
+                    let content = serde_json::from_str(content_json.as_deref().unwrap_or("{}"))
+                        .map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid typed MCP elicitation content: {error}"),
+                            )
+                        })?;
+                    orca_runtime::unstable_surface::SurfaceMcpElicitationDecision::Accept {
+                        content,
+                    }
+                } else {
+                    orca_runtime::unstable_surface::SurfaceMcpElicitationDecision::Decline
+                };
+                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::McpElicitation {
                     decision,
                 }
             }
