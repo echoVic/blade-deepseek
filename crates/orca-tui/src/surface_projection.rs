@@ -266,11 +266,10 @@ fn tool_result_status(kind: SurfaceToolResultKind) -> &'static str {
         SurfaceToolResultKind::Success => "completed",
         SurfaceToolResultKind::Denied => "denied",
         SurfaceToolResultKind::Cancelled => "cancelled",
-        SurfaceToolResultKind::TimedOut => "timed_out",
-        SurfaceToolResultKind::InvalidArguments => "invalid_arguments",
-        SurfaceToolResultKind::ExternalEffectAmbiguous => "external_effect_ambiguous",
-        SurfaceToolResultKind::ObservationUnavailable => "observation_unavailable",
-        SurfaceToolResultKind::CleanupAmbiguous => "cleanup_ambiguous",
+        SurfaceToolResultKind::TimedOut | SurfaceToolResultKind::InvalidArguments => "failed",
+        SurfaceToolResultKind::ExternalEffectAmbiguous
+        | SurfaceToolResultKind::ObservationUnavailable
+        | SurfaceToolResultKind::CleanupAmbiguous => "indeterminate",
         SurfaceToolResultKind::Failed => "failed",
     }
 }
@@ -423,5 +422,39 @@ mod tests {
             }) if gap_expected == expected && gap_observed == observed
         ));
         assert_eq!(projection.cursor(), &expected);
+    }
+
+    #[test]
+    fn typed_tool_statuses_use_existing_tui_vocabulary() {
+        assert_eq!(
+            tool_result_status(SurfaceToolResultKind::Success),
+            "completed"
+        );
+        assert_eq!(tool_result_status(SurfaceToolResultKind::Denied), "denied");
+        assert_eq!(
+            tool_result_status(SurfaceToolResultKind::Cancelled),
+            "cancelled"
+        );
+        assert_eq!(
+            tool_result_status(SurfaceToolResultKind::TimedOut),
+            "failed"
+        );
+        assert_eq!(
+            tool_result_status(SurfaceToolResultKind::InvalidArguments),
+            "failed"
+        );
+        assert_eq!(
+            tool_result_status(SurfaceToolResultKind::ExternalEffectAmbiguous),
+            "indeterminate"
+        );
+        assert_eq!(
+            tool_result_status(SurfaceToolResultKind::ObservationUnavailable),
+            "indeterminate"
+        );
+        assert_eq!(
+            tool_result_status(SurfaceToolResultKind::CleanupAmbiguous),
+            "indeterminate"
+        );
+        assert_eq!(tool_result_status(SurfaceToolResultKind::Failed), "failed");
     }
 }
