@@ -4980,7 +4980,7 @@ fn handle_hosted_submitted_turn(
     }
 }
 
-fn run_hosted_operation(
+pub(crate) fn run_hosted_operation(
     thread: &RuntimeThreadHandle,
     request: HostedTurnRequest,
     config: RunConfig,
@@ -5116,7 +5116,7 @@ fn run_hosted_goal_run(
     } else {
         request
     };
-    let status = match run_hosted_operation(thread, request, config.clone(), controller, event_tx) {
+    let status = match crate::run_surface(thread, request, config.clone(), controller, event_tx) {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
             let _ = event_tx.send(TuiEvent::Error(
@@ -5126,6 +5126,7 @@ fn run_hosted_goal_run(
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            send_hosted_operation_terminal_failure(event_tx, &HostedOperationKind::Turn);
             return;
         }
     };
@@ -5211,7 +5212,6 @@ fn existing_hosted_goal_session_id(
     let _ = event_tx.send(TuiEvent::Error(message.to_string()));
     None
 }
-
 fn show_hosted_goal(
     thread: &Option<RuntimeThreadHandle>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,

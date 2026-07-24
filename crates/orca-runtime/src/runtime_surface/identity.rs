@@ -723,6 +723,14 @@ uuid_wrapper!(SurfaceConnectionId, UuidV7);
 uuid_wrapper!(HostIncarnation, UuidV7);
 uuid_wrapper!(SurfaceIncarnation, UuidV7);
 
+impl SurfaceRequestId {
+    pub fn new() -> Self {
+        Self(
+            UuidV7::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).expect("generated UUID is v7"),
+        )
+    }
+}
+
 macro_rules! text_id {
     ($($name:ident),+ $(,)?) => {$ (
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

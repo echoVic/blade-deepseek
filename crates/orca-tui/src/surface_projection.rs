@@ -279,7 +279,7 @@ fn operation_terminal_status(terminal: &OperationTerminal) -> Option<&'static st
         OperationTerminal::Succeeded { .. } => Some("success"),
         OperationTerminal::Cancelled { .. } => Some("cancelled"),
         OperationTerminal::BudgetExhausted { .. } => Some("budget_exhausted"),
-        OperationTerminal::NotAdmitted { .. } => None,
+        OperationTerminal::NotAdmitted { .. } => Some("not_admitted"),
         OperationTerminal::Failed { class, .. } => match class {
             orca_runtime::surface::FailureClass::Verification => Some("verification_failed"),
             _ => Some("failed"),

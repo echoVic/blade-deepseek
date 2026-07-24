@@ -40,7 +40,9 @@ mod status_key_actions;
 mod submitted_turn;
 #[cfg(test)]
 mod surface_boundary_tests;
+mod surface_client;
 mod surface_projection;
+pub(crate) use surface_client::run as run_surface;
 mod terminal_lifecycle;
 pub mod theme;
 mod transcript_view;

@@ -31,6 +31,7 @@ struct HostedOperationState {
 #[derive(Debug, Default)]
 struct HostedOperationInner {
     active: Option<Arc<OperationHandle>>,
+    surface_active: Option<SurfaceActiveOperation>,
     interrupt_requested: bool,
     background_requested: bool,
     shutdown: bool,
@@ -52,14 +53,13 @@ impl TuiOperationController {
             .as_ref()
             .map(|operation| operation.id())
     }
-
     pub(crate) fn interrupt_current(&self) -> Option<OperationId> {
         let hosted = {
             let mut hosted = self.lock_hosted();
             if let Some(operation) = hosted.active.clone() {
                 operation
             } else {
-                if hosted.shutdown {
+                if cancel_surface_or_shutdown(&mut hosted) {
                     return None;
                 }
                 hosted.interrupt_requested = true;
@@ -136,7 +136,7 @@ impl TuiOperationController {
         if let Some(operation) = hosted {
             let _ = operation.interrupt();
         }
-        self.hosted.changed.notify_all();
+        self.cancel_surface_and_notify();
         self.broker.shutdown();
         *self.lock_background_current() = None;
     }
@@ -303,6 +303,98 @@ impl RuntimeProviderSuspensionControl for TuiTurnControl {
     fn take_suspension_request(&self) -> bool {
         TuiTurnControl::take_background_current(self)
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl TuiOperationController {
+    fn cancel_surface_and_notify(&self) {
+        let _ = cancel_surface_if_active(&mut self.lock_hosted());
+        self.hosted.changed.notify_all();
+    }
+
+    pub(crate) fn install_surface(
+        &self,
+        client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+    ) -> io::Result<()> {
+        let interrupt_requested = {
+            let mut hosted = self.lock_hosted();
+            if hosted.shutdown {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "TUI operation controller is shutting down",
+                ));
+            }
+            if hosted.active.is_some() || hosted.surface_active.is_some() {
+                return Err(io::Error::other("TUI operation is still active"));
+            }
+            hosted.surface_active = Some(SurfaceActiveOperation {
+                client: client.clone(),
+                operation_id: operation_id.clone(),
+            });
+            let requested = hosted.interrupt_requested;
+            hosted.interrupt_requested = false;
+            requested
+        };
+        self.hosted.changed.notify_all();
+        if interrupt_requested {
+            let _ = client
+                .cancel_operation(orca_runtime::surface::SurfaceRequestId::new(), operation_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_surface(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        let mut hosted = self.lock_hosted();
+        if hosted
+            .surface_active
+            .as_ref()
+            .is_some_and(|active| &active.operation_id == operation_id)
+        {
+            hosted.surface_active = None;
+        }
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_surface_active(&self) -> bool {
+        self.lock_hosted().surface_active.is_some()
+    }
+}
+
+#[derive(Clone)]
+struct SurfaceActiveOperation {
+    client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+    operation_id: orca_runtime::surface::SurfaceOperationId,
+}
+
+impl std::fmt::Debug for SurfaceActiveOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SurfaceActiveOperation")
+            .field("operation_id", &self.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+fn cancel_surface_if_active(hosted: &mut HostedOperationInner) -> bool {
+    let Some(surface) = hosted.surface_active.clone() else {
+        return false;
+    };
+    let _ = surface.client.cancel_operation(
+        orca_runtime::surface::SurfaceRequestId::new(),
+        surface.operation_id,
+    );
+    true
+}
+
+fn cancel_surface_or_shutdown(hosted: &mut HostedOperationInner) -> bool {
+    cancel_surface_if_active(hosted) || hosted.shutdown
 }
 
 #[cfg(test)]
