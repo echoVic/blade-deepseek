@@ -344,6 +344,33 @@ pub(crate) struct TranscriptRenderCache {
     last_prepare_visited: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TranscriptRenderContext<'a> {
+    width: usize,
+    theme: &'a Theme,
+    syntax_theme_revision: u64,
+    tick: u64,
+    force_expand: bool,
+}
+
+impl<'a> TranscriptRenderContext<'a> {
+    pub(crate) fn new(theme: &'a Theme, width: usize, tick: u64, force_expand: bool) -> Self {
+        Self {
+            width,
+            theme,
+            syntax_theme_revision: theme.syntax_theme_revision,
+            tick,
+            force_expand,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_syntax_theme_revision(mut self, syntax_theme_revision: u64) -> Self {
+        self.syntax_theme_revision = syntax_theme_revision;
+        self
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptViewport {
     pub lines: Vec<Line<'static>>,
@@ -452,15 +479,18 @@ impl TranscriptRenderCache {
         &mut self,
         messages: &[ChatMessage],
         revisions: &[u64],
-        width: usize,
-        theme: &Theme,
-        syntax_theme_revision: u64,
-        tick: u64,
-        force_expand: bool,
+        context: TranscriptRenderContext<'_>,
         mut build_message: F,
     ) where
         F: FnMut(usize, &ChatMessage, &Theme, usize, u64, bool) -> Vec<Line<'static>>,
     {
+        let TranscriptRenderContext {
+            width,
+            theme,
+            syntax_theme_revision,
+            tick,
+            force_expand,
+        } = context;
         let width = width.max(1);
         let theme_identity = ThemeIdentity::from(theme);
         self.reconcile_len(messages.len());
@@ -963,7 +993,8 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::{
-        SPINNER_FRAMES, TranscriptRenderCache, viewport_paragraph, wrap_line_ratatui_compatible,
+        SPINNER_FRAMES, TranscriptRenderCache, TranscriptRenderContext, viewport_paragraph,
+        wrap_line_ratatui_compatible,
     };
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
@@ -1031,11 +1062,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            width as usize,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, width as usize, 0, false),
             |_, _, _, _, _, _| source_lines.clone(),
         );
         let viewport = cache.viewport(0, usize::MAX, visible_height);
@@ -1059,11 +1086,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            width,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, width, 0, false),
             |_, message, _, _, _, _| {
                 let ChatMessage::System(index) = message else {
                     unreachable!()
@@ -1278,11 +1301,8 @@ mod tests {
         cache.prepare(
             messages,
             revisions,
-            width,
-            &theme,
-            syntax_theme_revision,
-            tick,
-            false,
+            TranscriptRenderContext::new(&theme, width, tick, false)
+                .with_syntax_theme_revision(syntax_theme_revision),
             |_, message, theme, width, tick, force_expand| {
                 counters
                     .message_builds
@@ -1520,11 +1540,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            40,
-            &theme,
-            1,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 40, 0, false).with_syntax_theme_revision(1),
             |index, message, _, _, _, _| {
                 built_indices.borrow_mut().push(index);
                 vec![Line::from(format!("{message:?}"))]
@@ -1539,11 +1555,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            40,
-            &theme,
-            1,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 40, 0, false).with_syntax_theme_revision(1),
             |index, message, _, _, _, _| {
                 built_indices.borrow_mut().push(index);
                 vec![Line::from(format!("{message:?}"))]
@@ -1621,11 +1633,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            80,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) => vec![Line::from(text.clone()), Line::from("")],
                 _ => unreachable!(),
@@ -1650,11 +1658,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            80,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) => vec![Line::from(text.clone()), Line::from("")],
                 _ => unreachable!(),
@@ -1679,11 +1683,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            80,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) => vec![Line::from(text.clone())],
                 _ => unreachable!(),
@@ -1711,11 +1711,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            80,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) if text == "tall" => (0..70_000)
                     .map(|index| Line::from(format!("line {index}")))
@@ -1741,11 +1737,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            80,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 80, 0, false),
             |_, _, _, _, _, _| {
                 (0..70_000)
                     .map(|index| Line::from(format!("line {index}")))
@@ -1772,11 +1764,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            5,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 5, 0, false),
             |_, message, _, _, _, _| match message {
                 ChatMessage::System(text) if text == "wrapped" => {
                     vec![Line::from("abcdefghijklmnopqrstuvwxy")]
@@ -1805,11 +1793,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            1,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 1, 0, false),
             |_, _, _, _, _, _| vec![Line::from(body.clone())],
         );
         let viewport = cache.viewport(0, 69_980, 20);
@@ -1830,11 +1814,7 @@ mod tests {
         cache.prepare(
             &messages,
             &revisions,
-            1,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 1, 0, false),
             |_, _, _, _, _, _| vec![Line::from(body.clone())],
         );
         let viewport = cache.viewport(0, 0, 20);

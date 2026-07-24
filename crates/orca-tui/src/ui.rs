@@ -21,7 +21,7 @@ use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
-use crate::transcript_view::viewport_paragraph;
+use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{AppState, AppStatus, ApprovalOption, ChatMessage, PanelMode};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
@@ -454,11 +454,7 @@ pub(crate) fn render_live_messages(
         state.welcome_render_cache.prepare(
             &welcome_message,
             &welcome_revisions,
-            width,
-            theme,
-            theme.syntax_theme_revision,
-            state.tick,
-            false,
+            TranscriptRenderContext::new(theme, width, state.tick, false),
             |_, _, _, _, _, _| lines.clone(),
         );
         let requested_scroll = if state.auto_scroll {
@@ -492,11 +488,7 @@ pub(crate) fn render_live_messages(
     cache.prepare(
         messages,
         revisions,
-        width,
-        theme,
-        theme.syntax_theme_revision,
-        state.tick,
-        false,
+        TranscriptRenderContext::new(theme, width, state.tick, false),
         |index, message, theme, width, tick, force_expand| {
             let refined =
                 AppState::refined_diff_styles_for_message(revisions, highlights, index, message);
