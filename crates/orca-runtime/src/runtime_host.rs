@@ -2223,7 +2223,7 @@ enum ThreadCommand {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         expected_thread_revision: surface::SettingsRevision,
-        patch: surface::RuntimeSettingsPatch,
+        patch: surface::NonEmptyVec<surface::RuntimeSettingsPatch>,
         reply: SyncSender<
             Result<
                 surface::MutationReply<surface::SettingsMutationOutput>,
@@ -2423,7 +2423,7 @@ async fn run_host_supervisor(
     while let Some(command) = command_rx.recv().await {
         match command {
             HostCommand::StartThread { request, reply } => {
-                let actor_config = request.config.clone();
+                let mut actor_config = request.config.clone();
                 let actor_title = request.title.clone();
                 let prepared = tokio::task::spawn_blocking(move || request.prepare()).await;
                 let prepared = match prepared {
@@ -2512,6 +2512,17 @@ async fn run_host_supervisor(
                 } else {
                     (unavailable_surface_handle(host_incarnation.clone()), None)
                 };
+                if let Some(resident) = resident_surface.as_ref() {
+                    if let Err(error) = hydrate_run_config_from_surface_settings(
+                        &mut actor_config,
+                        &resident.coordinator.state().snapshot().settings.effective,
+                    ) {
+                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                            message: format!("failed to restore runtime settings: {error:?}"),
+                        }));
+                        continue;
+                    }
+                }
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
                     session_id,
@@ -2810,7 +2821,7 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         expected_thread_revision: surface::SettingsRevision,
-        patch: surface::RuntimeSettingsPatch,
+        patch: surface::NonEmptyVec<surface::RuntimeSettingsPatch>,
     ) -> Result<
         surface::MutationReply<surface::SettingsMutationOutput>,
         surface::SurfaceClientCommandError,
@@ -2993,6 +3004,7 @@ fn bootstrap_recorded_surface(
             surface::SurfaceCapability::ReadSnapshot,
             surface::SurfaceCapability::SubmitOperation,
             surface::SurfaceCapability::ControlBoundOperation,
+            surface::SurfaceCapability::ManageThreadSettings,
             surface::SurfaceCapability::RespondGrantedInteraction,
             surface::SurfaceCapability::RepairThread,
         ]))
@@ -3234,6 +3246,35 @@ fn apply_runtime_settings_patch(
         }
         _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
     }
+    Ok(())
+}
+
+fn hydrate_run_config_from_surface_settings(
+    config: &mut RunConfig,
+    settings: &surface::SurfaceRuntimeSettings,
+) -> Result<(), surface::SurfaceClientCommandError> {
+    let mut restored = settings.clone();
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::SetModel {
+            model: settings.model.clone(),
+        },
+    )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::SetReasoning {
+            effort: settings.reasoning_effort,
+        },
+    )?;
+    apply_runtime_settings_patch(
+        config,
+        &mut restored,
+        &surface::RuntimeSettingsPatch::SetApprovalMode {
+            mode: settings.approval_mode,
+        },
+    )?;
     Ok(())
 }
 
@@ -4441,6 +4482,27 @@ impl ThreadActor {
         Err(io::Error::other(
             "provider semantic batch did not commit after bounded retries",
         ))
+    }
+
+    fn commit_surface_actor_batch_with_retry(
+        &mut self,
+        batch: &surface::SurfaceCommitBatch,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            match self.resident_surface.coordinator.commit_actor_batch(batch) {
+                Ok(_) => return Ok(()),
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) => {}
+                Err(_) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+            }
+        }
+        Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
     }
 
     fn commit_surface_provider_step(
@@ -7444,12 +7506,12 @@ impl ThreadActor {
         client: &surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         expected_thread_revision: surface::SettingsRevision,
-        patch: surface::RuntimeSettingsPatch,
+        patches: surface::NonEmptyVec<surface::RuntimeSettingsPatch>,
     ) -> Result<
         surface::MutationReply<surface::SettingsMutationOutput>,
         surface::SurfaceClientCommandError,
     > {
-        if !self.admits_surface_client(client, surface::SurfaceCapability::ControlBoundOperation) {
+        if !self.admits_surface_client(client, surface::SurfaceCapability::ManageThreadSettings) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         if self.active.is_some() {
@@ -7490,7 +7552,9 @@ impl ThreadActor {
         }
         let mut next_settings = current.clone();
         let mut next_config = self.config.clone();
-        apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, &patch)?;
+        for patch in patches.as_slice() {
+            apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, patch)?;
+        }
         let next_revision = surface::SettingsRevision::try_new(
             current
                 .thread_revision
@@ -7511,12 +7575,13 @@ impl ThreadActor {
             )],
             None,
         );
-        self.resident_surface
-            .coordinator
-            .commit_actor_batch(&batch)
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.commit_surface_actor_batch_with_retry(&batch)?;
         if let Some(state) = self.state.as_mut() {
-            if matches!(patch, surface::RuntimeSettingsPatch::SetModel { .. }) {
+            if patches
+                .as_slice()
+                .iter()
+                .any(|patch| matches!(patch, surface::RuntimeSettingsPatch::SetModel { .. }))
+            {
                 state
                     .thread
                     .session_mut()
@@ -11637,6 +11702,10 @@ mod tests {
         observed_model: SyncSender<String>,
     }
 
+    struct SettingsConfigSnapshotExecutor {
+        observed: SyncSender<(String, ApprovalMode, orca_core::config::ReasoningEffort)>,
+    }
+
     #[derive(Clone, Copy)]
     enum ExactSelectorCorruption {
         Revision,
@@ -11704,6 +11773,28 @@ mod tests {
             self.observed_model
                 .send(generation.config().model.display_name().to_string())
                 .map_err(|_| io::Error::other("settings config observer closed"))?;
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for SettingsConfigSnapshotExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            self.observed
+                .send((
+                    generation.config().model.display_name().to_string(),
+                    generation.config().approval_mode,
+                    generation.config().reasoning_effort,
+                ))
+                .map_err(|_| io::Error::other("settings config snapshot observer closed"))?;
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
         }
@@ -12064,6 +12155,7 @@ mod tests {
                 surface::SurfaceCapability::ReadSnapshot,
                 surface::SurfaceCapability::SubmitOperation,
                 surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageThreadSettings,
             ]),
         )
     }
@@ -12565,9 +12657,10 @@ mod tests {
                 .update_settings(
                     surface_request_id(),
                     previous_revision,
-                    surface::RuntimeSettingsPatch::SetModel {
+                    surface::NonEmptyVec::try_new(vec![surface::RuntimeSettingsPatch::SetModel {
                         model: surface::NonEmptyText::try_new("deepseek-v4-pro").unwrap(),
-                    },
+                    }])
+                    .unwrap(),
                 )
                 .expect("commit runtime model settings"),
         );
@@ -12581,9 +12674,12 @@ mod tests {
             .update_settings(
                 surface_request_id(),
                 previous_revision,
-                surface::RuntimeSettingsPatch::SetApprovalMode {
-                    mode: surface::SurfaceApprovalMode::Plan,
-                },
+                surface::NonEmptyVec::try_new(vec![
+                    surface::RuntimeSettingsPatch::SetApprovalMode {
+                        mode: surface::SurfaceApprovalMode::Plan,
+                    },
+                ])
+                .unwrap(),
             )
             .expect("stale settings response");
         assert!(matches!(stale, surface::MutationReply::Uncommitted { .. }));
@@ -12651,6 +12747,211 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown resumed settings host");
+    }
+
+    #[test]
+    fn typed_settings_batch_is_atomic_retried_and_recovered_into_next_turn() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(SettingsConfigSnapshotExecutor {
+            observed: observed_tx,
+        }))
+        .expect("start settings batch runtime host");
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let thread = host
+            .start_thread(config.clone(), "typed runtime settings batch")
+            .expect("start settings batch runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load settings batch transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ManageThreadSettings,
+            ]),
+        );
+        let previous_revision = attachment.baseline.snapshot.settings.thread_revision;
+        surface::JsonlSurfaceCommitLedger::inject_settings_checkpoint_failures(transcript_path, 2);
+        let updated = committed_surface_value(
+            attachment
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    previous_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::SetModel {
+                            model: surface::NonEmptyText::try_new("deepseek-v4-pro").unwrap(),
+                        },
+                        surface::RuntimeSettingsPatch::SetReasoning {
+                            effort: surface::SurfaceReasoningEffort::High,
+                        },
+                        surface::RuntimeSettingsPatch::SetApprovalMode {
+                            mode: surface::SurfaceApprovalMode::Plan,
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .expect("settings batch commits after exact retries"),
+        );
+        assert_eq!(
+            updated.settings.thread_revision.get(),
+            previous_revision.get() + 1
+        );
+        assert_eq!(updated.settings.effective.model.as_str(), "deepseek-v4-pro");
+        assert_eq!(
+            updated.settings.effective.reasoning_effort,
+            surface::SurfaceReasoningEffort::High
+        );
+        assert_eq!(
+            updated.settings.effective.approval_mode,
+            surface::SurfaceApprovalMode::Plan
+        );
+
+        let weak = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ControlBoundOperation,
+            ]),
+        );
+        assert!(matches!(
+            weak.client.update_settings(
+                surface_request_id(),
+                updated.settings.thread_revision,
+                surface::NonEmptyVec::try_new(vec![surface::RuntimeSettingsPatch::SetModel {
+                    model: surface::NonEmptyText::try_new("unauthorized-model").unwrap(),
+                },])
+                .unwrap(),
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        ));
+
+        let current = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ManageThreadSettings,
+            ]),
+        );
+        let reserved = committed_surface_value(
+            current
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&current.baseline.snapshot, "settings batch turn"),
+                )
+                .expect("reserve settings batch turn"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            current
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit settings batch turn"),
+        );
+        let terminal = current
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait settings batch turn");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        assert_eq!(
+            observed_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            (
+                "deepseek-v4-pro".to_string(),
+                ApprovalMode::Plan,
+                orca_core::config::ReasoningEffort::High,
+            )
+        );
+
+        let thread_id = thread.thread_id().to_string();
+        thread.shutdown().expect("shutdown settings batch thread");
+        host.shutdown().expect("shutdown settings batch host");
+        let mut resumed_config = config;
+        resumed_config.history_mode = HistoryMode::Resume(thread_id);
+        let (resumed_observed_tx, resumed_observed_rx) = mpsc::sync_channel(1);
+        let resumed_host =
+            RuntimeHost::start_with_executor(Arc::new(SettingsConfigSnapshotExecutor {
+                observed: resumed_observed_tx,
+            }))
+            .expect("start resumed settings batch host");
+        let resumed_thread = resumed_host
+            .start_thread(resumed_config, "resume typed runtime settings batch")
+            .expect("resume settings batch thread");
+        let resumed = fresh_surface_attachment_with_capabilities(
+            &resumed_thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+            ]),
+        );
+        assert_eq!(
+            resumed.baseline.snapshot.settings.effective.model.as_str(),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            resumed.baseline.snapshot.settings.effective.approval_mode,
+            surface::SurfaceApprovalMode::Plan
+        );
+        let resumed_reserved = committed_surface_value(
+            resumed
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &resumed.baseline.snapshot,
+                        "post-restart settings batch turn",
+                    ),
+                )
+                .expect("reserve post-restart settings batch turn"),
+        );
+        let resumed_operation_id = resumed_reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            resumed
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    resumed_operation_id.clone(),
+                    resumed_reserved.lease.lease_id,
+                )
+                .expect("admit post-restart settings batch turn"),
+        );
+        let resumed_terminal = resumed
+            .client
+            .wait_operation_terminal(surface_request_id(), resumed_operation_id)
+            .expect("wait post-restart settings batch turn");
+        assert!(matches!(
+            resumed_terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        assert_eq!(
+            resumed_observed_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .unwrap(),
+            (
+                "deepseek-v4-pro".to_string(),
+                ApprovalMode::Plan,
+                orca_core::config::ReasoningEffort::High,
+            )
+        );
+        resumed_thread
+            .shutdown()
+            .expect("shutdown resumed settings batch thread");
+        resumed_host
+            .shutdown()
+            .expect("shutdown resumed settings batch host");
     }
 
     #[test]

@@ -284,7 +284,7 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         client: RuntimeSurfaceClientHandle,
         request_id: SurfaceRequestId,
         expected_thread_revision: SettingsRevision,
-        patch: RuntimeSettingsPatch,
+        patch: NonEmptyVec<RuntimeSettingsPatch>,
     ) -> Result<MutationReply<SettingsMutationOutput>, SurfaceClientCommandError>;
 
     fn respond_interaction_by_id(
@@ -381,7 +381,7 @@ impl RuntimeSurfaceClientHandle {
         &self,
         request_id: SurfaceRequestId,
         expected_thread_revision: SettingsRevision,
-        patch: RuntimeSettingsPatch,
+        patch: NonEmptyVec<RuntimeSettingsPatch>,
     ) -> Result<MutationReply<SettingsMutationOutput>, SurfaceClientCommandError> {
         self.dispatcher
             .as_ref()

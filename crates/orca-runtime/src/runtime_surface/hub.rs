@@ -140,6 +140,7 @@ impl SurfaceHub {
             SurfaceCapability::ReadSnapshot,
             SurfaceCapability::SubmitOperation,
             SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::ManageThreadSettings,
             SurfaceCapability::RespondGrantedInteraction,
             SurfaceCapability::RepairThread,
         ]))

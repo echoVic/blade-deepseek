@@ -2491,6 +2491,11 @@ static PROVIDER_RESPONSE_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, us
 static PENDING_PROVIDER_RESPONSE_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+#[cfg(test)]
+static PENDING_SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -2716,6 +2721,15 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_settings_checkpoint_failures(path: impl Into<PathBuf>, count: usize) {
+        SETTINGS_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_generation_append_failure_once(path: impl Into<PathBuf>) {
         GENERATION_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -2903,6 +2917,48 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    fn arm_settings_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        if !batch
+            .events
+            .as_slice()
+            .iter()
+            .any(|event| matches!(&event.event, SurfaceEvent::Settings(_)))
+        {
+            return;
+        }
+        let mut failures = SETTINGS_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_SETTINGS_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(self.path.clone())
+                .and_modify(|pending| *pending += count)
+                .or_insert(count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_settings_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_SETTINGS_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
     fn take_provider_response_checkpoint_failure(&self) -> bool {
         let mut failures = PENDING_PROVIDER_RESPONSE_CHECKPOINT_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -3045,6 +3101,8 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         #[cfg(test)]
         self.arm_provider_response_checkpoint_failures(batch);
         #[cfg(test)]
+        self.arm_settings_checkpoint_failures(batch);
+        #[cfg(test)]
         if batch.events.as_slice().iter().any(|event| {
             matches!(
                 &event.event,
@@ -3079,6 +3137,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_provider_response_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_settings_checkpoint_failure() {
             return Err(SurfaceLedgerError::CheckpointFailed);
         }
         self.store

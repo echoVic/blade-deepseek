@@ -8,12 +8,13 @@ use orca_core::config::RunConfig;
 use orca_runtime::runtime_host::HostedOperationKind;
 use orca_runtime::runtime_host::{HostedTurnRequest, RuntimeThreadHandle};
 use orca_runtime::surface::{
-    AttachResult, FreshAttachRequest, MutationReply, OperationIngressCorrelation, OperationKind,
-    OperationPatch, OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
-    ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
-    SurfaceAttachmentRole, SurfaceCapability, SurfaceEvent, SurfaceInputRequest,
-    SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId, SurfaceRequestId,
-    SurfaceSettingsSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
+    AttachResult, FreshAttachRequest, MutationReply, NonEmptyVec, OperationIngressCorrelation,
+    OperationKind, OperationPatch, OperationRequestIntent, OperationSettingsPreparation,
+    OperationTerminal, ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
+    RuntimeSurfaceHandle, SurfaceAttachmentRole, SurfaceCapability, SurfaceEvent,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
+    SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSubscriptionItem,
+    WaitOperationTerminalResult,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -106,7 +107,7 @@ pub(crate) fn run(
 
 pub(crate) fn update_settings(
     thread: &RuntimeThreadHandle,
-    patch: RuntimeSettingsPatch,
+    patches: NonEmptyVec<RuntimeSettingsPatch>,
 ) -> io::Result<SurfaceSettingsSnapshot> {
     let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
@@ -114,7 +115,7 @@ pub(crate) fn update_settings(
         role: SurfaceAttachmentRole::Tui,
         requested_capabilities: BTreeSet::from([
             SurfaceCapability::ReadSnapshot,
-            SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::ManageThreadSettings,
         ]),
         interaction_capabilities: BTreeSet::new(),
     }) {
@@ -129,7 +130,7 @@ pub(crate) fn update_settings(
     let result =
         attachment
             .client
-            .update_settings(SurfaceRequestId::new(), expected_revision, patch);
+            .update_settings(SurfaceRequestId::new(), expected_revision, patches);
     detach(&surface, &attachment.client);
     let result = result.map_err(|error| {
         io::Error::other(format!("typed TUI settings update failed: {error:?}"))

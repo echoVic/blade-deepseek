@@ -5546,17 +5546,17 @@ fn apply_hosted_settings_action(
         return;
     }
     if let Some(thread) = thread {
-        let mut settings = None;
-        for patch in patches {
-            match crate::surface_client::update_settings(thread, patch) {
-                Ok(next) => settings = Some(next),
-                Err(error) => {
-                    let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
-                    return;
-                }
+        let patches = match orca_runtime::unstable_surface::NonEmptyVec::try_new(patches) {
+            Ok(patches) => patches,
+            Err(_) => return,
+        };
+        let settings = match crate::surface_client::update_settings(thread, patches) {
+            Ok(settings) => settings,
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
+                return;
             }
-        }
-        let Some(settings) = settings else { return };
+        };
         let model = settings.effective.model.as_str().to_string();
         let reasoning_effort = match settings.effective.reasoning_effort {
             orca_runtime::unstable_surface::SurfaceReasoningEffort::High => {
