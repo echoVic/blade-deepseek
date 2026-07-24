@@ -28,9 +28,15 @@ impl PendingMcpElicitationRequest {
     }
 }
 
+#[derive(Default)]
+struct PendingMcpElicitationState {
+    closed: bool,
+    pending: HashMap<String, PendingMcpElicitationRequest>,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct PendingMcpElicitationManager {
-    pending: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
+    state: Arc<Mutex<PendingMcpElicitationState>>,
 }
 
 impl PendingMcpElicitationManager {
@@ -39,14 +45,20 @@ impl PendingMcpElicitationManager {
         request_id: String,
         request: PendingMcpElicitationRequest,
     ) -> io::Result<()> {
-        let mut pending = self.pending.lock().map_err(lock_error)?;
-        if pending.contains_key(&request_id) {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "server MCP elicitation manager is closed",
+            ));
+        }
+        if state.pending.contains_key(&request_id) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("duplicate pending MCP elicitation request id: {request_id}"),
             ));
         }
-        pending.insert(request_id, request);
+        state.pending.insert(request_id, request);
         Ok(())
     }
 
@@ -54,8 +66,20 @@ impl PendingMcpElicitationManager {
         &self,
         request_id: &str,
     ) -> io::Result<Option<PendingMcpElicitationRequest>> {
-        let mut pending = self.pending.lock().map_err(lock_error)?;
-        Ok(pending.remove(request_id))
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Ok(state.pending.remove(request_id))
+    }
+
+    pub(super) fn close(&self) -> io::Result<()> {
+        let pending = {
+            let mut state = self.state.lock().map_err(lock_error)?;
+            state.closed = true;
+            std::mem::take(&mut state.pending)
+        };
+        for request in pending.into_values() {
+            let _ = request.sender.send(McpElicitationResponse::decline());
+        }
+        Ok(())
     }
 }
 
@@ -224,6 +248,45 @@ mod tests {
         assert_eq!(
             first_receiver.recv().expect("first receiver"),
             McpElicitationResponse::accept(json!({"code": "first"}))
+        );
+    }
+
+    #[test]
+    fn pending_mcp_elicitation_manager_close_declines_waiters_and_rejects_new_requests() {
+        let manager = PendingMcpElicitationManager::default();
+        let (sender, receiver) = mpsc::channel();
+        manager
+            .insert(
+                "mcp_elicitation:github:device-flow".to_string(),
+                PendingMcpElicitationRequest {
+                    sender,
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    generation: generation(0),
+                },
+            )
+            .expect("insert pending request");
+
+        manager.close().expect("close manager");
+        assert_eq!(
+            receiver.recv().expect("close settlement"),
+            McpElicitationResponse::decline()
+        );
+        let (sender, _receiver) = mpsc::channel();
+        assert_eq!(
+            manager
+                .insert(
+                    "mcp_elicitation:github:next".to_string(),
+                    PendingMcpElicitationRequest {
+                        sender,
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        generation: generation(1),
+                    },
+                )
+                .expect_err("closed manager rejects new requests")
+                .kind(),
+            io::ErrorKind::BrokenPipe
         );
     }
 
