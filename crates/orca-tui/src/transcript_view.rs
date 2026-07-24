@@ -1250,6 +1250,21 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy)]
+    struct RenderCounters<'a> {
+        message_builds: &'a Cell<usize>,
+        markdown_parses: &'a Cell<usize>,
+    }
+
+    impl<'a> RenderCounters<'a> {
+        fn new(message_builds: &'a Cell<usize>, markdown_parses: &'a Cell<usize>) -> Self {
+            Self {
+                message_builds,
+                markdown_parses,
+            }
+        }
+    }
+
     fn prepare_with_counters(
         cache: &mut TranscriptRenderCache,
         messages: &[ChatMessage],
@@ -1257,8 +1272,7 @@ mod tests {
         width: usize,
         syntax_theme_revision: u64,
         tick: u64,
-        message_builds: &Cell<usize>,
-        markdown_parses: &Cell<usize>,
+        counters: RenderCounters<'_>,
     ) {
         let theme = theme();
         cache.prepare(
@@ -1270,9 +1284,13 @@ mod tests {
             tick,
             false,
             |_, message, theme, width, tick, force_expand| {
-                message_builds.set(message_builds.get() + 1);
+                counters
+                    .message_builds
+                    .set(counters.message_builds.get() + 1);
                 if matches!(message, ChatMessage::Assistant(_)) {
-                    markdown_parses.set(markdown_parses.get() + 1);
+                    counters
+                        .markdown_parses
+                        .set(counters.markdown_parses.get() + 1);
                 }
                 build_lines_for_messages(
                     std::slice::from_ref(message),
@@ -1298,7 +1316,13 @@ mod tests {
         let mut cache = TranscriptRenderCache::default();
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         let _ = cache.viewport(0, 0, 4);
         assert_eq!(builds.get(), 3);
@@ -1307,7 +1331,13 @@ mod tests {
         builds.set(0);
         parses.set(0);
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         let _ = cache.viewport(0, 2, 4);
 
@@ -1329,7 +1359,13 @@ mod tests {
         let mut cache = TranscriptRenderCache::default();
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 32, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            32,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         builds.set(0);
         parses.set(0);
@@ -1341,7 +1377,13 @@ mod tests {
         revisions[2] = 4;
         cache.invalidate(2);
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 32, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            32,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
 
         assert_eq!(builds.get(), 1);
@@ -1359,19 +1401,37 @@ mod tests {
         let mut cache = TranscriptRenderCache::default();
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         builds.set(0);
         parses.set(0);
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         assert_eq!(builds.get(), 0);
         assert_eq!(parses.get(), 0);
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 2, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            2,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         assert_eq!(builds.get(), 1);
         assert_eq!(parses.get(), 1);
@@ -1379,7 +1439,13 @@ mod tests {
         builds.set(0);
         parses.set(0);
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 2, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            2,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         assert_eq!(builds.get(), 0);
         assert_eq!(parses.get(), 0);
@@ -1414,13 +1480,25 @@ mod tests {
         let mut cache = TranscriptRenderCache::default();
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         builds.set(0);
         parses.set(0);
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 2, 2, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            2,
+            2,
+            RenderCounters::new(&builds, &parses),
         );
 
         assert_eq!(builds.get(), 1);
@@ -1500,7 +1578,13 @@ mod tests {
         let mut cache = TranscriptRenderCache::default();
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         let before = cache.entries[1].as_ref().unwrap().wrapped_lines[0]
             .text
@@ -1508,7 +1592,13 @@ mod tests {
         builds.set(0);
         parses.set(0);
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 40, 1, 2, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            40,
+            1,
+            2,
+            RenderCounters::new(&builds, &parses),
         );
         let after = cache.entries[1].as_ref().unwrap().wrapped_lines[0]
             .text
@@ -1774,14 +1864,26 @@ mod tests {
         let mut cache = TranscriptRenderCache::default();
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 80, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            80,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         let wide_height = cache.viewport(0, usize::MAX, 5).total_height;
         builds.set(0);
         parses.set(0);
 
         prepare_with_counters(
-            &mut cache, &messages, &revisions, 20, 1, 0, &builds, &parses,
+            &mut cache,
+            &messages,
+            &revisions,
+            20,
+            1,
+            0,
+            RenderCounters::new(&builds, &parses),
         );
         let narrow = cache.viewport(0, usize::MAX, 5);
 
