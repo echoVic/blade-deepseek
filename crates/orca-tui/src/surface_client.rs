@@ -467,9 +467,11 @@ fn drain_operation(
     let mut waiter_finished = false;
     let mut terminal_event_emitted = false;
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
-        let mut made_progress = false;
-        while let Some(item) = subscription.try_recv() {
-            made_progress = true;
+        let mut next_item = subscription.try_recv();
+        if next_item.is_none() && !sealed {
+            next_item = subscription.recv_timeout(Duration::from_millis(25));
+        }
+        while let Some(item) = next_item {
             match item {
                 SurfaceSubscriptionItem::Batch { batch } => {
                     terminal_seen |= batch.events.as_slice().iter().any(|envelope| {
@@ -519,9 +521,12 @@ fn drain_operation(
                 }
                 SurfaceSubscriptionItem::Sealed { .. } => sealed = true,
             }
+            if sealed {
+                break;
+            }
+            next_item = subscription.try_recv();
         }
         if let Ok(result) = wait_rx.try_recv() {
-            made_progress = true;
             waiter_finished = true;
             match result {
                 Ok(WaitOperationTerminalResult::Terminal { value }) => {
@@ -560,9 +565,6 @@ fn drain_operation(
         if (!terminal_seen || terminal_receipt.is_none()) && !sealed {
             if controller.is_shutdown() {
                 let _ = client.cancel_operation(SurfaceRequestId::new(), operation_id.clone());
-            }
-            if !made_progress {
-                std::thread::sleep(Duration::from_millis(5));
             }
         }
     }

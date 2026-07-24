@@ -1,7 +1,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SurfaceHubConfig {
@@ -40,6 +40,7 @@ pub enum SurfaceHubBindError {
 #[derive(Clone)]
 pub struct SurfaceHub {
     inner: Arc<Mutex<SurfaceHubState>>,
+    notify: Arc<Condvar>,
     authority: SurfaceAttachAuthority,
     scope: Arc<()>,
     config: SurfaceHubConfig,
@@ -91,6 +92,7 @@ pub struct SurfaceSubscriptionReceiver {
     hub: Weak<Mutex<SurfaceHubState>>,
     attachment_id: SurfaceAttachmentId,
     dispatcher: Option<Arc<dyn RuntimeSurfaceCommandDispatcher>>,
+    notify: Arc<Condvar>,
 }
 
 impl SurfaceSubscriptionReceiver {
@@ -98,14 +100,38 @@ impl SurfaceSubscriptionReceiver {
         let hub = self.hub.upgrade()?;
         let item = {
             let mut state = lock(&hub);
-            let subscriber = subscriber_mut(&mut state, &self.attachment_id)?;
-            let item = dequeue_subscription_item(subscriber)?;
-            if matches!(item, QueuedSubscriptionItem::Gap(_)) {
-                state.retired_subscriptions.remove(&self.attachment_id);
-            }
-            item
+            take_subscription_item(&mut state, &self.attachment_id)
         };
-        Some(materialize_subscription_item(item))
+        item.map(materialize_subscription_item)
+    }
+
+    pub fn recv_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Option<SurfaceSubscriptionItem> {
+        let hub = self.hub.upgrade()?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = lock(&hub);
+        loop {
+            if let Some(item) = take_subscription_item(&mut state, &self.attachment_id) {
+                drop(state);
+                return Some(materialize_subscription_item(item));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, result) = self
+                .notify
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if result.timed_out() {
+                let item = take_subscription_item(&mut state, &self.attachment_id);
+                drop(state);
+                return item.map(materialize_subscription_item);
+            }
+        }
     }
 }
 
@@ -200,6 +226,7 @@ impl SurfaceHub {
                 subscriptions: BTreeMap::new(),
                 retired_subscriptions: BTreeMap::new(),
             })),
+            notify: Arc::new(Condvar::new()),
             authority,
             scope: Arc::new(()),
             config,
@@ -240,6 +267,7 @@ impl SurfaceHub {
         }
         Ok(Self {
             inner: self.inner.clone(),
+            notify: self.notify.clone(),
             authority,
             scope: self.scope.clone(),
             config: self.config,
@@ -364,6 +392,7 @@ impl SurfaceHub {
             hub: Arc::downgrade(&self.inner),
             attachment_id: attachment_id.clone(),
             dispatcher: self.dispatcher.clone(),
+            notify: self.notify.clone(),
         })
     }
 
@@ -394,6 +423,7 @@ impl SurfaceHub {
                 lost
             }
         };
+        self.notify.notify_all();
         self.notify_interaction_capability_change(!lost.is_empty());
     }
 
@@ -457,6 +487,7 @@ impl SurfaceHub {
             state.ready = true;
             lost
         };
+        self.notify.notify_all();
         self.notify_interaction_capability_change(!lost.is_empty());
     }
 
@@ -564,7 +595,10 @@ impl SurfaceHub {
         state.subscriptions.remove(attachment_id);
         state.retired_subscriptions.remove(attachment_id);
         match client.remember_detached(receipt.clone()) {
-            Ok(()) => DetachResult::Detached { receipt },
+            Ok(()) => {
+                self.notify.notify_all();
+                DetachResult::Detached { receipt }
+            }
             Err(receipt) => DetachResult::AlreadyDetached { receipt },
         }
     }
@@ -882,6 +916,18 @@ fn dequeue_subscription_item(subscriber: &mut SurfaceSubscriber) -> Option<Queue
             .queued_events
             .saturating_sub(batch.batch.event_count as u64);
         subscriber.queued_bytes = subscriber.queued_bytes.saturating_sub(batch.encoded_bytes);
+    }
+    Some(item)
+}
+
+fn take_subscription_item(
+    state: &mut SurfaceHubState,
+    attachment_id: &SurfaceAttachmentId,
+) -> Option<QueuedSubscriptionItem> {
+    let subscriber = subscriber_mut(state, attachment_id)?;
+    let item = dequeue_subscription_item(subscriber)?;
+    if matches!(item, QueuedSubscriptionItem::Gap(_)) {
+        state.retired_subscriptions.remove(attachment_id);
     }
     Some(item)
 }
@@ -1232,6 +1278,46 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert!(Arc::ptr_eq(&captured[0], &batch));
         assert!(materialize_replay(captured) == vec![batch.batch.clone()]);
+    }
+
+    #[test]
+    fn subscription_recv_timeout_wakes_on_a_published_batch() {
+        let initial = reducer_snapshot();
+        let hub = SurfaceHub::new_tui(
+            initial.clone(),
+            HostIncarnation::try_from_bytes(uuid_v7_bytes(218)).unwrap(),
+            SurfaceHubConfig::default(),
+        )
+        .unwrap();
+        hub.repair_committed(Arc::new(initial.clone()), &[]);
+        let attachment = match hub.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::try_from_bytes(uuid_v7_bytes(219)).unwrap(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("fresh attach failed"),
+        };
+        let mut receiver = hub.claim_subscription(&attachment.subscription).unwrap();
+        let batch = batch();
+        let mut next = initial;
+        next.cursor = batch.cursor_after.clone();
+        let publish_hub = hub.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_hub.apply_committed(Arc::new(next), &batch);
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(1)),
+            Some(SurfaceSubscriptionItem::Batch { .. })
+        ));
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(1))
+                .is_none()
+        );
+        publisher.join().unwrap();
     }
 
     #[test]
