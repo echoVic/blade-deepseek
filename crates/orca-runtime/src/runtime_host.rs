@@ -3253,7 +3253,9 @@ fn resolve_surface_input(request: &surface::SurfaceInputRequest) -> Option<surfa
     Some(surface::SurfaceInput {
         blocks: surface::NonEmptyVec::try_new(blocks).ok()?,
         canonical_text: surface::DisplayText::new(surface_request_text(request)),
-        bindings_digest: surface::Sha256Digest::new([0; 32]),
+        bindings_digest: surface_sha256(
+            &serde_json::to_vec(request).expect("surface input request is serializable"),
+        ),
     })
 }
 
@@ -6869,14 +6871,20 @@ impl ThreadActor {
         let origin = surface::OperationOrigin::TuiUser;
         let settings = &snapshot.settings;
         let replayability = surface::Replayability::Replayable {
-            capsule_digest: surface::Sha256Digest::new([0; 32]),
-            request: Some(input_request),
-            request_digest: Some(surface::Sha256Digest::new([0; 32])),
+            capsule_digest: surface_sha256(
+                &serde_json::to_vec(&input_request).expect("surface input is serializable"),
+            ),
+            request: Some(input_request.clone()),
+            request_digest: Some(surface_sha256(
+                &serde_json::to_vec(&input_request).expect("surface input is serializable"),
+            )),
             cwd: settings.effective.cwd.clone(),
             workspace_roots: settings.effective.workspace_roots.clone(),
             settings_revision: settings.thread_revision,
             policy_epoch: settings.effective.policy_epoch,
-            tool_schema_digest: surface::Sha256Digest::new([0; 32]),
+            tool_schema_digest: surface_sha256(
+                &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+            ),
         };
         let operation = surface::OperationRecord {
             operation_id: operation_id.clone(),
@@ -6891,7 +6899,9 @@ impl ThreadActor {
                 settings_revision: settings.thread_revision,
                 policy_epoch: settings.effective.policy_epoch,
                 required_capabilities: Default::default(),
-                capability_fingerprint: surface::Sha256Digest::new([0; 32]),
+                capability_fingerprint: surface_sha256(
+                    &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+                ),
                 settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
                     settings_revision: settings.thread_revision,
                     policy_epoch: settings.effective.policy_epoch,
