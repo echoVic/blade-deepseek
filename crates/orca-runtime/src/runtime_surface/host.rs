@@ -47,6 +47,12 @@ impl RuntimeSurfaceThreadHandle {
     }
 }
 
+impl RuntimeThreadHandle {
+    pub fn typed_surface(&self) -> RuntimeSurfaceThreadHandle {
+        RuntimeSurfaceThreadHandle::from_runtime(self.clone())
+    }
+}
+
 impl RuntimeHost {
     pub fn surface_handle(&self) -> RuntimeSurfaceHostHandle {
         RuntimeSurfaceHostHandle::from_runtime(self.handle())

@@ -13,9 +13,9 @@ use orca_runtime::surface::{
     AttachResult, FreshAttachRequest, MutationReply, NonEmptyVec, OperationIngressCorrelation,
     OperationKind, OperationPatch, OperationRequestIntent, OperationSettingsPreparation,
     OperationTerminal, ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
-    RuntimeSurfaceHandle, SurfaceAttachmentRole, SurfaceCapability, SurfaceEvent,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
-    SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSubscriptionItem,
+    RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceOperationId, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSubscriptionItem,
     WaitOperationTerminalResult,
 };
 
@@ -199,6 +199,17 @@ pub(crate) fn update_settings(
 
 fn run_typed(
     thread: &RuntimeThreadHandle,
+    request: HostedTurnRequest,
+    config: RunConfig,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    let typed_thread = thread.typed_surface();
+    run_typed_thread(&typed_thread, request, config, controller, event_tx)
+}
+
+fn run_typed_thread(
+    thread: &RuntimeSurfaceThreadHandle,
     request: HostedTurnRequest,
     config: RunConfig,
     controller: &TuiOperationController,
