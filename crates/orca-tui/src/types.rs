@@ -145,23 +145,6 @@ fn normalize_diff_relative_path(path: &str) -> Option<PathBuf> {
     (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
-#[derive(Clone, Copy)]
-struct DiffRange {
-    start: usize,
-    count: usize,
-}
-
-fn parse_diff_range(token: &str, marker: char) -> Option<DiffRange> {
-    let coordinates = token.strip_prefix(marker)?;
-    let mut parts = coordinates.split(',');
-    let start = parts.next()?.parse::<usize>().ok()?;
-    let count = match parts.next() {
-        Some(count) => count.parse().ok()?,
-        None => 1,
-    };
-    (parts.next().is_none()).then_some(DiffRange { start, count })
-}
-
 fn unified_diff_header_path(header: &str) -> &str {
     let path = header.split_once('\t').map_or(header, |(path, _)| path);
     path.strip_prefix("a/")
@@ -169,30 +152,19 @@ fn unified_diff_header_path(header: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn parse_hunk_ranges(header: &str) -> Option<(DiffRange, DiffRange)> {
-    let mut tokens = header.split_whitespace();
-    if tokens.next()? != "@@" {
-        return None;
+fn parsed_diff_structure_matches_target(
+    parsed: &crate::diff_highlight::ParsedDiff,
+    diff: &str,
+    target: &Path,
+) -> bool {
+    if !parsed.is_structurally_valid() || parsed.has_multiple_files {
+        return false;
     }
-    let old_range = parse_diff_range(tokens.next()?, '-')?;
-    let new_range = parse_diff_range(tokens.next()?, '+')?;
-    if tokens.next()? != "@@"
-        || (old_range.count > 0 && old_range.start == 0)
-        || (new_range.count > 0 && new_range.start == 0)
-    {
-        return None;
-    }
-    Some((old_range, new_range))
-}
-
-fn unified_diff_structure_is_valid(diff: &str, target: &Path) -> bool {
-    use std::collections::HashSet;
-
-    let lines = diff.lines().collect::<Vec<_>>();
-    let Some(old_header) = lines.first().and_then(|line| line.strip_prefix("--- ")) else {
+    let mut lines = diff.lines();
+    let Some(old_header) = lines.next().and_then(|line| line.strip_prefix("--- ")) else {
         return false;
     };
-    let Some(new_header) = lines.get(1).and_then(|line| line.strip_prefix("+++ ")) else {
+    let Some(new_header) = lines.next().and_then(|line| line.strip_prefix("+++ ")) else {
         return false;
     };
     let old_path = unified_diff_header_path(old_header);
@@ -208,90 +180,12 @@ fn unified_diff_structure_is_valid(diff: &str, target: &Path) -> bool {
     {
         return false;
     }
-
-    let mut index = 2;
-    let mut saw_hunk = false;
-    let mut previous_old_end = None;
-    let mut previous_new_end = None;
-    let mut hunk_ranges = HashSet::new();
-    while index < lines.len() {
-        let Some((old_range, new_range)) = parse_hunk_ranges(lines[index]) else {
-            return false;
-        };
-        if (old_range.count == 0 && new_range.count == 0)
-            || (old_is_null && (old_range.start != 0 || old_range.count != 0))
-            || (new_is_null && (new_range.start != 0 || new_range.count != 0))
-        {
-            return false;
-        }
-        let Some(old_end) = old_range.start.checked_add(old_range.count) else {
-            return false;
-        };
-        let Some(new_end) = new_range.start.checked_add(new_range.count) else {
-            return false;
-        };
-        if !hunk_ranges.insert((
-            old_range.start,
-            old_range.count,
-            new_range.start,
-            new_range.count,
-        )) || previous_old_end.is_some_and(|end| old_range.start < end)
-            || previous_new_end.is_some_and(|end| new_range.start < end)
-        {
-            return false;
-        }
-        previous_old_end = Some(old_end);
-        previous_new_end = Some(new_end);
-        let mut old_remaining = old_range.count;
-        let mut new_remaining = new_range.count;
-        saw_hunk = true;
-        index += 1;
-        let mut previous_was_source = false;
-        while old_remaining > 0 || new_remaining > 0 {
-            let Some(line) = lines.get(index) else {
-                return false;
-            };
-            match line.as_bytes().first() {
-                Some(b' ') if old_remaining > 0 && new_remaining > 0 => {
-                    old_remaining -= 1;
-                    new_remaining -= 1;
-                    previous_was_source = true;
-                }
-                Some(b'-') if old_remaining > 0 => {
-                    old_remaining -= 1;
-                    previous_was_source = true;
-                }
-                Some(b'+') if new_remaining > 0 => {
-                    new_remaining -= 1;
-                    previous_was_source = true;
-                }
-                Some(b'\\') if *line == "\\ No newline at end of file" && previous_was_source => {
-                    previous_was_source = false;
-                    index += 1;
-                    continue;
-                }
-                _ => return false,
-            }
-            index += 1;
-            if lines.get(index) == Some(&"\\ No newline at end of file") {
-                index += 1;
-                previous_was_source = false;
-            }
-        }
-        if lines.get(index) == Some(&"\\ No newline at end of file") {
-            if !previous_was_source {
-                return false;
-            }
-            index += 1;
-        }
-        if lines
-            .get(index)
-            .is_some_and(|line| line.starts_with("--- ") || line.starts_with("+++ "))
-        {
-            return false;
-        }
-    }
-    saw_hunk
+    parsed
+        .destination_path
+        .as_deref()
+        .and_then(normalize_diff_relative_path)
+        .as_deref()
+        == Some(target)
 }
 
 fn parsed_diff_has_valid_new_side(parsed: &crate::diff_highlight::ParsedDiff) -> bool {
@@ -1205,8 +1099,7 @@ impl AppState {
         let Some(normalized_destination) = normalize_diff_relative_path(destination_path) else {
             return;
         };
-        if parsed.has_multiple_files
-            || !unified_diff_structure_is_valid(diff, Path::new(&display_path))
+        if !parsed_diff_structure_matches_target(&parsed, diff, Path::new(&display_path))
             || normalized_destination != Path::new(&display_path)
             || !parsed_diff_has_valid_new_side(&parsed)
             || highlighter_for_path(&normalized_destination, self.syntax_theme).is_none()
@@ -5429,6 +5322,190 @@ mod tests {
         });
     }
 
+    fn malformed_structural_diffs() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "malformed-hunk-candidate",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ malformed coordinates @@
+@@ -1 +1 @@ valid function context
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "metadata-before-first-hunk",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+arbitrary metadata
+@@ -1 +1 @@
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "zero-old-start",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -0 +1 @@
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "zero-new-start",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +0 @@
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "zero-width",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,0 +1,0 @@
+@@ -1 +1 @@
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "overflow",
+                format!(
+                    "--- a/src/item.py\n+++ b/src/item.py\n@@ -{},2 +1,2 @@\n-old = 1\n-old = 2\n+value = 2\n+new = 2\n",
+                    usize::MAX
+                ),
+            ),
+            (
+                "duplicate",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+@@ -1 +1 @@
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "backward",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -3 +3 @@
+-old = 3
++new = 3
+@@ -1 +1 @@
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "old-overlap",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,2 +1 @@
+-old = 1
+-old = 2
++new = 1
+@@ -2 +2 @@
+-old = 2
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "new-overlap",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1,2 @@
+-old = 1
++new = 1
++value = 2
+@@ -2 +2 @@
+-old = 2
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "reused-old-anchor",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1,0 +1 @@
++first = 1
+@@ -1 +3 @@
+-value = 1
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "reused-new-anchor",
+                "\
+--- a/src/item.py
++++ b/src/item.py
+@@ -1 +1,0 @@
+-value = 1
+@@ -3 +1 @@
+-other = 3
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "null-old-range",
+                "\
+--- /dev/null
++++ b/src/item.py
+@@ -1,0 +1 @@
++value = 2
+"
+                .to_string(),
+            ),
+            (
+                "null-new-range",
+                "\
+--- a/src/item.py
++++ /dev/null
+@@ -1 +1,0 @@
+-value = 1
+"
+                .to_string(),
+            ),
+            (
+                "both-null",
+                "\
+--- /dev/null
++++ /dev/null
+@@ -0,0 +1 @@
++value = 2
+"
+                .to_string(),
+            ),
+        ]
+    }
+
     fn state_with_submitted_edit_job() -> (
         tempfile::TempDir,
         AppState,
@@ -5756,6 +5833,62 @@ mod tests {
     }
 
     #[test]
+    fn malformed_structures_fail_closed_across_parser_first_paint_and_app_state() {
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+
+        for (id, diff) in malformed_structural_diffs() {
+            let parsed = crate::diff_highlight::parse_unified_diff(&diff);
+            assert!(parsed.has_malformed_hunk, "{id}");
+            assert!(!parsed.is_structurally_valid(), "{id}");
+            assert_eq!(parsed.raw_fallback.as_deref(), Some(diff.as_str()), "{id}");
+
+            let rendered = crate::diff_highlight::render_parsed_diff(&parsed, &theme, None);
+            assert_eq!(rendered.len(), diff.lines().count(), "{id}");
+            for (raw_line, rendered_line) in diff.lines().zip(rendered) {
+                assert_eq!(
+                    rendered_line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>(),
+                    format!("    {raw_line}"),
+                    "{id}"
+                );
+                assert_eq!(rendered_line.spans.len(), 1, "{id}: {raw_line:?}");
+            }
+
+            let (_directory, mut state) = configured_edit_state();
+            submit_live_edit(&mut state, id, "src/item.py", &diff);
+            assert_eq!(state.pending_edit_highlight_count(), 0, "{id}");
+            assert!(!state.edit_highlight_runtime_started(), "{id}");
+        }
+    }
+
+    #[test]
+    fn headerless_then_headered_diff_is_ambiguous_and_submits_no_job() {
+        let (_directory, mut state) = configured_edit_state();
+        let diff = "\
+@@ -1 +1 @@
+-value = 1
++value = 2
+--- a/src/item.py
++++ b/src/item.py
+@@ -3 +3 @@
+-other = 3
++other = 4
+";
+
+        let parsed = crate::diff_highlight::parse_unified_diff(diff);
+        assert!(parsed.is_structurally_valid());
+        assert!(parsed.has_multiple_files);
+
+        submit_live_edit(&mut state, "mixed-sections", "src/item.py", diff);
+
+        assert_eq!(state.pending_edit_highlight_count(), 0);
+        assert!(!state.edit_highlight_runtime_started());
+    }
+
+    #[test]
     fn extra_source_line_after_completed_hunk_is_rejected_before_runtime_spawn() {
         let (_directory, mut state) = configured_edit_state();
         let malformed = "\
@@ -5846,11 +5979,13 @@ mod tests {
 
         submit_live_edit(&mut state, "invalid-null-add", "src/item.py", invalid_add);
         assert_eq!(state.pending_edit_highlight_count(), 0);
-        assert!(!unified_diff_structure_is_valid(
+        assert!(!parsed_diff_structure_matches_target(
+            &crate::diff_highlight::parse_unified_diff(invalid_add),
             invalid_add,
             Path::new("src/item.py")
         ));
-        assert!(!unified_diff_structure_is_valid(
+        assert!(!parsed_diff_structure_matches_target(
+            &crate::diff_highlight::parse_unified_diff(invalid_delete),
             invalid_delete,
             Path::new("src/item.py")
         ));
@@ -6344,12 +6479,14 @@ arbitrary metadata
 
         submit_live_edit(&mut state, "malformed-add", "src/item.py", malformed_add);
         assert_eq!(state.pending_edit_highlight_count(), 0);
-        assert!(!unified_diff_structure_is_valid(
+        assert!(!parsed_diff_structure_matches_target(
+            &crate::diff_highlight::parse_unified_diff(malformed_add),
             malformed_add,
             Path::new("src/item.py")
         ));
 
-        assert!(unified_diff_structure_is_valid(
+        assert!(parsed_diff_structure_matches_target(
+            &crate::diff_highlight::parse_unified_diff(delete),
             delete,
             Path::new("src/item.py")
         ));

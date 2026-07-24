@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ratatui::style::Style;
@@ -63,6 +63,12 @@ pub(crate) struct ParsedDiff {
     pub(crate) aggregate_source_lines: usize,
 }
 
+impl ParsedDiff {
+    pub(crate) fn is_structurally_valid(&self) -> bool {
+        !self.has_malformed_hunk && !self.hunks.is_empty()
+    }
+}
+
 pub(crate) type RefinedDiffStyles = HashMap<usize, StyledSourceLine>;
 
 /// Worker-facing entry point; callers with a `ParsedDiff` must use this ambiguity guard.
@@ -73,7 +79,7 @@ pub(crate) fn compute_parsed_diff_file_scoped_styles(
     parsed: &ParsedDiff,
     theme: SyntaxTheme,
 ) -> Option<RefinedDiffStyles> {
-    if parsed.has_multiple_files || parsed.has_malformed_hunk {
+    if parsed.has_multiple_files || !parsed.is_structurally_valid() {
         return None;
     }
     compute_file_scoped_styles(path, file_text, &parsed.hunks, theme)
@@ -153,6 +159,7 @@ struct HunkBuilder {
     new_next: usize,
     old_remaining: usize,
     new_remaining: usize,
+    previous_was_source: bool,
 }
 
 impl HunkBuilder {
@@ -172,6 +179,7 @@ impl HunkBuilder {
             new_next: new_start,
             old_remaining: old_count,
             new_remaining: new_count,
+            previous_was_source: false,
         }
     }
 
@@ -188,6 +196,7 @@ impl HunkBuilder {
     }
 
     fn source_line(&mut self, kind: DiffLineKind, content: String) -> DiffSourceLine {
+        self.previous_was_source = true;
         match kind {
             DiffLineKind::Context => {
                 let line = DiffSourceLine {
@@ -228,7 +237,127 @@ impl HunkBuilder {
     }
 }
 
-fn parse_range(token: &str, marker: char) -> Option<(usize, usize)> {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DiffRange {
+    start: usize,
+    count: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HunkCoordinates {
+    old: DiffRange,
+    new: DiffRange,
+}
+
+enum ParsedHunkHeader {
+    NotCandidate,
+    Malformed,
+    Valid(HunkCoordinates),
+}
+
+enum ParserPhase {
+    Prelude,
+    BetweenSections {
+        follows_section: bool,
+    },
+    PendingNewHeader {
+        old_path: Option<String>,
+        follows_section: bool,
+    },
+    AwaitingHunk,
+    InSection,
+}
+
+impl ParserPhase {
+    fn take_pending_new_header(&mut self) -> Option<(Option<String>, bool)> {
+        if !matches!(self, Self::PendingNewHeader { .. }) {
+            return None;
+        }
+        let Self::PendingNewHeader {
+            old_path,
+            follows_section,
+        } = std::mem::replace(self, Self::Prelude)
+        else {
+            unreachable!("checked pending header phase");
+        };
+        Some((old_path, follows_section))
+    }
+}
+
+fn is_git_extended_header(line: &str) -> bool {
+    [
+        "index ",
+        "new file mode ",
+        "deleted file mode ",
+        "old mode ",
+        "new mode ",
+        "similarity index ",
+        "dissimilarity index ",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+#[derive(Default)]
+struct FileSectionState {
+    old_path_is_null: bool,
+    new_path_is_null: bool,
+    previous_old_floor: Option<usize>,
+    previous_new_floor: Option<usize>,
+    hunk_ranges: HashSet<HunkCoordinates>,
+}
+
+impl FileSectionState {
+    fn reset(&mut self, old_path_is_null: bool, new_path_is_null: bool) {
+        self.old_path_is_null = old_path_is_null;
+        self.new_path_is_null = new_path_is_null;
+        self.previous_old_floor = None;
+        self.previous_new_floor = None;
+        self.hunk_ranges.clear();
+    }
+
+    fn accepts(&mut self, coordinates: HunkCoordinates) -> bool {
+        let Some(old_floor) = coordinates.old.ordering_floor() else {
+            return false;
+        };
+        let Some(new_floor) = coordinates.new.ordering_floor() else {
+            return false;
+        };
+        if (self.old_path_is_null && (coordinates.old.start != 0 || coordinates.old.count != 0))
+            || (self.new_path_is_null && (coordinates.new.start != 0 || coordinates.new.count != 0))
+            || (self.old_path_is_null && self.new_path_is_null)
+            || self
+                .previous_old_floor
+                .is_some_and(|floor| coordinates.old.start < floor)
+            || self
+                .previous_new_floor
+                .is_some_and(|floor| coordinates.new.start < floor)
+            || !self.hunk_ranges.insert(coordinates)
+        {
+            return false;
+        }
+        self.previous_old_floor = Some(old_floor);
+        self.previous_new_floor = Some(new_floor);
+        true
+    }
+}
+
+impl DiffRange {
+    fn ordering_floor(self) -> Option<usize> {
+        if self.count == 0 {
+            self.start.checked_add(1)
+        } else {
+            Some(self.end)
+        }
+    }
+}
+
+fn parse_range(token: &str, marker: char) -> Option<DiffRange> {
     let coordinates = token.strip_prefix(marker)?;
     let mut parts = coordinates.split(',');
     let start = parts.next()?.parse().ok()?;
@@ -239,23 +368,29 @@ fn parse_range(token: &str, marker: char) -> Option<(usize, usize)> {
     if parts.next().is_some() {
         return None;
     }
-    Some((start, count))
+    if count > 0 && start == 0 {
+        return None;
+    }
+    Some(DiffRange {
+        start,
+        count,
+        end: start.checked_add(count)?,
+    })
 }
 
-fn parse_hunk_coordinates(header: &str) -> Option<(usize, usize, usize, usize)> {
+fn parse_hunk_coordinates(header: &str) -> ParsedHunkHeader {
     if !header.starts_with("@@") {
-        return None;
+        return ParsedHunkHeader::NotCandidate;
     }
-    let mut tokens = header.split_whitespace();
-    if tokens.next()? != "@@" {
-        return None;
-    }
-    let (old_start, old_count) = parse_range(tokens.next()?, '-')?;
-    let (new_start, new_count) = parse_range(tokens.next()?, '+')?;
-    if tokens.next()? != "@@" {
-        return None;
-    }
-    Some((old_start, old_count, new_start, new_count))
+    let parsed = (|| {
+        let mut tokens = header.split_whitespace();
+        (tokens.next()? == "@@").then_some(())?;
+        let old = parse_range(tokens.next()?, '-')?;
+        let new = parse_range(tokens.next()?, '+')?;
+        (tokens.next()? == "@@").then_some(())?;
+        (!(old.count == 0 && new.count == 0)).then_some(HunkCoordinates { old, new })
+    })();
+    parsed.map_or(ParsedHunkHeader::Malformed, ParsedHunkHeader::Valid)
 }
 
 fn parse_header_path(header_value: &str) -> Option<String> {
@@ -282,8 +417,9 @@ fn finish_hunk(current: &mut Option<HunkBuilder>, hunks: &mut Vec<DiffHunk>) {
 pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
     let mut parsed = ParsedDiff::default();
     let mut current: Option<HunkBuilder> = None;
-    let mut pending_old_path: Option<Option<String>> = None;
-    let mut file_sections = 0usize;
+    let mut phase = ParserPhase::Prelude;
+    let mut section_count = 0usize;
+    let mut section = FileSectionState::default();
 
     for line in diff.lines() {
         let hunk_is_active = current
@@ -319,12 +455,17 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
             }
         }
 
-        if let Some(old_path) = pending_old_path.take() {
+        if let Some((old_path, follows_section)) = phase.take_pending_new_header() {
             if let Some(header_value) = line.strip_prefix("+++ ") {
-                file_sections = file_sections.saturating_add(1);
-                parsed.has_multiple_files = file_sections > 1;
-                parsed.destination_path =
-                    parse_header_path(header_value).or_else(|| old_path.clone());
+                let new_path = parse_header_path(header_value);
+                section_count = section_count.saturating_add(1);
+                parsed.has_multiple_files = section_count > 1;
+                parsed.destination_path = new_path.clone().or_else(|| old_path.clone());
+                section.reset(old_path.is_none(), new_path.is_none());
+                if old_path.is_none() && new_path.is_none() {
+                    parsed.has_malformed_hunk = true;
+                }
+                phase = ParserPhase::AwaitingHunk;
                 if let Some(builder) = current.as_mut() {
                     builder
                         .hunk
@@ -336,10 +477,139 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
                 continue;
             }
             parsed.has_malformed_hunk = true;
+            phase = if follows_section {
+                ParserPhase::InSection
+            } else {
+                ParserPhase::Prelude
+            };
+        }
+
+        let hunk_header = parse_hunk_coordinates(line);
+        if let ParsedHunkHeader::Valid(coordinates) = hunk_header
+            && !matches!(phase, ParserPhase::BetweenSections { .. })
+        {
+            if matches!(phase, ParserPhase::Prelude) {
+                section_count = section_count.saturating_add(1);
+                parsed.has_multiple_files = section_count > 1;
+                section.reset(false, false);
+                phase = ParserPhase::InSection;
+            }
+            if section.accepts(coordinates) {
+                if hunk_is_active {
+                    parsed.has_malformed_hunk = true;
+                }
+                finish_hunk(&mut current, &mut parsed.hunks);
+                current = Some(HunkBuilder::new(
+                    line.to_owned(),
+                    coordinates.old.start,
+                    coordinates.old.count,
+                    coordinates.new.start,
+                    coordinates.new.count,
+                ));
+                phase = ParserPhase::InSection;
+                continue;
+            }
+        }
+        if matches!(
+            hunk_header,
+            ParsedHunkHeader::Valid(_) | ParsedHunkHeader::Malformed
+        ) {
+            parsed.has_malformed_hunk = true;
+            if let Some(builder) = current.as_mut() {
+                builder
+                    .hunk
+                    .entries
+                    .push(DiffHunkEntry::Metadata(line.to_owned()));
+            } else {
+                parsed.prelude.push(line.to_owned());
+            }
+            continue;
+        }
+
+        if matches!(phase, ParserPhase::AwaitingHunk) {
+            parsed.has_malformed_hunk = true;
+        }
+
+        if line == "\\ No newline at end of file" {
+            if let Some(builder) = current.as_mut()
+                && builder.previous_was_source
+            {
+                builder.previous_was_source = false;
+                builder
+                    .hunk
+                    .entries
+                    .push(DiffHunkEntry::Metadata(line.to_owned()));
+                continue;
+            }
+            parsed.has_malformed_hunk = true;
+        }
+
+        if line.starts_with("diff --git ") {
+            let can_start_section = matches!(phase, ParserPhase::Prelude)
+                || (matches!(phase, ParserPhase::InSection)
+                    && current.as_ref().is_some_and(HunkBuilder::is_complete));
+            if can_start_section {
+                phase = ParserPhase::BetweenSections {
+                    follows_section: section_count > 0,
+                };
+                if let Some(builder) = current.as_mut() {
+                    builder
+                        .hunk
+                        .entries
+                        .push(DiffHunkEntry::Metadata(line.to_owned()));
+                } else {
+                    parsed.prelude.push(line.to_owned());
+                }
+                continue;
+            }
+            if matches!(phase, ParserPhase::BetweenSections { .. }) {
+                parsed.has_malformed_hunk = true;
+                if let Some(builder) = current.as_mut() {
+                    builder
+                        .hunk
+                        .entries
+                        .push(DiffHunkEntry::Metadata(line.to_owned()));
+                } else {
+                    parsed.prelude.push(line.to_owned());
+                }
+                continue;
+            }
+        }
+
+        if matches!(phase, ParserPhase::BetweenSections { .. }) && is_git_extended_header(line) {
+            if let Some(builder) = current.as_mut() {
+                builder
+                    .hunk
+                    .entries
+                    .push(DiffHunkEntry::Metadata(line.to_owned()));
+            } else {
+                parsed.prelude.push(line.to_owned());
+            }
+            continue;
         }
 
         if let Some(header_value) = line.strip_prefix("--- ") {
-            pending_old_path = Some(parse_header_path(header_value));
+            let follows_section = match phase {
+                ParserPhase::BetweenSections { follows_section } => follows_section,
+                _ => !matches!(phase, ParserPhase::Prelude),
+            };
+            phase = ParserPhase::PendingNewHeader {
+                old_path: parse_header_path(header_value),
+                follows_section,
+            };
+            if let Some(builder) = current.as_mut() {
+                builder
+                    .hunk
+                    .entries
+                    .push(DiffHunkEntry::Metadata(line.to_owned()));
+            } else {
+                parsed.prelude.push(line.to_owned());
+            }
+            continue;
+        }
+
+        if matches!(phase, ParserPhase::BetweenSections { .. }) {
+            parsed.has_malformed_hunk = true;
             if let Some(builder) = current.as_mut() {
                 builder
                     .hunk
@@ -364,21 +634,6 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
             continue;
         }
 
-        if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_coordinates(line) {
-            if hunk_is_active {
-                parsed.has_malformed_hunk = true;
-            }
-            finish_hunk(&mut current, &mut parsed.hunks);
-            current = Some(HunkBuilder::new(
-                line.to_owned(),
-                old_start,
-                old_count,
-                new_start,
-                new_count,
-            ));
-            continue;
-        }
-
         let completed_hunk_has_extra_source =
             current.as_ref().is_some_and(HunkBuilder::is_complete)
                 && matches!(line.as_bytes().first(), Some(b' ' | b'+' | b'-'));
@@ -387,6 +642,7 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
         }
 
         if hunk_is_active {
+            parsed.has_malformed_hunk = true;
             current
                 .as_mut()
                 .expect("active hunk")
@@ -397,6 +653,7 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
         }
 
         if let Some(builder) = current.as_mut() {
+            parsed.has_malformed_hunk = true;
             builder
                 .hunk
                 .entries
@@ -406,7 +663,12 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
         }
     }
 
-    if pending_old_path.is_some() {
+    if matches!(
+        phase,
+        ParserPhase::BetweenSections { .. }
+            | ParserPhase::PendingNewHeader { .. }
+            | ParserPhase::AwaitingHunk
+    ) {
         parsed.has_malformed_hunk = true;
     }
     if current
@@ -577,7 +839,7 @@ fn render_raw_diff(raw_diff: &str, theme: &Theme) -> Vec<Line<'static>> {
 
 fn syntax_is_eligible(parsed: &ParsedDiff) -> bool {
     !parsed.has_multiple_files
-        && !parsed.has_malformed_hunk
+        && parsed.is_structurally_valid()
         && parsed.aggregate_source_bytes <= MAX_HIGHLIGHT_BYTES
         && parsed.aggregate_source_lines <= MAX_HIGHLIGHT_LINES
         && parsed
@@ -706,7 +968,7 @@ mod tests {
 
     use orca_core::config::ThemeName;
     use orca_core::tool_types::FileChangePreview;
-    use ratatui::style::Style;
+    use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
 
     use super::{
@@ -767,6 +1029,58 @@ mod tests {
         assert_eq!(line.spans[0].style.fg, Some(color));
         assert_eq!(line.spans[1].content.as_ref(), content);
         assert_eq!(line.spans[1].style.fg, Some(color));
+    }
+
+    fn assert_malformed_raw_fallback(diff: &str) {
+        let theme = dark_theme();
+        let overlay_color = Color::Rgb(1, 2, 3);
+        let mut refined = RefinedDiffStyles::new();
+        refined.insert(
+            1,
+            vec![Span::styled(
+                "refined overlay must not render",
+                Style::default().fg(overlay_color),
+            )],
+        );
+
+        let parsed = parse_unified_diff(diff);
+
+        assert!(
+            parsed.has_malformed_hunk,
+            "fixture must be malformed:\n{diff}"
+        );
+        assert!(!parsed.is_structurally_valid());
+        assert_eq!(parsed.raw_fallback.as_deref(), Some(diff));
+        assert!(
+            compute_parsed_diff_file_scoped_styles(
+                Path::new("value.rs"),
+                "let value = 2;\n",
+                &parsed,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+        let rendered = render_parsed_diff(&parsed, &theme, Some(&refined));
+        assert_eq!(rendered.len(), diff.lines().count());
+        for (raw_line, rendered_line) in diff.lines().zip(&rendered) {
+            assert_eq!(rendered_text(rendered_line), format!("    {raw_line}"));
+            assert_eq!(
+                rendered_line.spans.len(),
+                1,
+                "raw fallback must not segment syntax tokens: {raw_line:?}"
+            );
+            let expected_color = if raw_line.starts_with('+') && !raw_line.starts_with("+++") {
+                theme.diff_add
+            } else if raw_line.starts_with('-') && !raw_line.starts_with("---") {
+                theme.diff_remove
+            } else if raw_line.starts_with("@@") {
+                theme.border
+            } else {
+                theme.muted
+            };
+            assert_eq!(rendered_line.spans[0].style.fg, Some(expected_color));
+            assert_ne!(rendered_line.spans[0].style.fg, Some(overlay_color));
+        }
     }
 
     fn padded_rust_line(len: usize) -> String {
@@ -855,6 +1169,635 @@ mod tests {
                 (DiffLineKind::Delete, Some(3), None, "old"),
                 (DiffLineKind::Insert, None, Some(3), "new"),
             ]
+        );
+    }
+
+    #[test]
+    fn malformed_hunk_candidate_forces_first_paint_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ malformed coordinates @@
+@@ -1 +1 @@ valid function context
+-let old = 1;
++let value = 2;
+",
+        );
+    }
+
+    #[test]
+    fn content_between_header_pair_and_first_hunk_forces_raw_fallback() {
+        for content in ["arbitrary metadata", ""] {
+            let diff = format!(
+                "--- a/value.rs\n+++ b/value.rs\n{content}\n@@ -1 +1 @@\n-let old = 1;\n+let value = 2;\n"
+            );
+
+            assert_malformed_raw_fallback(&diff);
+        }
+    }
+
+    #[test]
+    fn prelude_before_header_pair_remains_valid() {
+        let diff = "\
+diff --git a/value.rs b/value.rs
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1 @@
+-let old = 1;
++let value = 2;
+";
+
+        let parsed = parse_unified_diff(diff);
+
+        assert!(parsed.is_structurally_valid());
+        assert!(!parsed.has_multiple_files);
+        assert_eq!(
+            parsed.prelude,
+            vec![
+                "diff --git a/value.rs b/value.rs",
+                "--- a/value.rs",
+                "+++ b/value.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn headerless_hunk_followed_by_headered_section_disables_refinement() {
+        let theme = dark_theme();
+        let overlay_color = Color::Rgb(1, 2, 3);
+        let diff = "\
+@@ -1 +1 @@
+-let old = 1;
++let value = 2;
+--- a/other.rs
++++ b/other.rs
+@@ -1 +1 @@
+-let other = 1;
++let other = 2;
+";
+        let mut refined = RefinedDiffStyles::new();
+        refined.insert(
+            1,
+            vec![Span::styled(
+                "refined overlay must not render",
+                Style::default().fg(overlay_color),
+            )],
+        );
+
+        let parsed = parse_unified_diff(diff);
+        let rendered = render_parsed_diff(&parsed, &theme, Some(&refined));
+
+        assert!(parsed.is_structurally_valid());
+        assert!(parsed.has_multiple_files);
+        assert_eq!(parsed.hunks.len(), 2);
+        assert!(
+            compute_parsed_diff_file_scoped_styles(
+                Path::new("other.rs"),
+                "let other = 2;\n",
+                &parsed,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert_plain_source(
+            find_rendered_line(&rendered, "+let value = 2;"),
+            "    +",
+            "let value = 2;",
+            theme.diff_add,
+        );
+        assert_plain_source(
+            find_rendered_line(&rendered, "+let other = 2;"),
+            "    +",
+            "let other = 2;",
+            theme.diff_add,
+        );
+        assert!(
+            rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg != Some(overlay_color))
+        );
+    }
+
+    #[test]
+    fn multiple_headerless_hunks_remain_one_implicit_section() {
+        let diff = "\
+@@ -1 +1 @@ first
+-old = 1
++new = 1
+@@ -3 +3 @@ second
+-old = 3
++new = 3
+";
+
+        let parsed = parse_unified_diff(diff);
+
+        assert!(parsed.is_structurally_valid());
+        assert!(!parsed.has_multiple_files);
+        assert_eq!(parsed.hunks.len(), 2);
+    }
+
+    #[test]
+    fn positive_count_at_zero_start_forces_first_paint_raw_fallback() {
+        for diff in [
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -0 +1 @@
+-let old = 1;
++let value = 2;
+",
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +0 @@
+-let old = 1;
++let value = 2;
+",
+        ] {
+            assert_malformed_raw_fallback(diff);
+        }
+    }
+
+    #[test]
+    fn zero_width_hunk_forces_first_paint_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,0 +1,0 @@
+@@ -1 +1 @@
+-let old = 1;
++let value = 2;
+",
+        );
+    }
+
+    #[test]
+    fn overflowing_hunk_endpoint_forces_first_paint_raw_fallback() {
+        let diff = format!(
+            "--- a/value.rs\n+++ b/value.rs\n@@ -{},2 +1,2 @@\n-old = 1\n-old = 2\n+value = 2\n+new = 2\n",
+            usize::MAX
+        );
+
+        assert_malformed_raw_fallback(&diff);
+    }
+
+    #[test]
+    fn overflowing_zero_count_anchor_forces_first_paint_raw_fallback() {
+        let diff = format!(
+            "--- a/value.rs\n+++ b/value.rs\n@@ -{},0 +1 @@\n+let value = 2\n",
+            usize::MAX
+        );
+
+        assert_malformed_raw_fallback(&diff);
+    }
+
+    #[test]
+    fn duplicate_hunk_ranges_force_first_paint_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1 @@
+-old = 1
++value = 2
+@@ -1 +1 @@
+-old = 1
++value = 2
+",
+        );
+    }
+
+    #[test]
+    fn backward_hunk_forces_first_paint_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -3 +3 @@
+-old = 3
++new = 3
+@@ -1 +1 @@
+-old = 1
++value = 2
+",
+        );
+    }
+
+    #[test]
+    fn old_side_overlap_forces_first_paint_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,2 +1 @@
+-old = 1
+-old = 2
++new = 1
+@@ -2 +2 @@
+-old = 2
++value = 2
+",
+        );
+    }
+
+    #[test]
+    fn new_side_overlap_forces_first_paint_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1,2 @@
+-old = 1
++new = 1
++value = 2
+@@ -2 +2 @@
+-old = 2
++value = 2
+",
+        );
+    }
+
+    #[test]
+    fn zero_count_old_anchor_cannot_be_reused_by_later_positive_range() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,0 +1 @@
++let first = 1;
+@@ -1 +3 @@
+-let old = 1;
++let value = 2;
+",
+        );
+    }
+
+    #[test]
+    fn zero_count_new_anchor_cannot_be_reused_by_later_positive_range() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1,0 @@
+-let old = 1;
+@@ -3 +1 @@
+-let other = 3;
++let value = 2;
+",
+        );
+    }
+
+    #[test]
+    fn zero_count_anchor_allows_later_range_at_next_coordinate() {
+        for diff in [
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,0 +1 @@
++let first = 1;
+@@ -2 +3 @@
+-let old = 2;
++let value = 3;
+",
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1,0 @@
+-let old = 1;
+@@ -3 +2 @@
+-let other = 3;
++let value = 2;
+",
+        ] {
+            let parsed = parse_unified_diff(diff);
+
+            assert!(parsed.is_structurally_valid(), "{diff}");
+            assert!(!parsed.has_multiple_files, "{diff}");
+        }
+    }
+
+    #[test]
+    fn dev_null_range_mismatch_forces_first_paint_raw_fallback() {
+        for diff in [
+            "\
+--- /dev/null
++++ b/value.rs
+@@ -1,0 +1 @@
++let value = 2;
+",
+            "\
+--- a/value.rs
++++ /dev/null
+@@ -1 +1,0 @@
+-let old = 1;
+",
+            "\
+--- /dev/null
++++ /dev/null
+@@ -0,0 +1 @@
++let value = 2;
+",
+        ] {
+            assert_malformed_raw_fallback(diff);
+        }
+    }
+
+    #[test]
+    fn structural_hunk_controls_remain_valid() {
+        for diff in [
+            "\
+--- /dev/null
++++ b/added.rs
+@@ -0,0 +1 @@
++fn added() {}
+",
+            "\
+--- a/deleted.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-fn deleted() {}
+",
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,0 +2 @@ insertion point
++let value = 2;
+",
+            "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1 @@ first function
+-old = 1
++new = 1
+@@ -3 +3 @@ second function
+-old = 3
++new = 3
+",
+        ] {
+            let parsed = parse_unified_diff(diff);
+            assert!(
+                !parsed.has_malformed_hunk,
+                "valid control rejected:\n{diff}"
+            );
+            assert!(parsed.is_structurally_valid());
+            assert!(parsed.raw_fallback.is_none());
+        }
+    }
+
+    #[test]
+    fn multi_file_sections_reset_hunk_range_ordering() {
+        let diff = "\
+--- a/first.rs
++++ b/first.rs
+@@ -10 +10 @@
+-old = 10
++new = 10
+--- a/second.rs
++++ b/second.rs
+@@ -1 +1 @@ second function
+-old = 1
++new = 1
+";
+
+        let parsed = parse_unified_diff(diff);
+
+        assert!(parsed.has_multiple_files);
+        assert!(!parsed.has_malformed_hunk);
+        assert!(parsed.is_structurally_valid());
+        assert!(parsed.raw_fallback.is_none());
+    }
+
+    #[test]
+    fn standard_git_multi_file_separator_is_structurally_valid_and_plain() {
+        let theme = dark_theme();
+        let overlay_color = Color::Rgb(1, 2, 3);
+        let diff = "\
+diff --git a/a.rs b/a.rs
+index 111..222 100644
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+diff --git a/b.py b/b.py
+index 333..444 100644
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-old_b
++new_b
+";
+        let mut refined = RefinedDiffStyles::new();
+        refined.insert(
+            1,
+            vec![Span::styled(
+                "refined overlay must not render",
+                Style::default().fg(overlay_color),
+            )],
+        );
+
+        let parsed = parse_unified_diff(diff);
+        let rendered = render_parsed_diff(&parsed, &theme, Some(&refined));
+
+        assert!(parsed.has_multiple_files);
+        assert!(parsed.is_structurally_valid());
+        assert!(parsed.raw_fallback.is_none());
+        assert!(
+            compute_parsed_diff_file_scoped_styles(
+                Path::new("b.py"),
+                "new_b\n",
+                &parsed,
+                theme.syntax_theme,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert_plain_source(
+            find_rendered_line(&rendered, "+new_a"),
+            "    +",
+            "new_a",
+            theme.diff_add,
+        );
+        assert_plain_source(
+            find_rendered_line(&rendered, "+new_b"),
+            "    +",
+            "new_b",
+            theme.diff_add,
+        );
+        assert!(
+            rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg != Some(overlay_color))
+        );
+    }
+
+    #[test]
+    fn known_git_extended_headers_between_sections_are_allowed() {
+        let metadata = [
+            "index 111..222 100644",
+            "new file mode 100644",
+            "deleted file mode 100644",
+            "old mode 100644",
+            "new mode 100755",
+            "similarity index 90%",
+            "dissimilarity index 10%",
+            "rename from old.py",
+            "rename to new.py",
+            "copy from source.py",
+            "copy to destination.py",
+        ]
+        .join("\n");
+        let diff = format!(
+            "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old_a\n+new_a\n\
+             diff --git a/b.py b/b.py\n{metadata}\n--- a/b.py\n+++ b/b.py\n\
+             @@ -1 +1 @@\n-old_b\n+new_b\n"
+        );
+
+        let parsed = parse_unified_diff(&diff);
+
+        assert!(parsed.has_multiple_files);
+        assert!(parsed.is_structurally_valid());
+        assert!(parsed.raw_fallback.is_none());
+    }
+
+    #[test]
+    fn headerless_hunk_then_git_section_is_valid_but_ambiguous() {
+        let diff = "\
+@@ -1 +1 @@
+-old_a
++new_a
+diff --git a/b.py b/b.py
+index 333..444 100644
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-old_b
++new_b
+";
+
+        let parsed = parse_unified_diff(diff);
+
+        assert!(parsed.has_multiple_files);
+        assert!(parsed.is_structurally_valid());
+        assert!(parsed.raw_fallback.is_none());
+        assert_eq!(parsed.hunks.len(), 2);
+    }
+
+    #[test]
+    fn declared_initial_git_section_rejects_unknown_metadata_or_missing_pair() {
+        for diff in [
+            "\
+diff --git a/a.rs b/a.rs
+unknown metadata
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+",
+            "\
+diff --git a/a.rs b/a.rs
+index 111..222 100644
+",
+        ] {
+            assert_malformed_raw_fallback(diff);
+        }
+    }
+
+    #[test]
+    fn unknown_git_separator_metadata_forces_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+diff --git a/b.py b/b.py
+unknown metadata
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-old_b
++new_b
+",
+        );
+    }
+
+    #[test]
+    fn git_separator_without_header_pair_forces_raw_fallback() {
+        for diff in [
+            "\
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+diff --git a/b.py b/b.py
+index 333..444 100644
+",
+            "\
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+diff --git a/b.py b/b.py
+index 333..444 100644
+diff --git a/c.py b/c.py
+--- a/c.py
++++ b/c.py
+@@ -1 +1 @@
+-old_c
++new_c
+",
+            "\
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+diff --git a/b.py b/b.py
+@@ -3 +3 @@
+-old_b
++new_b
+",
+        ] {
+            assert_malformed_raw_fallback(diff);
+        }
+    }
+
+    #[test]
+    fn standalone_git_extended_header_after_hunk_forces_raw_fallback() {
+        assert_malformed_raw_fallback(
+            "\
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+index 333..444 100644
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-old_b
++new_b
+",
         );
     }
 
@@ -1483,28 +2426,43 @@ metadata instead of paired new header
     }
 
     #[test]
-    fn metadata_does_not_advance_parser_state() {
+    fn standard_metadata_does_not_advance_parser_state() {
         let theme = dark_theme();
         let diff = "\
 --- a/item.py
 +++ b/item.py
 @@ -1 +1,2 @@
  \"\"\"open string
-\"\"\"
+\\ No newline at end of file
 +value = 1
 ";
 
-        let lines = render_unified_diff(diff, &theme, None);
-        let inserted = find_rendered_line(&lines, "+value = 1");
-        let expected = highlight_sequence("item.py", &["\"\"\"open string", "value = 1"], &theme);
-        let advanced = highlight_sequence(
-            "item.py",
-            &["\"\"\"open string", "\"\"\"", "value = 1"],
+        let parsed = parse_unified_diff(diff);
+        let mut highlighted_content = Vec::new();
+        let rendered = super::render_hunk_with(
+            &parsed.hunks[0],
+            parsed.hunks[0].entries.len(),
             &theme,
+            None,
+            |_side, content| {
+                highlighted_content.push(content.to_owned());
+                Some(vec![Span::raw(content.to_owned())])
+            },
         );
 
-        assert_eq!(inserted.spans[1..], expected[1]);
-        assert_ne!(inserted.spans[1..], advanced[2]);
+        assert!(parsed.is_structurally_valid());
+        assert_eq!(
+            highlighted_content,
+            vec!["\"\"\"open string", "\"\"\"open string", "value = 1"]
+        );
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            vec![
+                "     \"\"\"open string",
+                "    \\ No newline at end of file",
+                "    +value = 1",
+            ]
+        );
     }
 
     #[test]
@@ -1687,6 +2645,9 @@ metadata instead of paired new header
 ";
 
         let parsed = parse_unified_diff(diff);
+        assert!(parsed.has_malformed_hunk);
+        assert!(!parsed.is_structurally_valid());
+        assert_eq!(parsed.raw_fallback.as_deref(), Some(diff));
         assert!(parsed.hunks.is_empty());
         assert_eq!(
             parsed.prelude,
@@ -1891,32 +2852,28 @@ class Item:
     #[test]
     fn full_file_duplicate_new_lines_reject_conflicts_and_dedupe_identical_text() {
         let theme = dark_theme();
-        let conflicting = parse_unified_diff(
-            "\
---- a/value.py
-+++ b/value.py
-@@ -1 +1 @@
- value = 1
-@@ -1 +1 @@
- value = 2
-",
-        );
-        let identical = parse_unified_diff(
-            "\
---- a/value.py
-+++ b/value.py
-@@ -1 +1 @@
- value = 1
-@@ -1 +1 @@
- value = 1
-",
-        );
+        let hunks_with = |second_content: &str| {
+            ["value = 1", second_content]
+                .into_iter()
+                .map(|content| DiffHunk {
+                    header: "@@ -1 +1 @@".to_owned(),
+                    entries: vec![DiffHunkEntry::Source(DiffSourceLine {
+                        kind: DiffLineKind::Context,
+                        old_line: Some(1),
+                        new_line: Some(1),
+                        content: content.to_owned(),
+                    })],
+                })
+                .collect::<Vec<_>>()
+        };
+        let conflicting = hunks_with("value = 2");
+        let identical = hunks_with("value = 1");
 
         assert!(
             compute_file_scoped_styles(
                 Path::new("value.py"),
                 "value = 1\n",
-                &conflicting.hunks,
+                &conflicting,
                 theme.syntax_theme,
             )
             .is_none()
@@ -1925,7 +2882,7 @@ class Item:
         let deduped = compute_file_scoped_styles(
             Path::new("value.py"),
             "value = 1\n",
-            &identical.hunks,
+            &identical,
             theme.syntax_theme,
         )
         .expect("identical duplicate");
