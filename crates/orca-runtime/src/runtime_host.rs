@@ -2271,6 +2271,17 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfacePinnedContextMutation {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::PinnedContextAction,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::PinnedContextMutationOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
         response: crate::model_response::RuntimeModelResponse,
@@ -2493,7 +2504,7 @@ async fn run_host_supervisor(
                     surface_owner,
                 } = prepared;
                 let started = tokio::task::spawn_blocking(move || request.start()).await;
-                let thread = match started {
+                let mut thread = match started {
                     Ok(Ok(thread)) => thread,
                     Ok(Err(error)) => {
                         let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
@@ -2532,7 +2543,7 @@ async fn run_host_supervisor(
                 let (surface_handle, resident_surface) = if let Some(surface_owner) = surface_owner
                 {
                     match bootstrap_recorded_surface(
-                        &thread,
+                        &mut thread,
                         &actor_config,
                         &actor_title,
                         host_incarnation.clone(),
@@ -2873,6 +2884,23 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         })
     }
 
+    fn pinned_context_mutation(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::PinnedContextAction,
+    ) -> Result<
+        surface::MutationReply<surface::PinnedContextMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfacePinnedContextMutation {
+            client,
+            request_id,
+            action,
+            reply,
+        })
+    }
+
     fn respond_interaction_by_id(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -2927,7 +2955,7 @@ fn unavailable_surface_handle(
 }
 
 fn bootstrap_recorded_surface(
-    thread: &RuntimeThread,
+    thread: &mut RuntimeThread,
     config: &RunConfig,
     title: &str,
     host_incarnation: surface::HostIncarnation,
@@ -3034,6 +3062,15 @@ fn bootstrap_recorded_surface(
             }
         }
     }
+    hydrate_session_pinned_context_from_surface(
+        thread,
+        coordinator
+            .state()
+            .snapshot()
+            .pinned_context
+            .entries
+            .as_slice(),
+    );
     let authority = surface::SurfaceAttachAuthority::new(
         host_incarnation,
         coordinator.state().snapshot().thread.thread_id.clone(),
@@ -3043,6 +3080,7 @@ fn bootstrap_recorded_surface(
             surface::SurfaceCapability::SubmitOperation,
             surface::SurfaceCapability::ControlBoundOperation,
             surface::SurfaceCapability::ManageThreadSettings,
+            surface::SurfaceCapability::ManagePinnedContext,
             surface::SurfaceCapability::RespondGrantedInteraction,
             surface::SurfaceCapability::RepairThread,
         ]))
@@ -3092,6 +3130,37 @@ fn bootstrap_recorded_surface(
             pending_admission_terminals: HashMap::new(),
         },
     ))
+}
+
+fn hydrate_session_pinned_context_from_surface(
+    thread: &mut RuntimeThread,
+    entries: &[surface::SurfacePinnedContextEntry],
+) {
+    let missing = entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, surface::SurfacePinnedContextKind::User))
+        .filter(|entry| {
+            !thread
+                .session()
+                .conversation()
+                .messages
+                .iter()
+                .any(|message| {
+                    matches!(
+                        message,
+                        Message::User { content, pinned: true } if content == entry.content.as_str()
+                    )
+                })
+        })
+        .map(|entry| entry.content.as_str().to_string())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    let session = thread.session_mut();
+    for content in missing {
+        session.add_pinned_context(content);
+    }
 }
 
 fn initial_surface_snapshot(
@@ -5088,6 +5157,34 @@ impl ThreadActor {
                     },
                 ])
                 .expect("settings commit has one acknowledgement"),
+            },
+            value,
+        }
+    }
+
+    fn committed_pinned_context_mutation<T>(
+        &self,
+        request_id: surface::SurfaceRequestId,
+        batch: &surface::SurfaceCommitBatch,
+        value: T,
+    ) -> surface::MutationReply<T> {
+        let event = &batch.events.as_slice()[0];
+        surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Thread {
+                    thread_id: batch.cursor_after.thread_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::PinnedContext,
+                        event_id: event.event_id.clone(),
+                        commit_class: batch.commit_class.clone(),
+                    },
+                ])
+                .expect("pinned context commit has one acknowledgement"),
             },
             value,
         }
@@ -7657,6 +7754,96 @@ impl ThreadActor {
         ))
     }
 
+    fn pinned_context_mutation(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::PinnedContextAction,
+    ) -> Result<
+        surface::MutationReply<surface::PinnedContextMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        if !self.admits_surface_client(client, surface::SurfaceCapability::ManagePinnedContext) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if self.active.is_some() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let surface::PinnedContextAction::Add {
+            expected_revision,
+            entry,
+            memory_receipt: _memory_receipt,
+        } = action
+        else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let current = &snapshot.pinned_context;
+        if expected_revision != current.revision {
+            return Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Stale {
+                    request_id,
+                    target: Some(surface::MutationTarget::Thread {
+                        thread_id: snapshot.thread.thread_id.clone(),
+                    }),
+                    error: surface::StaleMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::StaleRevision,
+                        message: surface::DisplayText::new("pinned context revision is stale"),
+                        winning_request_id: None,
+                        current_revision: Some(surface::SurfaceMutationRevision::PinnedContext {
+                            thread_id: snapshot.thread.thread_id.clone(),
+                            revision: current.revision,
+                        }),
+                    }),
+                },
+            });
+        }
+        if current.entries.iter().any(|current| current.id == entry.id) {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let next_revision = surface::PinnedContextRevision::try_new(
+            current
+                .revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::PinnedContext(surface::PinnedContextPatch::Added {
+                    previous_revision: current.revision,
+                    next_revision,
+                    entry: entry.clone(),
+                }),
+            )],
+            None,
+        );
+        self.commit_surface_actor_batch_with_retry(&batch)?;
+        if let Some(state) = self.state.as_mut() {
+            state
+                .thread
+                .session_mut()
+                .add_pinned_context(entry.content.as_str().to_string());
+        }
+        let next_snapshot = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .pinned_context
+            .clone();
+        Ok(self.committed_pinned_context_mutation(
+            request_id,
+            &batch,
+            surface::PinnedContextMutationOutput {
+                snapshot: next_snapshot,
+                cursor: batch.cursor_after.clone(),
+            },
+        ))
+    }
+
     fn admit_surface_operation(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -9217,6 +9404,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceUpdateSettings { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfacePinnedContextMutation { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -9407,6 +9597,15 @@ impl ThreadActor {
                     expected_thread_revision,
                     patch,
                 );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfacePinnedContextMutation {
+                client,
+                request_id,
+                action,
+                reply,
+            } => {
+                let result = self.pinned_context_mutation(&client, request_id, action);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
@@ -9793,6 +9992,9 @@ impl ThreadActor {
                 }
             }
             ThreadCommand::SurfaceUpdateSettings { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            }
+            ThreadCommand::SurfacePinnedContextMutation { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             ThreadCommand::SurfaceCommitProviderResponse {

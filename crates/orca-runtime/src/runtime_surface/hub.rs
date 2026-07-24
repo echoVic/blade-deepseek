@@ -141,6 +141,7 @@ impl SurfaceHub {
             SurfaceCapability::SubmitOperation,
             SurfaceCapability::ControlBoundOperation,
             SurfaceCapability::ManageThreadSettings,
+            SurfaceCapability::ManagePinnedContext,
             SurfaceCapability::RespondGrantedInteraction,
             SurfaceCapability::RepairThread,
         ]))

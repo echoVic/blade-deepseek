@@ -8,13 +8,15 @@ use std::time::Duration;
 use orca_core::config::RunConfig;
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
-    AttachResult, FreshAttachRequest, MutationReply, NonEmptyVec, OperationIngressCorrelation,
-    OperationKind, OperationPatch, OperationRequestIntent, OperationSettingsPreparation,
-    OperationTerminal, ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
-    RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, SurfaceAttachmentRole, SurfaceCapability,
-    SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceOperationId, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSubscriptionItem,
-    WaitOperationTerminalResult,
+    AttachResult, DisplayText, FreshAttachRequest, MutationReply, NonEmptyVec,
+    OperationIngressCorrelation, OperationKind, OperationPatch, OperationRequestIntent,
+    OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
+    PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
+    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
+    SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId, SurfaceEvent,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
+    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
+    SurfaceSubscriptionItem, WaitOperationTerminalResult,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -175,6 +177,68 @@ pub(crate) fn update_settings(
         ))),
         MutationReply::Deferred { .. } => {
             Err(io::Error::other("typed TUI settings update deferred"))
+        }
+    }
+}
+
+pub(crate) fn add_pinned_context(
+    thread: &RuntimeSurfaceThreadHandle,
+    note: &str,
+) -> io::Result<()> {
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManagePinnedContext,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => {
+            return Err(io::Error::other(
+                "typed TUI pinned context attachment unavailable",
+            ));
+        }
+    };
+    let revision = attachment.baseline.snapshot.pinned_context.revision;
+    let entry = SurfacePinnedContextEntry {
+        id: SurfaceCatalogEntryId::try_new(format!(
+            "tui-note-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+        .map_err(|error| io::Error::other(error.to_string()))?,
+        kind: SurfacePinnedContextKind::User,
+        label: orca_runtime::surface::NonEmptyText::try_new("remembered note")
+            .map_err(|error| io::Error::other(error.to_string()))?,
+        content: DisplayText::new(note),
+        content_digest: Sha256Digest::digest(note.as_bytes()),
+        source_revision: PinnedContextSourceRevision::User(
+            PinnedUserRevision::try_new(1).expect("user pinned revision is positive"),
+        ),
+    };
+    let result = attachment.client.pinned_context_mutation(
+        SurfaceRequestId::new(),
+        PinnedContextAction::Add {
+            expected_revision: revision,
+            entry,
+            memory_receipt: None,
+        },
+    );
+    detach(&surface, &attachment.client);
+    match result
+        .map_err(|error| io::Error::other(format!("typed TUI pinned context failed: {error:?}")))?
+    {
+        MutationReply::Committed { .. } => Ok(()),
+        MutationReply::Uncommitted { mutation } => Err(io::Error::other(format!(
+            "typed TUI pinned context did not commit: {mutation:?}"
+        ))),
+        MutationReply::Deferred { .. } => {
+            Err(io::Error::other("typed TUI pinned context deferred"))
         }
     }
 }

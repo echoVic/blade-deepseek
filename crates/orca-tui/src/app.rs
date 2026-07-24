@@ -4602,8 +4602,9 @@ fn hosted_tui_controller_loop(
             Ok(UserAction::Remember(note)) => {
                 let context = format!("[Pinned remembered note]\n{}", note.trim());
                 if let Some(runtime_thread) = thread.as_ref() {
+                    let typed_thread = runtime_thread.typed_surface();
                     if let Err(error) =
-                        runtime_thread.mutate(RuntimeThreadMutation::AddPinnedContext(context))
+                        crate::surface_client::add_pinned_context(&typed_thread, &context)
                     {
                         let _ = event_tx.send(TuiEvent::Error(error.to_string()));
                     }

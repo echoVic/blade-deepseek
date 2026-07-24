@@ -7,8 +7,10 @@ use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
 use orca_runtime::runtime_host::RuntimeHost;
 use orca_runtime::surface::{
-    AttachResult, FreshAttachRequest, SurfaceAttachmentRole, SurfaceCapability,
-    SurfaceInteractionKind, SurfaceRequestId,
+    AttachResult, DisplayText, FreshAttachRequest, MutationReply, NonEmptyText,
+    PinnedContextAction, PinnedContextRevision, PinnedContextSourceRevision, PinnedUserRevision,
+    Sha256Digest, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
+    SurfaceInteractionKind, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
 };
 use std::collections::{BTreeSet, HashMap};
 use tempfile::tempdir;
@@ -70,6 +72,55 @@ fn thread_facade_issues_a_distinct_acp_surface_authority() {
         attachment.capabilities.grant.role,
         SurfaceAttachmentRole::Acp
     );
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn tui_surface_can_commit_and_publish_pinned_context() {
+    let cwd = tempdir().expect("temp cwd");
+    let host = RuntimeHost::start().expect("runtime host");
+    let thread = host
+        .surface_handle()
+        .start_thread(test_config(cwd.path().to_path_buf()), "pinned context")
+        .expect("typed thread");
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManagePinnedContext,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("unexpected attachment result"),
+    };
+    let entry = SurfacePinnedContextEntry {
+        id: SurfaceCatalogEntryId::try_new("user-note-1").unwrap(),
+        kind: SurfacePinnedContextKind::User,
+        label: NonEmptyText::try_new("remembered note").unwrap(),
+        content: DisplayText::new("remember this"),
+        content_digest: Sha256Digest::new([7; 32]),
+        source_revision: PinnedContextSourceRevision::User(PinnedUserRevision::try_new(1).unwrap()),
+    };
+    let result = attachment.client.pinned_context_mutation(
+        SurfaceRequestId::new(),
+        PinnedContextAction::Add {
+            expected_revision: PinnedContextRevision::try_new(1).unwrap(),
+            entry: entry.clone(),
+            memory_receipt: None,
+        },
+    );
+    let output = match result.expect("pinned context command") {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("unexpected pinned context result"),
+    };
+    assert_eq!(
+        output.snapshot.revision,
+        PinnedContextRevision::try_new(2).unwrap()
+    );
+    assert_eq!(output.snapshot.entries, vec![entry]);
     host.shutdown().expect("shutdown runtime host");
 }
 

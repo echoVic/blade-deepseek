@@ -520,6 +520,11 @@ impl Sha256Digest {
         Self(value)
     }
 
+    pub fn digest(value: impl AsRef<[u8]>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(value).into())
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
