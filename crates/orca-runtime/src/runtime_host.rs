@@ -54,6 +54,7 @@ pub const THREAD_COMMAND_CAPACITY: usize = 16;
 pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS: usize = 3;
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
@@ -4344,6 +4345,38 @@ impl ThreadActor {
         batch
     }
 
+    fn commit_surface_generation_batch_with_retry(
+        &mut self,
+        fence: surface::SurfaceOperationFence,
+        batch: &surface::SurfaceCommitBatch,
+    ) -> io::Result<()> {
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            match self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(fence.clone(), batch)
+            {
+                Ok(_) => return Ok(()),
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) => {}
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "failed to commit provider semantic batch: {error:?}"
+                    )));
+                }
+            }
+        }
+        Err(io::Error::other(
+            "provider semantic batch did not commit after bounded retries",
+        ))
+    }
+
     fn commit_surface_provider_step(
         &mut self,
         active: &mut ActiveOperation,
@@ -4458,15 +4491,7 @@ impl ThreadActor {
             }),
         ));
         let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.resident_surface
-            .coordinator
-            .commit_generation_batch(fence, &batch)
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "failed to commit provider step semantic batch: {error:?}"
-                ))
-            })?;
-        Ok(())
+        self.commit_surface_generation_batch_with_retry(fence, &batch)
     }
 
     fn commit_surface_provider_response(
@@ -4677,15 +4702,7 @@ impl ThreadActor {
             )
         }));
         let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.resident_surface
-            .coordinator
-            .commit_generation_batch(fence, &batch)
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "failed to commit provider response semantic batch: {error:?}"
-                ))
-            })?;
-        Ok(())
+        self.commit_surface_generation_batch_with_retry(fence, &batch)
     }
 
     fn commit_surface_tool_results(
@@ -4843,15 +4860,7 @@ impl ThreadActor {
             ));
         }
         let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.resident_surface
-            .coordinator
-            .commit_generation_batch(fence, &batch)
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "failed to commit tool completion semantic batch: {error:?}"
-                ))
-            })?;
-        Ok(())
+        self.commit_surface_generation_batch_with_retry(fence, &batch)
     }
 
     fn committed_surface_mutation<T>(
@@ -11406,6 +11415,8 @@ mod tests {
         answer_tx: SyncSender<Option<String>>,
     }
 
+    struct ProviderResponseCheckpointRetryExecutor;
+
     #[derive(Clone, Copy)]
     enum ExactSelectorCorruption {
         Revision,
@@ -11428,6 +11439,35 @@ mod tests {
             _cancel: &CancelToken,
         ) -> io::Result<ThreadOperationOutcome> {
             panic!("recovered terminal operation must not execute")
+        }
+    }
+
+    impl ThreadOperationExecutor for ProviderResponseCheckpointRetryExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let turn_request = request.thread_turn_request(generation);
+            let ingress = turn_request
+                .provider_response_ingress()
+                .expect("typed generation installs provider response ingress");
+            ingress.commit_response(&RuntimeModelResponse::new(
+                ProviderResponse {
+                    steps: Vec::new(),
+                    assistant_content: Some("checkpoint retry succeeded".to_string()),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+                request.turn_id().clone(),
+            ))?;
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
         }
     }
 
@@ -12206,6 +12246,64 @@ mod tests {
                 })
         ));
         host.shutdown().expect("shutdown retry runtime host");
+    }
+
+    #[test]
+    fn provider_response_checkpoint_failure_retries_exact_semantic_batch() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host =
+            RuntimeHost::start_with_executor(Arc::new(ProviderResponseCheckpointRetryExecutor))
+                .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry provider response semantic batch",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load runtime transcript")
+            .path;
+        surface::JsonlSurfaceCommitLedger::inject_provider_response_checkpoint_failures(
+            transcript_path,
+            2,
+        );
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "provider response checkpoint retry",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait semantic retry terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        host.shutdown()
+            .expect("shutdown semantic retry runtime host");
     }
 
     #[test]
