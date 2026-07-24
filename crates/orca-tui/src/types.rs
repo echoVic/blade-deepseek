@@ -1101,12 +1101,34 @@ impl AppState {
         message_index: usize,
         tool_id: &str,
     ) -> Option<&crate::diff_highlight::RefinedDiffStyles> {
-        let revision = *self.message_revisions.get(message_index)?;
-        let ChatMessage::ToolCall { id, .. } = self.messages.get(message_index)? else {
+        let message = self.messages.get(message_index)?;
+        let ChatMessage::ToolCall { id, .. } = message else {
             return None;
         };
-        let highlight = self.applied_diff_highlights.get(&revision)?;
-        (id == tool_id && highlight.tool_id == tool_id).then_some(highlight.styles.as_ref())
+        (id == tool_id)
+            .then(|| {
+                Self::refined_diff_styles_for_message(
+                    &self.message_revisions,
+                    &self.applied_diff_highlights,
+                    message_index,
+                    message,
+                )
+            })
+            .flatten()
+    }
+
+    pub(crate) fn refined_diff_styles_for_message<'a>(
+        revisions: &[u64],
+        highlights: &'a HashMap<u64, AppliedDiffHighlight>,
+        message_index: usize,
+        message: &ChatMessage,
+    ) -> Option<&'a crate::diff_highlight::RefinedDiffStyles> {
+        let revision = *revisions.get(message_index)?;
+        let ChatMessage::ToolCall { id, .. } = message else {
+            return None;
+        };
+        let highlight = highlights.get(&revision)?;
+        (highlight.tool_id == *id).then_some(highlight.styles.as_ref())
     }
 
     fn new_edit_highlight_runtime(&self) -> std::io::Result<EditHighlightRuntime> {
@@ -1335,7 +1357,7 @@ impl AppState {
     }
 
     #[cfg(test)]
-    fn pending_edit_highlight_job(&self, tool_id: &str) -> Option<EditHighlightJob> {
+    pub(crate) fn pending_edit_highlight_job(&self, tool_id: &str) -> Option<EditHighlightJob> {
         self.edit_highlight_runtime.as_ref()?.pending_job(tool_id)
     }
 
@@ -1373,7 +1395,7 @@ impl AppState {
     }
 
     #[cfg(test)]
-    fn set_edit_highlight_drain_for_test(&mut self, drain: Option<EditHighlightDrain>) {
+    pub(crate) fn set_edit_highlight_drain_for_test(&mut self, drain: Option<EditHighlightDrain>) {
         self.edit_highlight_drain = drain;
     }
 
@@ -6530,6 +6552,217 @@ arbitrary metadata
     }
 
     #[test]
+    fn refinement_rebuilds_only_matching_message_then_steady_and_scroll_build_nothing() {
+        use std::cell::RefCell;
+
+        let (_directory, mut state, job) = state_with_submitted_edit_job();
+        state.push_message(ChatMessage::System("stable".to_string()));
+        let stable_index = job.message_index + 1;
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        let built_indices = RefCell::new(Vec::new());
+
+        {
+            let messages = &state.messages;
+            let revisions = &state.message_revisions;
+            let highlights = &state.applied_diff_highlights;
+            let cache = &mut state.transcript_render_cache;
+            cache.prepare(
+                messages,
+                revisions,
+                80,
+                &theme,
+                theme.syntax_theme_revision,
+                0,
+                false,
+                |index, message, theme, width, tick, force_expand| {
+                    built_indices.borrow_mut().push(index);
+                    let refined = AppState::refined_diff_styles_for_message(
+                        revisions, highlights, index, message,
+                    );
+                    crate::ui::build_lines_for_message(
+                        message,
+                        theme,
+                        width,
+                        tick,
+                        force_expand,
+                        refined,
+                    )
+                },
+            );
+        }
+        assert_eq!(
+            *built_indices.borrow(),
+            vec![job.message_index, stable_index]
+        );
+        let revisions_before = state.message_revisions.clone();
+        built_indices.borrow_mut().clear();
+
+        assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
+        {
+            let messages = &state.messages;
+            let revisions = &state.message_revisions;
+            let highlights = &state.applied_diff_highlights;
+            let cache = &mut state.transcript_render_cache;
+            cache.prepare(
+                messages,
+                revisions,
+                80,
+                &theme,
+                theme.syntax_theme_revision,
+                0,
+                false,
+                |index, message, theme, width, tick, force_expand| {
+                    built_indices.borrow_mut().push(index);
+                    let refined = AppState::refined_diff_styles_for_message(
+                        revisions, highlights, index, message,
+                    );
+                    crate::ui::build_lines_for_message(
+                        message,
+                        theme,
+                        width,
+                        tick,
+                        force_expand,
+                        refined,
+                    )
+                },
+            );
+        }
+
+        assert_eq!(*built_indices.borrow(), vec![job.message_index]);
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1);
+        assert_eq!(
+            state.message_revisions[stable_index],
+            revisions_before[stable_index]
+        );
+        let viewport = state
+            .transcript_render_cache
+            .viewport(0, usize::MAX, usize::MAX);
+        let inserted = viewport
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains("+value = 2"))
+            .expect("refined insert in cached viewport");
+        assert_eq!(
+            inserted.spans[1].style.fg,
+            Some(ratatui::style::Color::Magenta)
+        );
+
+        built_indices.borrow_mut().clear();
+        {
+            let messages = &state.messages;
+            let revisions = &state.message_revisions;
+            let highlights = &state.applied_diff_highlights;
+            let cache = &mut state.transcript_render_cache;
+            cache.prepare(
+                messages,
+                revisions,
+                80,
+                &theme,
+                theme.syntax_theme_revision,
+                0,
+                false,
+                |index, message, theme, width, tick, force_expand| {
+                    built_indices.borrow_mut().push(index);
+                    let refined = AppState::refined_diff_styles_for_message(
+                        revisions, highlights, index, message,
+                    );
+                    crate::ui::build_lines_for_message(
+                        message,
+                        theme,
+                        width,
+                        tick,
+                        force_expand,
+                        refined,
+                    )
+                },
+            );
+        }
+        assert!(built_indices.borrow().is_empty());
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 0);
+
+        let _ = state.transcript_render_cache.viewport(0, 0, 1);
+        let _ = state
+            .transcript_render_cache
+            .viewport(0, usize::MAX, usize::MAX);
+        assert!(built_indices.borrow().is_empty());
+        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 0);
+    }
+
+    #[test]
+    fn real_worker_result_becomes_exact_message_styles_and_warms_rendering() {
+        const SCOPED_DIFF: &str = "\
+--- a/item.py
++++ b/item.py
+@@ -3,2 +3,2 @@
+     \"\"\"
+-    field = 0
++    field = 1
+";
+        let directory = tempfile::tempdir().expect("scoped edit workspace");
+        std::fs::write(
+            directory.path().join("item.py"),
+            "\
+class Item:
+    \"\"\"Summary.
+    \"\"\"
+    field = 1
+",
+        )
+        .expect("post-edit Python file");
+        let mut state = state();
+        state.configure_syntax_highlighting(
+            directory.path().to_path_buf(),
+            crate::syntax_highlight::SyntaxTheme::OneHalfDark,
+        );
+        submit_live_edit(&mut state, "scoped-edit", "item.py", SCOPED_DIFF);
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        let cold =
+            crate::ui::build_lines_for_message(&state.messages[0], &theme, 80, 0, false, None);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if state.poll_edit_highlight_results() {
+                break;
+            }
+            assert!(
+                state.edit_highlight_needs_tick(),
+                "worker stopped pending without applying a result"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "worker did not return before the bounded deadline"
+            );
+            std::thread::yield_now();
+        }
+
+        let refined = state
+            .refined_diff_styles(0, "scoped-edit")
+            .expect("exact message refinement");
+        assert!(refined.contains_key(&3));
+        assert!(refined.contains_key(&4));
+        let warm = crate::ui::build_lines_for_message(
+            &state.messages[0],
+            &theme,
+            80,
+            0,
+            false,
+            Some(refined),
+        );
+        let cold_field = cold
+            .iter()
+            .find(|line| line.to_string().contains("+    field = 1"))
+            .expect("cold field");
+        let warm_field = warm
+            .iter()
+            .find(|line| line.to_string().contains("+    field = 1"))
+            .expect("warm field");
+
+        assert_ne!(warm_field.spans[1..], cold_field.spans[1..]);
+        assert_eq!(warm_field.spans[1..], refined[&4]);
+        assert!(!state.edit_highlight_needs_tick());
+    }
+
+    #[test]
     fn failed_result_finishes_pending_without_touching_or_noise() {
         let (_directory, mut state, job) = state_with_submitted_edit_job();
         let revisions_before = state.message_revisions.clone();
@@ -6956,8 +7189,24 @@ arbitrary metadata
         assert_eq!(job.message_index, 1);
 
         assert!(state.apply_edit_highlight_result(ready_result(job.clone())));
-        assert!(state.refined_diff_styles(0, "duplicate").is_none());
-        assert!(state.refined_diff_styles(1, "duplicate").is_some());
+        assert!(
+            AppState::refined_diff_styles_for_message(
+                &state.message_revisions,
+                &state.applied_diff_highlights,
+                0,
+                &state.messages[0],
+            )
+            .is_none()
+        );
+        assert!(
+            AppState::refined_diff_styles_for_message(
+                &state.message_revisions,
+                &state.applied_diff_highlights,
+                1,
+                &state.messages[1],
+            )
+            .is_some()
+        );
 
         state.truncate_messages(1);
 

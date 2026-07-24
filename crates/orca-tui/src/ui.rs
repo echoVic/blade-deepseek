@@ -485,28 +485,25 @@ pub(crate) fn render_live_messages(
         state.scroll_offset
     };
     let live_start = state.flushed_count.min(state.messages.len());
-    state.transcript_render_cache.prepare(
-        &state.messages,
-        &state.message_revisions,
+    let messages = &state.messages;
+    let revisions = &state.message_revisions;
+    let highlights = &state.applied_diff_highlights;
+    let cache = &mut state.transcript_render_cache;
+    cache.prepare(
+        messages,
+        revisions,
         width,
         theme,
         theme.syntax_theme_revision,
         state.tick,
         false,
-        |_, message, theme, width, tick, force_expand| {
-            build_lines_for_messages(
-                std::slice::from_ref(message),
-                theme,
-                width,
-                tick,
-                force_expand,
-            )
+        |index, message, theme, width, tick, force_expand| {
+            let refined =
+                AppState::refined_diff_styles_for_message(revisions, highlights, index, message);
+            build_lines_for_message(message, theme, width, tick, force_expand, refined)
         },
     );
-    let viewport =
-        state
-            .transcript_render_cache
-            .viewport(live_start, requested_scroll, visible_height);
+    let viewport = cache.viewport(live_start, requested_scroll, visible_height);
     state.total_lines = viewport.total_height;
     state.visible_height = visible_height;
     state.scroll_offset = viewport.scroll_offset;
@@ -1350,6 +1347,7 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
 /// immutable scrollback in full — once flushed it can never be re-expanded, so we must
 /// not freeze a truncated view. The live pane passes `false` and honours the per-message
 /// `expanded` flag that `e` toggles.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_lines_for_messages(
     messages: &[ChatMessage],
     theme: &Theme,
@@ -1359,8 +1357,36 @@ pub(crate) fn build_lines_for_messages(
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for msg in messages {
-        append_message_lines(&mut lines, msg, theme, width, tick, force_expand);
+        lines.extend(build_lines_for_message(
+            msg,
+            theme,
+            width,
+            tick,
+            force_expand,
+            None,
+        ));
     }
+    lines
+}
+
+pub(crate) fn build_lines_for_message(
+    message: &ChatMessage,
+    theme: &Theme,
+    width: usize,
+    tick: u64,
+    force_expand: bool,
+    refined_diff: Option<&crate::diff_highlight::RefinedDiffStyles>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    append_message_lines(
+        &mut lines,
+        message,
+        theme,
+        width,
+        tick,
+        force_expand,
+        refined_diff,
+    );
     lines
 }
 
@@ -1373,6 +1399,7 @@ fn append_message_lines(
     width: usize,
     tick: u64,
     force_expand: bool,
+    refined_diff: Option<&crate::diff_highlight::RefinedDiffStyles>,
 ) {
     match msg {
         ChatMessage::User(text) => {
@@ -1463,7 +1490,7 @@ fn append_message_lines(
                 append_tool_output_lines(lines, out, *expanded, force_expand, theme);
             }
             if let Some(diff) = diff {
-                append_diff_lines(lines, diff, theme, None);
+                append_diff_lines(lines, diff, theme, refined_diff);
             }
         }
         ChatMessage::PlanUpdate { explanation, plan } => {
@@ -3450,6 +3477,113 @@ mod tests {
 
     fn rendered_text(lines: &[Line<'static>]) -> Vec<String> {
         lines.iter().map(ToString::to_string).collect()
+    }
+
+    const REFINED_TOOL_DIFF: &str = "\
+--- a/item.py
++++ b/item.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ print(value)
+";
+
+    fn refined_tool_message() -> ChatMessage {
+        ChatMessage::ToolCall {
+            id: "edit-1".to_string(),
+            name: "edit".to_string(),
+            target: Some("item.py".to_string()),
+            status: "completed".to_string(),
+            output: None,
+            diff: Some(REFINED_TOOL_DIFF.to_string()),
+            kind: None,
+            expanded: false,
+        }
+    }
+
+    fn line_containing<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a Line<'static> {
+        lines
+            .iter()
+            .find(|line| line.to_string().contains(needle))
+            .unwrap_or_else(|| panic!("rendered line containing {needle:?}"))
+    }
+
+    #[test]
+    fn tool_message_uses_refined_new_side_styles_but_keeps_delete_hunk_styles() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let tool = refined_tool_message();
+        let refined = crate::diff_highlight::RefinedDiffStyles::from([
+            (
+                1,
+                vec![Span::styled(
+                    "value = 2",
+                    Style::default().fg(Color::Magenta),
+                )],
+            ),
+            (
+                2,
+                vec![Span::styled(
+                    "print(value)",
+                    Style::default().fg(Color::Cyan),
+                )],
+            ),
+        ]);
+        let cold = build_lines_for_message(&tool, &theme, 80, 0, false, None);
+        let warm = build_lines_for_message(&tool, &theme, 80, 0, false, Some(&refined));
+
+        let cold_delete = line_containing(&cold, "-value = 1");
+        let warm_delete = line_containing(&warm, "-value = 1");
+        let warm_insert = line_containing(&warm, "+value = 2");
+        let warm_context = line_containing(&warm, "print(value)");
+
+        assert_eq!(warm_insert.spans[0].content.as_ref(), "    +");
+        assert_eq!(warm_insert.spans[1].style.fg, Some(Color::Magenta));
+        assert_eq!(warm_context.spans[0].content.as_ref(), "     ");
+        assert_eq!(warm_context.spans[1].style.fg, Some(Color::Cyan));
+        assert_eq!(cold_delete.spans, warm_delete.spans);
+    }
+
+    #[test]
+    fn tool_message_rejects_mismatched_refined_text() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let tool = refined_tool_message();
+        let refined = crate::diff_highlight::RefinedDiffStyles::from([(
+            2,
+            vec![Span::styled(
+                "different text",
+                Style::default().fg(Color::Magenta),
+            )],
+        )]);
+        let cold = build_lines_for_message(&tool, &theme, 80, 0, false, None);
+        let warm = build_lines_for_message(&tool, &theme, 80, 0, false, Some(&refined));
+
+        assert_eq!(
+            line_containing(&cold, "print(value)").spans,
+            line_containing(&warm, "print(value)").spans
+        );
+    }
+
+    #[test]
+    fn single_message_none_and_non_tool_refined_rendering_keep_existing_behavior() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let tool = refined_tool_message();
+        let assistant = ChatMessage::Assistant("plain response".to_string());
+        let irrelevant = crate::diff_highlight::RefinedDiffStyles::from([(
+            1,
+            vec![Span::styled(
+                "plain response",
+                Style::default().fg(Color::Magenta),
+            )],
+        )]);
+
+        assert_eq!(
+            build_lines_for_message(&tool, &theme, 80, 0, false, None),
+            build_lines_for_messages(std::slice::from_ref(&tool), &theme, 80, 0, false)
+        );
+        assert_eq!(
+            build_lines_for_message(&assistant, &theme, 80, 0, false, Some(&irrelevant)),
+            build_lines_for_message(&assistant, &theme, 80, 0, false, None)
+        );
     }
 
     #[test]
