@@ -1778,6 +1778,34 @@ impl RuntimeThreadHandle {
         self.surface.with_authority(authority)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn jsonl_surface(&self) -> Option<surface::RuntimeSurfaceHandle> {
+        let authority = surface::SurfaceAttachAuthority::new(
+            self.surface.host_incarnation().clone(),
+            self.surface.thread_id().clone(),
+            surface::SurfaceAttachmentRole::Jsonl,
+            surface::NonEmptySet::try_new(BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::RespondGrantedInteraction,
+                surface::SurfaceCapability::RepairThread,
+            ]))
+            .expect("JSONL surface grant is non-empty"),
+            surface::NonEmptySet::try_new(BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+            ]))
+            .expect("JSONL surface required grant is non-empty"),
+            BTreeSet::from([
+                surface::SurfaceInteractionKind::ToolApproval,
+                surface::SurfaceInteractionKind::PermissionRequest,
+                surface::SurfaceInteractionKind::UserInput,
+                surface::SurfaceInteractionKind::McpElicitation,
+            ]),
+        );
+        self.surface.with_authority(authority)
+    }
+
     pub fn start_turn<W>(
         &self,
         request: HostedTurnRequest,
@@ -2233,6 +2261,19 @@ enum ThreadCommand {
         request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
         admission_lease_id: surface::SurfaceAdmissionLeaseId,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::AdmissionOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
+    SurfaceAdmitReservedWithOutput {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        admission_lease_id: surface::SurfaceAdmissionLeaseId,
+        writer: Box<dyn HostedOperationWriter>,
         reply: SyncSender<
             Result<
                 surface::MutationReply<surface::AdmissionOutput>,
@@ -2830,6 +2871,25 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             request_id,
             operation_id,
             admission_lease_id,
+            reply,
+        })
+    }
+
+    fn admit_reserved_with_output(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        admission_lease_id: surface::SurfaceAdmissionLeaseId,
+        writer: Box<dyn HostedOperationWriter>,
+    ) -> Result<surface::MutationReply<surface::AdmissionOutput>, surface::SurfaceClientCommandError>
+    {
+        self.dispatch(|reply| ThreadCommand::SurfaceAdmitReservedWithOutput {
+            client,
+            request_id,
+            operation_id,
+            admission_lease_id,
+            writer,
             reply,
         })
     }
@@ -7852,6 +7912,24 @@ impl ThreadActor {
         admission_lease_id: surface::SurfaceAdmissionLeaseId,
     ) -> Result<surface::MutationReply<surface::AdmissionOutput>, surface::SurfaceClientCommandError>
     {
+        self.admit_surface_operation_with_output(
+            client,
+            request_id,
+            operation_id,
+            admission_lease_id,
+            None,
+        )
+    }
+
+    fn admit_surface_operation_with_output(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        admission_lease_id: surface::SurfaceAdmissionLeaseId,
+        output_writer: Option<Box<dyn HostedOperationWriter>>,
+    ) -> Result<surface::MutationReply<surface::AdmissionOutput>, surface::SurfaceClientCommandError>
+    {
         if self
             .resident_surface
             .operation_origin_attachments
@@ -8155,7 +8233,8 @@ impl ThreadActor {
         let (start_tx, start_rx) = mpsc::sync_channel(1);
         self.handle_idle_command(ThreadCommand::StartTurn {
             request: Box::new(hosted_request),
-            writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+            writer: output_writer
+                .unwrap_or_else(|| Box::new(PassthroughHostedOperationWriter::new(io::sink()))),
             config: None,
             reply: start_tx,
         });
@@ -9395,6 +9474,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceAdmitReserved { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceAdmitReservedWithOutput { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceCancelOperation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -9549,6 +9631,29 @@ impl ThreadActor {
                         request_id,
                         operation_id,
                         admission_lease_id,
+                    )
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceAdmitReservedWithOutput {
+                client,
+                request_id,
+                operation_id,
+                admission_lease_id,
+                writer,
+                reply,
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::SubmitOperation)
+                {
+                    self.admit_surface_operation_with_output(
+                        &client,
+                        request_id,
+                        operation_id,
+                        admission_lease_id,
+                        Some(writer),
                     )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
@@ -9960,6 +10065,9 @@ impl ThreadActor {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             ThreadCommand::SurfaceAdmitReserved { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            }
+            ThreadCommand::SurfaceAdmitReservedWithOutput { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             ThreadCommand::SurfaceCancelOperation {
@@ -11960,6 +12068,24 @@ mod tests {
 
     struct ProviderResponseCheckpointRetryExecutor;
 
+    struct OutputWriterExecutor;
+
+    struct SharedOutputWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedOutputWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct SettingsConfigExecutor {
         observed_model: SyncSender<String>,
     }
@@ -12017,6 +12143,22 @@ mod tests {
                 },
                 request.turn_id().clone(),
             ))?;
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for OutputWriterExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            writer.write_all(b"typed output\n")?;
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
         }
@@ -12772,6 +12914,61 @@ mod tests {
                 if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
         ));
         host.shutdown().expect("shutdown repaired runtime host");
+    }
+
+    #[test]
+    fn typed_admission_with_output_routes_writer_through_runtime_operation() {
+        let cwd = tempfile::tempdir().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let host = RuntimeHost::start_with_executor(Arc::new(OutputWriterExecutor))
+            .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "typed output writer",
+            )
+            .expect("start recorded runtime thread");
+        let attachment = fresh_surface_attachment(&thread.surface());
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, "writer turn"),
+                )
+                .expect("reserve typed operation"),
+        );
+        let writer = PassthroughHostedOperationWriter::new(SharedOutputWriter(Arc::clone(&output)));
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved_with_output(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                    writer,
+                )
+                .expect("admit typed operation with output"),
+        );
+        assert!(matches!(
+            admitted,
+            surface::AdmissionOutput::Admitted { .. }
+        ));
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id)
+            .expect("wait typed output operation");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"typed output\n",
+            "the supplied writer must be owned by the admitted runtime operation"
+        );
+        host.shutdown().expect("shutdown typed output host");
     }
 
     #[test]

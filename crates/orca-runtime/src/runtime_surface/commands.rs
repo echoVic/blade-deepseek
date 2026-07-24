@@ -266,6 +266,15 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         admission_lease_id: SurfaceAdmissionLeaseId,
     ) -> Result<MutationReply<AdmissionOutput>, SurfaceClientCommandError>;
 
+    fn admit_reserved_with_output(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+        admission_lease_id: SurfaceAdmissionLeaseId,
+        writer: Box<dyn crate::runtime_host::HostedOperationWriter>,
+    ) -> Result<MutationReply<AdmissionOutput>, SurfaceClientCommandError>;
+
     fn cancel_operation(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -361,6 +370,28 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .admit_reserved(self.clone(), request_id, operation_id, admission_lease_id)
+    }
+
+    pub fn admit_reserved_with_output<W>(
+        &self,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+        admission_lease_id: SurfaceAdmissionLeaseId,
+        writer: W,
+    ) -> Result<MutationReply<AdmissionOutput>, SurfaceClientCommandError>
+    where
+        W: crate::runtime_host::HostedOperationWriter,
+    {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .admit_reserved_with_output(
+                self.clone(),
+                request_id,
+                operation_id,
+                admission_lease_id,
+                Box::new(writer),
+            )
     }
 
     pub fn cancel_operation(
