@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent, CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    ProtocolVersion, ResourceLink, SessionId, SessionNotification, SessionUpdate, StopReason,
+    Agent, CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PromptRequest, ProtocolVersion, ResourceLink, SessionId,
+    SessionNotification, SessionUpdate, StopReason,
 };
 use orca_core::cancel::CancelToken;
 use orca_core::config::{
@@ -358,6 +359,72 @@ fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
     assert_eq!(executor.call_count(), 0);
     assert!(format!("{error:?}").contains("unsupported"));
     host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_typed_load_replays_surface_history_after_restart() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let first_executor = Arc::new(AcpTestExecutor::new(vec![
+        TestBehavior::EmitMessageAndComplete {
+            message: "history survives restart".to_string(),
+        },
+    ]));
+    let first_host = RuntimeHost::start_with_executor(first_executor).expect("start first host");
+    let (first_note_tx, _first_note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let first_agent = OrcaAcpAgent::new_typed(
+        first_host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        first_note_tx,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let session_id = local.block_on(&rt, async {
+        let session = first_agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        first_agent
+            .prompt(PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from("persist this".to_string())],
+            ))
+            .await
+            .expect("prompt");
+        session.session_id
+    });
+    first_host.shutdown().expect("shutdown first host");
+
+    let second_executor = Arc::new(AcpTestExecutor::new(vec![]));
+    let second_host =
+        RuntimeHost::start_with_executor(second_executor.clone()).expect("start second host");
+    let (second_note_tx, mut second_note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let second_agent = OrcaAcpAgent::new_typed(
+        second_host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        second_note_tx,
+    );
+    local.block_on(&rt, async {
+        second_agent
+            .load_session(LoadSessionRequest::new(
+                session_id,
+                session_cwd.path().to_path_buf(),
+            ))
+            .await
+            .expect("load_session");
+    });
+
+    let updates = drain_notifications(&mut second_note_rx);
+    assert!(updates.iter().any(|update| {
+        matches!(update, SessionUpdate::AgentMessageChunk(chunk)
+            if matches!(&chunk.content, ContentBlock::Text(text) if text.text.contains("history survives restart")))
+    }));
+    assert_eq!(second_executor.call_count(), 0);
+    second_host.shutdown().expect("shutdown second host");
 }
 
 #[test]

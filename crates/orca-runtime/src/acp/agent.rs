@@ -5,7 +5,7 @@
 //! projected to `session/update` notifications via [`event_map`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -36,6 +36,7 @@ use crate::surface::{
 };
 
 use super::event_map;
+use crate::runtime_surface::SurfaceItem;
 
 /// Per-session runtime state held on the single-threaded ACP task.
 struct SessionEntry {
@@ -212,6 +213,57 @@ fn content_block_name(block: &ContentBlock) -> &'static str {
         ContentBlock::Resource(_) => "resource",
         _ => "unknown",
     }
+}
+
+fn replay_surface_snapshot(
+    surface: &RuntimeSurfaceHandle,
+    session_id: &SessionId,
+    note_tx: &UnboundedSender<SessionNotification>,
+) -> Result<(), String> {
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Acp,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { .. } => return Err("ACP history attachment denied".to_string()),
+        AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. }
+        | AttachResult::ThreadClosed { .. }
+        | AttachResult::Unavailable { .. } => {
+            return Err("ACP history snapshot unavailable".to_string());
+        }
+    };
+    for item in attachment.baseline.snapshot.items.iter() {
+        let update = match item {
+            SurfaceItem::AssistantMessage { text, .. } => Some(SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::ContentChunk::new(ContentBlock::from(
+                    text.as_str().to_string(),
+                )),
+            )),
+            SurfaceItem::AssistantReasoning { content, .. } => Some(
+                SessionUpdate::AgentThoughtChunk(agent_client_protocol::ContentChunk::new(
+                    ContentBlock::from(content.as_str().to_string()),
+                )),
+            ),
+            SurfaceItem::UserMessage { .. }
+            | SurfaceItem::SystemMessage { .. }
+            | SurfaceItem::AssistantPlan { .. }
+            | SurfaceItem::ToolResultMessage { .. } => None,
+        };
+        if let Some(update) = update {
+            let _ = note_tx.send(SessionNotification::new(session_id.clone(), update));
+        }
+    }
+    let _ = surface.detach(
+        &attachment.client,
+        crate::surface::DetachRequest {
+            request_id: SurfaceRequestId::new(),
+        },
+    );
+    Ok(())
 }
 
 fn prepare_surface_prompt(
@@ -546,7 +598,8 @@ impl Agent for OrcaAcpAgent {
             .map_err(Error::into_internal_error)?
             .map_err(Error::into_internal_error)?;
 
-        let config = self.build_session_config(args.cwd);
+        let mut config = self.build_session_config(args.cwd);
+        config.history_mode = HistoryMode::Resume(args.session_id.to_string());
         let session_config = config.clone();
         let request =
             RuntimeThreadStartRequest::new(config, "ACP session").with_preloaded(transcript);
@@ -573,6 +626,11 @@ impl Agent for OrcaAcpAgent {
                     .map_err(Error::into_internal_error)?;
             (thread, None)
         };
+
+        if let Some(surface) = surface.as_ref() {
+            replay_surface_snapshot(surface, &args.session_id, &self.note_tx)
+                .map_err(|message| Error::internal_error().data(message))?;
+        }
 
         self.state.borrow_mut().sessions.insert(
             args.session_id.clone(),
