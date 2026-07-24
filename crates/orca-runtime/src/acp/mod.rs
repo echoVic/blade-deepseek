@@ -44,9 +44,9 @@ pub fn run(config: RunConfig) -> i32 {
 
     let local_set = tokio::task::LocalSet::new();
     let exit_code = local_set.block_on(&rt, async {
-        let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+        let (note_tx, mut note_rx) = mpsc::channel::<SessionNotification>(256);
         let (client_bridge, mut permission_rx) = AcpClientBridge::new();
-        let agent = OrcaAcpAgent::new_typed(surface_host, config, note_tx)
+        let agent = OrcaAcpAgent::new_typed_bounded(surface_host, config, note_tx)
             .with_client_bridge(client_bridge.clone());
 
         let (incoming, outgoing) = transport::stdio();
@@ -59,7 +59,13 @@ pub fn run(config: RunConfig) -> i32 {
         let notification_conn = Rc::clone(&conn);
         tokio::task::spawn_local(async move {
             while let Some(notification) = note_rx.recv().await {
-                let _ = notification_conn.session_notification(notification).await;
+                if notification_conn
+                    .session_notification(notification)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
         });
 

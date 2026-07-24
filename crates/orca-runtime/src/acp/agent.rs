@@ -24,8 +24,7 @@ use agent_client_protocol::{
 };
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::event_sink::EventObserver;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::runtime_host::{
     HostedTurnRequest, OperationHandle, OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle,
@@ -48,6 +47,21 @@ use crate::runtime_surface::{
     SurfaceItem, SurfacePlanPriority, SurfacePlanStatus, SurfaceToolAction, SurfaceToolViewState,
 };
 
+#[derive(Clone)]
+pub(crate) enum AcpNotificationSender {
+    Unbounded(UnboundedSender<SessionNotification>),
+    Bounded(Sender<SessionNotification>),
+}
+
+impl AcpNotificationSender {
+    fn send(&self, notification: SessionNotification) -> Result<(), ()> {
+        match self {
+            Self::Unbounded(sender) => sender.send(notification).map_err(|_| ()),
+            Self::Bounded(sender) => sender.blocking_send(notification).map_err(|_| ()),
+        }
+    }
+}
+
 /// Per-session runtime state held on the single-threaded ACP task.
 struct SessionEntry {
     thread: RuntimeThreadHandle,
@@ -68,7 +82,7 @@ struct AgentState {
 /// channel. Runs synchronously on the runtime host thread; `send` is
 /// non-blocking, so it never stalls the runtime.
 struct AcpEventObserver {
-    note_tx: UnboundedSender<SessionNotification>,
+    note_tx: AcpNotificationSender,
     session_id: SessionId,
 }
 
@@ -88,7 +102,7 @@ pub struct OrcaAcpAgent {
     host: Option<RuntimeHostHandle>,
     surface_host: Option<RuntimeSurfaceHostHandle>,
     base_config: RunConfig,
-    note_tx: UnboundedSender<SessionNotification>,
+    note_tx: AcpNotificationSender,
     state: Rc<RefCell<AgentState>>,
     client_bridge: Option<Arc<AcpClientBridge>>,
 }
@@ -263,7 +277,7 @@ impl OrcaAcpAgent {
             host: Some(host),
             surface_host: None,
             base_config,
-            note_tx,
+            note_tx: AcpNotificationSender::Unbounded(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
             client_bridge: None,
         }
@@ -278,7 +292,22 @@ impl OrcaAcpAgent {
             host: None,
             surface_host: Some(host),
             base_config,
-            note_tx,
+            note_tx: AcpNotificationSender::Unbounded(note_tx),
+            state: Rc::new(RefCell::new(AgentState::default())),
+            client_bridge: None,
+        }
+    }
+
+    pub(crate) fn new_typed_bounded(
+        host: RuntimeSurfaceHostHandle,
+        base_config: RunConfig,
+        note_tx: Sender<SessionNotification>,
+    ) -> Self {
+        Self {
+            host: None,
+            surface_host: Some(host),
+            base_config,
+            note_tx: AcpNotificationSender::Bounded(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
             client_bridge: None,
         }
@@ -498,7 +527,7 @@ fn content_block_name(block: &ContentBlock) -> &'static str {
 fn replay_surface_snapshot(
     surface: &RuntimeSurfaceHandle,
     session_id: &SessionId,
-    note_tx: &UnboundedSender<SessionNotification>,
+    note_tx: &AcpNotificationSender,
 ) -> Result<(), String> {
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
@@ -893,7 +922,7 @@ fn permission_answer(
 fn drain_surface_prompt(
     mut prepared: PreparedSurfacePrompt,
     session_id: SessionId,
-    note_tx: UnboundedSender<SessionNotification>,
+    note_tx: AcpNotificationSender,
 ) -> Result<StopReason, String> {
     let (wait_tx, wait_rx) = std_mpsc::sync_channel(1);
     let waiter_client = prepared.client.clone();
@@ -1018,7 +1047,7 @@ fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, S
 
 fn emit_surface_event(
     session_id: &SessionId,
-    note_tx: &UnboundedSender<SessionNotification>,
+    note_tx: &AcpNotificationSender,
     event: &SurfaceEvent,
     tool_outputs: &mut HashMap<String, ToolOutputAccumulator>,
 ) {
@@ -1110,7 +1139,7 @@ fn emit_surface_event(
 fn project_surface_event(
     prepared: &mut PreparedSurfacePrompt,
     session_id: &SessionId,
-    note_tx: &UnboundedSender<SessionNotification>,
+    note_tx: &AcpNotificationSender,
     event: &SurfaceEvent,
 ) -> Result<(), String> {
     if let SurfaceEvent::Interaction(crate::surface::InteractionPatch::Requested { interaction }) =
@@ -1326,8 +1355,15 @@ impl Agent for OrcaAcpAgent {
         };
 
         if let Some(surface) = surface.as_ref() {
-            replay_surface_snapshot(surface, &args.session_id, &self.note_tx)
-                .map_err(|message| Error::internal_error().data(message))?;
+            let surface = surface.clone();
+            let session_id = args.session_id.clone();
+            let note_tx = self.note_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                replay_surface_snapshot(&surface, &session_id, &note_tx)
+            })
+            .await
+            .map_err(Error::into_internal_error)?
+            .map_err(|message| Error::internal_error().data(message))?;
         }
 
         self.state.borrow_mut().sessions.insert(
@@ -1506,6 +1542,7 @@ mod tests {
             arguments_digest: crate::runtime_surface::Sha256Digest::new([0; 32]),
         };
         let (note_tx, mut note_rx) = unbounded_channel();
+        let note_tx = AcpNotificationSender::Unbounded(note_tx);
         let mut tool_outputs = HashMap::new();
         emit_surface_event(
             &SessionId::new("typed-tools"),
