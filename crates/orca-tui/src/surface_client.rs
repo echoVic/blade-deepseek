@@ -92,13 +92,13 @@ pub(crate) fn run(
     #[cfg(test)]
     {
         if FORCE_TYPED_SURFACE_TEST_PATH.with(std::cell::Cell::get) {
-            return run_typed(thread, request, controller, event_tx);
+            return run_typed(thread, request, config, controller, event_tx);
         }
         return crate::app::run_hosted_operation(thread, request, config, controller, event_tx);
     }
     #[cfg(not(test))]
     if matches!(request.operation_kind(), HostedOperationKind::Turn) {
-        run_typed(thread, request, controller, event_tx)
+        run_typed(thread, request, config, controller, event_tx)
     } else {
         crate::app::run_hosted_operation(thread, request, config, controller, event_tx)
     }
@@ -107,6 +107,7 @@ pub(crate) fn run(
 fn run_typed(
     thread: &RuntimeThreadHandle,
     request: HostedTurnRequest,
+    config: RunConfig,
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
@@ -144,6 +145,11 @@ fn run_typed(
         .claim_subscription(&attachment.subscription)
         .ok_or_else(|| io::Error::other("typed TUI surface subscription unavailable"))?;
     let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
+    if !typed_config_matches_surface(&config, &attachment.baseline.snapshot) {
+        return Err(io::Error::other(
+            "typed TUI config differs from runtime surface settings; update settings before submitting",
+        ));
+    }
     for event in projection.hydrate_open_streams() {
         let _ = event_tx.send(event);
     }
@@ -235,6 +241,57 @@ fn run_typed(
         guard.terminal_observed();
     }
     result
+}
+
+fn typed_config_matches_surface(
+    config: &RunConfig,
+    snapshot: &orca_runtime::unstable_surface::SurfaceSnapshot,
+) -> bool {
+    let expected_cwd = config.cwd.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+    });
+    let Ok(expected_cwd) = orca_runtime::unstable_surface::CanonicalPath::try_new(expected_cwd)
+    else {
+        return false;
+    };
+    let expected_roots = config
+        .runtime_workspace_roots
+        .clone()
+        .unwrap_or_else(|| vec![expected_cwd.as_path().to_path_buf()]);
+    let expected_roots = expected_roots
+        .into_iter()
+        .map(orca_runtime::unstable_surface::CanonicalPath::try_new)
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(expected_roots) = expected_roots else {
+        return false;
+    };
+    let expected_approval_mode = match config.approval_mode {
+        orca_core::approval_types::ApprovalMode::Suggest => {
+            orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest
+        }
+        orca_core::approval_types::ApprovalMode::AutoEdit => {
+            orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit
+        }
+        orca_core::approval_types::ApprovalMode::FullAuto => {
+            orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto
+        }
+        orca_core::approval_types::ApprovalMode::Plan => {
+            orca_runtime::unstable_surface::SurfaceApprovalMode::Plan
+        }
+    };
+    let expected_reasoning = match config.reasoning_effort {
+        orca_core::config::ReasoningEffort::High => {
+            orca_runtime::unstable_surface::SurfaceReasoningEffort::High
+        }
+        orca_core::config::ReasoningEffort::Max => {
+            orca_runtime::unstable_surface::SurfaceReasoningEffort::Max
+        }
+    };
+    snapshot.settings.effective.model.as_str() == config.model.display_name()
+        && snapshot.settings.effective.cwd == expected_cwd
+        && snapshot.settings.effective.workspace_roots == expected_roots
+        && snapshot.settings.effective.approval_mode == expected_approval_mode
+        && snapshot.settings.effective.reasoning_effort == expected_reasoning
 }
 
 fn drain_operation(

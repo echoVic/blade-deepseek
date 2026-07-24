@@ -439,6 +439,130 @@ fn collect_until(
     }
 }
 
+#[test]
+fn operation_owner_attachment_controls_admit_and_cancel() {
+    let gate = ExecutionGate::new();
+    let mut harness = ForegroundHarness::recorded(ExecutionBehavior::HoldSuccess(gate.clone()));
+    let other = fresh_attachment(&harness.surface);
+    let reserved = harness.reserve("owner-bound operation");
+
+    assert!(matches!(
+        other.client.admit_reserved(
+            request_id(),
+            reserved.operation_id.clone(),
+            reserved.lease.lease_id.clone(),
+        ),
+        Err(SurfaceClientCommandError::Unauthorized)
+    ));
+    assert!(matches!(
+        other
+            .client
+            .cancel_operation(request_id(), reserved.operation_id.clone()),
+        Err(SurfaceClientCommandError::Unauthorized)
+    ));
+
+    harness.admit(&reserved);
+    gate.wait_until_entered();
+    assert!(matches!(
+        other
+            .client
+            .cancel_operation(request_id(), reserved.operation_id.clone()),
+        Err(SurfaceClientCommandError::Unauthorized)
+    ));
+    harness.cancel(reserved.operation_id.clone());
+    gate.release();
+    harness.wait_terminal(reserved.operation_id);
+    harness.shutdown_host();
+}
+
+#[test]
+fn use_current_settings_requires_exact_revision_before_requested() {
+    let mut harness = ForegroundHarness::recorded(ExecutionBehavior::PanicIfCalled);
+    let snapshot = harness.baseline.as_ref();
+    let stale_revision = SettingsRevision::try_new(snapshot.settings.thread_revision.get() + 1)
+        .expect("next settings revision is valid");
+    let intent = OperationRequestIntent {
+        correlation: OperationIngressCorrelation::TuiUser,
+        kind: OperationKind::UserTurn,
+        input: Some(SurfaceInputRequest {
+            blocks: NonEmptyVec::try_new(vec![SurfaceInputRequestBlock::Text {
+                text: DisplayText::new("stale settings"),
+            }])
+            .unwrap(),
+        }),
+        replayability: ReplayabilityRequest::CaptureReplayableCapsule,
+        settings_preparation: OperationSettingsPreparation::UseCurrent {
+            expected_settings_revision: stale_revision,
+            expected_policy_epoch: snapshot.settings.effective.policy_epoch,
+        },
+    };
+
+    let result = harness
+        .client
+        .reserve_operation(request_id(), intent)
+        .expect("stale settings is a committed surface response");
+    match result {
+        MutationReply::Uncommitted {
+            mutation: UncommittedMutation::Stale { error, .. },
+        } => assert_eq!(
+            error.error().code,
+            SurfaceMutationErrorCode::StaleRevision,
+            "settings CAS mismatch must be classified as stale"
+        ),
+        MutationReply::Committed { .. } => {
+            panic!("stale settings unexpectedly requested operation")
+        }
+        MutationReply::Deferred { .. } => panic!("stale settings unexpectedly deferred"),
+        MutationReply::Uncommitted { mutation } => {
+            panic!("wrong stale mutation classification: {mutation:?}")
+        }
+    }
+    harness.shutdown_host();
+}
+
+#[test]
+fn unsupported_thread_overrides_are_rejected_before_requested() {
+    let mut harness = ForegroundHarness::recorded(ExecutionBehavior::PanicIfCalled);
+    let snapshot = harness.baseline.as_ref();
+    let intent = OperationRequestIntent {
+        correlation: OperationIngressCorrelation::TuiUser,
+        kind: OperationKind::UserTurn,
+        input: Some(SurfaceInputRequest {
+            blocks: NonEmptyVec::try_new(vec![SurfaceInputRequestBlock::Text {
+                text: DisplayText::new("unsupported settings"),
+            }])
+            .unwrap(),
+        }),
+        replayability: ReplayabilityRequest::CaptureReplayableCapsule,
+        settings_preparation: OperationSettingsPreparation::ApplyThreadOverridesBeforeRequested {
+            expected_settings_revision: snapshot.settings.thread_revision,
+            expected_policy_epoch: snapshot.settings.effective.policy_epoch,
+            patches: NonEmptyVec::try_new(vec![RuntimeSettingsPatch::SetModel {
+                model: NonEmptyText::try_new("deepseek-v4-pro").unwrap(),
+            }])
+            .unwrap(),
+        },
+    };
+
+    let result = harness
+        .client
+        .reserve_operation(request_id(), intent)
+        .expect("unsupported settings is a committed surface response");
+    match result {
+        MutationReply::Uncommitted {
+            mutation: UncommittedMutation::Invalid { error, .. },
+        } => assert_eq!(error.error().code, SurfaceMutationErrorCode::IllegalState),
+        MutationReply::Committed { .. } => {
+            panic!("unsupported settings unexpectedly requested operation")
+        }
+        MutationReply::Deferred { .. } => panic!("unsupported settings unexpectedly deferred"),
+        MutationReply::Uncommitted { mutation } => {
+            panic!("wrong unsupported-settings classification: {mutation:?}")
+        }
+    }
+    harness.shutdown_host();
+}
+
 fn operation_patches<'a>(
     batches: &'a [SurfaceCommitBatch],
     operation_id: &SurfaceOperationId,
@@ -1422,6 +1546,12 @@ fn tui_foreground_restart_reconciles_requested_and_started_states() {
                 terminal.terminal
             );
             assert_eq!(executor.call_count(), 0);
+            assert!(matches!(
+                attachment
+                    .client
+                    .cancel_operation(request_id(), operation_id.clone()),
+                Err(SurfaceClientCommandError::Unauthorized)
+            ));
             host.shutdown().expect("shutdown recovered host");
         }
     });

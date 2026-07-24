@@ -3026,6 +3026,16 @@ fn initial_surface_snapshot(
             message: format!("invalid surface cwd: {error:?}"),
         }
     })?;
+    let workspace_roots = config
+        .runtime_workspace_roots
+        .clone()
+        .unwrap_or_else(|| vec![cwd.as_path().to_path_buf()])
+        .into_iter()
+        .map(surface::CanonicalPath::try_new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("invalid surface workspace root: {error:?}"),
+        })?;
     let now = surface::UnixMillis::new(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3039,6 +3049,10 @@ fn initial_surface_snapshot(
         ApprovalMode::FullAuto => surface::SurfaceApprovalMode::FullAuto,
         ApprovalMode::Plan => surface::SurfaceApprovalMode::Plan,
     };
+    let reasoning_effort = match config.reasoning_effort {
+        orca_core::config::ReasoningEffort::High => surface::SurfaceReasoningEffort::High,
+        orca_core::config::ReasoningEffort::Max => surface::SurfaceReasoningEffort::Max,
+    };
     let settings = surface::SurfaceRuntimeSettings {
         model: surface::NonEmptyText::try_new(
             config
@@ -3047,10 +3061,10 @@ fn initial_surface_snapshot(
                 .unwrap_or_else(|| "runtime-default".to_string()),
         )
         .expect("runtime model is non-empty"),
-        reasoning_effort: surface::SurfaceReasoningEffort::Max,
+        reasoning_effort,
         approval_mode,
         cwd: cwd.clone(),
-        workspace_roots: vec![cwd.clone()],
+        workspace_roots: workspace_roots.clone(),
         active_permission_profile: None,
         permission_rules: surface::SurfacePermissionRuleSet {
             ordered_rules: Vec::new(),
@@ -3084,7 +3098,7 @@ fn initial_surface_snapshot(
             created_at: now,
             updated_at: now,
             cwd: cwd.clone(),
-            workspace_roots: vec![cwd],
+            workspace_roots,
             closed: false,
         },
         foreground_operation: None,
@@ -7067,6 +7081,93 @@ impl ThreadActor {
             _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
         };
         let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let settings = &snapshot.settings;
+        let (expected_settings_revision, expected_policy_epoch) = match &intent.settings_preparation
+        {
+            surface::OperationSettingsPreparation::UseCurrent {
+                expected_settings_revision,
+                expected_policy_epoch,
+            }
+            | surface::OperationSettingsPreparation::ApplyThreadOverridesBeforeRequested {
+                expected_settings_revision,
+                expected_policy_epoch,
+                ..
+            } => (*expected_settings_revision, *expected_policy_epoch),
+        };
+        let stale_settings_message = if expected_settings_revision != settings.thread_revision {
+            Some("thread settings revision is stale")
+        } else if expected_policy_epoch != settings.effective.policy_epoch {
+            Some("thread settings policy epoch is stale")
+        } else {
+            None
+        };
+        if let Some(message) = stale_settings_message {
+            return Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Stale {
+                    request_id,
+                    target: Some(surface::MutationTarget::RuntimeSettings {
+                        host_incarnation: self
+                            .resident_surface
+                            .hub
+                            .authority()
+                            .host_incarnation()
+                            .clone(),
+                        thread_id: Some(snapshot.thread.thread_id.clone()),
+                    }),
+                    error: surface::StaleMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::StaleRevision,
+                        message: surface::DisplayText::new(message),
+                        winning_request_id: None,
+                        current_revision: Some(surface::SurfaceMutationRevision::Settings {
+                            host_incarnation: self
+                                .resident_surface
+                                .hub
+                                .authority()
+                                .host_incarnation()
+                                .clone(),
+                            thread_id: Some(snapshot.thread.thread_id.clone()),
+                            revision: settings.thread_revision,
+                        }),
+                    }),
+                },
+            });
+        }
+        if matches!(
+            &intent.settings_preparation,
+            surface::OperationSettingsPreparation::ApplyThreadOverridesBeforeRequested { .. }
+        ) {
+            return Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid {
+                    request_id,
+                    target: Some(surface::MutationTarget::RuntimeSettings {
+                        host_incarnation: self
+                            .resident_surface
+                            .hub
+                            .authority()
+                            .host_incarnation()
+                            .clone(),
+                        thread_id: Some(snapshot.thread.thread_id.clone()),
+                    }),
+                    error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::IllegalState,
+                        message: surface::DisplayText::new(
+                            "thread settings overrides are not supported by typed admission",
+                        ),
+                        winning_request_id: None,
+                        current_revision: Some(surface::SurfaceMutationRevision::Settings {
+                            host_incarnation: self
+                                .resident_surface
+                                .hub
+                                .authority()
+                                .host_incarnation()
+                                .clone(),
+                            thread_id: Some(snapshot.thread.thread_id.clone()),
+                            revision: settings.thread_revision,
+                        }),
+                    }),
+                },
+            });
+        }
         let operation_id =
             surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
@@ -7091,7 +7192,6 @@ impl ThreadActor {
             },
         );
         let origin = surface::OperationOrigin::TuiUser;
-        let settings = &snapshot.settings;
         let replayability = surface::Replayability::Replayable {
             capsule_digest: surface_sha256(
                 &serde_json::to_vec(&input_request).expect("surface input is serializable"),
@@ -7166,11 +7266,20 @@ impl ThreadActor {
 
     fn admit_surface_operation(
         &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
         admission_lease_id: surface::SurfaceAdmissionLeaseId,
     ) -> Result<surface::MutationReply<surface::AdmissionOutput>, surface::SurfaceClientCommandError>
     {
+        if self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&operation_id)
+            != Some(client.attachment_id())
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         if !self.resident_surface.pending_terminal_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
@@ -8267,12 +8376,21 @@ impl ThreadActor {
 
     fn cancel_surface_before_admission(
         &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
     ) -> Result<
         surface::MutationReply<surface::CancelOperationOutput>,
         surface::SurfaceClientCommandError,
     > {
+        if self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&operation_id)
+            != Some(client.attachment_id())
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         let operation = self
             .resident_surface
             .coordinator
@@ -8300,12 +8418,21 @@ impl ThreadActor {
     fn cancel_surface_running(
         &mut self,
         active: &mut ActiveOperation,
+        client: &surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
     ) -> Result<
         surface::MutationReply<surface::CancelOperationOutput>,
         surface::SurfaceClientCommandError,
     > {
+        if self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&operation_id)
+            != Some(client.attachment_id())
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         let fence = active
             .surface_operation
             .as_ref()
@@ -8829,7 +8956,12 @@ impl ThreadActor {
                 let result = if self
                     .admits_surface_client(&client, surface::SurfaceCapability::SubmitOperation)
                 {
-                    self.admit_surface_operation(request_id, operation_id, admission_lease_id)
+                    self.admit_surface_operation(
+                        &client,
+                        request_id,
+                        operation_id,
+                        admission_lease_id,
+                    )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -8845,7 +8977,7 @@ impl ThreadActor {
                     &client,
                     surface::SurfaceCapability::ControlBoundOperation,
                 ) {
-                    self.cancel_surface_before_admission(request_id, operation_id)
+                    self.cancel_surface_before_admission(&client, request_id, operation_id)
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -9228,7 +9360,7 @@ impl ThreadActor {
                     &client,
                     surface::SurfaceCapability::ControlBoundOperation,
                 ) {
-                    self.cancel_surface_running(active, request_id, operation_id)
+                    self.cancel_surface_running(active, &client, request_id, operation_id)
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
