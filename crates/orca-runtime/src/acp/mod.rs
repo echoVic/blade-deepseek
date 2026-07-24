@@ -27,7 +27,7 @@ pub fn run(config: RunConfig) -> i32 {
             return 1;
         }
     };
-    let host_handle = host.handle();
+    let surface_host = host.surface_handle();
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -43,7 +43,7 @@ pub fn run(config: RunConfig) -> i32 {
     let local_set = tokio::task::LocalSet::new();
     let exit_code = local_set.block_on(&rt, async {
         let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-        let agent = OrcaAcpAgent::new(host_handle, config, note_tx);
+        let agent = OrcaAcpAgent::new_typed(surface_host, config, note_tx);
 
         let (incoming, outgoing) = transport::stdio();
         let (conn, io_task) = AgentSideConnection::new(agent, outgoing, incoming, |fut| {
