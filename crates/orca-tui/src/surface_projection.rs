@@ -11,7 +11,7 @@ use orca_runtime::surface::{
     ToolPatch,
 };
 
-use crate::types::TuiEvent;
+use crate::types::{TuiEvent, TuiTaskLifecycle};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SurfaceProjectionError {
@@ -28,6 +28,7 @@ pub(crate) struct TuiSurfaceProjection {
     cursor: SurfaceCursor,
     assistant_streams: BTreeMap<SurfaceStreamId, SurfaceAssistantStream>,
     focused_operation: Option<SurfaceOperationId>,
+    pending_turn_started: Option<TuiTaskLifecycle>,
 }
 
 impl TuiSurfaceProjection {
@@ -39,6 +40,7 @@ impl TuiSurfaceProjection {
                 .map(|stream| (stream.stream_id.clone(), stream.clone()))
                 .collect(),
             focused_operation: None,
+            pending_turn_started: None,
         }
     }
 
@@ -51,26 +53,50 @@ impl TuiSurfaceProjection {
             .foreground_operation
             .as_ref()
             .map(|operation| operation.operation_id.clone());
+        projection.pending_turn_started = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.terminal.is_none())
+            .and_then(|operation| operation.agent_loop_turns.last())
+            .map(|turn| TuiTaskLifecycle {
+                id: turn.task_id.as_str().to_string(),
+                kind: "agent".to_string(),
+                status: "running".to_string(),
+                turn: turn.ordinal,
+            });
         projection
     }
 
-    pub(crate) fn hydrate_open_streams(&self) -> Vec<TuiEvent> {
-        self.assistant_streams
-            .values()
-            .filter(|stream| {
-                stream.state == SurfaceAssistantStreamState::Open
-                    && !stream.text.as_str().is_empty()
+    pub(crate) fn hydrate_open_streams(&mut self) -> Vec<TuiEvent> {
+        let mut projected = self
+            .pending_turn_started
+            .take()
+            .map(|task| {
+                vec![TuiEvent::TurnStarted {
+                    turn: task.turn,
+                    task: Some(task),
+                }]
             })
-            .map(|stream| match stream.channel {
-                AssistantChannel::Message => {
-                    TuiEvent::MessageDelta(stream.text.as_str().to_string())
-                }
-                AssistantChannel::Reasoning => {
-                    TuiEvent::ReasoningDelta(stream.text.as_str().to_string())
-                }
-                AssistantChannel::Plan => TuiEvent::Notice(stream.text.as_str().to_string()),
-            })
-            .collect()
+            .unwrap_or_default();
+        projected.extend(
+            self.assistant_streams
+                .values()
+                .filter(|stream| {
+                    stream.state == SurfaceAssistantStreamState::Open
+                        && !stream.text.as_str().is_empty()
+                })
+                .map(|stream| match stream.channel {
+                    AssistantChannel::Message => {
+                        TuiEvent::MessageDelta(stream.text.as_str().to_string())
+                    }
+                    AssistantChannel::Reasoning => {
+                        TuiEvent::ReasoningDelta(stream.text.as_str().to_string())
+                    }
+                    AssistantChannel::Plan => TuiEvent::Notice(stream.text.as_str().to_string()),
+                })
+                .collect::<Vec<_>>(),
+        );
+        projected
     }
 
     #[allow(dead_code)]
@@ -241,6 +267,19 @@ impl TuiSurfaceProjection {
                     used_tokens: usize::try_from(context.used_tokens).unwrap_or(usize::MAX),
                     limit_tokens: usize::try_from(context.limit_tokens).unwrap_or(usize::MAX),
                 }),
+                SurfaceEvent::Operation(OperationPatch::AgentLoopTurnStarted { turn })
+                    if focused_operation.as_ref() == Some(&turn.fence.operation_id) =>
+                {
+                    projected.push(TuiEvent::TurnStarted {
+                        turn: turn.ordinal,
+                        task: Some(TuiTaskLifecycle {
+                            id: turn.task_id.as_str().to_string(),
+                            kind: "agent".to_string(),
+                            status: "running".to_string(),
+                            turn: turn.ordinal,
+                        }),
+                    });
+                }
                 SurfaceEvent::Operation(OperationPatch::Terminal { record })
                     if focused_operation.as_ref() == Some(&record.operation_id) =>
                 {
@@ -456,5 +495,29 @@ mod tests {
             "indeterminate"
         );
         assert_eq!(tool_result_status(SurfaceToolResultKind::Failed), "failed");
+    }
+
+    #[test]
+    fn snapshot_hydration_emits_running_turn_once() {
+        let mut projection = TuiSurfaceProjection {
+            cursor: cursor(0, 1),
+            assistant_streams: BTreeMap::new(),
+            focused_operation: None,
+            pending_turn_started: Some(TuiTaskLifecycle {
+                id: "task-1".to_string(),
+                kind: "agent".to_string(),
+                status: "running".to_string(),
+                turn: 4,
+            }),
+        };
+
+        assert!(matches!(
+            projection.hydrate_open_streams().as_slice(),
+            [TuiEvent::TurnStarted {
+                turn: 4,
+                task: Some(TuiTaskLifecycle { id, status, .. }),
+            }] if id == "task-1" && status == "running"
+        ));
+        assert!(projection.hydrate_open_streams().is_empty());
     }
 }

@@ -511,6 +511,7 @@ mod tests {
     use std::time::Instant;
 
     use crate::interaction_broker::TuiInteractionBroker;
+    use crate::types::TuiTaskLifecycle;
 
     static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -562,6 +563,13 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             TuiEvent::MessageDelta(_) | TuiEvent::AssistantResponseCompleted(_, _)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TuiEvent::TurnStarted {
+                task: Some(TuiTaskLifecycle { status, .. }),
+                ..
+            } if status == "running"
         )));
         assert!(events.iter().any(
             |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
