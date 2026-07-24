@@ -21,8 +21,7 @@ use orca_core::conversation::Message;
 use orca_runtime::history;
 use orca_runtime::runtime_host::{
     HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, HostedWorkflowRequest,
-    OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadMutation,
-    RuntimeThreadStartRequest,
+    OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
 
 use crate::agent_runtime::TuiAgentRuntime;
@@ -4942,9 +4941,8 @@ fn ensure_hosted_thread(
     }
     if let Some(runtime_thread) = thread.as_ref() {
         while let Some(context) = pending_pinned_context.first().cloned() {
-            if let Err(error) =
-                runtime_thread.mutate(RuntimeThreadMutation::AddPinnedContext(context))
-            {
+            let typed_thread = runtime_thread.typed_surface();
+            if let Err(error) = crate::surface_client::add_pinned_context(&typed_thread, &context) {
                 return Err(error.to_string());
             }
             pending_pinned_context.remove(0);
