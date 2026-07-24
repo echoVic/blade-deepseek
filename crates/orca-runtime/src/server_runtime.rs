@@ -655,6 +655,16 @@ impl ServerThreadRuntime {
             .and_then(ServerThread::jsonl_surface)
     }
 
+    pub(crate) fn jsonl_surface_for_connection(
+        &self,
+        thread_id: &str,
+        connection_id: crate::surface::SurfaceConnectionId,
+    ) -> Option<crate::surface::RuntimeSurfaceHandle> {
+        self.threads
+            .get(thread_id)
+            .and_then(|thread| thread.handle.jsonl_surface_for_connection(connection_id))
+    }
+
     pub fn thread(&self, thread_id: &str) -> Option<&ServerThread> {
         self.threads.get(thread_id)
     }

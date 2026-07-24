@@ -1780,6 +1780,20 @@ impl RuntimeThreadHandle {
 
     #[allow(dead_code)]
     pub(crate) fn jsonl_surface(&self) -> Option<surface::RuntimeSurfaceHandle> {
+        self.jsonl_surface_with_connection(None)
+    }
+
+    pub(crate) fn jsonl_surface_for_connection(
+        &self,
+        connection_id: surface::SurfaceConnectionId,
+    ) -> Option<surface::RuntimeSurfaceHandle> {
+        self.jsonl_surface_with_connection(Some(connection_id))
+    }
+
+    fn jsonl_surface_with_connection(
+        &self,
+        connection_id: Option<surface::SurfaceConnectionId>,
+    ) -> Option<surface::RuntimeSurfaceHandle> {
         let authority = surface::SurfaceAttachAuthority::new(
             self.surface.host_incarnation().clone(),
             self.surface.thread_id().clone(),
@@ -1803,6 +1817,10 @@ impl RuntimeThreadHandle {
                 surface::SurfaceInteractionKind::McpElicitation,
             ]),
         );
+        let authority = match connection_id {
+            Some(connection_id) => authority.with_connection_id(connection_id),
+            None => authority,
+        };
         self.surface.with_authority(authority)
     }
 
@@ -7540,6 +7558,7 @@ impl ThreadActor {
         request_id: surface::SurfaceRequestId,
         intent: surface::OperationRequestIntent,
         origin_attachment: surface::SurfaceAttachmentId,
+        origin_connection: Option<surface::SurfaceConnectionId>,
     ) -> Result<
         surface::MutationReply<surface::ReservedOperationOutput>,
         surface::SurfaceClientCommandError,
@@ -7556,9 +7575,18 @@ impl ThreadActor {
             intent.correlation,
             surface::OperationIngressCorrelation::TuiUser
                 | surface::OperationIngressCorrelation::AcpPrompt { .. }
+                | surface::OperationIngressCorrelation::JsonlThreadTurn { .. }
+                | surface::OperationIngressCorrelation::JsonlStatelessSubmit { .. }
         ) || intent.kind != surface::OperationKind::UserTurn
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if let surface::OperationIngressCorrelation::JsonlThreadTurn { legacy_turn_id, .. } =
+            &intent.correlation
+        {
+            if TurnId::parse(legacy_turn_id.0.as_str()).is_err() {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
         }
         let input_request = match (&intent.replayability, intent.input.as_ref()) {
             (surface::ReplayabilityRequest::CaptureReplayableCapsule, Some(input))
@@ -7679,6 +7707,9 @@ impl ThreadActor {
                 tick: surface::MonotonicTick::new(0),
             },
         );
+        let jsonl_connection_id = origin_connection.or_else(|| {
+            surface::SurfaceConnectionId::try_from_bytes(*origin_attachment.as_bytes()).ok()
+        });
         let origin = match &intent.correlation {
             surface::OperationIngressCorrelation::TuiUser => surface::OperationOrigin::TuiUser,
             surface::OperationIngressCorrelation::AcpPrompt {
@@ -7694,6 +7725,22 @@ impl ThreadActor {
                 inbound_seq: *inbound_seq,
                 rpc_request_id: rpc_request_id.clone(),
             },
+            surface::OperationIngressCorrelation::JsonlThreadTurn {
+                rpc_id_digest,
+                legacy_turn_id,
+            } => surface::OperationOrigin::JsonlThreadTurn {
+                connection_id: jsonl_connection_id
+                    .clone()
+                    .expect("JSONL connection identity is bound"),
+                rpc_id_digest: rpc_id_digest.clone(),
+                legacy_turn_id: legacy_turn_id.clone(),
+            },
+            surface::OperationIngressCorrelation::JsonlStatelessSubmit { rpc_id_digest } => {
+                surface::OperationOrigin::JsonlStatelessSubmit {
+                    connection_id: jsonl_connection_id.expect("JSONL connection identity is bound"),
+                    rpc_id_digest: rpc_id_digest.clone(),
+                }
+            }
             _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
         };
         let replayability = surface::Replayability::Replayable {
@@ -8013,7 +8060,10 @@ impl ThreadActor {
         }
         if !matches!(
             operation.intent.origin,
-            surface::OperationOrigin::TuiUser | surface::OperationOrigin::AcpPrompt { .. }
+            surface::OperationOrigin::TuiUser
+                | surface::OperationOrigin::AcpPrompt { .. }
+                | surface::OperationOrigin::JsonlThreadTurn { .. }
+                | surface::OperationOrigin::JsonlStatelessSubmit { .. }
         ) || operation.intent.kind != surface::OperationKind::UserTurn
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
@@ -8029,7 +8079,13 @@ impl ThreadActor {
         let resolved_input = resolve_surface_input(&input_request)
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let snapshot = self.resident_surface.coordinator.state().snapshot();
-        let logical_turn_id = TurnId::new();
+        let logical_turn_id = match &operation.intent.origin {
+            surface::OperationOrigin::JsonlThreadTurn { legacy_turn_id, .. } => {
+                TurnId::parse(legacy_turn_id.0.as_str())
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            }
+            _ => TurnId::new(),
+        };
         let fence = surface::SurfaceOperationFence {
             thread_id: snapshot.thread.thread_id.clone(),
             thread_owner_epoch: snapshot.thread.owner_epoch,
@@ -9665,6 +9721,7 @@ impl ThreadActor {
                         request_id,
                         intent,
                         client.attachment_id().clone(),
+                        client.connection_id().cloned(),
                     )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)

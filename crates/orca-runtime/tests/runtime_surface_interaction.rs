@@ -2313,6 +2313,67 @@ fn with_orca_home<T>(body: impl FnOnce(&Path) -> T) -> T {
 }
 
 #[test]
+fn jsonl_submit_reserves_a_durable_surface_operation() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(ToolCompletionExecutor))
+        .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned JSONL submit",
+        )
+        .expect("start recorded runtime thread");
+    let attachment = fresh_interaction_attachment(&thread.surface());
+    let legacy_turn_id = orca_core::thread_identity::TurnId::new();
+    let mut intent = user_turn_intent(&attachment.baseline.snapshot, "jsonl submit");
+    intent.correlation = OperationIngressCorrelation::JsonlThreadTurn {
+        rpc_id_digest: Sha256Digest::new([0x42; 32]),
+        legacy_turn_id: LegacyTurnId(DisplayText::new(legacy_turn_id.as_str())),
+    };
+
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(request_id(), intent)
+            .expect("JSONL submit reservation should be accepted"),
+    );
+    let admitted = committed_value(
+        attachment
+            .client
+            .admit_reserved(
+                request_id(),
+                reserved.operation_id.clone(),
+                reserved.lease.lease_id,
+            )
+            .expect("JSONL submit admission should be accepted"),
+    );
+    assert!(matches!(admitted, AdmissionOutput::Admitted { .. }));
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), reserved.operation_id.clone())
+            .expect("wait JSONL operation terminal"),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+    let snapshot = match thread.surface().attach_fresh(FreshAttachRequest {
+        request_id: request_id(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment.baseline.snapshot,
+        _ => panic!("fresh JSONL snapshot attach failed"),
+    };
+    let operation = snapshot
+        .operation_history
+        .iter()
+        .find(|operation| operation.operation_id == reserved.operation_id)
+        .expect("JSONL operation history");
+    assert_eq!(operation.generations[0].logical_turn_id, legacy_turn_id);
+    host.shutdown().unwrap();
+}
+
+#[test]
 fn foreground_user_input_is_durable_before_typed_response_wakes_generation() {
     let cwd = tempfile::tempdir().unwrap();
     let (answer_tx, answer_rx) = mpsc::sync_channel(1);

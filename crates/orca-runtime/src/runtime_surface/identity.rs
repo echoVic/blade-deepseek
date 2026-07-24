@@ -704,6 +704,10 @@ macro_rules! uuid_wrapper {
             pub fn try_from_bytes(value: [u8; 16]) -> Result<Self, SurfaceValueError> {
                 $inner::try_from_bytes(value).map(Self)
             }
+
+            pub const fn as_bytes(&self) -> &[u8; 16] {
+                self.0.as_bytes()
+            }
         }
     };
 }

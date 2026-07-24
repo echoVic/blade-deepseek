@@ -142,6 +142,7 @@ pub struct SurfaceAttachAuthority {
     maximum_capabilities: NonEmptySet<SurfaceCapability>,
     required_capabilities: NonEmptySet<SurfaceCapability>,
     maximum_interaction_kinds: Set<SurfaceInteractionKind>,
+    connection_id: Option<SurfaceConnectionId>,
 }
 
 #[allow(dead_code)]
@@ -161,6 +162,7 @@ impl SurfaceAttachAuthority {
             maximum_capabilities,
             required_capabilities,
             maximum_interaction_kinds,
+            connection_id: None,
         }
     }
 
@@ -186,6 +188,15 @@ impl SurfaceAttachAuthority {
 
     pub(crate) fn maximum_interaction_kinds(&self) -> &Set<SurfaceInteractionKind> {
         &self.maximum_interaction_kinds
+    }
+
+    pub(crate) fn connection_id(&self) -> Option<&SurfaceConnectionId> {
+        self.connection_id.as_ref()
+    }
+
+    pub(crate) fn with_connection_id(mut self, connection_id: SurfaceConnectionId) -> Self {
+        self.connection_id = Some(connection_id);
+        self
     }
 }
 
@@ -501,6 +512,10 @@ impl RuntimeSurfaceClientHandle {
 
     pub(crate) fn attachment_id(&self) -> &SurfaceAttachmentId {
         &self.attachment_id
+    }
+
+    pub(crate) fn connection_id(&self) -> Option<&SurfaceConnectionId> {
+        self.connection_id.as_ref()
     }
 
     pub(crate) fn grant(&self) -> &SurfaceAttachmentGrant {
@@ -3747,6 +3762,23 @@ mod closed_command_domain_tests {
             pending: None,
             frozen_generation_revision: None,
         }
+    }
+
+    #[test]
+    fn surface_authority_binds_connection_identity() {
+        let host = host_incarnation(41);
+        let thread = thread_id(42);
+        let connection = SurfaceConnectionId::try_from_bytes(uuid_v7_bytes(43)).unwrap();
+        let authority = SurfaceAttachAuthority::new(
+            host,
+            thread,
+            SurfaceAttachmentRole::Jsonl,
+            NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot])).unwrap(),
+            NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot])).unwrap(),
+            BTreeSet::new(),
+        );
+        let bound = authority.with_connection_id(connection.clone());
+        assert_eq!(bound.connection_id(), Some(&connection));
     }
 
     fn thread_snapshot(seed: u8) -> SurfaceThreadSnapshot {

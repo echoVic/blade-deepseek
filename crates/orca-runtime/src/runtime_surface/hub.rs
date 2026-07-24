@@ -750,7 +750,7 @@ impl SurfaceHub {
             state.snapshot.thread.thread_id.clone(),
             self.authority.host_incarnation().clone(),
             capabilities.grant.clone(),
-            None,
+            self.authority.connection_id().cloned(),
             self.scope.clone(),
         )
         .with_dispatcher(self.dispatcher.clone());
