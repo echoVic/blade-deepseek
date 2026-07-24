@@ -2479,6 +2479,10 @@ static INTERACTION_REQUEST_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = 
 static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 pub struct JsonlSurfaceControlLedger {
     path: PathBuf,
@@ -2680,6 +2684,24 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_generation_append_failure_once(path: impl Into<PathBuf>) {
+        GENERATION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_admission_repair_append_failure_once(path: impl Into<PathBuf>) {
+        ADMISSION_REPAIR_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
     fn take_terminal_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
         let is_terminal = batch.events.as_slice().iter().any(|event| {
             matches!(
@@ -2721,6 +2743,46 @@ impl JsonlSurfaceCommitLedger {
         });
         requests_interaction
             && INTERACTION_REQUEST_APPEND_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+    }
+
+    #[cfg(test)]
+    fn take_generation_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let starts_generation = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::GenerationStarted { .. })
+            )
+        });
+        starts_generation
+            && GENERATION_APPEND_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+    }
+
+    #[cfg(test)]
+    fn take_admission_repair_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let repairs_admission = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(
+                    OperationPatch::GenerationStopped { .. }
+                        | OperationPatch::FinalizationStarted { .. }
+                )
+            )
+        }) && batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::GenerationStopped { .. })
+            )
+        });
+        repairs_admission
+            && ADMISSION_REPAIR_APPEND_FAILURES
                 .get_or_init(|| Mutex::new(HashSet::new()))
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2827,6 +2889,14 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_interaction_request_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_generation_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_admission_repair_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
         let (commit_id, durable_revision) = match &batch.commit_class {
