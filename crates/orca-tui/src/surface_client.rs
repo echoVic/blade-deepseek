@@ -158,10 +158,9 @@ pub(crate) fn run(
 }
 
 pub(crate) fn update_settings(
-    thread: &RuntimeThreadHandle,
+    surface: &RuntimeSurfaceHandle,
     patches: NonEmptyVec<RuntimeSettingsPatch>,
 ) -> io::Result<SurfaceSettingsSnapshot> {
-    let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
         role: SurfaceAttachmentRole::Tui,
@@ -183,7 +182,7 @@ pub(crate) fn update_settings(
         attachment
             .client
             .update_settings(SurfaceRequestId::new(), expected_revision, patches);
-    detach(&surface, &attachment.client);
+    detach(surface, &attachment.client);
     let result = result.map_err(|error| {
         io::Error::other(format!("typed TUI settings update failed: {error:?}"))
     })?;
@@ -205,8 +204,18 @@ fn run_typed(
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    let mut activation = SurfaceActivationGuard::begin(controller)?;
     let surface = thread.surface();
+    run_typed_surface(&surface, request, config, controller, event_tx)
+}
+
+fn run_typed_surface(
+    surface: &RuntimeSurfaceHandle,
+    request: HostedTurnRequest,
+    config: RunConfig,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    let mut activation = SurfaceActivationGuard::begin(controller)?;
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
         role: SurfaceAttachmentRole::Tui,
