@@ -50,6 +50,7 @@ use crate::runtime_event_actions::handle_runtime_event;
 use crate::runtime_interaction_adapter::{
     TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
 };
+use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
 use crate::terminal_lifecycle::TerminalCleanup;
@@ -388,6 +389,30 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                         TuiEvent::MentionCatalogDirty { generation } => {
                             mention_search.consume_catalog_dirty(generation, &mut state);
+                        }
+                        TuiEvent::SettingsUpdated {
+                            model,
+                            reasoning_effort,
+                            approval_mode,
+                        } => {
+                            config.model = orca_core::model::ModelSelection::from_unchecked(Some(
+                                model.clone(),
+                            ));
+                            config.reasoning_effort = reasoning_effort;
+                            config.approval_mode = approval_mode;
+                            handle_runtime_event(
+                                TuiEvent::SettingsUpdated {
+                                    model,
+                                    reasoning_effort,
+                                    approval_mode,
+                                },
+                                &mut state,
+                                &action_tx,
+                                &pending_workflow_notifications,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                            );
                         }
                         tui_event => {
                             handle_runtime_event(
@@ -3986,26 +4011,31 @@ mod tests {
         press(KeyCode::Up, &mut state, &mut config, &mut textarea);
         press(KeyCode::Enter, &mut state, &mut config, &mut textarea);
 
-        assert_eq!(state.model_name, "deepseek-v4-pro");
+        assert_eq!(
+            state.model_name, "auto",
+            "not applied before runtime commit"
+        );
         assert_eq!(
             state.reasoning_effort,
-            orca_core::config::ReasoningEffort::High
+            orca_core::config::ReasoningEffort::Max,
+            "not applied before runtime commit"
         );
-        assert_eq!(config.model.display_name(), "deepseek-v4-pro");
+        assert_eq!(config.model.display_name(), "auto");
         assert_eq!(
             config.reasoning_effort,
-            orca_core::config::ReasoningEffort::High
+            orca_core::config::ReasoningEffort::Max
         );
         let shared = shared_config.lock().unwrap();
-        assert_eq!(shared.model.display_name(), "deepseek-v4-pro");
+        assert_eq!(shared.model.display_name(), "auto");
         assert_eq!(
             shared.reasoning_effort,
-            orca_core::config::ReasoningEffort::High
+            orca_core::config::ReasoningEffort::Max
         );
         drop(shared);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SetModel(model)) if model == "deepseek-v4-pro"
+            Ok(UserAction::SetModel(intent))
+                if intent == "__orca_runtime_settings__:deepseek-v4-pro|high|-"
         ));
         assert!(state.slash_menu.is_none());
     }
@@ -4557,12 +4587,20 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::Interrupt) | Ok(UserAction::BackgroundCurrentTurn) => {}
             Ok(UserAction::SetModel(model)) => {
-                if let Some(runtime_thread) = thread.as_ref()
-                    && let Err(error) =
-                        runtime_thread.mutate(RuntimeThreadMutation::SetModel(Some(model)))
-                {
-                    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                }
+                let patches = decode_settings_intent(&model)
+                    .map(settings_intent_patches)
+                    .unwrap_or_else(|| {
+                        vec![
+                            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetModel {
+                                model: orca_runtime::unstable_surface::NonEmptyText::try_new(model)
+                                    .map_err(|error| error.to_string())
+                                    .unwrap_or_else(|_| {
+                                        unreachable!("validated model is non-empty")
+                                    }),
+                            },
+                        ]
+                    });
+                apply_hosted_settings_action(thread.as_ref(), &config, &event_tx, patches);
             }
             Ok(UserAction::Remember(note)) => {
                 let context = format!("[Pinned remembered note]\n{}", note.trim());
@@ -5450,4 +5488,162 @@ pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage>
             })
         }
     }
+}
+
+fn settings_intent_patches(
+    intent: SettingsIntent,
+) -> Vec<orca_runtime::unstable_surface::RuntimeSettingsPatch> {
+    let mut patches = Vec::new();
+    if let Some(model) = intent.model
+        && let Ok(model) = orca_runtime::unstable_surface::NonEmptyText::try_new(model)
+    {
+        patches.push(orca_runtime::unstable_surface::RuntimeSettingsPatch::SetModel { model });
+    }
+    if let Some(effort) = intent.reasoning_effort {
+        patches.push(
+            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetReasoning {
+                effort: match effort {
+                    orca_core::config::ReasoningEffort::High => {
+                        orca_runtime::unstable_surface::SurfaceReasoningEffort::High
+                    }
+                    orca_core::config::ReasoningEffort::Max => {
+                        orca_runtime::unstable_surface::SurfaceReasoningEffort::Max
+                    }
+                },
+            },
+        );
+    }
+    if let Some(mode) = intent.approval_mode {
+        patches.push(
+            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetApprovalMode {
+                mode: match mode {
+                    orca_core::approval_types::ApprovalMode::Suggest => {
+                        orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest
+                    }
+                    orca_core::approval_types::ApprovalMode::AutoEdit => {
+                        orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit
+                    }
+                    orca_core::approval_types::ApprovalMode::FullAuto => {
+                        orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto
+                    }
+                    orca_core::approval_types::ApprovalMode::Plan => {
+                        orca_runtime::unstable_surface::SurfaceApprovalMode::Plan
+                    }
+                },
+            },
+        );
+    }
+    patches
+}
+
+fn apply_hosted_settings_action(
+    thread: Option<&RuntimeThreadHandle>,
+    config: &Arc<Mutex<RunConfig>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    patches: Vec<orca_runtime::unstable_surface::RuntimeSettingsPatch>,
+) {
+    if patches.is_empty() {
+        return;
+    }
+    if let Some(thread) = thread {
+        let mut settings = None;
+        for patch in patches {
+            match crate::surface_client::update_settings(thread, patch) {
+                Ok(next) => settings = Some(next),
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
+                    return;
+                }
+            }
+        }
+        let Some(settings) = settings else { return };
+        let model = settings.effective.model.as_str().to_string();
+        let reasoning_effort = match settings.effective.reasoning_effort {
+            orca_runtime::unstable_surface::SurfaceReasoningEffort::High => {
+                orca_core::config::ReasoningEffort::High
+            }
+            orca_runtime::unstable_surface::SurfaceReasoningEffort::Max => {
+                orca_core::config::ReasoningEffort::Max
+            }
+            orca_runtime::unstable_surface::SurfaceReasoningEffort::Low
+            | orca_runtime::unstable_surface::SurfaceReasoningEffort::Medium => {
+                let _ = event_tx.send(TuiEvent::OperationRejected(
+                    "runtime returned an unsupported reasoning effort".to_string(),
+                ));
+                return;
+            }
+        };
+        let approval_mode = match settings.effective.approval_mode {
+            orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest => {
+                orca_core::approval_types::ApprovalMode::Suggest
+            }
+            orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit => {
+                orca_core::approval_types::ApprovalMode::AutoEdit
+            }
+            orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto => {
+                orca_core::approval_types::ApprovalMode::FullAuto
+            }
+            orca_runtime::unstable_surface::SurfaceApprovalMode::Plan => {
+                orca_core::approval_types::ApprovalMode::Plan
+            }
+        };
+        if let Ok(mut cfg) = config.lock() {
+            cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(model.clone()));
+            cfg.reasoning_effort = reasoning_effort;
+            cfg.approval_mode = approval_mode;
+        }
+        let _ = event_tx.send(TuiEvent::SettingsUpdated {
+            model,
+            reasoning_effort,
+            approval_mode,
+        });
+        return;
+    }
+
+    let mut cfg = config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for patch in patches {
+        match patch {
+            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetModel { model } => {
+                cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(
+                    model.as_str().to_string(),
+                ));
+            }
+            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetReasoning { effort } => {
+                cfg.reasoning_effort = match effort {
+                    orca_runtime::unstable_surface::SurfaceReasoningEffort::High => {
+                        orca_core::config::ReasoningEffort::High
+                    }
+                    orca_runtime::unstable_surface::SurfaceReasoningEffort::Max => {
+                        orca_core::config::ReasoningEffort::Max
+                    }
+                    orca_runtime::unstable_surface::SurfaceReasoningEffort::Low
+                    | orca_runtime::unstable_surface::SurfaceReasoningEffort::Medium => continue,
+                };
+            }
+            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {
+                cfg.approval_mode = match mode {
+                    orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest => {
+                        orca_core::approval_types::ApprovalMode::Suggest
+                    }
+                    orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit => {
+                        orca_core::approval_types::ApprovalMode::AutoEdit
+                    }
+                    orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto => {
+                        orca_core::approval_types::ApprovalMode::FullAuto
+                    }
+                    orca_runtime::unstable_surface::SurfaceApprovalMode::Plan => {
+                        orca_core::approval_types::ApprovalMode::Plan
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+    let _ = event_tx.send(TuiEvent::SettingsUpdated {
+        model: cfg.model.display_name().to_string(),
+        reasoning_effort: cfg.reasoning_effort,
+        approval_mode: cfg.approval_mode,
+    });
 }

@@ -10,10 +10,10 @@ use orca_runtime::runtime_host::{HostedTurnRequest, RuntimeThreadHandle};
 use orca_runtime::surface::{
     AttachResult, FreshAttachRequest, MutationReply, OperationIngressCorrelation, OperationKind,
     OperationPatch, OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
-    ReplayabilityRequest, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, SurfaceAttachmentRole,
-    SurfaceCapability, SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock,
-    SurfaceInteractionKind, SurfaceOperationId, SurfaceRequestId, SurfaceSubscriptionItem,
-    WaitOperationTerminalResult,
+    ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
+    SurfaceAttachmentRole, SurfaceCapability, SurfaceEvent, SurfaceInputRequest,
+    SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId, SurfaceRequestId,
+    SurfaceSettingsSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -101,6 +101,47 @@ pub(crate) fn run(
         run_typed(thread, request, config, controller, event_tx)
     } else {
         crate::app::run_hosted_operation(thread, request, config, controller, event_tx)
+    }
+}
+
+pub(crate) fn update_settings(
+    thread: &RuntimeThreadHandle,
+    patch: RuntimeSettingsPatch,
+) -> io::Result<SurfaceSettingsSnapshot> {
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => {
+            return Err(io::Error::other(
+                "typed TUI settings attachment unavailable",
+            ));
+        }
+    };
+    let expected_revision = attachment.baseline.snapshot.settings.thread_revision;
+    let result =
+        attachment
+            .client
+            .update_settings(SurfaceRequestId::new(), expected_revision, patch);
+    detach(&surface, &attachment.client);
+    let result = result.map_err(|error| {
+        io::Error::other(format!("typed TUI settings update failed: {error:?}"))
+    })?;
+    match result {
+        MutationReply::Committed { value, .. } => Ok(value.settings),
+        MutationReply::Uncommitted { mutation } => Err(io::Error::other(format!(
+            "typed TUI settings update did not commit: {mutation:?}"
+        ))),
+        MutationReply::Deferred { .. } => {
+            Err(io::Error::other("typed TUI settings update deferred"))
+        }
     }
 }
 

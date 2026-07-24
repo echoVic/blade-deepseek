@@ -279,6 +279,14 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         operation_id: SurfaceOperationId,
     ) -> Result<WaitOperationTerminalResult, SurfaceClientCommandError>;
 
+    fn update_settings(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        expected_thread_revision: SettingsRevision,
+        patch: RuntimeSettingsPatch,
+    ) -> Result<MutationReply<SettingsMutationOutput>, SurfaceClientCommandError>;
+
     fn respond_interaction_by_id(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -367,6 +375,18 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .wait_operation_terminal(self.clone(), request_id, operation_id)
+    }
+
+    pub fn update_settings(
+        &self,
+        request_id: SurfaceRequestId,
+        expected_thread_revision: SettingsRevision,
+        patch: RuntimeSettingsPatch,
+    ) -> Result<MutationReply<SettingsMutationOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .update_settings(self.clone(), request_id, expected_thread_revision, patch)
     }
 
     pub fn respond_interaction(

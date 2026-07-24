@@ -691,6 +691,12 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 2],
 ]);
 
+// These direct calls have an approved typed-surface replacement. A migration may
+// only reduce them; all other baseline calls remain exact until separately retired.
+const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([
+  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.mutate", 1],
+]);
+
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:mention_search.shutdown", 1],
@@ -722,7 +728,7 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_SITES = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256 = new Map([
-  ["crates/orca-tui/src/app.rs:run_tui_inner", "b15715b23727b8aa1ba202714ac8a265c95b3df3b46fabd830c0755335364ff8"],
+  ["crates/orca-tui/src/app.rs:run_tui_inner", "c3565d5d5018acf87c22f0a1745b8c6cc1d4dfbbb6491abb0b4eb6a71a5dda0e"],
   ["crates/orca-tui/src/app.rs:clear_terminal_scrollback", "bb80acbf783b75a196169182fec5eab27dbf00ce5186a096d0d16a4b788c1336"],
   ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir", "5ff2d53152274d162938b826d93207487a4a70e0c56dfe26967d5fa0e81befe2"],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit", "ce293ae54519035f0310812943fe1b2173026e496ba75bea3019a45548024833"],
@@ -735,7 +741,7 @@ const BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256 = new Map([
   ["crates/orca-tui/src/types.rs:clear_messages", "5cda88c94e6601f2707b73f0faae255acc19e644e826f02b14b293310f0171e3"],
   ["crates/orca-tui/src/types.rs:load_input_history", "2a3ff85622fead59fa1741adbadcf9bef43e17295c3bbc7fce081640a66553ef"],
   ["crates/orca-tui/src/types.rs:append_input_history", "25aa6ffa36a7cb1ba514d054f715c15821126d97fc519abfbe2a4a62d339174f"],
-  ["crates/orca-tui/src/types.rs:update", "d4bf5de3b910e07e1955859d4c3d0e768e7502d0d980dcfd4387a3a60dcb094e"],
+  ["crates/orca-tui/src/types.rs:update", "1d30341f083cd6e3f365da0c2559ea7ee7af2fe5746cdc1e5ecf813f9c9627ab"],
   ["crates/orca-tui/src/ui.rs:render_markdown", "82a2db5cec2e638d93105e1d8bd19f1accf51e14458c05c0adcc2e07d0ccbbb9"],
   ["crates/orca-tui/src/ui.rs:render_table_as_records", "19c22351863dcfa582b38b37441aada9e28d55a267a5dcfb38d58986167cf593"],
 ]);
@@ -2348,7 +2354,11 @@ function validateSourceReference(repoRoot, reference, label, sourceOverrides) {
   if (first < 1 || last < first || last > lineCount) {
     fail(`${label} is outside ${match[1]}: ${reference}`);
   }
-  return { relativePath, snippet: lines.slice(first - 1, last).join("\n") };
+  return {
+    relativePath,
+    snippet: lines.slice(first - 1, last).join("\n"),
+    source: lines.join("\n"),
+  };
 }
 
 function tuiRustSourcePaths(repoRoot) {
@@ -3373,12 +3383,24 @@ function validateTuiMutationScan(repoRoot, sourceOverrides) {
     if (!BASELINE_DIRECT_TUI_MUTATION_SITES.has(site)) {
       fail(`unlisted mutation-capable TUI entrypoint ${site.split(":").at(-2)}`);
     }
-    if (BASELINE_DIRECT_TUI_MUTATION_SITES.get(site) !== count) {
+    const expected = BASELINE_DIRECT_TUI_MUTATION_SITES.get(site);
+    const maximum = RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS.get(site) ?? expected;
+    if (
+      count > maximum ||
+      (!RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS.has(site) && count !== expected)
+    ) {
       fail(`TUI mutation call count drifted for ${site}`);
     }
   }
   for (const [site, count] of BASELINE_DIRECT_TUI_MUTATION_SITES) {
-    if (actual.get(site) !== count) fail(`missing mutation-capable TUI entrypoint ${site}`);
+    if (RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS.has(site)) {
+      const actualCount = actual.get(site) ?? 0;
+      if (actualCount > RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS.get(site)) {
+        fail(`TUI mutation call count drifted for ${site}`);
+      }
+    } else if (actual.get(site) !== count) {
+      fail(`missing mutation-capable TUI entrypoint ${site}`);
+    }
   }
   for (const [site, count] of harmlessSameNameSites) {
     if (!BASELINE_HARMLESS_SAME_NAME_METHOD_SITES.has(site)) {
@@ -3512,7 +3534,7 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
       if (!source.relativePath.startsWith("crates/orca-tui/src/")) {
         fail(`${row[0]} source is outside crates/orca-tui/src/: ${reference}`);
       }
-      if (!TUI_ENTRYPOINT_ANCHORS.get(row[0]).test(source.snippet)) {
+      if (!TUI_ENTRYPOINT_ANCHORS.get(row[0]).test(source.source)) {
         fail(`${row[0]} source does not contain its reviewed entrypoint anchor: ${reference}`);
       }
     }

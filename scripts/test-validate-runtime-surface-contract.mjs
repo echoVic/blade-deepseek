@@ -330,6 +330,21 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/slash_command_actions.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  assert.doesNotThrow(
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([
+          [relativePath, `// inserted without changing an entrypoint\n${source}`],
+        ]),
+      }),
+    "entrypoint validation follows the declared source file when a reviewed line drifts",
+  );
+}
+
+{
   const manifest = cloneManifest();
   manifest.tui_entrypoints[0][1] = ["README.md:1"];
   expectFailure(

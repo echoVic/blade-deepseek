@@ -311,6 +311,11 @@ pub enum TuiEvent {
         collapsed_messages: usize,
         status_text: String,
     },
+    SettingsUpdated {
+        model: String,
+        reasoning_effort: orca_core::config::ReasoningEffort,
+        approval_mode: ApprovalMode,
+    },
     GoalUpdated(ThreadGoal),
     GoalCleared,
     GoalStatus(Option<ThreadGoal>),
@@ -1926,6 +1931,21 @@ impl AppState {
             }
             TuiEvent::CompactionStarted => {
                 self.set_status(AppStatus::Compacting);
+            }
+            TuiEvent::SettingsUpdated {
+                model,
+                reasoning_effort,
+                approval_mode,
+            } => {
+                self.model_name = model;
+                self.reasoning_effort = reasoning_effort;
+                self.approval_mode = approval_mode;
+                self.push_message(ChatMessage::System(format!(
+                    "Runtime settings updated: model {}, reasoning effort {}, approval mode {}.",
+                    self.model_name,
+                    self.reasoning_effort.as_str(),
+                    self.approval_mode.as_str()
+                )));
             }
             TuiEvent::SessionCompleted { status } => {
                 let was_backgrounded = self.suppress_background_main_session_output;
