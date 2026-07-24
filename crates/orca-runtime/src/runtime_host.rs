@@ -4360,8 +4360,9 @@ impl ThreadActor {
         capability: surface::SurfaceCapability,
     ) -> bool {
         self.resident_surface.0.as_ref().is_some_and(|resident| {
-            resident.hub.admits_client(client)
-                && client.grant().capabilities.as_set().contains(&capability)
+            let admitted = resident.hub.admits_client(client);
+            let capability_granted = client.grant().capabilities.as_set().contains(&capability);
+            admitted && capability_granted
         })
     }
 
@@ -7342,8 +7343,11 @@ impl ThreadActor {
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        if intent.correlation != surface::OperationIngressCorrelation::TuiUser
-            || intent.kind != surface::OperationKind::UserTurn
+        if !matches!(
+            intent.correlation,
+            surface::OperationIngressCorrelation::TuiUser
+                | surface::OperationIngressCorrelation::AcpPrompt { .. }
+        ) || intent.kind != surface::OperationKind::UserTurn
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -7466,7 +7470,23 @@ impl ThreadActor {
                 tick: surface::MonotonicTick::new(0),
             },
         );
-        let origin = surface::OperationOrigin::TuiUser;
+        let origin = match &intent.correlation {
+            surface::OperationIngressCorrelation::TuiUser => surface::OperationOrigin::TuiUser,
+            surface::OperationIngressCorrelation::AcpPrompt {
+                session_id,
+                inbound_seq,
+                rpc_request_id,
+            } => surface::OperationOrigin::AcpPrompt {
+                connection_id: surface::SurfaceConnectionId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated ACP connection id is valid"),
+                session_id: session_id.clone(),
+                inbound_seq: *inbound_seq,
+                rpc_request_id: rpc_request_id.clone(),
+            },
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
         let replayability = surface::Replayability::Replayable {
             capsule_digest: surface_sha256(
                 &serde_json::to_vec(&input_request).expect("surface input is serializable"),
@@ -7674,8 +7694,10 @@ impl ThreadActor {
         if operation.reservation.lease_id != admission_lease_id {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if operation.intent.origin != surface::OperationOrigin::TuiUser
-            || operation.intent.kind != surface::OperationKind::UserTurn
+        if !matches!(
+            operation.intent.origin,
+            surface::OperationOrigin::TuiUser | surface::OperationOrigin::AcpPrompt { .. }
+        ) || operation.intent.kind != surface::OperationKind::UserTurn
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }

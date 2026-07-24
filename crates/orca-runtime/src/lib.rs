@@ -57,11 +57,11 @@ mod runtime_surface;
 
 pub mod surface {
     pub use crate::runtime_surface::{
-        AdmissionOutput, AssistantChannel, AssistantPatch, AttachResult, ByteCount, ByteOffset,
-        CancelOperationOutput, CommitClass, CompactionState, ContextRevision, CursorSourceRevision,
-        DeferredCommandValue, DetachRequest, DetachResult, DisplayText, DurableRevision,
-        FailureClass, FreshAttachRequest, FreshSurfaceAttachment, MutationReply, NonEmptyText,
-        NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
+        AcpRequestId, AdmissionOutput, AssistantChannel, AssistantPatch, AttachResult, ByteCount,
+        ByteOffset, CancelOperationOutput, CommitClass, CompactionState, ContextRevision,
+        CursorSourceRevision, DeferredCommandValue, DetachRequest, DetachResult, DisplayText,
+        DurableRevision, FailureClass, FreshAttachRequest, FreshSurfaceAttachment, MutationReply,
+        NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
         OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
         ProviderReplayHealth, ReplayabilityRequest, RuntimeSettingsPatch,
         RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle,
@@ -69,8 +69,8 @@ pub mod surface {
         SurfaceApprovalMode, SurfaceAssistantStream, SurfaceAssistantStreamState,
         SurfaceAttachmentRole, SurfaceCapability, SurfaceClientCommandError,
         SurfaceClientInteractionAnswer, SurfaceCommitBatch, SurfaceCommitId,
-        SurfaceCompletedModelResponse, SurfaceContextSnapshot, SurfaceCursor, SurfaceEvent,
-        SurfaceEventEnvelope, SurfaceEventId, SurfaceFileChange, SurfaceIncarnation,
+        SurfaceCompletedModelResponse, SurfaceConnectionId, SurfaceContextSnapshot, SurfaceCursor,
+        SurfaceEvent, SurfaceEventEnvelope, SurfaceEventId, SurfaceFileChange, SurfaceIncarnation,
         SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionId,
         SurfaceInteractionKind, SurfaceOperationId, SurfacePlanStatus, SurfaceReasoningEffort,
         SurfaceRequestId, SurfaceScope, SurfaceSettingsSnapshot, SurfaceShutdownReason,

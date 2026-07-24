@@ -575,15 +575,17 @@ impl SurfaceHub {
     #[allow(dead_code)]
     pub(crate) fn admits_client(&self, client: &RuntimeSurfaceClientHandle) -> bool {
         let state = lock(&self.inner);
-        client.belongs_to(
+        let belongs = client.belongs_to(
             &self.scope,
             &state.snapshot.thread.thread_id,
             self.authority.host_incarnation(),
-        ) && client.detached_receipt().is_none()
-            && state
-                .subscriptions
-                .get(client.attachment_id())
-                .is_some_and(|subscriber| &subscriber.grant == client.grant())
+        );
+        let live = client.detached_receipt().is_none();
+        let grant = state
+            .subscriptions
+            .get(client.attachment_id())
+            .is_some_and(|subscriber| &subscriber.grant == client.grant());
+        belongs && live && grant
     }
 
     pub(crate) fn select_interaction_attachment_for(

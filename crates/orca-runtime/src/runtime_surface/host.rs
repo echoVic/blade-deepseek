@@ -49,6 +49,10 @@ impl RuntimeSurfaceThreadHandle {
     pub fn acp_surface(&self) -> Option<RuntimeSurfaceHandle> {
         self.runtime.acp_surface()
     }
+
+    pub(crate) fn legacy(&self) -> RuntimeThreadHandle {
+        self.runtime.clone()
+    }
 }
 
 impl RuntimeThreadHandle {

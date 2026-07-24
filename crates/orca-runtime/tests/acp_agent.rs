@@ -24,9 +24,11 @@ use orca_core::config::{
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
+use orca_core::provider_types::ProviderResponse;
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::thread_identity::TurnId;
 use orca_runtime::acp::OrcaAcpAgent;
+use orca_runtime::model_response::RuntimeModelResponse;
 use orca_runtime::runtime_host::{
     GenerationContext, HostedTurnRequest, RuntimeHost, ThreadOperationExecutor,
     ThreadOperationOutcome,
@@ -113,6 +115,7 @@ fn test_config(cwd: PathBuf) -> RunConfig {
 
 enum TestBehavior {
     EmitMessageAndComplete { message: String },
+    Fail { message: String },
     WaitForCancel,
 }
 
@@ -158,13 +161,29 @@ impl ThreadOperationExecutor for AcpTestExecutor {
         let behavior = self.behaviors.lock().unwrap().remove(0);
         match behavior {
             TestBehavior::EmitMessageAndComplete { message } => {
-                let identity =
-                    orca_core::thread_item_projection::ModelResponseIdentity::new(TurnId::new());
-                let mut sink = EventSink::new(writer, generation.config().output_format)
-                    .with_optional_observer(request.event_observer());
-                sink.emit(events.assistant_message_delta(&identity, &message))?;
+                let turn_request = request.thread_turn_request(generation);
+                if let Some(ingress) = turn_request.provider_response_ingress() {
+                    ingress.commit_response(&RuntimeModelResponse::new(
+                        ProviderResponse {
+                            steps: Vec::new(),
+                            assistant_content: Some(message),
+                            assistant_reasoning: None,
+                            tool_calls: Vec::new(),
+                            usage: None,
+                        },
+                        request.turn_id().clone(),
+                    ))?;
+                } else {
+                    let identity = orca_core::thread_item_projection::ModelResponseIdentity::new(
+                        TurnId::new(),
+                    );
+                    let mut sink = EventSink::new(writer, generation.config().output_format)
+                        .with_optional_observer(request.event_observer());
+                    sink.emit(events.assistant_message_delta(&identity, &message))?;
+                }
                 Ok(RunStatus::Success.into())
             }
+            TestBehavior::Fail { message } => Err(io::Error::other(message)),
             TestBehavior::WaitForCancel => {
                 let deadline = std::time::Instant::now() + TEST_TIMEOUT;
                 while !cancel.is_cancelled() {
@@ -297,6 +316,107 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
     );
 
     drop(session_id);
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_typed_surface_prompt_projects_runtime_batch_and_terminal() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![
+        TestBehavior::EmitMessageAndComplete {
+            message: "Hello from typed surface!".to_string(),
+        },
+    ]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let agent = OrcaAcpAgent::new_typed(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let stop_reason = local.block_on(&rt, async {
+        let session = agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("typed new_session");
+        agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::from("Say hello".to_string())],
+            ))
+            .await
+            .expect("typed prompt")
+            .stop_reason
+    });
+
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    assert_eq!(executor.call_count(), 1);
+    let updates = drain_notifications(&mut note_rx);
+    assert!(updates.iter().any(|update| {
+        matches!(update, SessionUpdate::AgentMessageChunk(chunk)
+            if matches!(&chunk.content, ContentBlock::Text(text) if text.text.contains("Hello from typed surface!")))
+    }));
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_typed_surface_prompt_releases_session_after_terminal_error() {
+    let _home = OrcaHomeGuard::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![
+        TestBehavior::Fail {
+            message: "typed failure".to_string(),
+        },
+        TestBehavior::EmitMessageAndComplete {
+            message: "recovered typed prompt".to_string(),
+        },
+    ]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let agent = OrcaAcpAgent::new_typed(
+        host.surface_handle(),
+        test_config(cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let session = agent
+            .new_session(NewSessionRequest::new(cwd.path().to_path_buf()))
+            .await
+            .expect("typed new_session");
+        assert!(
+            agent
+                .prompt(PromptRequest::new(
+                    session.session_id.clone(),
+                    vec![ContentBlock::from("fail".to_string())],
+                ))
+                .await
+                .is_err()
+        );
+        let recovered = agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::from("recover".to_string())],
+            ))
+            .await
+            .expect("typed prompt should be reusable after terminal error");
+        assert_eq!(recovered.stop_reason, StopReason::EndTurn);
+    });
+
+    assert_eq!(executor.call_count(), 2);
     host.shutdown().expect("shutdown");
 }
 
