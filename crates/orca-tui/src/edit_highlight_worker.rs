@@ -192,6 +192,8 @@ pub(crate) struct EditHighlightRuntime {
     result_rx: Receiver<EditHighlightResult>,
     pending: HashMap<String, EditHighlightJob>,
     next_job_id: u64,
+    #[cfg(test)]
+    successful_submit_count: usize,
 }
 
 impl EditHighlightRuntime {
@@ -211,6 +213,8 @@ impl EditHighlightRuntime {
             result_rx,
             pending: HashMap::new(),
             next_job_id: 1,
+            #[cfg(test)]
+            successful_submit_count: 0,
         })
     }
 
@@ -238,6 +242,10 @@ impl EditHighlightRuntime {
         if self.job_tx.send(job.clone()).is_err() {
             self.pending.clear();
             return false;
+        }
+        #[cfg(test)]
+        {
+            self.successful_submit_count = self.successful_submit_count.saturating_add(1);
         }
         self.pending.insert(job.tool_id.clone(), job);
         true
@@ -291,9 +299,40 @@ impl EditHighlightRuntime {
         self.pending.clear();
     }
 
+    pub(crate) fn cancel_pending_for_message(
+        &mut self,
+        message_index: usize,
+        message_revision: u64,
+    ) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|_, pending| {
+            pending.message_index != message_index || pending.message_revision != message_revision
+        });
+        self.pending.len() != before
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_job(&self, tool_id: &str) -> Option<EditHighlightJob> {
         self.pending.get(tool_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn successful_submit_count(&self) -> usize {
+        self.successful_submit_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_test() -> Self {
+        let (job_tx, job_rx) = crossbeam_channel::unbounded();
+        drop(job_rx);
+        let (_result_tx, result_rx) = crossbeam_channel::unbounded();
+        Self {
+            job_tx,
+            result_rx,
+            pending: HashMap::new(),
+            next_job_id: 1,
+            successful_submit_count: 0,
+        }
     }
 }
 
@@ -876,6 +915,26 @@ mod tests {
     }
 
     #[test]
+    fn cancel_pending_for_message_removes_only_exact_message_revision() {
+        let mut runtime = EditHighlightRuntime::new().expect("test runtime");
+        let a = job(1, "edit-a", PathBuf::from("/a"), "a.py", "");
+        let mut b = job(2, "edit-b", PathBuf::from("/b"), "b.py", "");
+        b.message_index += 1;
+        b.message_revision += 1;
+        assert!(runtime.submit(a.clone()));
+        assert!(runtime.submit(b.clone()));
+
+        assert!(!runtime.cancel_pending_for_message(a.message_index, a.message_revision + 1));
+        assert!(runtime.pending_matches(&a));
+        assert!(runtime.pending_matches(&b));
+
+        assert!(runtime.cancel_pending_for_message(a.message_index, a.message_revision));
+        assert!(!runtime.pending_matches(&a));
+        assert!(runtime.pending_matches(&b));
+        assert_eq!(runtime.pending_count(), 1);
+    }
+
+    #[test]
     fn allocate_job_id_wraps_from_max_to_one_without_returning_zero() {
         let mut runtime = EditHighlightRuntime::new().expect("test runtime");
         runtime.next_job_id = u64::MAX;
@@ -896,12 +955,45 @@ mod tests {
             result_rx,
             pending: HashMap::from([(existing.tool_id.clone(), existing)]),
             next_job_id: 2,
+            successful_submit_count: 0,
         };
 
         assert!(!runtime.submit(job(2, "failed", PathBuf::from("/new"), "new.py", "")));
         assert!(!runtime.has_pending());
         assert_eq!(runtime.pending_count(), 0);
         assert!(runtime.pending_job("failed").is_none());
+    }
+
+    #[test]
+    fn successful_submit_count_tracks_sends_not_pending_replacements() {
+        let mut runtime = EditHighlightRuntime::new().expect("test runtime");
+
+        assert!(runtime.submit(job(1, "same-tool", PathBuf::from("/first"), "first.py", "")));
+        assert!(runtime.submit(job(
+            2,
+            "same-tool",
+            PathBuf::from("/second"),
+            "second.py",
+            ""
+        )));
+
+        assert_eq!(runtime.pending_count(), 1);
+        assert_eq!(runtime.successful_submit_count(), 2);
+    }
+
+    #[test]
+    fn disconnected_runtime_for_test_rejects_submit_without_counting_success() {
+        let mut runtime = EditHighlightRuntime::disconnected_for_test();
+
+        assert!(!runtime.submit(job(
+            1,
+            "disconnected",
+            PathBuf::from("/item"),
+            "item.py",
+            ""
+        )));
+        assert_eq!(runtime.pending_count(), 0);
+        assert_eq!(runtime.successful_submit_count(), 0);
     }
 
     #[test]
@@ -959,6 +1051,7 @@ mod tests {
             result_rx,
             pending: HashMap::new(),
             next_job_id: 1,
+            successful_submit_count: 0,
         };
 
         let empty = runtime.drain_results();
