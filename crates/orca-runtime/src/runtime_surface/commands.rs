@@ -312,6 +312,15 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         answer: SurfaceClientInteractionAnswer,
     ) -> Result<MutationReply<RespondInteractionOutput>, SurfaceClientCommandError>;
 
+    fn respond_interaction_by_id_with_policy(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        interaction_id: SurfaceInteractionId,
+        answer: SurfaceClientInteractionAnswer,
+        policy: BrokerInteractionAnswerPolicy,
+    ) -> Result<MutationReply<RespondInteractionOutput>, SurfaceClientCommandError>;
+
     fn retry_finalization(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -459,6 +468,25 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .respond_interaction_by_id(self.clone(), request_id, interaction_id, answer)
+    }
+
+    pub(crate) fn respond_interaction_by_id_with_policy(
+        &self,
+        request_id: SurfaceRequestId,
+        interaction_id: SurfaceInteractionId,
+        answer: SurfaceClientInteractionAnswer,
+        policy: BrokerInteractionAnswerPolicy,
+    ) -> Result<MutationReply<RespondInteractionOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .respond_interaction_by_id_with_policy(
+                self.clone(),
+                request_id,
+                interaction_id,
+                answer,
+                policy,
+            )
     }
 
     pub fn retry_finalization(

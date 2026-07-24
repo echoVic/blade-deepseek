@@ -2385,6 +2385,19 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfaceRespondInteractionByIdWithPolicy {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        interaction_id: surface::SurfaceInteractionId,
+        answer: surface::SurfaceClientInteractionAnswer,
+        policy: surface::BrokerInteractionAnswerPolicy,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::RespondInteractionOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
     SurfaceRetryFinalization {
         client: surface::RuntimeSurfaceClientHandle,
         token: surface::RetryFinalizationToken,
@@ -2978,6 +2991,29 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             answer,
             reply,
         })
+    }
+
+    fn respond_interaction_by_id_with_policy(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        interaction_id: surface::SurfaceInteractionId,
+        answer: surface::SurfaceClientInteractionAnswer,
+        policy: surface::BrokerInteractionAnswerPolicy,
+    ) -> Result<
+        surface::MutationReply<surface::RespondInteractionOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(
+            |reply| ThreadCommand::SurfaceRespondInteractionByIdWithPolicy {
+                client,
+                request_id,
+                interaction_id,
+                answer,
+                policy,
+                reply,
+            },
+        )
     }
 
     fn retry_finalization(
@@ -5950,6 +5986,26 @@ impl ThreadActor {
         surface::MutationReply<surface::RespondInteractionOutput>,
         surface::SurfaceClientCommandError,
     > {
+        self.respond_surface_interaction_by_id_with_policy(
+            client,
+            request_id,
+            interaction_id,
+            answer,
+            surface::BrokerInteractionAnswerPolicy::NativeStrict,
+        )
+    }
+
+    fn respond_surface_interaction_by_id_with_policy(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        interaction_id: surface::SurfaceInteractionId,
+        answer: surface::SurfaceClientInteractionAnswer,
+        policy: surface::BrokerInteractionAnswerPolicy,
+    ) -> Result<
+        surface::MutationReply<surface::RespondInteractionOutput>,
+        surface::SurfaceClientCommandError,
+    > {
         let interaction = self
             .resident_surface
             .interactions
@@ -5981,12 +6037,8 @@ impl ThreadActor {
                     .expect("generated UUID is v7")
             });
         let authority = interaction_answer_authority(&interaction.record.request, &answer);
-        let response = surface::BoundInteractionResponse::new(
-            response_id,
-            answer,
-            surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            authority,
-        );
+        let response =
+            surface::BoundInteractionResponse::new(response_id, answer, policy, authority);
         self.respond_surface_interaction(client, request_id, selector, response)
     }
 
@@ -9535,6 +9587,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceRespondInteractionById { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceRespondInteractionByIdWithPolicy { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceRetryFinalization { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -9776,6 +9831,23 @@ impl ThreadActor {
                     request_id,
                     interaction_id,
                     answer,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRespondInteractionByIdWithPolicy {
+                client,
+                request_id,
+                interaction_id,
+                answer,
+                policy,
+                reply,
+            } => {
+                let result = self.respond_surface_interaction_by_id_with_policy(
+                    &client,
+                    request_id,
+                    interaction_id,
+                    answer,
+                    policy,
                 );
                 let _ = reply.send(result);
             }
@@ -10194,6 +10266,23 @@ impl ThreadActor {
                     request_id,
                     interaction_id,
                     answer,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRespondInteractionByIdWithPolicy {
+                client,
+                request_id,
+                interaction_id,
+                answer,
+                policy,
+                reply,
+            } => {
+                let result = self.respond_surface_interaction_by_id_with_policy(
+                    &client,
+                    request_id,
+                    interaction_id,
+                    answer,
+                    policy,
                 );
                 let _ = reply.send(result);
             }
