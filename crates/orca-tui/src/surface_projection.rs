@@ -7,11 +7,87 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::surface::{
     AssistantChannel, AssistantPatch, OperationPatch, OperationTerminal, SurfaceAssistantStream,
     SurfaceAssistantStreamState, SurfaceCommitBatch, SurfaceCompletedModelResponse, SurfaceCursor,
-    SurfaceEvent, SurfaceFileChange, SurfaceOperationId, SurfaceStreamId, SurfaceToolResultKind,
-    ToolPatch,
+    SurfaceEvent, SurfaceFileChange, SurfaceInputPresentation, SurfaceItem, SurfaceOperationId,
+    SurfaceStreamId, SurfaceToolResultKind, SurfaceUserInputState, ToolPatch,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
+
+pub(crate) fn history_messages_from_surface_snapshot(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+) -> Vec<crate::types::ChatMessage> {
+    history_messages_from_surface_items(&snapshot.items)
+}
+
+fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
+    items
+        .iter()
+        .filter_map(history_message_from_surface_item)
+        .collect()
+}
+
+fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types::ChatMessage> {
+    match item {
+        SurfaceItem::UserMessage { input, .. } => match input {
+            SurfaceUserInputState::Pending { presentation, .. }
+            | SurfaceUserInputState::ResolutionFailed { presentation, .. } => {
+                visible_input_text(presentation).map(crate::types::ChatMessage::User)
+            }
+            SurfaceUserInputState::Resolved { fact } => match fact {
+                orca_runtime::surface::SurfaceResolvedInputFact::Replayable { input, .. } => Some(
+                    crate::types::ChatMessage::User(input.canonical_text.as_str().to_string()),
+                ),
+                orca_runtime::surface::SurfaceResolvedInputFact::NonReplayable {
+                    presentation,
+                    ..
+                } => visible_input_text(presentation).map(crate::types::ChatMessage::User),
+            },
+        },
+        SurfaceItem::SystemMessage { content, .. } => Some(crate::types::ChatMessage::System(
+            content.as_str().to_string(),
+        )),
+        SurfaceItem::AssistantMessage { text, .. } => (!text.as_str().trim().is_empty())
+            .then(|| crate::types::ChatMessage::Assistant(text.as_str().to_string())),
+        SurfaceItem::AssistantReasoning {
+            content, summary, ..
+        } => {
+            let text = if content.as_str().trim().is_empty() {
+                summary.as_str()
+            } else {
+                content.as_str()
+            };
+            (!text.trim().is_empty())
+                .then(|| crate::types::ChatMessage::Reasoning(text.to_string()))
+        }
+        SurfaceItem::AssistantPlan { text, .. } => (!text.as_str().trim().is_empty())
+            .then(|| crate::types::ChatMessage::ProposedPlan(text.as_str().to_string())),
+        SurfaceItem::ToolResultMessage {
+            tool_call_id,
+            content,
+            terminal,
+            ..
+        } => {
+            let output = (!content.as_str().is_empty()).then(|| content.as_str().to_string());
+            Some(crate::types::ChatMessage::ToolCall {
+                id: tool_call_id.as_str().to_string(),
+                name: format!("tool:{}", tool_call_id.as_str()),
+                target: None,
+                status: tool_result_status(terminal.kind).to_string(),
+                output,
+                diff: None,
+                kind: None,
+                expanded: false,
+            })
+        }
+    }
+}
+
+fn visible_input_text(presentation: &SurfaceInputPresentation) -> Option<String> {
+    match presentation {
+        SurfaceInputPresentation::Visible { text } => Some(text.as_str().to_string()),
+        SurfaceInputPresentation::Redacted => None,
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SurfaceProjectionError {
@@ -349,7 +425,8 @@ mod tests {
     use orca_runtime::surface::{
         ByteOffset, CommitClass, CursorSourceRevision, DisplayText, DurableRevision, NonEmptyVec,
         SequenceNumber, Sha256Digest, SurfaceCommitId, SurfaceEventEnvelope, SurfaceEventId,
-        SurfaceIncarnation, SurfaceScope, SurfaceThreadId,
+        SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope,
+        SurfaceThreadId, SurfaceTurnId,
     };
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
@@ -368,6 +445,78 @@ mod tests {
                 durable_revision: DurableRevision::try_new(revision).unwrap(),
             },
         }
+    }
+
+    #[test]
+    fn typed_history_projection_preserves_visible_items_and_redacts_secrets() {
+        let turn_id = SurfaceTurnId::new();
+        let items = vec![
+            SurfaceItem::UserMessage {
+                id: SurfaceItemId::new(),
+                turn_id: turn_id.clone(),
+                input: SurfaceUserInputState::Pending {
+                    presentation: SurfaceInputPresentation::Visible {
+                        text: DisplayText::new("visible prompt"),
+                    },
+                    correlation_id: SurfaceInputCorrelationId::try_from_bytes(uuid_v7_bytes(8))
+                        .unwrap(),
+                },
+                pinned: false,
+                origin: orca_runtime::surface::SurfaceItemOrigin::UserInput,
+            },
+            SurfaceItem::UserMessage {
+                id: SurfaceItemId::new(),
+                turn_id: turn_id.clone(),
+                input: SurfaceUserInputState::Pending {
+                    presentation: SurfaceInputPresentation::Redacted,
+                    correlation_id: SurfaceInputCorrelationId::try_from_bytes(uuid_v7_bytes(9))
+                        .unwrap(),
+                },
+                pinned: false,
+                origin: orca_runtime::surface::SurfaceItemOrigin::UserInput,
+            },
+            SurfaceItem::SystemMessage {
+                id: SurfaceItemId::new(),
+                content: DisplayText::new("system"),
+                pinned: false,
+                origin: orca_runtime::surface::SurfaceItemOrigin::RuntimeContext,
+            },
+            SurfaceItem::AssistantMessage {
+                id: SurfaceItemId::new(),
+                turn_id: turn_id.clone(),
+                text: DisplayText::new("answer"),
+                pinned: false,
+            },
+            SurfaceItem::AssistantReasoning {
+                id: SurfaceItemId::new(),
+                turn_id: turn_id.clone(),
+                summary: DisplayText::new("summary"),
+                content: DisplayText::new("reasoning"),
+                pinned: false,
+            },
+            SurfaceItem::AssistantPlan {
+                id: SurfaceItemId::new(),
+                turn_id,
+                text: DisplayText::new("plan"),
+                pinned: false,
+            },
+        ];
+
+        let messages = history_messages_from_surface_items(&items);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                crate::types::ChatMessage::User(prompt),
+                crate::types::ChatMessage::System(system),
+                crate::types::ChatMessage::Assistant(answer),
+                crate::types::ChatMessage::Reasoning(reasoning),
+                crate::types::ChatMessage::ProposedPlan(plan),
+            ] if prompt == "visible prompt"
+                && system == "system"
+                && answer == "answer"
+                && reasoning == "reasoning"
+                && plan == "plan"
+        ));
     }
 
     #[test]
