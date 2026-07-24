@@ -449,6 +449,7 @@ mod tests {
         handle_scroll_lines, should_queue_input_event,
     };
     use crate::theme::Theme;
+    use crate::transcript_view::TranscriptRenderContext;
     use crate::types::{
         AppState, AppStatus, ApprovalDialog, ApprovalOption, ChatMessage, UserAction,
     };
@@ -494,11 +495,7 @@ mod tests {
         state.transcript_render_cache.prepare(
             &state.messages,
             &state.message_revisions,
-            20,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 20, 0, false),
             |_, _, _, _, _, _| vec![Line::from("hello world")],
         );
         state.transcript_area = Some(Rect::new(0, 0, 20, 5));

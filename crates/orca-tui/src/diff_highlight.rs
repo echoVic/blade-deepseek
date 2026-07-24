@@ -54,8 +54,11 @@ impl DiffHunk {
 pub(crate) struct ParsedDiff {
     pub(crate) destination_path: Option<String>,
     pub(crate) has_multiple_files: bool,
+    pub(crate) has_malformed_hunk: bool,
+    pub(crate) raw_fallback: Option<String>,
     pub(crate) prelude: Vec<String>,
     pub(crate) hunks: Vec<DiffHunk>,
+    /// Exact parser bytes, including the synthetic `\n` added per source line.
     pub(crate) aggregate_source_bytes: usize,
     pub(crate) aggregate_source_lines: usize,
 }
@@ -70,7 +73,7 @@ pub(crate) fn compute_parsed_diff_file_scoped_styles(
     parsed: &ParsedDiff,
     theme: SyntaxTheme,
 ) -> Option<RefinedDiffStyles> {
-    if parsed.has_multiple_files {
+    if parsed.has_multiple_files || parsed.has_malformed_hunk {
         return None;
     }
     compute_file_scoped_styles(path, file_text, &parsed.hunks, theme)
@@ -176,6 +179,14 @@ impl HunkBuilder {
         self.old_remaining == 0 && self.new_remaining == 0
     }
 
+    fn can_accept(&self, kind: DiffLineKind) -> bool {
+        match kind {
+            DiffLineKind::Context => self.old_remaining > 0 && self.new_remaining > 0,
+            DiffLineKind::Insert => self.new_remaining > 0,
+            DiffLineKind::Delete => self.old_remaining > 0,
+        }
+    }
+
     fn source_line(&mut self, kind: DiffLineKind, content: String) -> DiffSourceLine {
         match kind {
             DiffLineKind::Context => {
@@ -271,7 +282,7 @@ fn finish_hunk(current: &mut Option<HunkBuilder>, hunks: &mut Vec<DiffHunk>) {
 pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
     let mut parsed = ParsedDiff::default();
     let mut current: Option<HunkBuilder> = None;
-    let mut old_path = None;
+    let mut pending_old_path: Option<Option<String>> = None;
     let mut file_sections = 0usize;
 
     for line in diff.lines() {
@@ -286,25 +297,77 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
                 _ => None,
             };
             if let Some((kind, content)) = source {
-                let source_line = current
-                    .as_mut()
-                    .expect("active hunk")
-                    .source_line(kind, content.to_owned());
-                parsed.aggregate_source_bytes = parsed
-                    .aggregate_source_bytes
-                    .saturating_add(source_line.content.len());
-                parsed.aggregate_source_lines = parsed.aggregate_source_lines.saturating_add(1);
-                current
-                    .as_mut()
-                    .expect("active hunk")
-                    .hunk
-                    .entries
-                    .push(DiffHunkEntry::Source(source_line));
+                let builder = current.as_mut().expect("active hunk");
+                if builder.can_accept(kind) {
+                    let source_line = builder.source_line(kind, content.to_owned());
+                    parsed.aggregate_source_bytes = parsed
+                        .aggregate_source_bytes
+                        .saturating_add(source_line.content.len().saturating_add(1));
+                    parsed.aggregate_source_lines = parsed.aggregate_source_lines.saturating_add(1);
+                    builder
+                        .hunk
+                        .entries
+                        .push(DiffHunkEntry::Source(source_line));
+                } else {
+                    parsed.has_malformed_hunk = true;
+                    builder
+                        .hunk
+                        .entries
+                        .push(DiffHunkEntry::Metadata(line.to_owned()));
+                }
                 continue;
             }
         }
 
+        if let Some(old_path) = pending_old_path.take() {
+            if let Some(header_value) = line.strip_prefix("+++ ") {
+                file_sections = file_sections.saturating_add(1);
+                parsed.has_multiple_files = file_sections > 1;
+                parsed.destination_path =
+                    parse_header_path(header_value).or_else(|| old_path.clone());
+                if let Some(builder) = current.as_mut() {
+                    builder
+                        .hunk
+                        .entries
+                        .push(DiffHunkEntry::Metadata(line.to_owned()));
+                } else {
+                    parsed.prelude.push(line.to_owned());
+                }
+                continue;
+            }
+            parsed.has_malformed_hunk = true;
+        }
+
+        if let Some(header_value) = line.strip_prefix("--- ") {
+            pending_old_path = Some(parse_header_path(header_value));
+            if let Some(builder) = current.as_mut() {
+                builder
+                    .hunk
+                    .entries
+                    .push(DiffHunkEntry::Metadata(line.to_owned()));
+            } else {
+                parsed.prelude.push(line.to_owned());
+            }
+            continue;
+        }
+
+        if line.starts_with("+++ ") {
+            parsed.has_malformed_hunk = true;
+            if let Some(builder) = current.as_mut() {
+                builder
+                    .hunk
+                    .entries
+                    .push(DiffHunkEntry::Metadata(line.to_owned()));
+            } else {
+                parsed.prelude.push(line.to_owned());
+            }
+            continue;
+        }
+
         if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_coordinates(line) {
+            if hunk_is_active {
+                parsed.has_malformed_hunk = true;
+            }
             finish_hunk(&mut current, &mut parsed.hunks);
             current = Some(HunkBuilder::new(
                 line.to_owned(),
@@ -314,6 +377,13 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
                 new_count,
             ));
             continue;
+        }
+
+        let completed_hunk_has_extra_source =
+            current.as_ref().is_some_and(HunkBuilder::is_complete)
+                && matches!(line.as_bytes().first(), Some(b' ' | b'+' | b'-'));
+        if completed_hunk_has_extra_source {
+            parsed.has_malformed_hunk = true;
         }
 
         if hunk_is_active {
@@ -326,15 +396,6 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
             continue;
         }
 
-        if let Some(header_value) = line.strip_prefix("--- ") {
-            file_sections = file_sections.saturating_add(1);
-            parsed.has_multiple_files = file_sections > 1;
-            old_path = parse_header_path(header_value);
-            parsed.destination_path = old_path.clone();
-        } else if let Some(header_value) = line.strip_prefix("+++ ") {
-            parsed.destination_path = parse_header_path(header_value).or_else(|| old_path.clone());
-        }
-
         if let Some(builder) = current.as_mut() {
             builder
                 .hunk
@@ -345,7 +406,19 @@ pub(crate) fn parse_unified_diff(diff: &str) -> ParsedDiff {
         }
     }
 
+    if pending_old_path.is_some() {
+        parsed.has_malformed_hunk = true;
+    }
+    if current
+        .as_ref()
+        .is_some_and(|builder| !builder.is_complete())
+    {
+        parsed.has_malformed_hunk = true;
+    }
     finish_hunk(&mut current, &mut parsed.hunks);
+    if parsed.has_malformed_hunk {
+        parsed.raw_fallback = Some(diff.to_owned());
+    }
     parsed
 }
 
@@ -482,8 +555,29 @@ fn parsed_line_count(parsed: &ParsedDiff) -> usize {
             .sum::<usize>()
 }
 
+fn render_raw_diff(raw_diff: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut rendered = raw_diff
+        .lines()
+        .take(MAX_RENDERED_DIFF_LINES)
+        .map(|line| {
+            Line::from(Span::styled(
+                format!("    {line}"),
+                Style::default().fg(unstructured_line_color(line, theme)),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if raw_diff.lines().count() > MAX_RENDERED_DIFF_LINES {
+        rendered.push(Line::from(Span::styled(
+            TRUNCATION_MARKER,
+            Style::default().fg(theme.muted),
+        )));
+    }
+    rendered
+}
+
 fn syntax_is_eligible(parsed: &ParsedDiff) -> bool {
     !parsed.has_multiple_files
+        && !parsed.has_malformed_hunk
         && parsed.aggregate_source_bytes <= MAX_HIGHLIGHT_BYTES
         && parsed.aggregate_source_lines <= MAX_HIGHLIGHT_LINES
         && parsed
@@ -556,6 +650,21 @@ pub(crate) fn render_parsed_diff(
     theme: &Theme,
     refined: Option<&RefinedDiffStyles>,
 ) -> Vec<Line<'static>> {
+    if parsed.has_malformed_hunk {
+        debug_assert!(
+            parsed.raw_fallback.is_some(),
+            "malformed parsed diffs must retain their raw fallback"
+        );
+        return parsed.raw_fallback.as_deref().map_or_else(
+            || {
+                render_parsed_diff_with(parsed, theme, |hunk, entry_budget| {
+                    render_hunk_fallback(hunk, entry_budget, theme)
+                })
+            },
+            |raw_diff| render_raw_diff(raw_diff, theme),
+        );
+    }
+
     let syntax_eligible = syntax_is_eligible(parsed);
     let syntax_path = syntax_eligible
         .then_some(parsed.destination_path.as_deref())
@@ -614,7 +723,7 @@ mod tests {
     const RUST_DIFF: &str = "\
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -1,3 +1,3 @@
+@@ -1,2 +1,2 @@
 -fn old() { let value = \"old\"; }
 +fn new() { let value = \"new\"; }
  context();
@@ -670,6 +779,10 @@ mod tests {
         let parsed = parse_unified_diff(RUST_DIFF);
 
         assert_eq!(parsed.destination_path.as_deref(), Some("src/main.rs"));
+        assert!(
+            parsed.raw_fallback.is_none(),
+            "valid parsed diffs must not duplicate the original diff text"
+        );
         assert_eq!(parsed.hunks.len(), 1);
         let source = parsed.hunks[0].source_lines().collect::<Vec<_>>();
         assert_eq!(
@@ -700,7 +813,10 @@ mod tests {
         );
         assert_eq!(
             parsed.aggregate_source_bytes,
-            source.iter().map(|line| line.content.len()).sum::<usize>()
+            source
+                .iter()
+                .map(|line| line.content.len().saturating_add(1))
+                .sum::<usize>()
         );
         assert_eq!(parsed.aggregate_source_lines, 3);
     }
@@ -801,6 +917,122 @@ mod tests {
             diff.lines()
                 .map(|line| format!("    {line}"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn standalone_new_header_after_completed_hunk_marks_whole_diff_malformed() {
+        let theme = dark_theme();
+        let inserted = "fn current() { let value = 1; }";
+        let diff = format!(
+            "\
+--- a/current.rs
++++ b/current.rs
+@@ -1 +1 @@
+-fn old() {{}}
++{inserted}
++++ b/other.rs
+"
+        );
+        let mut refined = RefinedDiffStyles::new();
+        refined.insert(
+            1,
+            vec![Span::styled(
+                inserted,
+                Style::default().fg(ratatui::style::Color::Magenta),
+            )],
+        );
+
+        let parsed = parse_unified_diff(&diff);
+        assert!(parsed.has_malformed_hunk);
+        assert!(!super::syntax_is_eligible(&parsed));
+
+        let rendered = render_parsed_diff(&parsed, &theme, Some(&refined));
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(rendered.iter().all(|line| line.spans.len() == 1));
+        assert_eq!(rendered[4].spans[0].style.fg, Some(theme.diff_add));
+        assert_eq!(rendered[5].spans[0].style.fg, Some(theme.muted));
+        assert!(
+            rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg != Some(ratatui::style::Color::Magenta))
+        );
+    }
+
+    #[test]
+    fn unpaired_old_header_after_completed_hunk_marks_whole_diff_malformed() {
+        let theme = dark_theme();
+        let diff = "\
+--- a/current.rs
++++ b/current.rs
+@@ -1 +1 @@
+-fn old() {}
++fn current() {}
+--- a/other.rs
+metadata instead of paired new header
+";
+
+        let parsed = parse_unified_diff(diff);
+        assert!(parsed.has_malformed_hunk);
+        assert_eq!(parsed.raw_fallback.as_deref(), Some(diff));
+        assert!(!super::syntax_is_eligible(&parsed));
+
+        let rendered = render_parsed_diff(&parsed, &theme, None);
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(rendered.iter().all(|line| line.spans.len() == 1));
+        assert_eq!(rendered[5].spans[0].style.fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn timestamped_second_file_header_pair_is_valid_but_syntax_ineligible() {
+        let theme = dark_theme();
+        let diff = "\
+--- a/one.py\t2026-07-24 10:00:00
++++ b/one.py\t2026-07-24 10:01:00
+@@ -1 +1 @@
+-value = 0
++value = 1
+--- a/two.py\t2026-07-24 10:02:00
++++ b/two.py\t2026-07-24 10:03:00
+@@ -1 +1 @@
+-other = 0
++other = 1
+";
+
+        let parsed = parse_unified_diff(diff);
+        assert!(parsed.has_multiple_files);
+        assert!(!parsed.has_malformed_hunk);
+        assert!(!super::syntax_is_eligible(&parsed));
+
+        let rendered = render_parsed_diff(&parsed, &theme, None);
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert_plain_source(
+            find_rendered_line(&rendered, "+value = 1"),
+            "    +",
+            "value = 1",
+            theme.diff_add,
+        );
+        assert_plain_source(
+            find_rendered_line(&rendered, "+other = 1"),
+            "    +",
+            "other = 1",
+            theme.diff_add,
         );
     }
 
@@ -931,6 +1163,141 @@ mod tests {
                 "    +let value = 2;",
                 "    malformed metadata",
             ]
+        );
+    }
+
+    #[test]
+    fn impossible_source_marker_marks_hunk_malformed_and_renders_all_lines_plain() {
+        let theme = dark_theme();
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,0 +1 @@
+-bogus
++let valid = 1;
+";
+
+        let parsed = parse_unified_diff(diff);
+        assert!(parsed.has_malformed_hunk);
+        assert!(!super::syntax_is_eligible(&parsed));
+
+        let rendered = render_parsed_diff(&parsed, &theme, None);
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rendered[3].spans.len(), 1);
+        assert_eq!(rendered[3].spans[0].style.fg, Some(theme.diff_remove));
+        assert_eq!(rendered[4].spans.len(), 1);
+        assert_eq!(rendered[4].spans[0].style.fg, Some(theme.diff_add));
+    }
+
+    #[test]
+    fn premature_next_hunk_marks_whole_diff_malformed_without_dropping_lines() {
+        let theme = dark_theme();
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -1,2 +1,2 @@
+ shared();
+@@ -10 +10 @@
+-let old = 1;
++let new = 2;
+";
+
+        let parsed = parse_unified_diff(diff);
+        assert!(parsed.has_malformed_hunk);
+        assert!(!super::syntax_is_eligible(&parsed));
+
+        let rendered = render_parsed_diff(&parsed, &theme, None);
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(rendered.iter().all(|line| line.spans.len() == 1));
+        assert_eq!(rendered[2].spans[0].style.fg, Some(theme.border));
+        assert_eq!(rendered[4].spans[0].style.fg, Some(theme.border));
+    }
+
+    #[test]
+    fn source_marker_after_completed_hunk_marks_diff_malformed() {
+        let theme = dark_theme();
+        let diff = "\
+--- /dev/null
++++ b/value.rs
+@@ -0,0 +1 @@
++let first = 1;
++let extra = 2;
+";
+
+        let parsed = parse_unified_diff(diff);
+        assert!(parsed.has_malformed_hunk);
+        assert!(!super::syntax_is_eligible(&parsed));
+
+        let rendered = render_parsed_diff(&parsed, &theme, None);
+        assert_eq!(
+            rendered.iter().map(rendered_text).collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rendered[3].spans.len(), 1);
+        assert_eq!(rendered[4].spans.len(), 1);
+        assert_eq!(rendered[4].spans[0].style.fg, Some(theme.diff_add));
+    }
+
+    #[test]
+    fn valid_zero_count_insertion_and_deletion_hunks_remain_eligible() {
+        let insertion = parse_unified_diff(
+            "\
+--- /dev/null
++++ b/added.rs
+@@ -0,0 +1 @@
++fn added() {}
+",
+        );
+        let deletion = parse_unified_diff(
+            "\
+--- a/deleted.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-fn deleted() {}
+",
+        );
+
+        for parsed in [&insertion, &deletion] {
+            assert!(!parsed.has_malformed_hunk);
+            assert!(super::syntax_is_eligible(parsed));
+            assert_eq!(parsed.hunks.len(), 1);
+            assert_eq!(parsed.hunks[0].source_lines().count(), 1);
+        }
+    }
+
+    #[test]
+    fn incomplete_hunk_at_eof_is_malformed_without_panicking() {
+        let theme = dark_theme();
+        let diff = "\
+--- a/value.rs
++++ b/value.rs
+@@ -1 +1 @@
++let replacement = 1;
+";
+
+        let parsed = parse_unified_diff(diff);
+        assert!(parsed.has_malformed_hunk);
+        assert!(!super::syntax_is_eligible(&parsed));
+        assert_eq!(
+            render_parsed_diff(&parsed, &theme, None)
+                .iter()
+                .map(rendered_text)
+                .collect::<Vec<_>>(),
+            diff.lines()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1141,33 +1508,38 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_byte_limit_is_strict_and_boundary_remains_eligible() {
+    fn aggregate_parser_byte_limit_is_strict_and_boundary_remains_eligible() {
         let theme = dark_theme();
-        let source = padded_rust_line(MAX_HIGHLIGHT_LINE_BYTES);
+        let exact_source = padded_rust_line(MAX_HIGHLIGHT_LINE_BYTES - 1);
+        let over_source = padded_rust_line(MAX_HIGHLIGHT_LINE_BYTES);
         let exact_diff = format!(
             "--- /dev/null\n+++ b/value.rs\n@@ -0,0 +1,128 @@\n{}",
             (0..(MAX_HIGHLIGHT_BYTES / MAX_HIGHLIGHT_LINE_BYTES))
-                .map(|_| format!("+{source}\n"))
+                .map(|_| format!("+{exact_source}\n"))
                 .collect::<String>()
         );
         let over_diff = format!(
-            "--- /dev/null\n+++ b/value.rs\n@@ -0,0 +1,129 @@\n{}+x\n",
-            (0..(MAX_HIGHLIGHT_BYTES / MAX_HIGHLIGHT_LINE_BYTES))
-                .map(|_| format!("+{source}\n"))
+            "--- /dev/null\n+++ b/value.rs\n@@ -0,0 +1,128 @@\n+{over_source}\n{}",
+            (1..(MAX_HIGHLIGHT_BYTES / MAX_HIGHLIGHT_LINE_BYTES))
+                .map(|_| format!("+{exact_source}\n"))
                 .collect::<String>()
         );
 
         let exact_parsed = parse_unified_diff(&exact_diff);
         assert_eq!(exact_parsed.aggregate_source_bytes, MAX_HIGHLIGHT_BYTES);
+        assert_eq!(exact_parsed.aggregate_source_lines, 128);
+        assert!(super::syntax_is_eligible(&exact_parsed));
         let exact = render_unified_diff(&exact_diff, &theme, None);
         let exact_source = find_rendered_line(&exact, "+let value");
         assert!(exact_source.spans.len() > 2);
 
         let over_parsed = parse_unified_diff(&over_diff);
         assert_eq!(over_parsed.aggregate_source_bytes, MAX_HIGHLIGHT_BYTES + 1);
+        assert_eq!(over_parsed.aggregate_source_lines, 128);
+        assert!(!super::syntax_is_eligible(&over_parsed));
         let over = render_unified_diff(&over_diff, &theme, None);
-        let over_source = find_rendered_line(&over, "+let value");
-        assert_plain_source(over_source, "    +", &source, theme.diff_add);
+        let rendered_over_source = find_rendered_line(&over, "+let value");
+        assert_plain_source(rendered_over_source, "    +", &over_source, theme.diff_add);
     }
 
     #[test]

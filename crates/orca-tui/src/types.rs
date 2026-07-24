@@ -26,6 +26,8 @@ use crate::edit_highlight_worker::{
 };
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
 use crate::transcript_view::TranscriptRenderCache;
+#[cfg(test)]
+use crate::transcript_view::TranscriptRenderContext;
 
 const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
 const GOAL_NOTICE_OBJECTIVE_WIDTH: usize = 80;
@@ -3324,11 +3326,7 @@ mod tests {
         state.transcript_render_cache.prepare(
             &state.messages,
             &state.message_revisions,
-            40,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 40, 0, false),
             |_, message, _, _, _, _| vec![ratatui::text::Line::from(format!("{message:?}"))],
         );
         assert_eq!(state.transcript_render_cache.populated_len(), 3);
@@ -3349,11 +3347,7 @@ mod tests {
         state.transcript_render_cache.prepare(
             &state.messages,
             &state.message_revisions,
-            40,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 40, 0, false),
             |index, message, _, _, _, _| {
                 built_indices.borrow_mut().push(index);
                 vec![ratatui::text::Line::from(format!("{message:?}"))]
@@ -3929,11 +3923,7 @@ mod tests {
         state.transcript_render_cache.prepare(
             &state.messages,
             &state.message_revisions,
-            40,
-            &theme,
-            theme.syntax_theme_revision,
-            0,
-            false,
+            TranscriptRenderContext::new(&theme, 40, 0, false),
             |_, message, _, _, _, _| match message {
                 ChatMessage::Assistant(text) => vec![ratatui::text::Line::from(text.clone())],
                 _ => unreachable!(),
@@ -6569,11 +6559,7 @@ arbitrary metadata
             cache.prepare(
                 messages,
                 revisions,
-                80,
-                &theme,
-                theme.syntax_theme_revision,
-                0,
-                false,
+                TranscriptRenderContext::new(&theme, 80, 0, false),
                 |index, message, theme, width, tick, force_expand| {
                     built_indices.borrow_mut().push(index);
                     let refined = AppState::refined_diff_styles_for_message(
@@ -6606,11 +6592,7 @@ arbitrary metadata
             cache.prepare(
                 messages,
                 revisions,
-                80,
-                &theme,
-                theme.syntax_theme_revision,
-                0,
-                false,
+                TranscriptRenderContext::new(&theme, 80, 0, false),
                 |index, message, theme, width, tick, force_expand| {
                     built_indices.borrow_mut().push(index);
                     let refined = AppState::refined_diff_styles_for_message(
@@ -6656,11 +6638,7 @@ arbitrary metadata
             cache.prepare(
                 messages,
                 revisions,
-                80,
-                &theme,
-                theme.syntax_theme_revision,
-                0,
-                false,
+                TranscriptRenderContext::new(&theme, 80, 0, false),
                 |index, message, theme, width, tick, force_expand| {
                     built_indices.borrow_mut().push(index);
                     let refined = AppState::refined_diff_styles_for_message(
