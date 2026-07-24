@@ -3,7 +3,7 @@ use crate::thread_store::JsonlThreadStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 #[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -2480,6 +2480,11 @@ static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLoc
 #[cfg(test)]
 static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
+static ADMISSION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+#[cfg(test)]
+static PENDING_ADMISSION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -2684,6 +2689,15 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_admission_checkpoint_failures(path: impl Into<PathBuf>, count: usize) {
+        ADMISSION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_generation_append_failure_once(path: impl Into<PathBuf>) {
         GENERATION_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -2827,6 +2841,23 @@ impl JsonlSurfaceCommitLedger {
             .remove(&self.path)
     }
 
+    #[cfg(test)]
+    fn take_admission_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_ADMISSION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
     fn id_string(id: &SurfaceCommitId) -> String {
         serde_json::to_value(id)
             .expect("surface commit id serializes")
@@ -2950,12 +2981,37 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         };
         #[cfg(test)]
         self.arm_terminal_checkpoint_failure(batch);
+        #[cfg(test)]
+        if batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::Admitted { .. })
+            )
+        }) {
+            let mut failures = ADMISSION_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(count) = failures.remove(&self.path) {
+                PENDING_ADMISSION_CHECKPOINT_FAILURES
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(self.path.clone())
+                    .and_modify(|pending| *pending += count)
+                    .or_insert(count);
+            }
+        }
         Ok(receipt)
     }
 
     fn checkpoint(&mut self, receipt: &DurableBatchReceipt) -> Result<(), SurfaceLedgerError> {
         #[cfg(test)]
         if self.take_pending_terminal_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_admission_checkpoint_failure() {
             return Err(SurfaceLedgerError::CheckpointFailed);
         }
         self.store

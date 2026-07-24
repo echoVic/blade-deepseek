@@ -3005,6 +3005,7 @@ fn bootstrap_recorded_surface(
             pending_detaches: HashMap::new(),
             pending_capability_losses: HashMap::new(),
             pending_terminalization: None,
+            pending_admission_commits: HashMap::new(),
             pending_admission_repairs: HashMap::new(),
             pending_admission_terminals: HashMap::new(),
         },
@@ -3330,6 +3331,7 @@ struct ResidentSurfaceState {
     pending_detaches: HashMap<surface::SurfaceAttachmentId, PendingSurfaceDetach>,
     pending_capability_losses: HashMap<surface::SurfaceAttachmentId, PendingSurfaceCapabilityLoss>,
     pending_terminalization: Option<PreparedSurfaceTerminalization>,
+    pending_admission_commits: HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionCommit>,
     pending_admission_repairs: HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionRepair>,
     pending_admission_terminals:
         HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionTerminal>,
@@ -3365,8 +3367,17 @@ struct PendingSurfaceAdmissionRepair {
     retry_at: tokio::time::Instant,
 }
 
+#[derive(Clone)]
+struct PendingSurfaceAdmissionCommit {
+    fence: surface::SurfaceOperationFence,
+    batch: surface::SurfaceCommitBatch,
+    message: &'static str,
+    retry_at: tokio::time::Instant,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PendingSurfaceTransitionRetry {
+    AdmissionCommit(surface::SurfaceOperationId),
     AdmissionRepair(surface::SurfaceOperationId),
     AdmissionTerminal(surface::SurfaceOperationId),
     PreparedTerminalization(surface::SurfaceOperationId),
@@ -6463,9 +6474,15 @@ impl ThreadActor {
     fn next_surface_transition_retry_at(&self) -> Option<tokio::time::Instant> {
         self.resident_surface.0.as_ref().and_then(|resident| {
             resident
-                .pending_admission_repairs
+                .pending_admission_commits
                 .values()
                 .map(|pending| pending.retry_at)
+                .chain(
+                    resident
+                        .pending_admission_repairs
+                        .values()
+                        .map(|pending| pending.retry_at),
+                )
                 .chain(
                     resident
                         .pending_admission_terminals
@@ -6688,6 +6705,42 @@ impl ThreadActor {
         }
     }
 
+    fn retry_surface_admission_commit(&mut self, operation_id: &surface::SurfaceOperationId) {
+        let Some(pending) = self
+            .resident_surface
+            .pending_admission_commits
+            .get(operation_id)
+            .cloned()
+        else {
+            return;
+        };
+        if self
+            .resident_surface
+            .coordinator
+            .commit_actor_batch(&pending.batch)
+            .is_err()
+        {
+            if let Some(retained) = self
+                .resident_surface
+                .pending_admission_commits
+                .get_mut(operation_id)
+            {
+                retained.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            }
+            return;
+        }
+        self.resident_surface
+            .pending_admission_commits
+            .remove(operation_id);
+        if let Err(error) = self.repair_surface_admission_failure(&pending.fence, pending.message) {
+            self.surface_terminal_blocked = Some(format!(
+                "typed surface admission repair failed for {:?}: {error:?}",
+                pending.fence.operation_id
+            ));
+        }
+    }
+
     fn retry_surface_admission_terminal(&mut self, operation_id: &surface::SurfaceOperationId) {
         let Some(pending) = self
             .resident_surface
@@ -6745,6 +6798,14 @@ impl ThreadActor {
                         ),
                     )
                 })
+                .chain(self.resident_surface.pending_admission_commits.iter().map(
+                    |(operation_id, pending)| {
+                        (
+                            pending.retry_at,
+                            PendingSurfaceTransitionRetry::AdmissionCommit(operation_id.clone()),
+                        )
+                    },
+                ))
                 .chain(
                     self.resident_surface
                         .pending_terminalization
@@ -6807,6 +6868,10 @@ impl ThreadActor {
         else {
             return;
         };
+        if let PendingSurfaceTransitionRetry::AdmissionCommit(operation_id) = retry {
+            self.retry_surface_admission_commit(&operation_id);
+            return;
+        }
         if let PendingSurfaceTransitionRetry::AdmissionRepair(operation_id) = retry {
             self.retry_surface_admission_repair(&operation_id);
             return;
@@ -7061,6 +7126,7 @@ impl ThreadActor {
         surface::SurfaceClientCommandError,
     > {
         if !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
             || self.surface_terminal_blocked.is_some()
@@ -7281,6 +7347,7 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         if !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
             || self.surface_terminal_blocked.is_some()
@@ -7387,40 +7454,39 @@ impl ThreadActor {
             ],
             None,
         );
-        if let Err(error) = self
+        match self
             .resident_surface
             .coordinator
             .commit_actor_batch(&admitted_batch)
         {
-            eprintln!("orca: typed surface admission commit failed: {error:?}");
-            let committed_admitted = self
-                .resident_surface
-                .coordinator
-                .commit_actor_batch(&admitted_batch)
-                .is_ok()
-                || self
-                    .resident_surface
-                    .coordinator
-                    .state()
-                    .snapshot()
-                    .foreground_operation
-                    .as_ref()
-                    .is_some_and(|current| {
-                        current.operation_id == operation_id
-                            && matches!(current.phase, surface::OperationPhase::Admitted)
-                    });
-            if committed_admitted {
+            Ok(_) => {}
+            Err(surface::SurfaceCommitError::Ledger(error)) => {
+                eprintln!("orca: typed surface admission commit failed: {error:?}");
+                self.resident_surface.pending_admission_commits.insert(
+                    operation_id.clone(),
+                    PendingSurfaceAdmissionCommit {
+                        fence: fence.clone(),
+                        batch: admitted_batch,
+                        message: "typed surface admission commit failed",
+                        retry_at: tokio::time::Instant::now()
+                            + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                    },
+                );
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+            Err(error) => {
+                eprintln!("orca: typed surface admission commit failed: {error:?}");
                 if let Err(repair_error) = self.repair_surface_admission_failure(
                     &fence,
-                    "typed surface admission commit acknowledgement failed",
+                    "typed surface admission commit failed",
                 ) {
                     self.surface_terminal_blocked = Some(format!(
                         "typed surface admission repair failed for {:?}: {repair_error:?}",
                         fence.operation_id
                     ));
                 }
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
             }
-            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
 
         let start_commit_id =
@@ -12074,6 +12140,72 @@ mod tests {
                 if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
         ));
         host.shutdown().expect("shutdown repaired runtime host");
+    }
+
+    #[test]
+    fn admitted_batch_checkpoint_failure_retries_exact_batch_before_terminal_repair() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, _entered_rx) = mpsc::sync_channel(1);
+        let (_release_tx, release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedSuccessExecutor {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry admitted batch",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load runtime transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, "checkpoint retry"),
+                )
+                .expect("reserve typed operation"),
+        );
+        surface::JsonlSurfaceCommitLedger::inject_admission_checkpoint_failures(transcript_path, 2);
+        assert!(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .is_err(),
+            "checkpoint failure must return a recoverable admission error"
+        );
+
+        let wait_client = attachment.client.clone();
+        let wait_operation_id = reserved.operation_id.clone();
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = wait_tx
+                .send(wait_client.wait_operation_terminal(surface_request_id(), wait_operation_id));
+        });
+        let terminal = wait_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("admission repair did not settle after checkpoint retries")
+            .expect("terminal wait failed");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::Persistence,
+                    ..
+                })
+        ));
+        host.shutdown().expect("shutdown retry runtime host");
     }
 
     #[test]
