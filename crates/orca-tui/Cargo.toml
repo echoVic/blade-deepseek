@@ -26,6 +26,7 @@ dirs = { workspace = true }
 crossbeam-channel = { workspace = true }
 syntect = { workspace = true }
 two-face = { workspace = true }
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

@@ -1674,6 +1674,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "dirs",
+ "libc",
  "orca-approval",
  "orca-core",
  "orca-file-search",
