@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use agent_client_protocol::{
     Agent, CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    ProtocolVersion, SessionId, SessionNotification, SessionUpdate, StopReason,
+    ProtocolVersion, ResourceLink, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use orca_core::cancel::CancelToken;
 use orca_core::config::{
@@ -316,6 +316,47 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
     );
 
     drop(session_id);
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let agent = OrcaAcpAgent::new_typed(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let error = local.block_on(&rt, async {
+        let session = agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::ResourceLink(ResourceLink::new(
+                    "notes",
+                    "file:///tmp/notes.txt",
+                ))],
+            ))
+            .await
+            .expect_err("unsupported resource prompt must fail")
+    });
+
+    assert_eq!(executor.call_count(), 0);
+    assert!(format!("{error:?}").contains("unsupported"));
     host.shutdown().expect("shutdown");
 }
 

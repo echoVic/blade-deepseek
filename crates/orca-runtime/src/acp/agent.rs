@@ -127,7 +127,8 @@ impl OrcaAcpAgent {
         args: PromptRequest,
         surface: RuntimeSurfaceHandle,
     ) -> Result<PromptResponse, Error> {
-        let prompt = flatten_prompt(&args.prompt);
+        let prompt = flatten_prompt(&args.prompt)
+            .map_err(|message| Error::invalid_params().data(message))?;
         let session_id = args.session_id.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             prepare_surface_prompt(&surface, &session_id, &prompt)
@@ -176,19 +177,41 @@ struct PreparedSurfacePrompt {
     subscription: crate::surface::SurfaceSubscriptionReceiver,
 }
 
-/// Flattens ACP content blocks into a single prompt string. Non-text blocks
-/// are skipped (this version only forwards text prompts to the runtime).
-fn flatten_prompt(blocks: &[ContentBlock]) -> String {
+/// Flattens ACP content blocks into a single prompt string.
+///
+/// This adapter currently supports text prompts only. Unsupported blocks must
+/// be rejected explicitly so a client-provided resource or media block is
+/// never silently lost before the runtime operation is reserved.
+fn flatten_prompt(blocks: &[ContentBlock]) -> Result<String, String> {
     let mut out = String::new();
     for block in blocks {
-        if let ContentBlock::Text(text) = block {
-            if !out.is_empty() {
-                out.push('\n');
+        match block {
+            ContentBlock::Text(text) => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&text.text);
             }
-            out.push_str(&text.text);
+            _ => {
+                return Err(format!(
+                    "unsupported ACP prompt content block: {}",
+                    content_block_name(block)
+                ));
+            }
         }
     }
-    out
+    Ok(out)
+}
+
+fn content_block_name(block: &ContentBlock) -> &'static str {
+    match block {
+        ContentBlock::Text(_) => "text",
+        ContentBlock::Image(_) => "image",
+        ContentBlock::Audio(_) => "audio",
+        ContentBlock::ResourceLink(_) => "resource_link",
+        ContentBlock::Resource(_) => "resource",
+        _ => "unknown",
+    }
 }
 
 fn prepare_surface_prompt(
@@ -587,7 +610,8 @@ impl Agent for OrcaAcpAgent {
             return self.prompt_typed(args, surface).await;
         }
 
-        let prompt = flatten_prompt(&args.prompt);
+        let prompt = flatten_prompt(&args.prompt)
+            .map_err(|message| Error::invalid_params().data(message))?;
         let observer: Arc<dyn EventObserver> = Arc::new(AcpEventObserver {
             note_tx: self.note_tx.clone(),
             session_id: args.session_id.clone(),
