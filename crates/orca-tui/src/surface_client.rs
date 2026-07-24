@@ -332,13 +332,12 @@ fn run_typed_surface(
 
 fn typed_config_matches_surface(
     config: &RunConfig,
-    snapshot: &orca_runtime::unstable_surface::SurfaceSnapshot,
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
 ) -> bool {
     let expected_cwd = config.cwd.clone().unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
     });
-    let Ok(expected_cwd) = orca_runtime::unstable_surface::CanonicalPath::try_new(expected_cwd)
-    else {
+    let Ok(expected_cwd) = orca_runtime::surface::CanonicalPath::try_new(expected_cwd) else {
         return false;
     };
     let expected_roots = config
@@ -347,31 +346,31 @@ fn typed_config_matches_surface(
         .unwrap_or_else(|| vec![expected_cwd.as_path().to_path_buf()]);
     let expected_roots = expected_roots
         .into_iter()
-        .map(orca_runtime::unstable_surface::CanonicalPath::try_new)
+        .map(orca_runtime::surface::CanonicalPath::try_new)
         .collect::<Result<Vec<_>, _>>();
     let Ok(expected_roots) = expected_roots else {
         return false;
     };
     let expected_approval_mode = match config.approval_mode {
         orca_core::approval_types::ApprovalMode::Suggest => {
-            orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest
+            orca_runtime::surface::SurfaceApprovalMode::Suggest
         }
         orca_core::approval_types::ApprovalMode::AutoEdit => {
-            orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit
+            orca_runtime::surface::SurfaceApprovalMode::AutoEdit
         }
         orca_core::approval_types::ApprovalMode::FullAuto => {
-            orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto
+            orca_runtime::surface::SurfaceApprovalMode::FullAuto
         }
         orca_core::approval_types::ApprovalMode::Plan => {
-            orca_runtime::unstable_surface::SurfaceApprovalMode::Plan
+            orca_runtime::surface::SurfaceApprovalMode::Plan
         }
     };
     let expected_reasoning = match config.reasoning_effort {
         orca_core::config::ReasoningEffort::High => {
-            orca_runtime::unstable_surface::SurfaceReasoningEffort::High
+            orca_runtime::surface::SurfaceReasoningEffort::High
         }
         orca_core::config::ReasoningEffort::Max => {
-            orca_runtime::unstable_surface::SurfaceReasoningEffort::Max
+            orca_runtime::surface::SurfaceReasoningEffort::Max
         }
     };
     snapshot.settings.effective.model.as_str() == config.model.display_name()
@@ -418,9 +417,7 @@ fn drain_operation(
                     });
                     for envelope in batch.events.as_slice() {
                         if let SurfaceEvent::Interaction(
-                            orca_runtime::unstable_surface::InteractionPatch::Requested {
-                                interaction,
-                            },
+                            orca_runtime::surface::InteractionPatch::Requested { interaction },
                         ) = &envelope.event
                         {
                             if let Some(event) =

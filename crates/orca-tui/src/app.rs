@@ -4591,15 +4591,11 @@ fn hosted_tui_controller_loop(
                 let patches = decode_settings_intent(&model)
                     .map(settings_intent_patches)
                     .unwrap_or_else(|| {
-                        vec![
-                            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetModel {
-                                model: orca_runtime::unstable_surface::NonEmptyText::try_new(model)
-                                    .map_err(|error| error.to_string())
-                                    .unwrap_or_else(|_| {
-                                        unreachable!("validated model is non-empty")
-                                    }),
-                            },
-                        ]
+                        vec![orca_runtime::surface::RuntimeSettingsPatch::SetModel {
+                            model: orca_runtime::surface::NonEmptyText::try_new(model)
+                                .map_err(|error| error.to_string())
+                                .unwrap_or_else(|_| unreachable!("validated model is non-empty")),
+                        }]
                     });
                 apply_hosted_settings_action(thread.as_ref(), &config, &event_tx, patches);
             }
@@ -5528,42 +5524,40 @@ pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage>
 
 fn settings_intent_patches(
     intent: SettingsIntent,
-) -> Vec<orca_runtime::unstable_surface::RuntimeSettingsPatch> {
+) -> Vec<orca_runtime::surface::RuntimeSettingsPatch> {
     let mut patches = Vec::new();
     if let Some(model) = intent.model
-        && let Ok(model) = orca_runtime::unstable_surface::NonEmptyText::try_new(model)
+        && let Ok(model) = orca_runtime::surface::NonEmptyText::try_new(model)
     {
-        patches.push(orca_runtime::unstable_surface::RuntimeSettingsPatch::SetModel { model });
+        patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetModel { model });
     }
     if let Some(effort) = intent.reasoning_effort {
-        patches.push(
-            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetReasoning {
-                effort: match effort {
-                    orca_core::config::ReasoningEffort::High => {
-                        orca_runtime::unstable_surface::SurfaceReasoningEffort::High
-                    }
-                    orca_core::config::ReasoningEffort::Max => {
-                        orca_runtime::unstable_surface::SurfaceReasoningEffort::Max
-                    }
-                },
+        patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetReasoning {
+            effort: match effort {
+                orca_core::config::ReasoningEffort::High => {
+                    orca_runtime::surface::SurfaceReasoningEffort::High
+                }
+                orca_core::config::ReasoningEffort::Max => {
+                    orca_runtime::surface::SurfaceReasoningEffort::Max
+                }
             },
-        );
+        });
     }
     if let Some(mode) = intent.approval_mode {
         patches.push(
-            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetApprovalMode {
+            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
                 mode: match mode {
                     orca_core::approval_types::ApprovalMode::Suggest => {
-                        orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest
+                        orca_runtime::surface::SurfaceApprovalMode::Suggest
                     }
                     orca_core::approval_types::ApprovalMode::AutoEdit => {
-                        orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit
+                        orca_runtime::surface::SurfaceApprovalMode::AutoEdit
                     }
                     orca_core::approval_types::ApprovalMode::FullAuto => {
-                        orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto
+                        orca_runtime::surface::SurfaceApprovalMode::FullAuto
                     }
                     orca_core::approval_types::ApprovalMode::Plan => {
-                        orca_runtime::unstable_surface::SurfaceApprovalMode::Plan
+                        orca_runtime::surface::SurfaceApprovalMode::Plan
                     }
                 },
             },
@@ -5576,13 +5570,13 @@ fn apply_hosted_settings_action(
     thread: Option<&RuntimeThreadHandle>,
     config: &Arc<Mutex<RunConfig>>,
     event_tx: &mpsc::Sender<TuiEvent>,
-    patches: Vec<orca_runtime::unstable_surface::RuntimeSettingsPatch>,
+    patches: Vec<orca_runtime::surface::RuntimeSettingsPatch>,
 ) {
     if patches.is_empty() {
         return;
     }
     if let Some(thread) = thread {
-        let patches = match orca_runtime::unstable_surface::NonEmptyVec::try_new(patches) {
+        let patches = match orca_runtime::surface::NonEmptyVec::try_new(patches) {
             Ok(patches) => patches,
             Err(_) => return,
         };
@@ -5596,14 +5590,14 @@ fn apply_hosted_settings_action(
         };
         let model = settings.effective.model.as_str().to_string();
         let reasoning_effort = match settings.effective.reasoning_effort {
-            orca_runtime::unstable_surface::SurfaceReasoningEffort::High => {
+            orca_runtime::surface::SurfaceReasoningEffort::High => {
                 orca_core::config::ReasoningEffort::High
             }
-            orca_runtime::unstable_surface::SurfaceReasoningEffort::Max => {
+            orca_runtime::surface::SurfaceReasoningEffort::Max => {
                 orca_core::config::ReasoningEffort::Max
             }
-            orca_runtime::unstable_surface::SurfaceReasoningEffort::Low
-            | orca_runtime::unstable_surface::SurfaceReasoningEffort::Medium => {
+            orca_runtime::surface::SurfaceReasoningEffort::Low
+            | orca_runtime::surface::SurfaceReasoningEffort::Medium => {
                 let _ = event_tx.send(TuiEvent::OperationRejected(
                     "runtime returned an unsupported reasoning effort".to_string(),
                 ));
@@ -5611,16 +5605,16 @@ fn apply_hosted_settings_action(
             }
         };
         let approval_mode = match settings.effective.approval_mode {
-            orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest => {
+            orca_runtime::surface::SurfaceApprovalMode::Suggest => {
                 orca_core::approval_types::ApprovalMode::Suggest
             }
-            orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit => {
+            orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
                 orca_core::approval_types::ApprovalMode::AutoEdit
             }
-            orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto => {
+            orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
                 orca_core::approval_types::ApprovalMode::FullAuto
             }
-            orca_runtime::unstable_surface::SurfaceApprovalMode::Plan => {
+            orca_runtime::surface::SurfaceApprovalMode::Plan => {
                 orca_core::approval_types::ApprovalMode::Plan
             }
         };
@@ -5642,35 +5636,35 @@ fn apply_hosted_settings_action(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for patch in patches {
         match patch {
-            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetModel { model } => {
+            orca_runtime::surface::RuntimeSettingsPatch::SetModel { model } => {
                 cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(
                     model.as_str().to_string(),
                 ));
             }
-            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetReasoning { effort } => {
+            orca_runtime::surface::RuntimeSettingsPatch::SetReasoning { effort } => {
                 cfg.reasoning_effort = match effort {
-                    orca_runtime::unstable_surface::SurfaceReasoningEffort::High => {
+                    orca_runtime::surface::SurfaceReasoningEffort::High => {
                         orca_core::config::ReasoningEffort::High
                     }
-                    orca_runtime::unstable_surface::SurfaceReasoningEffort::Max => {
+                    orca_runtime::surface::SurfaceReasoningEffort::Max => {
                         orca_core::config::ReasoningEffort::Max
                     }
-                    orca_runtime::unstable_surface::SurfaceReasoningEffort::Low
-                    | orca_runtime::unstable_surface::SurfaceReasoningEffort::Medium => continue,
+                    orca_runtime::surface::SurfaceReasoningEffort::Low
+                    | orca_runtime::surface::SurfaceReasoningEffort::Medium => continue,
                 };
             }
-            orca_runtime::unstable_surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {
+            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {
                 cfg.approval_mode = match mode {
-                    orca_runtime::unstable_surface::SurfaceApprovalMode::Suggest => {
+                    orca_runtime::surface::SurfaceApprovalMode::Suggest => {
                         orca_core::approval_types::ApprovalMode::Suggest
                     }
-                    orca_runtime::unstable_surface::SurfaceApprovalMode::AutoEdit => {
+                    orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
                         orca_core::approval_types::ApprovalMode::AutoEdit
                     }
-                    orca_runtime::unstable_surface::SurfaceApprovalMode::FullAuto => {
+                    orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
                         orca_core::approval_types::ApprovalMode::FullAuto
                     }
-                    orca_runtime::unstable_surface::SurfaceApprovalMode::Plan => {
+                    orca_runtime::surface::SurfaceApprovalMode::Plan => {
                         orca_core::approval_types::ApprovalMode::Plan
                     }
                 };

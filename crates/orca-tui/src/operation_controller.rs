@@ -390,7 +390,7 @@ impl TuiOperationController {
 
     pub(crate) fn register_surface_interaction(
         &self,
-        interaction: &orca_runtime::unstable_surface::SurfaceInteractionView,
+        interaction: &orca_runtime::surface::SurfaceInteractionView,
     ) -> Option<TuiEvent> {
         let mut hosted = self.lock_hosted();
         let active = hosted.surface_active.as_mut()?;
@@ -399,7 +399,7 @@ impl TuiOperationController {
         }
         let request_id = format!("{:?}", interaction.interaction_id);
         let (kind, event, permissions) = match &interaction.request {
-            orca_runtime::unstable_surface::SurfaceInteractionRequest::ToolApproval {
+            orca_runtime::surface::SurfaceInteractionRequest::ToolApproval {
                 tool,
                 description,
                 preview,
@@ -424,7 +424,7 @@ impl TuiOperationController {
                     None,
                 )
             }
-            orca_runtime::unstable_surface::SurfaceInteractionRequest::PermissionRequest {
+            orca_runtime::surface::SurfaceInteractionRequest::PermissionRequest {
                 tool_call_id,
                 reason,
                 permissions,
@@ -448,7 +448,7 @@ impl TuiOperationController {
                     Some(permissions.clone()),
                 )
             }
-            orca_runtime::unstable_surface::SurfaceInteractionRequest::UserInput {
+            orca_runtime::surface::SurfaceInteractionRequest::UserInput {
                 question,
                 suggestions,
             } => {
@@ -470,7 +470,7 @@ impl TuiOperationController {
                     None,
                 )
             }
-            orca_runtime::unstable_surface::SurfaceInteractionRequest::McpElicitation {
+            orca_runtime::surface::SurfaceInteractionRequest::McpElicitation {
                 server_name,
                 message,
                 request,
@@ -482,7 +482,7 @@ impl TuiOperationController {
                     TuiInteractionKind::McpElicitation,
                 );
                 let (mode, url, requested_schema_json) = match request {
-                    orca_runtime::unstable_surface::SurfaceMcpElicitationRequest::Form {
+                    orca_runtime::surface::SurfaceMcpElicitationRequest::Form {
                         requested_schema,
                         ..
                     } => (
@@ -493,7 +493,7 @@ impl TuiOperationController {
                                 .expect("surface MCP schema is serializable")
                         }),
                     ),
-                    orca_runtime::unstable_surface::SurfaceMcpElicitationRequest::Url {
+                    orca_runtime::surface::SurfaceMcpElicitationRequest::Url {
                         raw_url,
                         requested_schema,
                     } => (
@@ -556,11 +556,11 @@ impl TuiOperationController {
         };
         let answer = match (binding.kind, response) {
             (TuiInteractionKind::Approval, TuiInteractionResponse::Approval(approved)) => {
-                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::ToolApproval {
+                orca_runtime::surface::SurfaceClientInteractionAnswer::ToolApproval {
                     decision: if *approved {
-                        orca_runtime::unstable_surface::SurfaceAllowDeny::Allow
+                        orca_runtime::surface::SurfaceAllowDeny::Allow
                     } else {
-                        orca_runtime::unstable_surface::SurfaceAllowDeny::Deny
+                        orca_runtime::surface::SurfaceAllowDeny::Deny
                     },
                 }
             }
@@ -570,26 +570,26 @@ impl TuiOperationController {
                     .clone()
                     .ok_or_else(|| io::Error::other("typed TUI permission profile is missing"))?;
                 let decision = if *approved {
-                    orca_runtime::unstable_surface::SurfacePermissionClientDecision::Allow {
-                        scope: orca_runtime::unstable_surface::PermissionGrantScope::Turn,
+                    orca_runtime::surface::SurfacePermissionClientDecision::Allow {
+                        scope: orca_runtime::surface::PermissionGrantScope::Turn,
                         permissions,
                         strict_auto_review: false,
                     }
                 } else {
-                    orca_runtime::unstable_surface::SurfacePermissionClientDecision::Deny {
-                        scope: orca_runtime::unstable_surface::PermissionGrantScope::Turn,
+                    orca_runtime::surface::SurfacePermissionClientDecision::Deny {
+                        scope: orca_runtime::surface::PermissionGrantScope::Turn,
                         permissions,
                         strict_auto_review: false,
                     }
                 };
-                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                orca_runtime::surface::SurfaceClientInteractionAnswer::PermissionRequest {
                     decision,
                 }
             }
             (TuiInteractionKind::UserInput, TuiInteractionResponse::UserInput(answer)) => {
-                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::UserInput {
-                    decision: orca_runtime::unstable_surface::SurfaceUserInputDecision::Answer(
-                        orca_runtime::unstable_surface::DisplayText::new(answer.clone()),
+                orca_runtime::surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: orca_runtime::surface::SurfaceUserInputDecision::Answer(
+                        orca_runtime::surface::DisplayText::new(answer.clone()),
                     ),
                 }
             }
@@ -608,15 +608,11 @@ impl TuiOperationController {
                                 format!("invalid typed MCP elicitation content: {error}"),
                             )
                         })?;
-                    orca_runtime::unstable_surface::SurfaceMcpElicitationDecision::Accept {
-                        content,
-                    }
+                    orca_runtime::surface::SurfaceMcpElicitationDecision::Accept { content }
                 } else {
-                    orca_runtime::unstable_surface::SurfaceMcpElicitationDecision::Decline
+                    orca_runtime::surface::SurfaceMcpElicitationDecision::Decline
                 };
-                orca_runtime::unstable_surface::SurfaceClientInteractionAnswer::McpElicitation {
-                    decision,
-                }
+                orca_runtime::surface::SurfaceClientInteractionAnswer::McpElicitation { decision }
             }
             _ => return Ok(false),
         };
@@ -661,7 +657,7 @@ struct SurfaceInteractionBinding {
     client: orca_runtime::surface::RuntimeSurfaceClientHandle,
     interaction_id: orca_runtime::surface::SurfaceInteractionId,
     kind: TuiInteractionKind,
-    permissions: Option<orca_runtime::unstable_surface::SurfacePermissionProfile>,
+    permissions: Option<orca_runtime::surface::SurfacePermissionProfile>,
 }
 
 impl std::fmt::Debug for SurfaceActiveOperation {
@@ -689,7 +685,7 @@ fn cancel_surface_or_shutdown(hosted: &mut HostedOperationInner) -> bool {
 }
 
 fn permission_kind(
-    profile: &orca_runtime::unstable_surface::SurfacePermissionProfile,
+    profile: &orca_runtime::surface::SurfacePermissionProfile,
 ) -> orca_runtime::runtime_permission::RuntimePermissionRequestKind {
     if profile
         .network
