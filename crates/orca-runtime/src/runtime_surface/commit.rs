@@ -1337,20 +1337,92 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         selected_cause: super::OperationFinalizationCause,
         suspended_cause: Option<super::SuspendedFinalizationCause>,
     ) -> Result<SurfaceCommitBatch, SurfaceCommitError> {
+        let discard_reason = match &stop_reason {
+            super::GenerationStopReason::Cancelled { .. } => {
+                super::AssistantDiscardReason::GenerationCancelled
+            }
+            super::GenerationStopReason::InterruptedResumable => {
+                super::AssistantDiscardReason::GenerationInterrupted
+            }
+            super::GenerationStopReason::RuntimeRestart
+            | super::GenerationStopReason::NotStarted {
+                reason: super::NotStartedReason::RuntimeRestart,
+            } => super::AssistantDiscardReason::RuntimeRestart,
+            super::GenerationStopReason::ProjectionFailure { .. } => {
+                super::AssistantDiscardReason::ProjectionRepair
+            }
+            _ => super::AssistantDiscardReason::ProviderFailed,
+        };
+        let open_streams = self
+            .state
+            .snapshot()
+            .assistant_streams
+            .iter()
+            .filter(|stream| {
+                stream.fence == fence && stream.state == super::SurfaceAssistantStreamState::Open
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let mut patches = vec![super::OperationPatch::GenerationStopped {
-            fence,
+            fence: fence.clone(),
             reason: stop_reason,
             usage_delta: zero_usage(),
         }];
         let finalization =
             self.recovery_finalization_patch(operation_id, selected_cause, suspended_cause);
         patches.push(finalization);
-        self.operation_recovery_batch(
+        let mut batch = self.operation_recovery_batch(
             operation_id,
             super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7"),
             patches,
-        )
+        )?;
+        if open_streams.is_empty() {
+            return Ok(batch);
+        }
+
+        let background_scope = self
+            .state
+            .snapshot()
+            .background_operations
+            .iter()
+            .find(|operation| &operation.operation_id == operation_id)
+            .map(|operation| SurfaceScope::Background {
+                fence: operation.fence.clone(),
+            });
+        let stream_scope = background_scope.unwrap_or_else(|| SurfaceScope::Generation { fence });
+        let mut events = open_streams
+            .into_iter()
+            .map(|stream| super::SurfaceEventEnvelope {
+                ordinal: 0,
+                event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7"),
+                commit_class: batch.commit_class.clone(),
+                scope: stream_scope.clone(),
+                event: super::SurfaceEvent::Assistant(super::AssistantPatch::StreamDiscarded {
+                    stream_id: stream.stream_id,
+                    reason: discard_reason,
+                }),
+            })
+            .collect::<Vec<_>>();
+        events.extend(batch.events.as_slice().iter().cloned());
+        for (ordinal, event) in events.iter_mut().enumerate() {
+            event.ordinal = ordinal as u32;
+        }
+        batch.event_count = u32::try_from(events.len())
+            .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        batch.cursor_after.next_seq = super::SequenceNumber::new(
+            batch
+                .cursor_before
+                .next_seq
+                .get()
+                .checked_add(batch.event_count as u64)
+                .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        );
+        batch.events = super::NonEmptyVec::try_new(events)
+            .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        batch.batch_digest = super::canonical_batch_digest(&batch);
+        Ok(batch)
     }
 
     fn recovery_finalization_batch(
@@ -1607,6 +1679,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             BatchCommitAuthority::Single(permit) => {
                 permit_authorizes(&self.issued_permits, permit, batch, self.owner_epoch)
                     && finalizer_background_scope_matches_state(&self.state, permit, batch)
+                    && recovery_stream_dispositions_match_state(&self.state, permit, batch)
             }
             BatchCommitAuthority::ActorGenerationTerminalization { actor, generation } => {
                 actor_generation_terminalization_authorized(
@@ -1622,6 +1695,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 finalizer,
             } => {
                 live_generation_stop_disposition_authorized(
+                    &self.state,
                     &self.issued_permits,
                     generation,
                     finalizer,
@@ -1990,6 +2064,7 @@ fn actor_generation_terminalization_authorized(
 }
 
 fn live_generation_stop_disposition_authorized(
+    state: &SurfaceReducerState,
     issued_permits: &[SurfacePublisherPermit],
     generation_permit: &SurfacePublisherPermit,
     finalizer_permit: &SurfacePublisherPermit,
@@ -2014,7 +2089,10 @@ fn live_generation_stop_disposition_authorized(
     if *finalizer_owner_epoch != owner_epoch || operation_id != &fence.operation_id {
         return false;
     }
-    let [stop, finalization] = batch.events.as_slice() else {
+    let Some((finalization, prefix)) = batch.events.as_slice().split_last() else {
+        return false;
+    };
+    let Some((stop, stream_discards)) = prefix.split_last() else {
         return false;
     };
     let stop_reason = match (&stop.scope, &stop.event) {
@@ -2028,6 +2106,34 @@ fn live_generation_stop_disposition_authorized(
         ) if scope == fence && patch_fence == fence => reason,
         _ => return false,
     };
+    let expected_discard_reason = match stop_reason {
+        super::GenerationStopReason::Cancelled { .. } => {
+            super::AssistantDiscardReason::GenerationCancelled
+        }
+        super::GenerationStopReason::InterruptedResumable => {
+            super::AssistantDiscardReason::GenerationInterrupted
+        }
+        super::GenerationStopReason::RuntimeRestart
+        | super::GenerationStopReason::NotStarted {
+            reason: super::NotStartedReason::RuntimeRestart,
+        } => super::AssistantDiscardReason::RuntimeRestart,
+        super::GenerationStopReason::ProjectionFailure { .. } => {
+            super::AssistantDiscardReason::ProjectionRepair
+        }
+        _ => super::AssistantDiscardReason::ProviderFailed,
+    };
+    let generation_scope = SurfaceScope::Generation {
+        fence: fence.clone(),
+    };
+    if !stream_discards_cover_open_streams(
+        state,
+        fence,
+        &generation_scope,
+        expected_discard_reason,
+        stream_discards,
+    ) {
+        return false;
+    }
     matches!(
         (&finalization.scope, &finalization.event),
         (
@@ -2165,6 +2271,92 @@ fn finalizer_background_scope_matches_state(
         })
 }
 
+fn stream_discards_cover_open_streams<'a>(
+    state: &SurfaceReducerState,
+    fence: &super::SurfaceOperationFence,
+    expected_scope: &SurfaceScope,
+    expected_reason: super::AssistantDiscardReason,
+    events: impl IntoIterator<Item = &'a super::SurfaceEventEnvelope>,
+) -> bool {
+    let expected = state
+        .snapshot()
+        .assistant_streams
+        .iter()
+        .filter(|stream| {
+            stream.fence == *fence && stream.state == super::SurfaceAssistantStreamState::Open
+        })
+        .map(|stream| &stream.stream_id)
+        .collect::<Vec<_>>();
+    let actual = events.into_iter().collect::<Vec<_>>();
+    actual.len() == expected.len()
+        && actual.iter().zip(expected).all(|(event, stream_id)| {
+            event.scope == *expected_scope
+                && matches!(
+                    &event.event,
+                    super::SurfaceEvent::Assistant(super::AssistantPatch::StreamDiscarded {
+                        stream_id: discarded,
+                        reason,
+                    }) if discarded == stream_id && *reason == expected_reason
+                )
+        })
+}
+
+fn recovery_stream_dispositions_match_state(
+    state: &SurfaceReducerState,
+    permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+) -> bool {
+    let SurfacePublisherPermit::Recovery {
+        historical_fence, ..
+    } = permit
+    else {
+        return true;
+    };
+    let Some(stop) = batch
+        .events
+        .as_slice()
+        .iter()
+        .find(|event| recovery_generation_stop_authorized(historical_fence, event))
+    else {
+        return true;
+    };
+    let stop_reason = match &stop.event {
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+            reason, ..
+        }) => reason,
+        _ => return false,
+    };
+    let expected_reason = match stop_reason {
+        super::GenerationStopReason::Cancelled { .. } => {
+            super::AssistantDiscardReason::GenerationCancelled
+        }
+        super::GenerationStopReason::InterruptedResumable => {
+            super::AssistantDiscardReason::GenerationInterrupted
+        }
+        super::GenerationStopReason::RuntimeRestart
+        | super::GenerationStopReason::NotStarted {
+            reason: super::NotStartedReason::RuntimeRestart,
+        } => super::AssistantDiscardReason::RuntimeRestart,
+        super::GenerationStopReason::ProjectionFailure { .. } => {
+            super::AssistantDiscardReason::ProjectionRepair
+        }
+        _ => super::AssistantDiscardReason::ProviderFailed,
+    };
+    let expected_scope = stop.scope.clone();
+    stream_discards_cover_open_streams(
+        state,
+        historical_fence,
+        &expected_scope,
+        expected_reason,
+        batch.events.as_slice().iter().filter(|event| {
+            matches!(
+                event.event,
+                super::SurfaceEvent::Assistant(super::AssistantPatch::StreamDiscarded { .. })
+            )
+        }),
+    )
+}
+
 fn recovery_batch_authorized(
     historical_fence: &super::SurfaceOperationFence,
     batch: &SurfaceCommitBatch,
@@ -2193,14 +2385,66 @@ fn recovery_batch_authorized(
         SurfaceScope::Background { fence } => Some(fence),
         _ => None,
     };
+    let stop_reason = match &stops[0].event {
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+            reason, ..
+        }) => reason,
+        _ => return false,
+    };
+    let expected_discard_reason = match stop_reason {
+        super::GenerationStopReason::Cancelled { .. } => {
+            super::AssistantDiscardReason::GenerationCancelled
+        }
+        super::GenerationStopReason::InterruptedResumable => {
+            super::AssistantDiscardReason::GenerationInterrupted
+        }
+        super::GenerationStopReason::RuntimeRestart
+        | super::GenerationStopReason::NotStarted {
+            reason: super::NotStartedReason::RuntimeRestart,
+        } => super::AssistantDiscardReason::RuntimeRestart,
+        super::GenerationStopReason::ProjectionFailure { .. } => {
+            super::AssistantDiscardReason::ProjectionRepair
+        }
+        _ => super::AssistantDiscardReason::ProviderFailed,
+    };
     let dispositions = events
         .iter()
         .filter(|event| !recovery_generation_stop_authorized(historical_fence, event))
         .collect::<Vec<_>>();
-    dispositions.len() == 1
-        && events
-            .iter()
-            .all(|event| recovery_event_authorized(historical_fence, background_fence, event))
+    let mut non_stream_dispositions = 0usize;
+    dispositions.iter().all(|event| {
+        let stream_discard = match (&event.scope, &event.event) {
+            (
+                SurfaceScope::Generation { fence },
+                super::SurfaceEvent::Assistant(super::AssistantPatch::StreamDiscarded {
+                    reason,
+                    ..
+                }),
+            ) => {
+                background_fence.is_none()
+                    && fence == historical_fence
+                    && *reason == expected_discard_reason
+            }
+            (
+                SurfaceScope::Background { fence },
+                super::SurfaceEvent::Assistant(super::AssistantPatch::StreamDiscarded {
+                    reason,
+                    ..
+                }),
+            ) => {
+                background_fence == Some(fence)
+                    && &fence.operation_fence == historical_fence
+                    && *reason == expected_discard_reason
+            }
+            _ => false,
+        };
+        if stream_discard {
+            true
+        } else {
+            non_stream_dispositions += 1;
+            recovery_event_authorized(historical_fence, background_fence, event)
+        }
+    }) && non_stream_dispositions == 1
 }
 
 fn recovery_generation_stop_authorized(
@@ -4099,6 +4343,82 @@ mod tests {
             &permit,
             &batch,
             ThreadOwnerEpoch::new(1),
+        ));
+    }
+
+    #[test]
+    fn terminal_stream_disposition_requires_exact_open_stream_coverage() {
+        let fence = test_operation_fence(130);
+        let mut snapshot = reducer_snapshot();
+        let first = super::super::SurfaceAssistantStream {
+            stream_id: super::super::SurfaceStreamId::try_from_bytes(uuid_v7_bytes(131)).unwrap(),
+            fence: fence.clone(),
+            turn_id: orca_core::thread_identity::TurnId::new(),
+            item_id: orca_core::thread_identity::ConversationItemId::new(),
+            channel: super::super::AssistantChannel::Message,
+            next_offset: super::super::ByteOffset::new(5),
+            text: super::super::DisplayText::new("first"),
+            state: super::super::SurfaceAssistantStreamState::Open,
+        };
+        let second = super::super::SurfaceAssistantStream {
+            stream_id: super::super::SurfaceStreamId::try_from_bytes(uuid_v7_bytes(132)).unwrap(),
+            fence: fence.clone(),
+            turn_id: first.turn_id.clone(),
+            item_id: orca_core::thread_identity::ConversationItemId::new(),
+            channel: super::super::AssistantChannel::Reasoning,
+            next_offset: super::super::ByteOffset::new(6),
+            text: super::super::DisplayText::new("second"),
+            state: super::super::SurfaceAssistantStreamState::Open,
+        };
+        snapshot.assistant_streams = vec![first.clone(), second.clone()];
+        let state = SurfaceReducerState::new(snapshot);
+        let scope = SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let discard = |stream_id| {
+            (
+                scope.clone(),
+                super::super::SurfaceEvent::Assistant(
+                    super::super::AssistantPatch::StreamDiscarded {
+                        stream_id,
+                        reason: super::super::AssistantDiscardReason::ProviderFailed,
+                    },
+                ),
+            )
+        };
+        let exact = test_batch_with_events(
+            &state,
+            vec![
+                discard(first.stream_id.clone()),
+                discard(second.stream_id.clone()),
+            ],
+        );
+        let missing = test_batch_with_events(&state, vec![discard(first.stream_id.clone())]);
+        let reversed = test_batch_with_events(
+            &state,
+            vec![discard(second.stream_id), discard(first.stream_id)],
+        );
+
+        assert!(stream_discards_cover_open_streams(
+            &state,
+            &fence,
+            &scope,
+            super::super::AssistantDiscardReason::ProviderFailed,
+            exact.events.as_slice(),
+        ));
+        assert!(!stream_discards_cover_open_streams(
+            &state,
+            &fence,
+            &scope,
+            super::super::AssistantDiscardReason::ProviderFailed,
+            missing.events.as_slice(),
+        ));
+        assert!(!stream_discards_cover_open_streams(
+            &state,
+            &fence,
+            &scope,
+            super::super::AssistantDiscardReason::ProviderFailed,
+            reversed.events.as_slice(),
         ));
     }
 

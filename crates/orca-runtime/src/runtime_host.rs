@@ -1051,6 +1051,37 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         })?
     }
 
+    fn commit_provider_step(
+        &self,
+        identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+        step: &ProviderStep,
+    ) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceCommitProviderStep {
+                fence: self.fence.clone(),
+                identity: identity.clone(),
+                step: step.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime semantic ingress mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime semantic ingress actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime semantic ingress actor closed before commit acknowledgement",
+            )
+        })?
+    }
+
     fn commit_tool_results(&self, results: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
@@ -2190,6 +2221,12 @@ enum ThreadCommand {
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
         response: crate::model_response::RuntimeModelResponse,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceCommitProviderStep {
+        fence: surface::SurfaceOperationFence,
+        identity: orca_core::thread_item_projection::ModelResponseIdentity,
+        step: ProviderStep,
         reply: SyncSender<io::Result<()>>,
     },
     SurfaceCommitToolResults {
@@ -4255,6 +4292,131 @@ impl ThreadActor {
         batch
     }
 
+    fn commit_surface_provider_step(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+        step: &ProviderStep,
+    ) -> io::Result<()> {
+        if active.surface_operation.as_ref() != Some(&fence) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider step generation fence is stale",
+            ));
+        }
+        if Self::surface_interaction_admission_closed(active) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime generation is terminalizing",
+            ));
+        }
+        let (channel, item_id, text) = match step {
+            ProviderStep::MessageDelta(text) => (
+                surface::AssistantChannel::Message,
+                identity.item_ids.conversation_item_id.clone(),
+                text,
+            ),
+            ProviderStep::ReasoningDelta(text) => (
+                surface::AssistantChannel::Reasoning,
+                identity.item_ids.reasoning_item_id.clone(),
+                text,
+            ),
+            _ => return Ok(()),
+        };
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
+        let generation = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == fence)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
+        if generation.logical_turn_id != identity.turn_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provider step turn identity differs from active generation",
+            ));
+        }
+
+        let scope = surface::SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let mut events = Vec::with_capacity(2);
+        let (stream_id, offset) = if let Some(stream) = snapshot
+            .assistant_streams
+            .iter()
+            .find(|stream| stream.item_id == item_id && stream.channel == channel)
+        {
+            if stream.fence != fence
+                || stream.turn_id != identity.turn_id
+                || stream.state != surface::SurfaceAssistantStreamState::Open
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider step targets a closed or foreign assistant stream",
+                ));
+            }
+            (stream.stream_id.clone(), stream.next_offset)
+        } else {
+            let raw_id = item_id
+                .as_str()
+                .strip_prefix("item_")
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "provider step item identity is not UUIDv7-backed",
+                    )
+                })?;
+            let stream_id =
+                surface::SurfaceStreamId::try_from_bytes(*raw_id.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "provider step item identity is not UUIDv7-backed",
+                    )
+                })?;
+            events.push((
+                scope.clone(),
+                surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamOpened {
+                    stream: surface::SurfaceAssistantStream {
+                        stream_id: stream_id.clone(),
+                        fence: fence.clone(),
+                        turn_id: identity.turn_id.clone(),
+                        item_id,
+                        channel,
+                        next_offset: surface::ByteOffset::new(0),
+                        text: surface::DisplayText::new(""),
+                        state: surface::SurfaceAssistantStreamState::Open,
+                    },
+                }),
+            ));
+            (stream_id, surface::ByteOffset::new(0))
+        };
+        events.push((
+            scope,
+            surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
+                stream_id,
+                offset,
+                text: surface::DisplayText::new(text.clone()),
+            }),
+        ));
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(fence, &batch)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to commit provider step semantic batch: {error:?}"
+                ))
+            })?;
+        Ok(())
+    }
+
     fn commit_surface_provider_response(
         &mut self,
         active: &mut ActiveOperation,
@@ -4314,6 +4476,11 @@ impl ThreadActor {
                     summary,
                     content,
                 } => {
+                    let (summary, content) = if content.is_empty() && !summary.is_empty() {
+                        (String::new(), summary)
+                    } else {
+                        (summary, content)
+                    };
                     reasoning_item = Some(surface::SurfaceAssistantReasoningItem {
                         id,
                         turn_id: completed.identity.turn_id.clone(),
@@ -4405,12 +4572,52 @@ impl ThreadActor {
         let scope = surface::SurfaceScope::Generation {
             fence: fence.clone(),
         };
-        let mut events = vec![(
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let mut events = snapshot
+            .assistant_streams
+            .iter()
+            .filter(|stream| {
+                if stream.fence != fence
+                    || stream.turn_id != completed_response.turn_id
+                    || stream.state != surface::SurfaceAssistantStreamState::Open
+                {
+                    return false;
+                }
+                let completed_text = match stream.channel {
+                    surface::AssistantChannel::Message => completed_response
+                        .message_item
+                        .as_ref()
+                        .filter(|item| item.id == stream.item_id)
+                        .map(|item| &item.text),
+                    surface::AssistantChannel::Reasoning => completed_response
+                        .reasoning_item
+                        .as_ref()
+                        .filter(|item| item.id == stream.item_id)
+                        .map(|item| &item.content),
+                    surface::AssistantChannel::Plan => completed_response
+                        .plan_item
+                        .as_ref()
+                        .filter(|item| item.id == stream.item_id)
+                        .map(|item| &item.text),
+                };
+                completed_text != Some(&stream.text)
+            })
+            .map(|stream| {
+                (
+                    scope.clone(),
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamDiscarded {
+                        stream_id: stream.stream_id.clone(),
+                        reason: surface::AssistantDiscardReason::ProviderFailed,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        events.push((
             scope.clone(),
             surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseCompleted {
                 response: completed_response,
             }),
-        )];
+        ));
         events.extend(tool_requests.into_iter().map(|request| {
             (
                 scope.clone(),
@@ -7400,43 +7607,69 @@ impl ThreadActor {
         let terminal_commit_id =
             surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
-        let stop_and_finalization_batch = self.surface_event_batch_with_commit_id(
-            vec![
+        let stream_discard_reason = match &stop_reason {
+            surface::GenerationStopReason::Cancelled { .. } => {
+                surface::AssistantDiscardReason::GenerationCancelled
+            }
+            surface::GenerationStopReason::InterruptedResumable => {
+                surface::AssistantDiscardReason::GenerationInterrupted
+            }
+            surface::GenerationStopReason::RuntimeRestart
+            | surface::GenerationStopReason::NotStarted {
+                reason: surface::NotStartedReason::RuntimeRestart,
+            } => surface::AssistantDiscardReason::RuntimeRestart,
+            surface::GenerationStopReason::ProjectionFailure { .. } => {
+                surface::AssistantDiscardReason::ProjectionRepair
+            }
+            _ => surface::AssistantDiscardReason::ProviderFailed,
+        };
+        let generation_scope = surface::SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let mut stop_and_finalization_events = snapshot
+            .assistant_streams
+            .iter()
+            .filter(|stream| {
+                stream.fence == fence && stream.state == surface::SurfaceAssistantStreamState::Open
+            })
+            .map(|stream| {
                 (
-                    surface::SurfaceScope::Generation {
-                        fence: fence.clone(),
-                    },
-                    surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
-                        fence: fence.clone(),
-                        reason: stop_reason.clone(),
-                        usage_delta: surface::UsageTotals {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_tokens: 0,
-                            estimated_cost_usd_micros: 0,
-                        },
+                    generation_scope.clone(),
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamDiscarded {
+                        stream_id: stream.stream_id.clone(),
+                        reason: stream_discard_reason,
                     }),
-                ),
-                (
-                    surface::SurfaceScope::Operation {
-                        operation_id: operation_id.clone(),
-                    },
-                    surface::SurfaceEvent::Operation(
-                        surface::OperationPatch::FinalizationStarted {
-                            operation_id: operation_id.clone(),
-                            finalize_intent_id: finalize_intent_id.clone(),
-                            terminal_commit_id: terminal_commit_id.clone(),
-                            selected_cause: surface::OperationFinalizationCause::GenerationStop(
-                                stop_reason,
-                            ),
-                            suspended_cause: None,
-                            expected_settlements: Vec::new(),
-                        },
-                    ),
-                ),
-            ],
-            None,
-        );
+                )
+            })
+            .collect::<Vec<_>>();
+        stop_and_finalization_events.push((
+            generation_scope,
+            surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                fence: fence.clone(),
+                reason: stop_reason.clone(),
+                usage_delta: surface::UsageTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                    estimated_cost_usd_micros: 0,
+                },
+            }),
+        ));
+        stop_and_finalization_events.push((
+            surface::SurfaceScope::Operation {
+                operation_id: operation_id.clone(),
+            },
+            surface::SurfaceEvent::Operation(surface::OperationPatch::FinalizationStarted {
+                operation_id: operation_id.clone(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                terminal_commit_id: terminal_commit_id.clone(),
+                selected_cause: surface::OperationFinalizationCause::GenerationStop(stop_reason),
+                suspended_cause: None,
+                expected_settlements: Vec::new(),
+            }),
+        ));
+        let stop_and_finalization_batch =
+            self.surface_event_batch_with_commit_id(stop_and_finalization_events, None);
         self.resident_surface
             .coordinator
             .commit_live_generation_stop_disposition_batch(
@@ -7950,6 +8183,12 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
+                ThreadCommand::SurfaceCommitProviderStep { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceCommitToolResults { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -8111,6 +8350,12 @@ impl ThreadActor {
                 }
             }
             ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceCommitProviderStep { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "runtime generation is not active",
@@ -8493,6 +8738,15 @@ impl ThreadActor {
                 reply,
             } => {
                 let result = self.commit_surface_provider_response(active, fence, &response);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCommitProviderStep {
+                fence,
+                identity,
+                step,
+                reply,
+            } => {
+                let result = self.commit_surface_provider_step(active, fence, &identity, &step);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitToolResults {

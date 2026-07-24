@@ -20,6 +20,7 @@ use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::model::ModelSelection;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_config::SubagentConfig;
+use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::{McpElicitationMode, McpElicitationRequest, McpElicitationResponse};
 use orca_runtime::lifecycle::RuntimeUserInputRequest;
@@ -44,6 +45,7 @@ const RESOLVED_INTERACTION_RESTART_CHILD: &str = "ORCA_RESOLVED_INTERACTION_REST
 const EFFECT_APPROVAL_RESTART_CHILD: &str = "ORCA_EFFECT_APPROVAL_RESTART_CHILD";
 const RESOLVED_EFFECT_APPROVAL_RESTART_CHILD: &str = "ORCA_RESOLVED_EFFECT_APPROVAL_RESTART_CHILD";
 const TOOL_COMPLETION_RESTART_CHILD: &str = "ORCA_TOOL_COMPLETION_RESTART_CHILD";
+const ASSISTANT_STREAM_RESTART_CHILD: &str = "ORCA_ASSISTANT_STREAM_RESTART_CHILD";
 
 struct UserInputExecutor {
     answer_tx: mpsc::SyncSender<Option<String>>,
@@ -90,6 +92,14 @@ struct WrongToolCompletionExecutor;
 struct NonShellToolCompletionExecutor;
 
 struct ReadonlyBatchCompletionExecutor;
+
+struct AssistantStreamingExecutor;
+
+struct RecoveredAssistantStreamingExecutor;
+
+struct AbandonedAssistantStreamExecutor;
+
+struct BlockingAssistantStreamExecutor;
 
 struct PermissionExecutor {
     response_tx: mpsc::SyncSender<RuntimePermissionResponse>,
@@ -365,6 +375,130 @@ impl ThreadOperationExecutor for ReadonlyBatchCompletionExecutor {
         ])?;
         thread.lifecycle_mut().finish_task(RunStatus::Success);
         Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for AssistantStreamingExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let identity = ModelResponseIdentity::new(request.turn_id().clone());
+        let turn_request = request.thread_turn_request(generation);
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        for step in [
+            ProviderStep::MessageDelta("hel".to_string()),
+            ProviderStep::ReasoningDelta("thi".to_string()),
+            ProviderStep::MessageDelta("lo".to_string()),
+            ProviderStep::ReasoningDelta("nk".to_string()),
+        ] {
+            ingress.commit_provider_step(&identity, &step)?;
+        }
+        ingress.commit_response(&RuntimeModelResponse::from_parts(
+            ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("hello".to_string()),
+                assistant_reasoning: Some("think".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+            identity,
+        ))?;
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for RecoveredAssistantStreamingExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let identity = ModelResponseIdentity::new(request.turn_id().clone());
+        let turn_request = request.thread_turn_request(generation);
+        let ingress = turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress");
+        ingress.commit_provider_step(
+            &identity,
+            &ProviderStep::ReasoningDelta("first attempt thinking".to_string()),
+        )?;
+        ingress.commit_provider_step(
+            &identity,
+            &ProviderStep::MessageDelta("recovered".to_string()),
+        )?;
+        ingress.commit_response(&RuntimeModelResponse::from_parts(
+            ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("recovered".to_string()),
+                assistant_reasoning: Some("retry thinking".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+            identity,
+        ))?;
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for AbandonedAssistantStreamExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let identity = ModelResponseIdentity::new(request.turn_id().clone());
+        request
+            .thread_turn_request(generation)
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress")
+            .commit_provider_step(
+                &identity,
+                &ProviderStep::MessageDelta("partial".to_string()),
+            )?;
+        thread.lifecycle_mut().finish_task(RunStatus::Failed);
+        Ok(RunStatus::Failed.into())
+    }
+}
+
+impl ThreadOperationExecutor for BlockingAssistantStreamExecutor {
+    fn run_turn(
+        &self,
+        _thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let identity = ModelResponseIdentity::new(request.turn_id().clone());
+        request
+            .thread_turn_request(generation)
+            .provider_response_ingress()
+            .expect("typed generation installs semantic ingress")
+            .commit_provider_step(
+                &identity,
+                &ProviderStep::MessageDelta("restart-partial".to_string()),
+            )?;
+        std::thread::park();
+        unreachable!("restart fixture exits while assistant stream is open")
     }
 }
 
@@ -699,6 +833,228 @@ fn tool_completion_and_result_item_commit_before_operation_terminal() {
             && terminal == &result.terminal
     )));
     host.shutdown().unwrap();
+}
+
+#[test]
+fn assistant_streams_are_durable_and_complete_into_exact_items() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(AssistantStreamingExecutor))
+        .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned assistant streams",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(
+                    &attachment.baseline.snapshot,
+                    "stream exact assistant facts",
+                ),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    assert_eq!(snapshot.assistant_streams.len(), 2);
+    assert!(snapshot.assistant_streams.iter().any(|stream| {
+        stream.channel == AssistantChannel::Message
+            && stream.text.as_str() == "hello"
+            && stream.next_offset == ByteOffset::new(5)
+            && stream.state == SurfaceAssistantStreamState::Completed
+    }));
+    assert!(snapshot.assistant_streams.iter().any(|stream| {
+        stream.channel == AssistantChannel::Reasoning
+            && stream.text.as_str() == "think"
+            && stream.next_offset == ByteOffset::new(5)
+            && stream.state == SurfaceAssistantStreamState::Completed
+    }));
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::AssistantMessage { text, .. } if text.as_str() == "hello"
+    )));
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::AssistantReasoning { summary, content, .. }
+            if summary.as_str().is_empty() && content.as_str() == "think"
+    )));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn provider_recovery_discards_superseded_stream_before_completing_response() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(RecoveredAssistantStreamingExecutor))
+        .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "replace superseded assistant stream",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(
+                    &attachment.baseline.snapshot,
+                    "recover empty provider response",
+                ),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    assert!(snapshot.assistant_streams.iter().any(|stream| {
+        stream.channel == AssistantChannel::Reasoning
+            && stream.text.as_str() == "first attempt thinking"
+            && stream.state == SurfaceAssistantStreamState::Discarded
+    }));
+    assert!(snapshot.assistant_streams.iter().any(|stream| {
+        stream.channel == AssistantChannel::Message
+            && stream.text.as_str() == "recovered"
+            && stream.state == SurfaceAssistantStreamState::Completed
+    }));
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::AssistantReasoning { summary, content, .. }
+            if summary.as_str().is_empty() && content.as_str() == "retry thinking"
+    )));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn failed_generation_discards_open_assistant_stream_before_terminal() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(AbandonedAssistantStreamExecutor))
+        .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "discard abandoned assistant stream",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(
+                    &attachment.baseline.snapshot,
+                    "fail after a partial response",
+                ),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    assert_eq!(snapshot.assistant_streams.len(), 1);
+    assert_eq!(
+        snapshot.assistant_streams[0].state,
+        SurfaceAssistantStreamState::Discarded
+    );
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn cold_recovery_discards_durable_partial_assistant_stream() {
+    if std::env::var_os(ASSISTANT_STREAM_RESTART_CHILD).is_some() {
+        run_assistant_stream_restart_child();
+    }
+    with_orca_home(|home| {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("cold_recovery_discards_durable_partial_assistant_stream")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(ASSISTANT_STREAM_RESTART_CHILD, "1")
+            .env("ORCA_HOME", home)
+            .status()
+            .expect("start partial assistant restart fixture");
+        assert!(status.success(), "partial assistant restart child failed");
+        let thread_id: String = serde_json::from_slice(
+            &fs::read(home.join("runtime-surface-assistant-stream-restart.json")).unwrap(),
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host
+            .start_thread(
+                test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "recover partial assistant stream",
+            )
+            .unwrap();
+        let snapshot = fresh_snapshot(&thread.surface());
+        assert_eq!(snapshot.assistant_streams.len(), 1);
+        assert_eq!(
+            snapshot.assistant_streams[0].text.as_str(),
+            "restart-partial"
+        );
+        assert_eq!(
+            snapshot.assistant_streams[0].state,
+            SurfaceAssistantStreamState::Discarded
+        );
+        assert!(
+            snapshot
+                .operation_history
+                .iter()
+                .any(|operation| operation.terminal.is_some())
+        );
+        host.shutdown().unwrap();
+    });
 }
 
 #[test]
@@ -1056,6 +1412,60 @@ fn run_tool_completion_restart_child() -> ! {
     ));
     fs::write(
         home.join("runtime-surface-tool-completion-restart.json"),
+        serde_json::to_vec(&thread_id).unwrap(),
+    )
+    .unwrap();
+    std::process::exit(0)
+}
+
+fn run_assistant_stream_restart_child() -> ! {
+    let home = PathBuf::from(std::env::var_os("ORCA_HOME").expect("restart child ORCA_HOME"));
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start_with_executor(Arc::new(BlockingAssistantStreamExecutor)).unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "partial assistant restart fixture",
+        )
+        .unwrap();
+    let thread_id = thread.thread_id();
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(
+                    &attachment.baseline.snapshot,
+                    "persist partial assistant stream",
+                ),
+            )
+            .unwrap(),
+    );
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), reserved.operation_id, reserved.lease.lease_id)
+            .unwrap(),
+    );
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        if fresh_snapshot(&surface)
+            .assistant_streams
+            .iter()
+            .any(|stream| stream.text.as_str() == "restart-partial")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "partial assistant stream was not durably visible"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    fs::write(
+        home.join("runtime-surface-assistant-stream-restart.json"),
         serde_json::to_vec(&thread_id).unwrap(),
     )
     .unwrap();

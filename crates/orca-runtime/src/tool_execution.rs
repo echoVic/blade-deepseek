@@ -1223,6 +1223,14 @@ mod tests {
             Ok(())
         }
 
+        fn commit_provider_step(
+            &self,
+            _identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+            _step: &orca_core::provider_types::ProviderStep,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
         fn commit_tool_results(&self, _results: &[ToolResult]) -> io::Result<()> {
             self.committed.store(true, Ordering::SeqCst);
             Ok(())
