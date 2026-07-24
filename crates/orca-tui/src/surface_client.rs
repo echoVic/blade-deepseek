@@ -158,9 +158,10 @@ pub(crate) fn run(
 }
 
 pub(crate) fn update_settings(
-    surface: &RuntimeSurfaceHandle,
+    thread: &RuntimeSurfaceThreadHandle,
     patches: NonEmptyVec<RuntimeSettingsPatch>,
 ) -> io::Result<SurfaceSettingsSnapshot> {
+    let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
         role: SurfaceAttachmentRole::Tui,
@@ -182,7 +183,7 @@ pub(crate) fn update_settings(
         attachment
             .client
             .update_settings(SurfaceRequestId::new(), expected_revision, patches);
-    detach(surface, &attachment.client);
+    detach(&surface, &attachment.client);
     let result = result.map_err(|error| {
         io::Error::other(format!("typed TUI settings update failed: {error:?}"))
     })?;

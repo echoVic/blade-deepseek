@@ -5566,8 +5566,8 @@ fn apply_hosted_settings_action(
             Ok(patches) => patches,
             Err(_) => return,
         };
-        let surface = thread.surface();
-        let settings = match crate::surface_client::update_settings(&surface, patches) {
+        let typed_thread = thread.typed_surface();
+        let settings = match crate::surface_client::update_settings(&typed_thread, patches) {
             Ok(settings) => settings,
             Err(error) => {
                 let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
