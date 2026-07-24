@@ -770,4 +770,77 @@ mod tests {
             None => unsafe { std::env::remove_var("ORCA_HOME") },
         }
     }
+
+    #[test]
+    fn typed_ordinary_turn_reloads_and_runs_after_runtime_restart() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed restart source")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let first = run_through_dispatch(
+            &thread,
+            HostedTurnRequest::new("before runtime restart"),
+            config.clone(),
+            &controller,
+            &event_tx,
+        )
+        .expect("first typed turn");
+        assert!(matches!(
+            first,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        assert!(event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
+        let thread_id = thread.thread_id().to_string();
+        thread.shutdown().expect("first thread shutdown");
+        host.shutdown().expect("first host shutdown");
+
+        let mut resumed_config = config;
+        resumed_config.history_mode = HistoryMode::Resume(thread_id);
+        let resumed_host = RuntimeHost::start().expect("resumed runtime host");
+        let resumed_thread = resumed_host
+            .start_thread(resumed_config.clone(), "typed restart resumed")
+            .expect("resumed runtime thread");
+        let resumed_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (resumed_event_tx, resumed_event_rx) = mpsc::unbounded();
+        let second = run_through_dispatch(
+            &resumed_thread,
+            HostedTurnRequest::new("after runtime restart"),
+            resumed_config,
+            &resumed_controller,
+            &resumed_event_tx,
+        )
+        .expect("resumed typed turn");
+        assert!(matches!(
+            second,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        let resumed_events = resumed_event_rx.try_iter().collect::<Vec<_>>();
+        assert!(resumed_events.iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
+        assert!(
+            resumed_events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::MessageDelta(text) if !text.is_empty()))
+        );
+
+        resumed_thread.shutdown().expect("resumed thread shutdown");
+        resumed_host.shutdown().expect("resumed host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
 }
