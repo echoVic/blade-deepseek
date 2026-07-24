@@ -423,6 +423,15 @@ fn acp_typed_load_replays_surface_history_after_restart() {
         matches!(update, SessionUpdate::AgentMessageChunk(chunk)
             if matches!(&chunk.content, ContentBlock::Text(text) if text.text.contains("history survives restart")))
     }));
+    assert!(updates.iter().any(|update| {
+        matches!(update, SessionUpdate::UserMessageChunk(chunk)
+            if matches!(&chunk.content, ContentBlock::Text(text) if text.text.contains("persist this")))
+    }));
+    assert!(
+        updates
+            .iter()
+            .any(|update| matches!(update, SessionUpdate::Plan(_)))
+    );
     assert_eq!(second_executor.call_count(), 0);
     second_host.shutdown().expect("shutdown second host");
 }
