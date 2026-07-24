@@ -38,23 +38,26 @@ struct SurfaceRunGuard<'a> {
 
 struct SurfaceActivationGuard<'a> {
     controller: &'a TuiOperationController,
-    armed: bool,
+    pending: bool,
 }
 
 impl<'a> SurfaceActivationGuard<'a> {
     fn begin(controller: &'a TuiOperationController) -> io::Result<Self> {
-        let armed = controller.begin_surface_activation()?;
-        Ok(Self { controller, armed })
+        controller.begin_surface_activation()?;
+        Ok(Self {
+            controller,
+            pending: true,
+        })
     }
 
     fn disarm(&mut self) {
-        self.armed = false;
+        self.pending = false;
     }
 }
 
 impl Drop for SurfaceActivationGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
+        if self.pending {
             self.controller.cancel_surface_activation();
         }
     }
@@ -753,6 +756,64 @@ mod tests {
             TuiHostedOperationOutcome::Turn { status } if status == "success"
         ));
         assert!(second_event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_failed_prearmed_activation_does_not_cancel_next_turn() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed prearmed activation failure")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        assert!(controller.begin_surface_activation().expect("prearm"));
+
+        let mut mismatched = config.clone();
+        mismatched.approval_mode = orca_core::approval_types::ApprovalMode::AutoEdit;
+        let (failed_event_tx, _failed_event_rx) = mpsc::unbounded();
+        let error = match run_typed(
+            &thread,
+            HostedTurnRequest::new("must fail before reservation"),
+            mismatched,
+            &controller,
+            &failed_event_tx,
+        ) {
+            Ok(_) => panic!("mismatched settings must reject the activation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("config differs"));
+
+        controller.interrupt_current();
+
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let outcome = run_typed(
+            &thread,
+            HostedTurnRequest::new("turn after failed activation"),
+            config,
+            &controller,
+            &event_tx,
+        )
+        .expect("next typed turn");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        assert!(event_rx.try_iter().any(
             |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
         ));
 

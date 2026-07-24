@@ -5011,10 +5011,9 @@ pub(crate) fn run_hosted_operation(
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    let activation_armed = match request.operation_kind() {
-        HostedOperationKind::GoalRun => false,
-        _ => controller.begin_surface_activation()?,
-    };
+    if !matches!(request.operation_kind(), HostedOperationKind::GoalRun) {
+        controller.begin_surface_activation()?;
+    }
     let operation_kind = request.operation_kind().clone();
     let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
     let pending_interactions =
@@ -5053,9 +5052,7 @@ pub(crate) fn run_hosted_operation(
     let operation = match thread.start_turn_with_config(request, io::sink(), config) {
         Ok(operation) => Arc::new(operation),
         Err(error) => {
-            if activation_armed {
-                controller.cancel_surface_activation();
-            }
+            controller.cancel_surface_activation();
             send_hosted_operation_terminal_failure(event_tx, &operation_kind);
             return Err(io::Error::other(error.to_string()));
         }
