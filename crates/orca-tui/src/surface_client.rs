@@ -6,9 +6,7 @@ use std::io;
 use std::time::Duration;
 
 use orca_core::config::RunConfig;
-#[cfg(not(test))]
-use orca_runtime::runtime_host::HostedOperationKind;
-use orca_runtime::runtime_host::{HostedTurnRequest, RuntimeThreadHandle};
+use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
     AttachResult, FreshAttachRequest, MutationReply, NonEmptyVec, OperationIngressCorrelation,
     OperationKind, OperationPatch, OperationRequestIntent, OperationSettingsPreparation,
@@ -45,11 +43,6 @@ pub(crate) fn is_terminal_recovery_error(error: &io::Error) -> bool {
         .get_ref()
         .and_then(|source| source.downcast_ref::<TerminalRecoveryRequired>())
         .is_some()
-}
-
-#[cfg(test)]
-thread_local! {
-    static FORCE_TYPED_SURFACE_TEST_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct SurfaceRunGuard<'a> {
@@ -136,25 +129,13 @@ impl Drop for SurfaceRunGuard<'_> {
 }
 
 pub(crate) fn run(
-    thread: &RuntimeThreadHandle,
+    thread: &RuntimeSurfaceThreadHandle,
     request: HostedTurnRequest,
     config: RunConfig,
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
-    #[cfg(test)]
-    {
-        if FORCE_TYPED_SURFACE_TEST_PATH.with(std::cell::Cell::get) {
-            return run_typed(thread, request, config, controller, event_tx);
-        }
-        return crate::app::run_hosted_operation(thread, request, config, controller, event_tx);
-    }
-    #[cfg(not(test))]
-    if matches!(request.operation_kind(), HostedOperationKind::Turn) {
-        run_typed(thread, request, config, controller, event_tx)
-    } else {
-        crate::app::run_hosted_operation(thread, request, config, controller, event_tx)
-    }
+    run_typed_thread(thread, request, config, controller, event_tx)
 }
 
 pub(crate) fn update_settings(
@@ -196,17 +177,6 @@ pub(crate) fn update_settings(
             Err(io::Error::other("typed TUI settings update deferred"))
         }
     }
-}
-
-fn run_typed(
-    thread: &RuntimeThreadHandle,
-    request: HostedTurnRequest,
-    config: RunConfig,
-    controller: &TuiOperationController,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> io::Result<TuiHostedOperationOutcome> {
-    let typed_thread = thread.typed_surface();
-    run_typed_thread(&typed_thread, request, config, controller, event_tx)
 }
 
 fn run_typed_thread(
@@ -634,7 +604,7 @@ fn detach(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceClientHandle) {
 mod tests {
     use super::*;
     use orca_core::config::HistoryMode;
-    use orca_runtime::runtime_host::RuntimeHost;
+    use orca_runtime::runtime_host::{RuntimeHost, RuntimeThreadHandle};
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -650,12 +620,8 @@ mod tests {
         controller: &TuiOperationController,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        FORCE_TYPED_SURFACE_TEST_PATH.with(|enabled| {
-            let previous = enabled.replace(true);
-            let result = run(thread, request, config, controller, event_tx);
-            enabled.set(previous);
-            result
-        })
+        let typed_thread = thread.typed_surface();
+        run(&typed_thread, request, config, controller, event_tx)
     }
 
     #[test]
@@ -843,8 +809,9 @@ mod tests {
         let mut mismatched = config.clone();
         mismatched.approval_mode = orca_core::approval_types::ApprovalMode::AutoEdit;
         let (failed_event_tx, _failed_event_rx) = mpsc::unbounded();
-        let error = match run_typed(
-            &thread,
+        let typed_thread = thread.typed_surface();
+        let error = match run_typed_thread(
+            &typed_thread,
             HostedTurnRequest::new("must fail before reservation"),
             mismatched,
             &controller,
@@ -858,8 +825,9 @@ mod tests {
         controller.interrupt_current();
 
         let (event_tx, event_rx) = mpsc::unbounded();
-        let outcome = run_typed(
-            &thread,
+        let typed_thread = thread.typed_surface();
+        let outcome = run_typed_thread(
+            &typed_thread,
             HostedTurnRequest::new("turn after failed activation"),
             config,
             &controller,

@@ -42,6 +42,7 @@ mod submitted_turn;
 mod surface_boundary_tests;
 mod surface_client;
 mod surface_projection;
+#[cfg(not(test))]
 pub(crate) use surface_client::run as run_surface;
 mod terminal_lifecycle;
 pub mod theme;

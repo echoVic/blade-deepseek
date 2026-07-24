@@ -5171,7 +5171,27 @@ fn run_hosted_goal_run(
     } else {
         request
     };
-    let status = match crate::run_surface(thread, request, config.clone(), controller, event_tx) {
+    let outcome = match request.operation_kind() {
+        HostedOperationKind::GoalRun => {
+            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
+        }
+        HostedOperationKind::Turn => {
+            #[cfg(test)]
+            {
+                run_hosted_operation(thread, request, config.clone(), controller, event_tx)
+            }
+            #[cfg(not(test))]
+            {
+                let typed_thread = thread.typed_surface();
+                crate::run_surface(&typed_thread, request, config.clone(), controller, event_tx)
+            }
+        }
+        HostedOperationKind::ManualCompaction
+        | HostedOperationKind::BackgroundContinuation { .. } => {
+            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
+        }
+    };
+    let status = match outcome {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
             let _ = event_tx.send(TuiEvent::Error(
