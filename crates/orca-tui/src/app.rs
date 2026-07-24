@@ -777,6 +777,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_recovery_error_does_not_fabricate_failure_terminal() {
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let error = crate::surface_client::terminal_recovery_error_for_test(
+            "terminal commit requires recovery",
+        );
+
+        emit_hosted_operation_error(&event_tx, error, &HostedOperationKind::Turn);
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            matches!(events.as_slice(), [TuiEvent::Error(message)] if message.contains("requires recovery"))
+        );
+    }
+
+    #[test]
     fn stale_bound_file_preparation_emits_submission_rejected() {
         with_orca_home(|_| {
             let root = tempdir().expect("workspace root");
@@ -5107,6 +5122,18 @@ fn send_hosted_operation_terminal_failure(
     });
 }
 
+fn emit_hosted_operation_error(
+    event_tx: &mpsc::Sender<TuiEvent>,
+    error: io::Error,
+    operation_kind: &HostedOperationKind,
+) {
+    let recovery_required = crate::surface_client::is_terminal_recovery_error(&error);
+    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+    if !recovery_required {
+        send_hosted_operation_terminal_failure(event_tx, operation_kind);
+    }
+}
+
 fn run_hosted_goal_run(
     config: &RunConfig,
     thread: &RuntimeThreadHandle,
@@ -5153,8 +5180,7 @@ fn run_hosted_goal_run(
             return;
         }
         Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-            send_hosted_operation_terminal_failure(event_tx, &HostedOperationKind::Turn);
+            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn);
             return;
         }
     };

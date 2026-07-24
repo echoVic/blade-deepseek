@@ -1,5 +1,7 @@
 use crossbeam_channel as mpsc;
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
 use std::io;
 use std::time::Duration;
 
@@ -21,6 +23,29 @@ use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::TuiOperationController;
 use crate::surface_projection::TuiSurfaceProjection;
 use crate::types::TuiEvent;
+
+#[derive(Debug)]
+pub(crate) struct TerminalRecoveryRequired(&'static str);
+
+#[cfg(test)]
+pub(crate) fn terminal_recovery_error_for_test(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, TerminalRecoveryRequired(message))
+}
+
+impl fmt::Display for TerminalRecoveryRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl Error for TerminalRecoveryRequired {}
+
+pub(crate) fn is_terminal_recovery_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<TerminalRecoveryRequired>())
+        .is_some()
+}
 
 #[cfg(test)]
 thread_local! {
@@ -458,7 +483,18 @@ fn drain_operation(
                     }
                 }
                 Ok(other) => {
-                    failure = Some(io::Error::other(terminal_wait_failure_message(&other)));
+                    let message = terminal_wait_failure_message(&other);
+                    failure = Some(
+                        if matches!(
+                            other,
+                            WaitOperationTerminalResult::TerminalCommitFailure { .. }
+                                | WaitOperationTerminalResult::TerminalProjectionFailure { .. }
+                        ) {
+                            io::Error::new(io::ErrorKind::Other, TerminalRecoveryRequired(message))
+                        } else {
+                            io::Error::other(message)
+                        },
+                    );
                     sealed = true;
                 }
                 Err(error) => {
