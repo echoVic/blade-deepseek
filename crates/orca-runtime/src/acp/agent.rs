@@ -1530,6 +1530,32 @@ mod tests {
     }
 
     #[test]
+    fn permission_response_releases_exact_waiter() {
+        let (bridge, mut requests) = AcpClientBridge::new();
+        let waiter_bridge = Arc::clone(&bridge);
+        let waiter = std::thread::spawn(move || {
+            waiter_bridge.request_permission(permission_request("respond", "tool-1"))
+        });
+        let request = requests
+            .blocking_recv()
+            .expect("permission request is queued");
+        bridge.complete_permission(
+            &request.key,
+            Ok(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("allow_once")),
+            )),
+        );
+        let response = waiter
+            .join()
+            .expect("permission waiter joins")
+            .expect("permission response succeeds");
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(_)
+        ));
+    }
+
+    #[test]
     fn tool_events_project_as_typed_acp_updates() {
         let request = SurfaceToolRequest {
             tool_call_id: crate::runtime_surface::SurfaceToolCallId::try_new("tool-typed").unwrap(),
