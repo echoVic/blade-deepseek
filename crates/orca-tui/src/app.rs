@@ -4848,7 +4848,7 @@ fn hosted_tui_controller_loop(
                 };
                 let runtime = match thread
                     .as_ref()
-                    .and_then(|thread| thread.goal_runtime().ok())
+                    .and_then(|thread| thread.typed_surface().goal().ok())
                 {
                     Some(runtime) => runtime,
                     None => {
@@ -4914,7 +4914,7 @@ fn hosted_tui_controller_loop(
                 };
                 let runtime = match thread
                     .as_ref()
-                    .and_then(|thread| thread.goal_runtime().ok())
+                    .and_then(|thread| thread.typed_surface().goal().ok())
                 {
                     Some(runtime) => runtime,
                     None => {
@@ -4963,7 +4963,7 @@ fn hosted_tui_controller_loop(
                 };
                 let runtime = match thread
                     .as_ref()
-                    .and_then(|thread| thread.goal_runtime().ok())
+                    .and_then(|thread| thread.typed_surface().goal().ok())
                 {
                     Some(runtime) => runtime,
                     None => {
@@ -5021,7 +5021,7 @@ fn hosted_tui_controller_loop(
                 );
                 let goal = thread
                     .as_ref()
-                    .and_then(|runtime_thread| runtime_thread.goal_runtime().ok())
+                    .and_then(|runtime_thread| runtime_thread.typed_surface().goal().ok())
                     .and_then(|runtime| runtime.project_thread_goal(&session_id).ok().flatten());
                 if let (Some(runtime_thread), Some(goal)) = (thread.as_ref(), goal) {
                     let cfg = config.lock().unwrap().clone();
@@ -5348,7 +5348,7 @@ fn run_hosted_goal_run(
         send_goal_history_error(event_tx);
         return;
     };
-    let runtime = match thread.goal_runtime() {
+    let runtime = match thread.typed_surface().goal() {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error.to_string()));
@@ -5604,7 +5604,8 @@ fn resume_latest_active_goal_hosted(
     let active_goal =
         match goal_runtime.resume_into(&goal.session_id, &new_session_id, now_timestamp()) {
             Ok(Some(_)) => match resumed
-                .goal_runtime()
+                .typed_surface()
+                .goal()
                 .ok()
                 .and_then(|runtime| runtime.project_thread_goal(&new_session_id).ok().flatten())
             {
