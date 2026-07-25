@@ -178,6 +178,7 @@ struct PreparedThreadTurn<'a, 'session, W: io::Write> {
 
 struct ThreadTurnCompletion {
     status: RunStatus,
+    end_reason: crate::lifecycle::TurnEndReason,
     error: Option<String>,
     usage: UsageTotals,
     main_session_task: Option<ThreadTurnMainSessionTask>,
@@ -195,6 +196,7 @@ enum PreparedThreadTurnOutcome {
 pub enum ThreadTurnOutcome {
     Completed {
         status: RunStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
         background_workflows: RuntimeBackgroundWorkflows,
     },
     ProviderSuspended {
@@ -675,16 +677,24 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                 return Err(error);
             }
         };
-        let completion = (|| -> io::Result<(RunStatus, Option<String>)> {
-            let status = result.status;
-            lifecycle.finish_task(status);
-            if request.options().wait_for_background_workflows {
-                observe_background_workflows(true, events, sink, background_workflows)?;
-            }
-            let status = run_verifier_if_needed(status, config.verifier.as_deref(), events, sink)?;
-            Ok((status, result.error))
-        })();
-        let (status, error) = match completion {
+        let completion =
+            (|| -> io::Result<(RunStatus, crate::lifecycle::TurnEndReason, Option<String>)> {
+                let status = result.status;
+                let mut end_reason = result.reason;
+                lifecycle.finish_task(status);
+                if request.options().wait_for_background_workflows {
+                    observe_background_workflows(true, events, sink, background_workflows)?;
+                }
+                let status =
+                    run_verifier_if_needed(status, config.verifier.as_deref(), events, sink)?;
+                if status != result.status {
+                    // Verifier (or another post-loop step) changed the terminal
+                    // status; the original end reason no longer describes it.
+                    end_reason = crate::lifecycle::TurnEndReason::Unclassified;
+                }
+                Ok((status, end_reason, result.error))
+            })();
+        let (status, end_reason, error) = match completion {
             Ok(completion) => completion,
             Err(error) => {
                 if let Some(task) = main_session_task.as_ref() {
@@ -704,6 +714,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             RuntimeBackgroundWorkflows::from_vec(std::mem::take(background_workflows));
         Ok(PreparedThreadTurnOutcome::Completed(ThreadTurnCompletion {
             status,
+            end_reason,
             error,
             usage,
             main_session_task,
@@ -742,10 +753,12 @@ impl PreparedThreadTurnOutcome {
         match self {
             Self::Completed(mut completion) => {
                 let background_workflows = std::mem::take(&mut completion.background_workflows);
+                let end_reason = completion.end_reason;
                 completion
                     .commit(session, request, events, sink)
                     .map(|status| ThreadTurnOutcome::Completed {
                         status,
+                        end_reason,
                         background_workflows,
                     })
             }
@@ -765,6 +778,7 @@ impl ThreadTurnOutcome {
         match self {
             Self::Completed {
                 status,
+                end_reason: _,
                 background_workflows,
             } => {
                 background_workflows.join_silently();

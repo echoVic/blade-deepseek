@@ -259,26 +259,26 @@ impl GoalStore {
         Ok(load_stored_goal(&connection, session_id)?.map(|stored| stored.record))
     }
 
-    /// Recent non-null gap fingerprints for a goal, most recent first. Bounded
-    /// because only the streak limit's worth of history can affect the verdict.
+    /// Recent gap fingerprints for a goal, most recent first. `None` is a
+    /// progress barrier and must be preserved so equal gaps separated by a
+    /// productive turn never become one synthetic streak after restart.
     pub fn recent_gap_fingerprints(
         &self,
         goal_id: &GoalId,
         limit: u32,
-    ) -> Result<Vec<String>, GoalStoreError> {
+    ) -> Result<Vec<Option<String>>, GoalStoreError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT t.gap_fingerprint
              FROM goal_turns t
              JOIN goal_runs r ON t.goal_run_id = r.goal_run_id
              WHERE r.goal_id = ?1
-               AND t.gap_fingerprint IS NOT NULL
                AND t.finished_at IS NOT NULL
              ORDER BY t.finished_at DESC, t.rowid DESC
              LIMIT ?2",
         )?;
         let rows = statement.query_map(params![goal_id.as_str(), limit], |row| {
-            row.get::<_, String>(0)
+            row.get::<_, Option<String>>(0)
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -2134,6 +2134,66 @@ mod tests {
         assert_eq!(
             store.outer_turn_status(&outer_turn_id).unwrap().as_deref(),
             Some("success")
+        );
+    }
+
+    #[test]
+    fn recent_gap_history_preserves_progress_barriers() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let goal = create_goal(&store, "session-gap-barrier");
+        let run_id = GoalRunId::new();
+        store
+            .begin_run(BeginGoalRunInput {
+                goal_id: goal.goal_id.clone(),
+                goal_run_id: run_id.clone(),
+                origin: GoalTurnOrigin::User,
+                started_at: 700,
+            })
+            .unwrap();
+
+        for (index, fingerprint) in [
+            Some("gap:alpha".to_string()),
+            None,
+            Some("gap:alpha".to_string()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let outer_turn_id = GoalOuterTurnId::new();
+            let at = 701 + i64::try_from(index).unwrap() * 2;
+            store
+                .begin_outer_turn(BeginOuterTurnInput {
+                    goal_id: goal.goal_id.clone(),
+                    goal_run_id: run_id.clone(),
+                    outer_turn_id: outer_turn_id.clone(),
+                    origin: GoalTurnOrigin::Continuation,
+                    provider_turn_id: format!("provider-gap-{index}"),
+                    started_at: at,
+                })
+                .unwrap();
+            store
+                .finish_outer_turn(FinishOuterTurnInput {
+                    goal_id: goal.goal_id.clone(),
+                    goal_run_id: run_id.clone(),
+                    outer_turn_id,
+                    status: GoalTurnStatus::Success,
+                    tool_count: 1,
+                    model_response_count: 1,
+                    gap_fingerprint: fingerprint,
+                    usage_event: None,
+                    finished_at: at + 1,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.recent_gap_fingerprints(&goal.goal_id, 3).unwrap(),
+            vec![
+                Some("gap:alpha".to_string()),
+                None,
+                Some("gap:alpha".to_string()),
+            ]
         );
     }
 

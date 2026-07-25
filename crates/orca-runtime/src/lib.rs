@@ -4,6 +4,7 @@ pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
 pub mod background_turn;
+mod budget_soft_landing;
 mod child_agent_entrypoints;
 mod child_agent_loop_runner;
 mod child_agent_loop_setup;
@@ -4853,9 +4854,7 @@ mod tests {
             "impl RuntimeTurnStartResultStep",
             ".start_turn(",
             "started_turn.into_event()",
-            "AgentLoopResult::failure(",
-            "error.status",
-            "error.message",
+            "AgentLoopResult::from(",
         ] {
             assert!(
                 runtime_turn_start_source.contains(marker),

@@ -85,10 +85,7 @@ impl RuntimeTurnStartResultStep {
 
     pub(crate) fn fold(&self, output: RuntimeTurnStartStepOutput) -> RuntimeTurnStartResult {
         match output.error {
-            Some(error) => RuntimeTurnStartResult::Return(AgentLoopResult::failure(
-                error.status,
-                error.message,
-            )),
+            Some(error) => RuntimeTurnStartResult::Return(AgentLoopResult::from(error)),
             None => RuntimeTurnStartResult::Continue,
         }
     }

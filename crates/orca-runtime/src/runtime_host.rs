@@ -216,6 +216,7 @@ pub trait ThreadOperationExecutor: Send + Sync + 'static {
 pub enum ThreadOperationOutcome {
     Completed {
         status: RunStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
         background_workflows: RuntimeBackgroundWorkflows,
     },
     ProviderSuspended {
@@ -228,6 +229,7 @@ impl From<RunStatus> for ThreadOperationOutcome {
     fn from(status: RunStatus) -> Self {
         Self::Completed {
             status,
+            end_reason: crate::lifecycle::TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
         }
     }
@@ -327,9 +329,37 @@ pub enum GoalContinuationRejectCode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalTurnDisposition {
+    /// The outer turn completed normally and advanced the goal.
+    Advanced,
+    /// The outer turn stopped at a resumable runtime wall.
+    Interrupted {
+        reason: crate::lifecycle::TurnEndReason,
+    },
+    /// Continuation needs user, budget, verifier, or infrastructure intervention.
+    Blocked {
+        status: RunStatus,
+        reason: crate::lifecycle::TurnEndReason,
+    },
+}
+
+fn goal_turn_disposition(
+    status: RunStatus,
+    reason: crate::lifecycle::TurnEndReason,
+) -> GoalTurnDisposition {
+    match (status, reason) {
+        (RunStatus::Success, _) => GoalTurnDisposition::Advanced,
+        (RunStatus::BudgetExhausted, crate::lifecycle::TurnEndReason::MaxInnerTurns) => {
+            GoalTurnDisposition::Interrupted { reason }
+        }
+        _ => GoalTurnDisposition::Blocked { status, reason },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GoalContinuationPreflight {
     cancelled: bool,
-    successful_turn: bool,
+    disposition: GoalTurnDisposition,
     queued_user_input: bool,
     pending_interaction: bool,
     active_workflow: bool,
@@ -350,10 +380,10 @@ fn goal_continuation_preflight(
             "goal continuation rejected because the operation was cancelled",
         ));
     }
-    if !input.successful_turn {
+    if matches!(input.disposition, GoalTurnDisposition::Blocked { .. }) {
         return Some(reject(
             GoalContinuationRejectCode::NonSuccessfulTurn,
-            "goal continuation rejected after a non-successful outer turn",
+            "goal continuation rejected because the outer turn is blocked",
         ));
     }
     if input.queued_user_input {
@@ -1191,6 +1221,11 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                 } else {
                     RunStatus::Success
                 },
+                end_reason: if cancel.is_cancelled() {
+                    crate::lifecycle::TurnEndReason::Cancelled
+                } else {
+                    crate::lifecycle::TurnEndReason::Unclassified
+                },
                 background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             });
         }
@@ -1217,9 +1252,11 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
             .map(|outcome| match outcome {
                 crate::controller::ThreadTurnOutcome::Completed {
                     status,
+                    end_reason,
                     background_workflows,
                 } => ThreadOperationOutcome::Completed {
                     status,
+                    end_reason,
                     background_workflows,
                 },
                 crate::controller::ThreadTurnOutcome::ProviderSuspended {
@@ -12599,7 +12636,7 @@ impl ThreadActor {
                                     ),
                                 );
                             }
-                            if let (GoalContinuationAdmission::Admit { .. }, Some(objective)) =
+                            if let (GoalContinuationAdmission::Admit { .. }, Some(mut envelope)) =
                                 (admission, objective)
                             {
                                 if let Err(error) = result.writer.finish_generation(false) {
@@ -12629,10 +12666,10 @@ impl ThreadActor {
                                     .generation_id()
                                     .as_u64()
                                     .saturating_add(1);
-                                active.request.prompt = goal_continuation_prompt(
-                                    &objective,
-                                    usize::try_from(continuation).unwrap_or(usize::MAX),
-                                );
+                                envelope.continuation =
+                                    usize::try_from(continuation).unwrap_or(usize::MAX);
+                                active.request.prompt =
+                                    goal_continuation_envelope_prompt(&envelope);
                                 active.request.turn_id = TurnId::new();
                                 active.request.continuation = None;
                                 active.request.goal_turn_origin =
@@ -12732,18 +12769,68 @@ impl ThreadActor {
         state: &mut ThreadActorState,
         active: &mut ActiveOperation,
         outcome: &GenerationTaskOutcome,
-    ) -> (GoalContinuationAdmission, Option<String>) {
+    ) -> (GoalContinuationAdmission, Option<GoalContinuationEnvelope>) {
         let fence = active.generation.context.fence();
-        let successful_turn = matches!(
-            outcome,
+        let (disposition, last_outer_status, last_end_reason, trigger) = match outcome {
             GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
                 status: RunStatus::Success,
+                end_reason,
                 ..
-            })
-        );
+            }) => (
+                goal_turn_disposition(RunStatus::Success, *end_reason),
+                Some("success"),
+                Some(end_reason.as_str()),
+                GoalContinuationTrigger::Progress,
+            ),
+            GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
+                status: RunStatus::BudgetExhausted,
+                end_reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                ..
+            }) => (
+                goal_turn_disposition(
+                    RunStatus::BudgetExhausted,
+                    crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                ),
+                Some("budget_exhausted"),
+                Some("max_inner_turns"),
+                GoalContinuationTrigger::MaxInnerTurns,
+            ),
+            GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
+                status: RunStatus::BudgetExhausted,
+                end_reason: crate::lifecycle::TurnEndReason::CostBudgetExhausted,
+                ..
+            }) => (
+                goal_turn_disposition(
+                    RunStatus::BudgetExhausted,
+                    crate::lifecycle::TurnEndReason::CostBudgetExhausted,
+                ),
+                Some("budget_exhausted"),
+                Some("cost_budget_exhausted"),
+                GoalContinuationTrigger::Progress,
+            ),
+            GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
+                status,
+                end_reason,
+                ..
+            }) => (
+                goal_turn_disposition(*status, *end_reason),
+                Some(status.as_str()),
+                Some(end_reason.as_str()),
+                GoalContinuationTrigger::Progress,
+            ),
+            _ => (
+                GoalTurnDisposition::Blocked {
+                    status: RunStatus::Failed,
+                    reason: crate::lifecycle::TurnEndReason::Unclassified,
+                },
+                None,
+                None,
+                GoalContinuationTrigger::Progress,
+            ),
+        };
         if let Some(rejection) = goal_continuation_preflight(GoalContinuationPreflight {
             cancelled: active.generation.cancel.is_cancelled(),
-            successful_turn,
+            disposition,
             queued_user_input: active.steer_handle.has_pending(),
             pending_interaction: active
                 .request
@@ -12769,6 +12856,12 @@ impl ThreadActor {
                 None,
             );
         };
+        let conversation = state.thread.session().conversation();
+        let plan_snapshot = conversation
+            .internal_context
+            .get(orca_core::conversation::PLAN_CONTEXT_FRAGMENT_ID)
+            .map(|fragment| fragment.content.clone());
+        let previous_checkpoint = previous_assistant_checkpoint(conversation);
         let handle = match state.thread.goal_runtime_handle() {
             Ok(handle) => handle,
             Err(error) => {
@@ -12805,11 +12898,40 @@ impl ThreadActor {
         match snapshot.status {
             GoalContinuationStatus::Ready => {
                 active.goal_admitted_generation = Some(fence);
+                let last_gap_fingerprint =
+                    handle.recent_gap_fingerprint(&session_id).ok().flatten();
+                let trigger = if matches!(trigger, GoalContinuationTrigger::MaxInnerTurns) {
+                    GoalContinuationTrigger::MaxInnerTurns
+                } else if last_gap_fingerprint.is_some() {
+                    GoalContinuationTrigger::GapFeedback
+                } else {
+                    GoalContinuationTrigger::Progress
+                };
+                let admit_reason = match trigger {
+                    GoalContinuationTrigger::GapFeedback => {
+                        orca_core::goal_runtime::GoalContinuationReason::GapFeedback
+                    }
+                    GoalContinuationTrigger::MaxInnerTurns | GoalContinuationTrigger::Progress => {
+                        orca_core::goal_runtime::GoalContinuationReason::Progress
+                    }
+                };
                 (
                     GoalContinuationAdmission::Admit {
-                        reason: orca_core::goal_runtime::GoalContinuationReason::Progress,
+                        reason: admit_reason,
                     },
-                    Some(snapshot.record.objective),
+                    Some(GoalContinuationEnvelope {
+                        objective: snapshot.record.objective,
+                        // Filled by the host when spawning the next generation.
+                        continuation: 0,
+                        trigger,
+                        tokens_used: snapshot.record.usage.charged_tokens(),
+                        token_budget: snapshot.record.token_budget,
+                        last_gap_fingerprint,
+                        last_outer_status,
+                        last_end_reason,
+                        plan_snapshot,
+                        previous_checkpoint,
+                    }),
                 )
             }
             GoalContinuationStatus::PendingVerification => (
@@ -13401,12 +13523,21 @@ fn run_hosted_operation(
                 event_observer.as_deref(),
             );
             let usage_before = thread.session().aggregate_usage_totals();
-            let messages_before = thread.session().conversation().messages.len();
+            let progress_baseline =
+                crate::thread::TurnProgressBaseline::capture(thread.session().conversation());
             let outcome = executor.run_turn(thread, request, generation, events, writer, cancel);
-            let status = match &outcome {
-                Ok(ThreadOperationOutcome::Completed { status, .. }) => *status,
-                Ok(ThreadOperationOutcome::ProviderSuspended { .. }) => RunStatus::ApprovalRequired,
-                Err(_) => RunStatus::Failed,
+            let (status, end_reason) = match &outcome {
+                Ok(ThreadOperationOutcome::Completed {
+                    status, end_reason, ..
+                }) => (*status, *end_reason),
+                Ok(ThreadOperationOutcome::ProviderSuspended { .. }) => (
+                    RunStatus::ApprovalRequired,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                ),
+                Err(_) => (
+                    RunStatus::Failed,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                ),
             };
             let usage = crate::thread::goal_usage_delta(
                 usage_before,
@@ -13414,11 +13545,12 @@ fn run_hosted_operation(
             );
             let evidence = crate::thread::turn_progress_evidence_since(
                 thread.session().conversation(),
-                messages_before,
+                &progress_baseline,
             );
             thread.finish_goal_turn(
                 binding.as_ref(),
                 status,
+                end_reason,
                 usage,
                 Some(events),
                 event_observer.as_deref(),
@@ -13739,10 +13871,129 @@ fn provider_response_usage_totals(
     Some(tracker.add_usage(usage))
 }
 
-fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalContinuationTrigger {
+    Progress,
+    MaxInnerTurns,
+    GapFeedback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GoalContinuationEnvelope {
+    objective: String,
+    continuation: usize,
+    trigger: GoalContinuationTrigger,
+    tokens_used: i64,
+    token_budget: Option<i64>,
+    last_gap_fingerprint: Option<String>,
+    last_outer_status: Option<&'static str>,
+    last_end_reason: Option<&'static str>,
+    plan_snapshot: Option<String>,
+    previous_checkpoint: Option<String>,
+}
+
+fn goal_continuation_trigger_name(trigger: GoalContinuationTrigger) -> &'static str {
+    match trigger {
+        GoalContinuationTrigger::Progress => "progress",
+        GoalContinuationTrigger::MaxInnerTurns => "max_inner_turns",
+        GoalContinuationTrigger::GapFeedback => "gap_feedback",
+    }
+}
+
+fn goal_continuation_envelope_prompt(envelope: &GoalContinuationEnvelope) -> String {
+    let token_budget = envelope
+        .token_budget
+        .map(|budget| budget.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let tokens_remaining = envelope
+        .token_budget
+        .map(|budget| (budget - envelope.tokens_used).max(0).to_string())
+        .unwrap_or_else(|| "unbounded".to_string());
+    let last_status = envelope.last_outer_status.unwrap_or("unknown");
+    let last_reason = envelope.last_end_reason.unwrap_or("unclassified");
+    let open_gap = envelope
+        .last_gap_fingerprint
+        .as_deref()
+        .unwrap_or("none reported");
+    let trigger = goal_continuation_trigger_name(envelope.trigger);
+    let plan_snapshot = envelope
+        .plan_snapshot
+        .as_deref()
+        .unwrap_or("No task plan snapshot was recorded.");
+    let previous_checkpoint = envelope
+        .previous_checkpoint
+        .as_deref()
+        .unwrap_or("No assistant checkpoint was recorded.");
+    let next_action = match envelope.trigger {
+        GoalContinuationTrigger::MaxInnerTurns => {
+            "The previous outer turn hit the per-run inner-turn ceiling before finishing. \
+Do not restart from scratch. Resume from durable worktree evidence, finish the highest-value \
+unfinished requirements, and leave a clear next action if another outer turn is still needed. \
+Do not mark complete merely because a turn budget expired."
+        }
+        GoalContinuationTrigger::GapFeedback => {
+            "The previous outer turn left an open model-fixable gap. Address that gap with \
+fresh evidence rather than restating the same blocker without progress."
+        }
+        GoalContinuationTrigger::Progress => {
+            "Continue from current evidence. Preserve the full objective, verify every \
+requirement before completion, and use update_goal only with structured evidence."
+        }
+    };
+
     format!(
-        "[Goal continuation #{continuation}]\nContinue working on this persistent goal:\n{objective}\n\nWork from current evidence. Preserve the full objective, verify every requirement before completion, and use update_goal only with structured evidence."
+        "[Goal continuation #{continuation}]\n\
+Continue working on this persistent goal.\n\
+\n\
+<objective>\n{objective}\n</objective>\n\
+\n\
+Continuation envelope:\n\
+- trigger: {trigger}\n\
+- previous outer-turn status: {last_status}\n\
+- previous end reason: {last_reason}\n\
+- tokens used: {tokens_used}\n\
+- token budget: {token_budget}\n\
+- tokens remaining: {tokens_remaining}\n\
+- open gap fingerprint: {open_gap}\n\
+\n\
+Current task plan snapshot:\n\
+{plan_snapshot}\n\
+\n\
+Previous assistant checkpoint (verify against current state):\n\
+{previous_checkpoint}\n\
+\n\
+Next action:\n{next_action}",
+        continuation = envelope.continuation,
+        objective = envelope.objective,
+        tokens_used = envelope.tokens_used,
+        plan_snapshot = plan_snapshot,
+        previous_checkpoint = previous_checkpoint,
     )
+}
+
+const GOAL_CONTINUATION_CHECKPOINT_MAX_CHARS: usize = 4_000;
+
+fn previous_assistant_checkpoint(conversation: &Conversation) -> Option<String> {
+    let content = conversation.messages.iter().rev().find_map(|message| {
+        let Message::Assistant {
+            content: Some(content),
+            ..
+        } = message
+        else {
+            return None;
+        };
+        let content = content.trim();
+        (!content.is_empty()).then_some(content)
+    })?;
+    let mut chars = content.chars();
+    let mut checkpoint = chars
+        .by_ref()
+        .take(GOAL_CONTINUATION_CHECKPOINT_MAX_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        checkpoint.push_str("\n[checkpoint truncated]");
+    }
+    Some(checkpoint)
 }
 
 fn goal_continuation_reason_name(
@@ -19525,7 +19776,7 @@ mod tests {
     fn goal_continuation_preflight_has_no_outer_turn_limit() {
         let baseline = GoalContinuationPreflight {
             cancelled: false,
-            successful_turn: true,
+            disposition: GoalTurnDisposition::Advanced,
             queued_user_input: false,
             pending_interaction: false,
             active_workflow: false,
@@ -19570,20 +19821,145 @@ mod tests {
             ));
         }
         assert_eq!(goal_continuation_preflight(baseline), None);
+    }
 
-        // TurnEndReason classification is observability-only for now: a
-        // non-successful outer turn is still rejected regardless of why it
-        // ended. Admitting resumable reasons requires the progress watchdog to
-        // read real evidence first, otherwise a cost-exhausted goal would
-        // retry into the same wall.
+    #[test]
+    fn goal_continuation_preflight_admits_only_resumable_budget_ends() {
+        let baseline = GoalContinuationPreflight {
+            cancelled: false,
+            disposition: GoalTurnDisposition::Advanced,
+            queued_user_input: false,
+            pending_interaction: false,
+            active_workflow: false,
+            plan_mode: false,
+            duplicate_admission: false,
+        };
+
+        // Success remains admissible.
+        assert_eq!(goal_continuation_preflight(baseline), None);
+
+        // MaxInnerTurns is an interruption, not a block.
+        assert_eq!(
+            goal_continuation_preflight(GoalContinuationPreflight {
+                disposition: GoalTurnDisposition::Interrupted {
+                    reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                },
+                ..baseline
+            }),
+            None
+        );
+
+        // Cost budget, Failed, Cancelled, and other non-resumable ends reject.
         assert!(matches!(
             goal_continuation_preflight(GoalContinuationPreflight {
-                successful_turn: false,
+                disposition: GoalTurnDisposition::Blocked {
+                    status: RunStatus::BudgetExhausted,
+                    reason: crate::lifecycle::TurnEndReason::CostBudgetExhausted,
+                },
                 ..baseline
             }),
             Some(GoalContinuationAdmission::Reject { code, .. })
                 if code == GoalContinuationRejectCode::NonSuccessfulTurn
         ));
+    }
+
+    #[test]
+    fn turn_disposition_allows_success_or_max_inner_turns() {
+        use crate::lifecycle::TurnEndReason;
+
+        let success = ThreadOperationOutcome::Completed {
+            status: RunStatus::Success,
+            end_reason: TurnEndReason::Unclassified,
+            background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+        };
+        let max_inner = ThreadOperationOutcome::Completed {
+            status: RunStatus::BudgetExhausted,
+            end_reason: TurnEndReason::MaxInnerTurns,
+            background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+        };
+        let cost = ThreadOperationOutcome::Completed {
+            status: RunStatus::BudgetExhausted,
+            end_reason: TurnEndReason::CostBudgetExhausted,
+            background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+        };
+        let failed = ThreadOperationOutcome::Completed {
+            status: RunStatus::Failed,
+            end_reason: TurnEndReason::Unclassified,
+            background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+        };
+
+        let disposition = |outcome: &ThreadOperationOutcome| match outcome {
+            ThreadOperationOutcome::Completed {
+                status, end_reason, ..
+            } => goal_turn_disposition(*status, *end_reason),
+            _ => unreachable!("test outcomes are completed"),
+        };
+
+        assert_eq!(disposition(&success), GoalTurnDisposition::Advanced);
+        assert!(matches!(
+            disposition(&max_inner),
+            GoalTurnDisposition::Interrupted { .. }
+        ));
+        assert!(matches!(
+            disposition(&cost),
+            GoalTurnDisposition::Blocked { .. }
+        ));
+        assert!(matches!(
+            disposition(&failed),
+            GoalTurnDisposition::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn turn_disposition_keeps_advanced_interrupted_and_blocked_distinct() {
+        use crate::lifecycle::TurnEndReason;
+
+        assert_eq!(
+            goal_turn_disposition(RunStatus::Success, TurnEndReason::Unclassified),
+            GoalTurnDisposition::Advanced
+        );
+        assert_eq!(
+            goal_turn_disposition(RunStatus::BudgetExhausted, TurnEndReason::MaxInnerTurns),
+            GoalTurnDisposition::Interrupted {
+                reason: TurnEndReason::MaxInnerTurns
+            }
+        );
+        assert_eq!(
+            goal_turn_disposition(
+                RunStatus::BudgetExhausted,
+                TurnEndReason::CostBudgetExhausted
+            ),
+            GoalTurnDisposition::Blocked {
+                status: RunStatus::BudgetExhausted,
+                reason: TurnEndReason::CostBudgetExhausted
+            }
+        );
+    }
+
+    #[test]
+    fn goal_continuation_envelope_carries_plan_and_resume_instruction() {
+        let prompt = goal_continuation_envelope_prompt(&GoalContinuationEnvelope {
+            objective: "finish the runtime refactor".to_string(),
+            continuation: 4,
+            trigger: GoalContinuationTrigger::MaxInnerTurns,
+            tokens_used: 12_000,
+            token_budget: Some(20_000),
+            last_gap_fingerprint: Some("runtime:continuation-gate".to_string()),
+            last_outer_status: Some("budget_exhausted"),
+            last_end_reason: Some("max_inner_turns"),
+            plan_snapshot: Some(
+                "[completed] classify end reasons\n[in_progress] wire continuation".to_string(),
+            ),
+            previous_checkpoint: Some(
+                "HookManager APIs differ; resume at the adapter boundary.".to_string(),
+            ),
+        });
+
+        assert!(prompt.contains("trigger: max_inner_turns"));
+        assert!(prompt.contains("tokens remaining: 8000"));
+        assert!(prompt.contains("[in_progress] wire continuation"));
+        assert!(prompt.contains("HookManager APIs differ"));
+        assert!(prompt.contains("Do not restart from scratch"));
     }
 
     #[test]

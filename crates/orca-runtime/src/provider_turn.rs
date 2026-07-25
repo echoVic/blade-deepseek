@@ -206,9 +206,9 @@ impl RuntimeProviderErrorResultStep {
             RuntimeProviderErrorStepOutcome::ContinueAfterCompaction => {
                 RuntimeProviderErrorResult::ContinueLoop
             }
-            RuntimeProviderErrorStepOutcome::Failed(error) => RuntimeProviderErrorResult::Return(
-                AgentLoopResult::failure(error.status, error.message),
-            ),
+            RuntimeProviderErrorStepOutcome::Failed(error) => {
+                RuntimeProviderErrorResult::Return(AgentLoopResult::from(error))
+            }
         }
     }
 }
@@ -307,10 +307,7 @@ impl RuntimeProviderTurnResultResultStep {
                 RuntimeProviderTurnResultResult::Response(response)
             }
             RuntimeProviderTurnResultOutcome::Failed(error) => {
-                RuntimeProviderTurnResultResult::Return(AgentLoopResult::failure(
-                    error.status,
-                    error.message,
-                ))
+                RuntimeProviderTurnResultResult::Return(AgentLoopResult::from(error))
             }
             RuntimeProviderTurnResultOutcome::Suspended(suspension) => {
                 RuntimeProviderTurnResultResult::Suspended(suspension)
@@ -583,7 +580,11 @@ impl RuntimeProviderResponseResultStep {
                 RuntimeProviderResponseResult::Return(AgentLoopResult::success(final_message))
             }
             RuntimeProviderResponseOutcome::Return { status, error } => {
-                RuntimeProviderResponseResult::Return(AgentLoopResult::terminal(status, error))
+                RuntimeProviderResponseResult::Return(AgentLoopResult::terminal(
+                    status,
+                    TurnEndReason::Unclassified,
+                    error,
+                ))
             }
         }
     }

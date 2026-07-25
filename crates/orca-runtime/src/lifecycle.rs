@@ -64,6 +64,14 @@ pub struct RuntimeTaskActor<'a> {
     lifecycle: &'a mut RuntimeSessionLifecycle,
     max_turns: u32,
     turns_started: u32,
+    /// Soft-landing reminders already delivered for the inner-turn ceiling
+    /// within this outer turn (Codex-style delivery index).
+    inner_turn_reminder_index: u32,
+    /// Cost thresholds already acknowledged within this outer turn.
+    cost_budget_reminder_index: u32,
+    /// Reminder produced after the latest provider usage update and consumed
+    /// by the next model-turn opening.
+    pending_cost_budget_soft_landing: Option<String>,
 }
 
 pub(crate) fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
@@ -80,6 +88,7 @@ pub(crate) fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
 #[derive(Clone, Debug)]
 pub(crate) struct AgentLoopResult {
     pub(crate) status: RunStatus,
+    pub(crate) reason: TurnEndReason,
     pub(crate) final_message: Option<String>,
     pub(crate) error: Option<String>,
 }
@@ -93,21 +102,34 @@ impl AgentLoopResult {
     pub(crate) fn success(final_message: Option<String>) -> Self {
         Self {
             status: RunStatus::Success,
+            reason: TurnEndReason::Unclassified,
             final_message,
             error: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn failure(status: RunStatus, error: impl Into<String>) -> Self {
-        Self::terminal(status, Some(error.into()))
+        Self::terminal(status, TurnEndReason::Unclassified, Some(error.into()))
     }
 
-    pub(crate) fn terminal(status: RunStatus, error: Option<String>) -> Self {
+    pub(crate) fn terminal(
+        status: RunStatus,
+        reason: TurnEndReason,
+        error: Option<String>,
+    ) -> Self {
         Self {
             status,
+            reason,
             final_message: None,
             error,
         }
+    }
+}
+
+impl From<RuntimeTurnStartError> for AgentLoopResult {
+    fn from(error: RuntimeTurnStartError) -> Self {
+        Self::terminal(error.status, error.reason, Some(error.message))
     }
 }
 
@@ -228,6 +250,17 @@ pub enum TurnEndReason {
     Unclassified,
 }
 
+impl TurnEndReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxInnerTurns => "max_inner_turns",
+            Self::CostBudgetExhausted => "cost_budget_exhausted",
+            Self::Cancelled => "cancelled",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTurnStartError {
     pub status: RunStatus,
@@ -295,7 +328,36 @@ impl<'a> RuntimeTaskActor<'a> {
             lifecycle,
             max_turns,
             turns_started,
+            inner_turn_reminder_index: 0,
+            cost_budget_reminder_index: 0,
+            pending_cost_budget_soft_landing: None,
         }
+    }
+
+    pub fn max_turns(&self) -> u32 {
+        self.max_turns
+    }
+
+    pub fn turns_started(&self) -> u32 {
+        self.turns_started
+    }
+
+    /// If the inner-turn soft-landing threshold advanced on the latest
+    /// successful `start_turn`, return the reminder text and mark it delivered.
+    pub fn take_pending_inner_turn_soft_landing(&mut self) -> Option<String> {
+        let reminder = crate::budget_soft_landing::pending_inner_turn_reminder(
+            self.max_turns,
+            self.turns_started,
+            self.inner_turn_reminder_index,
+        )?;
+        self.inner_turn_reminder_index = reminder.reminder_index;
+        Some(crate::budget_soft_landing::format_soft_landing_message(
+            &reminder,
+        ))
+    }
+
+    pub fn take_pending_cost_budget_soft_landing(&mut self) -> Option<String> {
+        self.pending_cost_budget_soft_landing.take()
     }
 
     pub fn start_turn(
@@ -725,6 +787,18 @@ impl<'a> RuntimeTaskActor<'a> {
                     totals.estimated_cost_usd, max_budget
                 ),
             });
+        }
+        if let Some(max_budget) = max_budget_usd
+            && let Some(reminder) = crate::budget_soft_landing::pending_cost_budget_reminder(
+                max_budget,
+                totals.estimated_cost_usd,
+                self.cost_budget_reminder_index,
+            )
+        {
+            self.cost_budget_reminder_index = reminder.reminder_index;
+            self.pending_cost_budget_soft_landing = Some(
+                crate::budget_soft_landing::format_soft_landing_message(&reminder),
+            );
         }
         Ok(totals)
     }
@@ -1558,18 +1632,42 @@ mod tests {
     fn agent_loop_result_constructors_preserve_terminal_shape() {
         let success = AgentLoopResult::success(Some("done".to_string()));
         assert_eq!(success.status, RunStatus::Success);
+        assert_eq!(success.reason, TurnEndReason::Unclassified);
         assert_eq!(success.final_message.as_deref(), Some("done"));
         assert_eq!(success.error, None);
 
         let failure = AgentLoopResult::failure(RunStatus::Failed, "provider failed");
         assert_eq!(failure.status, RunStatus::Failed);
+        assert_eq!(failure.reason, TurnEndReason::Unclassified);
         assert_eq!(failure.final_message, None);
         assert_eq!(failure.error.as_deref(), Some("provider failed"));
 
-        let terminal = AgentLoopResult::terminal(RunStatus::Cancelled, None);
+        let terminal =
+            AgentLoopResult::terminal(RunStatus::Cancelled, TurnEndReason::Cancelled, None);
         assert_eq!(terminal.status, RunStatus::Cancelled);
+        assert_eq!(terminal.reason, TurnEndReason::Cancelled);
         assert_eq!(terminal.final_message, None);
         assert_eq!(terminal.error, None);
+    }
+
+    #[test]
+    fn agent_loop_result_preserves_turn_end_reason() {
+        let from_start = AgentLoopResult::from(RuntimeTurnStartError {
+            status: RunStatus::BudgetExhausted,
+            reason: TurnEndReason::MaxInnerTurns,
+            message: "max turns exhausted".to_string(),
+        });
+        assert_eq!(from_start.status, RunStatus::BudgetExhausted);
+        assert_eq!(from_start.reason, TurnEndReason::MaxInnerTurns);
+        assert_eq!(from_start.error.as_deref(), Some("max turns exhausted"));
+
+        let cost = AgentLoopResult::from(RuntimeTurnStartError {
+            status: RunStatus::BudgetExhausted,
+            reason: TurnEndReason::CostBudgetExhausted,
+            message: "budget exhausted".to_string(),
+        });
+        assert_eq!(cost.reason, TurnEndReason::CostBudgetExhausted);
+        assert_ne!(from_start.reason, cost.reason);
     }
 
     #[test]
@@ -1707,6 +1805,78 @@ mod tests {
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"turn.started\""));
         assert!(output.contains("\"type\":\"model.routed\""));
+    }
+
+    #[test]
+    fn turn_opening_injects_pending_cost_soft_landing_once() {
+        let mut lifecycle = RuntimeSessionLifecycle::new("cost-soft-landing".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 128);
+        let mut cost_tracker = CostTracker::new(Some("deepseek-v4-flash"));
+        actor
+            .record_usage(
+                Usage {
+                    input_tokens: 600_000,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                },
+                &mut cost_tracker,
+                Some(0.10),
+            )
+            .expect("usage remains below hard cost wall");
+
+        let mut events = EventFactory::new("cost-soft-landing".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let provider_config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let runtime = ModelRuntimeConfig::default();
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &runtime,
+        );
+        let hooks = HookRunner::default();
+        let mut conversation = Conversation::new();
+        let model = ModelSelection::parse(None).expect("model");
+        let subagent_type = SubagentType::General;
+        let turn_context =
+            RuntimeTurnContext::new(Path::new("."), "continue", 0, false, &subagent_type);
+
+        let result = RuntimeTurnOpeningStep::new()
+            .open(RuntimeTurnOpeningInput {
+                actor: &mut actor,
+                provider: ProviderKind::DeepSeek,
+                context_config: &context_config,
+                provider_config: &provider_config,
+                turn_context,
+                hooks: &hooks,
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                model: &model,
+                model_override: None,
+                cost_tracker: &mut cost_tracker,
+            })
+            .expect("open turn");
+        assert!(matches!(result, RuntimeTurnOpeningResult::Continue { .. }));
+        assert!(conversation.messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::System { content, pinned: true }
+                    if content.contains("Cost budget is low")
+            )
+        }));
+        assert!(
+            actor.take_pending_cost_budget_soft_landing().is_none(),
+            "the same crossed cost threshold must not be delivered twice"
+        );
     }
 
     #[test]

@@ -202,6 +202,11 @@ enum GoalActorCommand {
         session_id: String,
         reply: Reply,
     },
+    RecentGapFingerprints {
+        goal_id: GoalId,
+        limit: u32,
+        reply: Reply,
+    },
     TakeRecoveries {
         session_id: String,
         reply: Reply,
@@ -251,6 +256,7 @@ enum GoalActorCommand {
     FinishOuterTurn {
         session_id: String,
         status: GoalTurnStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
         usage: GoalUsage,
         tool_count: u32,
         model_response_count: u32,
@@ -287,6 +293,7 @@ enum GoalActorReply {
     Record(Option<GoalRecord>),
     Projected(Option<ThreadGoal>),
     Continuation(Option<GoalContinuationSnapshot>),
+    GapFingerprints(Vec<Option<String>>),
     Recoveries(Vec<GoalRecoveryRecord>),
     Created(GoalRecord),
     Usage(GoalUsage),
@@ -385,6 +392,29 @@ impl GoalRuntimeHandle {
                 "goal actor returned wrong continuation reply".to_string(),
             )),
         })
+    }
+
+    /// Most recent gap fingerprint for the session's goal, if any.
+    pub fn recent_gap_fingerprint(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, GoalActorError> {
+        let Some(record) = self.read(session_id)? else {
+            return Ok(None);
+        };
+        let history = self
+            .request(|reply| GoalActorCommand::RecentGapFingerprints {
+                goal_id: record.goal_id,
+                limit: 1,
+                reply,
+            })
+            .and_then(|reply| match reply {
+                GoalActorReply::GapFingerprints(history) => Ok(history),
+                _ => Err(GoalActorError::Invalid(
+                    "goal actor returned wrong gap history reply".to_string(),
+                )),
+            })?;
+        Ok(history.into_iter().next().flatten())
     }
 
     pub fn take_recoveries(
@@ -537,6 +567,7 @@ impl GoalRuntimeHandle {
         &self,
         session_id: &str,
         status: GoalTurnStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
         usage: GoalUsage,
         tool_count: u32,
         model_response_count: u32,
@@ -546,6 +577,7 @@ impl GoalRuntimeHandle {
         self.request(|reply| GoalActorCommand::FinishOuterTurn {
             session_id: session_id.to_string(),
             status,
+            end_reason,
             usage,
             tool_count,
             model_response_count,
@@ -668,6 +700,17 @@ impl GoalActor {
                 self.continuation_state(&session_id)
                     .map(GoalActorReply::Continuation),
             ),
+            GoalActorCommand::RecentGapFingerprints {
+                goal_id,
+                limit,
+                reply,
+            } => (
+                reply,
+                self.store
+                    .recent_gap_fingerprints(&goal_id, limit)
+                    .map(GoalActorReply::GapFingerprints)
+                    .map_err(Into::into),
+            ),
             GoalActorCommand::TakeRecoveries { session_id, reply } => (
                 reply,
                 Ok(GoalActorReply::Recoveries(
@@ -749,6 +792,7 @@ impl GoalActor {
             GoalActorCommand::FinishOuterTurn {
                 session_id,
                 status,
+                end_reason,
                 usage,
                 tool_count,
                 model_response_count,
@@ -760,6 +804,7 @@ impl GoalActor {
                 self.finish_outer_turn(
                     &session_id,
                     status,
+                    end_reason,
                     usage,
                     tool_count,
                     model_response_count,
@@ -991,17 +1036,23 @@ impl GoalActor {
         &mut self,
         session_id: &str,
         status: GoalTurnStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
         usage: GoalUsage,
         tool_count: u32,
         model_response_count: u32,
         gap_fingerprint: Option<String>,
         finished_at: i64,
     ) -> Result<GoalNextAction, GoalActorError> {
+        let effective_gap_fingerprint = gap_fingerprint.or_else(|| {
+            (tool_count == 0 && model_response_count == 0)
+                .then(|| crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string())
+        });
         let mut turn_result = build_turn_result(
             status,
+            end_reason,
             tool_count,
             model_response_count,
-            gap_fingerprint.clone(),
+            effective_gap_fingerprint.clone(),
         );
         turn_result.usage = usage.clone();
         let mut active = self
@@ -1025,9 +1076,10 @@ impl GoalActor {
             status,
             tool_count,
             model_response_count,
-            gap_fingerprint: Some(
-                gap_fingerprint.unwrap_or_else(|| "outer_turn:no_structured_progress".to_string()),
-            ),
+            // NULL is a durable progress barrier. A fingerprint is persisted
+            // only for turns that the caller classified as lacking substantive
+            // progress, so equal gaps cannot join across productive turns.
+            gap_fingerprint: effective_gap_fingerprint,
             usage_event: Some(GoalUsageEvent {
                 usage_event_id: format!("{}:turn", active.context.outer_turn_id),
                 goal_id: active.context.goal_id.clone(),
@@ -1233,27 +1285,34 @@ impl GoalActor {
 /// genuinely stuck turns among productive ones.
 fn build_turn_result(
     status: GoalTurnStatus,
+    end_reason: crate::lifecycle::TurnEndReason,
     tool_count: u32,
     model_response_count: u32,
     gap_fingerprint: Option<String>,
 ) -> GoalTurnResult {
     // GoalTurnResult::evidence_count is usize; widen from the u32 wire counters.
-    let evidence_count = tool_count as usize + model_response_count as usize;
+    let activity_count = tool_count as usize + model_response_count as usize;
+    let evidence_count = if gap_fingerprint.is_some() {
+        0
+    } else {
+        activity_count
+    };
     let gaps = match gap_fingerprint {
         Some(fingerprint) => vec![GoalGap {
             summary: "outer turn reported a structured gap".to_string(),
             fingerprint,
             model_fixable: true,
         }],
-        None if evidence_count == 0 => vec![GoalGap {
+        None if activity_count == 0 => vec![GoalGap {
             summary: "outer turn ended without structured progress evidence".to_string(),
-            fingerprint: "outer_turn:no_structured_progress".to_string(),
+            fingerprint: crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string(),
             model_fixable: true,
         }],
         None => Vec::new(),
     };
     GoalTurnResult {
         status,
+        end_reason,
         usage: GoalUsage::default(),
         gaps,
         evidence_count,
@@ -1279,23 +1338,36 @@ mod tests {
 
     #[test]
     fn outer_turn_result_reflects_evidence_instead_of_constant_gap() {
-        let active = build_turn_result(GoalTurnStatus::Success, 4, 2, None);
+        let active = build_turn_result(
+            GoalTurnStatus::Success,
+            crate::lifecycle::TurnEndReason::Unclassified,
+            4,
+            2,
+            None,
+        );
         assert_eq!(active.evidence_count, 6);
         assert!(
             active.gaps.is_empty(),
             "a turn with activity and no explicit gap must not synthesize one"
         );
 
-        let idle = build_turn_result(GoalTurnStatus::Success, 0, 0, None);
+        let idle = build_turn_result(
+            GoalTurnStatus::Success,
+            crate::lifecycle::TurnEndReason::Unclassified,
+            0,
+            0,
+            None,
+        );
         assert_eq!(idle.evidence_count, 0);
         assert_eq!(idle.gaps.len(), 1);
         assert_eq!(
             idle.gaps[0].fingerprint,
-            "outer_turn:no_structured_progress"
+            crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT
         );
 
         let explicit = build_turn_result(
             GoalTurnStatus::Success,
+            crate::lifecycle::TurnEndReason::Unclassified,
             5,
             1,
             Some("roadmap:next-slice".to_string()),
@@ -1303,9 +1375,18 @@ mod tests {
         assert_eq!(explicit.gaps.len(), 1);
         assert_eq!(explicit.gaps[0].fingerprint, "roadmap:next-slice");
         assert_eq!(
-            explicit.evidence_count, 6,
-            "an explicit gap does not erase the activity that happened"
+            explicit.evidence_count, 0,
+            "an explicit no-progress gap must not be erased by read/tool activity"
         );
+
+        let exploratory = build_turn_result(
+            GoalTurnStatus::Success,
+            crate::lifecycle::TurnEndReason::Unclassified,
+            7,
+            3,
+            Some("outer_turn:no_substantive_progress".to_string()),
+        );
+        assert_eq!(exploratory.evidence_count, 0);
     }
 
     #[test]
@@ -1378,6 +1459,7 @@ mod tests {
             .finish_outer_turn(
                 "actor-session",
                 GoalTurnStatus::Success,
+                crate::lifecycle::TurnEndReason::Unclassified,
                 GoalUsage::default(),
                 1,
                 1,
@@ -1459,6 +1541,7 @@ mod tests {
             .finish_outer_turn(
                 "verifier-usage-session",
                 GoalTurnStatus::Success,
+                crate::lifecycle::TurnEndReason::Unclassified,
                 GoalUsage::default(),
                 1,
                 1,
@@ -1532,6 +1615,7 @@ mod tests {
                 .finish_outer_turn(
                     "pause-resume-session",
                     GoalTurnStatus::Cancelled,
+                    crate::lifecycle::TurnEndReason::Cancelled,
                     GoalUsage {
                         charged_input_tokens: 5,
                         output_tokens: 2,
@@ -1619,6 +1703,7 @@ mod tests {
                 .finish_outer_turn(
                     "active-control-session",
                     GoalTurnStatus::Cancelled,
+                    crate::lifecycle::TurnEndReason::Cancelled,
                     GoalUsage::default(),
                     0,
                     0,
@@ -1663,6 +1748,7 @@ mod tests {
             .finish_outer_turn(
                 "streak-eviction-session",
                 GoalTurnStatus::Success,
+                crate::lifecycle::TurnEndReason::Unclassified,
                 GoalUsage::default(),
                 0,
                 0,
@@ -1682,6 +1768,7 @@ mod tests {
             .finish_outer_turn(
                 "streak-eviction-session",
                 GoalTurnStatus::Success,
+                crate::lifecycle::TurnEndReason::Unclassified,
                 GoalUsage::default(),
                 0,
                 0,
@@ -1695,7 +1782,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             history,
-            vec!["gap:repeat".to_string(), "gap:repeat".to_string()]
+            vec![
+                Some("gap:repeat".to_string()),
+                Some("gap:repeat".to_string())
+            ]
         );
 
         let record = handle.read("streak-eviction-session").unwrap().unwrap();
@@ -1704,7 +1794,9 @@ mod tests {
         // matching gap would only bring it to 1 and the tracker would
         // Continue. Recovering the streak at 2 means this third gap hits
         // the limit and pauses as NoProgress instead.
-        rebuilt.begin_outer_turn(GoalTurnOrigin::Continuation).unwrap();
+        rebuilt
+            .begin_outer_turn(GoalTurnOrigin::Continuation)
+            .unwrap();
         let action = rebuilt
             .finish_outer_turn(GoalTurnResult::successful_with_gaps(vec![GoalGap {
                 summary: "still stuck".to_string(),

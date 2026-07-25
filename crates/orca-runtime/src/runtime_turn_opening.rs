@@ -91,6 +91,15 @@ impl RuntimeTurnOpeningStep {
             RuntimeTurnStartResult::Continue => {}
         }
 
+        // Soft-land before the hard MaxInnerTurns wall: inject a pinned system
+        // reminder when remaining inner turns cross configured thresholds.
+        if let Some(message) = input.actor.take_pending_inner_turn_soft_landing() {
+            input.conversation.add_system_pinned(message);
+        }
+        if let Some(message) = input.actor.take_pending_cost_budget_soft_landing() {
+            input.conversation.add_system_pinned(message);
+        }
+
         let turn_provider_config = RuntimeModelRouteStep::new()
             .route(RuntimeModelRouteInput {
                 actor: input.actor,

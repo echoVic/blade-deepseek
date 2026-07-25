@@ -31,18 +31,39 @@ pub struct RuntimeThread {
 }
 
 /// Per-outer-turn activity counters used by the goal no-progress watchdog.
-/// Counts observable runtime activity, not semantic success: a turn that ran
-/// many tools but achieved nothing still reports activity here, and is
-/// distinguished later by gap fingerprint repetition rather than by volume.
+/// Activity is retained for observability, while `has_substantive_progress`
+/// deliberately excludes model chatter and completed read-only tools.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TurnProgressEvidence {
     pub(crate) tool_count: u32,
     pub(crate) model_response_count: u32,
+    pub(crate) substantive_tool_count: u32,
+    pub(crate) plan_changed: bool,
 }
 
 impl TurnProgressEvidence {
+    #[cfg(test)]
     pub(crate) fn has_activity(&self) -> bool {
         self.tool_count > 0 || self.model_response_count > 0
+    }
+
+    pub(crate) fn has_substantive_progress(&self) -> bool {
+        self.substantive_tool_count > 0 || self.plan_changed
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TurnProgressBaseline {
+    message_count: usize,
+    plan_snapshot: Option<String>,
+}
+
+impl TurnProgressBaseline {
+    pub(crate) fn capture(conversation: &orca_core::conversation::Conversation) -> Self {
+        Self {
+            message_count: conversation.messages.len(),
+            plan_snapshot: plan_snapshot(conversation).map(str::to_string),
+        }
     }
 }
 
@@ -162,6 +183,7 @@ impl RuntimeThread {
         &mut self,
         binding: Option<&GoalRuntimeBinding>,
         status: RunStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
         usage: orca_core::goal_runtime::GoalUsage,
         mut events: Option<&mut EventFactory>,
         observer: Option<&dyn orca_core::event_sink::EventObserver>,
@@ -195,10 +217,12 @@ impl RuntimeThread {
         let action = binding.handle.finish_outer_turn(
             &turn.session_id,
             goal_status,
+            end_reason,
             usage.clone(),
             evidence.tool_count,
             evidence.model_response_count,
-            None,
+            (!evidence.has_substantive_progress())
+                .then(|| crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string()),
             now_timestamp(),
         );
         let mut final_action = action.clone().ok();
@@ -419,7 +443,7 @@ impl RuntimeThread {
     ) -> io::Result<RunStatus> {
         let binding = self.begin_goal_turn(request)?;
         let usage_before = self.session.aggregate_usage_totals();
-        let messages_before = self.session.conversation().messages.len();
+        let progress_baseline = TurnProgressBaseline::capture(self.session.conversation());
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -430,10 +454,12 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request(request, writer);
-        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
+        let evidence =
+            turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
         self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            crate::lifecycle::TurnEndReason::Unclassified,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             None,
             None,
@@ -454,7 +480,7 @@ impl RuntimeThread {
         let binding = self.begin_goal_turn(request)?;
         let verifier_cancel = cancel.clone();
         let usage_before = self.session.aggregate_usage_totals();
-        let messages_before = self.session.conversation().messages.len();
+        let progress_baseline = TurnProgressBaseline::capture(self.session.conversation());
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -465,10 +491,12 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request_with_cancel(request, writer, cancel);
-        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
+        let evidence =
+            turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
         self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            crate::lifecycle::TurnEndReason::Unclassified,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             None,
             None,
@@ -508,7 +536,7 @@ impl RuntimeThread {
         Self::emit_goal_turn_started(binding.as_ref(), events, observer);
         let verifier_cancel = cancel.clone();
         let usage_before = self.session.aggregate_usage_totals();
-        let messages_before = self.session.conversation().messages.len();
+        let progress_baseline = TurnProgressBaseline::capture(self.session.conversation());
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -519,10 +547,12 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request_with_event_factory_and_cancel(request, writer, events, cancel);
-        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
+        let evidence =
+            turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
         self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
+            crate::lifecycle::TurnEndReason::Unclassified,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             Some(events),
             observer,
@@ -566,17 +596,25 @@ impl RuntimeThread {
         Self::emit_goal_turn_started(binding.as_ref(), events, observer);
         let verifier_cancel = cancel.clone();
         let usage_before = self.session.aggregate_usage_totals();
-        let messages_before = self.session.conversation().messages.len();
+        let progress_baseline = TurnProgressBaseline::capture(self.session.conversation());
         let result = self.run_request_with_event_factory_and_cancel_outcome_unbound(
             config, request, writer, events, cancel,
         );
-        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
+        let evidence =
+            turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
         self.finish_goal_turn(
             binding.as_ref(),
             match &result {
                 Ok(ThreadTurnOutcome::Completed { status, .. }) => *status,
                 Ok(ThreadTurnOutcome::ProviderSuspended { .. }) => RunStatus::ApprovalRequired,
                 Err(_) => RunStatus::Failed,
+            },
+            match &result {
+                Ok(ThreadTurnOutcome::Completed { end_reason, .. }) => *end_reason,
+                Ok(ThreadTurnOutcome::ProviderSuspended { .. }) => {
+                    crate::lifecycle::TurnEndReason::Unclassified
+                }
+                Err(_) => crate::lifecycle::TurnEndReason::Unclassified,
             },
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             Some(events),
@@ -623,21 +661,57 @@ pub(crate) fn goal_usage_delta(
     }
 }
 
-/// Counts assistant responses and tool results added after `since_index`.
-/// Compaction can shrink the conversation mid-turn, so a shrunk log yields
-/// zero rather than a bogus count from a negative delta.
+fn plan_snapshot(conversation: &orca_core::conversation::Conversation) -> Option<&str> {
+    conversation
+        .internal_context
+        .get(orca_core::conversation::PLAN_CONTEXT_FRAGMENT_ID)
+        .map(|fragment| fragment.content.as_str())
+}
+
+/// Measures activity added after the baseline and separates completed
+/// side-effecting tool calls / plan transitions from read-only exploration.
+/// Compaction can shrink the message log mid-turn; in that case message counts
+/// safely fall back to zero while an independently changed plan still counts.
 pub(crate) fn turn_progress_evidence_since(
     conversation: &orca_core::conversation::Conversation,
-    since_index: usize,
+    baseline: &TurnProgressBaseline,
 ) -> TurnProgressEvidence {
-    let Some(added) = conversation.messages.get(since_index..) else {
-        return TurnProgressEvidence::default();
+    use std::collections::HashSet;
+
+    use orca_core::tool_types::{ToolName, ToolStatus};
+
+    let added = conversation
+        .messages
+        .get(baseline.message_count..)
+        .unwrap_or_default();
+    let completed_tool_calls = added
+        .iter()
+        .filter_map(|message| match message {
+            orca_core::conversation::Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Completed => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut evidence = TurnProgressEvidence {
+        plan_changed: baseline.plan_snapshot.as_deref() != plan_snapshot(conversation),
+        ..TurnProgressEvidence::default()
     };
-    let mut evidence = TurnProgressEvidence::default();
     for message in added {
         match message {
-            orca_core::conversation::Message::Assistant { .. } => {
+            orca_core::conversation::Message::Assistant { tool_calls, .. } => {
                 evidence.model_response_count = evidence.model_response_count.saturating_add(1);
+                for tool_call in tool_calls {
+                    if completed_tool_calls.contains(tool_call.id.as_str())
+                        && ToolName::from_str(&tool_call.function_name)
+                            .is_none_or(|name| !name.is_read_only())
+                    {
+                        evidence.substantive_tool_count =
+                            evidence.substantive_tool_count.saturating_add(1);
+                    }
+                }
             }
             orca_core::conversation::Message::Tool { .. } => {
                 evidence.tool_count = evidence.tool_count.saturating_add(1);
@@ -647,7 +721,6 @@ pub(crate) fn turn_progress_evidence_since(
     }
     evidence
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -707,53 +780,121 @@ mod tests {
         let empty = TurnProgressEvidence::default();
         assert_eq!(empty.tool_count, 0);
         assert_eq!(empty.model_response_count, 0);
+        assert_eq!(empty.substantive_tool_count, 0);
+        assert!(!empty.plan_changed);
         assert!(!empty.has_activity());
+        assert!(!empty.has_substantive_progress());
 
         let active = TurnProgressEvidence {
             tool_count: 3,
             model_response_count: 1,
+            substantive_tool_count: 1,
+            plan_changed: false,
         };
         assert!(active.has_activity());
+        assert!(active.has_substantive_progress());
 
         let responses_only = TurnProgressEvidence {
             tool_count: 0,
             model_response_count: 2,
+            substantive_tool_count: 0,
+            plan_changed: false,
         };
         assert!(responses_only.has_activity());
+        assert!(!responses_only.has_substantive_progress());
+
+        let plan_only = TurnProgressEvidence {
+            plan_changed: true,
+            ..TurnProgressEvidence::default()
+        };
+        assert!(plan_only.has_substantive_progress());
     }
 
     #[test]
-    fn turn_progress_evidence_since_counts_only_new_messages() {
+    fn turn_progress_evidence_distinguishes_reads_from_completed_side_effects() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::conversation::{Conversation, RawToolCall};
+        use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+
+        let mut conversation = Conversation::new();
+        conversation
+            .messages
+            .push(orca_core::conversation::Message::User {
+                content: "before".to_string(),
+                pinned: false,
+            });
+        let baseline = TurnProgressBaseline::capture(&conversation);
+        let read = ToolRequest {
+            id: "read-1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("src/lib.rs".to_string()),
+            raw_arguments: None,
+        };
+        let edit = ToolRequest {
+            id: "edit-1".to_string(),
+            name: ToolName::Edit,
+            action: ActionKind::Write,
+            target: Some("src/lib.rs".to_string()),
+            raw_arguments: None,
+        };
+        conversation.add_assistant(
+            Some("inspect then edit".to_string()),
+            None,
+            vec![
+                RawToolCall {
+                    id: read.id.clone(),
+                    function_name: read.name.as_str().to_string(),
+                    arguments: "{}".to_string(),
+                },
+                RawToolCall {
+                    id: edit.id.clone(),
+                    function_name: edit.name.as_str().to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ],
+        );
+        conversation.add_tool_result_with_terminal(
+            &ToolResult::completed(&read, "contents".to_string(), false),
+            "contents".to_string(),
+        );
+        conversation.add_tool_result_with_terminal(
+            &ToolResult::completed(&edit, "edited".to_string(), false),
+            "edited".to_string(),
+        );
+
+        let evidence = turn_progress_evidence_since(&conversation, &baseline);
+        assert_eq!(evidence.model_response_count, 1);
+        assert_eq!(evidence.tool_count, 2);
+        assert_eq!(evidence.substantive_tool_count, 1);
+        assert!(!evidence.plan_changed);
+        assert!(evidence.has_activity());
+        assert!(evidence.has_substantive_progress());
+
+        // A conversation shrunk by compaction must not panic or overcount.
+        let shrunk = turn_progress_evidence_since(
+            &conversation,
+            &TurnProgressBaseline {
+                message_count: 99,
+                plan_snapshot: None,
+            },
+        );
+        assert_eq!(shrunk, TurnProgressEvidence::default());
+    }
+
+    #[test]
+    fn turn_progress_evidence_treats_plan_change_as_progress() {
         use orca_core::conversation::Conversation;
 
         let mut conversation = Conversation::new();
-        conversation.messages.push(orca_core::conversation::Message::User {
-            content: "before".to_string(),
-            pinned: false,
-        });
-        let baseline = conversation.messages.len();
+        conversation.replace_plan_state("[pending] inspect runtime".to_string());
+        let baseline = TurnProgressBaseline::capture(&conversation);
+        conversation
+            .replace_plan_state("[completed] inspect runtime\n[in_progress] fix gate".to_string());
 
-        conversation.messages.push(orca_core::conversation::Message::Assistant {
-            content: Some("hi".to_string()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            pinned: false,
-        });
-        conversation.messages.push(orca_core::conversation::Message::Tool {
-            tool_call_id: "call-1".to_string(),
-            content: "ok".to_string(),
-            terminal: None,
-            pinned: false,
-        });
-
-        let evidence = turn_progress_evidence_since(&conversation, baseline);
-        assert_eq!(evidence.model_response_count, 1);
-        assert_eq!(evidence.tool_count, 1);
-        assert!(evidence.has_activity());
-
-        // A conversation shrunk by compaction must not panic or overcount.
-        let shrunk = turn_progress_evidence_since(&conversation, 99);
-        assert_eq!(shrunk, TurnProgressEvidence::default());
+        let evidence = turn_progress_evidence_since(&conversation, &baseline);
+        assert!(evidence.plan_changed);
+        assert!(evidence.has_substantive_progress());
     }
 
     #[test]

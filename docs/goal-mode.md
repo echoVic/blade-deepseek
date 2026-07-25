@@ -83,7 +83,7 @@ ordering, so a user stop cannot be rewritten as an infrastructure failure.
 | --- | --- |
 | `active` | Eligible for continuation admission |
 | `paused(user)` | Yielded to an explicit user action, plan mode, or pending interaction |
-| `paused(no_progress)` | The same model-fixable gap repeated across three successful outer turns |
+| `paused(no_progress)` | Three consecutive outer turns repeat the same model-fixable gap, or eight consecutive outer turns hit the inner-turn ceiling |
 | `paused(infrastructure)` | Provider, verifier, persistence, or control-plane failure |
 | `paused(waiting_for_workflow)` | A workflow owns the next action |
 | `paused(recovery)` | A stale in-flight run was recovered after restart |
@@ -153,10 +153,16 @@ unbounded retry.
 
 ## Continuation Admission
 
-Automatic continuation is admitted only when all of these are true:
+Every outer turn is classified before continuation:
+
+- `Advanced`: a successful turn
+- `Interrupted`: `BudgetExhausted` caused by `MaxInnerTurns`; work may resume
+- `Blocked`: cost exhaustion, failure, cancellation, approval, or verification failure
+
+The continuation gate rejects `Blocked` and admits `Advanced` or `Interrupted`
+only when all of these are also true:
 
 - the Goal is `active`
-- the previous outer turn succeeded
 - no cancellation or shutdown is pending
 - no user steer input is queued
 - no approval, permission, user-input, or MCP interaction is pending
@@ -171,10 +177,24 @@ reason code, and continuation counter. A late user steer is persisted into the
 transcript before the Goal pauses, so rejecting automatic continuation does not
 discard user input.
 
-The primary no-progress rule is three closed, successful outer turns with the
-same normalized model-fixable gap. Token deltas and continuation counts are
-accounting and observability data, not proof of progress and not stopping
-conditions.
+The cross-turn watchdog is separate from that per-turn gate. A completed
+side-effecting tool call or a changed structured task plan is substantive
+progress and creates a durable `NULL` barrier in gap history. Model replies and
+read-only exploration remain observable activity but do not clear the gap
+streak. Three consecutive eligible turns with the same normalized model-fixable
+gap pause as `NoProgress`, including `MaxInnerTurns` continuations. An
+independent cap pauses after eight consecutive `MaxInnerTurns` outer turns even
+when intermediate progress is reported. Token deltas and continuation counts
+remain accounting and observability data, not proof of progress.
+
+Before hard walls, pinned system reminders are injected as remaining inner
+turns, cost budget, or Goal tokens cross configured thresholds. They ask the
+model to finish the current atomic step, update the task plan, and record key
+findings. A continued outer turn receives a typed envelope containing the full
+objective, continuation trigger, previous status and end reason, budget
+snapshot, open gap fingerprint, current task-plan snapshot, and a bounded
+previous-assistant checkpoint, with an explicit instruction to verify current
+state and resume instead of restarting exploration.
 
 ## Internal Context
 

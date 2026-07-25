@@ -8,6 +8,14 @@
 
 **Tech Stack:** Rust workspace, Cargo tests, Clippy, rusqlite.
 
+> **Implementation correction:** Observable activity is not sufficient progress.
+> The final implementation preserves tool/model counters for diagnostics, but
+> only completed side-effecting tool calls or a changed structured task plan
+> clear the watchdog. Read-only exploration emits
+> `outer_turn:no_substantive_progress`. Persisted `NULL` fingerprints are kept
+> in recent history as progress barriers so equal gaps cannot join across a
+> productive turn after restart.
+
 ---
 
 ## Why this exists

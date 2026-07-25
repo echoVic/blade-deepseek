@@ -94,6 +94,18 @@ pub fn format_goal_mode_instructions(goal: &ThreadGoal) -> String {
         .token_budget
         .map(|budget| (budget - goal.tokens_used).max(0).to_string())
         .unwrap_or_else(|| "unbounded".to_string());
+    let soft_landing = goal
+        .token_budget
+        .and_then(|budget| {
+            crate::budget_soft_landing::pending_goal_token_reminder(budget, goal.tokens_used, 0)
+        })
+        .map(|reminder| {
+            format!(
+                "\n\n{}\n",
+                crate::budget_soft_landing::format_soft_landing_message(&reminder)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"## Goal Mode
 Continue working toward the active persistent goal.
@@ -112,7 +124,7 @@ Continuation behavior:
 Budget:
 - Tokens used: {}
 - Token budget: {}
-- Tokens remaining: {}
+- Tokens remaining: {}{}
 
 Work from evidence:
 Use the current worktree and external state as authoritative. Previous conversation context can help locate relevant work, but inspect the current state before relying on it. Improve, replace, or remove existing work as needed to satisfy the actual objective.
@@ -147,7 +159,7 @@ Blocked audit:
 - Never use status "blocked" merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
 
 Do not call update_goal unless the goal is complete or the strict blocked audit above is satisfied. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work."#,
-        goal.objective, goal.tokens_used, token_budget, remaining_tokens
+        goal.objective, goal.tokens_used, token_budget, remaining_tokens, soft_landing
     )
 }
 
@@ -222,5 +234,23 @@ mod tests {
         assert!(instructions.contains("Do not call update_goal unless the goal is complete"));
         assert!(instructions.contains("Token budget: 100000"));
         assert!(instructions.contains("Tokens remaining: 75000"));
+    }
+
+    #[test]
+    fn goal_mode_instructions_soft_land_when_token_budget_is_nearly_exhausted() {
+        let goal = ThreadGoal {
+            session_id: "session-1".to_string(),
+            objective: "Ship the full requested release".to_string(),
+            status: ThreadGoalStatus::Active,
+            token_budget: Some(10_000),
+            tokens_used: 9_600,
+            time_used_seconds: 60,
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let instructions = format_goal_mode_instructions(&goal);
+        assert!(instructions.contains("[Budget soft landing]"));
+        assert!(instructions.contains("400 charged tokens remain"));
     }
 }

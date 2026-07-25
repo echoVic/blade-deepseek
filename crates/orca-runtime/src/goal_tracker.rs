@@ -7,18 +7,26 @@ use orca_core::goal_runtime::{
     GoalUsage, GoalVerificationResult,
 };
 
+use crate::lifecycle::TurnEndReason;
+
 pub(crate) const SAME_GAP_STREAK_LIMIT: u32 = 3;
+pub(crate) const NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT: &str =
+    "outer_turn:no_substantive_progress";
+/// Independent safety net beside the same-gap streak: auto-continuing after
+/// MaxInnerTurns without completing forever would otherwise spin a goal that
+/// keeps producing activity but never finishes.
+pub(crate) const MAX_CONSECUTIVE_INNER_TURN_CONTINUATIONS: u32 = 8;
 
 /// Recomputes the same-gap streak from recent turn fingerprints, most recent
 /// first. Kept pure and separate from storage so the streak survives restarts
 /// without persisting derived state that could drift from the turn history.
-fn streak_from_history(fingerprints: &[String]) -> (Option<String>, u32) {
-    let Some(most_recent) = fingerprints.first() else {
+fn streak_from_history(fingerprints: &[Option<String>]) -> (Option<String>, u32) {
+    let Some(Some(most_recent)) = fingerprints.first() else {
         return (None, 0);
     };
     let streak = fingerprints
         .iter()
-        .take_while(|fingerprint| *fingerprint == most_recent)
+        .take_while(|fingerprint| fingerprint.as_ref() == Some(most_recent))
         .count()
         .try_into()
         .unwrap_or(u32::MAX);
@@ -28,6 +36,7 @@ fn streak_from_history(fingerprints: &[String]) -> (Option<String>, u32) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalTurnResult {
     pub status: GoalTurnStatus,
+    pub end_reason: TurnEndReason,
     pub usage: GoalUsage,
     pub gaps: Vec<GoalGap>,
     pub evidence_count: usize,
@@ -37,6 +46,7 @@ impl GoalTurnResult {
     pub fn successful() -> Self {
         Self {
             status: GoalTurnStatus::Success,
+            end_reason: TurnEndReason::Unclassified,
             usage: GoalUsage::default(),
             gaps: Vec::new(),
             evidence_count: 0,
@@ -47,6 +57,16 @@ impl GoalTurnResult {
         Self {
             gaps,
             ..Self::successful()
+        }
+    }
+
+    pub fn budget_exhausted(end_reason: TurnEndReason) -> Self {
+        Self {
+            status: GoalTurnStatus::BudgetExhausted,
+            end_reason,
+            usage: GoalUsage::default(),
+            gaps: Vec::new(),
+            evidence_count: 0,
         }
     }
 }
@@ -83,6 +103,7 @@ pub struct GoalTracker {
     pending_intent: Option<GoalUpdateIntent>,
     last_gap_fingerprint: Option<String>,
     same_gap_streak: u32,
+    consecutive_inner_turn_budget_exhaustions: u32,
 }
 
 impl GoalTracker {
@@ -99,6 +120,7 @@ impl GoalTracker {
             pending_intent: None,
             last_gap_fingerprint: None,
             same_gap_streak: 0,
+            consecutive_inner_turn_budget_exhaustions: 0,
         }
     }
 
@@ -123,13 +145,15 @@ impl GoalTracker {
             pending_intent: None,
             last_gap_fingerprint: None,
             same_gap_streak: 0,
+            // In-memory only for now; gap streak is the durable watchdog.
+            consecutive_inner_turn_budget_exhaustions: 0,
         }
     }
 
     /// Like [`Self::from_record`], but restores the same-gap streak from
     /// persisted turn history so a restart does not silently reset the
     /// no-progress watchdog.
-    pub fn from_record_with_history(record: &GoalRecord, history: &[String]) -> Self {
+    pub fn from_record_with_history(record: &GoalRecord, history: &[Option<String>]) -> Self {
         let mut tracker = Self::from_record(record);
         let (fingerprint, streak) = streak_from_history(history);
         tracker.last_gap_fingerprint = fingerprint;
@@ -258,12 +282,46 @@ impl GoalTracker {
         self.usage.saturating_add_assign(&result.usage);
         self.last_outer_turn = Some(turn);
 
-        if result.status != GoalTurnStatus::Success {
-            self.pending_intent = None;
-            return Ok(self.pause(
-                GoalPauseReason::Infrastructure,
-                format!("goal outer turn ended with {:?}", result.status),
-            ));
+        match result.status {
+            GoalTurnStatus::Success => {
+                self.consecutive_inner_turn_budget_exhaustions = 0;
+            }
+            GoalTurnStatus::BudgetExhausted
+                if result.end_reason == TurnEndReason::MaxInnerTurns =>
+            {
+                self.consecutive_inner_turn_budget_exhaustions = self
+                    .consecutive_inner_turn_budget_exhaustions
+                    .saturating_add(1);
+                if self.consecutive_inner_turn_budget_exhaustions
+                    >= MAX_CONSECUTIVE_INNER_TURN_CONTINUATIONS
+                {
+                    self.pending_intent = None;
+                    return Ok(self.pause(
+                        GoalPauseReason::NoProgress,
+                        format!(
+                            "inner-turn budget exhausted for {} consecutive outer turns without completion",
+                            self.consecutive_inner_turn_budget_exhaustions
+                        ),
+                    ));
+                }
+                // Resumable: fall through into progress/gap accounting.
+            }
+            GoalTurnStatus::BudgetExhausted
+                if result.end_reason == TurnEndReason::CostBudgetExhausted =>
+            {
+                self.pending_intent = None;
+                return Ok(self.pause(
+                    GoalPauseReason::UsageLimit,
+                    "goal outer turn ended because the cost budget was exhausted".to_string(),
+                ));
+            }
+            other => {
+                self.pending_intent = None;
+                return Ok(self.pause(
+                    GoalPauseReason::Infrastructure,
+                    format!("goal outer turn ended with {other:?}"),
+                ));
+            }
         }
 
         if self
@@ -332,6 +390,7 @@ impl GoalTracker {
         self.current_outer_turn = None;
         self.pending_intent = None;
         self.reset_gap_streak();
+        self.consecutive_inner_turn_budget_exhaustions = 0;
         GoalNextAction::Continue {
             reason: match origin {
                 GoalTurnOrigin::Resume => GoalContinuationReason::Resume,
@@ -450,6 +509,86 @@ mod tests {
     }
 
     #[test]
+    fn max_inner_turns_budget_exhaustion_can_continue() {
+        let mut tracker = GoalTracker::new(GoalId::new(), None);
+        tracker.begin_outer_turn(GoalTurnOrigin::User).unwrap();
+        let action = tracker
+            .finish_outer_turn(GoalTurnResult {
+                status: GoalTurnStatus::BudgetExhausted,
+                end_reason: TurnEndReason::MaxInnerTurns,
+                usage: GoalUsage::default(),
+                gaps: Vec::new(),
+                evidence_count: 3,
+            })
+            .unwrap();
+        assert!(matches!(
+            action,
+            GoalNextAction::Continue {
+                reason: GoalContinuationReason::Progress
+            }
+        ));
+        assert_eq!(tracker.state(), &GoalState::Active);
+    }
+
+    #[test]
+    fn cost_budget_exhaustion_pauses_as_usage_limit() {
+        let mut tracker = GoalTracker::new(GoalId::new(), None);
+        tracker.begin_outer_turn(GoalTurnOrigin::User).unwrap();
+        let action = tracker
+            .finish_outer_turn(GoalTurnResult::budget_exhausted(
+                TurnEndReason::CostBudgetExhausted,
+            ))
+            .unwrap();
+        assert!(matches!(
+            action,
+            GoalNextAction::Pause {
+                reason: GoalPauseReason::UsageLimit,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tracker.state(),
+            GoalState::Paused {
+                reason: GoalPauseReason::UsageLimit,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn eight_consecutive_max_inner_turns_pauses_as_no_progress() {
+        let mut tracker = GoalTracker::new(GoalId::new(), None);
+        for attempt in 1..=MAX_CONSECUTIVE_INNER_TURN_CONTINUATIONS {
+            tracker
+                .begin_outer_turn(GoalTurnOrigin::Continuation)
+                .unwrap();
+            let action = tracker
+                .finish_outer_turn(GoalTurnResult {
+                    status: GoalTurnStatus::BudgetExhausted,
+                    end_reason: TurnEndReason::MaxInnerTurns,
+                    usage: GoalUsage::default(),
+                    gaps: Vec::new(),
+                    evidence_count: 2,
+                })
+                .unwrap();
+            if attempt < MAX_CONSECUTIVE_INNER_TURN_CONTINUATIONS {
+                assert!(
+                    matches!(action, GoalNextAction::Continue { .. }),
+                    "attempt {attempt} should still continue"
+                );
+            } else {
+                assert!(matches!(
+                    action,
+                    GoalNextAction::Pause {
+                        reason: GoalPauseReason::NoProgress,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn terminal_intent_is_deferred_until_turn_end_verification() {
         let mut tracker = GoalTracker::new(GoalId::new(), None);
         tracker.begin_outer_turn(GoalTurnOrigin::User).unwrap();
@@ -501,16 +640,16 @@ mod tests {
     fn streak_is_rebuilt_from_recent_fingerprints() {
         // Ordered most-recent-first, as returned by the history query.
         let repeated = vec![
-            "gap:alpha".to_string(),
-            "gap:alpha".to_string(),
-            "gap:beta".to_string(),
+            Some("gap:alpha".to_string()),
+            Some("gap:alpha".to_string()),
+            Some("gap:beta".to_string()),
         ];
         assert_eq!(
             streak_from_history(&repeated),
             (Some("gap:alpha".to_string()), 2)
         );
 
-        let fresh = vec!["gap:beta".to_string(), "gap:alpha".to_string()];
+        let fresh = vec![Some("gap:beta".to_string()), Some("gap:alpha".to_string())];
         assert_eq!(
             streak_from_history(&fresh),
             (Some("gap:beta".to_string()), 1)
@@ -519,13 +658,27 @@ mod tests {
         assert_eq!(streak_from_history(&[]), (None, 0));
 
         let all_same = vec![
-            "gap:alpha".to_string(),
-            "gap:alpha".to_string(),
-            "gap:alpha".to_string(),
+            Some("gap:alpha".to_string()),
+            Some("gap:alpha".to_string()),
+            Some("gap:alpha".to_string()),
         ];
         assert_eq!(
             streak_from_history(&all_same),
             (Some("gap:alpha".to_string()), 3)
+        );
+
+        let progress_barrier = vec![
+            Some("gap:alpha".to_string()),
+            None,
+            Some("gap:alpha".to_string()),
+        ];
+        assert_eq!(
+            streak_from_history(&progress_barrier),
+            (Some("gap:alpha".to_string()), 1)
+        );
+        assert_eq!(
+            streak_from_history(&[None, Some("gap:alpha".to_string())]),
+            (None, 0)
         );
     }
 
