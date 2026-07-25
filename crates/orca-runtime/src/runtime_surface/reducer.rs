@@ -946,11 +946,14 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
     match event {
         SurfaceEvent::Plan(_)
         | SurfaceEvent::Usage(_)
-        | SurfaceEvent::Context(_)
         | SurfaceEvent::Settings(_)
         | SurfaceEvent::McpCatalog(_)
         | SurfaceEvent::PinnedContext(_)
         | SurfaceEvent::Session(_) => matches!(scope, SurfaceScope::Thread),
+        SurfaceEvent::Context(_) => matches!(
+            scope,
+            SurfaceScope::Thread | SurfaceScope::Generation { .. }
+        ),
         SurfaceEvent::Task(patch) => match (scope, patch) {
             (SurfaceScope::Thread, _) => true,
             (
@@ -1158,7 +1161,31 @@ fn validate_batch_structure(
             });
         }
     }
+    if manual_compaction_rebuild_batch(batch)
+        && !super::commit::manual_compaction_item_rebuild_paired(state.snapshot(), batch)
+    {
+        return Err(batch_error(
+            batch,
+            SurfaceReducerErrorCode::InvalidOrdering,
+            "manual compaction item rebuild is not exact",
+        ));
+    }
     Ok(())
+}
+
+fn manual_compaction_rebuild_batch(batch: &SurfaceCommitBatch) -> bool {
+    batch.events.as_slice().iter().any(|event| {
+        matches!(
+            &event.event,
+            SurfaceEvent::Context(SurfaceContextSnapshot {
+                compaction: CompactionState::Completed {
+                    reason: CompactionReason::Manual,
+                    ..
+                },
+                ..
+            })
+        )
+    })
 }
 
 pub fn reduce_batch(
@@ -3237,6 +3264,9 @@ fn apply_item_patch(
                 }),
                 SurfaceItem::UserMessage { .. } | SurfaceItem::SystemMessage { .. } => true,
             };
+            let paired = paired
+                || compaction_item_replacement_paired(snapshot, batch, item)
+                || manual_compaction_rebuild_batch(batch);
             if !paired {
                 return Err(event_error(
                     envelope,
@@ -3334,6 +3364,51 @@ fn apply_item_patch(
             Ok(())
         }
     }
+}
+
+fn compaction_item_replacement_paired(
+    snapshot: &SurfaceSnapshot,
+    batch: &SurfaceCommitBatch,
+    added: &SurfaceItem,
+) -> bool {
+    let SurfaceItem::ToolResultMessage {
+        tool_call_id: added_tool_call_id,
+        ..
+    } = added
+    else {
+        return false;
+    };
+    let completes_manual_compaction = batch.events.as_slice().iter().any(|event| {
+        matches!(
+            &event.event,
+            SurfaceEvent::Context(SurfaceContextSnapshot {
+                compaction: CompactionState::Completed {
+                    reason: CompactionReason::Manual,
+                    ..
+                },
+                ..
+            })
+        )
+    });
+    completes_manual_compaction
+        && snapshot.items.iter().any(|item| {
+            let SurfaceItem::ToolResultMessage {
+                id, tool_call_id, ..
+            } = item
+            else {
+                return false;
+            };
+            tool_call_id == added_tool_call_id
+                && batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        SurfaceEvent::Item(ItemPatch::Removed {
+                            item_id,
+                            reason: ItemRemovalReason::Compacted,
+                        }) if item_id == id
+                    )
+                })
+        })
 }
 
 fn assistant_item_text<'a>(

@@ -20,7 +20,7 @@ pub(crate) use projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     message_to_thread_json, messages_to_thread_items, messages_to_thread_turns,
 };
-pub(crate) use types::StoredConversationRecord;
+pub(crate) use types::{ManualCompactionDurableSnapshot, StoredConversationRecord};
 pub use types::{
     SessionMeta, SessionSummary, SessionTranscript, SortDirection, StoredThreadItem,
     StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
@@ -29,7 +29,7 @@ pub use types::{
     TurnItemsView,
 };
 pub use writer::SessionWriter;
-pub(crate) use writer::redact_sensitive_text;
+pub(crate) use writer::{read_manual_compaction_snapshot, redact_sensitive_text};
 
 pub(crate) fn resume_conversation(
     transcript: &SessionTranscript,

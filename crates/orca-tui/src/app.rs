@@ -1583,6 +1583,9 @@ mod tests {
                         assert_eq!(runtime.controller().current_id(), None);
                         break;
                     }
+                    TuiEvent::OperationRejected(message) | TuiEvent::Error(message) => {
+                        panic!("manual compaction failed: {message}");
+                    }
                     _ => {}
                 }
             }
@@ -4931,13 +4934,9 @@ fn hosted_tui_controller_loop(
                     let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
                     continue;
                 };
-                let request = HostedTurnRequest::new("")
-                    .with_operation_kind(HostedOperationKind::ManualCompaction);
-                let cfg = config.lock().unwrap().clone();
-                if let Err(error) =
-                    run_hosted_operation(runtime_thread, request, cfg, &controller, &event_tx)
-                {
-                    let _ = event_tx.send(TuiEvent::Error(format!(
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                if let Err(error) = actions.manual_compact(&controller, &event_tx) {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "manual compaction failed: {error}"
                     )));
                 }

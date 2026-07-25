@@ -58,10 +58,11 @@ mod runtime_surface;
 pub mod surface {
     pub use crate::runtime_surface::{
         AcpRequestId, AdmissionOutput, AssistantChannel, AssistantPatch, AttachResult, ByteCount,
-        ByteOffset, CancelOperationOutput, CanonicalPath, CommitClass, CompactionState,
-        ContextRevision, CursorSourceRevision, DeferredCommandValue, DetachRequest, DetachResult,
-        DisplayText, DurableRevision, FailureClass, FreshAttachRequest, FreshSurfaceAttachment,
-        InteractionPatch, LegacyTurnId, MutationReply, NonEmptyText, NonEmptyVec,
+        ByteOffset, CancelOperationOutput, CanonicalPath, CommitClass, CompactionReason,
+        CompactionState, ContextRevision, CursorSourceRevision, DeferredCommandValue,
+        DetachRequest, DetachResult, DisplayText, DurableRevision, FailureClass,
+        FreshAttachRequest, FreshSurfaceAttachment, InteractionPatch, LegacyTurnId,
+        MaintenanceOperationOutput, MutationReply, NonEmptyText, NonEmptyVec,
         OperationIngressCorrelation, OperationKind, OperationPatch, OperationRequestIntent,
         OperationSettingsPreparation, OperationTerminal, PermissionGrantScope, PinnedContextAction,
         PinnedContextMutationOutput, PinnedContextPatch, PinnedContextRevision,

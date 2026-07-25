@@ -2499,6 +2499,9 @@ static PENDING_SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usi
 static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static MANUAL_COMPACTION_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
 
 pub struct JsonlSurfaceControlLedger {
     path: PathBuf,
@@ -2748,6 +2751,18 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_manual_compaction_completion_append_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        MANUAL_COMPACTION_COMPLETION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
     fn take_terminal_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
         let is_terminal = batch.events.as_slice().iter().any(|event| {
             matches!(
@@ -2871,6 +2886,38 @@ impl JsonlSurfaceCommitLedger {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.path)
+    }
+
+    #[cfg(test)]
+    fn take_manual_compaction_completion_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let completes_manual_compaction = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Context(SurfaceContextSnapshot {
+                    compaction: CompactionState::Completed {
+                        reason: CompactionReason::Manual,
+                        ..
+                    },
+                    ..
+                })
+            )
+        });
+        if !completes_manual_compaction {
+            return false;
+        }
+        let mut failures = MANUAL_COMPACTION_COMPLETION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
     }
 
     #[cfg(test)]
@@ -3045,6 +3092,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_admission_repair_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_manual_compaction_completion_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
         let (commit_id, durable_revision) = match &batch.commit_class {

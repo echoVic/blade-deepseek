@@ -9,10 +9,12 @@ use orca_core::subagent_config::SubagentConfig;
 use orca_core::task_types::{PendingToolCallSummary, TaskStatus};
 use orca_runtime::runtime_host::RuntimeHost;
 use orca_runtime::surface::{
-    AttachResult, DisplayText, FreshAttachRequest, MutationReply, NonEmptyText,
-    PinnedContextAction, PinnedContextRevision, PinnedContextSourceRevision, PinnedUserRevision,
-    Sha256Digest, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
-    SurfaceInteractionKind, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
+    AttachResult, CompactionState, DisplayText, FreshAttachRequest, MutationReply, NonEmptyText,
+    OperationTerminal, PinnedContextAction, PinnedContextRevision, PinnedContextSourceRevision,
+    PinnedUserRevision, Sha256Digest, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceCatalogEntryId, SurfaceEvent, SurfaceInteractionKind, SurfacePinnedContextEntry,
+    SurfacePinnedContextKind, SurfaceRequestId, SurfaceSubscriptionItem,
+    WaitOperationTerminalResult,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -124,6 +126,95 @@ fn tui_surface_can_commit_and_publish_pinned_context() {
         PinnedContextRevision::try_new(2).unwrap()
     );
     assert_eq!(output.snapshot.entries, vec![entry]);
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn tui_surface_manual_compaction_is_durable_before_terminal() {
+    let cwd = tempdir().expect("temp cwd");
+    let host = RuntimeHost::start().expect("runtime host");
+    let thread = host
+        .surface_handle()
+        .start_thread(
+            test_config(cwd.path().to_path_buf()),
+            "typed manual compaction",
+        )
+        .expect("typed thread");
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("unexpected attachment result"),
+    };
+    let expected_context_revision = attachment.baseline.snapshot.context.revision;
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("surface subscription");
+    let output = match attachment
+        .client
+        .manual_compact(SurfaceRequestId::new(), expected_context_revision)
+        .expect("manual compact command")
+    {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("manual compaction must commit"),
+    };
+    let terminal = attachment
+        .client
+        .wait_operation_terminal(SurfaceRequestId::new(), output.operation_id.clone())
+        .expect("terminal wait");
+    assert!(matches!(
+        terminal,
+        WaitOperationTerminalResult::Terminal { value }
+            if matches!(value.terminal, OperationTerminal::Succeeded { .. })
+    ));
+
+    let mut saw_running = false;
+    let mut saw_completed = false;
+    let mut saw_terminal = false;
+    while let Some(item) = subscription.try_recv() {
+        if let SurfaceSubscriptionItem::Batch { batch } = item {
+            for envelope in batch.events.as_slice() {
+                match &envelope.event {
+                    SurfaceEvent::Context(context) => match &context.compaction {
+                        CompactionState::Running { operation_id, .. }
+                            if operation_id == &output.operation_id =>
+                        {
+                            saw_running = true;
+                            assert!(!saw_completed);
+                            assert!(!saw_terminal);
+                        }
+                        CompactionState::Completed { operation_id, .. }
+                            if operation_id == &output.operation_id =>
+                        {
+                            saw_completed = true;
+                            assert!(saw_running);
+                            assert!(!saw_terminal);
+                        }
+                        _ => {}
+                    },
+                    SurfaceEvent::Operation(orca_runtime::surface::OperationPatch::Terminal {
+                        record,
+                    }) if record.operation_id == output.operation_id => {
+                        saw_terminal = true;
+                        assert!(saw_completed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(saw_running);
+    assert!(saw_completed);
+    assert!(saw_terminal);
+
     host.shutdown().expect("shutdown runtime host");
 }
 

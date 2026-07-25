@@ -134,7 +134,17 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
         &transcript.summaries,
     )
     .into_iter()
-    .filter(|message| !matches!(message, Message::System { .. }))
+    .filter(|message| {
+        !matches!(
+            message,
+            Message::System {
+                content,
+                pinned: false,
+            } if !content.starts_with(
+                "[Earlier conversation history was truncated to fit context window]"
+            )
+        )
+    })
     .collect::<Vec<_>>();
     normalize_tool_boundaries(&mut restored_messages);
     for message in restored_messages.iter() {
@@ -810,6 +820,67 @@ mod tests {
             }
         }
         result.expect("no rolling summary without records");
+    }
+
+    #[test]
+    fn resume_preserves_manual_compaction_marker_and_pinned_hook_context() {
+        let _guard = lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os(ORCA_HOME_ENV);
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, home.path());
+        }
+
+        let result = (|| {
+            let cwd = std::env::current_dir()?;
+            let mut writer = SessionWriter::start(&cwd, "mock", None, "manual snapshot")?;
+            let operation_id = crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .expect("generated UUID is v7");
+            let identity = crate::session::ManualCompactionPersistenceIdentity {
+                operation_id,
+                snapshot_id: uuid::Uuid::now_v7().to_string(),
+            };
+            let mut compacted = Conversation::new();
+            compacted.add_system(
+                "[Earlier conversation history was truncated to fit context window]".to_string(),
+            );
+            compacted.add_system_pinned("[Hook context]\nretained".to_string());
+            compacted.add_user("tail".to_string());
+            writer.append_manual_compaction_snapshot(
+                &identity,
+                5,
+                "local_truncation",
+                &compacted,
+            )?;
+
+            let transcript = load_session("latest")?;
+            let resumed = resume_conversation(&transcript, "fresh system".to_string());
+            assert!(matches!(
+                resumed.messages.as_slice(),
+                [
+                    Message::System { content: system, .. },
+                    Message::System { content: marker, pinned: false },
+                    Message::System { content: hook, pinned: true },
+                    Message::User { content: tail, .. },
+                ] if system == "fresh system"
+                    && marker
+                        == "[Earlier conversation history was truncated to fit context window]"
+                    && hook == "[Hook context]\nretained"
+                    && tail == "tail"
+            ));
+            Ok::<(), io::Error>(())
+        })();
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(ORCA_HOME_ENV, previous);
+            } else {
+                std::env::remove_var(ORCA_HOME_ENV);
+            }
+        }
+        result.expect("manual compaction system context resumes");
     }
 
     #[test]

@@ -94,6 +94,16 @@ pub struct HostedGenerationHandlers {
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
     provider_response_ingress: Option<Arc<dyn surface::RuntimeProviderResponseIngress>>,
+    manual_compaction_precommit: Option<
+        Arc<
+            dyn Fn(
+                    &crate::session::ManualCompactionOutcome,
+                )
+                    -> io::Result<crate::session::ManualCompactionPersistenceIdentity>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl fmt::Debug for HostedGenerationHandlers {
@@ -114,6 +124,10 @@ impl fmt::Debug for HostedGenerationHandlers {
             .field(
                 "provider_response_ingress",
                 &self.provider_response_ingress.is_some(),
+            )
+            .field(
+                "manual_compaction_precommit",
+                &self.manual_compaction_precommit.is_some(),
             )
             .finish()
     }
@@ -165,6 +179,21 @@ impl HostedGenerationHandlers {
         ingress: Arc<dyn surface::RuntimeProviderResponseIngress>,
     ) -> Self {
         self.provider_response_ingress = Some(ingress);
+        self
+    }
+
+    fn with_manual_compaction_precommit(
+        mut self,
+        handler: Arc<
+            dyn Fn(
+                    &crate::session::ManualCompactionOutcome,
+                )
+                    -> io::Result<crate::session::ManualCompactionPersistenceIdentity>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        self.manual_compaction_precommit = Some(handler);
         self
     }
 }
@@ -877,6 +906,18 @@ impl GenerationContext {
     pub fn mcp_elicitation_handler(&self) -> Option<&(dyn McpElicitationHandler + Send + Sync)> {
         self.handlers.mcp_elicitation_handler.as_deref()
     }
+
+    fn prepare_manual_compaction(
+        &self,
+        outcome: &crate::session::ManualCompactionOutcome,
+    ) -> io::Result<crate::session::ManualCompactionPersistenceIdentity> {
+        self.handlers
+            .manual_compaction_precommit
+            .as_ref()
+            .ok_or_else(|| io::Error::other("manual compaction precommit handler is unavailable"))?(
+            outcome,
+        )
+    }
 }
 
 struct RuntimeSurfaceUserInputHandler {
@@ -1129,17 +1170,29 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
             let mut sink = EventSink::new(writer, config.output_format)
                 .with_optional_observer(request.event_observer());
             sink.emit(events.context_compaction_started("manual", before_messages))?;
-            let (before_messages, after_messages) =
-                thread.session_mut().compact(config, &cwd, cancel);
+            let compaction = thread
+                .session_mut()
+                .compact(config, &cwd, cancel, |outcome| {
+                    generation.prepare_manual_compaction(outcome)
+                })?;
+            let before_messages = compaction.before.messages.len();
+            let after_messages = compaction.after.messages.len();
             sink.emit(events.context_compacted(
                 "manual",
-                "manual",
+                compaction.strategy,
                 before_messages,
                 after_messages,
                 before_messages.saturating_sub(after_messages),
                 "compacted context manually",
             ))?;
-            return Ok(RunStatus::Success.into());
+            return Ok(ThreadOperationOutcome::Completed {
+                status: if cancel.is_cancelled() {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::Success
+                },
+                background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+            });
         }
         if request.operation_kind() != &HostedOperationKind::Turn
             && request.operation_kind() != &HostedOperationKind::GoalRun
@@ -2433,6 +2486,22 @@ enum ThreadCommand {
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
     },
+    SurfaceManualCompact {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        expected_context_revision: surface::ContextRevision,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::MaintenanceOperationOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
+    SurfacePrepareManualCompaction {
+        fence: surface::SurfaceOperationFence,
+        outcome: crate::session::ManualCompactionOutcome,
+        reply: SyncSender<io::Result<crate::session::ManualCompactionPersistenceIdentity>>,
+    },
     SurfaceUpdateSettings {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
@@ -2614,6 +2683,7 @@ enum ThreadShutdownAck {
 struct SurfaceActorTestProbe {
     waiter_count: usize,
     legacy_completion: Option<OperationCompletion>,
+    pending_manual_compaction_completion: bool,
     exact_interaction_selector: Option<surface::InteractionSelector>,
     secret_bearing_interaction_count: usize,
     pending_capability_loss: Option<PendingCapabilityLossTestProbe>,
@@ -3097,6 +3167,23 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         })
     }
 
+    fn manual_compact(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        expected_context_revision: surface::ContextRevision,
+    ) -> Result<
+        surface::MutationReply<surface::MaintenanceOperationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceManualCompact {
+            client,
+            request_id,
+            expected_context_revision,
+            reply,
+        })
+    }
+
     fn update_settings(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -3281,6 +3368,19 @@ fn bootstrap_recorded_surface(
             .map(|operation| operation.operation_id.clone())
             .collect::<Vec<_>>();
         for operation_id in operation_ids {
+            let durable_compaction = thread
+                .session()
+                .manual_compaction_snapshot(&operation_id)
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to read durable manual compaction snapshot: {error}"),
+                })?;
+            coordinator
+                .recover_interrupted_manual_compaction(&operation_id, durable_compaction.as_ref())
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!(
+                        "failed to reconcile typed manual compaction context: {error:?}"
+                    ),
+                })?;
             coordinator
                 .recover_unavailable_interactions(&operation_id, &materialization)
                 .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -3768,6 +3868,7 @@ struct ThreadActor {
     background_completion_rx: tokio_mpsc::UnboundedReceiver<String>,
     usage_ledger: RuntimeUsageLedger,
     resident_surface: ResidentSurfaceSlot,
+    pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
     surface_terminal_blocked: Option<String>,
 }
 
@@ -3856,6 +3957,7 @@ struct PendingSurfaceAdmissionCommit {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PendingSurfaceTransitionRetry {
+    ManualCompactionCompletion,
     AdmissionCommit(surface::SurfaceOperationId),
     AdmissionRepair(surface::SurfaceOperationId),
     AdmissionTerminal(surface::SurfaceOperationId),
@@ -4591,6 +4693,9 @@ struct ActiveOperation {
     pending_goal_pause_event: Option<PendingGoalPauseEvent>,
     generation: ActiveGeneration,
     surface_operation: Option<surface::SurfaceOperationFence>,
+    surface_manual_compaction_before_messages: Option<u64>,
+    surface_manual_compaction_committed: bool,
+    surface_manual_compaction_prepared: Option<surface::SurfaceCommitBatch>,
     surface_terminalization: Option<surface::TerminalizationCause>,
     surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
 }
@@ -4622,6 +4727,14 @@ struct OperationTaskResult {
     writer: Box<dyn HostedOperationWriter>,
     outcome: GenerationTaskOutcome,
     usage_delta: UsageTotals,
+}
+
+struct PendingManualCompactionCompletion {
+    active: ActiveOperation,
+    result: OperationTaskResult,
+    batch: surface::SurfaceCommitBatch,
+    retry_at: tokio::time::Instant,
+    allow_resume: bool,
 }
 
 enum GenerationTaskOutcome {
@@ -4860,6 +4973,9 @@ impl ThreadActor {
         &mut self,
         batch: &surface::SurfaceCommitBatch,
     ) -> Result<(), surface::SurfaceClientCommandError> {
+        if self.pending_manual_compaction_completion.is_some() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
         for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
             match self.resident_surface.coordinator.commit_actor_batch(batch) {
                 Ok(_) => return Ok(()),
@@ -7127,49 +7243,58 @@ impl ThreadActor {
     }
 
     fn next_surface_transition_retry_at(&self) -> Option<tokio::time::Instant> {
-        self.resident_surface.0.as_ref().and_then(|resident| {
-            resident
-                .pending_admission_commits
-                .values()
-                .map(|pending| pending.retry_at)
-                .chain(
-                    resident
-                        .pending_admission_repairs
-                        .values()
-                        .map(|pending| pending.retry_at),
-                )
-                .chain(
-                    resident
-                        .pending_admission_terminals
-                        .values()
-                        .map(|pending| pending.retry_at),
-                )
-                .chain(
-                    resident
-                        .pending_terminalization
-                        .iter()
-                        .map(|pending| pending.retry_at),
-                )
-                .chain(resident.interactions.values().filter_map(|interaction| {
-                    interaction
-                        .private_response
-                        .as_ref()
-                        .and_then(|private| private.retry_at)
-                }))
-                .chain(
-                    resident
-                        .pending_detaches
-                        .values()
-                        .map(|pending| pending.retry_at),
-                )
-                .chain(
-                    resident
-                        .pending_capability_losses
-                        .values()
-                        .map(|pending| pending.retry_at),
-                )
-                .min()
-        })
+        self.resident_surface
+            .0
+            .as_ref()
+            .into_iter()
+            .flat_map(|resident| {
+                resident
+                    .pending_admission_commits
+                    .values()
+                    .map(|pending| pending.retry_at)
+                    .chain(
+                        resident
+                            .pending_admission_repairs
+                            .values()
+                            .map(|pending| pending.retry_at),
+                    )
+                    .chain(
+                        resident
+                            .pending_admission_terminals
+                            .values()
+                            .map(|pending| pending.retry_at),
+                    )
+                    .chain(
+                        resident
+                            .pending_terminalization
+                            .iter()
+                            .map(|pending| pending.retry_at),
+                    )
+                    .chain(resident.interactions.values().filter_map(|interaction| {
+                        interaction
+                            .private_response
+                            .as_ref()
+                            .and_then(|private| private.retry_at)
+                    }))
+                    .chain(
+                        resident
+                            .pending_detaches
+                            .values()
+                            .map(|pending| pending.retry_at),
+                    )
+                    .chain(
+                        resident
+                            .pending_capability_losses
+                            .values()
+                            .map(|pending| pending.retry_at),
+                    )
+            })
+            .chain(
+                self.pending_manual_compaction_completion
+                    .iter()
+                    .map(|pending| pending.retry_at),
+            )
+            .min()
     }
 
     fn has_pending_surface_transition_retry(&self) -> bool {
@@ -7441,88 +7566,129 @@ impl ThreadActor {
     }
 
     fn retry_pending_surface_transition(&mut self, mut active: Option<&mut ActiveOperation>) {
+        let manual_compaction = self
+            .pending_manual_compaction_completion
+            .iter()
+            .map(|pending| {
+                (
+                    pending.retry_at,
+                    PendingSurfaceTransitionRetry::ManualCompactionCompletion,
+                )
+            });
         let Some((_, retry)) =
-            self.resident_surface
-                .pending_admission_repairs
-                .values()
-                .map(|pending| {
-                    (
-                        pending.retry_at,
-                        PendingSurfaceTransitionRetry::AdmissionRepair(
-                            pending.fence.operation_id.clone(),
-                        ),
-                    )
-                })
-                .chain(self.resident_surface.pending_admission_commits.iter().map(
-                    |(operation_id, pending)| {
-                        (
-                            pending.retry_at,
-                            PendingSurfaceTransitionRetry::AdmissionCommit(operation_id.clone()),
-                        )
-                    },
-                ))
+            manual_compaction
                 .chain(
                     self.resident_surface
-                        .pending_terminalization
-                        .iter()
+                        .pending_admission_repairs
+                        .values()
                         .map(|pending| {
                             (
                                 pending.retry_at,
-                                PendingSurfaceTransitionRetry::PreparedTerminalization(
+                                PendingSurfaceTransitionRetry::AdmissionRepair(
                                     pending.fence.operation_id.clone(),
                                 ),
                             )
-                        }),
-                )
-                .chain(
-                    self.resident_surface
-                        .pending_admission_terminals
-                        .iter()
-                        .map(|(operation_id, pending)| {
-                            (
-                                pending.retry_at,
-                                PendingSurfaceTransitionRetry::AdmissionTerminal(
-                                    operation_id.clone(),
-                                ),
-                            )
-                        }),
-                )
-                .chain(self.resident_surface.interactions.iter().filter_map(
-                    |(interaction_id, interaction)| {
-                        interaction
-                            .private_response
-                            .as_ref()
-                            .and_then(|private| private.retry_at)
-                            .map(|retry_at| {
+                        })
+                        .chain(self.resident_surface.pending_admission_commits.iter().map(
+                            |(operation_id, pending)| {
                                 (
-                                    retry_at,
-                                    PendingSurfaceTransitionRetry::PrivateResponse(
-                                        interaction_id.clone(),
+                                    pending.retry_at,
+                                    PendingSurfaceTransitionRetry::AdmissionCommit(
+                                        operation_id.clone(),
                                     ),
                                 )
-                            })
-                    },
-                ))
-                .chain(self.resident_surface.pending_detaches.iter().map(
-                    |(attachment_id, pending)| {
-                        (
-                            pending.retry_at,
-                            PendingSurfaceTransitionRetry::Detach(attachment_id.clone()),
+                            },
+                        ))
+                        .chain(self.resident_surface.pending_terminalization.iter().map(
+                            |pending| {
+                                (
+                                    pending.retry_at,
+                                    PendingSurfaceTransitionRetry::PreparedTerminalization(
+                                        pending.fence.operation_id.clone(),
+                                    ),
+                                )
+                            },
+                        ))
+                        .chain(
+                            self.resident_surface
+                                .pending_admission_terminals
+                                .iter()
+                                .map(|(operation_id, pending)| {
+                                    (
+                                        pending.retry_at,
+                                        PendingSurfaceTransitionRetry::AdmissionTerminal(
+                                            operation_id.clone(),
+                                        ),
+                                    )
+                                }),
                         )
-                    },
-                ))
-                .chain(self.resident_surface.pending_capability_losses.iter().map(
-                    |(attachment_id, pending)| {
-                        (
-                            pending.retry_at,
-                            PendingSurfaceTransitionRetry::CapabilityLoss(attachment_id.clone()),
-                        )
-                    },
-                ))
+                        .chain(self.resident_surface.interactions.iter().filter_map(
+                            |(interaction_id, interaction)| {
+                                interaction
+                                    .private_response
+                                    .as_ref()
+                                    .and_then(|private| private.retry_at)
+                                    .map(|retry_at| {
+                                        (
+                                            retry_at,
+                                            PendingSurfaceTransitionRetry::PrivateResponse(
+                                                interaction_id.clone(),
+                                            ),
+                                        )
+                                    })
+                            },
+                        ))
+                        .chain(self.resident_surface.pending_detaches.iter().map(
+                            |(attachment_id, pending)| {
+                                (
+                                    pending.retry_at,
+                                    PendingSurfaceTransitionRetry::Detach(attachment_id.clone()),
+                                )
+                            },
+                        ))
+                        .chain(self.resident_surface.pending_capability_losses.iter().map(
+                            |(attachment_id, pending)| {
+                                (
+                                    pending.retry_at,
+                                    PendingSurfaceTransitionRetry::CapabilityLoss(
+                                        attachment_id.clone(),
+                                    ),
+                                )
+                            },
+                        )),
+                )
                 .min()
         else {
             return;
         };
+        if retry == PendingSurfaceTransitionRetry::ManualCompactionCompletion {
+            let Some(mut pending) = self.pending_manual_compaction_completion.take() else {
+                return;
+            };
+            let fence = pending
+                .active
+                .surface_operation
+                .clone()
+                .expect("pending manual compaction keeps its generation fence");
+            if self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(fence, &pending.batch)
+                .is_err()
+            {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                self.pending_manual_compaction_completion = Some(pending);
+                return;
+            }
+            pending.active.surface_manual_compaction_committed = true;
+            if let Err(error) =
+                self.finish_generation(pending.active, Ok(pending.result), pending.allow_resume)
+            {
+                self.surface_terminal_blocked = Some(error.to_string());
+            }
+            return;
+        }
         if let PendingSurfaceTransitionRetry::AdmissionCommit(operation_id) = retry {
             self.retry_surface_admission_commit(&operation_id);
             return;
@@ -7657,6 +7823,12 @@ impl ThreadActor {
         request: surface::DetachRequest,
     ) -> surface::DetachResult {
         let attachment_id = client.attachment_id().clone();
+        if self.pending_manual_compaction_completion.is_some() {
+            return surface::DetachResult::StaleAttachment {
+                request_id: request.request_id,
+                attachment_id,
+            };
+        }
         if !self.resident_surface.pending_capability_losses.is_empty()
             && !self
                 .resident_surface
@@ -7781,7 +7953,8 @@ impl ThreadActor {
         surface::MutationReply<surface::ReservedOperationOutput>,
         surface::SurfaceClientCommandError,
     > {
-        if !self.resident_surface.pending_terminal_commits.is_empty()
+        if self.pending_manual_compaction_completion.is_some()
+            || !self.resident_surface.pending_terminal_commits.is_empty()
             || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
@@ -8033,6 +8206,414 @@ impl ThreadActor {
         ))
     }
 
+    fn manual_compact_surface(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        expected_context_revision: surface::ContextRevision,
+    ) -> Result<
+        surface::MutationReply<surface::MaintenanceOperationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        if client.grant().role != surface::SurfaceAttachmentRole::Tui {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if let Some(replay) = self.replay_manual_compaction_request(client, request_id.clone())? {
+            return Ok(replay);
+        }
+        if self.active.is_some()
+            || self.pending_manual_compaction_completion.is_some()
+            || !self.background_tasks.is_empty()
+            || !self.resident_surface.interactions.is_empty()
+            || !self.resident_surface.pending_detaches.is_empty()
+            || !self.resident_surface.pending_capability_losses.is_empty()
+            || !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.pending_admission_commits.is_empty()
+            || !self.resident_surface.pending_admission_repairs.is_empty()
+            || !self.resident_surface.pending_admission_terminals.is_empty()
+            || self.surface_terminal_blocked.is_some()
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.thread.session().has_active_workflows())
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        if snapshot.context.revision != expected_context_revision {
+            return Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Stale {
+                    request_id,
+                    target: Some(surface::MutationTarget::Thread {
+                        thread_id: snapshot.thread.thread_id.clone(),
+                    }),
+                    error: surface::StaleMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::StaleRevision,
+                        message: surface::DisplayText::new("context revision is stale"),
+                        winning_request_id: None,
+                        current_revision: Some(surface::SurfaceMutationRevision::Context {
+                            thread_id: snapshot.thread.thread_id.clone(),
+                            revision: snapshot.context.revision,
+                        }),
+                    }),
+                },
+            });
+        }
+        snapshot
+            .context
+            .revision
+            .get()
+            .checked_add(2)
+            .and_then(|revision| surface::ContextRevision::try_new(revision).ok())
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let operation_id =
+            surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let lease = surface::ReservationLease::new(
+            surface::SurfaceAdmissionLeaseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            operation_id.clone(),
+            surface::SequenceNumber::new(snapshot.queued_operations.len() as u64 + 1),
+            self.resident_surface
+                .hub
+                .authority()
+                .host_incarnation()
+                .clone(),
+            surface::MonotonicInstant {
+                clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                tick: surface::MonotonicTick::new(0),
+            },
+        );
+        let replayability = surface::Replayability::NonReplayable {
+            reason: surface::NonReplayableReason::Missing,
+            live_capsule: surface::LiveOperationCapsule::Available {
+                incarnation: snapshot.cursor.incarnation.clone(),
+            },
+        };
+        let capability_fingerprint = surface_sha256(
+            &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+        );
+        let operation = surface::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: request_id.clone(),
+            intent: surface::OperationIntent {
+                origin: surface::OperationOrigin::TuiUser,
+                kind: surface::OperationKind::ManualCompaction {
+                    reason: surface::ManualCompactionReason::Manual,
+                },
+                initial_replayability: replayability.clone(),
+                busy_disposition: surface::BusyDisposition::Queue,
+                interrupt_settlement: surface::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: capability_fingerprint.clone(),
+                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: surface::OperationPhase::Requested,
+            reservation: lease,
+            ready_for_admission: false,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        };
+        let requested_batch = self.surface_operation_batch(
+            &operation_id,
+            vec![surface::OperationPatch::Requested { operation }],
+        );
+        self.commit_surface_actor_batch_with_retry(&requested_batch)?;
+        self.resident_surface
+            .operation_origin_attachments
+            .insert(operation_id.clone(), client.attachment_id().clone());
+
+        let logical_turn_id = TurnId::new();
+        let fence = surface::SurfaceOperationFence {
+            thread_id: snapshot.thread.thread_id.clone(),
+            thread_owner_epoch: snapshot.thread.owner_epoch,
+            operation_id: operation_id.clone(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        };
+        let generation = surface::GenerationRecord {
+            fence: fence.clone(),
+            logical_turn_id: logical_turn_id.clone(),
+            input: surface::GenerationInputState::NotApplicable,
+            predecessor: None,
+            attempt: surface::GenerationAttempt::Initial,
+            goal_identity: None,
+            replayability: replayability.clone(),
+            required_capabilities: Default::default(),
+            capability_fingerprint: capability_fingerprint.clone(),
+            phase: surface::GenerationPhase::Reserved,
+            started_witness: None,
+            stop_reason: None,
+        };
+        let admitted_batch = self.surface_operation_batch(
+            &operation_id,
+            vec![surface::OperationPatch::Admitted {
+                operation_id: operation_id.clone(),
+                logical_turn_id,
+                input: surface::AdmittedInput::NotApplicable,
+                first_generation: generation,
+            }],
+        );
+        if let Err(error) = self.commit_surface_actor_batch_with_retry(&admitted_batch) {
+            let _ = self.terminalize_surface_reservation(
+                operation_id,
+                surface::ReservationFinalizerReason::AdmissionRejected {
+                    reason: surface::AdmissionRejectionReason::ConfigurationConflict,
+                },
+                surface::NotAdmittedReason::ConfigurationConflict,
+            );
+            return Err(error);
+        }
+
+        let start_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let started_batch = self.surface_operation_batch_with_commit_id(
+            &operation_id,
+            vec![surface::OperationPatch::GenerationStarted {
+                fence: fence.clone(),
+                witness: surface::GenerationStartedWitness {
+                    started_commit_id: start_commit_id.clone(),
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                    durable_replayability_digest: surface::canonical_replayability_digest(
+                        &replayability,
+                    ),
+                    capability_fingerprint,
+                },
+            }],
+            Some(start_commit_id),
+        );
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &started_batch)
+            .is_err()
+        {
+            let _ = self.repair_surface_admission_failure(
+                &fence,
+                "typed manual compaction start commit failed",
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+
+        let before_messages = self
+            .state
+            .as_ref()
+            .map(|state| state.thread.session().conversation().messages.len() as u64)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let next_context_revision = surface::ContextRevision::try_new(
+            snapshot
+                .context
+                .revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let mut running_context = snapshot.context.clone();
+        running_context.revision = next_context_revision;
+        running_context.compaction = surface::CompactionState::Running {
+            operation_id: operation_id.clone(),
+            reason: surface::CompactionReason::Manual,
+            before_messages,
+        };
+        let running_batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Context(running_context),
+            )],
+            None,
+        );
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &running_batch)
+            .is_err()
+        {
+            let _ = self.repair_surface_admission_failure(
+                &fence,
+                "typed manual compaction running context commit failed",
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        let precommit_command_tx = self.handle.command_tx.clone();
+        let precommit_fence = fence.clone();
+        self.handle_idle_command(ThreadCommand::StartTurn {
+            request: Box::new(
+                HostedTurnRequest::new("")
+                    .with_operation_kind(HostedOperationKind::ManualCompaction)
+                    .with_generation_handlers(move |_, _| {
+                        let command_tx = precommit_command_tx.clone();
+                        let fence = precommit_fence.clone();
+                        HostedGenerationHandlers::default().with_manual_compaction_precommit(
+                            Arc::new(move |outcome| {
+                                let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+                                command_tx
+                                    .try_send(ThreadCommand::SurfacePrepareManualCompaction {
+                                        fence: fence.clone(),
+                                        outcome: outcome.clone(),
+                                        reply: reply_tx,
+                                    })
+                                    .map_err(|error| match error {
+                                        TrySendError::Full(_) => io::Error::new(
+                                            io::ErrorKind::WouldBlock,
+                                            "manual compaction precommit mailbox is full",
+                                        ),
+                                        TrySendError::Closed(_) => io::Error::new(
+                                            io::ErrorKind::BrokenPipe,
+                                            "manual compaction precommit actor is unavailable",
+                                        ),
+                                    })?;
+                                reply_rx.recv().map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "manual compaction precommit actor closed",
+                                    )
+                                })?
+                            }),
+                        )
+                    }),
+            ),
+            writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+            config: None,
+            reply: start_tx,
+        });
+        if !matches!(start_rx.recv(), Ok(Ok(_))) {
+            let _ = self.repair_surface_admission_failure(
+                &fence,
+                "typed manual compaction runtime start failed",
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let Some(active) = self.active.as_mut() else {
+            let _ = self.repair_surface_admission_failure(
+                &fence,
+                "typed manual compaction active generation was missing",
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        active.surface_operation = Some(fence);
+        active.surface_manual_compaction_before_messages = Some(before_messages);
+
+        Ok(Self::committed_surface_mutation(
+            request_id,
+            operation_id.clone(),
+            &admitted_batch,
+            surface::MaintenanceOperationOutput {
+                operation_id,
+                admitted_cursor: admitted_batch.cursor_after.clone(),
+                waiter: surface::OperationWaiterHandle::new(),
+            },
+        ))
+    }
+
+    fn replay_manual_compaction_request(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+    ) -> Result<
+        Option<surface::MutationReply<surface::MaintenanceOperationOutput>>,
+        surface::SurfaceClientCommandError,
+    > {
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let Some(operation) = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| operation.request_id == request_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            operation.intent.kind,
+            surface::OperationKind::ManualCompaction {
+                reason: surface::ManualCompactionReason::Manual
+            }
+        ) {
+            return Ok(Some(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid {
+                    request_id,
+                    target: Some(surface::MutationTarget::Operation {
+                        thread_id: snapshot.thread.thread_id.clone(),
+                        operation_id: operation.operation_id,
+                    }),
+                    error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::InvalidRequest,
+                        message: surface::DisplayText::new(
+                            "request id is already bound to another operation",
+                        ),
+                        winning_request_id: Some(operation.request_id),
+                        current_revision: Some(surface::SurfaceMutationRevision::Thread {
+                            cursor: snapshot.cursor.clone(),
+                        }),
+                    }),
+                },
+            }));
+        }
+        if let Some(bound) = self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&operation.operation_id)
+            && bound != client.attachment_id()
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let recovered = self
+            .resident_surface
+            .coordinator
+            .ledger()
+            .recover_batches()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let admitted_batch = recovered
+            .committed
+            .iter()
+            .find(|batch| {
+                batch.events.as_slice().iter().any(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::Admitted { operation_id, .. }
+                        ) if operation_id == &operation.operation_id
+                    )
+                })
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.resident_surface
+            .operation_origin_attachments
+            .entry(operation.operation_id.clone())
+            .or_insert_with(|| client.attachment_id().clone());
+        Ok(Some(Self::committed_surface_mutation(
+            request_id,
+            operation.operation_id.clone(),
+            &admitted_batch,
+            surface::MaintenanceOperationOutput {
+                operation_id: operation.operation_id,
+                admitted_cursor: admitted_batch.cursor_after.clone(),
+                waiter: surface::OperationWaiterHandle::new(),
+            },
+        )))
+    }
+
     fn update_surface_settings(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -8046,7 +8627,7 @@ impl ThreadActor {
         if !self.admits_surface_client(client, surface::SurfaceCapability::ManageThreadSettings) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self.active.is_some() {
+        if self.active.is_some() || self.pending_manual_compaction_completion.is_some() {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         let snapshot = self.resident_surface.coordinator.state().snapshot();
@@ -8143,7 +8724,7 @@ impl ThreadActor {
         if !self.admits_surface_client(client, surface::SurfaceCapability::ManagePinnedContext) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if self.active.is_some() {
+        if self.active.is_some() || self.pending_manual_compaction_completion.is_some() {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         let surface::PinnedContextAction::Add {
@@ -8255,7 +8836,8 @@ impl ThreadActor {
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        if !self.resident_surface.pending_terminal_commits.is_empty()
+        if self.pending_manual_compaction_completion.is_some()
+            || !self.resident_surface.pending_terminal_commits.is_empty()
             || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
             || !self.resident_surface.pending_admission_terminals.is_empty()
@@ -9361,6 +9943,136 @@ impl ThreadActor {
         Ok(value)
     }
 
+    fn prepare_manual_compaction_completed_batch(
+        &self,
+        active: &ActiveOperation,
+        after_messages: u64,
+        compaction: Option<&crate::session::ManualCompactionOutcome>,
+    ) -> Result<surface::SurfaceCommitBatch, RuntimeHostError> {
+        let Some(before_messages) = active.surface_manual_compaction_before_messages else {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction completion metadata is missing".to_string(),
+            });
+        };
+        let fence = active.surface_operation.clone().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction operation fence is missing".to_string(),
+            }
+        })?;
+        let operation_id = fence.operation_id.clone();
+        let current = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .context
+            .clone();
+        if !matches!(
+            &current.compaction,
+            surface::CompactionState::Running {
+                operation_id: running,
+                before_messages: running_before,
+                ..
+            } if running == &operation_id && *running_before == before_messages
+        ) {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction context is not running".to_string(),
+            });
+        }
+        let revision =
+            surface::ContextRevision::try_new(current.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "typed manual compaction context revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction context revision is invalid".to_string(),
+            })?;
+        let mut completed = current;
+        completed.revision = revision;
+        completed.compaction = surface::CompactionState::Completed {
+            operation_id: operation_id.clone(),
+            reason: surface::CompactionReason::Manual,
+            strategy: surface::NonEmptyText::try_new(
+                compaction.map_or("manual", |outcome| outcome.strategy),
+            )
+            .expect("manual strategy is non-empty"),
+            before_messages,
+            after_messages,
+            collapsed_messages: before_messages.saturating_sub(after_messages),
+            status_text: surface::DisplayText::new("compacted context manually"),
+        };
+        let scope = surface::SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let mut events = Vec::new();
+        if let Some(compaction) = compaction {
+            let item_patches = surface::manual_compaction_item_patches(
+                &self.resident_surface.coordinator.state().snapshot().items,
+                &compaction.after,
+            )
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "manual compaction result cannot materialize every typed item".to_string(),
+            })?;
+            events.extend(
+                item_patches
+                    .into_iter()
+                    .map(|patch| (scope.clone(), surface::SurfaceEvent::Item(patch))),
+            );
+        }
+        events.push((scope, surface::SurfaceEvent::Context(completed)));
+        if events.len() as u64 > surface::SURFACE_COMMIT_BATCH_EVENT_LIMIT {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction completion exceeds one durable batch".to_string(),
+            });
+        }
+        Ok(self.surface_event_batch_with_commit_id(events, None))
+    }
+
+    fn prepare_manual_compaction_idle_batch(
+        &self,
+        active: &ActiveOperation,
+    ) -> Result<surface::SurfaceCommitBatch, RuntimeHostError> {
+        let fence = active.surface_operation.clone().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction operation fence is missing".to_string(),
+            }
+        })?;
+        let mut context = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .context
+            .clone();
+        if !matches!(
+            &context.compaction,
+            surface::CompactionState::Running { operation_id, .. }
+                if operation_id == &fence.operation_id
+        ) {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction context is not running".to_string(),
+            });
+        }
+        context.revision =
+            surface::ContextRevision::try_new(context.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "typed manual compaction context revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "typed manual compaction context revision is invalid".to_string(),
+            })?;
+        context.compaction = surface::CompactionState::Idle;
+        Ok(self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Generation { fence },
+                surface::SurfaceEvent::Context(context),
+            )],
+            None,
+        ))
+    }
+
     fn bind_surface_operation_controller(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -9401,7 +10113,8 @@ impl ThreadActor {
         surface::MutationReply<surface::ResumeOperationOutput>,
         surface::SurfaceClientCommandError,
     > {
-        if !self.bind_surface_operation_controller(client, &operation_id)
+        if self.pending_manual_compaction_completion.is_some()
+            || !self.bind_surface_operation_controller(client, &operation_id)
             || !self.resident_surface.pending_terminal_commits.is_empty()
             || !self.resident_surface.pending_admission_commits.is_empty()
             || !self.resident_surface.pending_admission_repairs.is_empty()
@@ -9707,6 +10420,9 @@ impl ThreadActor {
         surface::MutationReply<surface::CancelOperationOutput>,
         surface::SurfaceClientCommandError,
     > {
+        if self.pending_manual_compaction_completion.is_some() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
         if !self.bind_surface_operation_controller(client, &operation_id) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -10012,6 +10728,7 @@ impl ThreadActor {
             background_completion_rx,
             usage_ledger,
             resident_surface: ResidentSurfaceSlot(resident_surface),
+            pending_manual_compaction_completion: None,
             surface_terminal_blocked: None,
         }
     }
@@ -10030,7 +10747,9 @@ impl ThreadActor {
                         self.retry_pending_surface_transition(None);
                     }
                     wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
-                        if wake.is_some() {
+                        if wake.is_some()
+                            && self.pending_manual_compaction_completion.is_none()
+                        {
                             self.reconcile_surface_interaction_capabilities(None);
                         }
                     }
@@ -10110,7 +10829,9 @@ impl ThreadActor {
                     self.active = Some(active);
                 }
                 wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
-                    if wake.is_some() {
+                    if wake.is_some()
+                        && active.surface_manual_compaction_prepared.is_none()
+                    {
                         self.reconcile_surface_interaction_capabilities(Some(&mut active));
                     }
                     self.active = Some(active);
@@ -10118,6 +10839,13 @@ impl ThreadActor {
                 command = command_rx.recv() => {
                     match command {
                         Some(ThreadCommand::ShutdownThread { reply, reason }) => {
+                            if active.surface_manual_compaction_prepared.is_some() {
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(ThreadShutdownAck::Retry);
+                                }
+                                self.active = Some(active);
+                                continue;
+                            }
                             let terminalization = match reason {
                                 surface::SurfaceShutdownReason::HostShutdown => {
                                     surface::TerminalizationCause::HostShutdown
@@ -10279,6 +11007,15 @@ impl ThreadActor {
                 ThreadCommand::SurfaceWaitOperationTerminal { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceManualCompact { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfacePrepareManualCompaction { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceUpdateSettings { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -10390,7 +11127,30 @@ impl ThreadActor {
         }
     }
 
+    fn reject_thread_command_unavailable(command: ThreadCommand) {
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(1);
+        command_tx
+            .try_send(command)
+            .expect("fresh rejection mailbox has capacity");
+        drop(command_tx);
+        Self::drain_closed_thread_commands(&mut command_rx);
+    }
+
     fn handle_idle_command(&mut self, command: ThreadCommand) {
+        let permitted_during_manual_retry = matches!(
+            &command,
+            ThreadCommand::SurfaceWaitOperationTerminal { .. }
+                | ThreadCommand::SurfaceManualCompact { .. }
+                | ThreadCommand::ReadState { .. }
+                | ThreadCommand::ReadSnapshot { .. }
+        );
+        #[cfg(test)]
+        let permitted_during_manual_retry = permitted_during_manual_retry
+            || matches!(&command, ThreadCommand::SurfaceActorTestProbe { .. });
+        if self.pending_manual_compaction_completion.is_some() && !permitted_during_manual_retry {
+            Self::reject_thread_command_unavailable(command);
+            return;
+        }
         match command {
             ThreadCommand::SurfaceDetach {
                 client,
@@ -10516,6 +11276,27 @@ impl ThreadActor {
                 } else {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
+            }
+            ThreadCommand::SurfaceManualCompact {
+                client,
+                request_id,
+                expected_context_revision,
+                reply,
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::SubmitOperation)
+                {
+                    self.manual_compact_surface(&client, request_id, expected_context_revision)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfacePrepareManualCompaction { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
             }
             ThreadCommand::SurfaceUpdateSettings {
                 client,
@@ -10654,6 +11435,9 @@ impl ThreadActor {
                         .get(&operation_id)
                         .map_or(0, Vec::len),
                     legacy_completion: None,
+                    pending_manual_compaction_completion: self
+                        .pending_manual_compaction_completion
+                        .is_some(),
                     exact_interaction_selector: exact_interaction_selector_for_test(
                         &self.resident_surface,
                         &operation_id,
@@ -10788,6 +11572,9 @@ impl ThreadActor {
                     pending_goal_pause_event: None,
                     generation,
                     surface_operation: None,
+                    surface_manual_compaction_before_messages: None,
+                    surface_manual_compaction_committed: false,
+                    surface_manual_compaction_prepared: None,
                     surface_terminalization: None,
                     surface_execution_failure: None,
                 });
@@ -10900,6 +11687,20 @@ impl ThreadActor {
     }
 
     fn handle_running_command(&mut self, command: ThreadCommand, active: &mut ActiveOperation) {
+        let permitted_during_manual_precommit = matches!(
+            &command,
+            ThreadCommand::SurfaceWaitOperationTerminal { .. }
+                | ThreadCommand::SurfaceManualCompact { .. }
+                | ThreadCommand::ReadState { .. }
+        );
+        #[cfg(test)]
+        let permitted_during_manual_precommit = permitted_during_manual_precommit
+            || matches!(&command, ThreadCommand::SurfaceActorTestProbe { .. });
+        if active.surface_manual_compaction_prepared.is_some() && !permitted_during_manual_precommit
+        {
+            Self::reject_thread_command_unavailable(command);
+            return;
+        }
         let generation = active.generation.context.fence();
         match command {
             ThreadCommand::SurfaceDetach {
@@ -10950,6 +11751,79 @@ impl ThreadActor {
                 } else {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
+            }
+            ThreadCommand::SurfaceManualCompact {
+                client,
+                request_id,
+                reply,
+                ..
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::SubmitOperation)
+                {
+                    self.replay_manual_compaction_request(&client, request_id)
+                        .and_then(|replay| {
+                            replay.ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)
+                        })
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfacePrepareManualCompaction {
+                fence,
+                outcome,
+                reply,
+            } => {
+                let result = (|| {
+                    if active.surface_operation.as_ref() != Some(&fence)
+                        || active.surface_manual_compaction_prepared.is_some()
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "manual compaction precommit fence is stale",
+                        ));
+                    }
+                    let before_messages = active
+                        .surface_manual_compaction_before_messages
+                        .ok_or_else(|| {
+                            io::Error::other("manual compaction before-count is missing")
+                        })?;
+                    if outcome.before.messages.len() as u64 != before_messages
+                        || outcome.after.messages.len() as u64 > before_messages
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "manual compaction must not increase the canonical message count",
+                        ));
+                    }
+                    let batch = self
+                        .prepare_manual_compaction_completed_batch(
+                            active,
+                            outcome.after.messages.len() as u64,
+                            Some(&outcome),
+                        )
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    if !matches!(
+                        surface::reduce_batch(
+                            surface::SurfaceReduceMode::Live,
+                            self.resident_surface.coordinator.state(),
+                            &batch,
+                        ),
+                        surface::SurfaceReduceResult::Applied { .. }
+                    ) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "manual compaction surface batch failed precommit validation",
+                        ));
+                    }
+                    active.surface_manual_compaction_prepared = Some(batch);
+                    Ok(crate::session::ManualCompactionPersistenceIdentity {
+                        operation_id: fence.operation_id,
+                        snapshot_id: uuid::Uuid::now_v7().to_string(),
+                    })
+                })();
+                let _ = reply.send(result);
             }
             ThreadCommand::SurfaceUpdateSettings { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
@@ -11143,6 +12017,9 @@ impl ThreadActor {
                         .get(&operation_id)
                         .map_or(0, Vec::len),
                     legacy_completion,
+                    pending_manual_compaction_completion: self
+                        .pending_manual_compaction_completion
+                        .is_some(),
                     exact_interaction_selector: exact_interaction_selector_for_test(
                         &self.resident_surface,
                         &operation_id,
@@ -11500,6 +12377,73 @@ impl ThreadActor {
     ) -> Result<(), RuntimeHostError> {
         let outcome = match result {
             Ok(mut result) => {
+                let manual_compaction = active
+                    .surface_manual_compaction_before_messages
+                    .is_some()
+                    .then(|| {
+                        result
+                            .state
+                            .thread
+                            .session_mut()
+                            .take_manual_compaction_outcome()
+                    })
+                    .flatten();
+                if active.surface_manual_compaction_before_messages.is_some()
+                    && !active.surface_manual_compaction_committed
+                {
+                    let completed = matches!(
+                        &result.outcome,
+                        GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
+                            status: RunStatus::Success | RunStatus::Cancelled,
+                            ..
+                        })
+                    );
+                    let batch = if completed {
+                        if manual_compaction.is_some() {
+                            active
+                                .surface_manual_compaction_prepared
+                                .take()
+                                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                                    message:
+                                        "durable manual compaction lacks its prevalidated surface batch"
+                                            .to_string(),
+                                })?
+                        } else {
+                            let after_messages =
+                                result.state.thread.session().conversation().messages.len() as u64;
+                            self.prepare_manual_compaction_completed_batch(
+                                &active,
+                                after_messages,
+                                None,
+                            )?
+                        }
+                    } else {
+                        self.prepare_manual_compaction_idle_batch(&active)?
+                    };
+                    let fence = active
+                        .surface_operation
+                        .clone()
+                        .expect("typed manual compaction keeps its generation fence");
+                    if self
+                        .resident_surface
+                        .coordinator
+                        .commit_generation_batch(fence, &batch)
+                        .is_err()
+                    {
+                        debug_assert!(self.pending_manual_compaction_completion.is_none());
+                        self.pending_manual_compaction_completion =
+                            Some(PendingManualCompactionCompletion {
+                                active,
+                                result,
+                                batch,
+                                retry_at: tokio::time::Instant::now()
+                                    + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                                allow_resume,
+                            });
+                        return Ok(());
+                    }
+                    active.surface_manual_compaction_committed = true;
+                }
                 self.usage_ledger.add(result.usage_delta);
                 self.publish_pending_goal_pause_event(&mut result.state, &mut active);
                 let background_error = match &mut result.outcome {
@@ -13861,6 +14805,312 @@ mod tests {
                 if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
         ));
         host.shutdown().expect("shutdown repaired runtime host");
+    }
+
+    #[test]
+    fn typed_manual_compaction_cancel_settles_context_before_cancelled_terminal() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (cancel_observed_tx, cancel_observed_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(CancelAwareShutdownExecutor {
+            entered: entered_tx,
+            cancel_observed: cancel_observed_tx,
+            completed: completed_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "cancel typed manual compaction",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let output = committed_surface_value(
+            attachment
+                .client
+                .manual_compact(
+                    surface_request_id(),
+                    attachment.baseline.snapshot.context.revision,
+                )
+                .expect("start typed manual compaction"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("manual compaction entered executor");
+
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), output.operation_id.clone())
+                .expect("cancel typed manual compaction"),
+        );
+        cancel_observed_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("executor observed manual compaction cancel");
+        completed_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("manual compaction executor completed");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), output.operation_id.clone())
+            .expect("wait manual compaction terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(
+                    value.terminal,
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User
+                    }
+                )
+        ));
+        let refreshed = fresh_surface_attachment(&surface);
+        assert!(matches!(
+            &refreshed.baseline.snapshot.context.compaction,
+            surface::CompactionState::Completed { operation_id, .. }
+                if operation_id == &output.operation_id
+        ));
+
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn typed_manual_compaction_completion_append_failure_retries_before_terminal() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedSuccessExecutor {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry typed manual compaction completion",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load runtime transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim manual compaction subscription");
+        let compact_request_id = surface_request_id();
+        let output = committed_surface_value(
+            attachment
+                .client
+                .manual_compact(
+                    compact_request_id.clone(),
+                    attachment.baseline.snapshot.context.revision,
+                )
+                .expect("start typed manual compaction"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("manual compaction entered executor");
+        surface::JsonlSurfaceCommitLedger::inject_manual_compaction_completion_append_failures(
+            transcript_path,
+            2,
+        );
+        release_tx.send(()).expect("release manual compaction");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let probe = thread
+                .surface_actor_probe_for_test(output.operation_id.clone())
+                .expect("probe retained manual compaction completion");
+            if probe.pending_manual_compaction_completion {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "manual compaction completion was not retained for retry"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            attachment.client.reserve_operation(
+                surface_request_id(),
+                surface_user_turn_intent(
+                    &attachment.baseline.snapshot,
+                    "must not advance the cursor during compaction retry",
+                ),
+            ),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), output.operation_id.clone())
+            .expect("wait retried manual compaction terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "completion retry must not execute compaction again"
+        );
+        let replayed = committed_surface_value(
+            attachment
+                .client
+                .manual_compact(
+                    compact_request_id,
+                    attachment.baseline.snapshot.context.revision,
+                )
+                .expect("replay typed manual compaction request"),
+        );
+        assert_eq!(replayed.operation_id, output.operation_id);
+        assert_eq!(replayed.admitted_cursor, output.admitted_cursor);
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "idempotent request replay must not execute compaction again"
+        );
+
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let mut events = Vec::new();
+        loop {
+            while let Some(item) = subscription.try_recv() {
+                if let surface::SurfaceSubscriptionItem::Batch { batch } = item {
+                    events.extend(batch.events.as_slice().iter().cloned());
+                }
+            }
+            if events.iter().any(|envelope| {
+                matches!(
+                    &envelope.event,
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                        record
+                    }) if record.operation_id == output.operation_id
+                )
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "manual compaction subscription did not publish terminal"
+            );
+            std::thread::yield_now();
+        }
+        let completed = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, envelope)| {
+                matches!(
+                    &envelope.event,
+                    surface::SurfaceEvent::Context(surface::SurfaceContextSnapshot {
+                        compaction: surface::CompactionState::Completed {
+                            operation_id,
+                            ..
+                        },
+                        ..
+                    }) if operation_id == &output.operation_id
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed.len(),
+            1,
+            "completion batch must commit exactly once"
+        );
+        let terminal_index = events
+            .iter()
+            .position(|envelope| {
+                matches!(
+                    &envelope.event,
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                        record
+                    }) if record.operation_id == output.operation_id
+                )
+            })
+            .expect("terminal event");
+        assert!(
+            completed[0] < terminal_index,
+            "completion fact must be durable before terminal"
+        );
+
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn typed_manual_compaction_history_failure_keeps_conversation_and_context_recoverable() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(config.clone(), "fail manual compaction history")
+            .expect("start recorded runtime thread");
+        let thread_id = thread.thread_id().to_string();
+        let transcript = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load runtime transcript");
+        let before_messages = transcript.messages.clone();
+        crate::thread_store::SessionWriter::inject_manual_compaction_snapshot_failure_once(
+            transcript.path,
+        );
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let output = committed_surface_value(
+            attachment
+                .client
+                .manual_compact(
+                    surface_request_id(),
+                    attachment.baseline.snapshot.context.revision,
+                )
+                .expect("start typed manual compaction"),
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), output.operation_id)
+            .expect("wait failed manual compaction terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Failed { .. })
+        ));
+        let settled = fresh_surface_attachment(&surface);
+        assert!(matches!(
+            settled.baseline.snapshot.context.compaction,
+            surface::CompactionState::Idle
+        ));
+        thread
+            .shutdown()
+            .expect("shutdown failed compaction thread");
+        host.shutdown().expect("shutdown failed compaction host");
+
+        let recovered = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("reload failed compaction transcript");
+        assert_eq!(
+            format!("{:?}", recovered.messages),
+            format!("{before_messages:?}")
+        );
+        let resumed_host = RuntimeHost::start().expect("start recovery host");
+        let resumed = resumed_host
+            .start_thread(
+                RunConfig {
+                    history_mode: HistoryMode::Resume(thread_id),
+                    ..config
+                },
+                "recover failed manual compaction",
+            )
+            .expect("resume failed manual compaction thread");
+        assert_eq!(
+            resumed
+                .snapshot()
+                .expect("read recovered runtime snapshot")
+                .messages()
+                .len(),
+            before_messages.len()
+        );
+        resumed.shutdown().expect("shutdown recovered thread");
+        resumed_host.shutdown().expect("shutdown recovered host");
     }
 
     #[test]

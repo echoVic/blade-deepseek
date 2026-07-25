@@ -1546,11 +1546,16 @@ fn tui_foreground_restart_reconciles_requested_and_started_states() {
                 terminal.terminal
             );
             assert_eq!(executor.call_count(), 0);
-            assert!(matches!(
+            let repeated_cancel = committed_value(
                 attachment
                     .client
-                    .cancel_operation(request_id(), operation_id.clone()),
-                Err(SurfaceClientCommandError::Unauthorized)
+                    .cancel_operation(request_id(), operation_id.clone())
+                    .expect("terminal cancel is idempotent after recovery"),
+            );
+            assert!(matches!(
+                repeated_cancel,
+                CancelOperationOutput::AlreadyTerminal { terminal: replayed }
+                    if replayed == terminal
             ));
             host.shutdown().expect("shutdown recovered host");
         }

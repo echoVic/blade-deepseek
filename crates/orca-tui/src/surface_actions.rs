@@ -84,6 +84,14 @@ impl TuiSurfaceActions {
         )
     }
 
+    pub(crate) fn manual_compact(
+        &self,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        crate::surface_client::manual_compact(&self.thread, controller, event_tx)
+    }
+
     pub(crate) fn update_settings(
         &self,
         patches: NonEmptyVec<RuntimeSettingsPatch>,

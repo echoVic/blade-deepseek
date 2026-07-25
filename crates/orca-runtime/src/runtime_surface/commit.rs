@@ -8,6 +8,448 @@ use super::{
 };
 use std::collections::VecDeque;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ManualCompactionItemKey {
+    System {
+        content: String,
+        pinned: bool,
+    },
+    User {
+        content: String,
+        pinned: bool,
+    },
+    AssistantText {
+        content: String,
+        pinned: bool,
+    },
+    AssistantReasoning {
+        content: String,
+        pinned: bool,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+        pinned: bool,
+    },
+}
+
+fn manual_compaction_conversation_keys(
+    conversation: &orca_core::conversation::Conversation,
+) -> Vec<ManualCompactionItemKey> {
+    let mut keys = Vec::new();
+    for message in &conversation.messages {
+        match message {
+            orca_core::conversation::Message::System { content, pinned } => {
+                keys.push(ManualCompactionItemKey::System {
+                    content: content.clone(),
+                    pinned: *pinned,
+                });
+            }
+            orca_core::conversation::Message::User { content, pinned } => {
+                keys.push(ManualCompactionItemKey::User {
+                    content: content.clone(),
+                    pinned: *pinned,
+                });
+            }
+            orca_core::conversation::Message::Assistant {
+                content,
+                reasoning_content,
+                pinned,
+                ..
+            } => {
+                if let Some(content) = content {
+                    keys.push(ManualCompactionItemKey::AssistantText {
+                        content: content.clone(),
+                        pinned: *pinned,
+                    });
+                }
+                if let Some(content) = reasoning_content {
+                    keys.push(ManualCompactionItemKey::AssistantReasoning {
+                        content: content.clone(),
+                        pinned: *pinned,
+                    });
+                }
+            }
+            orca_core::conversation::Message::Tool {
+                tool_call_id,
+                content,
+                pinned,
+                ..
+            } => keys.push(ManualCompactionItemKey::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: content.clone(),
+                pinned: *pinned,
+            }),
+        }
+    }
+    keys
+}
+
+fn manual_compaction_surface_item_key(
+    item: &super::SurfaceItem,
+) -> Option<ManualCompactionItemKey> {
+    match item {
+        super::SurfaceItem::SystemMessage {
+            content, pinned, ..
+        } => Some(ManualCompactionItemKey::System {
+            content: content.as_str().to_string(),
+            pinned: *pinned,
+        }),
+        super::SurfaceItem::UserMessage { input, pinned, .. } => {
+            manual_compaction_surface_user_input(input).map(|content| {
+                ManualCompactionItemKey::User {
+                    content: content.to_string(),
+                    pinned: *pinned,
+                }
+            })
+        }
+        super::SurfaceItem::AssistantMessage { text, pinned, .. }
+        | super::SurfaceItem::AssistantPlan { text, pinned, .. } => {
+            Some(ManualCompactionItemKey::AssistantText {
+                content: text.as_str().to_string(),
+                pinned: *pinned,
+            })
+        }
+        super::SurfaceItem::AssistantReasoning {
+            content, pinned, ..
+        } => Some(ManualCompactionItemKey::AssistantReasoning {
+            content: content.as_str().to_string(),
+            pinned: *pinned,
+        }),
+        super::SurfaceItem::ToolResultMessage {
+            tool_call_id,
+            content,
+            pinned,
+            ..
+        } => Some(ManualCompactionItemKey::Tool {
+            tool_call_id: tool_call_id.as_str().to_string(),
+            content: content.as_str().to_string(),
+            pinned: *pinned,
+        }),
+    }
+}
+
+fn manual_compaction_key_matches(
+    candidate: &ManualCompactionItemKey,
+    target: &ManualCompactionItemKey,
+) -> bool {
+    if candidate == target {
+        return true;
+    }
+    let redacted_matches = |candidate: &str, target: &str| {
+        crate::thread_store::redact_sensitive_text(candidate) == target
+    };
+    match (candidate, target) {
+        (
+            ManualCompactionItemKey::System {
+                content: candidate,
+                pinned: candidate_pinned,
+            },
+            ManualCompactionItemKey::System {
+                content: target,
+                pinned: target_pinned,
+            },
+        )
+        | (
+            ManualCompactionItemKey::User {
+                content: candidate,
+                pinned: candidate_pinned,
+            },
+            ManualCompactionItemKey::User {
+                content: target,
+                pinned: target_pinned,
+            },
+        )
+        | (
+            ManualCompactionItemKey::AssistantText {
+                content: candidate,
+                pinned: candidate_pinned,
+            },
+            ManualCompactionItemKey::AssistantText {
+                content: target,
+                pinned: target_pinned,
+            },
+        )
+        | (
+            ManualCompactionItemKey::AssistantReasoning {
+                content: candidate,
+                pinned: candidate_pinned,
+            },
+            ManualCompactionItemKey::AssistantReasoning {
+                content: target,
+                pinned: target_pinned,
+            },
+        ) => candidate_pinned == target_pinned && redacted_matches(candidate, target),
+        (
+            ManualCompactionItemKey::Tool {
+                tool_call_id: candidate_id,
+                content: candidate,
+                pinned: candidate_pinned,
+            },
+            ManualCompactionItemKey::Tool {
+                tool_call_id: target_id,
+                content: target,
+                pinned: target_pinned,
+            },
+        ) => {
+            candidate_id == target_id
+                && candidate_pinned == target_pinned
+                && redacted_matches(candidate, target)
+        }
+        _ => false,
+    }
+}
+
+fn manual_compaction_surface_user_input(input: &super::SurfaceUserInputState) -> Option<&str> {
+    match input {
+        super::SurfaceUserInputState::Resolved {
+            fact: super::SurfaceResolvedInputFact::Replayable { input, .. },
+        } => Some(input.canonical_text.as_str()),
+        super::SurfaceUserInputState::Resolved {
+            fact:
+                super::SurfaceResolvedInputFact::NonReplayable {
+                    presentation: super::SurfaceInputPresentation::Visible { text },
+                    ..
+                },
+        } => Some(text.as_str()),
+        super::SurfaceUserInputState::Pending { .. }
+        | super::SurfaceUserInputState::ResolutionFailed { .. }
+        | super::SurfaceUserInputState::Resolved {
+            fact:
+                super::SurfaceResolvedInputFact::NonReplayable {
+                    presentation: super::SurfaceInputPresentation::Redacted,
+                    ..
+                },
+        } => None,
+    }
+}
+
+fn manual_compaction_surface_item_id(item: &super::SurfaceItem) -> &super::SurfaceItemId {
+    match item {
+        super::SurfaceItem::UserMessage { id, .. }
+        | super::SurfaceItem::SystemMessage { id, .. }
+        | super::SurfaceItem::AssistantMessage { id, .. }
+        | super::SurfaceItem::AssistantReasoning { id, .. }
+        | super::SurfaceItem::AssistantPlan { id, .. }
+        | super::SurfaceItem::ToolResultMessage { id, .. } => id,
+    }
+}
+
+pub(crate) fn manual_compaction_item_patches(
+    items: &[super::SurfaceItem],
+    conversation: &orca_core::conversation::Conversation,
+) -> Option<Vec<super::ItemPatch>> {
+    let keys = manual_compaction_conversation_keys(conversation);
+    let mut assignments = vec![None; keys.len()];
+    let mut required = vec![false; keys.len()];
+    let mut used = vec![false; items.len()];
+    for (target_index, key) in keys.iter().enumerate().rev() {
+        required[target_index] = match key {
+            ManualCompactionItemKey::System { .. } => true,
+            ManualCompactionItemKey::User { .. } => items
+                .iter()
+                .any(|item| matches!(item, super::SurfaceItem::UserMessage { .. })),
+            ManualCompactionItemKey::AssistantText { .. } => items.iter().any(|item| {
+                matches!(
+                    item,
+                    super::SurfaceItem::AssistantMessage { .. }
+                        | super::SurfaceItem::AssistantPlan { .. }
+                )
+            }),
+            ManualCompactionItemKey::AssistantReasoning { .. } => items
+                .iter()
+                .any(|item| matches!(item, super::SurfaceItem::AssistantReasoning { .. })),
+            ManualCompactionItemKey::Tool { .. } => items
+                .iter()
+                .any(|item| matches!(item, super::SurfaceItem::ToolResultMessage { .. })),
+        };
+        if let Some(source_index) = items.iter().enumerate().rev().find_map(|(index, item)| {
+            (!used[index]
+                && manual_compaction_surface_item_key(item)
+                    .as_ref()
+                    .is_some_and(|candidate| manual_compaction_key_matches(candidate, key)))
+            .then_some(index)
+        }) {
+            used[source_index] = true;
+            assignments[target_index] = Some(items[source_index].clone());
+            continue;
+        }
+        let replacement = match key {
+            ManualCompactionItemKey::System { content, pinned } => {
+                Some(super::SurfaceItem::SystemMessage {
+                    id: super::SurfaceItemId::new(),
+                    content: super::DisplayText::new(content.clone()),
+                    pinned: *pinned,
+                    origin: super::SurfaceItemOrigin::HistoryMaterialization,
+                })
+            }
+            ManualCompactionItemKey::Tool {
+                tool_call_id,
+                content,
+                pinned,
+            } => items.iter().enumerate().rev().find_map(|(index, item)| {
+                if used[index] {
+                    return None;
+                }
+                let super::SurfaceItem::ToolResultMessage {
+                    id,
+                    turn_id,
+                    tool_call_id: existing_id,
+                    terminal,
+                    ..
+                } = item
+                else {
+                    return None;
+                };
+                (existing_id.as_str() == tool_call_id).then(|| {
+                    used[index] = true;
+                    super::SurfaceItem::ToolResultMessage {
+                        id: id.clone(),
+                        turn_id: turn_id.clone(),
+                        tool_call_id: existing_id.clone(),
+                        content: super::DisplayText::new(content.clone()),
+                        terminal: terminal.clone(),
+                        pinned: *pinned,
+                    }
+                })
+            }),
+            ManualCompactionItemKey::User { .. }
+            | ManualCompactionItemKey::AssistantText { .. }
+            | ManualCompactionItemKey::AssistantReasoning { .. } => None,
+        };
+        assignments[target_index] = replacement;
+    }
+    if assignments
+        .iter()
+        .zip(required.iter())
+        .any(|(assignment, required)| *required && assignment.is_none())
+    {
+        return None;
+    }
+    let mut patches = items
+        .iter()
+        .map(|item| super::ItemPatch::Removed {
+            item_id: manual_compaction_surface_item_id(item).clone(),
+            reason: super::ItemRemovalReason::Compacted,
+        })
+        .collect::<Vec<_>>();
+    patches.extend(
+        assignments
+            .into_iter()
+            .flatten()
+            .map(|item| super::ItemPatch::Added { item }),
+    );
+    Some(patches)
+}
+
+pub(super) fn manual_compaction_item_rebuild_paired(
+    snapshot: &super::SurfaceSnapshot,
+    batch: &super::SurfaceCommitBatch,
+) -> bool {
+    let completes_manual_compaction = batch.events.as_slice().iter().any(|event| {
+        matches!(
+            &event.event,
+            super::SurfaceEvent::Context(super::SurfaceContextSnapshot {
+                compaction: super::CompactionState::Completed {
+                    reason: super::CompactionReason::Manual,
+                    ..
+                },
+                ..
+            })
+        )
+    });
+    if !completes_manual_compaction {
+        return false;
+    }
+    let removed = batch
+        .events
+        .as_slice()
+        .iter()
+        .filter_map(|event| match &event.event {
+            super::SurfaceEvent::Item(super::ItemPatch::Removed {
+                item_id,
+                reason: super::ItemRemovalReason::Compacted,
+            }) => Some(item_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    removed.len() == snapshot.items.len()
+        && snapshot.items.iter().all(|item| {
+            removed
+                .iter()
+                .filter(|item_id| **item_id == manual_compaction_surface_item_id(item))
+                .count()
+                == 1
+        })
+        && batch
+            .events
+            .as_slice()
+            .iter()
+            .all(|event| match &event.event {
+                super::SurfaceEvent::Item(super::ItemPatch::Removed {
+                    item_id,
+                    reason: super::ItemRemovalReason::Compacted,
+                }) => snapshot
+                    .items
+                    .iter()
+                    .any(|item| manual_compaction_surface_item_id(item) == item_id),
+                super::SurfaceEvent::Item(super::ItemPatch::Added { item }) => {
+                    let item_id = manual_compaction_surface_item_id(item);
+                    match snapshot
+                        .items
+                        .iter()
+                        .find(|existing| manual_compaction_surface_item_id(existing) == item_id)
+                    {
+                        Some(existing) if existing == item => true,
+                        Some(super::SurfaceItem::ToolResultMessage {
+                            turn_id,
+                            tool_call_id,
+                            terminal,
+                            ..
+                        }) => matches!(
+                            item,
+                            super::SurfaceItem::ToolResultMessage {
+                                turn_id: added_turn,
+                                tool_call_id: added_tool,
+                                terminal: added_terminal,
+                                ..
+                            } if added_turn == turn_id
+                                && added_tool == tool_call_id
+                                && added_terminal == terminal
+                        ),
+                        Some(_) => false,
+                        None => matches!(
+                            item,
+                            super::SurfaceItem::SystemMessage {
+                                origin: super::SurfaceItemOrigin::HistoryMaterialization,
+                                ..
+                            }
+                        ),
+                    }
+                }
+                super::SurfaceEvent::Item(_) => false,
+                _ => true,
+            })
+        && {
+            let added_ids = batch
+                .events
+                .as_slice()
+                .iter()
+                .filter_map(|event| match &event.event {
+                    super::SurfaceEvent::Item(super::ItemPatch::Added { item }) => {
+                        Some(manual_compaction_surface_item_id(item))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            added_ids.iter().enumerate().all(|(index, item_id)| {
+                added_ids[index + 1..]
+                    .iter()
+                    .all(|other| *other != *item_id)
+            })
+        }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub enum SurfaceCommitError {
     OversizedBatch,
@@ -767,6 +1209,72 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         Ok(())
     }
 
+    pub(crate) fn recover_interrupted_manual_compaction(
+        &mut self,
+        operation_id: &super::SurfaceOperationId,
+        durable_snapshot: Option<&crate::thread_store::ManualCompactionDurableSnapshot>,
+    ) -> Result<bool, SurfaceCommitError> {
+        let snapshot = self.state.snapshot();
+        let before_messages = match &snapshot.context.compaction {
+            super::CompactionState::Running {
+                operation_id: running,
+                before_messages,
+                ..
+            } if running == operation_id => *before_messages,
+            _ => return Ok(false),
+        };
+        let next_revision = super::ContextRevision::try_new(
+            snapshot
+                .context
+                .revision
+                .get()
+                .checked_add(1)
+                .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        )
+        .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        let mut context = snapshot.context.clone();
+        context.revision = next_revision;
+        if let Some(durable_snapshot) = durable_snapshot {
+            if durable_snapshot.operation_id != *operation_id
+                || durable_snapshot.before_messages as u64 != before_messages
+            {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+            let observed_message_count = durable_snapshot.conversation.messages.len() as u64;
+            let fence = snapshot
+                .foreground_operation
+                .iter()
+                .chain(snapshot.queued_operations.iter())
+                .chain(snapshot.operation_history.iter())
+                .find(|operation| &operation.operation_id == operation_id)
+                .and_then(|operation| operation.generations.last())
+                .map(|generation| generation.fence.clone())
+                .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            context.compaction = super::CompactionState::Completed {
+                operation_id: operation_id.clone(),
+                reason: super::CompactionReason::Manual,
+                strategy: super::NonEmptyText::try_new(durable_snapshot.strategy.clone())
+                    .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                before_messages,
+                after_messages: observed_message_count,
+                collapsed_messages: before_messages.saturating_sub(observed_message_count),
+                status_text: super::DisplayText::new("recovered completed manual compaction"),
+            };
+            let item_patches =
+                manual_compaction_item_patches(&snapshot.items, &durable_snapshot.conversation)
+                    .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            let batch =
+                self.manual_compaction_recovery_batch(fence.clone(), item_patches, context)?;
+            let permit = self.issue_recovery_permit(fence);
+            self.commit_batch(&permit, &batch)?;
+        } else {
+            context.compaction = super::CompactionState::Idle;
+            let batch = self.thread_context_recovery_batch(context)?;
+            self.commit_actor_batch(&batch)?;
+        }
+        Ok(true)
+    }
+
     pub fn recover_operation_with_settlement_store<S: super::ExternalSettlementStore>(
         &mut self,
         operation_id: &super::SurfaceOperationId,
@@ -1227,6 +1735,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         let actor = self.actor_control_permit.clone();
         if permit_authorizes(&self.issued_permits, &actor, batch, self.owner_epoch)
             && finalizer_background_scope_matches_state(&self.state, &actor, batch)
+            && recovery_manual_compaction_matches_state(&self.state, &actor, batch)
         {
             return Ok(RecoveredBatchAuthority::Single(actor));
         }
@@ -1339,6 +1848,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         issued.push(candidate.clone());
         if !permit_authorizes(&issued, &candidate, batch, self.owner_epoch)
             || !finalizer_background_scope_matches_state(&self.state, &candidate, batch)
+            || !recovery_manual_compaction_matches_state(&self.state, &candidate, batch)
         {
             return Err(SurfaceCommitError::StalePublisherPermit);
         }
@@ -1591,6 +2101,137 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         Ok(batch)
     }
 
+    fn thread_context_recovery_batch(
+        &self,
+        context: super::SurfaceContextSnapshot,
+    ) -> Result<SurfaceCommitBatch, SurfaceCommitError> {
+        let cursor_before = self.state.snapshot().cursor.clone();
+        let durable_revision = match cursor_before.source_revision {
+            super::CursorSourceRevision::Recorded { durable_revision } => {
+                super::DurableRevision::try_new(
+                    durable_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                )
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?
+            }
+            super::CursorSourceRevision::Ephemeral { .. } => {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: self.owner_epoch,
+            durable_revision,
+            commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+        };
+        let event = super::SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Thread,
+            event: super::SurfaceEvent::Context(context),
+        };
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: cursor_before.clone(),
+            cursor_after: super::SurfaceCursor {
+                next_seq: super::SequenceNumber::new(
+                    cursor_before
+                        .next_seq
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                ),
+                source_revision: super::CursorSourceRevision::Recorded { durable_revision },
+                ..cursor_before
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: super::Sha256Digest::new([0; 32]),
+            events: super::NonEmptyVec::try_new(vec![event])
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        };
+        batch.batch_digest = super::canonical_batch_digest(&batch);
+        Ok(batch)
+    }
+
+    fn manual_compaction_recovery_batch(
+        &self,
+        fence: super::SurfaceOperationFence,
+        item_patches: Vec<super::ItemPatch>,
+        context: super::SurfaceContextSnapshot,
+    ) -> Result<SurfaceCommitBatch, SurfaceCommitError> {
+        let cursor_before = self.state.snapshot().cursor.clone();
+        let durable_revision = match cursor_before.source_revision {
+            super::CursorSourceRevision::Recorded { durable_revision } => {
+                super::DurableRevision::try_new(
+                    durable_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                )
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?
+            }
+            super::CursorSourceRevision::Ephemeral { .. } => {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: self.owner_epoch,
+            durable_revision,
+            commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+        };
+        let scope = SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let mut facts = item_patches
+            .into_iter()
+            .map(|patch| (scope.clone(), super::SurfaceEvent::Item(patch)))
+            .collect::<Vec<_>>();
+        facts.push((scope, super::SurfaceEvent::Context(context)));
+        if facts.len() as u64 > super::SURFACE_COMMIT_BATCH_EVENT_LIMIT {
+            return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+        }
+        let event_count = u32::try_from(facts.len())
+            .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        let events = facts
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (scope, event))| super::SurfaceEventEnvelope {
+                ordinal: ordinal as u32,
+                event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7"),
+                commit_class: commit_class.clone(),
+                scope,
+                event,
+            })
+            .collect::<Vec<_>>();
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: cursor_before.clone(),
+            cursor_after: super::SurfaceCursor {
+                next_seq: super::SequenceNumber::new(
+                    cursor_before
+                        .next_seq
+                        .get()
+                        .checked_add(event_count as u64)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                ),
+                source_revision: super::CursorSourceRevision::Recorded { durable_revision },
+                ..cursor_before
+            },
+            commit_class,
+            event_count,
+            batch_digest: super::Sha256Digest::new([0; 32]),
+            events: super::NonEmptyVec::try_new(events)
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        };
+        batch.batch_digest = super::canonical_batch_digest(&batch);
+        Ok(batch)
+    }
+
     fn interaction_recovery_batch(
         &self,
         fence: super::SurfaceOperationFence,
@@ -1705,6 +2346,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 permit_authorizes(&self.issued_permits, permit, batch, self.owner_epoch)
                     && finalizer_background_scope_matches_state(&self.state, permit, batch)
                     && recovery_stream_dispositions_match_state(&self.state, permit, batch)
+                    && recovery_manual_compaction_matches_state(&self.state, permit, batch)
             }
             BatchCommitAuthority::ActorGenerationTerminalization { actor, generation } => {
                 actor_generation_terminalization_authorized(
@@ -2500,6 +3142,9 @@ fn recovery_batch_authorized(
     batch: &SurfaceCommitBatch,
 ) -> bool {
     let events = batch.events.as_slice();
+    if recovery_manual_compaction_completion_authorized(historical_fence, events) {
+        return true;
+    }
     if let [event] = events {
         return matches!(
             (&event.scope, &event.event),
@@ -2583,6 +3228,65 @@ fn recovery_batch_authorized(
             recovery_event_authorized(historical_fence, background_fence, event)
         }
     }) && non_stream_dispositions == 1
+}
+
+fn recovery_manual_compaction_completion_authorized(
+    historical_fence: &super::SurfaceOperationFence,
+    events: &[super::SurfaceEventEnvelope],
+) -> bool {
+    let mut completed = 0usize;
+    events.iter().all(|event| {
+        if !matches!(
+            &event.scope,
+            SurfaceScope::Generation { fence } if fence == historical_fence
+        ) {
+            return false;
+        }
+        match &event.event {
+            super::SurfaceEvent::Item(super::ItemPatch::Removed {
+                reason: super::ItemRemovalReason::Compacted,
+                ..
+            }) => true,
+            super::SurfaceEvent::Item(super::ItemPatch::Added { .. }) => true,
+            super::SurfaceEvent::Context(super::SurfaceContextSnapshot {
+                compaction:
+                    super::CompactionState::Completed {
+                        operation_id,
+                        reason: super::CompactionReason::Manual,
+                        ..
+                    },
+                ..
+            }) if operation_id == &historical_fence.operation_id => {
+                completed += 1;
+                true
+            }
+            _ => false,
+        }
+    }) && completed == 1
+}
+
+fn recovery_manual_compaction_matches_state(
+    state: &SurfaceReducerState,
+    permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+) -> bool {
+    if !matches!(permit, SurfacePublisherPermit::Recovery { .. })
+        || !batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                super::SurfaceEvent::Context(super::SurfaceContextSnapshot {
+                    compaction: super::CompactionState::Completed {
+                        reason: super::CompactionReason::Manual,
+                        ..
+                    },
+                    ..
+                })
+            )
+        })
+    {
+        return true;
+    }
+    manual_compaction_item_rebuild_paired(state.snapshot(), batch)
 }
 
 fn recovery_generation_stop_authorized(
@@ -4649,6 +5353,491 @@ mod tests {
         coordinator.retry_projection(&token).unwrap();
         assert_eq!(coordinator.ledger().writes, 2);
         assert_eq!(coordinator.state().snapshot().cursor.next_seq.get(), 1);
+    }
+
+    #[test]
+    fn interrupted_manual_compaction_context_is_reset_before_operation_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let operation_id = test_operation_fence(132).operation_id;
+        let mut snapshot = reducer_snapshot();
+        snapshot.context.compaction = super::super::CompactionState::Running {
+            operation_id: operation_id.clone(),
+            reason: super::super::CompactionReason::Manual,
+            before_messages: 4,
+        };
+        let state = SurfaceReducerState::new(snapshot);
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owner_lease(TestLedger::default(), state, &owner)
+                .unwrap();
+        assert!(
+            coordinator
+                .recover_interrupted_manual_compaction(&operation_id, None)
+                .unwrap()
+        );
+        assert!(matches!(
+            coordinator.state().snapshot().context.compaction,
+            super::super::CompactionState::Idle
+        ));
+        assert_eq!(
+            coordinator.state().snapshot().context.revision,
+            super::super::ContextRevision::try_new(2).unwrap()
+        );
+        assert_eq!(coordinator.ledger().writes, 2);
+        assert!(
+            !coordinator
+                .recover_interrupted_manual_compaction(&operation_id, None)
+                .unwrap()
+        );
+        assert_eq!(coordinator.ledger().writes, 2);
+    }
+
+    #[test]
+    fn manual_compaction_item_diff_preserves_the_latest_duplicate_identity() {
+        let first = super::super::SurfaceItemId::new();
+        let retained_tail = super::super::SurfaceItemId::new();
+        let items = vec![
+            super::super::SurfaceItem::SystemMessage {
+                id: first.clone(),
+                content: super::super::DisplayText::new("duplicate"),
+                pinned: false,
+                origin: super::super::SurfaceItemOrigin::HistoryMaterialization,
+            },
+            super::super::SurfaceItem::SystemMessage {
+                id: retained_tail.clone(),
+                content: super::super::DisplayText::new("duplicate"),
+                pinned: false,
+                origin: super::super::SurfaceItemOrigin::HistoryMaterialization,
+            },
+        ];
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.add_system("duplicate".to_string());
+
+        let patches = manual_compaction_item_patches(&items, &conversation).unwrap();
+
+        assert_eq!(patches.len(), 3);
+        assert!(matches!(
+            &patches[0],
+            super::super::ItemPatch::Removed { item_id, .. } if item_id == &first
+        ));
+        assert!(matches!(
+            &patches[1],
+            super::super::ItemPatch::Removed { item_id, .. } if item_id == &retained_tail
+        ));
+        assert!(matches!(
+            &patches[2],
+            super::super::ItemPatch::Added {
+                item: super::super::SurfaceItem::SystemMessage { id, .. },
+            } if id == &retained_tail
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_item_rebuild_keeps_rewritten_tool_in_durable_order() {
+        let prefix_id = super::super::SurfaceItemId::new();
+        let tool_id = super::super::SurfaceItemId::new();
+        let tail_id = super::super::SurfaceItemId::new();
+        let turn_id = super::super::SurfaceTurnId::new();
+        let tool_call_id = super::super::SurfaceToolCallId::try_new("call-compact").unwrap();
+        let items = vec![
+            super::super::SurfaceItem::SystemMessage {
+                id: prefix_id.clone(),
+                content: super::super::DisplayText::new("system"),
+                pinned: false,
+                origin: super::super::SurfaceItemOrigin::HistoryMaterialization,
+            },
+            super::super::SurfaceItem::ToolResultMessage {
+                id: tool_id.clone(),
+                turn_id,
+                tool_call_id: tool_call_id.clone(),
+                content: super::super::DisplayText::new("large tool output"),
+                terminal: super::super::SurfaceToolTerminal {
+                    kind: super::super::SurfaceToolResultKind::Success,
+                    source: super::super::ToolTerminalSource::Observed,
+                    invocation_started: super::super::ToolInvocationStarted::Yes,
+                },
+                pinned: false,
+            },
+            super::super::SurfaceItem::SystemMessage {
+                id: tail_id.clone(),
+                content: super::super::DisplayText::new("tail"),
+                pinned: true,
+                origin: super::super::SurfaceItemOrigin::HistoryMaterialization,
+            },
+        ];
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.add_system("system".to_string());
+        conversation.add_tool_result(
+            tool_call_id.as_str().to_string(),
+            "micro-compacted tool output".to_string(),
+        );
+        conversation.add_system_pinned("tail".to_string());
+
+        let patches = manual_compaction_item_patches(&items, &conversation).unwrap();
+
+        assert_eq!(patches.len(), 6);
+        assert!(matches!(
+            &patches[3],
+            super::super::ItemPatch::Added {
+                item: super::super::SurfaceItem::SystemMessage { id, content, .. },
+            } if id == &prefix_id && content.as_str() == "system"
+        ));
+        assert!(matches!(
+            &patches[4],
+            super::super::ItemPatch::Added {
+                item:
+                    super::super::SurfaceItem::ToolResultMessage {
+                        id,
+                        tool_call_id: added_call,
+                        content,
+                        ..
+                    },
+            } if id == &tool_id
+                && added_call == &tool_call_id
+                && content.as_str() == "micro-compacted tool output"
+        ));
+        assert!(matches!(
+            &patches[5],
+            super::super::ItemPatch::Added {
+                item: super::super::SurfaceItem::SystemMessage { id, content, .. },
+            } if id == &tail_id && content.as_str() == "tail"
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_item_rebuild_preserves_identity_across_durable_redaction() {
+        let item_id = super::super::SurfaceItemId::new();
+        let items = vec![super::super::SurfaceItem::SystemMessage {
+            id: item_id.clone(),
+            content: super::super::DisplayText::new(
+                "provider api_key=sk-test-manual-compact-redaction-1234567890",
+            ),
+            pinned: false,
+            origin: super::super::SurfaceItemOrigin::HistoryMaterialization,
+        }];
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.add_system("provider api_key=<redacted>".to_string());
+
+        let patches = manual_compaction_item_patches(&items, &conversation).unwrap();
+
+        assert!(matches!(
+            patches.as_slice(),
+            [
+                super::super::ItemPatch::Removed {
+                    item_id: removed,
+                    ..
+                },
+                super::super::ItemPatch::Added {
+                    item: super::super::SurfaceItem::SystemMessage { id: added, .. },
+                },
+            ] if removed == &item_id && added == &item_id
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_item_rebuild_does_not_fabricate_missing_assistant_authority() {
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.add_user("user".to_string());
+        conversation.add_assistant(
+            Some("assistant".to_string()),
+            Some("reasoning".to_string()),
+            Vec::new(),
+        );
+
+        let patches = manual_compaction_item_patches(&[], &conversation).unwrap();
+
+        assert!(patches.is_empty());
+    }
+
+    #[test]
+    fn manual_compaction_item_rebuild_excludes_audit_only_duplicate_user_input() {
+        let resolved_id = super::super::SurfaceItemId::new();
+        let failed_id = super::super::SurfaceItemId::new();
+        let turn_id = super::super::SurfaceTurnId::new();
+        let visible = super::super::SurfaceInputPresentation::Visible {
+            text: super::super::DisplayText::new("same user text"),
+        };
+        let resolved = super::super::SurfaceItem::UserMessage {
+            id: resolved_id.clone(),
+            turn_id: turn_id.clone(),
+            input: super::super::SurfaceUserInputState::Resolved {
+                fact: super::super::SurfaceResolvedInputFact::NonReplayable {
+                    presentation: visible.clone(),
+                    live_capsule_incarnation: super::super::SurfaceIncarnation::try_from_bytes(
+                        uuid_v7_bytes(145),
+                    )
+                    .unwrap(),
+                },
+            },
+            pinned: false,
+            origin: super::super::SurfaceItemOrigin::UserInput,
+        };
+        let failed = super::super::SurfaceItem::UserMessage {
+            id: failed_id.clone(),
+            turn_id,
+            input: super::super::SurfaceUserInputState::ResolutionFailed {
+                presentation: visible,
+                correlation_id: super::super::SurfaceInputCorrelationId::try_from_bytes(
+                    uuid_v7_bytes(146),
+                )
+                .unwrap(),
+                code: super::super::InputResolutionErrorCode::RuntimeUnavailable,
+                message: super::super::SafeDiagnosticText::try_new("resolution failed").unwrap(),
+            },
+            pinned: false,
+            origin: super::super::SurfaceItemOrigin::UserInput,
+        };
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.add_user("same user text".to_string());
+
+        let patches =
+            manual_compaction_item_patches(&[resolved.clone(), failed], &conversation).unwrap();
+
+        assert!(matches!(
+            patches.as_slice(),
+            [
+                super::super::ItemPatch::Removed {
+                    item_id: removed_resolved,
+                    ..
+                },
+                super::super::ItemPatch::Removed {
+                    item_id: removed_failed,
+                    ..
+                },
+                super::super::ItemPatch::Added {
+                    item:
+                        super::super::SurfaceItem::UserMessage {
+                            id: added,
+                            input: super::super::SurfaceUserInputState::Resolved { .. },
+                            ..
+                        },
+                },
+            ] if removed_resolved == &resolved_id
+                && removed_failed == &failed_id
+                && added == &resolved_id
+        ));
+    }
+
+    #[test]
+    fn interrupted_same_count_manual_compaction_recovers_from_operation_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let fence = test_operation_fence(133);
+        let operation_id = fence.operation_id.clone();
+        let mut snapshot = reducer_snapshot();
+        let replayability = super::super::Replayability::NonReplayable {
+            reason: super::super::NonReplayableReason::Missing,
+            live_capsule: super::super::LiveOperationCapsule::Available {
+                incarnation: snapshot.cursor.incarnation.clone(),
+            },
+        };
+        let capability_fingerprint = digest(133);
+        let logical_turn_id = super::super::SurfaceTurnId::new();
+        snapshot.foreground_operation = Some(super::super::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: super::super::SurfaceRequestId::try_from_bytes(uuid_v7_bytes(135)).unwrap(),
+            intent: super::super::OperationIntent {
+                origin: super::super::OperationOrigin::TuiUser,
+                kind: super::super::OperationKind::ManualCompaction {
+                    reason: super::super::ManualCompactionReason::Manual,
+                },
+                initial_replayability: replayability.clone(),
+                busy_disposition: super::super::BusyDisposition::Queue,
+                interrupt_settlement:
+                    super::super::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: super::super::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: capability_fingerprint.clone(),
+                settings_receipt: super::super::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: super::super::OperationPhase::Admitted,
+            reservation: super::super::ReservationLease::new(
+                super::super::SurfaceAdmissionLeaseId::try_from_bytes(uuid_v7_bytes(136)).unwrap(),
+                operation_id.clone(),
+                super::super::SequenceNumber::new(1),
+                super::super::HostIncarnation::try_from_bytes(uuid_v7_bytes(137)).unwrap(),
+                super::super::MonotonicInstant {
+                    clock_id: super::super::HostMonotonicClockId::try_from_bytes(uuid_v7_bytes(
+                        138,
+                    ))
+                    .unwrap(),
+                    tick: super::super::MonotonicTick::new(0),
+                },
+            ),
+            ready_for_admission: false,
+            initial_logical_turn_id: Some(logical_turn_id.clone()),
+            initial_input_item_id: None,
+            generations: vec![super::super::GenerationRecord {
+                fence: fence.clone(),
+                logical_turn_id,
+                input: super::super::GenerationInputState::NotApplicable,
+                predecessor: None,
+                attempt: super::super::GenerationAttempt::Initial,
+                goal_identity: None,
+                replayability: replayability.clone(),
+                required_capabilities: Default::default(),
+                capability_fingerprint: capability_fingerprint.clone(),
+                phase: super::super::GenerationPhase::Started,
+                started_witness: Some(super::super::GenerationStartedWitness {
+                    started_commit_id: super::super::SurfaceCommitId::try_from_bytes(
+                        uuid_v7_bytes(139),
+                    )
+                    .unwrap(),
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                    durable_replayability_digest: super::super::canonical_replayability_digest(
+                        &replayability,
+                    ),
+                    capability_fingerprint,
+                }),
+                stop_reason: None,
+            }],
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        });
+        let compacted_item_id = super::super::SurfaceItemId::new();
+        let retained_user_id = super::super::SurfaceItemId::new();
+        let retained_message_id = super::super::SurfaceItemId::new();
+        let retained_reasoning_id = super::super::SurfaceItemId::new();
+        let retained_plan_id = super::super::SurfaceItemId::new();
+        let retained_turn_id = super::super::SurfaceTurnId::new();
+        snapshot.items.extend([
+            super::super::SurfaceItem::SystemMessage {
+                id: compacted_item_id.clone(),
+                content: super::super::DisplayText::new("old context"),
+                pinned: false,
+                origin: super::super::SurfaceItemOrigin::HistoryMaterialization,
+            },
+            super::super::SurfaceItem::UserMessage {
+                id: retained_user_id.clone(),
+                turn_id: retained_turn_id.clone(),
+                input: super::super::SurfaceUserInputState::Resolved {
+                    fact: super::super::SurfaceResolvedInputFact::NonReplayable {
+                        presentation: super::super::SurfaceInputPresentation::Visible {
+                            text: super::super::DisplayText::new("retained user"),
+                        },
+                        live_capsule_incarnation: snapshot.cursor.incarnation.clone(),
+                    },
+                },
+                pinned: false,
+                origin: super::super::SurfaceItemOrigin::UserInput,
+            },
+            super::super::SurfaceItem::AssistantMessage {
+                id: retained_message_id.clone(),
+                turn_id: retained_turn_id.clone(),
+                text: super::super::DisplayText::new("retained assistant"),
+                pinned: false,
+            },
+            super::super::SurfaceItem::AssistantReasoning {
+                id: retained_reasoning_id.clone(),
+                turn_id: retained_turn_id.clone(),
+                summary: super::super::DisplayText::new("reasoning summary"),
+                content: super::super::DisplayText::new("retained reasoning"),
+                pinned: false,
+            },
+            super::super::SurfaceItem::AssistantPlan {
+                id: retained_plan_id.clone(),
+                turn_id: retained_turn_id,
+                text: super::super::DisplayText::new("retained plan"),
+                pinned: false,
+            },
+        ]);
+        snapshot.context.compaction = super::super::CompactionState::Running {
+            operation_id: operation_id.clone(),
+            reason: super::super::CompactionReason::Manual,
+            before_messages: 5,
+        };
+        let state = SurfaceReducerState::new(snapshot);
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owner_lease(TestLedger::default(), state, &owner)
+                .unwrap();
+        let mut observed = orca_core::conversation::Conversation::new();
+        observed.add_system(
+            "[Earlier conversation history was truncated to fit context window]".to_string(),
+        );
+        observed.add_user("retained user".to_string());
+        observed.add_assistant(
+            Some("retained assistant".to_string()),
+            Some("retained reasoning".to_string()),
+            Vec::new(),
+        );
+        observed.add_assistant(Some("retained plan".to_string()), None, Vec::new());
+        let durable_snapshot = crate::thread_store::ManualCompactionDurableSnapshot {
+            operation_id: operation_id.clone(),
+            strategy: "local_truncation".to_string(),
+            before_messages: 5,
+            conversation: observed,
+        };
+
+        assert!(
+            coordinator
+                .recover_interrupted_manual_compaction(&operation_id, Some(&durable_snapshot),)
+                .unwrap()
+        );
+        assert!(matches!(
+            &coordinator.state().snapshot().context.compaction,
+            super::super::CompactionState::Completed {
+                operation_id: completed,
+                before_messages: 5,
+                after_messages: 4,
+                collapsed_messages: 1,
+                ..
+            } if completed == &operation_id
+        ));
+        assert!(matches!(
+            coordinator.state().snapshot().items.as_slice(),
+            [
+                super::super::SurfaceItem::SystemMessage {
+                    content: marker,
+                    ..
+                },
+                super::super::SurfaceItem::UserMessage {
+                    id,
+                    ..
+                },
+                super::super::SurfaceItem::AssistantMessage {
+                    id: message_id,
+                    ..
+                },
+                super::super::SurfaceItem::AssistantReasoning {
+                    id: reasoning_id,
+                    ..
+                },
+                super::super::SurfaceItem::AssistantPlan { id: plan_id, .. },
+            ] if marker.as_str()
+                == "[Earlier conversation history was truncated to fit context window]"
+                && id == &retained_user_id
+                && message_id == &retained_message_id
+                && reasoning_id == &retained_reasoning_id
+                && plan_id == &retained_plan_id
+        ));
+        assert!(!coordinator.state().snapshot().items.iter().any(|item| {
+            matches!(
+                item,
+                super::super::SurfaceItem::SystemMessage { id, .. }
+                    if id == &compacted_item_id
+            )
+        }));
+        assert_eq!(coordinator.ledger().writes, 2);
     }
 
     #[test]

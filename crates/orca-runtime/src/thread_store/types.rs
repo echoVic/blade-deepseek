@@ -87,6 +87,26 @@ pub struct SessionTranscript {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ManualCompactionSnapshotRecord {
+    pub snapshot_id: String,
+    pub operation_id: crate::runtime_surface::SurfaceOperationId,
+    pub strategy: String,
+    pub compacted_at: DateTime<Utc>,
+    pub before_messages: usize,
+    pub messages: Vec<StoredMessage>,
+    pub rolling_summary: Option<String>,
+    pub summary_state: orca_core::conversation::SummaryState,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManualCompactionDurableSnapshot {
+    pub operation_id: crate::runtime_surface::SurfaceOperationId,
+    pub strategy: String,
+    pub before_messages: usize,
+    pub conversation: orca_core::conversation::Conversation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum SessionRecord {
     #[serde(rename = "session.meta")]
@@ -120,6 +140,8 @@ pub(crate) enum SessionRecord {
     ContextCollapsed(CompactionRecord),
     #[serde(rename = "context.summary")]
     ContextSummary(ContextSummaryRecord),
+    #[serde(rename = "context.manual_compaction_snapshot")]
+    ManualCompactionSnapshot(ManualCompactionSnapshotRecord),
     #[serde(rename = "session.usage")]
     Usage(UsageTotals),
     #[serde(rename = "session.usage_baseline")]

@@ -178,6 +178,107 @@ pub(crate) fn cancel_recovered_operation(
     )
 }
 
+pub(crate) fn manual_compact(
+    thread: &RuntimeSurfaceThreadHandle,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    let mut activation = SurfaceActivationGuard::begin(controller)?;
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { .. } => {
+            return Err(io::Error::other(
+                "typed TUI manual compaction attachment denied",
+            ));
+        }
+        AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. }
+        | AttachResult::ThreadClosed { .. }
+        | AttachResult::Unavailable { .. } => {
+            return Err(io::Error::other(
+                "typed TUI manual compaction surface unavailable",
+            ));
+        }
+    };
+    let mut guard = SurfaceRunGuard::new(&surface, attachment.client.clone(), controller);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .ok_or_else(|| io::Error::other("typed TUI surface subscription unavailable"))?;
+    let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
+    for event in projection.hydrate_open_streams() {
+        let _ = event_tx.send(event);
+    }
+    let output = match attachment
+        .client
+        .manual_compact(
+            SurfaceRequestId::new(),
+            attachment.baseline.snapshot.context.revision,
+        )
+        .map_err(|error| {
+            io::Error::other(format!("typed TUI manual compaction failed: {error:?}"))
+        })? {
+        MutationReply::Committed { value, .. } => value,
+        MutationReply::Deferred { mutation, .. } => {
+            return Err(io::Error::other(format!(
+                "typed TUI manual compaction deferred: request={:?} commit={:?}",
+                mutation.request_id, mutation.commit_id
+            )));
+        }
+        MutationReply::Uncommitted { mutation } => {
+            return Err(io::Error::other(format!(
+                "typed TUI manual compaction did not commit: {mutation:?}"
+            )));
+        }
+    };
+    let operation_id = output.operation_id;
+    guard.bind_operation(operation_id.clone());
+    projection.focus_operation(operation_id.clone());
+    controller.install_surface(attachment.client.clone(), operation_id.clone())?;
+    activation.disarm();
+    guard.controller_installed();
+    let result = drain_operation(
+        &attachment.client,
+        &operation_id,
+        &mut subscription,
+        &mut projection,
+        controller,
+        event_tx,
+    );
+    if result.is_ok() {
+        guard.terminal_observed();
+    }
+    manual_compaction_terminal_outcome(result?)
+}
+
+fn manual_compaction_terminal_outcome(
+    outcome: TuiHostedOperationOutcome,
+) -> io::Result<TuiHostedOperationOutcome> {
+    match outcome {
+        TuiHostedOperationOutcome::Turn { status }
+            if status == "success" || status == "cancelled" =>
+        {
+            Ok(TuiHostedOperationOutcome::ManualCompaction)
+        }
+        TuiHostedOperationOutcome::Turn { status } => Err(io::Error::other(format!(
+            "typed TUI manual compaction terminated with status {status}"
+        ))),
+        TuiHostedOperationOutcome::ManualCompaction => {
+            Ok(TuiHostedOperationOutcome::ManualCompaction)
+        }
+    }
+}
+
 pub(crate) fn update_settings(
     thread: &RuntimeSurfaceThreadHandle,
     patches: NonEmptyVec<RuntimeSettingsPatch>,
@@ -865,6 +966,24 @@ fn detach(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceClientHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_compaction_failed_terminal_is_not_reported_as_success() {
+        let error = match manual_compaction_terminal_outcome(TuiHostedOperationOutcome::Turn {
+            status: "failed".to_string(),
+        }) {
+            Ok(_) => panic!("failed manual compaction must surface to the TUI action"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("status failed"));
+        assert!(matches!(
+            manual_compaction_terminal_outcome(TuiHostedOperationOutcome::Turn {
+                status: "cancelled".to_string(),
+            })
+            .expect("cancelled manual compaction remains a settled user outcome"),
+            TuiHostedOperationOutcome::ManualCompaction
+        ));
+    }
     use orca_core::config::HistoryMode;
     use orca_runtime::runtime_host::{RuntimeHost, RuntimeThreadHandle};
     use std::sync::Mutex;
@@ -930,6 +1049,57 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
         ));
+        assert!(controller.current_id().is_none());
+        assert!(!controller.has_surface_active());
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_manual_compaction_projects_durable_lifecycle() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config, "typed TUI manual compaction")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        let outcome = manual_compact(&thread.typed_surface(), &controller, &event_tx)
+            .expect("typed manual compaction");
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        let started = events
+            .iter()
+            .position(|event| matches!(event, TuiEvent::CompactionStarted))
+            .expect("compaction started");
+        let completed = events
+            .iter()
+            .position(|event| matches!(event, TuiEvent::Compacted { .. }))
+            .expect("compaction completed");
+        let terminal = events
+            .iter()
+            .position(
+                |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success"),
+            )
+            .expect("compaction terminal");
+
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::ManualCompaction
+        ));
+        assert!(started < completed);
+        assert!(completed < terminal);
         assert!(controller.current_id().is_none());
         assert!(!controller.has_surface_active());
 

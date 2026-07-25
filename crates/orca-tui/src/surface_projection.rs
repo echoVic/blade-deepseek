@@ -406,10 +406,46 @@ impl TuiSurfaceProjection {
                             / 1_000_000.0,
                     }));
                 }
-                SurfaceEvent::Context(context) => projected.push(TuiEvent::ContextUpdated {
-                    used_tokens: usize::try_from(context.used_tokens).unwrap_or(usize::MAX),
-                    limit_tokens: usize::try_from(context.limit_tokens).unwrap_or(usize::MAX),
-                }),
+                SurfaceEvent::Context(context) => {
+                    projected.push(TuiEvent::ContextUpdated {
+                        used_tokens: usize::try_from(context.used_tokens).unwrap_or(usize::MAX),
+                        limit_tokens: usize::try_from(context.limit_tokens).unwrap_or(usize::MAX),
+                    });
+                    match &context.compaction {
+                        orca_runtime::surface::CompactionState::Running { .. } => {
+                            projected.push(TuiEvent::CompactionStarted);
+                        }
+                        orca_runtime::surface::CompactionState::Completed {
+                            reason,
+                            strategy,
+                            before_messages,
+                            after_messages,
+                            collapsed_messages,
+                            status_text,
+                            ..
+                        } => {
+                            projected.push(TuiEvent::Compacted {
+                                before_messages: usize::try_from(*before_messages)
+                                    .unwrap_or(usize::MAX),
+                                after_messages: usize::try_from(*after_messages)
+                                    .unwrap_or(usize::MAX),
+                                reason: match reason {
+                                    orca_runtime::surface::CompactionReason::Manual => {
+                                        "manual".to_string()
+                                    }
+                                    orca_runtime::surface::CompactionReason::Automatic => {
+                                        "automatic".to_string()
+                                    }
+                                },
+                                strategy: strategy.as_str().to_string(),
+                                collapsed_messages: usize::try_from(*collapsed_messages)
+                                    .unwrap_or(usize::MAX),
+                                status_text: status_text.as_str().to_string(),
+                            });
+                        }
+                        orca_runtime::surface::CompactionState::Idle => {}
+                    }
+                }
                 SurfaceEvent::Operation(OperationPatch::AgentLoopTurnStarted { turn })
                     if focused_operation.as_ref() == Some(&turn.fence.operation_id) =>
                 {
