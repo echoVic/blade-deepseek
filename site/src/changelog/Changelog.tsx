@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.51":
+        "Ordinary TUI turns now run end to end through a runtime-owned typed surface: prompt admission, atomic durable commit, assistant and tool projection, approval and permission decisions, cancellation, terminal cleanup, snapshot replay, and restart recovery share one RuntimeHost truth. Recovered controls remain bound to the original operation and generation, interaction responses are durable before waiters wake, and production tests cover real Record-to-Resume history plus PTY terminal restoration. ACP typed prompt, replay, permission, and bounded RPC bridges are included without changing Goal, workflow, or JSONL compatibility.",
       "v0.2.50":
         "Goal Mode no longer has a fixed outer-turn or continuation ceiling. RuntimeHost admits the next turn from semantic state, cancellation, pending interactions, workflow ownership, progress, and token budget; continuation_count remains only persisted ledger and event telemetry. This removes the false Paused(NoProgress) terminal that could appear after 64 otherwise valid turns without weakening budget, stall, or user-control boundaries.",
       "v0.2.49":
@@ -544,6 +546,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.51":
+        "普通 TUI turn 现在端到端运行在 runtime-owned typed surface 上：prompt 准入、原子 durable commit、assistant 与 tool 投影、审批与权限响应、取消、terminal 清理、snapshot replay 和重启恢复共用同一份 RuntimeHost 事实。恢复后的控制仍绑定原 operation 与 generation，交互响应会先持久化再唤醒 waiter；生产测试覆盖真实 Record-to-Resume 历史与 PTY 终端恢复。本版本同时包含 ACP typed prompt、replay、permission 与有界 RPC bridge，但不改变 Goal、workflow 或 JSONL compatibility。",
       "v0.2.50":
         "Goal Mode 不再设置固定 outer-turn 或 continuation 上限。RuntimeHost 只根据语义状态、取消、待处理交互、workflow 所有权、进展与 token budget 决定是否续轮；continuation_count 继续持久化，但只用于账本与事件观测。这消除了 Goal 在 64 个正常 turn 后被错误映射为 Paused(NoProgress) 的终态，同时保留预算、stall 与用户控制边界。",
       "v0.2.49":

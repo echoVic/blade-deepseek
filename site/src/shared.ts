@@ -4,9 +4,14 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.2.50";
+export const releaseVersion = "v0.2.51";
 
 export const releases = [
+  {
+    version: "v0.2.51",
+    date: "2026-07-25",
+    url: "https://github.com/echoVic/blade-deepseek/releases/tag/v0.2.51",
+  },
   {
     version: "v0.2.50",
     date: "2026-07-19",
