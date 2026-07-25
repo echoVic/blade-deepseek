@@ -54,6 +54,10 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.read_surface_history()
     }
 
+    pub fn backtrack_last_user(&self) -> Result<Option<String>, RuntimeHostError> {
+        self.runtime.backtrack_last_user()
+    }
+
     pub(crate) fn legacy(&self) -> RuntimeThreadHandle {
         self.runtime.clone()
     }

@@ -4763,7 +4763,7 @@ fn hosted_tui_controller_loop(
             Ok(UserAction::Backtrack) => {
                 let result = thread
                     .as_ref()
-                    .map(RuntimeThreadHandle::backtrack_last_user)
+                    .map(|runtime_thread| runtime_thread.typed_surface().backtrack_last_user())
                     .transpose();
                 match result {
                     Ok(Some(Some(prompt))) => {
