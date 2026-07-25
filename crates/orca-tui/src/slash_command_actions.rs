@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
-use orca_runtime::history;
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
 use crate::types::{AppState, ChatMessage, TuiMemoryScope, UserAction};
@@ -169,7 +169,7 @@ pub(crate) fn handle_slash_command(
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
-        SlashCommand::History => match history::list_sessions(10) {
+        SlashCommand::History => match RuntimeSurfaceHostHandle::list_saved_sessions(10) {
             Ok(sessions) if sessions.is_empty() => {
                 state.push_message(ChatMessage::System("No saved sessions.".to_string()))
             }

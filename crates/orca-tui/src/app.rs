@@ -24,6 +24,7 @@ use orca_runtime::runtime_host::{
     HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, HostedWorkflowRequest,
     OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::agent_runtime::TuiAgentRuntime;
 use crate::background_approval::submit_background_approval_response_for_tui;
@@ -121,7 +122,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             HistoryMode::Resume(_) | HistoryMode::Fork(_)
         );
     let picker_sessions = if should_show_picker {
-        orca_runtime::history::list_sessions(20).unwrap_or_default()
+        RuntimeSurfaceHostHandle::list_saved_sessions(20).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -5659,7 +5660,7 @@ fn resume_latest_active_goal_hosted(
             return;
         }
     };
-    let transcript = match history::load_session(&goal.session_id) {
+    let transcript = match RuntimeSurfaceHostHandle::load_saved_session(&goal.session_id) {
         Ok(transcript) => transcript,
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(format!(

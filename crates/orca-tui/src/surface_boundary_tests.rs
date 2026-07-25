@@ -10,6 +10,8 @@ const MENTION_SEARCH_MANAGER: &str = include_str!("mention_search_manager.rs");
 const BACKGROUND_TASKS: &str = include_str!("background_tasks.rs");
 const BACKGROUND_APPROVAL: &str = include_str!("background_approval.rs");
 const SLASH_COMMAND_ACTIONS: &str = include_str!("slash_command_actions.rs");
+const SLASH_MENU_ACTIONS: &str = include_str!("slash_menu_actions.rs");
+const SESSION_PICKER_ACTIONS: &str = include_str!("session_picker_actions.rs");
 
 const CURRENT_ACTIONS: [(&str, &str); 21] = [
     ("Submit", "runtime_mutation"),
@@ -509,5 +511,11 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
     assert!(
         TYPES.contains("Remember {") && !SLASH_COMMAND_ACTIONS.contains("orca_runtime::memory::"),
         "memory scope and persistence must cross the TUI action facade"
+    );
+    assert!(
+        !SLASH_COMMAND_ACTIONS.contains("history::list_sessions")
+            && !SLASH_MENU_ACTIONS.contains("history::list_sessions")
+            && !SESSION_PICKER_ACTIONS.contains("history::load_session"),
+        "session history reads must cross the runtime surface history boundary"
     );
 }

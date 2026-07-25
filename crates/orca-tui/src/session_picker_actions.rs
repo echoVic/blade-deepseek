@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{KeyCode, KeyEvent};
 
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_runtime::history;
 use orca_runtime::history::SessionTranscript;
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::app::chat_message_from_history;
 use crate::types::{AppState, AppStatus, ChatMessage};
@@ -64,7 +64,7 @@ where
     }
     // The picker is a read-only presentation query. The runtime still resolves
     // and reopens the selected session independently when the next turn starts.
-    if let Ok(transcript) = history::load_session(&session_id) {
+    if let Ok(transcript) = RuntimeSurfaceHostHandle::load_saved_session(&session_id) {
         let restored_messages = transcript
             .messages
             .iter()

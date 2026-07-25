@@ -105,6 +105,20 @@ impl RuntimeSurfaceGoalHandle {
 }
 
 impl RuntimeSurfaceHostHandle {
+    /// Read saved thread projections without acquiring an owner lease. Opening
+    /// a selected session still happens inside `RuntimeHost::start_thread`.
+    pub fn list_saved_sessions(
+        limit: usize,
+    ) -> std::io::Result<Vec<crate::history::SessionSummary>> {
+        crate::history::list_sessions(limit)
+    }
+
+    pub fn load_saved_session(
+        selector: &str,
+    ) -> std::io::Result<crate::history::SessionTranscript> {
+        crate::history::load_session(selector)
+    }
+
     pub fn start_thread(
         &self,
         config: RunConfig,

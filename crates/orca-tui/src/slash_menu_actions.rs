@@ -5,6 +5,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::{Input, TextArea};
 
 use orca_core::config::{ReasoningEffort, RunConfig};
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::commands;
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
@@ -261,7 +262,7 @@ fn select_slash_menu_command(
         "/history" => {
             state.slash_menu = None;
             *textarea = make_textarea(vim_state, theme);
-            match orca_runtime::history::list_sessions(20) {
+            match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
                 Ok(sessions) if !sessions.is_empty() => {
                     state.session_picker_sessions = sessions;
                     state.session_picker_selected = 0;
