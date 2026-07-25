@@ -104,7 +104,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let (event_tx, pending_event_rx) = tui_event_channel();
     let (action_tx, action_rx) = user_action_channel();
-    let (mention_registry_tx, mention_registry_rx) = mpsc::bounded(1);
     let mut mention_search =
         MentionSearchManager::new_roots(mention_search_roots(&config), event_tx.clone());
     let pending_workflow_notifications: bridge::PendingWorkflowNotifications =
@@ -171,7 +170,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let agent_event_tx = event_tx.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
     let agent_mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-    let _ = mention_registry_tx.send(agent_mcp_registry.clone());
     let agent_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
 
     let mut agent_runtime = TuiAgentRuntime::spawn_hosted(
@@ -235,9 +233,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     'main: loop {
         let now = Instant::now();
-        if let Ok(registry) = mention_registry_rx.try_recv() {
-            mention_search.install_registry(registry);
-        }
         // The copy notice and edge-drag auto-scroll count as animation so the
         // idle loop keeps drawing frames: the notice until it expires (expiry
         // clears it while THIS iteration still counts as animating, so
@@ -377,6 +372,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                         TuiEvent::MentionCatalogDirty { generation } => {
                             mention_search.consume_catalog_dirty(generation, &mut state);
+                        }
+                        TuiEvent::MentionRuntimeReady(thread) => {
+                            mention_search.install_runtime_thread(thread);
                         }
                         TuiEvent::SettingsUpdated {
                             model,
@@ -4662,6 +4660,7 @@ fn hosted_tui_controller_loop(
             HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
         };
         let title = format!("Restored session {selector}");
+        let thread_was_missing = thread.is_none();
         let result = ensure_hosted_thread(
             &mut thread,
             &host,
@@ -4687,6 +4686,9 @@ fn hosted_tui_controller_loop(
                     "failed to restore typed conversation snapshot: {error}"
                 )));
             }
+        }
+        if thread_was_missing && thread.is_some() {
+            announce_runtime_ready(thread.as_ref().expect("startup hosted thread"), &event_tx);
         }
     }
 
@@ -4738,6 +4740,7 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
                 let cfg = config.lock().unwrap().clone();
+                let thread_was_missing = thread.is_none();
                 if let Err(error) = ensure_hosted_thread(
                     &mut thread,
                     &host,
@@ -4749,6 +4752,9 @@ fn hosted_tui_controller_loop(
                 ) {
                     send_hosted_action_failure(&event_tx, error);
                     continue;
+                }
+                if thread_was_missing {
+                    announce_runtime_ready(thread.as_ref().expect("workflow thread"), &event_tx);
                 }
                 if let Some(runtime_thread) = thread.as_ref() {
                     let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
@@ -4789,6 +4795,7 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::Remember(note)) => {
                 let context = format!("[Pinned remembered note]\n{}", note.trim());
+                let thread_was_missing = thread.is_none();
                 if thread.is_none() {
                     let cfg = config.lock().unwrap().clone();
                     if let Err(error) = ensure_hosted_thread(
@@ -4803,6 +4810,9 @@ fn hosted_tui_controller_loop(
                         let _ = event_tx.send(TuiEvent::Error(error));
                         continue;
                     }
+                }
+                if thread_was_missing {
+                    announce_runtime_ready(thread.as_ref().expect("remember thread"), &event_tx);
                 }
                 if let Some(runtime_thread) = thread.as_ref() {
                     let typed_thread = runtime_thread.typed_surface();
@@ -4896,6 +4906,7 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::GoalSet(objective)) => {
                 let cfg = config.lock().unwrap().clone();
+                let thread_was_missing = thread.is_none();
                 if let Err(error) = ensure_hosted_thread(
                     &mut thread,
                     &host,
@@ -4907,6 +4918,9 @@ fn hosted_tui_controller_loop(
                 ) {
                     send_hosted_action_failure(&event_tx, error);
                     continue;
+                }
+                if thread_was_missing {
+                    announce_runtime_ready(thread.as_ref().expect("goal thread"), &event_tx);
                 }
                 let Some(session_id) = thread
                     .as_ref()
@@ -5148,6 +5162,10 @@ fn ensure_hosted_thread(
     Ok(())
 }
 
+fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<TuiEvent>) {
+    let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
+}
+
 fn emit_typed_history_snapshot(
     thread: &RuntimeThreadHandle,
     mode: &HistoryMode,
@@ -5244,6 +5262,7 @@ fn handle_hosted_submitted_turn(
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let cfg = config.lock().unwrap().clone();
+    let thread_was_missing = thread.is_none();
     let cwd = cfg
         .cwd
         .clone()
@@ -5260,6 +5279,9 @@ fn handle_hosted_submitted_turn(
     ) {
         send_submission_error(event_tx, rejection_prompt.as_deref(), error);
         return;
+    }
+    if thread_was_missing {
+        announce_runtime_ready(thread.as_ref().expect("submitted thread"), event_tx);
     }
     let runtime_thread = thread.as_ref().expect("hosted thread initialized");
     let workspace_roots = cfg

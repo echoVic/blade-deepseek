@@ -158,6 +158,34 @@ fn typed_thread_expands_mentions_with_runtime_owned_registry() {
     host.shutdown().expect("shutdown runtime host");
 }
 
+#[test]
+fn typed_thread_discovers_mention_catalog_with_runtime_owned_registry() {
+    let cwd = tempdir().expect("temp cwd");
+    let manifest_dir = cwd.path().join(".orca/plugins/github/.codex-plugin");
+    fs::create_dir_all(&manifest_dir).expect("plugin directory");
+    fs::write(
+        manifest_dir.join("plugin.json"),
+        r#"{"name":"github","description":"GitHub workflows","interface":{"displayName":"GitHub"}}"#,
+    )
+    .expect("plugin manifest");
+    let root = cwd.path().canonicalize().expect("canonical cwd");
+    let host = RuntimeHost::start().expect("runtime host");
+    let thread = host
+        .surface_handle()
+        .start_thread(test_config(root.clone()), "mention catalog")
+        .expect("typed thread");
+
+    let catalog = thread.discover_mention_catalog(std::slice::from_ref(&root));
+
+    assert!(
+        catalog
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.display == "GitHub")
+    );
+    host.shutdown().expect("shutdown runtime host");
+}
+
 fn test_config(cwd: std::path::PathBuf) -> RunConfig {
     RunConfig {
         app_version: "test".to_string(),

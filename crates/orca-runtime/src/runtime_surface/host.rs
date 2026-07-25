@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::goal_actor::GoalRuntimeHandle;
@@ -16,6 +17,15 @@ use super::{RuntimeSurfaceHandle, RuntimeSurfaceHostHandle};
 #[derive(Clone)]
 pub struct RuntimeSurfaceThreadHandle {
     runtime: RuntimeThreadHandle,
+}
+
+impl fmt::Debug for RuntimeSurfaceThreadHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeSurfaceThreadHandle")
+            .field("thread_id", &self.thread_id())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A thread-scoped Goal control facade. The actor handle remains private to
@@ -151,6 +161,12 @@ impl RuntimeSurfaceThreadHandle {
             workspace_roots,
             &self.runtime.mcp_registry(),
         )
+    }
+
+    /// Discover immutable mention candidates with the runtime-owned MCP
+    /// registry. Surface clients receive the result, never the registry.
+    pub fn discover_mention_catalog(&self, roots: &[PathBuf]) -> crate::mentions::MentionCatalog {
+        crate::mentions::MentionCatalog::discover(roots, &self.runtime.mcp_registry())
     }
 
     pub fn backtrack_last_user(&self) -> Result<Option<String>, RuntimeHostError> {

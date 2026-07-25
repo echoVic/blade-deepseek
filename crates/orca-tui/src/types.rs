@@ -15,6 +15,7 @@ use orca_runtime::history::SessionSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
+use orca_runtime::surface::RuntimeSurfaceThreadHandle;
 
 use crate::display_text::truncate_to_display_width;
 use crate::transcript_view::TranscriptRenderCache;
@@ -293,6 +294,7 @@ pub enum TuiEvent {
     MentionCatalogDirty {
         generation: u64,
     },
+    MentionRuntimeReady(RuntimeSurfaceThreadHandle),
     SubmissionRejected {
         prompt: String,
         message: String,
@@ -1933,7 +1935,9 @@ impl AppState {
             TuiEvent::Notice(msg) => {
                 self.push_message(ChatMessage::System(msg));
             }
-            TuiEvent::MentionSearchDirty { .. } | TuiEvent::MentionCatalogDirty { .. } => {}
+            TuiEvent::MentionSearchDirty { .. }
+            | TuiEvent::MentionCatalogDirty { .. }
+            | TuiEvent::MentionRuntimeReady(_) => {}
             TuiEvent::UsageUpdated(usage) => {
                 self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
                 self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
