@@ -20,6 +20,9 @@ An existing Orca installation must provide one guided upgrade flow that:
 7. activates `orca` as a compatibility command that launches DeepSea; and
 8. launches DeepSea.
 
+An independently installed DeepSea binary must discover the same legacy data
+and offer the same migration before normal first-run setup.
+
 The migration must be resumable, idempotent, inspectable, and reversible.
 
 ## Naming and Distribution Contract
@@ -197,6 +200,76 @@ result activates the legacy-command compatibility receipt. Cancellation,
 partial success, a generic zero exit status without the success result, or any
 validation error leaves Orca behavior unchanged.
 
+## Direct DeepSea Installation Entry
+
+Users may install `@blade-ai/deepsea` or a native DeepSea binary without first
+accepting the Orca update prompt. The first interactive DeepSea launch must
+therefore perform legacy discovery before creating new configuration,
+credentials, history, or Goal state.
+
+DeepSea checks legacy homes in this order:
+
+1. an explicit legacy-home argument supplied to the migration command;
+2. the current `ORCA_HOME`, when set; and
+3. the default `~/.orca`.
+
+Duplicate paths are canonicalized and inspected once. A directory counts as a
+migration candidate only when it contains supported user data; an empty
+directory or an update cache by itself does not trigger the prompt.
+
+When a candidate exists, DeepSea shows:
+
+```text
+Existing Orca data found
+
+Source: ~/.orca
+• Configuration and credentials
+• 126 sessions
+• 3 active goals
+• 8 skills
+• 2 workflows
+• Current project .orca settings
+
+[Migrate from Orca] [Start Fresh] [Not Now]
+```
+
+Semantics:
+
+- **Migrate from Orca** enters the same inventory, conflict, copy, validation,
+  journal, and report flow used by the Orca handoff.
+- **Start Fresh** records a decision for the fingerprinted legacy home and
+  continues normal DeepSea setup. It never deletes or modifies Orca data.
+- **Not Now** postpones the decision for the current DeepSea release.
+- `deepsea migrate-from-orca` always remains available to reopen discovery and
+  migrate explicitly.
+
+DeepSea records discovery decisions in its own update state, keyed by the
+canonical legacy-home path and a non-secret content fingerprint. It must not
+prompt on every launch when the user chose **Start Fresh**, when the candidate
+has already migrated successfully, or when no supported Orca data exists. A
+material change to the legacy source may be shown as a new optional migration,
+but it must not block normal startup.
+
+If `~/.deepsea` or `DEEPSEA_HOME` already contains user state, direct-install
+migration enters the normal conflict-planning flow. It never treats the
+DeepSea destination as empty merely because this is the first launch of the
+current binary.
+
+After validated direct-install migration, DeepSea checks whether an `orca`
+command is installed:
+
+- if no `orca` command exists, migration completes without creating an
+  unsolicited alias;
+- if a compatible transition Orca is found, DeepSea sends it a
+  nonce-bound activation request so that Orca records its own redirect receipt;
+- if an older Orca cannot activate the redirect, DeepSea offers to update the
+  Orca compatibility package or exact direct launcher before retrying; and
+- DeepSea never replaces an unrelated executable that happens to be named
+  `orca`.
+
+This preserves the ownership boundary: direct-install DeepSea discovers and
+migrates data, while Orca still owns activation of its existing command path.
+
 ## Migration Inventory
 
 DeepSea inventories the resolved Orca home. It must respect an explicit
@@ -352,6 +425,9 @@ Removing legacy components is a separate, explicit advanced action:
 - **Compatibility activation failure:** report migration success separately,
   keep the existing Orca command functional, and provide an idempotent
   `deepsea migrate repair-alias` command.
+- **Direct-install discovery failure:** continue normal DeepSea startup only
+  after reporting the inaccessible candidate; never interpret a permission
+  error as an empty Orca home.
 - **DeepSea missing after migration:** the `orca` launcher fails safely with
   the exact `@blade-ai/deepsea` reinstall command; it never falls back to an
   unrelated executable from the current directory.
@@ -401,6 +477,15 @@ Removing legacy components is a separate, explicit advanced action:
 Automated coverage must include:
 
 - npm-managed and direct-binary handoff;
+- npm-managed and direct-binary DeepSea installation without an Orca handoff;
+- first interactive launch with and without supported Orca data;
+- direct installation before DeepSea has created any destination state;
+- direct installation with existing non-empty DeepSea state;
+- Start Fresh, Not Now, later explicit migration, and source-change
+  rediscovery;
+- canonical duplicate legacy paths and inaccessible legacy homes;
+- compatible, outdated, missing, and unrelated `orca` executables after direct
+  installation;
 - macOS arm64/x64 and Linux arm64/x64 package resolution;
 - custom `ORCA_HOME`;
 - empty legacy home;
