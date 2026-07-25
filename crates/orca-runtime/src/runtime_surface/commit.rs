@@ -2939,7 +2939,7 @@ fn actor_control_admission_pair_authorized(batch: &SurfaceCommitBatch) -> bool {
                             presentation: item_presentation,
                             correlation_id: item_correlation,
                         },
-                    pinned: false,
+                    pinned: _,
                     origin: super::SurfaceItemOrigin::UserInput,
                 },
         }),

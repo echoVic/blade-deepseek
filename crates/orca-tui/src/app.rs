@@ -542,7 +542,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
         background_capacity,
         controller,
         move |controller, commands, host| {
-            hosted_tui_controller_loop(
+            hosted_tui_controller_loop_with_ordinary_turn_runner(
                 agent_config,
                 agent_preloaded,
                 agent_events,
@@ -551,6 +551,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
                 agent_pending,
                 agent_registry,
                 host,
+                run_hosted_legacy_ordinary_turn,
             );
         },
     )
@@ -1594,6 +1595,160 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_tui_dispatch_commits_user_and_provider_items_to_typed_surface() {
+        with_orca_home(|_| {
+            let config = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "typed ordinary turn ingress")
+                .expect("runtime thread");
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_ordinary_turn(
+                &config,
+                &thread,
+                hosted_turn_request(
+                    &SubmittedTurn::user("typed app dispatch".to_string()),
+                    false,
+                ),
+                &event_tx,
+                &controller,
+            )
+            .expect("typed ordinary turn");
+
+            let snapshot = TuiSurfaceActions::new(thread.typed_surface())
+                .read_snapshot()
+                .expect("typed snapshot");
+            let (user, user_is_pinned) = snapshot
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    orca_runtime::surface::SurfaceItem::UserMessage {
+                        turn_id,
+                        input: orca_runtime::surface::SurfaceUserInputState::Resolved { .. },
+                        pinned,
+                        ..
+                    } => Some((turn_id.clone(), *pinned)),
+                    _ => None,
+                })
+                .expect("resolved typed user item");
+            let assistant = snapshot
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    orca_runtime::surface::SurfaceItem::AssistantMessage {
+                        turn_id, text, ..
+                    } if text.as_str()
+                        == "Mock runtime completed the headless harness contract." =>
+                    {
+                        Some(turn_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("typed assistant item");
+            let reasoning = snapshot
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    orca_runtime::surface::SurfaceItem::AssistantReasoning {
+                        turn_id,
+                        content,
+                        ..
+                    } if content.as_str()
+                        == "Mock runtime is preserving the DeepSeek reasoning channel." =>
+                    {
+                        Some(turn_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("typed reasoning item");
+
+            assert_eq!(assistant, user);
+            assert_eq!(reasoning, user);
+            assert!(
+                !user_is_pinned,
+                "ordinary TUI input must stay unpinned so it remains backtrackable"
+            );
+            assert!(snapshot.foreground_operation.is_none());
+            assert!(snapshot.operation_history.iter().any(|operation| {
+                matches!(
+                    operation.terminal.as_ref().map(|record| &record.terminal),
+                    Some(orca_runtime::surface::OperationTerminal::Succeeded { .. })
+                )
+            }));
+            assert!(event_rx.try_iter().any(
+                |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+            ));
+
+            thread.shutdown().expect("thread shutdown");
+            host.shutdown().expect("host shutdown");
+        });
+    }
+
+    #[test]
+    fn ordinary_tui_typed_submit_can_manual_compact_the_same_durable_conversation() {
+        with_orca_home(|_| {
+            let config = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "typed ordinary turn compaction")
+                .expect("runtime thread");
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_ordinary_turn(
+                &config,
+                &thread,
+                hosted_turn_request(
+                    &SubmittedTurn::user("typed app dispatch before compaction".to_string()),
+                    false,
+                ),
+                &event_tx,
+                &controller,
+            )
+            .expect("typed ordinary turn");
+            let outcome = match TuiSurfaceActions::new(thread.typed_surface())
+                .manual_compact(&controller, &event_tx)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => panic!(
+                    "typed manual compaction after ordinary turn: {error}; events={:?}",
+                    event_rx.try_iter().collect::<Vec<_>>()
+                ),
+            };
+
+            assert!(matches!(
+                outcome,
+                TuiHostedOperationOutcome::ManualCompaction
+            ));
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, TuiEvent::CompactionStarted))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, TuiEvent::Compacted { .. }))
+            );
+            assert!(
+                TuiSurfaceActions::new(thread.typed_surface())
+                    .read_snapshot()
+                    .expect("typed snapshot after compaction")
+                    .foreground_operation
+                    .is_none()
+            );
+
+            thread.shutdown().expect("thread shutdown");
+            host.shutdown().expect("host shutdown");
+        });
+    }
+
+    #[test]
     fn hosted_tui_foreground_turn_uses_canonical_verifier_terminal() {
         with_orca_home(|_| {
             let mut config = test_config(HistoryMode::Record);
@@ -1918,6 +2073,7 @@ mod tests {
                 &pending,
                 &registry,
                 &host_handle,
+                run_hosted_ordinary_turn,
             );
 
             assert!(matches!(
@@ -4697,6 +4853,14 @@ fn send_submission_error(
     }
 }
 
+type OrdinaryTurnRunner = fn(
+    &RunConfig,
+    &RuntimeThreadHandle,
+    HostedTurnRequest,
+    &mpsc::Sender<TuiEvent>,
+    &TuiOperationController,
+) -> io::Result<TuiHostedOperationOutcome>;
+
 #[allow(clippy::too_many_arguments)]
 fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -4707,6 +4871,31 @@ fn hosted_tui_controller_loop(
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     mcp_registry: orca_mcp::McpRegistry,
     host: RuntimeHostHandle,
+) {
+    hosted_tui_controller_loop_with_ordinary_turn_runner(
+        config,
+        preloaded,
+        event_tx,
+        action_rx,
+        controller,
+        pending_workflow_notifications,
+        mcp_registry,
+        host,
+        run_hosted_ordinary_turn,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hosted_tui_controller_loop_with_ordinary_turn_runner(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    controller: TuiOperationController,
+    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+    mcp_registry: orca_mcp::McpRegistry,
+    host: RuntimeHostHandle,
+    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut pending_actions = VecDeque::new();
@@ -4770,6 +4959,7 @@ fn hosted_tui_controller_loop(
                 &pending_workflow_notifications,
                 &mcp_registry,
                 &host,
+                ordinary_turn_runner,
             ),
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
                 handle_hosted_submitted_turn(
@@ -4782,6 +4972,7 @@ fn hosted_tui_controller_loop(
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &host,
+                    ordinary_turn_runner,
                 );
             }
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
@@ -4795,6 +4986,7 @@ fn hosted_tui_controller_loop(
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &host,
+                    ordinary_turn_runner,
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
@@ -5062,6 +5254,7 @@ fn hosted_tui_controller_loop(
                                 orca_core::goal_runtime::GoalTurnOrigin::User,
                                 &event_tx,
                                 &controller,
+                                ordinary_turn_runner,
                             );
                         }
                     }
@@ -5144,6 +5337,7 @@ fn hosted_tui_controller_loop(
                         &event_tx,
                         &controller,
                         &pending_workflow_notifications,
+                        ordinary_turn_runner,
                     );
                     continue;
                 }
@@ -5172,6 +5366,7 @@ fn hosted_tui_controller_loop(
                         orca_core::goal_runtime::GoalTurnOrigin::Resume,
                         &event_tx,
                         &controller,
+                        ordinary_turn_runner,
                     );
                 }
             }
@@ -5329,6 +5524,7 @@ fn handle_hosted_submitted_turn(
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
     host: &RuntimeHostHandle,
+    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let cfg = config.lock().unwrap().clone();
@@ -5374,6 +5570,7 @@ fn handle_hosted_submitted_turn(
         orca_core::goal_runtime::GoalTurnOrigin::User,
         event_tx,
         controller,
+        ordinary_turn_runner,
     );
     if cfg.desktop_notifications {
         let _ = orca_runtime::notify::notify("Orca", "Task completed");
@@ -5502,6 +5699,7 @@ fn run_hosted_goal_run(
     origin: orca_core::goal_runtime::GoalTurnOrigin,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
+    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     let Some(session_id) = thread.session_id().map(str::to_string) else {
         send_goal_history_error(event_tx);
@@ -5531,14 +5729,7 @@ fn run_hosted_goal_run(
             run_hosted_operation(thread, request, config.clone(), controller, event_tx)
         }
         HostedOperationKind::Turn => {
-            #[cfg(test)]
-            {
-                run_hosted_operation(thread, request, config.clone(), controller, event_tx)
-            }
-            #[cfg(not(test))]
-            {
-                actions.run_turn(request, config.clone(), controller, event_tx)
-            }
+            ordinary_turn_runner(config, thread, request, event_tx, controller)
         }
         HostedOperationKind::ManualCompaction
         | HostedOperationKind::BackgroundContinuation { .. } => {
@@ -5589,6 +5780,32 @@ fn run_hosted_goal_run(
             let _ = event_tx.send(TuiEvent::Error(error.to_string()));
         }
     }
+}
+
+fn run_hosted_ordinary_turn(
+    config: &RunConfig,
+    thread: &RuntimeThreadHandle,
+    request: HostedTurnRequest,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    controller: &TuiOperationController,
+) -> io::Result<TuiHostedOperationOutcome> {
+    TuiSurfaceActions::new(thread.typed_surface()).run_turn(
+        request,
+        config.clone(),
+        controller,
+        event_tx,
+    )
+}
+
+#[cfg(test)]
+fn run_hosted_legacy_ordinary_turn(
+    config: &RunConfig,
+    thread: &RuntimeThreadHandle,
+    request: HostedTurnRequest,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    controller: &TuiOperationController,
+) -> io::Result<TuiHostedOperationOutcome> {
+    run_hosted_operation(thread, request, config.clone(), controller, event_tx)
 }
 
 fn hosted_turn_request(
@@ -5685,6 +5902,7 @@ fn resume_latest_active_goal_hosted(
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         send_goal_history_error(event_tx);
@@ -5785,6 +6003,7 @@ fn resume_latest_active_goal_hosted(
             orca_core::goal_runtime::GoalTurnOrigin::Resume,
             event_tx,
             controller,
+            ordinary_turn_runner,
         );
     }
 }

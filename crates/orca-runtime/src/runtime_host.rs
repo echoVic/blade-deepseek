@@ -8879,6 +8879,9 @@ impl ThreadActor {
         let resolved_input = resolve_surface_input(&input_request)
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let backtrack_target =
+            matches!(&operation.intent.origin, surface::OperationOrigin::TuiUser);
+        let input_pinned = !backtrack_target;
         let logical_turn_id = match &operation.intent.origin {
             surface::OperationOrigin::JsonlThreadTurn { legacy_turn_id, .. } => {
                 TurnId::parse(legacy_turn_id.0.as_str())
@@ -8948,7 +8951,7 @@ impl ThreadActor {
                                 presentation: presentation.clone(),
                                 correlation_id,
                             },
-                            pinned: false,
+                            pinned: input_pinned,
                             origin: surface::SurfaceItemOrigin::UserInput,
                         },
                     }),
@@ -9111,6 +9114,7 @@ impl ThreadActor {
         let interaction_command_tx = self.handle.command_tx.clone();
         let interaction_fence = fence.clone();
         let mut hosted_request = HostedTurnRequest::new(resolved_input.canonical_text.as_str())
+            .with_backtrack_target(backtrack_target)
             .with_generation_handlers(move |_, _| {
                 HostedGenerationHandlers::default()
                     .with_provider_response_ingress(Arc::new(
@@ -10308,6 +10312,10 @@ impl ThreadActor {
         let interaction_command_tx = self.handle.command_tx.clone();
         let interaction_fence = fence.clone();
         let mut hosted_request = HostedTurnRequest::new(resolved_input.canonical_text.as_str())
+            .with_backtrack_target(matches!(
+                &operation.intent.origin,
+                surface::OperationOrigin::TuiUser
+            ))
             .with_generation_handlers(move |_, _| {
                 HostedGenerationHandlers::default()
                     .with_provider_response_ingress(Arc::new(
