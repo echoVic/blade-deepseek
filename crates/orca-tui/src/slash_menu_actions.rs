@@ -5,10 +5,11 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::{Input, TextArea};
 
 use orca_core::config::{ReasoningEffort, RunConfig};
-use orca_core::model::ModelSelection;
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::commands;
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
+use crate::slash_command_actions::encode_settings_intent;
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command, parse_approval_mode};
 use crate::theme::Theme;
 use crate::types::{
@@ -64,6 +65,7 @@ pub(crate) fn handle_slash_menu_key(
     vim_state: &VimState,
     theme: &Theme,
 ) -> bool {
+    let mut pending_settings = None;
     let menu = match &mut state.slash_menu {
         Some(m) => m,
         None => return false,
@@ -102,31 +104,16 @@ pub(crate) fn handle_slash_menu_key(
                     if let (Some(model), Some(effort)) =
                         (pending_model, parse_reasoning_effort(&chosen))
                     {
-                        config.model = ModelSelection::from_unchecked(Some(model.clone()));
-                        config.reasoning_effort = effort;
-                        if let Ok(mut cfg) = shared_config.lock() {
-                            cfg.model = ModelSelection::from_unchecked(Some(model.clone()));
-                            cfg.reasoning_effort = effort;
-                        }
-                        state.model_name = model.clone();
-                        state.reasoning_effort = effort;
-                        state.push_message(ChatMessage::System(format!(
-                            "Model switched to {model} (reasoning effort: {}).",
-                            effort.as_str()
-                        )));
-                        let _ = action_tx.send(UserAction::SetModel(model));
+                        pending_settings =
+                            Some(encode_settings_intent(Some(&model), Some(effort), None));
                     }
                 } else if title == "/mode"
                     && let Some(mode) = parse_approval_mode(&chosen)
                 {
-                    config.approval_mode = mode;
-                    if let Ok(mut cfg) = shared_config.lock() {
-                        cfg.approval_mode = mode;
-                    }
-                    state.approval_mode = mode;
-                    state.push_message(ChatMessage::System(format!(
-                        "Approval mode switched to {chosen}."
-                    )));
+                    pending_settings = Some(encode_settings_intent(None, None, Some(mode)));
+                }
+                if let Some(settings) = pending_settings {
+                    let _ = action_tx.send(UserAction::SetModel(settings));
                 }
                 state.slash_menu = None;
                 *textarea = make_textarea(vim_state, theme);
@@ -275,7 +262,7 @@ fn select_slash_menu_command(
         "/history" => {
             state.slash_menu = None;
             *textarea = make_textarea(vim_state, theme);
-            match orca_runtime::history::list_sessions(20) {
+            match RuntimeSurfaceHostHandle::list_saved_sessions(20) {
                 Ok(sessions) if !sessions.is_empty() => {
                     state.session_picker_sessions = sessions;
                     state.session_picker_selected = 0;

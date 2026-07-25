@@ -10,9 +10,11 @@ use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult, ToolS
 use orca_mcp::McpRegistry;
 
 use crate::hooks::{HookContext, HookRunError, HookRunner};
+use crate::runtime_surface::RuntimeProviderResponseIngress;
 use crate::runtime_tool_call::{RuntimeReadonlyToolInvocation, RuntimeToolCallRuntime};
 use crate::session::record_tool_result_for_agent;
 use crate::thread_store::SessionWriter;
+use crate::tool_execution::semantic_commit_failure;
 use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
 };
@@ -29,6 +31,7 @@ pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) max_parallel: usize,
+    pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
 }
 
 pub(crate) struct RuntimeReadonlyToolTurnContext<'a, W: io::Write> {
@@ -56,6 +59,7 @@ pub(crate) struct RuntimeReadonlyToolTurnIo<'a, W: io::Write> {
 pub(crate) struct RuntimeReadonlyToolTurnServices<'a> {
     pub(crate) mcp_registry: &'a McpRegistry,
     pub(crate) hooks: &'a HookRunner,
+    pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
 }
 
 pub(crate) struct RuntimeReadonlyBatchExecution {
@@ -85,6 +89,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         cancel,
         output_truncation,
         max_parallel,
+        provider_response_ingress,
     } = context;
     let mut early_results: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
     let mut runnable = Vec::new();
@@ -173,6 +178,12 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         .into_iter()
         .map(|result| result.expect("each read-only batch item has a result"))
         .collect::<Vec<_>>();
+
+    if let Some(ingress) = provider_response_ingress {
+        ingress
+            .commit_tool_results(&results)
+            .map_err(semantic_commit_failure)?;
+    }
 
     for (tool_request, result) in tool_requests.iter().zip(results.iter()) {
         if emit_deltas {
@@ -285,6 +296,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
     let RuntimeReadonlyToolTurnServices {
         mcp_registry,
         hooks,
+        provider_response_ingress,
     } = services;
     let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
         cwd,
@@ -297,6 +309,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         cancel,
         output_truncation,
         max_parallel,
+        provider_response_ingress,
     })?;
     let cancelled_result = execution
         .results
@@ -342,6 +355,7 @@ mod tests {
     use orca_mcp::transport::McpTransport;
     use serde_json::{Value, json};
 
+    use crate::model_response::RuntimeModelResponse;
     use crate::runtime_host::{
         GenerationContext, HostedTurnRequest, InterruptOperationResult, OperationOutcome,
         RuntimeHost, RuntimeHostError, ThreadOperationExecutor, ThreadOperationOutcome,
@@ -349,6 +363,84 @@ mod tests {
     use crate::thread::RuntimeThread;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingReadonlyBatchIngress {
+        batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RuntimeProviderResponseIngress for RecordingReadonlyBatchIngress {
+        fn commit_response(&self, _response: &RuntimeModelResponse) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_provider_step(
+            &self,
+            _identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+            _step: &orca_core::provider_types::ProviderStep,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()> {
+            self.batches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(results.iter().map(|result| result.id.clone()).collect());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn readonly_execution_commits_all_results_in_one_semantic_batch() {
+        let requests = [
+            ToolRequest {
+                id: "readonly-1".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("one.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"one.txt"}"#.to_string()),
+            },
+            ToolRequest {
+                id: "readonly-2".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("two.txt".to_string()),
+                raw_arguments: Some(r#"{"path":"two.txt"}"#.to_string()),
+            },
+        ];
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let ingress = RecordingReadonlyBatchIngress::default();
+        let mut events = EventFactory::new("readonly-semantic-batch".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+
+        let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            cwd: Path::new("."),
+            events: &mut events,
+            sink: &mut sink,
+            tool_requests: &requests,
+            emit_deltas: false,
+            mcp_registry: &registry,
+            hooks: &hooks,
+            cancel: &cancel,
+            output_truncation: ToolOutputTruncation::default(),
+            max_parallel: 2,
+            provider_response_ingress: Some(&ingress),
+        })
+        .unwrap();
+
+        assert_eq!(execution.results.len(), 2);
+        assert_eq!(
+            *ingress
+                .batches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec![vec!["readonly-1".to_string(), "readonly-2".to_string()]]
+        );
+    }
 
     struct BlockingResourceTransport {
         started: mpsc::SyncSender<()>,
@@ -619,6 +711,7 @@ mod tests {
                 cancel,
                 output_truncation: ToolOutputTruncation::default(),
                 max_parallel: 2,
+                provider_response_ingress: None,
             })?;
             let status = if execution
                 .results
@@ -755,6 +848,7 @@ mod tests {
                 cancel: &worker_cancel,
                 output_truncation: ToolOutputTruncation::default(),
                 max_parallel: 1,
+                provider_response_ingress: None,
             })
             .expect("execute read-only batch");
             let _ = done_tx.send(execution.results);

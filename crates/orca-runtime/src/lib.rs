@@ -53,6 +53,44 @@ pub(crate) mod runtime_special;
 pub mod runtime_state;
 mod runtime_steer;
 mod runtime_subagent_call;
+mod runtime_surface;
+
+pub mod surface {
+    pub use crate::runtime_surface::{
+        AcpRequestId, AdmissionOutput, AssistantChannel, AssistantPatch, AttachResult, ByteCount,
+        ByteOffset, CancelOperationOutput, CanonicalPath, CommitClass, CompactionReason,
+        CompactionState, ContextRevision, CursorSourceRevision, DeferredCommandValue,
+        DetachRequest, DetachResult, DisplayText, DurableRevision, FailureClass,
+        FreshAttachRequest, FreshSurfaceAttachment, InteractionPatch, LegacyTurnId,
+        MaintenanceOperationOutput, MutationReply, NonEmptyText, NonEmptyVec,
+        OperationIngressCorrelation, OperationKind, OperationPatch, OperationRequestIntent,
+        OperationSettingsPreparation, OperationTerminal, PermissionGrantScope, PinnedContextAction,
+        PinnedContextMutationOutput, PinnedContextPatch, PinnedContextRevision,
+        PinnedContextSourceRevision, PinnedUserRevision, ProviderReplayHealth,
+        ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
+        RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, RuntimeSurfaceThreadHandle, SequenceNumber,
+        Set, Sha256Digest, SnapshotAtCursor, SurfaceAllowDeny, SurfaceApprovalMode,
+        SurfaceAssistantStream, SurfaceAssistantStreamState, SurfaceAttachmentRole,
+        SurfaceCapability, SurfaceCatalogEntryId, SurfaceClientCommandError,
+        SurfaceClientInteractionAnswer, SurfaceCommitBatch, SurfaceCommitId,
+        SurfaceCompletedModelResponse, SurfaceConnectionId, SurfaceContextSnapshot, SurfaceCursor,
+        SurfaceDataProperty, SurfaceDataValue, SurfaceEvent, SurfaceEventEnvelope, SurfaceEventId,
+        SurfaceFileChange, SurfaceHistoryAssistantRole, SurfaceHistoryId, SurfaceHistoryMessage,
+        SurfaceHistorySystemRole, SurfaceHistoryToolRole, SurfaceHistoryUserRole,
+        SurfaceIncarnation, SurfaceInput, SurfaceInputBlock, SurfaceInputCorrelationId,
+        SurfaceInputPresentation, SurfaceInputRequest, SurfaceInputRequestBlock,
+        SurfaceInteractionId, SurfaceInteractionKind, SurfaceInteractionRequest,
+        SurfaceInteractionView, SurfaceItem, SurfaceItemId, SurfaceItemOrigin,
+        SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest, SurfaceOperationId,
+        SurfacePermissionClientDecision, SurfacePermissionProfile, SurfacePinnedContextEntry,
+        SurfacePinnedContextKind, SurfacePlanStatus, SurfaceReasoningEffort,
+        SurfaceRecoverableOperation, SurfaceRequestId, SurfaceResolvedInputFact, SurfaceScope,
+        SurfaceSettingsSnapshot, SurfaceShutdownReason, SurfaceSnapshot, SurfaceStreamId,
+        SurfaceSubscriptionHandle, SurfaceSubscriptionItem, SurfaceSubscriptionReceiver,
+        SurfaceThreadId, SurfaceToolResultKind, SurfaceTurnId, SurfaceUserInputDecision,
+        SurfaceUserInputState, ThreadOwnerEpoch, ToolPatch, WaitOperationTerminalResult,
+    };
+}
 mod runtime_tool_actor;
 mod runtime_tool_call;
 pub(crate) mod runtime_tool_scheduler;
@@ -86,6 +124,10 @@ pub mod update_check;
 pub mod workflow;
 pub mod workflow_execution;
 pub mod worktree;
+
+pub mod unstable_surface {
+    pub use crate::runtime_surface::*;
+}
 
 #[cfg(test)]
 mod tests {

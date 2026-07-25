@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
-use orca_core::model::ModelSelection;
-use orca_runtime::history;
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
-use crate::types::{AppState, ChatMessage, UserAction};
+use crate::surface_actions::TuiHostActions;
+use crate::types::{AppState, ChatMessage, TuiMemoryScope, UserAction};
 
 pub(crate) enum SlashOutcome {
     Continue,
@@ -16,7 +16,7 @@ pub(crate) enum SlashOutcome {
 pub(crate) fn handle_slash_command(
     text: &str,
     config: &mut RunConfig,
-    shared_config: &Arc<Mutex<RunConfig>>,
+    _shared_config: &Arc<Mutex<RunConfig>>,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> Option<SlashOutcome> {
@@ -26,16 +26,11 @@ pub(crate) fn handle_slash_command(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let command = commands::parse_with_cwd(text, &cwd)?;
+    let mut pending_settings_action = None;
     match command {
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
-                config.model = ModelSelection::from_unchecked(Some(model.clone()));
-                if let Ok(mut cfg) = shared_config.lock() {
-                    cfg.model = ModelSelection::from_unchecked(Some(model.clone()));
-                }
-                state.model_name = model.clone();
-                state.push_message(ChatMessage::System(format!("Model switched to {model}.")));
-                let _ = action_tx.send(UserAction::SetModel(model));
+                pending_settings_action = Some(UserAction::SetModel(model));
             }
             Err(error) => state.push_message(ChatMessage::Error(error)),
         },
@@ -62,13 +57,10 @@ pub(crate) fn handle_slash_command(
         }
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
-                config.approval_mode = approval_mode;
-                if let Ok(mut cfg) = shared_config.lock() {
-                    cfg.approval_mode = approval_mode;
-                }
-                state.approval_mode = approval_mode;
-                state.push_message(ChatMessage::System(format!(
-                    "Approval mode switched to {mode}."
+                pending_settings_action = Some(UserAction::SetModel(encode_settings_intent(
+                    None,
+                    None,
+                    Some(approval_mode),
                 )));
             }
             None => state.push_message(ChatMessage::Error(
@@ -83,20 +75,18 @@ pub(crate) fn handle_slash_command(
         }
         SlashCommand::Plan(arg) => match arg.as_deref() {
             Some("off") => {
-                config.approval_mode = ApprovalMode::Suggest;
-                if let Ok(mut cfg) = shared_config.lock() {
-                    cfg.approval_mode = ApprovalMode::Suggest;
-                }
-                state.approval_mode = ApprovalMode::Suggest;
-                state.push_message(ChatMessage::System("Plan mode disabled.".to_string()));
+                pending_settings_action = Some(UserAction::SetModel(encode_settings_intent(
+                    None,
+                    None,
+                    Some(ApprovalMode::Suggest),
+                )));
             }
             None => {
-                config.approval_mode = ApprovalMode::Plan;
-                if let Ok(mut cfg) = shared_config.lock() {
-                    cfg.approval_mode = ApprovalMode::Plan;
-                }
-                state.approval_mode = ApprovalMode::Plan;
-                state.push_message(ChatMessage::System("Plan mode enabled.".to_string()));
+                pending_settings_action = Some(UserAction::SetModel(encode_settings_intent(
+                    None,
+                    None,
+                    Some(ApprovalMode::Plan),
+                )));
             }
             Some(_) => state.push_message(ChatMessage::Error(
                 "unsupported plan command. Use /plan or /plan off.".to_string(),
@@ -169,38 +159,38 @@ pub(crate) fn handle_slash_command(
             state.show_agents();
         }
         SlashCommand::Remember(note) => {
-            let remembered_note = note
-                .strip_prefix("project:")
-                .map(str::trim)
-                .unwrap_or(note.as_str())
-                .to_string();
-            let result = if let Some(project_note) = note.strip_prefix("project:") {
-                let cwd = config
-                    .cwd
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                orca_runtime::memory::remember_project(&cwd, project_note)
+            let (scope, note) = if let Some(project_note) = note.strip_prefix("project:") {
+                (TuiMemoryScope::Project, project_note.trim().to_string())
             } else {
-                orca_runtime::memory::remember_user(&note)
+                (TuiMemoryScope::User, note)
             };
-            match &result {
-                Ok(path) => state.push_message(ChatMessage::System(format!(
-                    "Remembered in {}.",
-                    path.display()
-                ))),
-                Err(error) => {
-                    state.push_message(ChatMessage::Error(format!("failed to remember: {error}")))
-                }
-            }
-            if result.is_ok() {
-                let _ = action_tx.send(UserAction::Remember(remembered_note));
-            }
+            let _ = action_tx.send(UserAction::Remember { scope, note });
         }
         SlashCommand::Compact => {
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
-        SlashCommand::History => match history::list_sessions(10) {
+        SlashCommand::ResumeOperation => {
+            if let Some(operation_id) = state.recoverable_operation_id.clone() {
+                state.enter_running();
+                let _ = action_tx.send(UserAction::ResumeOperation { operation_id });
+            } else {
+                state.push_message(ChatMessage::Error(
+                    "no recoverable operation is available".to_string(),
+                ));
+            }
+        }
+        SlashCommand::CancelOperation => {
+            if let Some(operation_id) = state.recoverable_operation_id.clone() {
+                state.enter_running();
+                let _ = action_tx.send(UserAction::CancelOperation { operation_id });
+            } else {
+                state.push_message(ChatMessage::Error(
+                    "no recoverable operation is available".to_string(),
+                ));
+            }
+        }
+        SlashCommand::History => match RuntimeSurfaceHostHandle::list_saved_sessions(10) {
             Ok(sessions) if sessions.is_empty() => {
                 state.push_message(ChatMessage::System("No saved sessions.".to_string()))
             }
@@ -223,46 +213,42 @@ pub(crate) fn handle_slash_command(
                 "failed to list history: {error}"
             ))),
         },
-        SlashCommand::Trust(trust_command) => {
-            use orca_core::config::folder_trust::{self, TrustLevel};
-            match trust_command {
-                TrustSlashCommand::Show => {
-                    if folder_trust::is_trusted(&cwd) {
-                        state.push_message(ChatMessage::System(format!(
+        SlashCommand::Trust(trust_command) => match trust_command {
+            TrustSlashCommand::Show => {
+                if TuiHostActions::folder_is_trusted(&cwd) {
+                    state.push_message(ChatMessage::System(format!(
                             "{} is trusted; the OS sandbox honors the configured write and network policy.",
                             cwd.display()
                         )))
-                    } else {
-                        state.push_message(ChatMessage::System(format!(
+                } else {
+                    state.push_message(ChatMessage::System(format!(
                             "{} is not trusted; commands run read-only with no network. Use /trust add to trust it.",
                             cwd.display()
                         )))
-                    }
-                }
-                TrustSlashCommand::Add => {
-                    match folder_trust::set_trust(&cwd, TrustLevel::Trusted) {
-                        Ok(()) => state.push_message(ChatMessage::System(format!(
-                            "Trusted {}. Restart Orca to load project config from this folder.",
-                            cwd.display()
-                        ))),
-                        Err(error) => state.push_message(ChatMessage::Error(format!(
-                            "failed to trust folder: {error}"
-                        ))),
-                    }
-                }
-                TrustSlashCommand::Remove => {
-                    match folder_trust::set_trust(&cwd, TrustLevel::Untrusted) {
-                        Ok(()) => state.push_message(ChatMessage::System(format!(
-                            "Removed trust for {}; commands now run read-only with no network.",
-                            cwd.display()
-                        ))),
-                        Err(error) => state.push_message(ChatMessage::Error(format!(
-                            "failed to update trust: {error}"
-                        ))),
-                    }
                 }
             }
-        }
+            TrustSlashCommand::Add => match TuiHostActions::set_folder_trust(&cwd, true) {
+                Ok(()) => state.push_message(ChatMessage::System(format!(
+                    "Trusted {}. Restart Orca to load project config from this folder.",
+                    cwd.display()
+                ))),
+                Err(error) => state.push_message(ChatMessage::Error(format!(
+                    "failed to trust folder: {error}"
+                ))),
+            },
+            TrustSlashCommand::Remove => match TuiHostActions::set_folder_trust(&cwd, false) {
+                Ok(()) => state.push_message(ChatMessage::System(format!(
+                    "Removed trust for {}; commands now run read-only with no network.",
+                    cwd.display()
+                ))),
+                Err(error) => state.push_message(ChatMessage::Error(format!(
+                    "failed to update trust: {error}"
+                ))),
+            },
+        },
+    }
+    if let Some(action) = pending_settings_action {
+        let _ = action_tx.send(action);
     }
     state.scroll_to_bottom();
     Some(SlashOutcome::Continue)
@@ -276,4 +262,62 @@ pub(crate) fn parse_approval_mode(mode: &str) -> Option<ApprovalMode> {
         "plan" => Some(ApprovalMode::Plan),
         _ => None,
     }
+}
+
+const SETTINGS_INTENT_PREFIX: &str = "__orca_runtime_settings__:";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SettingsIntent {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+    pub approval_mode: Option<ApprovalMode>,
+}
+
+pub(crate) fn encode_settings_intent(
+    model: Option<&str>,
+    reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+    approval_mode: Option<ApprovalMode>,
+) -> String {
+    format!(
+        "{SETTINGS_INTENT_PREFIX}{}|{}|{}",
+        model.unwrap_or("-"),
+        reasoning_effort.map_or("-", orca_core::config::ReasoningEffort::as_str),
+        approval_mode.map_or("-", ApprovalMode::as_str),
+    )
+}
+
+pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
+    let fields = value
+        .strip_prefix(SETTINGS_INTENT_PREFIX)?
+        .split('|')
+        .collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return None;
+    }
+    let model = match fields[0] {
+        "-" => None,
+        model if orca_core::model::validate_model(model).is_ok() => Some(model.to_string()),
+        _ => return None,
+    };
+    let reasoning_effort = match fields[1] {
+        "-" => None,
+        "high" => Some(orca_core::config::ReasoningEffort::High),
+        "max" => Some(orca_core::config::ReasoningEffort::Max),
+        _ => return None,
+    };
+    let approval_mode = match fields[2] {
+        "-" => None,
+        "suggest" => Some(ApprovalMode::Suggest),
+        "auto-edit" => Some(ApprovalMode::AutoEdit),
+        "full-auto" => Some(ApprovalMode::FullAuto),
+        "plan" => Some(ApprovalMode::Plan),
+        _ => return None,
+    };
+    (model.is_some() || reasoning_effort.is_some() || approval_mode.is_some()).then_some(
+        SettingsIntent {
+            model,
+            reasoning_effort,
+            approval_mode,
+        },
+    )
 }

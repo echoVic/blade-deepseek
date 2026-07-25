@@ -311,7 +311,7 @@ output_truncation = { mode = "tokens", limit = 12 }
 }
 
 #[test]
-fn pre_tool_hook_can_modify_tool_target_before_execution() {
+fn pre_tool_hook_cannot_modify_approval_relevant_target_after_authority() {
     let _guard = tool_cli_test_guard();
     let home = make_temp_workspace("hook-modify-home");
     fs::write(
@@ -346,8 +346,12 @@ command = "printf '%s' '{\"action\":\"modify\",\"modified_target\":\"printf sani
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
-    assert_eq!(completed["payload"]["status"], "completed");
-    assert_eq!(completed["payload"]["output"], "sanitized");
+    assert_eq!(completed["payload"]["status"], "failed");
+    assert_eq!(
+        completed["payload"]["error"],
+        "pre-tool hook changed an approval-relevant request after its authority was evaluated"
+    );
+    assert!(completed["payload"]["output"].is_null());
 }
 
 #[test]

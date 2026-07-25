@@ -14,7 +14,7 @@ use orca_core::tool_types::truncate_output;
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
-    normalized_stored_messages, stored_message_to_thread_json,
+    is_surface_coordinator_record, normalized_stored_messages, stored_message_to_thread_json,
 };
 use super::types::{
     SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
@@ -25,7 +25,7 @@ use super::types::{
 };
 use super::writer::{
     conversation_record_from_semantic_event, lock_file, read_history_lines, read_records,
-    read_session_meta, read_transcript, rewrite_records, unlock_file,
+    read_session_meta, read_transcript, rewrite_records, unlock_file, write_durable_record,
 };
 use super::{LiveThread, ORCA_HOME_ENV};
 
@@ -35,6 +35,265 @@ pub struct JsonlThreadStore;
 pub type SessionStore = JsonlThreadStore;
 
 impl JsonlThreadStore {
+    pub(crate) fn append_surface_commit_prepared(
+        &self,
+        path: &Path,
+        commit_id: String,
+        event_count: u32,
+        batch_digest: Vec<u8>,
+        cursor_before: u64,
+        cursor_after: u64,
+        durable_revision: u64,
+        batch: crate::runtime_surface::StoredSurfaceCommitBatchV1,
+    ) -> io::Result<()> {
+        write_durable_record(
+            path,
+            &SessionRecord::SurfaceCommitPrepared {
+                commit_id,
+                event_count,
+                batch_digest,
+                cursor_before,
+                cursor_after,
+                durable_revision,
+                batch: Some(batch),
+            },
+        )
+    }
+
+    pub(crate) fn append_surface_commit_committed(
+        &self,
+        path: &Path,
+        commit_id: String,
+        event_count: u32,
+        batch_digest: Vec<u8>,
+        cursor_after: u64,
+        durable_revision: u64,
+    ) -> io::Result<()> {
+        write_durable_record(
+            path,
+            &SessionRecord::SurfaceCommitCommitted {
+                commit_id,
+                event_count,
+                batch_digest,
+                cursor_after,
+                durable_revision,
+            },
+        )
+    }
+
+    pub(crate) fn append_surface_owner_epoch(
+        &self,
+        path: &Path,
+        owner_epoch: u64,
+    ) -> io::Result<()> {
+        write_durable_record(path, &SessionRecord::SurfaceOwnerEpoch { owner_epoch })
+    }
+
+    pub(crate) fn append_surface_finalize_intent(
+        &self,
+        path: &Path,
+        finalize_intent_id: crate::runtime_surface::SurfaceFinalizeIntentId,
+        expected_settlements: Vec<crate::runtime_surface::SurfaceSettlementId>,
+    ) -> io::Result<()> {
+        write_durable_record(
+            path,
+            &SessionRecord::SurfaceFinalizeIntent {
+                finalize_intent_id,
+                expected_settlements,
+            },
+        )
+    }
+
+    pub(crate) fn append_surface_settlement(
+        &self,
+        path: &Path,
+        settlement_id: String,
+        receipt_digest: Vec<u8>,
+    ) -> io::Result<()> {
+        write_durable_record(
+            path,
+            &SessionRecord::SurfaceSettlement {
+                settlement_id,
+                receipt_digest,
+            },
+        )
+    }
+
+    pub(crate) fn append_surface_shutdown_barrier(
+        &self,
+        path: &Path,
+        barrier_id: String,
+        plan_digest: Vec<u8>,
+        record: crate::runtime_surface::StoredShutdownBarrierRecordV1,
+    ) -> io::Result<()> {
+        write_durable_record(
+            path,
+            &SessionRecord::SurfaceShutdownBarrier {
+                barrier_id,
+                plan_digest,
+                record,
+            },
+        )
+    }
+
+    pub(crate) fn probe_surface_control_record(
+        &self,
+        path: &Path,
+        requested_type: &str,
+        requested_id: &str,
+    ) -> io::Result<
+        Option<(
+            Vec<u8>,
+            crate::runtime_surface::StoredShutdownBarrierRecordV1,
+        )>,
+    > {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut found = None;
+        for record in read_records(path)? {
+            match record {
+                SessionRecord::SurfaceShutdownBarrier {
+                    barrier_id,
+                    plan_digest,
+                    record,
+                } if requested_type == "shutdown" && barrier_id == requested_id => {
+                    found = Some((plan_digest, record));
+                }
+                _ => {}
+            }
+        }
+        Ok(found)
+    }
+
+    pub(crate) fn probe_surface_finalize_intent(
+        &self,
+        path: &Path,
+        requested_id: &crate::runtime_surface::SurfaceFinalizeIntentId,
+    ) -> io::Result<Option<Vec<crate::runtime_surface::SurfaceSettlementId>>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut found = None;
+        for record in read_records(path)? {
+            if let SessionRecord::SurfaceFinalizeIntent {
+                finalize_intent_id,
+                expected_settlements,
+            } = record
+                && &finalize_intent_id == requested_id
+            {
+                found = Some(expected_settlements);
+            }
+        }
+        Ok(found)
+    }
+
+    pub(crate) fn probe_surface_commit(
+        &self,
+        path: &Path,
+        requested_commit_id: &str,
+    ) -> io::Result<Option<(bool, u32, Vec<u8>, u64, u64, u64)>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut found = None;
+        for record in read_records(path)? {
+            match record {
+                SessionRecord::SurfaceCommitPrepared {
+                    commit_id,
+                    event_count,
+                    batch_digest,
+                    cursor_before,
+                    cursor_after,
+                    durable_revision,
+                    batch: _,
+                } if commit_id == requested_commit_id => {
+                    found = Some((
+                        false,
+                        event_count,
+                        batch_digest,
+                        cursor_before,
+                        cursor_after,
+                        durable_revision,
+                    ));
+                }
+                SessionRecord::SurfaceCommitCommitted {
+                    commit_id,
+                    event_count,
+                    batch_digest,
+                    cursor_after,
+                    durable_revision,
+                } if commit_id == requested_commit_id => {
+                    found = Some((
+                        true,
+                        event_count,
+                        batch_digest,
+                        0,
+                        cursor_after,
+                        durable_revision,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(found)
+    }
+
+    pub(crate) fn load_surface_commit_batches(
+        &self,
+        path: &Path,
+    ) -> io::Result<Vec<(bool, crate::runtime_surface::StoredSurfaceCommitBatchV1)>> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut batches = Vec::<(
+            String,
+            bool,
+            crate::runtime_surface::StoredSurfaceCommitBatchV1,
+        )>::new();
+        for record in read_records(path)? {
+            match record {
+                SessionRecord::SurfaceCommitPrepared {
+                    commit_id,
+                    batch: Some(batch),
+                    ..
+                } => {
+                    if let Some(existing) = batches
+                        .iter_mut()
+                        .find(|(existing_id, _, _)| existing_id == &commit_id)
+                    {
+                        existing.2 = batch;
+                    } else {
+                        batches.push((commit_id, false, batch));
+                    }
+                }
+                SessionRecord::SurfaceCommitPrepared { batch: None, .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "surface commit is missing its durable batch payload",
+                    ));
+                }
+                SessionRecord::SurfaceCommitCommitted { commit_id, .. } => {
+                    let Some(existing) = batches
+                        .iter_mut()
+                        .find(|(existing_id, _, _)| existing_id == &commit_id)
+                    else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "committed surface record has no prepared batch",
+                        ));
+                    };
+                    existing.1 = true;
+                }
+                _ => {}
+            }
+        }
+        Ok(batches
+            .into_iter()
+            .map(|(_, committed, batch)| (committed, batch))
+            .collect())
+    }
+
     pub fn list_sessions(&self, limit: usize) -> io::Result<Vec<SessionSummary>> {
         list_sessions(limit)
     }
@@ -181,6 +440,9 @@ pub(crate) fn load_thread_records(
     let mut meta = None;
     let mut conversation_records = Vec::new();
     for record in records {
+        if is_surface_coordinator_record(&record) {
+            continue;
+        }
         match record {
             SessionRecord::Meta(record_meta) => meta = Some(record_meta),
             SessionRecord::Message {

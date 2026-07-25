@@ -15,6 +15,7 @@ use orca_runtime::history::SessionSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
+use orca_runtime::surface::{RuntimeSurfaceThreadHandle, SurfaceOperationId};
 
 use crate::display_text::truncate_to_display_width;
 use crate::transcript_view::TranscriptRenderCache;
@@ -199,6 +200,7 @@ pub enum TuiEvent {
     },
     ReasoningDelta(String),
     MessageDelta(String),
+    AssistantResponseCompleted(Option<String>, Option<String>),
     ToolRequested {
         id: String,
         name: String,
@@ -280,12 +282,21 @@ pub enum TuiEvent {
         url: Option<String>,
         requested_schema_json: Option<String>,
     },
+    HistoryLoaded {
+        messages: Vec<ChatMessage>,
+        plan: Option<(Option<String>, Vec<PlanItem>)>,
+        label: String,
+    },
     Notice(String),
     MentionSearchDirty {
         generation: SessionGeneration,
     },
     MentionCatalogDirty {
         generation: u64,
+    },
+    MentionRuntimeReady(RuntimeSurfaceThreadHandle),
+    RecoveryAvailable {
+        operation_id: SurfaceOperationId,
     },
     SubmissionRejected {
         prompt: String,
@@ -310,12 +321,23 @@ pub enum TuiEvent {
         collapsed_messages: usize,
         status_text: String,
     },
+    SettingsUpdated {
+        model: String,
+        reasoning_effort: orca_core::config::ReasoningEffort,
+        approval_mode: ApprovalMode,
+    },
     GoalUpdated(ThreadGoal),
     GoalCleared,
     GoalStatus(Option<ThreadGoal>),
     Backtracked {
         prompt: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum TuiMemoryScope {
+    User,
+    Project,
 }
 
 #[derive(Debug, Clone)]
@@ -331,7 +353,10 @@ pub enum UserAction {
         args: Option<String>,
     },
     SetModel(String),
-    Remember(String),
+    Remember {
+        scope: TuiMemoryScope,
+        note: String,
+    },
     Compact,
     GoalShow,
     GoalSet(String),
@@ -357,6 +382,12 @@ pub enum UserAction {
     BackgroundCurrentTurn,
     Interrupt,
     Cancel,
+    ResumeOperation {
+        operation_id: SurfaceOperationId,
+    },
+    CancelOperation {
+        operation_id: SurfaceOperationId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,6 +675,7 @@ pub struct AppState {
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
     pub current_goal: Option<ThreadGoal>,
+    pub recoverable_operation_id: Option<SurfaceOperationId>,
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
@@ -774,6 +806,7 @@ impl AppState {
             proposed_plan_parser: ProposedPlanStreamParser::default(),
             plan_update_failed: false,
             current_goal: None,
+            recoverable_operation_id: None,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
             pending_workflow_notifications: VecDeque::new(),
@@ -1164,7 +1197,6 @@ impl AppState {
         let last = self.workflow_panel.tasks.len().saturating_sub(1);
         self.workflow_panel.selected = (self.workflow_panel.selected + 1).min(last);
     }
-
     pub fn open_selected_background_approval_dialog(&mut self) -> bool {
         let Some(task) = self.workflow_panel.tasks.get(self.workflow_panel.selected) else {
             return false;
@@ -1471,7 +1503,23 @@ impl AppState {
 
     pub fn update(&mut self, event: TuiEvent) {
         match event {
+            TuiEvent::HistoryLoaded {
+                messages,
+                plan,
+                label,
+            } => {
+                self.recoverable_operation_id = None;
+                self.replace_messages(messages);
+                if let Some(plan) = plan {
+                    self.current_plan = Some(plan);
+                }
+                self.push_message(ChatMessage::System(label));
+                self.finalized_count = self.messages.len();
+                self.flushed_count = self.messages.len();
+                self.set_status(AppStatus::Idle);
+            }
             TuiEvent::TurnStarted { .. } => {
+                self.recoverable_operation_id = None;
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
             }
@@ -1496,6 +1544,12 @@ impl AppState {
                     return;
                 }
                 self.handle_message_delta(&text);
+            }
+            TuiEvent::AssistantResponseCompleted(message, reasoning) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                self.reconcile_assistant_response(message.as_deref(), reasoning.as_deref());
             }
             TuiEvent::ToolRequested { id, name, target } => {
                 if self.suppress_background_main_session_output {
@@ -1903,7 +1957,12 @@ impl AppState {
             TuiEvent::Notice(msg) => {
                 self.push_message(ChatMessage::System(msg));
             }
-            TuiEvent::MentionSearchDirty { .. } | TuiEvent::MentionCatalogDirty { .. } => {}
+            TuiEvent::RecoveryAvailable { operation_id } => {
+                self.recoverable_operation_id = Some(operation_id);
+            }
+            TuiEvent::MentionSearchDirty { .. }
+            | TuiEvent::MentionCatalogDirty { .. }
+            | TuiEvent::MentionRuntimeReady(_) => {}
             TuiEvent::UsageUpdated(usage) => {
                 self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
                 self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
@@ -1921,7 +1980,23 @@ impl AppState {
             TuiEvent::CompactionStarted => {
                 self.set_status(AppStatus::Compacting);
             }
+            TuiEvent::SettingsUpdated {
+                model,
+                reasoning_effort,
+                approval_mode,
+            } => {
+                self.model_name = model;
+                self.reasoning_effort = reasoning_effort;
+                self.approval_mode = approval_mode;
+                self.push_message(ChatMessage::System(format!(
+                    "Runtime settings updated: model {}, reasoning effort {}, approval mode {}.",
+                    self.model_name,
+                    self.reasoning_effort.as_str(),
+                    self.approval_mode.as_str()
+                )));
+            }
             TuiEvent::SessionCompleted { status } => {
+                self.recoverable_operation_id = None;
                 let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
                 self.approval_dialog = None;
@@ -2006,6 +2081,42 @@ impl AppState {
         if let Some(ChatMessage::Reasoning(text)) = self.messages.get(index) {
             let text = text.clone();
             self.replace_message(index, ChatMessage::Assistant(text));
+        }
+    }
+
+    fn reconcile_assistant_response(&mut self, message: Option<&str>, reasoning: Option<&str>) {
+        let last_user = self
+            .messages
+            .iter()
+            .rposition(|item| matches!(item, ChatMessage::User(_)));
+        if let Some(last_user) = last_user {
+            let old_messages = std::mem::take(&mut self.messages);
+            self.messages = old_messages
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    if index <= last_user
+                        || !matches!(
+                            item,
+                            ChatMessage::Reasoning(_)
+                                | ChatMessage::Assistant(_)
+                                | ChatMessage::ProposedPlan(_)
+                        )
+                    {
+                        Some(item)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        self.proposed_plan_parser = ProposedPlanStreamParser::default();
+        if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+            self.messages
+                .push(ChatMessage::Reasoning(reasoning.to_string()));
+        }
+        if let Some(message) = message.filter(|text| !text.is_empty()) {
+            self.handle_message_delta(message);
         }
     }
 
@@ -2407,6 +2518,45 @@ mod tests {
         state.selection = Some(dummy_selection());
         state.clear_messages();
         assert_eq!(state.selection, None);
+    }
+
+    #[test]
+    fn history_loaded_replaces_legacy_prefix_and_freezes_snapshot() {
+        let mut state = state();
+        state.push_message(ChatMessage::User("legacy".to_string()));
+
+        state.update(TuiEvent::HistoryLoaded {
+            messages: vec![
+                ChatMessage::User("restored".to_string()),
+                ChatMessage::Assistant("answer".to_string()),
+            ],
+            plan: Some((
+                Some("resume plan".to_string()),
+                vec![PlanItem {
+                    step: "continue".to_string(),
+                    status: PlanStatus::InProgress,
+                }],
+            )),
+            label: "Resumed saved conversation.".to_string(),
+        });
+
+        assert!(matches!(
+            state.messages.as_slice(),
+            [
+                ChatMessage::User(prompt),
+                ChatMessage::Assistant(answer),
+                ChatMessage::System(label),
+            ] if prompt == "restored"
+                && answer == "answer"
+                && label == "Resumed saved conversation."
+        ));
+        assert_eq!(state.finalized_count, state.messages.len());
+        assert_eq!(state.flushed_count, state.messages.len());
+        assert_eq!(
+            state.current_plan.as_ref().unwrap().0.as_deref(),
+            Some("resume plan")
+        );
+        assert_eq!(state.status, AppStatus::Idle);
     }
 
     fn session(id: &str, title: &str) -> SessionSummary {
@@ -3294,6 +3444,34 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::Error(message)) if message == "operation could not start"
         ));
+    }
+
+    #[test]
+    fn recovery_projection_keeps_exact_operation_until_start_or_terminal() {
+        let mut state = state();
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
+        ])
+        .unwrap();
+
+        state.update(TuiEvent::RecoveryAvailable {
+            operation_id: operation_id.clone(),
+        });
+        assert_eq!(state.recoverable_operation_id.as_ref(), Some(&operation_id));
+
+        state.update(TuiEvent::TurnStarted {
+            turn: 2,
+            task: None,
+        });
+        assert!(state.recoverable_operation_id.is_none());
+
+        state.update(TuiEvent::RecoveryAvailable {
+            operation_id: operation_id.clone(),
+        });
+        state.update(TuiEvent::SessionCompleted {
+            status: "cancelled".to_string(),
+        });
+        assert!(state.recoverable_operation_id.is_none());
     }
 
     #[test]

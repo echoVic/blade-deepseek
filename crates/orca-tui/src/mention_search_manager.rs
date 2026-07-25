@@ -9,6 +9,7 @@ use orca_file_search::{
 use orca_runtime::mentions::{self, MentionToken};
 use orca_runtime::mentions::{MentionCandidate, MentionCatalog};
 
+use crate::surface_actions::TuiSurfaceActions;
 use crate::types::{AppState, AppStatus, TuiEvent};
 
 const WARM_IDLE: Duration = Duration::from_secs(30);
@@ -37,6 +38,8 @@ impl From<&MentionToken> for TokenIdentity {
 pub(crate) struct MentionSearchManager {
     roots: Vec<PathBuf>,
     catalog: MentionCatalog,
+    catalog_actions: Option<TuiSurfaceActions>,
+    #[cfg(test)]
     catalog_registry: Option<orca_mcp::McpRegistry>,
     catalog_generation: u64,
     catalog_result_tx: mpsc::Sender<CatalogDiscoveryResult>,
@@ -72,13 +75,15 @@ impl MentionSearchManager {
         roots: Vec<PathBuf>,
         event_tx: mpsc::Sender<TuiEvent>,
         catalog: MentionCatalog,
-        catalog_registry: Option<orca_mcp::McpRegistry>,
+        _catalog_registry: Option<orca_mcp::McpRegistry>,
     ) -> Self {
         let (catalog_result_tx, catalog_result_rx) = mpsc::bounded(CATALOG_RESULT_CAPACITY);
         Self {
             roots: normalize_roots(roots),
             catalog,
-            catalog_registry,
+            catalog_actions: None,
+            #[cfg(test)]
+            catalog_registry: _catalog_registry,
             catalog_generation: 0,
             catalog_result_tx,
             catalog_result_rx,
@@ -117,6 +122,12 @@ impl MentionSearchManager {
         self.begin_stop();
     }
 
+    pub(crate) fn install_runtime_actions(&mut self, actions: TuiSurfaceActions) {
+        self.catalog_actions = Some(actions);
+        self.refresh_catalog_async();
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_registry(&mut self, registry: orca_mcp::McpRegistry) {
         self.catalog_registry = Some(registry);
         self.refresh_catalog_async();
@@ -299,9 +310,12 @@ impl MentionSearchManager {
     }
 
     fn refresh_catalog_async(&mut self) {
-        let Some(registry) = self.catalog_registry.clone() else {
+        #[cfg(not(test))]
+        let Some(actions) = self.catalog_actions.clone() else {
             return;
         };
+        #[cfg(test)]
+        let registry = self.catalog_registry.clone();
         self.catalog_generation = self.catalog_generation.wrapping_add(1);
         let generation = self.catalog_generation;
         let roots = self.roots.clone();
@@ -310,6 +324,13 @@ impl MentionSearchManager {
         let worker = std::thread::Builder::new()
             .name("orca-mention-catalog".to_string())
             .spawn(move || {
+                #[cfg(not(test))]
+                let catalog = actions.discover_mention_catalog(&roots);
+                #[cfg(test)]
+                let Some(registry) = registry else {
+                    return;
+                };
+                #[cfg(test)]
                 let catalog = MentionCatalog::discover(&roots, &registry);
                 if result_tx
                     .send(CatalogDiscoveryResult {

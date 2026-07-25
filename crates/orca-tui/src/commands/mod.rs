@@ -2,6 +2,8 @@
 pub enum SlashCommand {
     Model(Option<String>),
     Compact,
+    ResumeOperation,
+    CancelOperation,
     Cost,
     ConfigShow,
     History,
@@ -88,6 +90,8 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
             parts.next().map(|name| name.to_string()),
         )),
         "compact" => Some(SlashCommand::Compact),
+        "resume" => Some(SlashCommand::ResumeOperation),
+        "cancel-operation" => Some(SlashCommand::CancelOperation),
         "cost" => Some(SlashCommand::Cost),
         "config" if parts.next() == Some("show") => Some(SlashCommand::ConfigShow),
         "history" => Some(SlashCommand::History),
@@ -133,6 +137,8 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
     &[
         ("/model", "Switch model and reasoning effort"),
         ("/compact", "Compress conversation context"),
+        ("/resume", "Resume a recoverable operation"),
+        ("/cancel-operation", "Cancel a recoverable operation"),
         ("/cost", "Show session cost"),
         ("/config show", "Show merged config"),
         ("/mode", "Switch approval mode"),
@@ -291,6 +297,15 @@ mod tests {
         assert_eq!(
             parse("/plan off"),
             Some(SlashCommand::Plan(Some("off".to_string())))
+        );
+    }
+
+    #[test]
+    fn parses_recovery_commands() {
+        assert_eq!(parse("/resume"), Some(SlashCommand::ResumeOperation));
+        assert_eq!(
+            parse("/cancel-operation"),
+            Some(SlashCommand::CancelOperation)
         );
     }
 

@@ -1,25 +1,22 @@
-use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
+use std::{collections::HashMap, io};
 
-use orca_core::cancel::{CancelToken, OperationId};
+use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_runtime::provider_stream::RuntimeProviderSuspensionControl;
 use orca_runtime::runtime_host::PauseGoalRunResult;
 use orca_runtime::runtime_host::{InterruptOperationResult, OperationHandle};
 
 use crate::interaction_broker::TuiInteractionBroker;
 use crate::interaction_broker::TuiInteractionWaiter;
-use crate::types::TuiInteractionKind;
-
-pub(crate) trait TuiOperationInterrupt {
-    fn interrupt_current(&self);
-}
+use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 
 #[derive(Clone, Debug)]
 pub(crate) struct TuiOperationController {
     hosted: Arc<HostedOperationState>,
     broker: TuiInteractionBroker,
     background_current: Arc<Mutex<Option<OperationId>>>,
+    surface_ids: Arc<OperationIdAllocator>,
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +28,8 @@ struct HostedOperationState {
 #[derive(Debug, Default)]
 struct HostedOperationInner {
     active: Option<Arc<OperationHandle>>,
+    surface_active: Option<SurfaceActiveOperation>,
+    surface_activation_armed: bool,
     interrupt_requested: bool,
     background_requested: bool,
     shutdown: bool,
@@ -42,9 +41,9 @@ impl TuiOperationController {
             hosted: Arc::new(HostedOperationState::default()),
             broker,
             background_current: Arc::new(Mutex::new(None)),
+            surface_ids: Arc::new(OperationIdAllocator::default()),
         }
     }
-
     #[cfg(test)]
     pub(crate) fn current_id(&self) -> Option<OperationId> {
         self.lock_hosted()
@@ -52,14 +51,13 @@ impl TuiOperationController {
             .as_ref()
             .map(|operation| operation.id())
     }
-
     pub(crate) fn interrupt_current(&self) -> Option<OperationId> {
         let hosted = {
             let mut hosted = self.lock_hosted();
             if let Some(operation) = hosted.active.clone() {
                 operation
             } else {
-                if hosted.shutdown {
+                if cancel_surface_or_shutdown(&mut hosted) || !hosted.surface_activation_armed {
                     return None;
                 }
                 hosted.interrupt_requested = true;
@@ -136,13 +134,42 @@ impl TuiOperationController {
         if let Some(operation) = hosted {
             let _ = operation.interrupt();
         }
-        self.hosted.changed.notify_all();
+        self.cancel_surface_and_notify();
         self.broker.shutdown();
         *self.lock_background_current() = None;
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
         self.lock_hosted().shutdown
+    }
+
+    pub(crate) fn begin_surface_activation(&self) -> io::Result<bool> {
+        let mut hosted = self.lock_hosted();
+        if hosted.shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "TUI operation controller is shutting down",
+            ));
+        }
+        if hosted.surface_activation_armed {
+            return Ok(false);
+        }
+        if hosted.active.is_some() || hosted.surface_active.is_some() {
+            return Err(io::Error::other("TUI operation is still active"));
+        }
+        hosted.surface_activation_armed = true;
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
+        Ok(true)
+    }
+
+    pub(crate) fn cancel_surface_activation(&self) {
+        let mut hosted = self.lock_hosted();
+        hosted.surface_activation_armed = false;
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
     }
 
     pub(crate) fn install_hosted(&self, operation: Arc<OperationHandle>) -> io::Result<()> {
@@ -173,6 +200,7 @@ impl TuiOperationController {
         }
         let interrupt_requested = hosted.interrupt_requested;
         let background_requested = hosted.background_requested;
+        hosted.surface_activation_armed = false;
         hosted.interrupt_requested = false;
         hosted.background_requested = false;
         hosted.active = Some(Arc::clone(&operation));
@@ -228,6 +256,7 @@ impl TuiOperationController {
         if hosted.active.as_ref().map(|operation| operation.id()) == Some(operation_id) {
             hosted.active = None;
         }
+        hosted.surface_activation_armed = false;
         hosted.interrupt_requested = false;
         hosted.background_requested = false;
         drop(hosted);
@@ -253,12 +282,6 @@ impl TuiOperationController {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-impl TuiOperationInterrupt for TuiOperationController {
-    fn interrupt_current(&self) {
-        let _ = TuiOperationController::interrupt_current(self);
     }
 }
 
@@ -303,6 +326,390 @@ impl RuntimeProviderSuspensionControl for TuiTurnControl {
     fn take_suspension_request(&self) -> bool {
         TuiTurnControl::take_background_current(self)
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl TuiOperationController {
+    fn cancel_surface_and_notify(&self) {
+        let _ = cancel_surface_if_active(&mut self.lock_hosted());
+        self.hosted.changed.notify_all();
+    }
+
+    pub(crate) fn install_surface(
+        &self,
+        client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+    ) -> io::Result<()> {
+        let interrupt_requested = {
+            let mut hosted = self.lock_hosted();
+            if hosted.shutdown {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "TUI operation controller is shutting down",
+                ));
+            }
+            if hosted.active.is_some() || hosted.surface_active.is_some() {
+                return Err(io::Error::other("TUI operation is still active"));
+            }
+            hosted.surface_active = Some(SurfaceActiveOperation {
+                client: client.clone(),
+                operation_id: operation_id.clone(),
+                ui_operation_id: self.surface_ids.allocate(),
+                interactions: HashMap::new(),
+            });
+            let requested = hosted.interrupt_requested;
+            hosted.surface_activation_armed = false;
+            hosted.interrupt_requested = false;
+            requested
+        };
+        self.hosted.changed.notify_all();
+        if interrupt_requested {
+            let _ = client
+                .cancel_operation(orca_runtime::surface::SurfaceRequestId::new(), operation_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_surface(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        let mut hosted = self.lock_hosted();
+        if hosted
+            .surface_active
+            .as_ref()
+            .is_some_and(|active| &active.operation_id == operation_id)
+        {
+            hosted.surface_active = None;
+        }
+        hosted.surface_activation_armed = false;
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
+    }
+
+    pub(crate) fn register_surface_interaction(
+        &self,
+        interaction: &orca_runtime::surface::SurfaceInteractionView,
+    ) -> Option<TuiEvent> {
+        let mut hosted = self.lock_hosted();
+        let active = hosted.surface_active.as_mut()?;
+        if active.operation_id != interaction.fence.operation_id {
+            return None;
+        }
+        let request_id = format!("{:?}", interaction.interaction_id);
+        let (kind, event, permissions) = match &interaction.request {
+            orca_runtime::surface::SurfaceInteractionRequest::ToolApproval {
+                tool,
+                description,
+                preview,
+                ..
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::Approval,
+                );
+                (
+                    TuiInteractionKind::Approval,
+                    TuiEvent::ApprovalNeeded {
+                        key,
+                        tool: tool.name.as_str().to_string(),
+                        target: tool.target.as_ref().map(|value| value.as_str().to_string()),
+                        preview: preview
+                            .as_ref()
+                            .or(Some(description))
+                            .map(|value| value.as_str().to_string()),
+                    },
+                    None,
+                )
+            }
+            orca_runtime::surface::SurfaceInteractionRequest::PermissionRequest {
+                tool_call_id,
+                reason,
+                permissions,
+                ..
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::Permission,
+                );
+                let tool = tool_call_id.as_str().to_string();
+                (
+                    TuiInteractionKind::Permission,
+                    TuiEvent::PermissionApprovalNeeded {
+                        key,
+                        tool,
+                        target: None,
+                        preview: reason.as_ref().map(|value| value.as_str().to_string()),
+                        permission_kind: permission_kind(permissions),
+                    },
+                    Some(permissions.clone()),
+                )
+            }
+            orca_runtime::surface::SurfaceInteractionRequest::UserInput {
+                question,
+                suggestions,
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::UserInput,
+                );
+                (
+                    TuiInteractionKind::UserInput,
+                    TuiEvent::UserInputRequested {
+                        key,
+                        question: question.as_str().to_string(),
+                        choices: suggestions
+                            .iter()
+                            .map(|value| value.as_str().to_string())
+                            .collect(),
+                    },
+                    None,
+                )
+            }
+            orca_runtime::surface::SurfaceInteractionRequest::McpElicitation {
+                server_name,
+                message,
+                request,
+                ..
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::McpElicitation,
+                );
+                let (mode, url, requested_schema_json) = match request {
+                    orca_runtime::surface::SurfaceMcpElicitationRequest::Form {
+                        requested_schema,
+                        ..
+                    } => (
+                        orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Form,
+                        None,
+                        requested_schema.as_ref().map(|value| {
+                            serde_json::to_string(value)
+                                .expect("surface MCP schema is serializable")
+                        }),
+                    ),
+                    orca_runtime::surface::SurfaceMcpElicitationRequest::Url {
+                        raw_url,
+                        requested_schema,
+                    } => (
+                        orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Url,
+                        raw_url.as_ref().map(|value| value.as_str().to_string()),
+                        requested_schema.as_ref().map(|value| {
+                            serde_json::to_string(value)
+                                .expect("surface MCP schema is serializable")
+                        }),
+                    ),
+                };
+                (
+                    TuiInteractionKind::McpElicitation,
+                    TuiEvent::McpElicitationRequested {
+                        key,
+                        server_name: server_name.as_str().to_string(),
+                        mode,
+                        message: message.as_str().to_string(),
+                        url,
+                        requested_schema_json,
+                    },
+                    None,
+                )
+            }
+            _ => return None,
+        };
+        let key = match &event {
+            TuiEvent::ApprovalNeeded { key, .. }
+            | TuiEvent::PermissionApprovalNeeded { key, .. }
+            | TuiEvent::UserInputRequested { key, .. }
+            | TuiEvent::McpElicitationRequested { key, .. } => key.clone(),
+            _ => return None,
+        };
+        active
+            .interactions
+            .entry(key)
+            .or_insert(SurfaceInteractionBinding {
+                client: active.client.clone(),
+                interaction_id: interaction.interaction_id.clone(),
+                kind,
+                permissions,
+            });
+        Some(event)
+    }
+
+    pub(crate) fn respond_surface_interaction(
+        &self,
+        key: &TuiInteractionKey,
+        response: &TuiInteractionResponse,
+    ) -> io::Result<bool> {
+        let binding = {
+            let hosted = self.lock_hosted();
+            hosted
+                .surface_active
+                .as_ref()
+                .and_then(|active| active.interactions.get(key).cloned())
+        };
+        let Some(binding) = binding else {
+            return Ok(false);
+        };
+        let answer = match (binding.kind, response) {
+            (TuiInteractionKind::Approval, TuiInteractionResponse::Approval(approved)) => {
+                orca_runtime::surface::SurfaceClientInteractionAnswer::ToolApproval {
+                    decision: if *approved {
+                        orca_runtime::surface::SurfaceAllowDeny::Allow
+                    } else {
+                        orca_runtime::surface::SurfaceAllowDeny::Deny
+                    },
+                }
+            }
+            (TuiInteractionKind::Permission, TuiInteractionResponse::Permission(approved)) => {
+                let permissions = binding
+                    .permissions
+                    .clone()
+                    .ok_or_else(|| io::Error::other("typed TUI permission profile is missing"))?;
+                let decision = if *approved {
+                    orca_runtime::surface::SurfacePermissionClientDecision::Allow {
+                        scope: orca_runtime::surface::PermissionGrantScope::Turn,
+                        permissions,
+                        strict_auto_review: false,
+                    }
+                } else {
+                    orca_runtime::surface::SurfacePermissionClientDecision::Deny {
+                        scope: orca_runtime::surface::PermissionGrantScope::Turn,
+                        permissions,
+                        strict_auto_review: false,
+                    }
+                };
+                orca_runtime::surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                    decision,
+                }
+            }
+            (TuiInteractionKind::UserInput, TuiInteractionResponse::UserInput(answer)) => {
+                orca_runtime::surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: orca_runtime::surface::SurfaceUserInputDecision::Answer(
+                        orca_runtime::surface::DisplayText::new(answer.clone()),
+                    ),
+                }
+            }
+            (
+                TuiInteractionKind::McpElicitation,
+                TuiInteractionResponse::McpElicitation {
+                    accepted,
+                    content_json,
+                },
+            ) => {
+                let decision = if *accepted {
+                    let content = serde_json::from_str(content_json.as_deref().unwrap_or("{}"))
+                        .map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid typed MCP elicitation content: {error}"),
+                            )
+                        })?;
+                    orca_runtime::surface::SurfaceMcpElicitationDecision::Accept { content }
+                } else {
+                    orca_runtime::surface::SurfaceMcpElicitationDecision::Decline
+                };
+                orca_runtime::surface::SurfaceClientInteractionAnswer::McpElicitation { decision }
+            }
+            _ => return Ok(false),
+        };
+        match binding.client.respond_interaction_by_id(
+            orca_runtime::surface::SurfaceRequestId::new(),
+            binding.interaction_id,
+            answer,
+        ) {
+            Ok(orca_runtime::surface::MutationReply::Committed { .. }) => {
+                let mut hosted = self.lock_hosted();
+                if let Some(active) = hosted.surface_active.as_mut() {
+                    active.interactions.remove(key);
+                }
+                Ok(true)
+            }
+            Ok(orca_runtime::surface::MutationReply::Deferred { .. })
+            | Ok(orca_runtime::surface::MutationReply::Uncommitted { .. }) => Err(
+                io::Error::other("typed TUI interaction response was not committed"),
+            ),
+            Err(error) => Err(io::Error::other(format!(
+                "typed TUI interaction response failed: {error:?}"
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_surface_active(&self) -> bool {
+        self.lock_hosted().surface_active.is_some()
+    }
+}
+
+#[derive(Clone)]
+struct SurfaceActiveOperation {
+    client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+    operation_id: orca_runtime::surface::SurfaceOperationId,
+    ui_operation_id: OperationId,
+    interactions: HashMap<TuiInteractionKey, SurfaceInteractionBinding>,
+}
+
+#[derive(Clone)]
+struct SurfaceInteractionBinding {
+    client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+    interaction_id: orca_runtime::surface::SurfaceInteractionId,
+    kind: TuiInteractionKind,
+    permissions: Option<orca_runtime::surface::SurfacePermissionProfile>,
+}
+
+impl std::fmt::Debug for SurfaceActiveOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SurfaceActiveOperation")
+            .field("operation_id", &self.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+fn cancel_surface_if_active(hosted: &mut HostedOperationInner) -> bool {
+    let Some(surface) = hosted.surface_active.clone() else {
+        return false;
+    };
+    let _ = surface.client.cancel_operation(
+        orca_runtime::surface::SurfaceRequestId::new(),
+        surface.operation_id,
+    );
+    true
+}
+
+fn cancel_surface_or_shutdown(hosted: &mut HostedOperationInner) -> bool {
+    cancel_surface_if_active(hosted) || hosted.shutdown
+}
+
+fn permission_kind(
+    profile: &orca_runtime::surface::SurfacePermissionProfile,
+) -> orca_runtime::runtime_permission::RuntimePermissionRequestKind {
+    if profile
+        .network
+        .as_ref()
+        .is_some_and(|network| network.enabled == Some(true) || !network.domains.is_empty())
+    {
+        return orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock;
+    }
+    if profile
+        .file_system
+        .as_ref()
+        .and_then(|filesystem| filesystem.write.as_ref())
+        .is_some_and(|paths| !paths.is_empty())
+    {
+        return orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite;
+    }
+    profile
+        .shell
+        .as_ref()
+        .and_then(|shell| shell.unsandboxed.then_some(()))
+        .map(|_| {
+            orca_runtime::runtime_permission::RuntimePermissionRequestKind::UnsandboxedShellRetry
+        })
+        .unwrap_or(orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite)
 }
 
 #[cfg(test)]

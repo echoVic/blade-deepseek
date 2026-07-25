@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{KeyCode, KeyEvent};
 
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_runtime::history;
 use orca_runtime::history::SessionTranscript;
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::app::chat_message_from_history;
 use crate::types::{AppState, AppStatus, ChatMessage};
@@ -62,7 +62,9 @@ where
     if let Ok(mut cfg) = shared_config.lock() {
         cfg.history_mode = HistoryMode::Resume(session_id.clone());
     }
-    if let Ok(transcript) = history::load_session(&session_id) {
+    // The picker is a read-only presentation query. The runtime still resolves
+    // and reopens the selected session independently when the next turn starts.
+    if let Ok(transcript) = RuntimeSurfaceHostHandle::load_saved_session(&session_id) {
         let restored_messages = transcript
             .messages
             .iter()
@@ -72,21 +74,17 @@ where
         state.replace_messages(restored_messages);
         state.scroll_offset = 0;
         state.auto_scroll = true;
-        if let Some((explanation, plan)) = &transcript.plan {
-            state.current_plan = Some((explanation.clone(), plan.clone()));
-        } else {
-            state.current_plan = None;
-        }
+        state.current_plan = transcript.plan.clone();
         state.plan_update_failed = false;
         state.push_message(ChatMessage::System(
             "Resumed saved conversation.".to_string(),
         ));
         state.finalized_count = state.messages.len();
-        if let Ok(mut preloaded) = preloaded_transcript.lock() {
-            *preloaded = Some(transcript);
-        }
-        clear_terminal()?;
     }
+    if let Ok(mut preloaded) = preloaded_transcript.lock() {
+        *preloaded = None;
+    }
+    clear_terminal()?;
     state.set_status(AppStatus::Idle);
     Ok(())
 }

@@ -1,6 +1,10 @@
+#[cfg(test)]
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -16,8 +20,38 @@ use uuid::Uuid;
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
 use super::types::{
-    SessionMeta, SessionRecord, SessionTranscript, StoredConversationRecord, StoredMessage,
+    ManualCompactionDurableSnapshot, ManualCompactionSnapshotRecord, SessionMeta, SessionRecord,
+    SessionTranscript, StoredConversationRecord, StoredMessage,
 };
+
+#[cfg(test)]
+static MANUAL_COMPACTION_SNAPSHOT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static MANUAL_COMPACTION_SNAPSHOT_POST_WRITE_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> =
+    OnceLock::new();
+
+pub(crate) fn read_manual_compaction_snapshot(
+    path: &Path,
+    operation_id: &crate::runtime_surface::SurfaceOperationId,
+) -> io::Result<Option<ManualCompactionDurableSnapshot>> {
+    let record = read_records(path)?.into_iter().rev().find_map(|record| {
+        let SessionRecord::ManualCompactionSnapshot(record) = record else {
+            return None;
+        };
+        (record.operation_id == *operation_id).then_some(record)
+    });
+    Ok(record.map(|record| ManualCompactionDurableSnapshot {
+        operation_id: record.operation_id,
+        strategy: record.strategy,
+        before_messages: record.before_messages,
+        conversation: orca_core::conversation::Conversation {
+            messages: record.messages.into_iter().map(Message::from).collect(),
+            internal_context: Default::default(),
+            rolling_summary: record.rolling_summary,
+            summary: record.summary_state,
+        },
+    }))
+}
 
 pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -29,6 +63,80 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
     write_record_line(&mut file, record)?;
     file.flush()?;
     unlock_file(&file)
+}
+
+pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    lock_file(&file)?;
+    let result = (|| {
+        repair_incomplete_final_record(&mut file)?;
+        write_record_line(&mut file, record)?;
+        file.flush()?;
+        file.sync_data()
+    })();
+    let unlock = unlock_file(&file);
+    result.and(unlock)
+}
+
+fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        file.seek(SeekFrom::End(0))?;
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::End(-1))?;
+    let mut final_byte = [0; 1];
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] == b'\n' {
+        file.seek(SeekFrom::End(0))?;
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(&mut *file);
+    let mut line = Vec::new();
+    let mut line_start = 0_u64;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line_start = line_start
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("JSONL offset overflow"))?;
+            continue;
+        }
+        break;
+    }
+    drop(reader);
+
+    match serde_json::from_slice::<SessionRecord>(&line) {
+        Ok(_) => {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+        }
+        Err(error) if error.classify() == serde_json::error::Category::Eof => {
+            file.set_len(line_start)?;
+            file.seek(SeekFrom::End(0))?;
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid complete final JSONL record: {error}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
@@ -270,6 +378,21 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
             SessionRecord::BackgroundTaskProviderResponse { usage: None, .. } => {}
             SessionRecord::ContextCollapsed(record) => compactions.push(record),
             SessionRecord::ContextSummary(record) => summaries.push(record),
+            SessionRecord::ManualCompactionSnapshot(record) => {
+                let after_messages = record.messages.len();
+                messages = record.messages.into_iter().map(Message::from).collect();
+                compactions.clear();
+                summaries.clear();
+                if record.rolling_summary.is_some() || !record.summary_state.is_empty() {
+                    summaries.push(ContextSummaryRecord {
+                        summarized_at: record.compacted_at,
+                        before_messages: record.before_messages,
+                        after_messages,
+                        summary: record.rolling_summary.unwrap_or_default(),
+                        summary_state: Some(record.summary_state),
+                    });
+                }
+            }
             SessionRecord::Usage(record) => foreground_usage = Some(record),
             SessionRecord::UsageBaseline(record) => {
                 usage_baseline = record;
@@ -287,6 +410,12 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
                 }
                 semantic_events.push(event);
             }
+            SessionRecord::SurfaceCommitPrepared { .. }
+            | SessionRecord::SurfaceCommitCommitted { .. }
+            | SessionRecord::SurfaceOwnerEpoch { .. }
+            | SessionRecord::SurfaceFinalizeIntent { .. }
+            | SessionRecord::SurfaceSettlement { .. }
+            | SessionRecord::SurfaceShutdownBarrier { .. } => {}
             SessionRecord::PlanState { explanation, plan } => {
                 let all_done = !plan.is_empty()
                     && plan.iter().all(|item| item.status == PlanStatus::Completed);
@@ -372,10 +501,30 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
                 }
             }
         }
+        SessionRecord::ManualCompactionSnapshot(record) => {
+            for message in &mut record.messages {
+                redact_stored_message(message);
+            }
+            if let Some(summary) = &mut record.rolling_summary {
+                redact_string_in_place(summary);
+            }
+            if let Some(baseline) = &mut record.summary_state.baseline {
+                redact_string_in_place(baseline);
+            }
+            for delta in &mut record.summary_state.deltas {
+                redact_string_in_place(delta);
+            }
+        }
         SessionRecord::Usage(_)
         | SessionRecord::UsageBaseline(_)
         | SessionRecord::EventSequenceReserved { .. } => {}
         SessionRecord::SemanticEvent { event } => redact_json_value(&mut event.payload),
+        SessionRecord::SurfaceCommitPrepared { .. }
+        | SessionRecord::SurfaceCommitCommitted { .. }
+        | SessionRecord::SurfaceOwnerEpoch { .. }
+        | SessionRecord::SurfaceSettlement { .. } => {}
+        SessionRecord::SurfaceFinalizeIntent { .. }
+        | SessionRecord::SurfaceShutdownBarrier { .. } => {}
         SessionRecord::PlanState { explanation, plan } => {
             if let Some(explanation) = explanation {
                 redact_string_in_place(explanation);
@@ -692,6 +841,29 @@ fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
 }
 
 impl SessionWriter {
+    #[cfg(test)]
+    pub(crate) fn inject_manual_compaction_snapshot_failure_once(path: impl Into<PathBuf>) {
+        MANUAL_COMPACTION_SNAPSHOT_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_manual_compaction_snapshot_post_write_failure_once(
+        path: impl Into<PathBuf>,
+    ) {
+        MANUAL_COMPACTION_SNAPSHOT_POST_WRITE_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn start(
         cwd: &Path,
         provider: &str,
@@ -917,6 +1089,73 @@ impl SessionWriter {
         )
     }
 
+    pub(crate) fn append_manual_compaction_snapshot(
+        &mut self,
+        identity: &crate::session::ManualCompactionPersistenceIdentity,
+        before_messages: usize,
+        strategy: &str,
+        conversation: &orca_core::conversation::Conversation,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if MANUAL_COMPACTION_SNAPSHOT_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path)
+        {
+            return Err(io::Error::other(
+                "injected manual compaction snapshot failure",
+            ));
+        }
+        let record = SessionRecord::ManualCompactionSnapshot(ManualCompactionSnapshotRecord {
+            snapshot_id: identity.snapshot_id.clone(),
+            operation_id: identity.operation_id.clone(),
+            strategy: strategy.to_string(),
+            compacted_at: Utc::now(),
+            before_messages,
+            messages: conversation
+                .messages
+                .iter()
+                .map(StoredMessage::from)
+                .collect(),
+            rolling_summary: conversation.rolling_summary.clone(),
+            summary_state: conversation.summary.clone(),
+        });
+        let result = write_durable_record(&self.path, &record);
+        #[cfg(test)]
+        let result = if result.is_ok()
+            && MANUAL_COMPACTION_SNAPSHOT_POST_WRITE_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+        {
+            Err(io::Error::other(
+                "injected manual compaction post-write failure",
+            ))
+        } else {
+            result
+        };
+        if result.is_ok() {
+            return Ok(());
+        }
+        let exact_record_present = read_records(&self.path).is_ok_and(|records| {
+            records.into_iter().any(|candidate| {
+                matches!(
+                    candidate,
+                    SessionRecord::ManualCompactionSnapshot(snapshot)
+                        if snapshot.snapshot_id == identity.snapshot_id
+                            && snapshot.operation_id == identity.operation_id
+                )
+            })
+        });
+        if !exact_record_present {
+            return result;
+        }
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        file.sync_data()
+    }
+
     pub fn append_usage(&mut self, usage: UsageTotals) -> io::Result<()> {
         write_record(&self.path, &SessionRecord::Usage(usage))
     }
@@ -1040,6 +1279,93 @@ mod tests {
             turn_id: None,
         };
         (directory, path, writer)
+    }
+
+    #[test]
+    fn manual_compaction_snapshot_is_one_atomic_resume_boundary() {
+        let (_directory, path, mut writer) = new_transcript();
+        writer.enter_turn(TurnId::new());
+        writer
+            .append_message(&Message::user("discarded prefix".to_string()))
+            .expect("append prefix");
+        writer
+            .append_message(&Message::Assistant {
+                content: Some("discarded answer".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            })
+            .expect("append answer");
+
+        let mut compacted = orca_core::conversation::Conversation::new();
+        compacted.add_system(
+            "[Earlier conversation history was truncated to fit context window]".to_string(),
+        );
+        compacted.add_user("retained tail".to_string());
+        compacted.rolling_summary = Some("rolling summary".to_string());
+        compacted.summary = orca_core::conversation::SummaryState {
+            baseline: Some("baseline".to_string()),
+            deltas: vec!["delta".to_string()],
+        };
+        let identity = crate::session::ManualCompactionPersistenceIdentity {
+            operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .expect("generated UUID is v7"),
+            snapshot_id: uuid::Uuid::now_v7().to_string(),
+        };
+        SessionWriter::inject_manual_compaction_snapshot_post_write_failure_once(path.clone());
+        writer
+            .append_manual_compaction_snapshot(&identity, 4, "local_truncation", &compacted)
+            .expect("post-write ambiguity is reprobed and durably acknowledged");
+        writer
+            .append_message(&Message::Assistant {
+                content: Some("post-compaction answer".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            })
+            .expect("append post-compaction message");
+
+        let records = read_records(&path).expect("read manual compaction records");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, SessionRecord::ManualCompactionSnapshot(_)))
+                .count(),
+            1
+        );
+        let durable = read_manual_compaction_snapshot(&path, &identity.operation_id)
+            .expect("read manual compaction receipt")
+            .expect("manual compaction receipt exists");
+        assert_eq!(durable.operation_id, identity.operation_id);
+        assert_eq!(durable.strategy, "local_truncation");
+        assert_eq!(durable.before_messages, 4);
+        let transcript = read_transcript(&path).expect("resume manual compaction snapshot");
+        assert!(matches!(
+            transcript.messages.as_slice(),
+            [
+                Message::System { content: marker, .. },
+                Message::User { content: tail, .. },
+                Message::Assistant {
+                    content: Some(answer),
+                    ..
+                }
+            ] if marker == "[Earlier conversation history was truncated to fit context window]"
+                && tail == "retained tail"
+                && answer == "post-compaction answer"
+        ));
+        let summary = transcript.summaries.as_slice();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].before_messages, 4);
+        assert_eq!(summary[0].after_messages, 2);
+        assert_eq!(summary[0].summary, "rolling summary");
+        let state = summary[0]
+            .summary_state
+            .as_ref()
+            .expect("summary state survives atomic snapshot");
+        assert_eq!(state.baseline.as_deref(), Some("baseline"));
+        assert_eq!(state.deltas, ["delta"]);
     }
 
     #[test]

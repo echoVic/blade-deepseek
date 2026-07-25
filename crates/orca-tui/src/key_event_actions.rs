@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::{Arc, Mutex};
 
 use crossbeam_channel as mpsc;
 
@@ -9,7 +8,6 @@ use orca_core::config::RunConfig;
 
 use crate::approval_mode_actions::cycle_approval_mode;
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
-use crate::operation_controller::TuiOperationInterrupt;
 use crate::shortcuts::{ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
 
@@ -22,10 +20,8 @@ pub(crate) enum KeyEventFlow {
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,
-    config: &mut RunConfig,
-    shared_config: &Arc<Mutex<RunConfig>>,
+    config: &RunConfig,
     action_tx: &mpsc::Sender<UserAction>,
-    operation: &impl TuiOperationInterrupt,
     clear_terminal: F,
 ) -> io::Result<KeyEventFlow>
 where
@@ -36,8 +32,7 @@ where
     }
 
     if let Some(ShortcutAction::Global(shortcut)) = resolve_shortcut(ShortcutContext::Global, key) {
-        return match handle_global_shortcut(shortcut, state, action_tx, operation, clear_terminal)?
-        {
+        return match handle_global_shortcut(shortcut, state, action_tx, clear_terminal)? {
             GlobalShortcutFlow::Continue => Ok(KeyEventFlow::Continue),
             GlobalShortcutFlow::Exit(code) => Ok(KeyEventFlow::Exit(code)),
         };
@@ -61,7 +56,7 @@ where
             AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
         )
     {
-        cycle_approval_mode(config, shared_config, state);
+        cycle_approval_mode(config, state, action_tx);
         return Ok(KeyEventFlow::Continue);
     }
 

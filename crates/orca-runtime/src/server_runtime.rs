@@ -211,6 +211,11 @@ impl ServerThread {
         self.handle.thread_id()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn jsonl_surface(&self) -> Option<crate::surface::RuntimeSurfaceHandle> {
+        self.handle.jsonl_surface()
+    }
+
     pub fn active_task_id(&self) -> Option<String> {
         self.handle
             .snapshot()
@@ -638,6 +643,26 @@ impl ServerThreadRuntime {
         self.threads
             .get(thread_id)
             .and_then(|thread| thread.active_permission_profile.clone())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn jsonl_surface(
+        &self,
+        thread_id: &str,
+    ) -> Option<crate::surface::RuntimeSurfaceHandle> {
+        self.threads
+            .get(thread_id)
+            .and_then(ServerThread::jsonl_surface)
+    }
+
+    pub(crate) fn jsonl_surface_for_connection(
+        &self,
+        thread_id: &str,
+        connection_id: crate::surface::SurfaceConnectionId,
+    ) -> Option<crate::surface::RuntimeSurfaceHandle> {
+        self.threads
+            .get(thread_id)
+            .and_then(|thread| thread.handle.jsonl_surface_for_connection(connection_id))
     }
 
     pub fn thread(&self, thread_id: &str) -> Option<&ServerThread> {

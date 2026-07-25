@@ -27,6 +27,7 @@ use crate::runtime_readonly_tool_turn::{
     RuntimeReadonlyToolTurnContext, RuntimeReadonlyToolTurnIo, RuntimeReadonlyToolTurnRequest,
     RuntimeReadonlyToolTurnServices, run_readonly_tool_turn,
 };
+use crate::runtime_surface::RuntimeProviderResponseIngress;
 use crate::runtime_tool_scheduler::{RuntimeToolDispatch, RuntimeToolDispatchScheduler};
 use crate::session::record_tool_result_for_agent;
 use crate::step_context::{
@@ -39,7 +40,10 @@ use crate::subagent_execution::{
 };
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
-use crate::tool_execution::{ToolExecutionContext, execute_tool_with_approval};
+use crate::tool_execution::{
+    ToolExecutionContext, execute_tool_with_approval, is_semantic_commit_failure,
+    semantic_commit_failure,
+};
 use crate::tool_invocation::reject_disallowed_child_tool;
 use crate::tool_router::RuntimeToolTurnDisposition;
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -134,6 +138,7 @@ pub(crate) struct RuntimeNormalToolTurnInteractions<'a> {
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
+    pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
 }
 
 impl ToolTurnOutcome {
@@ -203,6 +208,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let tool_policy = step_snapshot.tool_policy;
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
+    let provider_response_ingress = step_snapshot.turn_context.provider_response_ingress();
     let policy = step_snapshot.policy;
     let capabilities = step_snapshot.capabilities();
     let instructions = capabilities.instructions;
@@ -226,6 +232,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 conversation,
                 history_writer.as_deref_mut(),
                 emit_deltas,
+                provider_response_ingress,
                 "the tool turn was cancelled before dispatch",
             )?;
             return Ok(ToolTurnOutcome::Return {
@@ -239,6 +246,20 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             mcp_registry,
             &config.external_tools,
         ) {
+            let event_error = emit_tool_terminal_events(
+                events,
+                sink,
+                tool_request,
+                &result,
+                emit_deltas,
+                provider_response_ingress,
+            )
+            .err();
+            if let Some(error) = event_error.as_ref()
+                && is_semantic_commit_failure(error)
+            {
+                return Err(io::Error::new(error.kind(), error.to_string()));
+            }
             record_tool_result_for_agent(
                 conversation,
                 history_writer.as_deref_mut(),
@@ -246,11 +267,6 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 emit_deltas,
             )?;
             sampling_state.advance_tool_cursor_one(tool_requests.len());
-            let event_error = if emit_deltas {
-                emit_tool_terminal_events(events, sink, tool_request, &result).err()
-            } else {
-                None
-            };
             let outcome = ToolTurnOutcome::Return {
                 status: RunStatus::Failed,
                 error: Some(result.error.clone().unwrap_or_default()),
@@ -263,6 +279,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 conversation,
                 history_writer.as_deref_mut(),
                 emit_deltas,
+                provider_response_ingress,
                 "an earlier sibling was rejected by tool policy",
             )?;
             if let Some(error) = event_error {
@@ -317,6 +334,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         conversation,
                         history_writer.as_deref_mut(),
                         emit_deltas,
+                        provider_response_ingress,
                         "an earlier subagent batch ended after an event I/O error",
                     )?;
                     return Err(error);
@@ -331,6 +349,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     conversation,
                     history_writer.as_deref_mut(),
                     emit_deltas,
+                    provider_response_ingress,
                     "an earlier sibling ended the tool turn",
                 )?;
                 return Ok(outcome);
@@ -357,12 +376,17 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 services: RuntimeReadonlyToolTurnServices {
                     mcp_registry,
                     hooks,
+                    provider_response_ingress,
                 },
             });
-            sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
             let outcome = match outcome {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
+                    outcome
+                }
+                Err(error) if is_semantic_commit_failure(&error) => return Err(error),
                 Err(error) => {
+                    sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
                     close_unstarted_tool_requests(
                         sampling_state,
                         tool_requests,
@@ -371,6 +395,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         conversation,
                         history_writer.as_deref_mut(),
                         emit_deltas,
+                        provider_response_ingress,
                         "an earlier read-only batch completed before an event I/O error",
                     )?;
                     return Err(error);
@@ -385,6 +410,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     conversation,
                     history_writer.as_deref_mut(),
                     emit_deltas,
+                    provider_response_ingress,
                     "an earlier sibling ended the tool turn",
                 )?;
                 return Ok(outcome);
@@ -431,6 +457,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 permission_handler,
                 user_input_handler,
                 mcp_elicitation_handler,
+                provider_response_ingress,
             },
             extensions,
             executors: RuntimeNormalToolTurnExecutors {
@@ -441,6 +468,9 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         let execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
+                if is_semantic_commit_failure(&error) {
+                    return Err(error);
+                }
                 if conversation_has_tool_result(conversation, &tool_request.id) {
                     sampling_state.advance_tool_cursor_one(tool_requests.len());
                     close_unstarted_tool_requests(
@@ -451,6 +481,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         conversation,
                         history_writer.as_deref_mut(),
                         emit_deltas,
+                        provider_response_ingress,
                         "an earlier tool result was recorded before persistence failed",
                     )?;
                     return Err(error);
@@ -461,6 +492,14 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         "Tool invocation outcome is indeterminate after runtime I/O error: {error}. Inspect external state before retrying."
                     ),
                 );
+                emit_tool_terminal_events(
+                    events,
+                    sink,
+                    tool_request,
+                    &result,
+                    emit_deltas,
+                    provider_response_ingress,
+                )?;
                 record_tool_result_for_agent(
                     conversation,
                     history_writer.as_deref_mut(),
@@ -476,6 +515,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     conversation,
                     history_writer.as_deref_mut(),
                     emit_deltas,
+                    provider_response_ingress,
                     "an earlier tool invocation ended after a runtime I/O error",
                 )?;
                 return Err(error);
@@ -491,6 +531,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 conversation,
                 history_writer.as_deref_mut(),
                 emit_deltas,
+                provider_response_ingress,
                 "an earlier tool invocation completed before an event I/O error",
             )?;
             return Err(error);
@@ -505,6 +546,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 conversation,
                 history_writer.as_deref_mut(),
                 emit_deltas,
+                provider_response_ingress,
                 "an earlier sibling ended the tool turn",
             )?;
             return Ok(outcome);
@@ -522,27 +564,42 @@ fn close_unstarted_tool_requests<W: io::Write>(
     conversation: &mut Conversation,
     mut history_writer: Option<&mut SessionWriter>,
     emit_deltas: bool,
+    provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
     reason: &str,
 ) -> io::Result<()> {
+    let pending_window =
+        sampling_state.tool_dispatch_window(tool_requests, |requests, _| requests.len());
+    let pending = pending_window.tool_requests();
+    let results = pending
+        .iter()
+        .map(|tool_request| ToolResult::cancelled_before_start(tool_request, reason))
+        .collect::<Vec<_>>();
+    if results.is_empty() {
+        return Ok(());
+    }
+    if let Some(ingress) = provider_response_ingress {
+        ingress
+            .commit_tool_results(&results)
+            .map_err(semantic_commit_failure)?;
+    }
     let mut first_error = None;
-    while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
-        let result = ToolResult::cancelled_before_start(tool_request, reason);
+    for (tool_request, result) in pending.iter().zip(results.iter()) {
+        if let Err(error) =
+            emit_tool_terminal_events(events, sink, tool_request, result, emit_deltas, None)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         if let Err(error) = record_tool_result_for_agent(
             conversation,
             history_writer.as_deref_mut(),
-            &result,
+            result,
             emit_deltas,
         ) && first_error.is_none()
         {
             first_error = Some(error);
         }
         sampling_state.advance_tool_cursor_one(tool_requests.len());
-        if emit_deltas
-            && let Err(error) = emit_tool_terminal_events(events, sink, tool_request, &result)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
     }
     match first_error {
         Some(error) => Err(error),
@@ -567,7 +624,17 @@ fn emit_tool_terminal_events<W: io::Write>(
     sink: &mut EventSink<W>,
     request: &ToolRequest,
     result: &ToolResult,
+    emit_deltas: bool,
+    provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
 ) -> io::Result<()> {
+    if let Some(ingress) = provider_response_ingress {
+        ingress
+            .commit_tool_result(result)
+            .map_err(semantic_commit_failure)?;
+    }
+    if !emit_deltas {
+        return Ok(());
+    }
     let requested = sink.emit(RuntimeTaskActor::tool_call_requested_event_for(
         events, request,
     ));
@@ -627,14 +694,19 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         permission_handler,
         user_input_handler,
         mcp_elicitation_handler,
+        provider_response_ingress,
     } = interactions;
     if let Some(error) = subagent_budget_exhaustion_error(config, tool_request, cost_tracker) {
         let result = ToolResult::failed_before_start(tool_request, error.clone(), None);
-        let event_error = if emit_deltas {
-            emit_tool_terminal_events(events, sink, tool_request, &result).err()
-        } else {
-            None
-        };
+        let event_error = emit_tool_terminal_events(
+            events,
+            sink,
+            tool_request,
+            &result,
+            emit_deltas,
+            provider_response_ingress,
+        )
+        .err();
         sampling_state.record_normal_tool_result(
             conversation,
             history_writer.as_deref_mut(),
@@ -665,7 +737,8 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         .with_approval_handler(approval_handler)
         .with_permission_handler(permission_handler)
         .with_user_input_handler(user_input_handler)
-        .with_mcp_elicitation_handler(mcp_elicitation_handler);
+        .with_mcp_elicitation_handler(mcp_elicitation_handler)
+        .with_provider_response_ingress(provider_response_ingress);
     if let Some(extensions) = extensions {
         execution_context =
             execution_context.with_extensions(extensions.registry(), extensions.stores());
@@ -677,7 +750,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             execution_context = execution_context.with_goal_runtime_binding((*binding).clone());
         }
     }
-    let execution = execute_tool_with_approval(
+    let mut execution = execute_tool_with_approval(
         config,
         events,
         sink,
@@ -686,6 +759,16 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         subagent_child_executor,
         workflow_child_executor,
     )?;
+    if execution
+        .event_error
+        .as_ref()
+        .is_some_and(is_semantic_commit_failure)
+    {
+        return Err(execution
+            .event_error
+            .take()
+            .expect("semantic commit failure remains available"));
+    }
 
     let budget_exhaustion = subagent_budget_exhaustion_error(config, tool_request, cost_tracker);
     let mut event_error = execution.event_error;
@@ -773,6 +856,94 @@ mod tests {
     use crate::hooks::HookRunner;
     use crate::tool_execution::policy_for_tool_execution;
     use crate::tool_invocation::AgentToolPolicyContext;
+
+    #[derive(Debug)]
+    struct FailingToolResultIngress;
+
+    impl RuntimeProviderResponseIngress for FailingToolResultIngress {
+        fn commit_response(
+            &self,
+            _response: &crate::model_response::RuntimeModelResponse,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_provider_step(
+            &self,
+            _identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+            _step: &orca_core::provider_types::ProviderStep,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_tool_results(&self, _results: &[ToolResult]) -> io::Result<()> {
+            Err(io::Error::other("semantic ledger unavailable"))
+        }
+    }
+
+    #[test]
+    fn semantic_commit_failure_precedes_closed_sibling_history_recording() {
+        let request = ToolRequest {
+            id: "pending-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("printf pending".to_string()),
+            raw_arguments: Some(r#"{"command":"printf pending"}"#.to_string()),
+        };
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let mut events = EventFactory::new("semantic-before-history".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+
+        let error = close_unstarted_tool_requests(
+            &mut sampling_state,
+            std::slice::from_ref(&request),
+            &mut events,
+            &mut sink,
+            &mut conversation,
+            None,
+            true,
+            Some(&FailingToolResultIngress),
+            "test terminalization",
+        )
+        .expect_err("semantic failure must stop before history recording");
+
+        assert!(is_semantic_commit_failure(&error));
+        assert_eq!(sampling_state.tool_cursor_position(), 0);
+        assert!(!conversation_has_tool_result(&conversation, &request.id));
+    }
+
+    #[test]
+    fn closing_zero_siblings_skips_semantic_commit() {
+        let request = ToolRequest {
+            id: "already-finished".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("printf done".to_string()),
+            raw_arguments: Some(r#"{"command":"printf done"}"#.to_string()),
+        };
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        sampling_state.advance_tool_cursor_one(1);
+        let mut events = EventFactory::new("zero-sibling-close".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+
+        close_unstarted_tool_requests(
+            &mut sampling_state,
+            std::slice::from_ref(&request),
+            &mut events,
+            &mut sink,
+            &mut conversation,
+            None,
+            true,
+            Some(&FailingToolResultIngress),
+            "nothing remains",
+        )
+        .expect("an empty sibling set must not reach semantic ingress");
+
+        assert_eq!(sampling_state.tool_cursor_position(), 1);
+        assert!(conversation.messages.is_empty());
+    }
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
         RunConfig {
@@ -1309,6 +1480,7 @@ mod tests {
                 permission_handler: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
+                provider_response_ingress: None,
             },
             extensions: None,
             executors: RuntimeNormalToolTurnExecutors {
@@ -1370,6 +1542,7 @@ mod tests {
             services: RuntimeReadonlyToolTurnServices {
                 mcp_registry: &registry,
                 hooks: &hooks,
+                provider_response_ingress: None,
             },
         })
         .expect("run readonly tool turn");
@@ -1438,6 +1611,7 @@ mod tests {
             services: RuntimeReadonlyToolTurnServices {
                 mcp_registry: &registry,
                 hooks: &hooks,
+                provider_response_ingress: None,
             },
         })
         .expect("run cancelled readonly tool turn");
@@ -1505,6 +1679,7 @@ mod tests {
             services: RuntimeReadonlyToolTurnServices {
                 mcp_registry: &registry,
                 hooks: &hooks,
+                provider_response_ingress: None,
             },
         })
         .expect("run readonly hook failures");
@@ -1567,6 +1742,7 @@ mod tests {
             services: RuntimeReadonlyToolTurnServices {
                 mcp_registry: &registry,
                 hooks: &hooks,
+                provider_response_ingress: None,
             },
         })
         .expect("cancel blocked readonly pre-hook");
@@ -2645,6 +2821,7 @@ mod tests {
                 permission_handler: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
+                provider_response_ingress: None,
             },
             extensions: None,
             executors: RuntimeNormalToolTurnExecutors {

@@ -371,10 +371,11 @@ impl RuntimeProviderTurnStep {
                     emit_provider_delta(
                         delivery.step(),
                         &response_identity,
+                        input.turn_context.provider_response_ingress(),
                         emit_deltas,
                         events,
                         sink,
-                    );
+                    )?;
                 }
                 Ok(ProviderStreamEvent::Completed(response)) => break response,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -505,6 +506,9 @@ impl RuntimeProviderResponseStep {
             batch_child_executor,
         } = executors;
         let step_snapshot = step_context.snapshot();
+        if let Some(ingress) = step_snapshot.turn_context.provider_response_ingress() {
+            ingress.commit_response(&response)?;
+        }
         let completed_response = response.completed();
         let response = response.response;
         if response.tool_calls.is_empty() {
@@ -739,12 +743,16 @@ fn cancelled_provider_turn<W: io::Write>(
 fn emit_provider_delta<W: io::Write>(
     step: &ProviderStep,
     identity: &ModelResponseIdentity,
+    semantic_ingress: Option<&dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
     emit_deltas: bool,
     events: &mut EventFactory,
     sink: &mut EventSink<W>,
-) {
+) -> io::Result<()> {
+    if let Some(ingress) = semantic_ingress {
+        ingress.commit_provider_step(identity, step)?;
+    }
     if !emit_deltas {
-        return;
+        return Ok(());
     }
     match step {
         ProviderStep::ReasoningDelta(text) => {
@@ -761,6 +769,7 @@ fn emit_provider_delta<W: io::Write>(
         }
         _ => {}
     }
+    Ok(())
 }
 
 impl RuntimeProviderTurnOutput {
@@ -791,6 +800,30 @@ mod tests {
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
     use crate::tool_execution::policy_for_tool_execution;
+
+    #[derive(Debug)]
+    struct FailingProviderStepIngress;
+
+    impl crate::runtime_surface::RuntimeProviderResponseIngress for FailingProviderStepIngress {
+        fn commit_response(&self, _response: &RuntimeModelResponse) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_provider_step(
+            &self,
+            _identity: &ModelResponseIdentity,
+            _step: &ProviderStep,
+        ) -> io::Result<()> {
+            Err(io::Error::other("semantic stream unavailable"))
+        }
+
+        fn commit_tool_results(
+            &self,
+            _results: &[orca_core::tool_types::ToolResult],
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn runtime_response(response: ProviderResponse) -> RuntimeModelResponse {
         RuntimeModelResponse::new(response, orca_core::thread_identity::TurnId::new())
@@ -922,10 +955,12 @@ mod tests {
         emit_provider_delta(
             &ProviderStep::ToolCallProgress(progress),
             &response_identity(),
+            None,
             true,
             &mut events,
             &mut sink,
-        );
+        )
+        .expect("legacy-only progress emission");
 
         drop(sink);
         let output = String::from_utf8(output).expect("jsonl is utf8");
@@ -933,6 +968,27 @@ mod tests {
         assert!(output.contains("\"id\":\"call_1\""));
         assert!(output.contains("\"name\":\"write_file\""));
         assert!(output.contains("\"arguments_bytes\":12345"));
+    }
+
+    #[test]
+    fn provider_delta_requires_typed_commit_before_legacy_visibility() {
+        let mut events = EventFactory::new("provider-semantic-before-legacy".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        let error = emit_provider_delta(
+            &ProviderStep::MessageDelta("must stay hidden".to_string()),
+            &response_identity(),
+            Some(&FailingProviderStepIngress),
+            true,
+            &mut events,
+            &mut sink,
+        )
+        .expect_err("semantic failure must precede legacy delta visibility");
+
+        assert_eq!(error.to_string(), "semantic stream unavailable");
+        drop(sink);
+        assert!(output.is_empty());
     }
 
     #[test]

@@ -18,12 +18,13 @@ use ratatui::backend::CrosstermBackend;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
+use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
 use orca_runtime::runtime_host::{
     HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, HostedWorkflowRequest,
-    OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadMutation,
-    RuntimeThreadStartRequest,
+    OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::agent_runtime::TuiAgentRuntime;
 use crate::background_approval::submit_background_approval_response_for_tui;
@@ -50,8 +51,10 @@ use crate::runtime_event_actions::handle_runtime_event;
 use crate::runtime_interaction_adapter::{
     TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
 };
+use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
+use crate::surface_actions::TuiSurfaceActions;
 use crate::terminal_lifecycle::TerminalCleanup;
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
@@ -103,7 +106,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     let (event_tx, pending_event_rx) = tui_event_channel();
     let (action_tx, action_rx) = user_action_channel();
-    let (mention_registry_tx, mention_registry_rx) = mpsc::bounded(1);
     let mut mention_search =
         MentionSearchManager::new_roots(mention_search_roots(&config), event_tx.clone());
     let pending_workflow_notifications: bridge::PendingWorkflowNotifications =
@@ -120,7 +122,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             HistoryMode::Resume(_) | HistoryMode::Fork(_)
         );
     let picker_sessions = if should_show_picker {
-        orca_runtime::history::list_sessions(20).unwrap_or_default()
+        RuntimeSurfaceHostHandle::list_saved_sessions(20).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -159,50 +161,17 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Some(config.prompt.clone())
     };
 
-    let startup_preloaded_transcript = if matches!(
-        config.history_mode,
-        HistoryMode::Resume(_) | HistoryMode::Fork(_)
-    ) {
-        if let Ok(transcript) = orca_runtime::history::load_session(match &config.history_mode {
-            HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
-            HistoryMode::Record | HistoryMode::Disabled => "",
-        }) {
-            for message in &transcript.messages {
-                if let Some(chat_message) = chat_message_from_history(message.clone()) {
-                    state.push_message(chat_message);
-                }
-            }
-            if let Some((explanation, plan)) = &transcript.plan {
-                state.current_plan = Some((explanation.clone(), plan.clone()));
-            }
-            if !state.messages.is_empty() {
-                let label = if matches!(config.history_mode, HistoryMode::Fork(_)) {
-                    "Forked saved conversation."
-                } else {
-                    "Resumed saved conversation."
-                };
-                state.push_message(ChatMessage::System(label.to_string()));
-            }
-            // The preloaded transcript is entirely past turns; freeze it so the next
-            // turn (or an initial prompt) starts a fresh live suffix.
-            state.finalized_count = state.messages.len();
-            Some(transcript)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let shared_config = Arc::new(Mutex::new(config.clone()));
     let agent_config = Arc::clone(&shared_config);
+    // Session selectors are resolved by RuntimeHost. Keeping this lane empty
+    // prevents the TUI from becoming the history owner before the runtime
+    // can establish its lease and typed surface.
     let preloaded_transcript: Arc<Mutex<Option<history::SessionTranscript>>> =
-        Arc::new(Mutex::new(startup_preloaded_transcript));
+        Arc::new(Mutex::new(None));
     let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
     let agent_mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
-    let _ = mention_registry_tx.send(agent_mcp_registry.clone());
     let agent_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
 
     let mut agent_runtime = TuiAgentRuntime::spawn_hosted(
@@ -223,6 +192,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             );
         },
     )?;
+    let mut pending_initial_prompt =
+        if typed_history_startup_eligible(&config.history_mode, &preloaded_transcript) {
+            initial_prompt.clone()
+        } else {
+            None
+        };
     // These moved bindings are declared after the runtime so unwinding drops
     // the event receiver and restores the terminal before the runtime joins.
     let terminal_cleanup = pending_terminal_cleanup;
@@ -232,7 +207,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let mut textarea = if needs_setup {
         make_setup_textarea(&theme)
     } else {
-        if let Some(prompt) = initial_prompt.clone() {
+        if let Some(prompt) = initial_prompt.clone()
+            && pending_initial_prompt.is_none()
+        {
             state.push_message(ChatMessage::User(prompt.clone()));
             state.enter_running();
             let _ = action_tx.send(UserAction::Submit(prompt));
@@ -258,9 +235,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
 
     'main: loop {
         let now = Instant::now();
-        if let Ok(registry) = mention_registry_rx.try_recv() {
-            mention_search.install_registry(registry);
-        }
         // The copy notice and edge-drag auto-scroll count as animation so the
         // idle loop keeps drawing frames: the notice until it expires (expiry
         // clears it while THIS iteration still counts as animating, so
@@ -330,7 +304,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                         &mut config,
                                         &shared_config,
                                         &action_tx,
-                                        agent_runtime.controller(),
                                         &preloaded_transcript,
                                         &mut textarea,
                                         &mut vim_state,
@@ -349,10 +322,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             match handle_key_event_preflight(
                                 *key,
                                 &mut state,
-                                &mut config,
-                                &shared_config,
+                                &config,
                                 &action_tx,
-                                agent_runtime.controller(),
                                 || clear_terminal_scrollback(&mut terminal),
                             )? {
                                 KeyEventFlow::Continue => return Ok(None),
@@ -367,7 +338,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                                 &mut config,
                                 &shared_config,
                                 &action_tx,
-                                agent_runtime.controller(),
                                 &preloaded_transcript,
                                 &mut textarea,
                                 &mut vim_state,
@@ -380,6 +350,22 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     },
                     IterationEvent::Runtime(tui_event) => match tui_event {
+                        TuiEvent::HistoryLoaded { .. } => {
+                            handle_runtime_event(
+                                tui_event,
+                                &mut state,
+                                &action_tx,
+                                &pending_workflow_notifications,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                            );
+                            if let Some(prompt) = pending_initial_prompt.take() {
+                                state.push_message(ChatMessage::User(prompt.clone()));
+                                state.enter_running();
+                                let _ = action_tx.send(UserAction::Submit(prompt));
+                            }
+                        }
                         TuiEvent::MentionSearchDirty { generation } => {
                             let text = textarea_text(&textarea);
                             let cursor = textarea_cursor_byte_index(&textarea);
@@ -388,6 +374,33 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                         TuiEvent::MentionCatalogDirty { generation } => {
                             mention_search.consume_catalog_dirty(generation, &mut state);
+                        }
+                        TuiEvent::MentionRuntimeReady(thread) => {
+                            mention_search.install_runtime_actions(TuiSurfaceActions::new(thread));
+                        }
+                        TuiEvent::SettingsUpdated {
+                            model,
+                            reasoning_effort,
+                            approval_mode,
+                        } => {
+                            config.model = orca_core::model::ModelSelection::from_unchecked(Some(
+                                model.clone(),
+                            ));
+                            config.reasoning_effort = reasoning_effort;
+                            config.approval_mode = approval_mode;
+                            handle_runtime_event(
+                                TuiEvent::SettingsUpdated {
+                                    model,
+                                    reasoning_effort,
+                                    approval_mode,
+                                },
+                                &mut state,
+                                &action_tx,
+                                &pending_workflow_notifications,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                            );
                         }
                         tui_event => {
                             handle_runtime_event(
@@ -529,7 +542,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
         background_capacity,
         controller,
         move |controller, commands, host| {
-            hosted_tui_controller_loop(
+            hosted_tui_controller_loop_with_ordinary_turn_runner(
                 agent_config,
                 agent_preloaded,
                 agent_events,
@@ -538,6 +551,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
                 agent_pending,
                 agent_registry,
                 host,
+                run_hosted_legacy_ordinary_turn,
             );
         },
     )
@@ -649,6 +663,20 @@ mod tests {
         bridge::PendingWorkflowNotifications::new()
     }
 
+    fn test_task_surface() -> (
+        orca_runtime::runtime_host::RuntimeHost,
+        RuntimeThreadHandle,
+        TuiSurfaceActions,
+    ) {
+        let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .handle()
+            .start_thread(test_config(HistoryMode::Disabled), "task surface test")
+            .expect("runtime thread");
+        let actions = TuiSurfaceActions::new(thread.typed_surface());
+        (host, thread, actions)
+    }
+
     #[test]
     fn hosted_tui_saved_workflow_routes_through_runtime_host() {
         if !orca_runtime::workflow::host::WorkflowHost::node_available() {
@@ -756,6 +784,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_recovery_error_does_not_fabricate_failure_terminal() {
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let error = crate::surface_client::terminal_recovery_error_for_test(
+            "terminal commit requires recovery",
+        );
+
+        emit_hosted_operation_error(&event_tx, error, &HostedOperationKind::Turn);
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            matches!(events.as_slice(), [TuiEvent::Error(message)] if message.contains("requires recovery"))
+        );
+    }
+
+    #[test]
     fn stale_bound_file_preparation_emits_submission_rejected() {
         with_orca_home(|_| {
             let root = tempdir().expect("workspace root");
@@ -814,10 +857,8 @@ mod tests {
     #[test]
     fn esc_clears_mouse_selection_before_other_esc_semantics() {
         let (mut state, _rx) = test_state();
-        let mut config = test_config(HistoryMode::Record);
-        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let config = test_config(HistoryMode::Record);
         let (action_tx, _action_rx) = mpsc::unbounded();
-        let operation = crate::test_support::TestOperationInterrupt::default();
 
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
         let head = crate::selection::SelectionPos { row: 2, col: 5 };
@@ -832,10 +873,8 @@ mod tests {
         let flow = handle_key_event_preflight(
             crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
             &mut state,
-            &mut config,
-            &shared_config,
+            &config,
             &action_tx,
-            &operation,
             || Ok(()),
         )
         .expect("preflight");
@@ -847,15 +886,12 @@ mod tests {
         let flow = handle_key_event_preflight(
             crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
             &mut state,
-            &mut config,
-            &shared_config,
+            &config,
             &action_tx,
-            &operation,
             || Ok(()),
         )
         .expect("preflight");
         assert!(matches!(flow, KeyEventFlow::Unhandled));
-        assert_eq!(operation.call_count(), 0);
     }
 
     #[test]
@@ -1094,7 +1130,8 @@ mod tests {
 
     #[test]
     fn recovered_background_approval_notifies_tui_user() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
@@ -1114,7 +1151,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
 
         assert_eq!(
-            notify_recovered_background_approvals_for_tui(&registry, &event_tx),
+            notify_recovered_background_approvals_for_tui(&actions, &event_tx),
             1
         );
 
@@ -1132,6 +1169,7 @@ mod tests {
                     && message.contains("task_list")
                     && message.contains("waiting for approval")
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
@@ -1238,7 +1276,8 @@ mod tests {
 
     #[test]
     fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
@@ -1258,7 +1297,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
 
         let continuation_request = submit_background_approval_response_for_tui(
-            Some(&registry),
+            Some(&actions),
             "mock-tool-1",
             false,
             &event_tx,
@@ -1281,17 +1320,19 @@ mod tests {
             Ok(TuiEvent::Notice(message))
                 if message.contains("Background approval denied")
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
     fn stop_task_for_tui_requests_stop_and_refreshes_tasks() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Running in background".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
+        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
 
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopping);
@@ -1307,11 +1348,13 @@ mod tests {
                 if message.contains("Task stop requested")
                     && message.contains(&task.id)
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
     fn stop_task_for_tui_stops_approval_required_task_immediately() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
@@ -1330,7 +1373,7 @@ mod tests {
             .unwrap();
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
+        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
 
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
@@ -1344,21 +1387,19 @@ mod tests {
                     && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
                     && tasks[0].pending_tool_call.is_none()
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
     fn foreground_task_for_tui_marks_backgrounded_task_and_refreshes_tasks() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Long answer".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        assert!(foreground_task_for_tui(
-            Some(&registry),
-            &task.id,
-            &event_tx
-        ));
+        assert!(foreground_task_for_tui(Some(&actions), &task.id, &event_tx));
 
         let record = registry.get(&task.id).unwrap();
         assert!(!record.is_backgrounded);
@@ -1371,6 +1412,7 @@ mod tests {
             event_rx.try_recv(),
             Ok(TuiEvent::Notice(message)) if message.contains("returned to foreground")
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     fn transcript(session_id: &str) -> history::SessionTranscript {
@@ -1437,6 +1479,45 @@ mod tests {
     impl HostedTuiHarness {
         fn start(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
             Self::start_with_background_capacity(config, preloaded, 8)
+        }
+
+        fn start_typed(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
+            let config = Arc::new(Mutex::new(config));
+            let preloaded = Arc::new(Mutex::new(preloaded));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let pending = test_pending_workflow_notifications();
+            let registry = orca_mcp::initialize_registry(&[]);
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let agent_config = Arc::clone(&config);
+            let agent_preloaded = Arc::clone(&preloaded);
+            let agent_events = event_tx.clone();
+            let runtime = TuiAgentRuntime::spawn_hosted(
+                action_rx,
+                event_tx,
+                8,
+                controller,
+                move |controller, commands, host| {
+                    hosted_tui_controller_loop(
+                        agent_config,
+                        agent_preloaded,
+                        agent_events,
+                        commands,
+                        controller,
+                        pending,
+                        registry,
+                        host,
+                    );
+                },
+            )
+            .expect("typed hosted TUI runtime");
+            Self {
+                action_tx,
+                event_rx,
+                runtime,
+                config,
+                preloaded,
+            }
         }
 
         fn start_with_background_capacity(
@@ -1542,10 +1623,167 @@ mod tests {
                         assert_eq!(runtime.controller().current_id(), None);
                         break;
                     }
+                    TuiEvent::OperationRejected(message) | TuiEvent::Error(message) => {
+                        panic!("manual compaction failed: {message}");
+                    }
                     _ => {}
                 }
             }
             runtime.shutdown().expect("hosted runtime shutdown");
+        });
+    }
+
+    #[test]
+    fn ordinary_tui_dispatch_commits_user_and_provider_items_to_typed_surface() {
+        with_orca_home(|_| {
+            let config = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "typed ordinary turn ingress")
+                .expect("runtime thread");
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_ordinary_turn(
+                &config,
+                &thread,
+                hosted_turn_request(
+                    &SubmittedTurn::user("typed app dispatch".to_string()),
+                    false,
+                ),
+                &event_tx,
+                &controller,
+            )
+            .expect("typed ordinary turn");
+
+            let snapshot = TuiSurfaceActions::new(thread.typed_surface())
+                .read_snapshot()
+                .expect("typed snapshot");
+            let (user, user_is_pinned) = snapshot
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    orca_runtime::surface::SurfaceItem::UserMessage {
+                        turn_id,
+                        input: orca_runtime::surface::SurfaceUserInputState::Resolved { .. },
+                        pinned,
+                        ..
+                    } => Some((turn_id.clone(), *pinned)),
+                    _ => None,
+                })
+                .expect("resolved typed user item");
+            let assistant = snapshot
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    orca_runtime::surface::SurfaceItem::AssistantMessage {
+                        turn_id, text, ..
+                    } if text.as_str()
+                        == "Mock runtime completed the headless harness contract." =>
+                    {
+                        Some(turn_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("typed assistant item");
+            let reasoning = snapshot
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    orca_runtime::surface::SurfaceItem::AssistantReasoning {
+                        turn_id,
+                        content,
+                        ..
+                    } if content.as_str()
+                        == "Mock runtime is preserving the DeepSeek reasoning channel." =>
+                    {
+                        Some(turn_id.clone())
+                    }
+                    _ => None,
+                })
+                .expect("typed reasoning item");
+
+            assert_eq!(assistant, user);
+            assert_eq!(reasoning, user);
+            assert!(
+                !user_is_pinned,
+                "ordinary TUI input must stay unpinned so it remains backtrackable"
+            );
+            assert!(snapshot.foreground_operation.is_none());
+            assert!(snapshot.operation_history.iter().any(|operation| {
+                matches!(
+                    operation.terminal.as_ref().map(|record| &record.terminal),
+                    Some(orca_runtime::surface::OperationTerminal::Succeeded { .. })
+                )
+            }));
+            assert!(event_rx.try_iter().any(
+                |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+            ));
+
+            thread.shutdown().expect("thread shutdown");
+            host.shutdown().expect("host shutdown");
+        });
+    }
+
+    #[test]
+    fn ordinary_tui_typed_submit_can_manual_compact_the_same_durable_conversation() {
+        with_orca_home(|_| {
+            let config = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "typed ordinary turn compaction")
+                .expect("runtime thread");
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_ordinary_turn(
+                &config,
+                &thread,
+                hosted_turn_request(
+                    &SubmittedTurn::user("typed app dispatch before compaction".to_string()),
+                    false,
+                ),
+                &event_tx,
+                &controller,
+            )
+            .expect("typed ordinary turn");
+            let outcome = match TuiSurfaceActions::new(thread.typed_surface())
+                .manual_compact(&controller, &event_tx)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => panic!(
+                    "typed manual compaction after ordinary turn: {error}; events={:?}",
+                    event_rx.try_iter().collect::<Vec<_>>()
+                ),
+            };
+
+            assert!(matches!(
+                outcome,
+                TuiHostedOperationOutcome::ManualCompaction
+            ));
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, TuiEvent::CompactionStarted))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, TuiEvent::Compacted { .. }))
+            );
+            assert!(
+                TuiSurfaceActions::new(thread.typed_surface())
+                    .read_snapshot()
+                    .expect("typed snapshot after compaction")
+                    .foreground_operation
+                    .is_none()
+            );
+
+            thread.shutdown().expect("thread shutdown");
+            host.shutdown().expect("host shutdown");
         });
     }
 
@@ -1716,7 +1954,7 @@ mod tests {
     #[test]
     fn hosted_canonical_approval_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "bash printf canonical-approval".to_string(),
             ));
@@ -1727,10 +1965,7 @@ mod tests {
                 TuiEvent::ApprovalNeeded { key, .. } => key,
                 _ => unreachable!(),
             };
-            assert_eq!(
-                Some(key.operation_id),
-                harness.runtime.controller().current_id()
-            );
+            assert!(harness.runtime.controller().has_surface_active());
             harness.send(UserAction::RespondToInteraction {
                 key,
                 response: TuiInteractionResponse::Approval(true),
@@ -1749,7 +1984,7 @@ mod tests {
     #[test]
     fn hosted_canonical_permission_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "request_network_permissions_then_done example.com".to_string(),
             ));
@@ -1760,10 +1995,7 @@ mod tests {
                 TuiEvent::PermissionApprovalNeeded { key, .. } => key,
                 _ => unreachable!(),
             };
-            assert_eq!(
-                Some(key.operation_id),
-                harness.runtime.controller().current_id()
-            );
+            assert!(harness.runtime.controller().has_surface_active());
             harness.send(UserAction::RespondToInteraction {
                 key,
                 response: TuiInteractionResponse::Permission(true),
@@ -1782,7 +2014,7 @@ mod tests {
     #[test]
     fn hosted_canonical_user_input_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("ask continue?".to_string()));
 
             let key = match harness
@@ -1791,10 +2023,7 @@ mod tests {
                 TuiEvent::UserInputRequested { key, .. } => key,
                 _ => unreachable!(),
             };
-            assert_eq!(
-                Some(key.operation_id),
-                harness.runtime.controller().current_id()
-            );
+            assert!(harness.runtime.controller().has_surface_active());
             harness.send(UserAction::RespondToInteraction {
                 key,
                 response: TuiInteractionResponse::UserInput("yes".to_string()),
@@ -1863,19 +2092,18 @@ mod tests {
             let host_handle = host.handle();
             host.shutdown().unwrap();
             let mut thread = None;
-            let mut pending_pinned_context = Vec::new();
 
             handle_hosted_submitted_turn(
                 SubmittedTurn::user("retry me".to_string()),
                 &config,
                 &preloaded,
                 &mut thread,
-                &mut pending_pinned_context,
                 &event_tx,
                 &controller,
                 &pending,
                 &registry,
                 &host_handle,
+                run_hosted_ordinary_turn,
             );
 
             assert!(matches!(
@@ -1894,6 +2122,162 @@ mod tests {
                 Some("preserved-session")
             );
         });
+    }
+
+    #[test]
+    fn remember_without_thread_commits_through_typed_surface() {
+        with_orca_home(|home| {
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(home.to_path_buf());
+            let preloaded = Arc::new(Mutex::new(None));
+            let event_tx = mpsc::unbounded().0;
+            let registry = orca_mcp::initialize_registry(&[]);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+            let host_handle = host.handle();
+            let mut thread = None;
+
+            ensure_hosted_thread(
+                &mut thread,
+                &host_handle,
+                &config,
+                &preloaded,
+                "remembered context",
+                &registry,
+                &event_tx,
+            )
+            .expect("runtime-owned thread starts for remember");
+            let runtime_thread = thread.as_ref().expect("thread is initialized");
+            let typed_thread = runtime_thread.typed_surface();
+            let actions = TuiSurfaceActions::new(typed_thread.clone());
+            let memory_path = actions
+                .remember(
+                    crate::types::TuiMemoryScope::User,
+                    home,
+                    "prefer durable runtime ownership",
+                )
+                .expect("runtime-owned memory mutation");
+            assert!(
+                std::fs::read_to_string(memory_path)
+                    .expect("saved memory")
+                    .contains("prefer durable runtime ownership")
+            );
+            actions
+                .add_pinned_context("[Pinned remembered note]\nprefer durable runtime ownership")
+                .expect("typed pinned context mutation");
+
+            let attachment = match typed_thread.surface().attach_fresh(
+                orca_runtime::surface::FreshAttachRequest {
+                    request_id: orca_runtime::surface::SurfaceRequestId::new(),
+                    role: orca_runtime::surface::SurfaceAttachmentRole::Tui,
+                    requested_capabilities: std::collections::BTreeSet::from([
+                        orca_runtime::surface::SurfaceCapability::ReadSnapshot,
+                    ]),
+                    interaction_capabilities: std::collections::BTreeSet::new(),
+                },
+            ) {
+                orca_runtime::surface::AttachResult::FreshAttached { attachment } => attachment,
+                _ => panic!("typed pinned context attach failed"),
+            };
+            assert!(
+                attachment
+                    .baseline
+                    .snapshot
+                    .pinned_context
+                    .entries
+                    .iter()
+                    .any(|entry| entry.content.as_str().contains("durable runtime ownership"))
+            );
+            typed_thread.surface().detach(
+                &attachment.client,
+                orca_runtime::surface::DetachRequest {
+                    request_id: orca_runtime::surface::SurfaceRequestId::new(),
+                },
+            );
+
+            thread.unwrap().shutdown().unwrap();
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn remember_slash_command_dispatches_scope_without_writing_memory() {
+        with_orca_home(|home| {
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(home.to_path_buf());
+            let shared_config = Arc::new(Mutex::new(config.clone()));
+            let (mut state, _) = test_state();
+            let (action_tx, action_rx) = mpsc::unbounded();
+
+            handle_slash_command(
+                "/remember project: prefer runtime ownership",
+                &mut config,
+                &shared_config,
+                &mut state,
+                &action_tx,
+            );
+
+            assert!(matches!(
+                action_rx.try_recv(),
+                Ok(UserAction::Remember {
+                    scope: crate::types::TuiMemoryScope::Project,
+                    note,
+                }) if note == "prefer runtime ownership"
+            ));
+            assert!(
+                orca_runtime::memory::load_for_cwd(home).is_empty(),
+                "the renderer-side slash action must not persist memory"
+            );
+        });
+    }
+
+    #[test]
+    fn recovery_slash_commands_dispatch_explicit_runtime_actions() {
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (mut resume_state, _) = test_state();
+        let (resume_tx, resume_rx) = mpsc::unbounded();
+        let resume_operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
+        ])
+        .unwrap();
+        resume_state.recoverable_operation_id = Some(resume_operation_id.clone());
+
+        handle_slash_command(
+            "/resume",
+            &mut config,
+            &shared_config,
+            &mut resume_state,
+            &resume_tx,
+        );
+
+        assert!(matches!(
+            resume_rx.try_recv(),
+            Ok(UserAction::ResumeOperation { operation_id })
+                if operation_id == resume_operation_id
+        ));
+        assert_eq!(resume_state.status, AppStatus::Running);
+
+        let (mut cancel_state, _) = test_state();
+        let (cancel_tx, cancel_rx) = mpsc::unbounded();
+        let cancel_operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2,
+        ])
+        .unwrap();
+        cancel_state.recoverable_operation_id = Some(cancel_operation_id.clone());
+        handle_slash_command(
+            "/cancel-operation",
+            &mut config,
+            &shared_config,
+            &mut cancel_state,
+            &cancel_tx,
+        );
+
+        assert!(matches!(
+            cancel_rx.try_recv(),
+            Ok(UserAction::CancelOperation { operation_id })
+                if operation_id == cancel_operation_id
+        ));
+        assert_eq!(cancel_state.status, AppStatus::Running);
     }
 
     #[test]
@@ -1967,20 +2351,17 @@ mod tests {
         let (mut state, action_rx) = test_state();
         state.status = AppStatus::Running;
         let action_tx = state.event_tx.clone();
-        let operation = crate::test_support::TestOperationInterrupt::default();
 
         crate::running_actions::handle_running_shortcut(
             crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
             &mut state,
             &action_tx,
-            &operation,
         );
 
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::BackgroundCurrentTurn)
         ));
-        assert_eq!(operation.call_count(), 0);
         assert_eq!(state.status, AppStatus::Idle);
     }
 
@@ -2110,6 +2491,64 @@ mod tests {
             handle.join().unwrap();
 
             assert!(matches!(event, TuiEvent::GoalStatus(None)));
+        });
+    }
+
+    #[test]
+    fn resumed_uuid_session_emits_typed_history_before_accepting_initial_turn() {
+        with_orca_home(|_| {
+            let mut source = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            source.send(UserAction::Submit("restored prompt".to_string()));
+            let source_terminal =
+                source.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                source_terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
+            source.shutdown();
+            let session_id = history::load_session("latest").unwrap().meta.session_id;
+
+            let mut harness =
+                HostedTuiHarness::start_typed(test_config(HistoryMode::Resume(session_id)), None);
+            let event = harness
+                .event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("typed history event");
+            assert!(matches!(
+                event,
+                TuiEvent::HistoryLoaded { messages, .. }
+                    if messages.iter().any(|message| matches!(
+                        message,
+                        ChatMessage::User(prompt) if prompt == "restored prompt"
+                    ))
+            ));
+
+            harness.send(UserAction::Submit("mock_history_echo".to_string()));
+            let mut saw_restored_history = false;
+            loop {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("resumed typed TUI event")
+                {
+                    TuiEvent::MessageDelta(text) if text.contains("restored prompt") => {
+                        saw_restored_history = true;
+                    }
+                    TuiEvent::SessionCompleted { status } => {
+                        assert_eq!(status, "success");
+                        break;
+                    }
+                    TuiEvent::Error(message) | TuiEvent::OperationRejected(message) => {
+                        panic!("resumed typed TUI turn failed: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                saw_restored_history,
+                "resumed typed turn must receive durable history"
+            );
+            harness.shutdown();
         });
     }
 
@@ -2664,26 +3103,23 @@ mod tests {
     #[test]
     fn cancelled_hosted_tui_turn_does_not_cancel_next_submit() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
 
-            let first_id = loop {
+            loop {
                 match harness
                     .event_rx
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                 {
                     TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
-                        break harness
-                            .runtime
-                            .controller()
-                            .current_id()
-                            .expect("first operation id");
+                        assert!(harness.runtime.controller().has_surface_active());
+                        break;
                     }
                     TuiEvent::Error(message) => panic!("unexpected first-turn error: {message}"),
                     _ => {}
                 }
-            };
+            }
 
             harness.send(UserAction::Interrupt);
             loop {
@@ -2694,6 +3130,7 @@ mod tests {
                 {
                     TuiEvent::SessionCompleted { status } => {
                         assert_eq!(status, "cancelled");
+                        assert!(!harness.runtime.controller().has_surface_active());
                         break;
                     }
                     TuiEvent::Error(message) => panic!("unexpected cancellation error: {message}"),
@@ -2703,7 +3140,7 @@ mod tests {
 
             harness.send(UserAction::Submit("mock_history_echo".to_string()));
 
-            let mut second_id = None;
+            let mut saw_second_start = false;
             let mut saw_second_output = false;
             loop {
                 match harness
@@ -2712,13 +3149,8 @@ mod tests {
                     .unwrap()
                 {
                     TuiEvent::TurnStarted { .. } => {
-                        let current = harness
-                            .runtime
-                            .controller()
-                            .current_id()
-                            .expect("second operation id");
-                        assert_ne!(current, first_id);
-                        second_id = Some(current);
+                        assert!(harness.runtime.controller().has_surface_active());
+                        saw_second_start = true;
                     }
                     TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
                         saw_second_output = true;
@@ -2734,10 +3166,7 @@ mod tests {
 
             harness.shutdown();
 
-            assert!(
-                second_id.is_some(),
-                "second turn must start a fresh operation"
-            );
+            assert!(saw_second_start, "second turn must start a fresh operation");
             assert!(saw_second_output, "second turn must run to provider output");
         });
     }
@@ -3986,26 +4415,31 @@ mod tests {
         press(KeyCode::Up, &mut state, &mut config, &mut textarea);
         press(KeyCode::Enter, &mut state, &mut config, &mut textarea);
 
-        assert_eq!(state.model_name, "deepseek-v4-pro");
+        assert_eq!(
+            state.model_name, "auto",
+            "not applied before runtime commit"
+        );
         assert_eq!(
             state.reasoning_effort,
-            orca_core::config::ReasoningEffort::High
+            orca_core::config::ReasoningEffort::Max,
+            "not applied before runtime commit"
         );
-        assert_eq!(config.model.display_name(), "deepseek-v4-pro");
+        assert_eq!(config.model.display_name(), "auto");
         assert_eq!(
             config.reasoning_effort,
-            orca_core::config::ReasoningEffort::High
+            orca_core::config::ReasoningEffort::Max
         );
         let shared = shared_config.lock().unwrap();
-        assert_eq!(shared.model.display_name(), "deepseek-v4-pro");
+        assert_eq!(shared.model.display_name(), "auto");
         assert_eq!(
             shared.reasoning_effort,
-            orca_core::config::ReasoningEffort::High
+            orca_core::config::ReasoningEffort::Max
         );
         drop(shared);
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SetModel(model)) if model == "deepseek-v4-pro"
+            Ok(UserAction::SetModel(intent))
+                if intent == "__orca_runtime_settings__:deepseek-v4-pro|high|-"
         ));
         assert!(state.slash_menu.is_none());
     }
@@ -4368,44 +4802,61 @@ fn update_goal_status_for_session(
         ));
         return false;
     };
-    let mut detached_join = None;
-    let runtime = match thread {
-        Some(thread) => match thread.goal_runtime() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                return false;
-            }
-        },
-        None => match orca_runtime::goal_actor::GoalRuntimeHandle::open_default() {
-            Ok((runtime, join)) => {
-                detached_join = Some(join);
-                runtime
-            }
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                return false;
-            }
-        },
-    };
+    match thread {
+        Some(thread) => {
+            let actions = TuiSurfaceActions::new(thread.typed_surface());
+            update_goal_status_with(
+                status,
+                event_tx,
+                {
+                    let actions = actions.clone();
+                    move || actions.resume_goal(session_id, now_timestamp())
+                },
+                {
+                    let actions = actions.clone();
+                    move || actions.pause_goal(session_id, now_timestamp())
+                },
+                move || actions.goal(session_id),
+            )
+        }
+        None => {
+            let updated = update_goal_status_with(
+                status,
+                event_tx,
+                move || {
+                    RuntimeSurfaceHostHandle::resume_saved_goal(session_id, now_timestamp())
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+                move || {
+                    RuntimeSurfaceHostHandle::pause_saved_goal(session_id, now_timestamp())
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+                move || {
+                    RuntimeSurfaceHostHandle::project_saved_goal(session_id)
+                        .map_err(|error| error.to_string())
+                },
+            );
+            updated
+        }
+    }
+}
+
+fn update_goal_status_with(
+    status: orca_core::goal_types::ThreadGoalStatus,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    resume: impl FnOnce() -> Result<(), String>,
+    pause: impl FnOnce() -> Result<(), String>,
+    project: impl FnOnce() -> Result<Option<orca_core::goal_types::ThreadGoal>, String>,
+) -> bool {
     let result = match status {
-        orca_core::goal_types::ThreadGoalStatus::Active => runtime.resume(
-            session_id,
-            orca_core::goal_runtime::GoalTurnOrigin::Resume,
-            now_timestamp(),
-        ),
-        orca_core::goal_types::ThreadGoalStatus::Paused => runtime.pause(
-            session_id,
-            orca_core::goal_runtime::GoalPauseReason::User,
-            "paused by user",
-            now_timestamp(),
-        ),
-        _ => Err(orca_runtime::goal_actor::GoalActorError::Invalid(
-            "TUI can only pause or resume a goal through this command".to_string(),
-        )),
+        orca_core::goal_types::ThreadGoalStatus::Active => resume(),
+        orca_core::goal_types::ThreadGoalStatus::Paused => pause(),
+        _ => Err("TUI can only pause or resume a goal through this command".to_string()),
     };
-    let updated = match result {
-        Ok(_) => match runtime.project_thread_goal(session_id) {
+    match result {
+        Ok(()) => match project() {
             Ok(Some(goal)) => {
                 let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
                 true
@@ -4415,7 +4866,7 @@ fn update_goal_status_for_session(
                 false
             }
             Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                let _ = event_tx.send(TuiEvent::Error(error));
                 false
             }
         },
@@ -4423,12 +4874,7 @@ fn update_goal_status_for_session(
             let _ = event_tx.send(TuiEvent::Error(format!("failed to update goal: {error}")));
             false
         }
-    };
-    drop(runtime);
-    if let Some(join) = detached_join {
-        let _ = join.join();
     }
-    updated
 }
 
 fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
@@ -4452,6 +4898,14 @@ fn send_submission_error(
     }
 }
 
+type OrdinaryTurnRunner = fn(
+    &RunConfig,
+    &RuntimeThreadHandle,
+    HostedTurnRequest,
+    &mpsc::Sender<TuiEvent>,
+    &TuiOperationController,
+) -> io::Result<TuiHostedOperationOutcome>;
+
 #[allow(clippy::too_many_arguments)]
 fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -4463,9 +4917,73 @@ fn hosted_tui_controller_loop(
     mcp_registry: orca_mcp::McpRegistry,
     host: RuntimeHostHandle,
 ) {
+    hosted_tui_controller_loop_with_ordinary_turn_runner(
+        config,
+        preloaded,
+        event_tx,
+        action_rx,
+        controller,
+        pending_workflow_notifications,
+        mcp_registry,
+        host,
+        run_hosted_ordinary_turn,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hosted_tui_controller_loop_with_ordinary_turn_runner(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    controller: TuiOperationController,
+    pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+    mcp_registry: orca_mcp::McpRegistry,
+    host: RuntimeHostHandle,
+    ordinary_turn_runner: OrdinaryTurnRunner,
+) {
     let mut thread: Option<RuntimeThreadHandle> = None;
-    let mut pending_pinned_context = Vec::new();
     let mut pending_actions = VecDeque::new();
+
+    let startup_history_mode = config.lock().unwrap().history_mode.clone();
+    if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
+        let cfg = config.lock().unwrap().clone();
+        let selector = match &startup_history_mode {
+            HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
+            HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
+        };
+        let title = format!("Restored session {selector}");
+        let thread_was_missing = thread.is_none();
+        let result = ensure_hosted_thread(
+            &mut thread,
+            &host,
+            &cfg,
+            &preloaded,
+            &title,
+            &mcp_registry,
+            &event_tx,
+        )
+        .and_then(|_| {
+            emit_typed_history_snapshot(
+                thread.as_ref().expect("startup hosted thread"),
+                &startup_history_mode,
+                &event_tx,
+            )
+        });
+        if let Err(error) = result {
+            if !cfg.prompt.trim().is_empty() {
+                emit_empty_history_snapshot(&event_tx, "Unable to restore saved conversation.");
+            }
+            if !error.contains("typed TUI snapshot attachment unavailable") {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "failed to restore typed conversation snapshot: {error}"
+                )));
+            }
+        }
+        if thread_was_missing && thread.is_some() {
+            announce_runtime_ready(thread.as_ref().expect("startup hosted thread"), &event_tx);
+        }
+    }
 
     loop {
         let action = if controller.is_shutdown() {
@@ -4481,12 +4999,12 @@ fn hosted_tui_controller_loop(
                 &config,
                 &preloaded,
                 &mut thread,
-                &mut pending_pinned_context,
                 &event_tx,
                 &controller,
                 &pending_workflow_notifications,
                 &mcp_registry,
                 &host,
+                ordinary_turn_runner,
             ),
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
                 handle_hosted_submitted_turn(
@@ -4494,12 +5012,12 @@ fn hosted_tui_controller_loop(
                     &config,
                     &preloaded,
                     &mut thread,
-                    &mut pending_pinned_context,
                     &event_tx,
                     &controller,
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &host,
+                    ordinary_turn_runner,
                 );
             }
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
@@ -4508,16 +5026,17 @@ fn hosted_tui_controller_loop(
                     &config,
                     &preloaded,
                     &mut thread,
-                    &mut pending_pinned_context,
                     &event_tx,
                     &controller,
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &host,
+                    ordinary_turn_runner,
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
                 let cfg = config.lock().unwrap().clone();
+                let thread_was_missing = thread.is_none();
                 if let Err(error) = ensure_hosted_thread(
                     &mut thread,
                     &host,
@@ -4525,13 +5044,16 @@ fn hosted_tui_controller_loop(
                     &preloaded,
                     &format!("Run saved workflow `{name}`"),
                     &mcp_registry,
-                    &mut pending_pinned_context,
                     &event_tx,
                 ) {
                     send_hosted_action_failure(&event_tx, error);
                     continue;
                 }
+                if thread_was_missing {
+                    announce_runtime_ready(thread.as_ref().expect("workflow thread"), &event_tx);
+                }
                 if let Some(runtime_thread) = thread.as_ref() {
+                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                     let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
                     let _ = observer.finish_foreground();
                     let mut request = HostedWorkflowRequest::new(name).with_config(cfg.clone());
@@ -4545,9 +5067,9 @@ fn hosted_tui_controller_loop(
                         };
                     }
                     if let Err(error) =
-                        runtime_thread.launch_workflow(request.with_event_observer(observer))
+                        actions.launch_workflow(request.with_event_observer(observer))
                     {
-                        let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                        let _ = event_tx.send(TuiEvent::Error(error));
                         continue;
                     }
                 }
@@ -4556,24 +5078,92 @@ fn hosted_tui_controller_loop(
                 }
             }
             Ok(UserAction::Interrupt) | Ok(UserAction::BackgroundCurrentTurn) => {}
-            Ok(UserAction::SetModel(model)) => {
-                if let Some(runtime_thread) = thread.as_ref()
-                    && let Err(error) =
-                        runtime_thread.mutate(RuntimeThreadMutation::SetModel(Some(model)))
+            Ok(UserAction::ResumeOperation { operation_id }) => {
+                let Some(runtime_thread) = thread.as_ref() else {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(
+                        "no recoverable operation is available".to_string(),
+                    ));
+                    continue;
+                };
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                if let Err(error) = actions.resume_operation(&operation_id, &controller, &event_tx)
                 {
-                    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                        "failed to resume operation: {error}"
+                    )));
                 }
             }
-            Ok(UserAction::Remember(note)) => {
+            Ok(UserAction::CancelOperation { operation_id }) => {
+                let Some(runtime_thread) = thread.as_ref() else {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(
+                        "no recoverable operation is available".to_string(),
+                    ));
+                    continue;
+                };
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                if let Err(error) = actions.cancel_operation(&operation_id, &controller, &event_tx)
+                {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                        "failed to cancel operation: {error}"
+                    )));
+                }
+            }
+            Ok(UserAction::SetModel(model)) => {
+                let patches = decode_settings_intent(&model)
+                    .map(settings_intent_patches)
+                    .unwrap_or_else(|| {
+                        vec![orca_runtime::surface::RuntimeSettingsPatch::SetModel {
+                            model: orca_runtime::surface::NonEmptyText::try_new(model)
+                                .map_err(|error| error.to_string())
+                                .unwrap_or_else(|_| unreachable!("validated model is non-empty")),
+                        }]
+                    });
+                apply_hosted_settings_action(thread.as_ref(), &config, &event_tx, patches);
+            }
+            Ok(UserAction::Remember { scope, note }) => {
                 let context = format!("[Pinned remembered note]\n{}", note.trim());
-                if let Some(runtime_thread) = thread.as_ref() {
-                    if let Err(error) =
-                        runtime_thread.mutate(RuntimeThreadMutation::AddPinnedContext(context))
-                    {
-                        let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                let thread_was_missing = thread.is_none();
+                let cfg = config.lock().unwrap().clone();
+                if thread.is_none() {
+                    if let Err(error) = ensure_hosted_thread(
+                        &mut thread,
+                        &host,
+                        &cfg,
+                        &preloaded,
+                        "Remembered context",
+                        &mcp_registry,
+                        &event_tx,
+                    ) {
+                        let _ = event_tx.send(TuiEvent::Error(error));
+                        continue;
                     }
-                } else {
-                    pending_pinned_context.push(context);
+                }
+                if thread_was_missing {
+                    announce_runtime_ready(thread.as_ref().expect("remember thread"), &event_tx);
+                }
+                if let Some(runtime_thread) = thread.as_ref() {
+                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                    let cwd = cfg
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    match actions.remember(scope, &cwd, &note) {
+                        Ok(path) => {
+                            let _ = event_tx.send(TuiEvent::Notice(format!(
+                                "Remembered in {}.",
+                                path.display()
+                            )));
+                            if let Err(error) = actions.add_pinned_context(&context) {
+                                let _ = event_tx.send(TuiEvent::Error(format!(
+                                    "memory was saved but could not be pinned: {error}"
+                                )));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = event_tx
+                                .send(TuiEvent::Error(format!("failed to remember: {error}")));
+                        }
+                    }
                 }
             }
             Ok(UserAction::Compact) => {
@@ -4581,13 +5171,9 @@ fn hosted_tui_controller_loop(
                     let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
                     continue;
                 };
-                let request = HostedTurnRequest::new("")
-                    .with_operation_kind(HostedOperationKind::ManualCompaction);
-                let cfg = config.lock().unwrap().clone();
-                if let Err(error) =
-                    run_hosted_operation(runtime_thread, request, cfg, &controller, &event_tx)
-                {
-                    let _ = event_tx.send(TuiEvent::Error(format!(
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                if let Err(error) = actions.manual_compact(&controller, &event_tx) {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "manual compaction failed: {error}"
                     )));
                 }
@@ -4595,7 +5181,9 @@ fn hosted_tui_controller_loop(
             Ok(UserAction::Backtrack) => {
                 let result = thread
                     .as_ref()
-                    .map(RuntimeThreadHandle::backtrack_last_user)
+                    .map(|runtime_thread| {
+                        TuiSurfaceActions::new(runtime_thread.typed_surface()).backtrack_last_user()
+                    })
                     .transpose();
                 match result {
                     Ok(Some(Some(prompt))) => {
@@ -4610,17 +5198,23 @@ fn hosted_tui_controller_loop(
                 }
             }
             Ok(UserAction::StopTask { task_id }) => {
-                let registry = thread.as_ref().map(RuntimeThreadHandle::task_registry);
-                let _ = stop_task_for_tui(registry.as_ref(), &task_id, &event_tx);
+                let actions = thread
+                    .as_ref()
+                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
+                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &event_tx);
             }
             Ok(UserAction::ForegroundTask { task_id }) => {
-                let registry = thread.as_ref().map(RuntimeThreadHandle::task_registry);
-                let _ = foreground_task_for_tui(registry.as_ref(), &task_id, &event_tx);
+                let actions = thread
+                    .as_ref()
+                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
+                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &event_tx);
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
-                let registry = thread.as_ref().map(RuntimeThreadHandle::task_registry);
+                let actions = thread
+                    .as_ref()
+                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
                 let continuation = submit_background_approval_response_for_tui(
-                    registry.as_ref(),
+                    actions.as_ref(),
                     &id,
                     approved,
                     &event_tx,
@@ -4659,6 +5253,7 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::GoalSet(objective)) => {
                 let cfg = config.lock().unwrap().clone();
+                let thread_was_missing = thread.is_none();
                 if let Err(error) = ensure_hosted_thread(
                     &mut thread,
                     &host,
@@ -4666,11 +5261,13 @@ fn hosted_tui_controller_loop(
                     &preloaded,
                     &objective,
                     &mcp_registry,
-                    &mut pending_pinned_context,
                     &event_tx,
                 ) {
                     send_hosted_action_failure(&event_tx, error);
                     continue;
+                }
+                if thread_was_missing {
+                    announce_runtime_ready(thread.as_ref().expect("goal thread"), &event_tx);
                 }
                 let Some(session_id) = thread
                     .as_ref()
@@ -4680,41 +5277,15 @@ fn hosted_tui_controller_loop(
                     send_goal_history_error(&event_tx);
                     continue;
                 };
-                let runtime = match thread
-                    .as_ref()
-                    .and_then(|thread| thread.goal_runtime().ok())
-                {
-                    Some(runtime) => runtime,
-                    None => {
-                        let _ = event_tx.send(TuiEvent::Error(
-                            "failed to initialize runtime-owned goal actor".to_string(),
-                        ));
-                        continue;
-                    }
-                };
-                let result = match runtime.read(&session_id) {
-                    Ok(Some(_)) => runtime
-                        .edit(&session_id, objective.clone(), None, now_timestamp())
-                        .map_err(|error| error.to_string()),
-                    Ok(None) => runtime
-                        .create(orca_runtime::goal_store::CreateGoalInput {
-                            session_id: session_id.clone(),
-                            objective: objective.clone(),
-                            token_budget: None,
-                            now: now_timestamp(),
-                        })
-                        .map(Some)
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
-                };
+                let actions = TuiSurfaceActions::new(
+                    thread
+                        .as_ref()
+                        .expect("goal thread initialized")
+                        .typed_surface(),
+                );
+                let result = actions.set_goal(&session_id, objective.clone(), now_timestamp());
                 match result {
-                    Ok(Some(_)) | Ok(None) => {
-                        let goal = runtime.project_thread_goal(&session_id).ok().flatten();
-                        let Some(goal) = goal else {
-                            let _ = event_tx
-                                .send(TuiEvent::Error("no goal is currently set".to_string()));
-                            continue;
-                        };
+                    Ok(goal) => {
                         let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
                         let _ = event_tx.send(TuiEvent::Notice(
                             "Starting goal. Automatic continuation will keep running while it remains active."
@@ -4728,6 +5299,7 @@ fn hosted_tui_controller_loop(
                                 orca_core::goal_runtime::GoalTurnOrigin::User,
                                 &event_tx,
                                 &controller,
+                                ordinary_turn_runner,
                             );
                         }
                     }
@@ -4746,34 +5318,12 @@ fn hosted_tui_controller_loop(
                 ) else {
                     continue;
                 };
-                let runtime = match thread
-                    .as_ref()
-                    .and_then(|thread| thread.goal_runtime().ok())
-                {
-                    Some(runtime) => runtime,
-                    None => {
-                        let _ = event_tx.send(TuiEvent::Error(
-                            "failed to initialize runtime-owned goal actor".to_string(),
-                        ));
-                        continue;
-                    }
+                let Some(runtime_thread) = thread.as_ref() else {
+                    continue;
                 };
-                match runtime.edit(&session_id, objective, None, now_timestamp()) {
-                    Ok(Some(record)) => {
-                        let goal = runtime
-                            .project_thread_goal(&session_id)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| orca_core::goal_types::ThreadGoal {
-                                session_id: record.session_id.clone(),
-                                objective: record.objective.clone(),
-                                status: orca_core::goal_types::ThreadGoalStatus::Active,
-                                token_budget: record.token_budget,
-                                tokens_used: record.usage.charged_tokens(),
-                                time_used_seconds: record.usage.elapsed_seconds,
-                                created_at: 0,
-                                updated_at: now_timestamp(),
-                            });
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                match actions.edit_goal(&session_id, objective, now_timestamp()) {
+                    Ok(Some(goal)) => {
                         let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
                     }
                     Ok(None) => {
@@ -4795,19 +5345,11 @@ fn hosted_tui_controller_loop(
                 ) else {
                     continue;
                 };
-                let runtime = match thread
-                    .as_ref()
-                    .and_then(|thread| thread.goal_runtime().ok())
-                {
-                    Some(runtime) => runtime,
-                    None => {
-                        let _ = event_tx.send(TuiEvent::Error(
-                            "failed to initialize runtime-owned goal actor".to_string(),
-                        ));
-                        continue;
-                    }
+                let Some(runtime_thread) = thread.as_ref() else {
+                    continue;
                 };
-                match runtime.clear(&session_id) {
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                match actions.clear_goal(&session_id) {
                     Ok(()) => {
                         let _ = event_tx.send(TuiEvent::GoalCleared);
                     }
@@ -4840,6 +5382,7 @@ fn hosted_tui_controller_loop(
                         &event_tx,
                         &controller,
                         &pending_workflow_notifications,
+                        ordinary_turn_runner,
                     );
                     continue;
                 }
@@ -4853,10 +5396,12 @@ fn hosted_tui_controller_loop(
                     orca_core::goal_types::ThreadGoalStatus::Active,
                     &event_tx,
                 );
-                let goal = thread
-                    .as_ref()
-                    .and_then(|runtime_thread| runtime_thread.goal_runtime().ok())
-                    .and_then(|runtime| runtime.project_thread_goal(&session_id).ok().flatten());
+                let goal = thread.as_ref().and_then(|runtime_thread| {
+                    TuiSurfaceActions::new(runtime_thread.typed_surface())
+                        .goal(&session_id)
+                        .ok()
+                        .flatten()
+                });
                 if let (Some(runtime_thread), Some(goal)) = (thread.as_ref(), goal) {
                     let cfg = config.lock().unwrap().clone();
                     run_hosted_goal_run(
@@ -4866,6 +5411,7 @@ fn hosted_tui_controller_loop(
                         orca_core::goal_runtime::GoalTurnOrigin::Resume,
                         &event_tx,
                         &controller,
+                        ordinary_turn_runner,
                     );
                 }
             }
@@ -4884,37 +5430,132 @@ fn ensure_hosted_thread(
     thread: &mut Option<RuntimeThreadHandle>,
     host: &RuntimeHostHandle,
     config: &RunConfig,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     title: &str,
-    mcp_registry: &orca_mcp::McpRegistry,
-    pending_pinned_context: &mut Vec<String>,
+    _mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
     if thread.is_none() {
-        let transcript = preloaded.lock().unwrap().clone();
-        let mut request = RuntimeThreadStartRequest::new(config.clone(), title)
-            .with_mcp_registry(mcp_registry.clone());
-        if let Some(transcript) = transcript {
-            request = request.with_preloaded(transcript);
-        }
+        let request = RuntimeThreadStartRequest::new(config.clone(), title);
+        #[cfg(test)]
+        let request = request.with_mcp_registry(_mcp_registry.clone());
+        #[cfg(test)]
+        let request = if let Some(transcript) = _preloaded.lock().unwrap().clone() {
+            request.with_preloaded(transcript)
+        } else {
+            request
+        };
         let started = host
             .start_thread_with_request(request)
             .map_err(|error| format!("failed to initialize conversation history: {error}"))?;
-        *preloaded.lock().unwrap() = None;
-        notify_recovered_background_approvals_for_tui(&started.task_registry(), event_tx);
+        #[cfg(test)]
+        {
+            *_preloaded.lock().unwrap() = None;
+        }
+        notify_recovered_background_approvals_for_tui(
+            &TuiSurfaceActions::new(started.typed_surface()),
+            event_tx,
+        );
         *thread = Some(started);
     }
-    if let Some(runtime_thread) = thread.as_ref() {
-        while let Some(context) = pending_pinned_context.first().cloned() {
-            if let Err(error) =
-                runtime_thread.mutate(RuntimeThreadMutation::AddPinnedContext(context))
-            {
-                return Err(error.to_string());
-            }
-            pending_pinned_context.remove(0);
-        }
-    }
     Ok(())
+}
+
+fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<TuiEvent>) {
+    let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    if let Ok(Some(recovery)) = actions
+        .read_snapshot()
+        .map(|snapshot| snapshot.recoverable_user_operation())
+    {
+        let _ = event_tx.send(TuiEvent::RecoveryAvailable {
+            operation_id: recovery.operation_id().clone(),
+        });
+        let _ = event_tx.send(TuiEvent::Notice(
+            "A recoverable operation is suspended. Use /resume to continue it or /cancel-operation to close it."
+                .to_string(),
+        ));
+    }
+}
+
+fn emit_typed_history_snapshot(
+    thread: &RuntimeThreadHandle,
+    mode: &HistoryMode,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
+    let history = actions.read_history().map_err(|error| error.to_string())?;
+    let messages = crate::surface_projection::history_messages_from_surface_history(&history);
+    let plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
+        None
+    } else {
+        Some((
+            snapshot
+                .plan
+                .explanation
+                .as_ref()
+                .map(|text| text.as_str().to_string()),
+            snapshot
+                .plan
+                .items
+                .iter()
+                .map(|item| PlanItem {
+                    step: item.step.as_str().to_string(),
+                    status: match item.status {
+                        orca_runtime::surface::SurfacePlanStatus::Pending => PlanStatus::Pending,
+                        orca_runtime::surface::SurfacePlanStatus::InProgress => {
+                            PlanStatus::InProgress
+                        }
+                        orca_runtime::surface::SurfacePlanStatus::Completed => {
+                            PlanStatus::Completed
+                        }
+                    },
+                })
+                .collect(),
+        ))
+    };
+    let label = if matches!(mode, HistoryMode::Fork(_)) {
+        "Forked saved conversation."
+    } else {
+        "Resumed saved conversation."
+    };
+    event_tx
+        .send(TuiEvent::HistoryLoaded {
+            messages,
+            plan,
+            label: label.to_string(),
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn typed_history_startup_eligible(
+    mode: &HistoryMode,
+    _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+) -> bool {
+    let HistoryMode::Resume(selector) = mode else {
+        return false;
+    };
+    selector == "latest" || looks_like_uuid_session_id(selector)
+}
+
+fn looks_like_uuid_session_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn emit_empty_history_snapshot(event_tx: &mpsc::Sender<TuiEvent>, label: &str) {
+    let _ = event_tx.send(TuiEvent::HistoryLoaded {
+        messages: Vec::new(),
+        plan: None,
+        label: label.to_string(),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4923,15 +5564,16 @@ fn handle_hosted_submitted_turn(
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     thread: &mut Option<RuntimeThreadHandle>,
-    pending_pinned_context: &mut Vec<String>,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
     host: &RuntimeHostHandle,
+    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let cfg = config.lock().unwrap().clone();
+    let thread_was_missing = thread.is_none();
     let cwd = cfg
         .cwd
         .clone()
@@ -4944,11 +5586,13 @@ fn handle_hosted_submitted_turn(
         preloaded,
         &title_seed,
         mcp_registry,
-        pending_pinned_context,
         event_tx,
     ) {
         send_submission_error(event_tx, rejection_prompt.as_deref(), error);
         return;
+    }
+    if thread_was_missing {
+        announce_runtime_ready(thread.as_ref().expect("submitted thread"), event_tx);
     }
     let runtime_thread = thread.as_ref().expect("hosted thread initialized");
     let workspace_roots = cfg
@@ -4956,11 +5600,8 @@ fn handle_hosted_submitted_turn(
         .clone()
         .filter(|roots| !roots.is_empty())
         .unwrap_or_else(|| vec![cwd.clone()]);
-    let prompt = match submitted_turn.prompt_for_model(
-        &cwd,
-        &workspace_roots,
-        &runtime_thread.mcp_registry(),
-    ) {
+    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+    let prompt = match submitted_turn.prompt_for_model(&actions, &cwd, &workspace_roots) {
         Ok(prompt) => prompt,
         Err(error) => {
             send_submission_error(event_tx, rejection_prompt.as_deref(), error);
@@ -4974,19 +5615,23 @@ fn handle_hosted_submitted_turn(
         orca_core::goal_runtime::GoalTurnOrigin::User,
         event_tx,
         controller,
+        ordinary_turn_runner,
     );
     if cfg.desktop_notifications {
         let _ = orca_runtime::notify::notify("Orca", "Task completed");
     }
 }
 
-fn run_hosted_operation(
+pub(crate) fn run_hosted_operation(
     thread: &RuntimeThreadHandle,
     request: HostedTurnRequest,
     config: RunConfig,
     controller: &TuiOperationController,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
+    if !matches!(request.operation_kind(), HostedOperationKind::GoalRun) {
+        controller.begin_surface_activation()?;
+    }
     let operation_kind = request.operation_kind().clone();
     let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
     let pending_interactions =
@@ -5025,6 +5670,7 @@ fn run_hosted_operation(
     let operation = match thread.start_turn_with_config(request, io::sink(), config) {
         Ok(operation) => Arc::new(operation),
         Err(error) => {
+            controller.cancel_surface_activation();
             send_hosted_operation_terminal_failure(event_tx, &operation_kind);
             return Err(io::Error::other(error.to_string()));
         }
@@ -5079,6 +5725,18 @@ fn send_hosted_operation_terminal_failure(
     });
 }
 
+fn emit_hosted_operation_error(
+    event_tx: &mpsc::Sender<TuiEvent>,
+    error: io::Error,
+    operation_kind: &HostedOperationKind,
+) {
+    let recovery_required = crate::surface_client::is_terminal_recovery_error(&error);
+    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+    if !recovery_required {
+        send_hosted_operation_terminal_failure(event_tx, operation_kind);
+    }
+}
+
 fn run_hosted_goal_run(
     config: &RunConfig,
     thread: &RuntimeThreadHandle,
@@ -5086,19 +5744,14 @@ fn run_hosted_goal_run(
     origin: orca_core::goal_runtime::GoalTurnOrigin,
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
+    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     let Some(session_id) = thread.session_id().map(str::to_string) else {
         send_goal_history_error(event_tx);
         return;
     };
-    let runtime = match thread.goal_runtime() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-            return;
-        }
-    };
-    let active_goal = match runtime.project_thread_goal(&session_id) {
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    let active_goal = match actions.goal(&session_id) {
         Ok(goal) => goal.filter(|goal| goal.status.should_continue()),
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error.to_string()));
@@ -5116,7 +5769,19 @@ fn run_hosted_goal_run(
     } else {
         request
     };
-    let status = match run_hosted_operation(thread, request, config.clone(), controller, event_tx) {
+    let outcome = match request.operation_kind() {
+        HostedOperationKind::GoalRun => {
+            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
+        }
+        HostedOperationKind::Turn => {
+            ordinary_turn_runner(config, thread, request, event_tx, controller)
+        }
+        HostedOperationKind::ManualCompaction
+        | HostedOperationKind::BackgroundContinuation { .. } => {
+            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
+        }
+    };
+    let status = match outcome {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
             let _ = event_tx.send(TuiEvent::Error(
@@ -5125,16 +5790,16 @@ fn run_hosted_goal_run(
             return;
         }
         Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn);
             return;
         }
     };
-    match runtime.project_thread_goal(&session_id) {
+    match actions.goal(&session_id) {
         Ok(Some(goal)) => {
             let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
             let _ = event_tx.send(TuiEvent::GoalUpdated(goal.clone()));
             if status != "success" || !goal.status.should_continue() {
-                let notice = match runtime.read(&session_id) {
+                let notice = match actions.goal_record(&session_id) {
                     Ok(Some(record)) => match record.state {
                         orca_core::goal_runtime::GoalState::Paused {
                             reason: orca_core::goal_runtime::GoalPauseReason::NoProgress,
@@ -5160,6 +5825,32 @@ fn run_hosted_goal_run(
             let _ = event_tx.send(TuiEvent::Error(error.to_string()));
         }
     }
+}
+
+fn run_hosted_ordinary_turn(
+    config: &RunConfig,
+    thread: &RuntimeThreadHandle,
+    request: HostedTurnRequest,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    controller: &TuiOperationController,
+) -> io::Result<TuiHostedOperationOutcome> {
+    TuiSurfaceActions::new(thread.typed_surface()).run_turn(
+        request,
+        config.clone(),
+        controller,
+        event_tx,
+    )
+}
+
+#[cfg(test)]
+fn run_hosted_legacy_ordinary_turn(
+    config: &RunConfig,
+    thread: &RuntimeThreadHandle,
+    request: HostedTurnRequest,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    controller: &TuiOperationController,
+) -> io::Result<TuiHostedOperationOutcome> {
+    run_hosted_operation(thread, request, config.clone(), controller, event_tx)
 }
 
 fn hosted_turn_request(
@@ -5211,7 +5902,6 @@ fn existing_hosted_goal_session_id(
     let _ = event_tx.send(TuiEvent::Error(message.to_string()));
     None
 }
-
 fn show_hosted_goal(
     thread: &Option<RuntimeThreadHandle>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
@@ -5226,26 +5916,11 @@ fn show_hosted_goal(
         }
         return;
     };
-    let mut detached_join = None;
-    let runtime = match thread.as_ref() {
-        Some(thread) => thread.goal_runtime().map_err(|error| error.to_string()),
-        None => orca_runtime::goal_actor::GoalRuntimeHandle::open_default()
-            .map(|(runtime, join)| {
-                detached_join = Some(join);
-                runtime
-            })
+    let result = match thread.as_ref() {
+        Some(thread) => TuiSurfaceActions::new(thread.typed_surface()).goal(&session_id),
+        None => RuntimeSurfaceHostHandle::project_saved_goal(&session_id)
             .map_err(|error| error.to_string()),
     };
-    let result = runtime.and_then(|runtime| {
-        let result = runtime
-            .project_thread_goal(&session_id)
-            .map_err(|error| error.to_string());
-        drop(runtime);
-        result
-    });
-    if let Some(join) = detached_join {
-        let _ = join.join();
-    }
     match result {
         Ok(goal) => {
             let _ = event_tx.send(TuiEvent::GoalStatus(goal));
@@ -5272,20 +5947,13 @@ fn resume_latest_active_goal_hosted(
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         send_goal_history_error(event_tx);
         return;
     }
-    let (goal_runtime, _goal_actor_join) =
-        match orca_runtime::goal_actor::GoalRuntimeHandle::open_default() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!("failed to read goals: {error}")));
-                return;
-            }
-        };
-    let goal = match goal_runtime.latest_active() {
+    let goal = match RuntimeSurfaceHostHandle::latest_active_saved_goal() {
         Ok(Some(goal)) => goal,
         Ok(None) => {
             let _ = event_tx.send(TuiEvent::GoalStatus(None));
@@ -5296,7 +5964,7 @@ fn resume_latest_active_goal_hosted(
             return;
         }
     };
-    let transcript = match history::load_session(&goal.session_id) {
+    let transcript = match RuntimeSurfaceHostHandle::load_saved_session(&goal.session_id) {
         Ok(transcript) => transcript,
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(format!(
@@ -5325,41 +5993,44 @@ fn resume_latest_active_goal_hosted(
         let _ = resumed.shutdown();
         return;
     };
-    let active_goal =
-        match goal_runtime.resume_into(&goal.session_id, &new_session_id, now_timestamp()) {
-            Ok(Some(_)) => match resumed
-                .goal_runtime()
-                .ok()
-                .and_then(|runtime| runtime.project_thread_goal(&new_session_id).ok().flatten())
-            {
-                Some(goal) => goal,
-                None => {
-                    let _ = event_tx.send(TuiEvent::Error(
-                        "goal disappeared while projecting the resumed session".to_string(),
-                    ));
-                    let _ = resumed.shutdown();
-                    return;
-                }
-            },
-            Ok(None) => {
+    let resumed_actions = TuiSurfaceActions::new(resumed.typed_surface());
+    let active_goal = match resumed_actions.resume_goal_into(
+        &goal.session_id,
+        &new_session_id,
+        now_timestamp(),
+    ) {
+        Ok(Some(_)) => match resumed_actions.goal(&new_session_id).ok().flatten() {
+            Some(goal) => goal,
+            None => {
                 let _ = event_tx.send(TuiEvent::Error(
-                    "goal disappeared while restoring its session".to_string(),
+                    "goal disappeared while projecting the resumed session".to_string(),
                 ));
                 let _ = resumed.shutdown();
                 return;
             }
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "failed to resume goal in restored session: {error}"
-                )));
-                let _ = resumed.shutdown();
-                return;
-            }
-        };
+        },
+        Ok(None) => {
+            let _ = event_tx.send(TuiEvent::Error(
+                "goal disappeared while restoring its session".to_string(),
+            ));
+            let _ = resumed.shutdown();
+            return;
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to resume goal in restored session: {error}"
+            )));
+            let _ = resumed.shutdown();
+            return;
+        }
+    };
     if let Some(previous) = thread.take() {
         let _ = previous.shutdown();
     }
-    notify_recovered_background_approvals_for_tui(&resumed.task_registry(), event_tx);
+    notify_recovered_background_approvals_for_tui(
+        &TuiSurfaceActions::new(resumed.typed_surface()),
+        event_tx,
+    );
     *thread = Some(resumed);
     *preloaded.lock().unwrap() = None;
     if let Ok(mut shared) = config.lock() {
@@ -5377,6 +6048,7 @@ fn resume_latest_active_goal_hosted(
             orca_core::goal_runtime::GoalTurnOrigin::Resume,
             event_tx,
             controller,
+            ordinary_turn_runner,
         );
     }
 }
@@ -5450,4 +6122,161 @@ pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage>
             })
         }
     }
+}
+
+fn settings_intent_patches(
+    intent: SettingsIntent,
+) -> Vec<orca_runtime::surface::RuntimeSettingsPatch> {
+    let mut patches = Vec::new();
+    if let Some(model) = intent.model
+        && let Ok(model) = orca_runtime::surface::NonEmptyText::try_new(model)
+    {
+        patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetModel { model });
+    }
+    if let Some(effort) = intent.reasoning_effort {
+        patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetReasoning {
+            effort: match effort {
+                orca_core::config::ReasoningEffort::High => {
+                    orca_runtime::surface::SurfaceReasoningEffort::High
+                }
+                orca_core::config::ReasoningEffort::Max => {
+                    orca_runtime::surface::SurfaceReasoningEffort::Max
+                }
+            },
+        });
+    }
+    if let Some(mode) = intent.approval_mode {
+        patches.push(
+            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
+                mode: match mode {
+                    orca_core::approval_types::ApprovalMode::Suggest => {
+                        orca_runtime::surface::SurfaceApprovalMode::Suggest
+                    }
+                    orca_core::approval_types::ApprovalMode::AutoEdit => {
+                        orca_runtime::surface::SurfaceApprovalMode::AutoEdit
+                    }
+                    orca_core::approval_types::ApprovalMode::FullAuto => {
+                        orca_runtime::surface::SurfaceApprovalMode::FullAuto
+                    }
+                    orca_core::approval_types::ApprovalMode::Plan => {
+                        orca_runtime::surface::SurfaceApprovalMode::Plan
+                    }
+                },
+            },
+        );
+    }
+    patches
+}
+
+fn apply_hosted_settings_action(
+    thread: Option<&RuntimeThreadHandle>,
+    config: &Arc<Mutex<RunConfig>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    patches: Vec<orca_runtime::surface::RuntimeSettingsPatch>,
+) {
+    if patches.is_empty() {
+        return;
+    }
+    if let Some(thread) = thread {
+        let patches = match orca_runtime::surface::NonEmptyVec::try_new(patches) {
+            Ok(patches) => patches,
+            Err(_) => return,
+        };
+        let actions = TuiSurfaceActions::new(thread.typed_surface());
+        let settings = match actions.update_settings(patches) {
+            Ok(settings) => settings,
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
+                return;
+            }
+        };
+        let model = settings.effective.model.as_str().to_string();
+        let reasoning_effort = match settings.effective.reasoning_effort {
+            orca_runtime::surface::SurfaceReasoningEffort::High => {
+                orca_core::config::ReasoningEffort::High
+            }
+            orca_runtime::surface::SurfaceReasoningEffort::Max => {
+                orca_core::config::ReasoningEffort::Max
+            }
+            orca_runtime::surface::SurfaceReasoningEffort::Low
+            | orca_runtime::surface::SurfaceReasoningEffort::Medium => {
+                let _ = event_tx.send(TuiEvent::OperationRejected(
+                    "runtime returned an unsupported reasoning effort".to_string(),
+                ));
+                return;
+            }
+        };
+        let approval_mode = match settings.effective.approval_mode {
+            orca_runtime::surface::SurfaceApprovalMode::Suggest => {
+                orca_core::approval_types::ApprovalMode::Suggest
+            }
+            orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
+                orca_core::approval_types::ApprovalMode::AutoEdit
+            }
+            orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
+                orca_core::approval_types::ApprovalMode::FullAuto
+            }
+            orca_runtime::surface::SurfaceApprovalMode::Plan => {
+                orca_core::approval_types::ApprovalMode::Plan
+            }
+        };
+        if let Ok(mut cfg) = config.lock() {
+            cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(model.clone()));
+            cfg.reasoning_effort = reasoning_effort;
+            cfg.approval_mode = approval_mode;
+        }
+        let _ = event_tx.send(TuiEvent::SettingsUpdated {
+            model,
+            reasoning_effort,
+            approval_mode,
+        });
+        return;
+    }
+
+    let mut cfg = config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for patch in patches {
+        match patch {
+            orca_runtime::surface::RuntimeSettingsPatch::SetModel { model } => {
+                cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(
+                    model.as_str().to_string(),
+                ));
+            }
+            orca_runtime::surface::RuntimeSettingsPatch::SetReasoning { effort } => {
+                cfg.reasoning_effort = match effort {
+                    orca_runtime::surface::SurfaceReasoningEffort::High => {
+                        orca_core::config::ReasoningEffort::High
+                    }
+                    orca_runtime::surface::SurfaceReasoningEffort::Max => {
+                        orca_core::config::ReasoningEffort::Max
+                    }
+                    orca_runtime::surface::SurfaceReasoningEffort::Low
+                    | orca_runtime::surface::SurfaceReasoningEffort::Medium => continue,
+                };
+            }
+            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {
+                cfg.approval_mode = match mode {
+                    orca_runtime::surface::SurfaceApprovalMode::Suggest => {
+                        orca_core::approval_types::ApprovalMode::Suggest
+                    }
+                    orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
+                        orca_core::approval_types::ApprovalMode::AutoEdit
+                    }
+                    orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
+                        orca_core::approval_types::ApprovalMode::FullAuto
+                    }
+                    orca_runtime::surface::SurfaceApprovalMode::Plan => {
+                        orca_core::approval_types::ApprovalMode::Plan
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+    let _ = event_tx.send(TuiEvent::SettingsUpdated {
+        model: cfg.model.display_name().to_string(),
+        reasoning_effort: cfg.reasoning_effort,
+        approval_mode: cfg.approval_mode,
+    });
 }

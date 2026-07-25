@@ -33,6 +33,7 @@ use crate::memory::MemoryBlock;
 use crate::provider_stream::RuntimeProviderSuspensionControl;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_state::RuntimeTurnReducer;
+use crate::runtime_surface::RuntimeProviderResponseIngress;
 use crate::runtime_tool_call::{
     RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
 };
@@ -133,6 +134,7 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
     pub(crate) provider_suspension_control: Option<&'a dyn RuntimeProviderSuspensionControl>,
+    pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
 }
 
 #[derive(Clone, Copy)]
@@ -879,6 +881,14 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_provider_response_ingress(
+        mut self,
+        ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
+    ) -> Self {
+        self.turn_context = self.turn_context.with_provider_response_ingress(ingress);
+        self
+    }
+
     #[allow(dead_code)]
     pub(crate) fn with_initial_response(mut self, response: ProviderResponse) -> Self {
         let turn_id = self.turn_context.turn_id.clone();
@@ -998,6 +1008,7 @@ impl<'a> RuntimeTurnContext<'a> {
             continuation: None,
             steer_handle: None,
             provider_suspension_control: None,
+            provider_response_ingress: None,
         }
     }
 
@@ -1022,6 +1033,20 @@ impl<'a> RuntimeTurnContext<'a> {
     ) -> Self {
         self.provider_suspension_control = control;
         self
+    }
+
+    pub(crate) fn with_provider_response_ingress(
+        mut self,
+        ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
+    ) -> Self {
+        self.provider_response_ingress = ingress;
+        self
+    }
+
+    pub(crate) fn provider_response_ingress(
+        &self,
+    ) -> Option<&'a dyn RuntimeProviderResponseIngress> {
+        self.provider_response_ingress
     }
 
     #[cfg(test)]

@@ -125,6 +125,7 @@ impl ServerState {
         self.command_exec.terminate_all(self.shells.sessions_mut());
         let _ = self.pending_permissions.close();
         let _ = self.pending_user_inputs.close();
+        let _ = self.pending_mcp_elicitations.close();
         self.shells.terminate_all();
         self.terminate_searches();
         let result = self.threads.shutdown();

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -417,10 +418,17 @@ fn load_auth_key(path: &Path) -> Option<String> {
 }
 
 pub fn save_api_key(api_key: &str) {
-    let Some(dir) = config_dir() else {
-        return;
-    };
-    let _ = fs::create_dir_all(&dir);
+    let _ = save_api_key_checked(api_key);
+}
+
+pub fn save_api_key_checked(api_key: &str) -> io::Result<PathBuf> {
+    let dir = config_dir()
+        .ok_or_else(|| io::Error::other("could not resolve the Orca configuration directory"))?;
+    save_api_key_checked_to_dir(&dir, api_key)
+}
+
+fn save_api_key_checked_to_dir(dir: &Path, api_key: &str) -> io::Result<PathBuf> {
+    fs::create_dir_all(&dir)?;
     let path = dir.join("auth.json");
 
     let mut map: HashMap<String, String> = fs::read_to_string(&path)
@@ -430,9 +438,9 @@ pub fn save_api_key(api_key: &str) {
 
     map.insert("DEEPSEEK_API_KEY".to_string(), api_key.to_string());
 
-    if let Ok(content) = serde_json::to_string_pretty(&map) {
-        let _ = fs::write(&path, content);
-    }
+    let content = serde_json::to_string_pretty(&map).map_err(io::Error::other)?;
+    fs::write(&path, content)?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -444,6 +452,21 @@ mod tests {
             return FileConfig::default();
         };
         toml::from_str(&content).unwrap_or_default()
+    }
+
+    #[test]
+    fn checked_api_key_save_returns_only_after_the_file_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = save_api_key_checked_to_dir(dir.path(), "sk-test").unwrap();
+
+        assert_eq!(path, dir.path().join("auth.json"));
+        let saved: HashMap<String, String> =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("DEEPSEEK_API_KEY").map(String::as_str),
+            Some("sk-test")
+        );
     }
 
     #[test]

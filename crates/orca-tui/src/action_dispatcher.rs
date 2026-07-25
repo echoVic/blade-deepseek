@@ -138,7 +138,15 @@ fn route_action(
 ) -> bool {
     match action {
         UserAction::RespondToInteraction { key, response } => {
-            let _ = controller.broker().respond(&key, response);
+            match controller.respond_surface_interaction(&key, &response) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = controller.broker().respond(&key, response);
+                }
+                Err(error) => {
+                    let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
+                }
+            }
         }
         UserAction::Interrupt => {
             controller.interrupt_current();
@@ -160,11 +168,33 @@ fn route_action(
             }
         },
         UserAction::Cancel => return false,
-        action => match enqueue_action(action, command_tx, backlog, backlog_capacity) {
-            EnqueueResult::Queued => {}
-            EnqueueResult::Disconnected => return false,
-            EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
-        },
+        action => {
+            let arms_surface_activation = matches!(
+                &action,
+                UserAction::Submit(_)
+                    | UserAction::SubmitWithMentions { .. }
+                    | UserAction::SubmitWorkflowNotification(_)
+                    | UserAction::Compact
+                    | UserAction::ResumeOperation { .. }
+                    | UserAction::GoalResume
+                    | UserAction::ResolveBackgroundApproval { .. }
+            );
+            let armed_here = if arms_surface_activation {
+                controller.begin_surface_activation().unwrap_or(false)
+            } else {
+                false
+            };
+            match enqueue_action(action, command_tx, backlog, backlog_capacity) {
+                EnqueueResult::Queued => {}
+                EnqueueResult::Disconnected => return false,
+                EnqueueResult::Overflow(action) => {
+                    if armed_here {
+                        controller.cancel_surface_activation();
+                    }
+                    reject_overflowed_action(event_tx, action);
+                }
+            }
+        }
     }
     true
 }

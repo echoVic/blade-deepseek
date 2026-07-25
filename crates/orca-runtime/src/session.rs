@@ -51,6 +51,7 @@ pub struct InteractiveSession {
     hooks: HookRunner,
     memory: MemoryBlock,
     task_registry: TaskRegistry,
+    last_manual_compaction: Option<ManualCompactionOutcome>,
 }
 
 pub(crate) struct InteractiveSessionRuntimeParts<'a> {
@@ -62,6 +63,19 @@ pub(crate) struct InteractiveSessionRuntimeParts<'a> {
     pub hooks: &'a HookRunner,
     pub memory: &'a MemoryBlock,
     pub task_registry: &'a TaskRegistry,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManualCompactionOutcome {
+    pub before: Conversation,
+    pub after: Conversation,
+    pub strategy: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManualCompactionPersistenceIdentity {
+    pub operation_id: crate::runtime_surface::SurfaceOperationId,
+    pub snapshot_id: String,
 }
 
 pub(crate) fn record_tool_result_for_agent(
@@ -187,6 +201,16 @@ impl InteractiveSession {
         preloaded: Option<SessionTranscript>,
         mcp_registry: McpRegistry,
     ) -> io::Result<Self> {
+        Self::new_with_prepared_history(config, prompt_for_title, preloaded, mcp_registry, None)
+    }
+
+    pub(crate) fn new_with_prepared_history(
+        config: &RunConfig,
+        prompt_for_title: &str,
+        preloaded: Option<SessionTranscript>,
+        mcp_registry: McpRegistry,
+        prepared_record_meta: Option<SessionMeta>,
+    ) -> io::Result<Self> {
         let cwd = config
             .cwd
             .clone()
@@ -260,29 +284,34 @@ impl InteractiveSession {
                 None => None,
             },
             HistoryMode::Record => {
-                match store.create_live_thread_with_permissions(
-                    &cwd,
-                    config.provider.as_str(),
-                    config.model.as_history_value(),
-                    prompt_for_title,
-                    config.active_permission_profile.clone(),
-                    config.approval_mode,
-                    config.permission_rules.clone(),
-                    config.additional_working_directories.clone(),
-                ) {
-                    Ok(mut thread) => {
-                        if let Err(error) = thread.append_items(&conversation.messages) {
-                            eprintln!("orca: warning: history write failed: {error}");
-                            None
-                        } else {
-                            let (thread_id, writer) = thread.into_thread_id_and_writer();
-                            session_id = Some(thread_id);
-                            Some(writer)
+                if let Some(meta) = prepared_record_meta {
+                    session_id = Some(meta.session_id.clone());
+                    start_writer_with_messages(&store, meta, &conversation)
+                } else {
+                    match store.create_live_thread_with_permissions(
+                        &cwd,
+                        config.provider.as_str(),
+                        config.model.as_history_value(),
+                        prompt_for_title,
+                        config.active_permission_profile.clone(),
+                        config.approval_mode,
+                        config.permission_rules.clone(),
+                        config.additional_working_directories.clone(),
+                    ) {
+                        Ok(mut thread) => {
+                            if let Err(error) = thread.append_items(&conversation.messages) {
+                                eprintln!("orca: warning: history write failed: {error}");
+                                None
+                            } else {
+                                let (thread_id, writer) = thread.into_thread_id_and_writer();
+                                session_id = Some(thread_id);
+                                Some(writer)
+                            }
                         }
-                    }
-                    Err(error) => {
-                        eprintln!("orca: warning: failed to initialize history: {error}");
-                        None
+                        Err(error) => {
+                            eprintln!("orca: warning: failed to initialize history: {error}");
+                            None
+                        }
                     }
                 }
             }
@@ -323,6 +352,7 @@ impl InteractiveSession {
             hooks,
             memory,
             task_registry: TaskRegistry::new_for_cwd(task_session_id, &cwd),
+            last_manual_compaction: None,
         })
     }
 
@@ -332,6 +362,20 @@ impl InteractiveSession {
 
     pub fn conversation_mut(&mut self) -> &mut Conversation {
         &mut self.conversation
+    }
+
+    pub(crate) fn take_manual_compaction_outcome(&mut self) -> Option<ManualCompactionOutcome> {
+        self.last_manual_compaction.take()
+    }
+
+    pub(crate) fn manual_compaction_snapshot(
+        &self,
+        operation_id: &crate::runtime_surface::SurfaceOperationId,
+    ) -> io::Result<Option<crate::thread_store::ManualCompactionDurableSnapshot>> {
+        let Some(writer) = &self.writer else {
+            return Ok(None);
+        };
+        crate::thread_store::read_manual_compaction_snapshot(writer.path(), operation_id)
     }
 
     pub fn writer_mut(&mut self) -> Option<&mut SessionWriter> {
@@ -353,6 +397,12 @@ impl InteractiveSession {
             .as_ref()
             .cloned()
             .map(|writer| (self.next_event_seq, writer))
+    }
+
+    pub(crate) fn surface_commit_path(&self) -> Option<std::path::PathBuf> {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.path().to_path_buf())
     }
 
     pub fn completion_error(&self) -> Option<&str> {
@@ -484,13 +534,19 @@ impl InteractiveSession {
         self.conversation.replace_skill_context(content);
     }
 
-    pub fn compact(
+    pub(crate) fn compact<F>(
         &mut self,
         config: &RunConfig,
         cwd: &Path,
         cancel: &orca_core::cancel::CancelToken,
-    ) -> (usize, usize) {
+        precommit: F,
+    ) -> io::Result<ManualCompactionOutcome>
+    where
+        F: FnOnce(&ManualCompactionOutcome) -> io::Result<ManualCompactionPersistenceIdentity>,
+    {
+        let before = self.conversation.clone();
         let before_messages = self.conversation.messages.len();
+        let mut candidate = self.conversation.clone();
         if let Ok(outcome) = self.hooks.run_with_cancel(
             HookEvent::OnBudgetWarning,
             HookContext {
@@ -505,7 +561,7 @@ impl InteractiveSession {
             cancel,
         ) && !outcome.injected_context.is_empty()
         {
-            self.conversation = conversation_with_hook_context(&self.conversation, &outcome);
+            candidate = conversation_with_hook_context(&candidate, &outcome);
         }
         let _ = self.hooks.run_with_cancel(
             HookEvent::PreCompact,
@@ -531,7 +587,7 @@ impl InteractiveSession {
         };
         let compaction = orca_provider::context::compact_with_summary_cancellable(
             config.provider,
-            &self.conversation,
+            &candidate,
             &orca_provider::context::ContextConfig::for_model_with_runtime(
                 config.model.as_option().as_deref(),
                 &config.model_runtime,
@@ -539,20 +595,28 @@ impl InteractiveSession {
             &provider_config,
             cancel,
         );
-        self.conversation = compaction.conversation;
-        let after_messages = self.conversation.messages.len();
+        let strategy = match &compaction.kind {
+            orca_provider::context::CompactionKind::LocalTruncation => "local_truncation",
+            orca_provider::context::CompactionKind::RemoteSummary(_) => "remote_summary",
+        };
+        let after = compaction.conversation;
+        let after_messages = after.messages.len();
+        let outcome = ManualCompactionOutcome {
+            before,
+            after,
+            strategy,
+        };
+        let identity = precommit(&outcome)?;
         if let Some(writer) = &mut self.writer {
-            let _ = writer.append_compaction(before_messages, after_messages);
-            if let orca_provider::context::CompactionKind::RemoteSummary(summary) = compaction.kind
-            {
-                let _ = writer.append_summary_state(
-                    before_messages,
-                    after_messages,
-                    summary,
-                    &self.conversation.summary,
-                );
-            }
+            writer.append_manual_compaction_snapshot(
+                &identity,
+                before_messages,
+                outcome.strategy,
+                &outcome.after,
+            )?;
         }
+        self.conversation = outcome.after.clone();
+        self.last_manual_compaction = Some(outcome.clone());
         let _ = self.hooks.run_with_cancel(
             HookEvent::PostCompact,
             HookContext {
@@ -566,7 +630,7 @@ impl InteractiveSession {
             },
             cancel,
         );
-        (before_messages, after_messages)
+        Ok(outcome)
     }
 }
 
