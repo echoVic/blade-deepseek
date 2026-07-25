@@ -19,8 +19,8 @@ use crate::goal_store::{
     FinishGoalOuterTurnForSurfaceInput, FinishOuterTurnInput, GoalIntentRecord, GoalRecoveryRecord,
     GoalStore, GoalStoreError, GoalSurfaceMutationContext, GoalSurfaceMutationRecord,
     GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate, GoalUsageEvent, PauseGoalForSurfaceInput,
-    PrepareGoalRunForSurfaceInput, RecoverGoalRunForSurfaceInput,
-    ReplaceGoalContinuationForSurfaceInput,
+    PauseQuiescentGoalForSurfaceInput, PrepareGoalRunForSurfaceInput,
+    RecoverGoalRunForSurfaceInput, ReplaceGoalContinuationForSurfaceInput,
 };
 use crate::goal_tracker::{GoalTracker, GoalTurnResult, SAME_GAP_STREAK_LIMIT};
 
@@ -619,6 +619,11 @@ enum GoalActorCommand {
         context: GoalSurfaceMutationContext,
         reply: Reply,
     },
+    PauseQuiescentForSurface {
+        input: PauseQuiescentGoalForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
     FinishOuterTurnForSurface {
         input: FinishGoalOuterTurnForSurfaceInput,
         contexts: Vec<GoalSurfaceMutationContext>,
@@ -1181,6 +1186,24 @@ impl GoalRuntimeHandle {
             GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
             _ => Err(GoalActorError::Invalid(
                 "goal actor returned wrong surface pause reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn pause_quiescent_for_surface(
+        &self,
+        input: PauseQuiescentGoalForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::PauseQuiescentForSurface {
+            input,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface quiescent pause reply".to_string(),
             )),
         })
     }
@@ -1841,6 +1864,20 @@ impl GoalActor {
                     .and_then(|context| {
                         self.store
                             .pause_goal_for_surface(input, context)
+                            .map_err(Into::into)
+                    })
+                    .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::PauseQuiescentForSurface {
+                input,
+                context,
+                reply,
+            } => (
+                reply,
+                self.authorize_surface_context(context)
+                    .and_then(|context| {
+                        self.store
+                            .pause_quiescent_goal_for_surface(input, context)
                             .map_err(Into::into)
                     })
                     .map(GoalActorReply::SurfaceMutation),

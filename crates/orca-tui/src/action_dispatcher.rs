@@ -176,6 +176,7 @@ fn route_action(
                     | UserAction::SubmitWorkflowNotification(_)
                     | UserAction::Compact
                     | UserAction::ResumeOperation { .. }
+                    | UserAction::GoalSet(_)
                     | UserAction::GoalResume
                     | UserAction::ResolveBackgroundApproval { .. }
             );

@@ -8,15 +8,16 @@ use std::time::Duration;
 use orca_core::config::RunConfig;
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
-    AttachResult, DisplayText, FreshAttachRequest, MutationReply, NonEmptyVec,
-    OperationIngressCorrelation, OperationKind, OperationPatch, OperationRequestIntent,
-    OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
-    PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
-    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
-    SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId, SurfaceEvent,
-    SurfaceHistoryMessage, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
-    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
+    AttachResult, DisplayText, ExpectedGoal, FreshAttachRequest, GoalMutationAction, GoalRunInput,
+    GoalTokenBudgetUpdate, MutationReply, NonEmptyText, NonEmptyVec, OperationIngressCorrelation,
+    OperationKind, OperationPatch, OperationRequestIntent, OperationSettingsPreparation,
+    OperationTerminal, PinnedContextAction, PinnedContextSourceRevision, PinnedUserRevision,
+    ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
+    RuntimeSurfaceThreadHandle, Sha256Digest, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceCatalogEntryId, SurfaceEvent, SurfaceGoal, SurfaceGoalFence, SurfaceHistoryMessage,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
+    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
+    SurfaceSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -329,20 +330,290 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
         interaction_capabilities: BTreeSet::new(),
     }) {
         AttachResult::FreshAttached { attachment } => attachment,
-        AttachResult::Denied { .. }
-        | AttachResult::CursorAttached { .. }
+        AttachResult::Denied { reason } => {
+            return Err(io::Error::other(format!(
+                "typed TUI snapshot attachment denied: {reason:?}"
+            )));
+        }
+        AttachResult::Unavailable { reason } => {
+            return Err(io::Error::other(format!(
+                "typed TUI snapshot attachment unavailable: {reason:?}"
+            )));
+        }
+        AttachResult::ThreadClosed { .. } => {
+            return Err(io::Error::other("typed TUI snapshot thread is closed"));
+        }
+        AttachResult::CursorAttached { .. }
         | AttachResult::SnapshotRequired { .. }
-        | AttachResult::InvalidCursor { .. }
-        | AttachResult::ThreadClosed { .. }
-        | AttachResult::Unavailable { .. } => {
+        | AttachResult::InvalidCursor { .. } => {
             return Err(io::Error::other(
-                "typed TUI snapshot attachment unavailable",
+                "typed TUI snapshot attachment returned an invalid fresh-attach result",
             ));
         }
     };
     let snapshot = (*attachment.baseline.snapshot).clone();
     detach(&surface, &attachment.client);
     Ok(snapshot)
+}
+
+pub(crate) fn read_goal(
+    thread: &RuntimeSurfaceThreadHandle,
+) -> io::Result<Option<orca_core::goal_types::ThreadGoal>> {
+    let snapshot = read_snapshot(thread)?;
+    Ok(snapshot.goal.as_ref().map(|goal| {
+        crate::surface_projection::thread_goal_from_surface(
+            goal,
+            snapshot.thread.created_at,
+            snapshot.thread.updated_at,
+        )
+    }))
+}
+
+pub(crate) fn edit_goal(
+    thread: &RuntimeSurfaceThreadHandle,
+    objective: String,
+) -> io::Result<Option<orca_core::goal_types::ThreadGoal>> {
+    mutate_idle_goal(thread, |goal| {
+        Ok(GoalMutationAction::Edit {
+            fence: goal_fence(goal),
+            objective: NonEmptyText::try_new(objective)
+                .map_err(|error| io::Error::other(error.to_string()))?,
+            token_budget: GoalTokenBudgetUpdate::Keep,
+        })
+    })
+}
+
+pub(crate) fn clear_goal(thread: &RuntimeSurfaceThreadHandle) -> io::Result<()> {
+    mutate_idle_goal(thread, |goal| {
+        Ok(GoalMutationAction::Clear {
+            fence: goal_fence(goal),
+        })
+    })
+    .map(|_| ())
+}
+
+pub(crate) fn pause_goal(
+    thread: &RuntimeSurfaceThreadHandle,
+) -> io::Result<orca_core::goal_types::ThreadGoal> {
+    let surface = thread.surface();
+    let attachment = attach_goal(&surface, false)?;
+    let snapshot = &attachment.baseline.snapshot;
+    let current = snapshot
+        .goal
+        .as_ref()
+        .ok_or_else(|| io::Error::other("no goal is currently set"))?;
+    let result = attachment
+        .client
+        .pause_goal_operation(SurfaceRequestId::new(), goal_fence(current));
+    detach(&surface, &attachment.client);
+    let output = match result
+        .map_err(|error| io::Error::other(format!("typed TUI Goal pause failed: {error:?}")))?
+    {
+        MutationReply::Committed { value, .. } => value,
+        MutationReply::Deferred { mutation, .. } => {
+            return Err(io::Error::other(format!(
+                "typed TUI Goal pause deferred: request={:?} commit={:?}",
+                mutation.request_id, mutation.commit_id
+            )));
+        }
+        MutationReply::Uncommitted { mutation } => {
+            return Err(io::Error::other(format!(
+                "typed TUI Goal pause did not commit: {mutation:?}"
+            )));
+        }
+    };
+    Ok(crate::surface_projection::thread_goal_from_surface(
+        &output.goal,
+        snapshot.thread.created_at,
+        snapshot.thread.updated_at,
+    ))
+}
+
+fn mutate_idle_goal(
+    thread: &RuntimeSurfaceThreadHandle,
+    action: impl FnOnce(&SurfaceGoal) -> io::Result<GoalMutationAction>,
+) -> io::Result<Option<orca_core::goal_types::ThreadGoal>> {
+    let surface = thread.surface();
+    let attachment = attach_goal(&surface, false)?;
+    let snapshot = &attachment.baseline.snapshot;
+    let current = snapshot
+        .goal
+        .as_ref()
+        .ok_or_else(|| io::Error::other("no goal is currently set"))?;
+    let result = attachment
+        .client
+        .goal_mutation(SurfaceRequestId::new(), action(current)?);
+    detach(&surface, &attachment.client);
+    let output = committed_goal_output(
+        result.map_err(|error| io::Error::other(format!("typed TUI Goal failed: {error:?}")))?,
+    )?;
+    Ok(output.goal.as_ref().map(|goal| {
+        crate::surface_projection::thread_goal_from_surface(
+            goal,
+            snapshot.thread.created_at,
+            snapshot.thread.updated_at,
+        )
+    }))
+}
+
+pub(crate) fn set_goal_and_run(
+    thread: &RuntimeSurfaceThreadHandle,
+    objective: String,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    run_goal_mutation(thread, controller, event_tx, move |snapshot| {
+        let objective = NonEmptyText::try_new(objective)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(GoalMutationAction::SetAndRun {
+            expected_goal: snapshot
+                .goal
+                .as_ref()
+                .map(|goal| ExpectedGoal::Exact(goal_fence(goal)))
+                .unwrap_or(ExpectedGoal::None),
+            token_budget: snapshot.goal.as_ref().and_then(|goal| goal.token_budget),
+            input: supplied_goal_input(objective.as_str())?,
+            objective,
+        })
+    })
+}
+
+pub(crate) fn resume_goal_and_run(
+    thread: &RuntimeSurfaceThreadHandle,
+    prompt: String,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    run_goal_mutation(thread, controller, event_tx, move |snapshot| {
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no goal is currently set"))?;
+        Ok(GoalMutationAction::ResumeAndRun {
+            fence: goal_fence(goal),
+            input: supplied_goal_input(&prompt)?,
+        })
+    })
+}
+
+fn run_goal_mutation(
+    thread: &RuntimeSurfaceThreadHandle,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    action: impl FnOnce(&SurfaceSnapshot) -> io::Result<GoalMutationAction>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    let mut activation = SurfaceActivationGuard::begin(controller)?;
+    let surface = thread.surface();
+    let attachment = attach_goal(&surface, true)?;
+    let mut guard = SurfaceRunGuard::new(&surface, attachment.client.clone(), controller);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .ok_or_else(|| io::Error::other("typed TUI Goal subscription unavailable"))?;
+    let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
+    let output = committed_goal_output(
+        attachment
+            .client
+            .goal_mutation(
+                SurfaceRequestId::new(),
+                action(&attachment.baseline.snapshot)?,
+            )
+            .map_err(|error| io::Error::other(format!("typed TUI Goal failed: {error:?}")))?,
+    )?;
+    let goal = output
+        .goal
+        .as_ref()
+        .ok_or_else(|| io::Error::other("typed TUI Goal mutation removed the goal"))?;
+    let operation_id = output
+        .operation_id
+        .ok_or_else(|| io::Error::other("typed TUI Goal mutation did not start an operation"))?;
+    guard.bind_operation(operation_id.clone());
+    projection.focus_operation(operation_id.clone());
+    controller.install_surface_goal(
+        attachment.client.clone(),
+        operation_id.clone(),
+        goal_fence(goal),
+    )?;
+    activation.disarm();
+    guard.controller_installed();
+    let result = drain_operation(
+        &attachment.client,
+        &operation_id,
+        &mut subscription,
+        &mut projection,
+        controller,
+        event_tx,
+    );
+    if result.is_ok() {
+        guard.terminal_observed();
+    }
+    result
+}
+
+fn attach_goal(
+    surface: &RuntimeSurfaceHandle,
+    running: bool,
+) -> io::Result<orca_runtime::surface::FreshSurfaceAttachment> {
+    let mut capabilities = BTreeSet::from([
+        SurfaceCapability::ReadSnapshot,
+        SurfaceCapability::ManageGoal,
+    ]);
+    let mut interaction_capabilities = BTreeSet::new();
+    if running {
+        capabilities.extend([
+            SurfaceCapability::SubmitOperation,
+            SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::RespondGrantedInteraction,
+        ]);
+        interaction_capabilities.extend([
+            SurfaceInteractionKind::ToolApproval,
+            SurfaceInteractionKind::PermissionRequest,
+            SurfaceInteractionKind::UserInput,
+            SurfaceInteractionKind::McpElicitation,
+        ]);
+    }
+    match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: capabilities,
+        interaction_capabilities,
+    }) {
+        AttachResult::FreshAttached { attachment } => Ok(attachment),
+        _ => Err(io::Error::other("typed TUI Goal attachment unavailable")),
+    }
+}
+
+fn committed_goal_output(
+    reply: MutationReply<orca_runtime::surface::GoalMutationOutput>,
+) -> io::Result<orca_runtime::surface::GoalMutationOutput> {
+    match reply {
+        MutationReply::Committed { value, .. } => Ok(value),
+        MutationReply::Deferred { mutation, .. } => Err(io::Error::other(format!(
+            "typed TUI Goal mutation deferred: request={:?} commit={:?}",
+            mutation.request_id, mutation.commit_id
+        ))),
+        MutationReply::Uncommitted { mutation } => Err(io::Error::other(format!(
+            "typed TUI Goal mutation did not commit: {mutation:?}"
+        ))),
+    }
+}
+
+fn supplied_goal_input(prompt: &str) -> io::Result<GoalRunInput> {
+    Ok(GoalRunInput::Supplied {
+        request: SurfaceInputRequest {
+            blocks: NonEmptyVec::try_new(vec![SurfaceInputRequestBlock::Text {
+                text: DisplayText::new(prompt),
+            }])
+            .map_err(|error| io::Error::other(error.to_string()))?,
+        },
+    })
+}
+
+fn goal_fence(goal: &SurfaceGoal) -> SurfaceGoalFence {
+    SurfaceGoalFence {
+        goal_id: goal.goal_id.clone(),
+        goal_revision: goal.goal_revision,
+        goal_owner_epoch: goal.goal_owner_epoch,
+    }
 }
 
 pub(crate) fn read_history(

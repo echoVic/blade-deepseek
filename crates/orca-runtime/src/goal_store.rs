@@ -240,6 +240,15 @@ pub struct PauseGoalForSurfaceInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseQuiescentGoalForSurfaceInput {
+    pub session_id: String,
+    pub expected_goal_id: GoalId,
+    pub expected_goal_revision: u32,
+    pub message: String,
+    pub paused_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoverGoalRunForSurfaceInput {
     pub session_id: String,
     pub expected_goal_id: GoalId,
@@ -317,6 +326,10 @@ pub enum GoalSurfaceMutation {
         goal_run_id: GoalRunId,
         operation_id: SurfaceOperationId,
         outer_turn_id: Option<GoalOuterTurnId>,
+        message: String,
+    },
+    PausedQuiescent {
+        previous_revision: u32,
         message: String,
     },
     ContinuationStopped {
@@ -2235,6 +2248,106 @@ impl GoalStore {
             goal_run_id: current_run.goal_run_id.clone(),
             operation_id: input.expected_operation_id,
             outer_turn_id: current_run.outer_turn_id.clone(),
+            message: input.message.trim().to_string(),
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            next_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(paused),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, input.paused_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub(crate) fn pause_quiescent_goal_for_surface(
+        &self,
+        input: PauseQuiescentGoalForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        if input.session_id.trim().is_empty() || input.message.trim().is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "Goal surface quiescent pause input is invalid".to_string(),
+            ));
+        }
+        let session_id = input.session_id.trim();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || state.goal_id != input.expected_goal_id
+            || state.goal_revision != input.expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal surface quiescent pause fence is stale".to_string(),
+            ));
+        }
+        let current = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before quiescent pause".to_string())
+        })?;
+        if current.record.current_run.is_some()
+            || matches!(current.record.state, GoalState::Complete { .. })
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal surface quiescent pause requires an open non-running Goal".to_string(),
+            ));
+        }
+        let previous_state = current.record.state.clone();
+        let next_state = GoalState::Paused {
+            reason: GoalPauseReason::User,
+            message: input.message.trim().to_string(),
+        };
+        transaction.execute(
+            "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+            params![
+                state_json(&next_state)?,
+                input.paused_at,
+                input.expected_goal_id.as_str()
+            ],
+        )?;
+        if previous_state != next_state {
+            insert_transition(
+                &transaction,
+                &input.expected_goal_id,
+                None,
+                &previous_state,
+                &next_state,
+                "surface_goal_paused",
+                input.paused_at,
+            )?;
+        }
+        let paused = load_stored_goal(&transaction, session_id)?
+            .expect("paused quiescent surface Goal remains readable")
+            .record;
+        let next_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let mutation = GoalSurfaceMutation::PausedQuiescent {
+            previous_revision: state.goal_revision,
             message: input.message.trim().to_string(),
         };
         let retained_context = GoalSurfaceMutationContext {
@@ -4772,6 +4885,26 @@ fn validate_stored_surface_mutation(
                     ) if stored_message == message
                         && &run.goal_run_id == goal_run_id
                         && run.outer_turn_id.as_ref() == outer_turn_id.as_ref()
+                )
+        }
+        (
+            GoalSurfaceMutation::PausedQuiescent {
+                previous_revision,
+                message,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && goal.current_run.is_none()
+                && matches!(
+                    &goal.state,
+                    GoalState::Paused {
+                        reason: GoalPauseReason::User,
+                        message: stored_message,
+                    } if stored_message == message
                 )
         }
         (

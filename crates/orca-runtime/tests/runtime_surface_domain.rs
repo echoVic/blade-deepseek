@@ -769,6 +769,111 @@ fn goal_create_is_durable_before_the_facade_replies_and_restores_into_snapshot()
 }
 
 #[test]
+fn quiescent_goal_pause_commits_without_fabricating_an_operation_and_survives_restart() {
+    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
+    let home = tempdir().unwrap();
+    let cwd = tempdir().unwrap();
+    let previous = std::env::var_os("ORCA_HOME");
+    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+
+    let host = RuntimeHost::start().unwrap();
+    let thread = host
+        .surface_handle()
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "quiescent Goal pause",
+        )
+        .unwrap();
+    let session_id = thread.thread_id().to_string();
+    thread
+        .set_goal(
+            &session_id,
+            "pause without an admitted operation".to_string(),
+            200,
+        )
+        .unwrap();
+    let attachment = match thread.surface().attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManageGoal,
+            SurfaceCapability::ControlBoundOperation,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("fresh TUI attachment failed"),
+    };
+    let goal = attachment
+        .baseline
+        .snapshot
+        .goal
+        .as_ref()
+        .expect("quiescent Goal");
+    let paused = match attachment
+        .client
+        .pause_goal_operation(
+            SurfaceRequestId::new(),
+            orca_runtime::unstable_surface::SurfaceGoalFence {
+                goal_id: goal.goal_id.clone(),
+                goal_revision: goal.goal_revision,
+                goal_owner_epoch: goal.goal_owner_epoch,
+            },
+        )
+        .expect("quiescent typed Goal pause")
+    {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("quiescent Goal pause must commit"),
+    };
+    assert!(matches!(
+        paused.goal.state,
+        orca_runtime::unstable_surface::SurfaceGoalState::Paused {
+            reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::User,
+            ..
+        }
+    ));
+    assert!(matches!(
+        paused.operation,
+        orca_runtime::unstable_surface::PauseGoalOperationOutput::None
+    ));
+    let snapshot = attach_snapshot(&thread.surface());
+    assert!(snapshot.foreground_operation.is_none());
+    assert!(snapshot.queued_operations.is_empty());
+    assert!(snapshot.operation_history.is_empty());
+    host.shutdown().unwrap();
+
+    let host = RuntimeHost::start().unwrap();
+    let resumed = host
+        .surface_handle()
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Resume(session_id)),
+            "recovered quiescent Goal pause",
+        )
+        .unwrap();
+    let recovered = attach_snapshot(&resumed.surface());
+    assert!(recovered.goal.as_ref().is_some_and(|goal| {
+        goal.current_run.is_none()
+            && matches!(
+                goal.state,
+                orca_runtime::unstable_surface::SurfaceGoalState::Paused {
+                    reason: orca_runtime::unstable_surface::SurfaceGoalPauseReason::User,
+                    ..
+                }
+            )
+    }));
+    assert!(recovered.foreground_operation.is_none());
+    assert!(recovered.queued_operations.is_empty());
+    assert!(recovered.operation_history.is_empty());
+    host.shutdown().unwrap();
+
+    match previous {
+        Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+        None => unsafe { std::env::remove_var("ORCA_HOME") },
+    }
+}
+
+#[test]
 fn restart_only_acknowledges_a_goal_receipt_already_present_in_the_surface_ledger() {
     let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
     let home = tempdir().unwrap();

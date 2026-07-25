@@ -7,8 +7,10 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::surface::{
     AssistantChannel, AssistantPatch, OperationPatch, OperationTerminal, SurfaceAssistantStream,
     SurfaceAssistantStreamState, SurfaceCommitBatch, SurfaceCompletedModelResponse, SurfaceCursor,
-    SurfaceEvent, SurfaceFileChange, SurfaceHistoryMessage, SurfaceInputPresentation, SurfaceItem,
+    SurfaceEvent, SurfaceFileChange, SurfaceGoal, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
+    SurfaceGoalState, SurfaceHistoryMessage, SurfaceInputPresentation, SurfaceItem,
     SurfaceOperationId, SurfaceStreamId, SurfaceToolResultKind, SurfaceUserInputState, ToolPatch,
+    UnixMillis,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
@@ -172,6 +174,9 @@ pub(crate) struct TuiSurfaceProjection {
     assistant_streams: BTreeMap<SurfaceStreamId, SurfaceAssistantStream>,
     focused_operation: Option<SurfaceOperationId>,
     pending_turn_started: Option<TuiTaskLifecycle>,
+    goal: Option<SurfaceGoal>,
+    thread_created_at: UnixMillis,
+    thread_updated_at: UnixMillis,
 }
 
 impl TuiSurfaceProjection {
@@ -184,6 +189,9 @@ impl TuiSurfaceProjection {
                 .collect(),
             focused_operation: None,
             pending_turn_started: None,
+            goal: None,
+            thread_created_at: UnixMillis::new(0),
+            thread_updated_at: UnixMillis::new(0),
         }
     }
 
@@ -207,6 +215,9 @@ impl TuiSurfaceProjection {
                 status: "running".to_string(),
                 turn: turn.ordinal,
             });
+        projection.goal = snapshot.goal.clone();
+        projection.thread_created_at = snapshot.thread.created_at;
+        projection.thread_updated_at = snapshot.thread.updated_at;
         projection
     }
 
@@ -264,6 +275,7 @@ impl TuiSurfaceProjection {
 
         let mut assistant_streams = self.assistant_streams.clone();
         let mut focused_operation = self.focused_operation.clone();
+        let mut goal = self.goal.clone();
         let mut projected = Vec::new();
         for envelope in batch.events.as_slice() {
             match &envelope.event {
@@ -469,14 +481,147 @@ impl TuiSurfaceProjection {
                     }
                     focused_operation = None;
                 }
+                SurfaceEvent::Goal(goal_patch) => {
+                    let previous_state = goal.as_ref().map(|goal| goal.state.clone());
+                    match &goal_patch.patch {
+                        orca_runtime::surface::GoalPatch::Created { goal: created }
+                        | orca_runtime::surface::GoalPatch::Edited { goal: created, .. } => {
+                            goal = Some(created.clone());
+                        }
+                        orca_runtime::surface::GoalPatch::Removed { .. } => {
+                            goal = None;
+                            projected.push(TuiEvent::GoalCleared);
+                            continue;
+                        }
+                        patch => {
+                            let Some(current) = goal.as_mut() else {
+                                continue;
+                            };
+                            current.goal_revision = goal_patch.receipt.goal_revision;
+                            current.objective_revision = goal_patch.receipt.objective_revision;
+                            current.catalog_revision = goal_patch.receipt.catalog_revision;
+                            current.goal_owner_epoch = goal_patch.receipt.goal_owner_epoch;
+                            match &goal_patch.receipt.row_state {
+                                SurfaceGoalReceiptState::Present { state, current_run } => {
+                                    current.state = state.clone();
+                                    current.current_run = current_run.clone();
+                                }
+                                SurfaceGoalReceiptState::Removed { .. } => {
+                                    goal = None;
+                                    projected.push(TuiEvent::GoalCleared);
+                                    continue;
+                                }
+                            }
+                            match patch {
+                                orca_runtime::surface::GoalPatch::OuterTurnFinished {
+                                    usage,
+                                    ..
+                                }
+                                | orca_runtime::surface::GoalPatch::Completed { usage, .. } => {
+                                    current.usage = usage.clone()
+                                }
+                                orca_runtime::surface::GoalPatch::Transitioned {
+                                    transition,
+                                    ..
+                                } => current.last_transition = Some(transition.clone()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    if let Some(current) = goal.as_ref() {
+                        if !matches!(
+                            previous_state,
+                            Some(SurfaceGoalState::Paused {
+                                reason: SurfaceGoalPauseReason::NoProgress,
+                                ..
+                            })
+                        ) && matches!(
+                            current.state,
+                            SurfaceGoalState::Paused {
+                                reason: SurfaceGoalPauseReason::NoProgress,
+                                ..
+                            }
+                        ) {
+                            projected.push(TuiEvent::Notice(
+                                "Goal paused because the last turns made no measurable progress. Use /goal resume to continue."
+                                    .to_string(),
+                            ));
+                        }
+                        projected.push(TuiEvent::GoalUpdated(thread_goal_from_surface(
+                            current,
+                            self.thread_created_at,
+                            self.thread_updated_at,
+                        )));
+                    }
+                }
                 _ => {}
             }
         }
         self.assistant_streams = assistant_streams;
         self.focused_operation = focused_operation;
+        self.goal = goal;
         self.cursor = batch.cursor_after.clone();
         Ok(projected)
     }
+}
+
+pub(crate) fn thread_goal_from_surface(
+    goal: &SurfaceGoal,
+    created_at: UnixMillis,
+    updated_at: UnixMillis,
+) -> orca_core::goal_types::ThreadGoal {
+    let status = match &goal.state {
+        SurfaceGoalState::Active => orca_core::goal_types::ThreadGoalStatus::Active,
+        SurfaceGoalState::Paused {
+            reason: SurfaceGoalPauseReason::NoProgress,
+            ..
+        } => orca_core::goal_types::ThreadGoalStatus::Stalled,
+        SurfaceGoalState::Paused {
+            reason: SurfaceGoalPauseReason::UsageLimit,
+            ..
+        } => orca_core::goal_types::ThreadGoalStatus::UsageLimited,
+        SurfaceGoalState::Paused { .. } => orca_core::goal_types::ThreadGoalStatus::Paused,
+        SurfaceGoalState::Blocked { .. } => orca_core::goal_types::ThreadGoalStatus::Blocked,
+        SurfaceGoalState::BudgetLimited => orca_core::goal_types::ThreadGoalStatus::BudgetLimited,
+        SurfaceGoalState::Complete { .. } => orca_core::goal_types::ThreadGoalStatus::Complete,
+    };
+    orca_core::goal_types::ThreadGoal {
+        session_id: surface_thread_id_text(&goal.thread_id),
+        objective: goal.objective.as_str().to_string(),
+        status,
+        token_budget: goal.token_budget,
+        tokens_used: goal
+            .usage
+            .charged_input_tokens
+            .saturating_add(goal.usage.output_tokens)
+            .saturating_add(goal.usage.verifier_tokens),
+        time_used_seconds: goal.usage.elapsed_seconds,
+        created_at: created_at.get(),
+        updated_at: updated_at.get(),
+    }
+}
+
+fn surface_thread_id_text(thread_id: &orca_runtime::surface::SurfaceThreadId) -> String {
+    let bytes = thread_id.as_bytes();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
 }
 
 fn tool_result_status(kind: SurfaceToolResultKind) -> &'static str {
@@ -801,6 +946,9 @@ mod tests {
                 status: "running".to_string(),
                 turn: 4,
             }),
+            goal: None,
+            thread_created_at: UnixMillis::new(0),
+            thread_updated_at: UnixMillis::new(0),
         };
 
         assert!(matches!(

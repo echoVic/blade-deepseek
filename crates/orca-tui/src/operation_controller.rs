@@ -82,7 +82,31 @@ impl TuiOperationController {
     }
 
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
-        let hosted = self.lock_hosted().active.clone();
+        let (surface, hosted) = {
+            let state = self.lock_hosted();
+            (state.surface_active.clone(), state.active.clone())
+        };
+        if let Some(surface) = surface {
+            let Some(goal_fence) = surface.goal_fence else {
+                return Ok(false);
+            };
+            return match surface
+                .client
+                .pause_goal_operation(orca_runtime::surface::SurfaceRequestId::new(), goal_fence)
+                .map_err(|error| io::Error::other(format!("typed Goal pause failed: {error:?}")))?
+            {
+                orca_runtime::surface::MutationReply::Committed { .. } => Ok(true),
+                orca_runtime::surface::MutationReply::Deferred { mutation, .. } => {
+                    Err(io::Error::other(format!(
+                        "typed Goal pause deferred: request={:?} commit={:?}",
+                        mutation.request_id, mutation.commit_id
+                    )))
+                }
+                orca_runtime::surface::MutationReply::Uncommitted { mutation } => Err(
+                    io::Error::other(format!("typed Goal pause did not commit: {mutation:?}")),
+                ),
+            };
+        }
         let Some(hosted) = hosted else {
             return Ok(false);
         };
@@ -340,6 +364,24 @@ impl TuiOperationController {
         client: orca_runtime::surface::RuntimeSurfaceClientHandle,
         operation_id: orca_runtime::surface::SurfaceOperationId,
     ) -> io::Result<()> {
+        self.install_surface_with_goal(client, operation_id, None)
+    }
+
+    pub(crate) fn install_surface_goal(
+        &self,
+        client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+        goal_fence: orca_runtime::surface::SurfaceGoalFence,
+    ) -> io::Result<()> {
+        self.install_surface_with_goal(client, operation_id, Some(goal_fence))
+    }
+
+    fn install_surface_with_goal(
+        &self,
+        client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+        goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
+    ) -> io::Result<()> {
         let interrupt_requested = {
             let mut hosted = self.lock_hosted();
             if hosted.shutdown {
@@ -354,6 +396,7 @@ impl TuiOperationController {
             hosted.surface_active = Some(SurfaceActiveOperation {
                 client: client.clone(),
                 operation_id: operation_id.clone(),
+                goal_fence,
                 ui_operation_id: self.surface_ids.allocate(),
                 interactions: HashMap::new(),
             });
@@ -648,6 +691,7 @@ impl TuiOperationController {
 struct SurfaceActiveOperation {
     client: orca_runtime::surface::RuntimeSurfaceClientHandle,
     operation_id: orca_runtime::surface::SurfaceOperationId,
+    goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
     ui_operation_id: OperationId,
     interactions: HashMap<TuiInteractionKey, SurfaceInteractionBinding>,
 }

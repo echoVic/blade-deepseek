@@ -38,8 +38,8 @@ use crate::goal_store::{
     CreateGoalAndPrepareRunForSurfaceInput, CreateGoalInput, EditGoalAndPrepareRunForSurfaceInput,
     FinishGoalOuterTurnForSurfaceInput, GoalStore, GoalSurfaceMutation, GoalSurfaceMutationContext,
     GoalSurfaceMutationRecord, GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate,
-    PauseGoalForSurfaceInput, PrepareGoalRunForSurfaceInput, RecoverGoalRunForSurfaceInput,
-    ReplaceGoalContinuationForSurfaceInput,
+    PauseGoalForSurfaceInput, PauseQuiescentGoalForSurfaceInput, PrepareGoalRunForSurfaceInput,
+    RecoverGoalRunForSurfaceInput, ReplaceGoalContinuationForSurfaceInput,
 };
 use crate::goal_verifier::{
     DeepSeekGoalVerifier, DeterministicGoalVerifier, GoalVerificationRequest, GoalVerifier,
@@ -5096,6 +5096,7 @@ fn goal_surface_operation(
         | GoalSurfaceMutation::OuterTurnFinished { .. }
         | GoalSurfaceMutation::VerificationCompleted { .. }
         | GoalSurfaceMutation::Paused { .. }
+        | GoalSurfaceMutation::PausedQuiescent { .. }
         | GoalSurfaceMutation::ContinuationStopped { .. }
         | GoalSurfaceMutation::ContinuationAdmitted { .. }
         | GoalSurfaceMutation::Recovered { .. } => None,
@@ -5389,6 +5390,25 @@ fn surface_goal_mutation_event(
                                 .map_err(surface_goal_value_error)
                         })
                         .transpose()?,
+                    state: surface_goal_state(&record.state)?,
+                },
+            )
+        }
+        (GoalSurfaceRowState::Present(record), GoalSurfaceMutation::PausedQuiescent { .. }) => {
+            if record.current_run.is_some() {
+                return Err(RuntimeHostError::GoalControlFailed {
+                    message: "quiescent paused Goal receipt retained a current run".to_string(),
+                });
+            }
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: None,
+                },
+                surface::GoalPatch::Paused {
+                    goal_id: goal_id.clone(),
+                    goal_run_id: None,
+                    outer_turn_id: None,
                     state: surface_goal_state(&record.state)?,
                 },
             )
@@ -15638,6 +15658,109 @@ impl ThreadActor {
         })
     }
 
+    fn pause_goal_surface_idle(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        goal_fence: surface::SurfaceGoalFence,
+    ) -> Result<surface::MutationReply<surface::PauseGoalOutput>, surface::SurfaceClientCommandError>
+    {
+        if self.pending_manual_compaction_completion.is_some() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let session_id = self
+            .handle
+            .session_id
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .filter(|goal| {
+                goal.goal_id == goal_fence.goal_id
+                    && goal.goal_revision == goal_fence.goal_revision
+                    && goal.goal_owner_epoch == goal_fence.goal_owner_epoch
+                    && goal.current_run.is_none()
+                    && !matches!(goal.state, surface::SurfaceGoalState::Complete { .. })
+            })
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let runtime = self
+            .goal_runtime_for_surface()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.reconcile_goal_surface_outbox(&runtime, &session_id)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let command_digest = *surface_sha256(
+            &serde_json::to_vec(&(
+                "pause_quiescent_goal_operation",
+                request_id.as_bytes(),
+                &goal_fence,
+            ))
+            .expect("quiescent Goal pause digest input is serializable"),
+        )
+        .as_bytes();
+        let mutation = runtime
+            .pause_quiescent_for_surface(
+                PauseQuiescentGoalForSurfaceInput {
+                    session_id,
+                    expected_goal_id: orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
+                        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    expected_goal_revision: u32::try_from(goal.goal_revision.get())
+                        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    message: "paused by user".to_string(),
+                    paused_at: chrono::Utc::now().timestamp(),
+                },
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest,
+                    goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                },
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self
+            .settle_goal_surface_mutation_with_batch(&runtime, &mutation)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let (_, _, _, _, event) =
+            surface_goal_mutation_event(&mutation, batch.cursor_after.thread_id.clone())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let surface::SurfaceEvent::Goal(goal_event) = event else {
+            unreachable!("quiescent Goal pause projects a Goal event")
+        };
+        let goal = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .goal
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let goal_event_id = batch.events.as_slice()[0].event_id.clone();
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Goal {
+                    goal_id: goal.goal_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Goal,
+                        event_id: goal_event_id,
+                        commit_class: batch.commit_class.clone(),
+                    },
+                ])
+                .expect("quiescent Goal pause has one acknowledgement"),
+            },
+            value: surface::PauseGoalOutput {
+                goal,
+                goal_receipt: goal_event.receipt,
+                goal_cursor: batch.cursor_after,
+                operation: surface::PauseGoalOperationOutput::None,
+            },
+        })
+    }
+
     fn commit_surface_terminalization(
         &mut self,
         active: &mut ActiveOperation,
@@ -16306,8 +16429,20 @@ impl ThreadActor {
                 };
                 let _ = reply.send(result);
             }
-            ThreadCommand::SurfacePauseGoalOperation { reply, .. } => {
-                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            ThreadCommand::SurfacePauseGoalOperation {
+                client,
+                request_id,
+                goal_fence,
+                reply,
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::ManageGoal)
+                {
+                    self.pause_goal_surface_idle(request_id, goal_fence)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
             }
             ThreadCommand::SurfaceResumeOperation {
                 client,

@@ -2633,7 +2633,10 @@ mod tests {
                     assert_eq!(goal.token_budget, Some(80_000));
                     assert_eq!(goal.tokens_used, 23_456);
                     assert_eq!(goal.time_used_seconds, 13 * 60);
-                    assert_eq!(goal.created_at, original.created_at);
+                    assert!(
+                        goal.created_at > 0,
+                        "typed Goal presentation uses the owning thread timestamp"
+                    );
                     goal.session_id
                 }
                 other => panic!("expected resumed goal update, got {other:?}"),
@@ -2762,7 +2765,7 @@ mod tests {
     #[test]
     fn preloaded_goal_resume_projects_elapsed_before_first_turn_started() {
         with_orca_home(|_| {
-            let session_id = "resume-goal-timer-session";
+            let session_id = "019f8a00-0000-7000-8000-000000000001";
             let goal_store = orca_runtime::goal_store::GoalStore::load_default().unwrap();
             let created = goal_store
                 .create_goal(orca_runtime::goal_store::CreateGoalInput {
@@ -2845,7 +2848,7 @@ mod tests {
     #[test]
     fn preloaded_resume_goal_pause_updates_persisted_goal_before_live_session_exists() {
         with_orca_home(|_| {
-            let session_id = "resume-goal-session";
+            let session_id = "019f8a00-0000-7000-8000-000000000002";
             orca_runtime::goal_store::GoalStore::load_default()
                 .unwrap()
                 .create_goal(orca_runtime::goal_store::CreateGoalInput {
@@ -2859,7 +2862,12 @@ mod tests {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
                 session_id.to_string(),
             ))));
-            let preloaded = Arc::new(Mutex::new(Some(transcript(session_id))));
+            let fixture = transcript(session_id);
+            history::SessionWriter::start_from_meta(fixture.meta)
+                .expect("create resumable paused Goal transcript");
+            let restored =
+                history::load_session(session_id).expect("load resumable paused Goal transcript");
+            let preloaded = Arc::new(Mutex::new(Some(restored)));
             let (event_tx, event_rx) = mpsc::unbounded();
             let (action_tx, action_rx) = mpsc::unbounded();
             let cancel = CancelToken::new();
@@ -2881,7 +2889,15 @@ mod tests {
             });
 
             action_tx.send(UserAction::GoalPause).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let event = loop {
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                if matches!(event, TuiEvent::GoalUpdated(_)) {
+                    break event;
+                }
+                if let TuiEvent::Error(message) = event {
+                    panic!("unexpected Goal pause error: {message}");
+                }
+            };
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
@@ -2900,6 +2916,79 @@ mod tests {
             assert_eq!(
                 reloaded.status,
                 orca_core::goal_types::ThreadGoalStatus::Paused
+            );
+        });
+    }
+
+    #[test]
+    fn preloaded_goal_edit_and_clear_restore_the_runtime_surface_before_mutation() {
+        with_orca_home(|_| {
+            let session_id = "019f8a00-0000-7000-8000-000000000003";
+            orca_runtime::goal_store::GoalStore::load_default()
+                .unwrap()
+                .create_goal(orca_runtime::goal_store::CreateGoalInput {
+                    session_id: session_id.to_string(),
+                    objective: "original objective".to_string(),
+                    token_budget: None,
+                    now: 1,
+                })
+                .unwrap();
+            let fixture = transcript(session_id);
+            history::SessionWriter::start_from_meta(fixture.meta)
+                .expect("create resumable editable Goal transcript");
+            let restored =
+                history::load_session(session_id).expect("load resumable editable Goal transcript");
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Resume(
+                session_id.to_string(),
+            ))));
+            let preloaded = Arc::new(Mutex::new(Some(restored)));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let cancel = CancelToken::new();
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    run_hosted_tui_controller_for_test(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::GoalEdit("edited objective".to_string()))
+                .unwrap();
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    TuiEvent::GoalUpdated(goal) if goal.objective == "edited objective" => break,
+                    TuiEvent::Error(message) => panic!("unexpected Goal edit error: {message}"),
+                    _ => {}
+                }
+            }
+            action_tx.send(UserAction::GoalClear).unwrap();
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    TuiEvent::GoalCleared => break,
+                    TuiEvent::Error(message) => panic!("unexpected Goal clear error: {message}"),
+                    _ => {}
+                }
+            }
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+
+            assert!(
+                orca_runtime::goal_store::GoalStore::load_default()
+                    .unwrap()
+                    .project_thread_goal(session_id)
+                    .unwrap()
+                    .is_none(),
+                "typed clear must persist the Goal tombstone"
             );
         });
     }
@@ -2935,6 +3024,26 @@ mod tests {
             };
 
             assert!(matches!(paused, TuiEvent::GoalUpdated(_)));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn queued_goal_set_preserves_immediate_interrupt_until_typed_operation_binds() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::GoalSet("mock_stream_delay_ms 5000".to_string()));
+            harness.send(UserAction::Interrupt);
+
+            let terminal = harness.recv_until(|event| {
+                matches!(event, TuiEvent::SessionCompleted { status } if status == "cancelled")
+            });
+            assert!(matches!(
+                terminal,
+                TuiEvent::SessionCompleted { status } if status == "cancelled"
+            ));
+            assert_eq!(harness.runtime.controller().current_id(), None);
+            assert!(!harness.runtime.controller().has_surface_active());
             harness.shutdown();
         });
     }
@@ -4790,93 +4899,6 @@ mod tests {
     }
 }
 
-fn update_goal_status_for_session(
-    thread: Option<&RuntimeThreadHandle>,
-    session_id: Option<&str>,
-    status: orca_core::goal_types::ThreadGoalStatus,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> bool {
-    let Some(session_id) = session_id else {
-        let _ = event_tx.send(TuiEvent::Error(
-            "persistent goals require a saved session".to_string(),
-        ));
-        return false;
-    };
-    match thread {
-        Some(thread) => {
-            let actions = TuiSurfaceActions::new(thread.typed_surface());
-            update_goal_status_with(
-                status,
-                event_tx,
-                {
-                    let actions = actions.clone();
-                    move || actions.resume_goal(session_id, now_timestamp())
-                },
-                {
-                    let actions = actions.clone();
-                    move || actions.pause_goal(session_id, now_timestamp())
-                },
-                move || actions.goal(session_id),
-            )
-        }
-        None => {
-            let updated = update_goal_status_with(
-                status,
-                event_tx,
-                move || {
-                    RuntimeSurfaceHostHandle::resume_saved_goal(session_id, now_timestamp())
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                },
-                move || {
-                    RuntimeSurfaceHostHandle::pause_saved_goal(session_id, now_timestamp())
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                },
-                move || {
-                    RuntimeSurfaceHostHandle::project_saved_goal(session_id)
-                        .map_err(|error| error.to_string())
-                },
-            );
-            updated
-        }
-    }
-}
-
-fn update_goal_status_with(
-    status: orca_core::goal_types::ThreadGoalStatus,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    resume: impl FnOnce() -> Result<(), String>,
-    pause: impl FnOnce() -> Result<(), String>,
-    project: impl FnOnce() -> Result<Option<orca_core::goal_types::ThreadGoal>, String>,
-) -> bool {
-    let result = match status {
-        orca_core::goal_types::ThreadGoalStatus::Active => resume(),
-        orca_core::goal_types::ThreadGoalStatus::Paused => pause(),
-        _ => Err("TUI can only pause or resume a goal through this command".to_string()),
-    };
-    match result {
-        Ok(()) => match project() {
-            Ok(Some(goal)) => {
-                let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
-                true
-            }
-            Ok(None) => {
-                let _ = event_tx.send(TuiEvent::Error("no goal is currently set".to_string()));
-                false
-            }
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(error));
-                false
-            }
-        },
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!("failed to update goal: {error}")));
-            false
-        }
-    }
-}
-
 fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     format!(
         "[Goal continuation #{continuation}]\nContinue working on this persistent goal:\n{objective}\n\nWork from current evidence. Preserve the full objective, verify every requirement before completion, and call update_goal only with status \"complete\" when the goal is actually finished or status \"blocked\" after the same blocker has repeated for at least three consecutive goal turns."
@@ -5269,44 +5291,18 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 if thread_was_missing {
                     announce_runtime_ready(thread.as_ref().expect("goal thread"), &event_tx);
                 }
-                let Some(session_id) = thread
-                    .as_ref()
-                    .and_then(RuntimeThreadHandle::session_id)
-                    .map(str::to_string)
-                else {
-                    send_goal_history_error(&event_tx);
-                    continue;
-                };
                 let actions = TuiSurfaceActions::new(
                     thread
                         .as_ref()
                         .expect("goal thread initialized")
                         .typed_surface(),
                 );
-                let result = actions.set_goal(&session_id, objective.clone(), now_timestamp());
-                match result {
-                    Ok(goal) => {
-                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
-                        let _ = event_tx.send(TuiEvent::Notice(
-                            "Starting goal. Automatic continuation will keep running while it remains active."
-                                .to_string(),
-                        ));
-                        if let Some(runtime_thread) = thread.as_ref() {
-                            run_hosted_goal_run(
-                                &cfg,
-                                runtime_thread,
-                                SubmittedTurn::user(objective),
-                                orca_core::goal_runtime::GoalTurnOrigin::User,
-                                &event_tx,
-                                &controller,
-                                ordinary_turn_runner,
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        let _ =
-                            event_tx.send(TuiEvent::Error(format!("failed to set goal: {error}")));
-                    }
+                let _ = event_tx.send(TuiEvent::Notice(
+                    "Starting goal. Automatic continuation will keep running while it remains active."
+                        .to_string(),
+                ));
+                if let Err(error) = actions.set_goal_and_run(objective, &controller, &event_tx) {
+                    emit_hosted_operation_error(&event_tx, error, &HostedOperationKind::GoalRun);
                 }
             }
             Ok(UserAction::GoalEdit(objective)) => {
@@ -5318,6 +5314,25 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 ) else {
                     continue;
                 };
+                if thread.is_none() {
+                    let cfg = config.lock().unwrap().clone();
+                    if let Err(error) = ensure_hosted_thread(
+                        &mut thread,
+                        &host,
+                        &cfg,
+                        &preloaded,
+                        &objective,
+                        &mcp_registry,
+                        &event_tx,
+                    ) {
+                        send_hosted_action_failure(&event_tx, error);
+                        continue;
+                    }
+                    announce_runtime_ready(
+                        thread.as_ref().expect("restored Goal edit thread"),
+                        &event_tx,
+                    );
+                }
                 let Some(runtime_thread) = thread.as_ref() else {
                     continue;
                 };
@@ -5345,6 +5360,25 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 ) else {
                     continue;
                 };
+                if thread.is_none() {
+                    let cfg = config.lock().unwrap().clone();
+                    if let Err(error) = ensure_hosted_thread(
+                        &mut thread,
+                        &host,
+                        &cfg,
+                        &preloaded,
+                        "clear Goal",
+                        &mcp_registry,
+                        &event_tx,
+                    ) {
+                        send_hosted_action_failure(&event_tx, error);
+                        continue;
+                    }
+                    announce_runtime_ready(
+                        thread.as_ref().expect("restored Goal clear thread"),
+                        &event_tx,
+                    );
+                }
                 let Some(runtime_thread) = thread.as_ref() else {
                     continue;
                 };
@@ -5360,15 +5394,45 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 }
             }
             Ok(UserAction::GoalPause) => {
-                if let Some(session_id) =
-                    existing_hosted_goal_session_id(thread.as_ref(), &preloaded, &config, &event_tx)
-                {
-                    update_goal_status_for_session(
-                        thread.as_ref(),
-                        Some(&session_id),
-                        orca_core::goal_types::ThreadGoalStatus::Paused,
+                let Some(_session_id) = existing_hosted_goal_session_id(
+                    thread.as_ref(),
+                    &preloaded,
+                    &config,
+                    &event_tx,
+                ) else {
+                    continue;
+                };
+                if thread.is_none() {
+                    let cfg = config.lock().unwrap().clone();
+                    if let Err(error) = ensure_hosted_thread(
+                        &mut thread,
+                        &host,
+                        &cfg,
+                        &preloaded,
+                        "pause Goal",
+                        &mcp_registry,
+                        &event_tx,
+                    ) {
+                        send_hosted_action_failure(&event_tx, error);
+                        continue;
+                    }
+                    announce_runtime_ready(
+                        thread.as_ref().expect("restored Goal pause thread"),
                         &event_tx,
                     );
+                }
+                let Some(runtime_thread) = thread.as_ref() else {
+                    continue;
+                };
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                match actions.pause_goal() {
+                    Ok(goal) => {
+                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
+                    }
+                    Err(error) => {
+                        let _ = event_tx
+                            .send(TuiEvent::Error(format!("failed to pause goal: {error}")));
+                    }
                 }
             }
             Ok(UserAction::GoalResume) => {
@@ -5390,12 +5454,6 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 else {
                     continue;
                 };
-                update_goal_status_for_session(
-                    thread.as_ref(),
-                    Some(&session_id),
-                    orca_core::goal_types::ThreadGoalStatus::Active,
-                    &event_tx,
-                );
                 let goal = thread.as_ref().and_then(|runtime_thread| {
                     TuiSurfaceActions::new(runtime_thread.typed_surface())
                         .goal(&session_id)
@@ -5403,16 +5461,18 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         .flatten()
                 });
                 if let (Some(runtime_thread), Some(goal)) = (thread.as_ref(), goal) {
-                    let cfg = config.lock().unwrap().clone();
-                    run_hosted_goal_run(
-                        &cfg,
-                        runtime_thread,
-                        SubmittedTurn::user(goal_continuation_prompt(&goal.objective, 1)),
-                        orca_core::goal_runtime::GoalTurnOrigin::Resume,
-                        &event_tx,
+                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                    if let Err(error) = actions.resume_goal_and_run(
+                        goal_continuation_prompt(&goal.objective, 1),
                         &controller,
-                        ordinary_turn_runner,
-                    );
+                        &event_tx,
+                    ) {
+                        emit_hosted_operation_error(
+                            &event_tx,
+                            error,
+                            &HostedOperationKind::GoalRun,
+                        );
+                    }
                 }
             }
             Ok(UserAction::Cancel) | Err(_) => break,
@@ -5760,15 +5820,15 @@ fn run_hosted_goal_run(
     };
     if let Some(goal) = active_goal.as_ref() {
         let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
+        if let Err(error) =
+            actions.resume_goal_and_run(submitted_turn.prompt().to_string(), controller, event_tx)
+        {
+            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
+        }
+        return;
     }
-    let request = hosted_turn_request(&submitted_turn, active_goal.is_some());
-    let request = if active_goal.is_some() {
-        request
-            .with_operation_kind(HostedOperationKind::GoalRun)
-            .with_goal_turn_origin(origin)
-    } else {
-        request
-    };
+    let _ = origin;
+    let request = hosted_turn_request(&submitted_turn, false);
     let outcome = match request.operation_kind() {
         HostedOperationKind::GoalRun => {
             run_hosted_operation(thread, request, config.clone(), controller, event_tx)
@@ -5794,37 +5854,7 @@ fn run_hosted_goal_run(
             return;
         }
     };
-    match actions.goal(&session_id) {
-        Ok(Some(goal)) => {
-            let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
-            let _ = event_tx.send(TuiEvent::GoalUpdated(goal.clone()));
-            if status != "success" || !goal.status.should_continue() {
-                let notice = match actions.goal_record(&session_id) {
-                    Ok(Some(record)) => match record.state {
-                        orca_core::goal_runtime::GoalState::Paused {
-                            reason: orca_core::goal_runtime::GoalPauseReason::NoProgress,
-                            ..
-                        } => "Goal paused because the last turns made no measurable progress. Use /goal resume to continue.".to_string(),
-                        _ => format!(
-                            "Goal run stopped with status `{status}` while the goal is {}.",
-                            orca_core::goal_types::goal_status_label(goal.status)
-                        ),
-                    },
-                    _ => format!(
-                        "Goal run stopped with status `{status}` while the goal is {}.",
-                        orca_core::goal_types::goal_status_label(goal.status)
-                    ),
-                };
-                let _ = event_tx.send(TuiEvent::Notice(notice));
-            }
-        }
-        Ok(None) => {
-            let _ = event_tx.send(TuiEvent::GoalStatus(None));
-        }
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-        }
-    }
+    let _ = status;
 }
 
 fn run_hosted_ordinary_turn(
@@ -5947,7 +5977,7 @@ fn resume_latest_active_goal_hosted(
     event_tx: &mpsc::Sender<TuiEvent>,
     controller: &TuiOperationController,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    ordinary_turn_runner: OrdinaryTurnRunner,
+    _ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         send_goal_history_error(event_tx);
@@ -5988,27 +6018,9 @@ fn resume_latest_active_goal_hosted(
             return;
         }
     };
-    let Some(new_session_id) = resumed.session_id().map(str::to_string) else {
-        send_goal_history_error(event_tx);
-        let _ = resumed.shutdown();
-        return;
-    };
     let resumed_actions = TuiSurfaceActions::new(resumed.typed_surface());
-    let active_goal = match resumed_actions.resume_goal_into(
-        &goal.session_id,
-        &new_session_id,
-        now_timestamp(),
-    ) {
-        Ok(Some(_)) => match resumed_actions.goal(&new_session_id).ok().flatten() {
-            Some(goal) => goal,
-            None => {
-                let _ = event_tx.send(TuiEvent::Error(
-                    "goal disappeared while projecting the resumed session".to_string(),
-                ));
-                let _ = resumed.shutdown();
-                return;
-            }
-        },
+    let active_goal = match resumed_actions.goal(&goal.session_id) {
+        Ok(Some(goal)) => goal,
         Ok(None) => {
             let _ = event_tx.send(TuiEvent::Error(
                 "goal disappeared while restoring its session".to_string(),
@@ -6018,7 +6030,7 @@ fn resume_latest_active_goal_hosted(
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to resume goal in restored session: {error}"
+                "failed to project goal in restored session: {error}"
             )));
             let _ = resumed.shutdown();
             return;
@@ -6041,15 +6053,14 @@ fn resume_latest_active_goal_hosted(
         "Resumed latest active goal in a restored session.".to_string(),
     ));
     if let Some(runtime_thread) = thread.as_ref() {
-        run_hosted_goal_run(
-            &cfg,
-            runtime_thread,
-            SubmittedTurn::user(goal_continuation_prompt(&active_goal.objective, 1)),
-            orca_core::goal_runtime::GoalTurnOrigin::Resume,
-            event_tx,
+        let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+        if let Err(error) = actions.resume_goal_and_run(
+            goal_continuation_prompt(&active_goal.objective, 1),
             controller,
-            ordinary_turn_runner,
-        );
+            event_tx,
+        ) {
+            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
+        }
     }
 }
 

@@ -3,7 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use orca_core::config::RunConfig;
-use orca_core::goal_runtime::GoalRecord;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
@@ -133,26 +132,8 @@ impl TuiSurfaceActions {
     }
 
     pub(crate) fn goal(&self, session_id: &str) -> Result<Option<ThreadGoal>, String> {
-        self.thread
-            .project_goal(session_id)
-            .map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn goal_record(&self, session_id: &str) -> Result<Option<GoalRecord>, String> {
-        self.thread
-            .read_goal(session_id)
-            .map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn set_goal(
-        &self,
-        session_id: &str,
-        objective: String,
-        at: i64,
-    ) -> Result<ThreadGoal, String> {
-        self.thread
-            .set_goal(session_id, objective, at)
-            .map_err(|error| error.to_string())
+        let _ = session_id;
+        crate::surface_client::read_goal(&self.thread).map_err(|error| error.to_string())
     }
 
     pub(crate) fn edit_goal(
@@ -161,38 +142,35 @@ impl TuiSurfaceActions {
         objective: String,
         at: i64,
     ) -> Result<Option<ThreadGoal>, String> {
-        self.thread
-            .edit_goal(session_id, objective, at)
-            .map_err(|error| error.to_string())
+        let _ = (session_id, at);
+        crate::surface_client::edit_goal(&self.thread, objective).map_err(|error| error.to_string())
     }
 
     pub(crate) fn clear_goal(&self, session_id: &str) -> Result<(), String> {
-        self.thread
-            .clear_goal(session_id)
-            .map_err(|error| error.to_string())
+        let _ = session_id;
+        crate::surface_client::clear_goal(&self.thread).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn pause_goal(&self, session_id: &str, at: i64) -> Result<(), String> {
-        self.thread
-            .pause_goal(session_id, at)
-            .map_err(|error| error.to_string())
+    pub(crate) fn pause_goal(&self) -> Result<ThreadGoal, String> {
+        crate::surface_client::pause_goal(&self.thread).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn resume_goal(&self, session_id: &str, at: i64) -> Result<(), String> {
-        self.thread
-            .resume_goal(session_id, at)
-            .map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn resume_goal_into(
+    pub(crate) fn set_goal_and_run(
         &self,
-        source_session_id: &str,
-        resumed_session_id: &str,
-        at: i64,
-    ) -> Result<Option<GoalRecord>, String> {
-        self.thread
-            .resume_goal_into(source_session_id, resumed_session_id, at)
-            .map_err(|error| error.to_string())
+        objective: String,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        crate::surface_client::set_goal_and_run(&self.thread, objective, controller, event_tx)
+    }
+
+    pub(crate) fn resume_goal_and_run(
+        &self,
+        prompt: String,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        crate::surface_client::resume_goal_and_run(&self.thread, prompt, controller, event_tx)
     }
 
     pub(crate) fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {
