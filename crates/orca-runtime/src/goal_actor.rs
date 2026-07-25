@@ -992,8 +992,13 @@ impl GoalActor {
         gap_fingerprint: Option<String>,
         finished_at: i64,
     ) -> Result<GoalNextAction, GoalActorError> {
-        let gap_fingerprint =
-            gap_fingerprint.unwrap_or_else(|| "outer_turn:no_structured_progress".to_string());
+        let mut turn_result = build_turn_result(
+            status,
+            tool_count,
+            model_response_count,
+            gap_fingerprint.clone(),
+        );
+        turn_result.usage = usage.clone();
         let mut active = self
             .active
             .remove(session_id)
@@ -1001,16 +1006,7 @@ impl GoalActor {
         let requested_pause = active.pending_pause.take();
         let tracker_action = active
             .tracker
-            .finish_outer_turn(GoalTurnResult {
-                status,
-                usage: usage.clone(),
-                gaps: vec![GoalGap {
-                    summary: "outer turn ended without structured progress evidence".to_string(),
-                    fingerprint: gap_fingerprint.clone(),
-                    model_fixable: true,
-                }],
-                evidence_count: 0,
-            })
+            .finish_outer_turn(turn_result)
             .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
         let action = if let Some(pause) = requested_pause.as_ref() {
             active.tracker.pause(pause.reason, pause.message.clone())
@@ -1024,7 +1020,9 @@ impl GoalActor {
             status,
             tool_count,
             model_response_count,
-            gap_fingerprint: Some(gap_fingerprint),
+            gap_fingerprint: Some(
+                gap_fingerprint.unwrap_or_else(|| "outer_turn:no_structured_progress".to_string()),
+            ),
             usage_event: Some(GoalUsageEvent {
                 usage_event_id: format!("{}:turn", active.context.outer_turn_id),
                 goal_id: active.context.goal_id.clone(),
@@ -1217,6 +1215,41 @@ impl GoalActor {
     }
 }
 
+/// Builds the tracker input for a finished outer turn.
+///
+/// An explicit gap fingerprint always wins. Otherwise a gap is synthesized only
+/// when the turn produced no observable activity at all — this was previously
+/// unconditional, which made the tracker's progress branch unreachable and hid
+/// genuinely stuck turns among productive ones.
+fn build_turn_result(
+    status: GoalTurnStatus,
+    tool_count: u32,
+    model_response_count: u32,
+    gap_fingerprint: Option<String>,
+) -> GoalTurnResult {
+    // GoalTurnResult::evidence_count is usize; widen from the u32 wire counters.
+    let evidence_count = tool_count as usize + model_response_count as usize;
+    let gaps = match gap_fingerprint {
+        Some(fingerprint) => vec![GoalGap {
+            summary: "outer turn reported a structured gap".to_string(),
+            fingerprint,
+            model_fixable: true,
+        }],
+        None if evidence_count == 0 => vec![GoalGap {
+            summary: "outer turn ended without structured progress evidence".to_string(),
+            fingerprint: "outer_turn:no_structured_progress".to_string(),
+            model_fixable: true,
+        }],
+        None => Vec::new(),
+    };
+    GoalTurnResult {
+        status,
+        usage: GoalUsage::default(),
+        gaps,
+        evidence_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,6 +1265,37 @@ mod tests {
                 now: 1,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn outer_turn_result_reflects_evidence_instead_of_constant_gap() {
+        let active = build_turn_result(GoalTurnStatus::Success, 4, 2, None);
+        assert_eq!(active.evidence_count, 6);
+        assert!(
+            active.gaps.is_empty(),
+            "a turn with activity and no explicit gap must not synthesize one"
+        );
+
+        let idle = build_turn_result(GoalTurnStatus::Success, 0, 0, None);
+        assert_eq!(idle.evidence_count, 0);
+        assert_eq!(idle.gaps.len(), 1);
+        assert_eq!(
+            idle.gaps[0].fingerprint,
+            "outer_turn:no_structured_progress"
+        );
+
+        let explicit = build_turn_result(
+            GoalTurnStatus::Success,
+            5,
+            1,
+            Some("roadmap:next-slice".to_string()),
+        );
+        assert_eq!(explicit.gaps.len(), 1);
+        assert_eq!(explicit.gaps[0].fingerprint, "roadmap:next-slice");
+        assert_eq!(
+            explicit.evidence_count, 6,
+            "an explicit gap does not erase the activity that happened"
+        );
     }
 
     #[test]
