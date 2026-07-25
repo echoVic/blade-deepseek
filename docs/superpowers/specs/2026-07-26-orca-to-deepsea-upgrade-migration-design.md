@@ -1,0 +1,348 @@
+# Orca to DeepSea Upgrade Migration Design
+
+Date: 2026-07-26
+Status: Approved direction
+Selected approach: Orca installs and hands off to DeepSea; DeepSea owns migration
+
+## Objective
+
+Rename the public product from Orca to DeepSea Code without abandoning existing
+users or silently mutating their local state.
+
+An existing Orca installation must provide one guided upgrade flow that:
+
+1. explains the rename;
+2. installs the matching DeepSea distribution;
+3. verifies the new executable;
+4. hands migration authority to DeepSea;
+5. inventories and copies compatible user and current-project state;
+6. validates the migrated state;
+7. launches DeepSea; and
+8. offers, but never requires, removal of the old Orca package.
+
+The migration must be resumable, idempotent, inspectable, and reversible.
+
+## Naming and Distribution Contract
+
+| Surface | Legacy | New |
+| --- | --- | --- |
+| Product | Orca | DeepSea Code |
+| CLI | `orca` | `deepsea` |
+| npm package | `@blade-ai/orca` | `@blade-ai/deepsea` |
+| User home | `~/.orca` / `ORCA_HOME` | `~/.deepsea` / `DEEPSEA_HOME` |
+| Project directory | `.orca/` | `.deepsea/` |
+| Repository | `echoVic/blade-deepseek` | unchanged |
+| Legacy website | `orcaagent.dev` | retained as a transition and redirect surface |
+
+Platform-specific npm packages follow the existing distribution model:
+
+- `@blade-ai/deepsea-darwin-arm64`
+- `@blade-ai/deepsea-darwin-x64`
+- `@blade-ai/deepsea-linux-arm64`
+- `@blade-ai/deepsea-linux-x64`
+
+## Ownership Boundary
+
+The old Orca binary owns only:
+
+- detecting that the available release is a product migration;
+- explaining the migration;
+- detecting the current installation method;
+- installing the corresponding DeepSea package or binary;
+- verifying that the installed DeepSea executable starts; and
+- launching DeepSea with a short-lived migration handoff.
+
+The new DeepSea binary exclusively owns:
+
+- inventorying legacy state;
+- presenting the migration plan;
+- resolving destination conflicts;
+- copying and transforming data;
+- validating migrated state;
+- recording migration progress and results; and
+- launching the normal DeepSea experience.
+
+Orca must not write `~/.deepsea` or `.deepsea/`. DeepSea must not require Orca
+to understand the new storage format.
+
+## Upgrade Entry
+
+The existing update checker gains a distinct migration release response rather
+than representing the rename as an ordinary patch update. The prompt is:
+
+```text
+Orca is now DeepSea Code
+
+• New command: deepsea
+• New package: @blade-ai/deepsea
+• Your configuration, credentials, sessions, goals, skills,
+  tools, workflows, and current-project settings can be migrated.
+• Orca data will be kept for rollback.
+
+[Migrate to DeepSea] [Remind me later] [Stay on Orca]
+```
+
+Semantics:
+
+- **Migrate to DeepSea** begins installation and handoff.
+- **Remind me later** dismisses the prompt only for the current release.
+- **Stay on Orca** records an explicit opt-out for the migration release.
+  A materially newer migration or security release may prompt again.
+- Non-interactive invocations never open an interactive migration. They print
+  one concise notice to stderr and provide an explicit migration command.
+
+## Installation and Handoff
+
+### npm-managed installation
+
+Orca runs the platform-appropriate equivalent of:
+
+```bash
+npm install -g @blade-ai/deepsea
+```
+
+It does not uninstall `@blade-ai/orca`.
+
+### Direct binary installation
+
+Orca invokes the signed/versioned DeepSea installer using the same destination
+directory as the running Orca executable when writable. If the directory is
+not writable, the prompt explains the target and required user action rather
+than silently changing installation location.
+
+### Verification
+
+After installation, Orca resolves the exact installed executable and runs a
+machine-readable version probe. A successful probe must establish:
+
+- the executable is DeepSea rather than Orca;
+- its version supports the migration protocol; and
+- the executable path is the one the handoff will launch.
+
+Orca then creates a short-lived handoff file containing only:
+
+- migration protocol version;
+- source Orca version and install method;
+- resolved legacy home path;
+- current working directory;
+- expected DeepSea executable path; and
+- a random one-time nonce.
+
+The handoff contains no API keys or configuration contents. It is created with
+user-only permissions and deleted after consumption or expiry.
+
+DeepSea is launched as:
+
+```bash
+deepsea migrate-from-orca --handoff <path>
+```
+
+## Migration Inventory
+
+DeepSea inventories the resolved Orca home. It must respect an explicit
+`ORCA_HOME`; it must not assume `~/.orca` when the old installation used a
+custom home.
+
+The initial migration covers:
+
+| Legacy source | DeepSea destination | Treatment |
+| --- | --- | --- |
+| `config.toml` | `config.toml` | Parse, transform renamed keys, then serialize |
+| `auth.json` | `auth.json` | Copy without logging contents; preserve restrictive permissions |
+| `sessions/` | `sessions/` | Copy; preserve bytes unless a versioned index migration is required |
+| `goals_1.json` | `goals_1.json` | Parse and validate references to migrated sessions |
+| `task-sessions/` | `task-sessions/` | Copy and validate metadata |
+| `workflow-sessions/` | `workflow-sessions/` | Copy and validate metadata |
+| `skills/` | `skills/` | Copy |
+| `tools/` | `tools/` | Copy and rewrite only documented Orca paths or executable names |
+| `workflows/` | `workflows/` | Copy and rewrite only documented Orca paths or executable names |
+| rules files/directories | corresponding DeepSea paths | Copy |
+| trust and permission stores | corresponding DeepSea paths | Parse and validate; preserve decisions |
+| update cache | not migrated | DeepSea starts with its own update state |
+
+Unknown files are listed in the report and left in the Orca home. They are not
+silently copied.
+
+## Current-Project Migration
+
+The wizard inspects only the current working directory for `.orca/`.
+
+It may offer to copy:
+
+- `.orca/config.toml`;
+- `.orca/skills/`;
+- `.orca/workflows/`;
+- `.orca/tools/`; and
+- `.orca/rules*`.
+
+It must not scan the entire filesystem or mutate projects recovered from
+session history. Other projects are reported as candidates and are migrated
+only when the user later opens them and confirms the project migration.
+
+Project migration must respect repository state:
+
+- if `.deepsea/` does not exist, stage the copied directory atomically;
+- if `.deepsea/` exists, show conflicts before writing;
+- do not stage, commit, or modify Git history; and
+- clearly report that new `.deepsea/` files are ordinary working-tree changes.
+
+## Confirmation and Conflict Policy
+
+Before writing, DeepSea displays counts, byte sizes, destinations, warnings,
+and conflicts. The default action is migration with rollback preserved.
+
+For each destination conflict the supported decisions are:
+
+- keep the existing DeepSea item;
+- replace it with the Orca item;
+- keep both when the item type has a safe deterministic alternate name; or
+- skip it.
+
+No global "replace everything" default is allowed when credentials, config,
+goals, trust, or permission state conflicts.
+
+## Transaction and Recovery
+
+Migration is copy-based. The source Orca home and project directory are never
+deleted or modified.
+
+DeepSea writes a migration journal under its home. Each item progresses through
+explicit states:
+
+```text
+discovered -> planned -> copied -> validated -> committed
+```
+
+Writes use a staging directory on the same filesystem as the destination.
+After validation, files or directories are atomically renamed into place.
+
+Restart behavior:
+
+- committed items are not recopied;
+- staged but uncommitted items are revalidated or discarded safely;
+- changed source files are detected by size, modification time, and checksum
+  before reuse;
+- the user can resume, restart the migration plan, or exit without losing the
+  original Orca data.
+
+Running the migration again after success produces an inventory and a
+no-op/changed-items plan rather than duplicating sessions or goals.
+
+## Validation
+
+Migration success requires more than successful file copies. DeepSea validates:
+
+- `config.toml` parses under the new schema;
+- authentication data is readable without exposing the credential;
+- all migrated session transcripts can be indexed;
+- active goals reference available sessions and retain status, elapsed time,
+  token usage, budget, objective, and timestamps;
+- task and workflow session metadata can be loaded;
+- skills, tools, workflows, and rules can be discovered;
+- trust and permission stores parse with the same effective decisions; and
+- the current project's new configuration resolves from `.deepsea/`.
+
+Validation failures are itemized. A partial migration is never reported as
+complete.
+
+## Completion and Cleanup
+
+On success, DeepSea displays:
+
+```text
+Migration complete
+
+✓ Configuration
+✓ Credentials
+✓ 126 sessions
+✓ 3 active goals
+✓ 8 skills
+✓ 2 workflows
+✓ Current project settings
+
+Run: deepsea
+
+Orca remains installed and its data was not modified.
+
+[Launch DeepSea] [Uninstall Orca] [View migration report]
+```
+
+Uninstallation is a separate, explicit action:
+
+- npm installations may remove `@blade-ai/orca`;
+- direct installations may remove only the exact resolved Orca executable;
+- neither path deletes `~/.orca` or project `.orca/` data; and
+- data deletion, if ever supported, requires a separate command and explicit
+  target confirmation.
+
+## Failure Behavior
+
+- **Network or package failure:** keep Orca running and provide the exact retry
+  command.
+- **DeepSea probe failure:** do not launch migration or uninstall Orca.
+- **Permission failure:** identify the exact destination and leave both
+  installations unchanged.
+- **Existing DeepSea state:** enter conflict planning; never overwrite.
+- **Migration validation failure:** retain the journal and staging data needed
+  for resume, keep Orca data untouched, and do not claim success.
+- **Offline environment:** provide a version-matched manual download and a
+  `deepsea migrate-from-orca` command that can run after installation.
+- **Non-interactive environment:** never prompt or mutate; return structured
+  instructions.
+
+## Security and Privacy
+
+- Handoff and journal files use user-only permissions.
+- Secrets are never embedded in the handoff, report, logs, telemetry, or error
+  messages.
+- Symlinks in copied trees are inventoried and shown; migration must not follow
+  a symlink outside the approved source root.
+- Destination paths are canonicalized and confined to the approved DeepSea
+  home or current-project `.deepsea/`.
+- No network upload of configuration, history, prompts, goals, or credentials
+  occurs.
+- Migration telemetry, if introduced, is opt-in and limited to anonymous
+  success/failure counters without paths or item contents.
+
+## Release Strategy
+
+1. Publish and verify all DeepSea platform packages and the main npm package.
+2. Publish a final Orca transition release containing the migration-aware
+   update prompt and installer handoff.
+3. Keep ordinary Orca execution available during the transition window.
+4. Stop feature releases under Orca after the transition release; allow
+   security fixes when required.
+5. Deprecate `@blade-ai/orca` only after the DeepSea install and migration path
+   has been verified against published artifacts.
+6. Keep `orcaagent.dev` as a migration explanation and eventual permanent
+   redirect surface.
+
+## Verification Matrix
+
+Automated coverage must include:
+
+- npm-managed and direct-binary handoff;
+- macOS arm64/x64 and Linux arm64/x64 package resolution;
+- custom `ORCA_HOME`;
+- empty legacy home;
+- complete home with every supported item type;
+- existing non-conflicting and conflicting DeepSea homes;
+- interrupted migration at every journal state;
+- repeated migration after success;
+- malformed config, auth metadata, sessions, goals, and workflow state;
+- symlink escape attempts;
+- current project with clean, dirty, and pre-existing `.deepsea/` state;
+- non-interactive invocation;
+- install, probe, and permission failures;
+- uninstall refusal and uninstall success; and
+- published-package smoke tests that prove `deepsea --version`, history resume,
+  Goal restoration, and Orca rollback all work with real artifacts.
+
+## Non-Goals
+
+- Renaming the GitHub repository.
+- Deleting legacy Orca user or project data.
+- Scanning and mutating every repository referenced by history.
+- Silently merging conflicting credentials, permissions, trust, or goals.
+- Maintaining permanent dual writes between `.orca` and `.deepsea`.
+- Making Orca understand or write the DeepSea storage format.
