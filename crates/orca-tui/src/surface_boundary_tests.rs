@@ -390,7 +390,7 @@ pub enum LifetimeFixture<'a> {
 }
 
 #[test]
-fn current_user_actions_are_exactly_classified_without_future_variants() {
+fn user_actions_are_exactly_classified_with_required_recovery_variants() {
     let manifest: serde_json::Value = serde_json::from_str(MANIFEST).expect("manifest JSON");
     let rows = manifest["tui_actions"].as_array().expect("tui_actions");
     let current_rows: Vec<(&str, &str)> = rows
@@ -406,17 +406,15 @@ fn current_user_actions_are_exactly_classified_without_future_variants() {
     let current_variants = enum_variants(TYPES, "pub enum UserAction {");
 
     assert_eq!(current_rows, CURRENT_ACTIONS);
+    let expected = CURRENT_ACTIONS
+        .map(|(name, _)| name.to_string())
+        .into_iter()
+        .chain(FUTURE_ACTIONS.map(str::to_string))
+        .collect::<Vec<_>>();
     assert_eq!(
-        current_variants,
-        CURRENT_ACTIONS.map(|(name, _)| name.to_string()),
+        current_variants, expected,
         "UserAction drift requires an inventory review"
     );
-    for required in FUTURE_ACTIONS {
-        assert!(
-            !current_variants.iter().any(|variant| variant == required),
-            "{required} is a required future addition, not a baseline variant"
-        );
-    }
 }
 
 #[test]
@@ -475,6 +473,8 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
 
     for method in [
         "run_turn",
+        "resume_operation",
+        "cancel_operation",
         "update_settings",
         "read_snapshot",
         "read_history",
@@ -496,6 +496,11 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
     assert!(
         APP.contains("TuiSurfaceActions::new"),
         "app must construct the closed TUI action facade"
+    );
+    assert!(
+        APP.contains("Ok(UserAction::ResumeOperation { operation_id })")
+            && APP.contains("Ok(UserAction::CancelOperation { operation_id })"),
+        "TUI recovery actions must route through the controller loop"
     );
     assert!(
         !SUBMITTED_TURN.contains("RuntimeSurfaceThreadHandle"),

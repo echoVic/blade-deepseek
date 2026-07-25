@@ -82,12 +82,12 @@ pub mod surface {
         SurfaceInteractionView, SurfaceItem, SurfaceItemId, SurfaceItemOrigin,
         SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest, SurfaceOperationId,
         SurfacePermissionClientDecision, SurfacePermissionProfile, SurfacePinnedContextEntry,
-        SurfacePinnedContextKind, SurfacePlanStatus, SurfaceReasoningEffort, SurfaceRequestId,
-        SurfaceResolvedInputFact, SurfaceScope, SurfaceSettingsSnapshot, SurfaceShutdownReason,
-        SurfaceSnapshot, SurfaceStreamId, SurfaceSubscriptionHandle, SurfaceSubscriptionItem,
-        SurfaceSubscriptionReceiver, SurfaceThreadId, SurfaceToolResultKind, SurfaceTurnId,
-        SurfaceUserInputDecision, SurfaceUserInputState, ThreadOwnerEpoch, ToolPatch,
-        WaitOperationTerminalResult,
+        SurfacePinnedContextKind, SurfacePlanStatus, SurfaceReasoningEffort,
+        SurfaceRecoverableOperation, SurfaceRequestId, SurfaceResolvedInputFact, SurfaceScope,
+        SurfaceSettingsSnapshot, SurfaceShutdownReason, SurfaceSnapshot, SurfaceStreamId,
+        SurfaceSubscriptionHandle, SurfaceSubscriptionItem, SurfaceSubscriptionReceiver,
+        SurfaceThreadId, SurfaceToolResultKind, SurfaceTurnId, SurfaceUserInputDecision,
+        SurfaceUserInputState, ThreadOwnerEpoch, ToolPatch, WaitOperationTerminalResult,
     };
 }
 mod runtime_tool_actor;

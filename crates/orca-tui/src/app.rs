@@ -2042,6 +2042,56 @@ mod tests {
     }
 
     #[test]
+    fn recovery_slash_commands_dispatch_explicit_runtime_actions() {
+        let mut config = test_config(HistoryMode::Record);
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let (mut resume_state, _) = test_state();
+        let (resume_tx, resume_rx) = mpsc::unbounded();
+        let resume_operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
+        ])
+        .unwrap();
+        resume_state.recoverable_operation_id = Some(resume_operation_id.clone());
+
+        handle_slash_command(
+            "/resume",
+            &mut config,
+            &shared_config,
+            &mut resume_state,
+            &resume_tx,
+        );
+
+        assert!(matches!(
+            resume_rx.try_recv(),
+            Ok(UserAction::ResumeOperation { operation_id })
+                if operation_id == resume_operation_id
+        ));
+        assert_eq!(resume_state.status, AppStatus::Running);
+
+        let (mut cancel_state, _) = test_state();
+        let (cancel_tx, cancel_rx) = mpsc::unbounded();
+        let cancel_operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2,
+        ])
+        .unwrap();
+        cancel_state.recoverable_operation_id = Some(cancel_operation_id.clone());
+        handle_slash_command(
+            "/cancel-operation",
+            &mut config,
+            &shared_config,
+            &mut cancel_state,
+            &cancel_tx,
+        );
+
+        assert!(matches!(
+            cancel_rx.try_recv(),
+            Ok(UserAction::CancelOperation { operation_id })
+                if operation_id == cancel_operation_id
+        ));
+        assert_eq!(cancel_state.status, AppStatus::Running);
+    }
+
+    #[test]
     fn hosted_operation_admission_failure_publishes_terminal_event() {
         with_orca_home(|_| {
             let cfg = test_config(HistoryMode::Record);
@@ -4788,6 +4838,36 @@ fn hosted_tui_controller_loop(
                 }
             }
             Ok(UserAction::Interrupt) | Ok(UserAction::BackgroundCurrentTurn) => {}
+            Ok(UserAction::ResumeOperation { operation_id }) => {
+                let Some(runtime_thread) = thread.as_ref() else {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(
+                        "no recoverable operation is available".to_string(),
+                    ));
+                    continue;
+                };
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                if let Err(error) = actions.resume_operation(&operation_id, &controller, &event_tx)
+                {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                        "failed to resume operation: {error}"
+                    )));
+                }
+            }
+            Ok(UserAction::CancelOperation { operation_id }) => {
+                let Some(runtime_thread) = thread.as_ref() else {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(
+                        "no recoverable operation is available".to_string(),
+                    ));
+                    continue;
+                };
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                if let Err(error) = actions.cancel_operation(&operation_id, &controller, &event_tx)
+                {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                        "failed to cancel operation: {error}"
+                    )));
+                }
+            }
             Ok(UserAction::SetModel(model)) => {
                 let patches = decode_settings_intent(&model)
                     .map(settings_intent_patches)
@@ -5144,6 +5224,19 @@ fn ensure_hosted_thread(
 
 fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<TuiEvent>) {
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    if let Ok(Some(recovery)) = actions
+        .read_snapshot()
+        .map(|snapshot| snapshot.recoverable_user_operation())
+    {
+        let _ = event_tx.send(TuiEvent::RecoveryAvailable {
+            operation_id: recovery.operation_id().clone(),
+        });
+        let _ = event_tx.send(TuiEvent::Notice(
+            "A recoverable operation is suspended. Use /resume to continue it or /cancel-operation to close it."
+                .to_string(),
+        ));
+    }
 }
 
 fn emit_typed_history_snapshot(

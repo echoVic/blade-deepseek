@@ -15,7 +15,7 @@ use orca_runtime::history::SessionSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
-use orca_runtime::surface::RuntimeSurfaceThreadHandle;
+use orca_runtime::surface::{RuntimeSurfaceThreadHandle, SurfaceOperationId};
 
 use crate::display_text::truncate_to_display_width;
 use crate::transcript_view::TranscriptRenderCache;
@@ -295,6 +295,9 @@ pub enum TuiEvent {
         generation: u64,
     },
     MentionRuntimeReady(RuntimeSurfaceThreadHandle),
+    RecoveryAvailable {
+        operation_id: SurfaceOperationId,
+    },
     SubmissionRejected {
         prompt: String,
         message: String,
@@ -379,6 +382,12 @@ pub enum UserAction {
     BackgroundCurrentTurn,
     Interrupt,
     Cancel,
+    ResumeOperation {
+        operation_id: SurfaceOperationId,
+    },
+    CancelOperation {
+        operation_id: SurfaceOperationId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,6 +675,7 @@ pub struct AppState {
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
     pub current_goal: Option<ThreadGoal>,
+    pub recoverable_operation_id: Option<SurfaceOperationId>,
     pub panel_mode: PanelMode,
     pub workflow_panel: WorkflowPanelState,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
@@ -796,6 +806,7 @@ impl AppState {
             proposed_plan_parser: ProposedPlanStreamParser::default(),
             plan_update_failed: false,
             current_goal: None,
+            recoverable_operation_id: None,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
             pending_workflow_notifications: VecDeque::new(),
@@ -1497,6 +1508,7 @@ impl AppState {
                 plan,
                 label,
             } => {
+                self.recoverable_operation_id = None;
                 self.replace_messages(messages);
                 if let Some(plan) = plan {
                     self.current_plan = Some(plan);
@@ -1507,6 +1519,7 @@ impl AppState {
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::TurnStarted { .. } => {
+                self.recoverable_operation_id = None;
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
             }
@@ -1944,6 +1957,9 @@ impl AppState {
             TuiEvent::Notice(msg) => {
                 self.push_message(ChatMessage::System(msg));
             }
+            TuiEvent::RecoveryAvailable { operation_id } => {
+                self.recoverable_operation_id = Some(operation_id);
+            }
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
             | TuiEvent::MentionRuntimeReady(_) => {}
@@ -1980,6 +1996,7 @@ impl AppState {
                 )));
             }
             TuiEvent::SessionCompleted { status } => {
+                self.recoverable_operation_id = None;
                 let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
                 self.approval_dialog = None;
@@ -3427,6 +3444,34 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::Error(message)) if message == "operation could not start"
         ));
+    }
+
+    #[test]
+    fn recovery_projection_keeps_exact_operation_until_start_or_terminal() {
+        let mut state = state();
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
+        ])
+        .unwrap();
+
+        state.update(TuiEvent::RecoveryAvailable {
+            operation_id: operation_id.clone(),
+        });
+        assert_eq!(state.recoverable_operation_id.as_ref(), Some(&operation_id));
+
+        state.update(TuiEvent::TurnStarted {
+            turn: 2,
+            task: None,
+        });
+        assert!(state.recoverable_operation_id.is_none());
+
+        state.update(TuiEvent::RecoveryAvailable {
+            operation_id: operation_id.clone(),
+        });
+        state.update(TuiEvent::SessionCompleted {
+            status: "cancelled".to_string(),
+        });
+        assert!(state.recoverable_operation_id.is_none());
     }
 
     #[test]

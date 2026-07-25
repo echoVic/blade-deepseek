@@ -120,6 +120,37 @@ pub struct SurfaceSnapshot {
     pub session_health: SurfaceSessionHealth,
 }
 
+impl SurfaceSnapshot {
+    pub fn recoverable_user_operation(&self) -> Option<SurfaceRecoverableOperation> {
+        let operation = self.foreground_operation.as_ref()?;
+        if !matches!(operation.phase, OperationPhase::Suspended { .. })
+            || operation.pending_control.is_some()
+            || operation.finalization.is_some()
+            || operation.terminal.is_some()
+            || operation.intent.kind != OperationKind::UserTurn
+        {
+            return None;
+        }
+        let generation = operation.generations.last()?;
+        if generation.phase != GenerationPhase::Stopped {
+            return None;
+        }
+        let resume_source = match &operation.intent.initial_replayability {
+            Replayability::Replayable { .. } => ResumeSourceWitness::DurableReplay {
+                replayability_digest: canonical_replayability_digest(
+                    &operation.intent.initial_replayability,
+                ),
+            },
+            Replayability::NonReplayable { .. } => return None,
+        };
+        Some(SurfaceRecoverableOperation {
+            operation_id: operation.operation_id.clone(),
+            expected_last_generation: generation.fence.generation_id,
+            resume_source,
+        })
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct SnapshotAtCursor {
     pub snapshot: Arc<SurfaceSnapshot>,
@@ -451,6 +482,19 @@ impl RuntimeSurfaceClientHandle {
                 expected_last_generation,
                 resume_source,
             )
+    }
+
+    pub fn resume_recoverable(
+        &self,
+        request_id: SurfaceRequestId,
+        recovery: SurfaceRecoverableOperation,
+    ) -> Result<MutationReply<ResumeOperationOutput>, SurfaceClientCommandError> {
+        self.resume_operation(
+            request_id,
+            recovery.operation_id,
+            recovery.expected_last_generation,
+            recovery.resume_source,
+        )
     }
 
     pub fn wait_operation_terminal(
@@ -1885,6 +1929,19 @@ pub enum BackgroundTarget {
 pub enum ResumeSourceWitness {
     DurableReplay { replayability_digest: Sha256Digest },
     LiveCapsule { incarnation: SurfaceIncarnation },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceRecoverableOperation {
+    operation_id: SurfaceOperationId,
+    expected_last_generation: SurfaceGenerationId,
+    resume_source: ResumeSourceWitness,
+}
+
+impl SurfaceRecoverableOperation {
+    pub fn operation_id(&self) -> &SurfaceOperationId {
+        &self.operation_id
+    }
 }
 
 #[derive(Clone, PartialEq)]

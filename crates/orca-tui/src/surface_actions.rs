@@ -56,6 +56,34 @@ impl TuiSurfaceActions {
         crate::surface_client::run(&self.thread, request, config, controller, event_tx)
     }
 
+    pub(crate) fn resume_operation(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        crate::surface_client::resume_recovered_operation(
+            &self.thread,
+            operation_id,
+            controller,
+            event_tx,
+        )
+    }
+
+    pub(crate) fn cancel_operation(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        crate::surface_client::cancel_recovered_operation(
+            &self.thread,
+            operation_id,
+            controller,
+            event_tx,
+        )
+    }
+
     pub(crate) fn update_settings(
         &self,
         patches: NonEmptyVec<RuntimeSettingsPatch>,

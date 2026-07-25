@@ -13903,10 +13903,7 @@ mod tests {
                 )
                 .expect("admit typed operation"),
         );
-        let surface::AdmissionOutput::Admitted {
-            first_generation, ..
-        } = admitted
-        else {
+        let surface::AdmissionOutput::Admitted { .. } = admitted else {
             panic!("operation was queued instead of admitted");
         };
         assert_eq!(entered_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), 0);
@@ -13920,25 +13917,16 @@ mod tests {
         )
         .baseline
         .snapshot;
-        let replayability_digest = surface::canonical_replayability_digest(
-            &suspended_snapshot
-                .foreground_operation
-                .as_ref()
-                .filter(|operation| operation.operation_id == operation_id)
-                .expect("suspended operation remains visible")
-                .intent
-                .initial_replayability,
-        );
+        let recovery = suspended_snapshot
+            .recoverable_user_operation()
+            .expect("suspended operation is publicly recoverable");
+        assert_eq!(recovery.operation_id(), &operation_id);
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         let resumed = loop {
-            match attachment.client.resume_operation(
-                surface_request_id(),
-                operation_id.clone(),
-                first_generation.generation_id,
-                surface::ResumeSourceWitness::DurableReplay {
-                    replayability_digest: replayability_digest.clone(),
-                },
-            ) {
+            match attachment
+                .client
+                .resume_recoverable(surface_request_id(), recovery.clone())
+            {
                 Ok(reply) => break committed_surface_value(reply),
                 Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
                     if Instant::now() < deadline =>
@@ -14101,7 +14089,7 @@ mod tests {
     }
 
     fn run_suspended_operation_recovery_child(resume: bool) -> ! {
-        let (thread_id, operation_id, generation_id, replayability_digest):
+        let (thread_id, operation_id, _generation_id, _replayability_digest):
             SuspendedOperationFixture = serde_json::from_slice(
             &std::fs::read(suspended_operation_fixture_path())
                 .expect("read suspended operation fixture"),
@@ -14136,17 +14124,16 @@ mod tests {
         ));
 
         if resume {
+            let recovery = attachment
+                .baseline
+                .snapshot
+                .recoverable_user_operation()
+                .expect("cold-recovered operation is publicly recoverable");
+            assert_eq!(recovery.operation_id(), &operation_id);
             let resumed = committed_surface_value(
                 attachment
                     .client
-                    .resume_operation(
-                        surface_request_id(),
-                        operation_id.clone(),
-                        generation_id,
-                        surface::ResumeSourceWitness::DurableReplay {
-                            replayability_digest,
-                        },
-                    )
+                    .resume_recoverable(surface_request_id(), recovery)
                     .expect("resume cold-recovered operation"),
             );
             assert_eq!(resumed.operation_id, operation_id);

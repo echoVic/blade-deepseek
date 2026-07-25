@@ -110,6 +110,14 @@ impl<'a> SurfaceRunGuard<'a> {
     fn terminal_observed(&mut self) {
         self.cancel_on_drop = false;
     }
+
+    fn preserve_operation(&mut self) {
+        self.cancel_on_drop = false;
+    }
+
+    fn operation_started(&mut self) {
+        self.cancel_on_drop = true;
+    }
 }
 
 impl Drop for SurfaceRunGuard<'_> {
@@ -138,6 +146,36 @@ pub(crate) fn run(
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     run_typed_thread(thread, request, config, controller, event_tx)
+}
+
+pub(crate) fn resume_recovered_operation(
+    thread: &RuntimeSurfaceThreadHandle,
+    operation_id: &SurfaceOperationId,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    control_recovered_operation(
+        thread,
+        operation_id,
+        controller,
+        event_tx,
+        RecoveryControl::Resume,
+    )
+}
+
+pub(crate) fn cancel_recovered_operation(
+    thread: &RuntimeSurfaceThreadHandle,
+    operation_id: &SurfaceOperationId,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    control_recovered_operation(
+        thread,
+        operation_id,
+        controller,
+        event_tx,
+        RecoveryControl::Cancel,
+    )
 }
 
 pub(crate) fn update_settings(
@@ -413,6 +451,134 @@ fn run_typed_surface(
     activation.disarm();
     guard.controller_installed();
 
+    let result = drain_operation(
+        &attachment.client,
+        &operation_id,
+        &mut subscription,
+        &mut projection,
+        controller,
+        event_tx,
+    );
+    if result.is_ok() {
+        guard.terminal_observed();
+    }
+    result
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryControl {
+    Resume,
+    Cancel,
+}
+
+fn control_recovered_operation(
+    thread: &RuntimeSurfaceThreadHandle,
+    expected_operation_id: &SurfaceOperationId,
+    controller: &TuiOperationController,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    control: RecoveryControl,
+) -> io::Result<TuiHostedOperationOutcome> {
+    let mut activation = SurfaceActivationGuard::begin(controller)?;
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::RespondGrantedInteraction,
+        ]),
+        interaction_capabilities: BTreeSet::from([
+            SurfaceInteractionKind::ToolApproval,
+            SurfaceInteractionKind::PermissionRequest,
+            SurfaceInteractionKind::UserInput,
+            SurfaceInteractionKind::McpElicitation,
+        ]),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { .. } => {
+            return Err(io::Error::other("typed TUI recovery attachment denied"));
+        }
+        AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. }
+        | AttachResult::ThreadClosed { .. }
+        | AttachResult::Unavailable { .. } => {
+            return Err(io::Error::other(
+                "typed TUI recovery attachment unavailable",
+            ));
+        }
+    };
+    let mut guard = SurfaceRunGuard::new(&surface, attachment.client.clone(), controller);
+    guard.preserve_operation();
+    let recovery = attachment
+        .baseline
+        .snapshot
+        .recoverable_user_operation()
+        .ok_or_else(|| io::Error::other("no recoverable operation is available"))?;
+    let operation_id = recovery.operation_id().clone();
+    if &operation_id != expected_operation_id {
+        return Err(io::Error::other(
+            "recoverable operation changed before the command was admitted",
+        ));
+    }
+    guard.bind_operation(operation_id.clone());
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .ok_or_else(|| io::Error::other("typed TUI recovery subscription unavailable"))?;
+    let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
+    projection.focus_operation(operation_id.clone());
+    for event in projection.hydrate_open_streams() {
+        let _ = event_tx.send(event);
+    }
+
+    match control {
+        RecoveryControl::Resume => {
+            match attachment
+                .client
+                .resume_recoverable(SurfaceRequestId::new(), recovery)
+                .map_err(|error| io::Error::other(format!("typed TUI resume failed: {error:?}")))?
+            {
+                MutationReply::Committed { .. } => guard.operation_started(),
+                MutationReply::Deferred { mutation, .. } => {
+                    return Err(io::Error::other(format!(
+                        "typed TUI resume deferred and requires runtime reconciliation: request={:?} commit={:?}",
+                        mutation.request_id, mutation.commit_id
+                    )));
+                }
+                MutationReply::Uncommitted { mutation } => {
+                    return Err(io::Error::other(format!(
+                        "typed TUI resume did not commit: {mutation:?}"
+                    )));
+                }
+            }
+        }
+        RecoveryControl::Cancel => {
+            match attachment
+                .client
+                .cancel_operation(SurfaceRequestId::new(), operation_id.clone())
+                .map_err(|error| {
+                    io::Error::other(format!("typed TUI recovery cancel failed: {error:?}"))
+                })? {
+                MutationReply::Committed { .. } => {}
+                MutationReply::Deferred { mutation, .. } => {
+                    return Err(io::Error::other(format!(
+                        "typed TUI recovery cancel deferred and requires runtime reconciliation: request={:?} commit={:?}",
+                        mutation.request_id, mutation.commit_id
+                    )));
+                }
+                MutationReply::Uncommitted { mutation } => {
+                    return Err(io::Error::other(format!(
+                        "typed TUI recovery cancel did not commit: {mutation:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    controller.install_surface(attachment.client.clone(), operation_id.clone())?;
+    activation.disarm();
+    guard.controller_installed();
     let result = drain_operation(
         &attachment.client,
         &operation_id,

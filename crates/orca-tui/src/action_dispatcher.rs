@@ -175,6 +175,7 @@ fn route_action(
                     | UserAction::SubmitWithMentions { .. }
                     | UserAction::SubmitWorkflowNotification(_)
                     | UserAction::Compact
+                    | UserAction::ResumeOperation { .. }
                     | UserAction::GoalResume
                     | UserAction::ResolveBackgroundApproval { .. }
             );

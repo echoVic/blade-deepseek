@@ -170,6 +170,26 @@ pub(crate) fn handle_slash_command(
             state.enter_running();
             let _ = action_tx.send(UserAction::Compact);
         }
+        SlashCommand::ResumeOperation => {
+            if let Some(operation_id) = state.recoverable_operation_id.clone() {
+                state.enter_running();
+                let _ = action_tx.send(UserAction::ResumeOperation { operation_id });
+            } else {
+                state.push_message(ChatMessage::Error(
+                    "no recoverable operation is available".to_string(),
+                ));
+            }
+        }
+        SlashCommand::CancelOperation => {
+            if let Some(operation_id) = state.recoverable_operation_id.clone() {
+                state.enter_running();
+                let _ = action_tx.send(UserAction::CancelOperation { operation_id });
+            } else {
+                state.push_message(ChatMessage::Error(
+                    "no recoverable operation is available".to_string(),
+                ));
+            }
+        }
         SlashCommand::History => match RuntimeSurfaceHostHandle::list_saved_sessions(10) {
             Ok(sessions) if sessions.is_empty() => {
                 state.push_message(ChatMessage::System("No saved sessions.".to_string()))
