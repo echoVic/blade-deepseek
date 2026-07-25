@@ -16,7 +16,7 @@ use crate::goal_store::{
     BeginGoalRunInput, BeginOuterTurnInput, CreateGoalInput, FinishOuterTurnInput,
     GoalIntentRecord, GoalRecoveryRecord, GoalStore, GoalStoreError, GoalUsageEvent,
 };
-use crate::goal_tracker::{GoalTracker, GoalTurnResult};
+use crate::goal_tracker::{GoalTracker, GoalTurnResult, SAME_GAP_STREAK_LIMIT};
 
 const ACTOR_MAILBOX_CAPACITY: usize = 32;
 static GOAL_RUNTIME_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<GoalRuntimeLeaseInner>>>> =
@@ -926,10 +926,15 @@ impl GoalActor {
         } else {
             run_id
         };
-        let mut tracker = self
-            .trackers
-            .remove(session_id)
-            .unwrap_or_else(|| GoalTracker::from_record(&record));
+        let mut tracker = match self.trackers.remove(session_id) {
+            Some(tracker) => tracker,
+            None => {
+                let history = self
+                    .store
+                    .recent_gap_fingerprints(&record.goal_id, SAME_GAP_STREAK_LIMIT)?;
+                GoalTracker::from_record_with_history(&record, &history)
+            }
+        };
         let outer_turn_id = tracker
             .begin_outer_turn(origin)
             .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
@@ -1201,10 +1206,15 @@ impl GoalActor {
             .store
             .get_by_session(session_id)?
             .ok_or_else(|| GoalActorError::Invalid("goal does not exist".to_string()))?;
-        let mut tracker = self
-            .trackers
-            .remove(session_id)
-            .unwrap_or_else(|| GoalTracker::from_record(&record));
+        let mut tracker = match self.trackers.remove(session_id) {
+            Some(tracker) => tracker,
+            None => {
+                let history = self
+                    .store
+                    .recent_gap_fingerprints(&record.goal_id, SAME_GAP_STREAK_LIMIT)?;
+                GoalTracker::from_record_with_history(&record, &history)
+            }
+        };
         let action = tracker.resume(origin).clone();
         if matches!(action, GoalNextAction::Continue { .. }) {
             self.store
@@ -1618,6 +1628,94 @@ mod tests {
                 .unwrap(),
             GoalNextAction::Pause {
                 reason: GoalPauseReason::Infrastructure,
+                ..
+            }
+        ));
+
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn streak_survives_tracker_eviction() {
+        // Exercises the seam directly rather than end-to-end: GoalTracker's
+        // same_gap_streak field is private, so there is no public way to
+        // observe the in-memory streak of an actor-owned tracker after a
+        // simulated restart. Instead this drives two real outer turns with
+        // the same explicit gap fingerprint through the actor/store, then
+        // proves the cold-start reconstruction (store.recent_gap_fingerprints
+        // + GoalTracker::from_record_with_history) recovers a streak of 2.
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let inspection_store = store.clone();
+        let (handle, join) = GoalRuntimeHandle::spawn(store);
+        let goal = create(&handle, "streak-eviction-session");
+
+        handle
+            .begin_outer_turn(
+                "streak-eviction-session",
+                GoalTurnOrigin::User,
+                "provider-1",
+                1,
+            )
+            .unwrap();
+        handle
+            .finish_outer_turn(
+                "streak-eviction-session",
+                GoalTurnStatus::Success,
+                GoalUsage::default(),
+                0,
+                0,
+                Some("gap:repeat".to_string()),
+                2,
+            )
+            .unwrap();
+        handle
+            .begin_outer_turn(
+                "streak-eviction-session",
+                GoalTurnOrigin::Continuation,
+                "provider-2",
+                3,
+            )
+            .unwrap();
+        handle
+            .finish_outer_turn(
+                "streak-eviction-session",
+                GoalTurnStatus::Success,
+                GoalUsage::default(),
+                0,
+                0,
+                Some("gap:repeat".to_string()),
+                4,
+            )
+            .unwrap();
+
+        let history = inspection_store
+            .recent_gap_fingerprints(&goal.goal_id, SAME_GAP_STREAK_LIMIT)
+            .unwrap();
+        assert_eq!(
+            history,
+            vec!["gap:repeat".to_string(), "gap:repeat".to_string()]
+        );
+
+        let record = handle.read("streak-eviction-session").unwrap().unwrap();
+        let mut rebuilt = GoalTracker::from_record_with_history(&record, &history);
+        // If the streak were reset to 0 (the from_record-only bug), a third
+        // matching gap would only bring it to 1 and the tracker would
+        // Continue. Recovering the streak at 2 means this third gap hits
+        // the limit and pauses as NoProgress instead.
+        rebuilt.begin_outer_turn(GoalTurnOrigin::Continuation).unwrap();
+        let action = rebuilt
+            .finish_outer_turn(GoalTurnResult::successful_with_gaps(vec![GoalGap {
+                summary: "still stuck".to_string(),
+                fingerprint: "gap:repeat".to_string(),
+                model_fixable: true,
+            }]))
+            .unwrap();
+        assert!(matches!(
+            action,
+            GoalNextAction::Pause {
+                reason: GoalPauseReason::NoProgress,
                 ..
             }
         ));

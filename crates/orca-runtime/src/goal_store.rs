@@ -259,6 +259,30 @@ impl GoalStore {
         Ok(load_stored_goal(&connection, session_id)?.map(|stored| stored.record))
     }
 
+    /// Recent non-null gap fingerprints for a goal, most recent first. Bounded
+    /// because only the streak limit's worth of history can affect the verdict.
+    pub fn recent_gap_fingerprints(
+        &self,
+        goal_id: &GoalId,
+        limit: u32,
+    ) -> Result<Vec<String>, GoalStoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT t.gap_fingerprint
+             FROM goal_turns t
+             JOIN goal_runs r ON t.goal_run_id = r.goal_run_id
+             WHERE r.goal_id = ?1
+               AND t.gap_fingerprint IS NOT NULL
+               AND t.finished_at IS NOT NULL
+             ORDER BY t.finished_at DESC, t.rowid DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![goal_id.as_str(), limit], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn project_thread_goal(
         &self,
         session_id: &str,

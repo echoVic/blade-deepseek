@@ -7,7 +7,23 @@ use orca_core::goal_runtime::{
     GoalUsage, GoalVerificationResult,
 };
 
-const SAME_GAP_STREAK_LIMIT: u32 = 3;
+pub(crate) const SAME_GAP_STREAK_LIMIT: u32 = 3;
+
+/// Recomputes the same-gap streak from recent turn fingerprints, most recent
+/// first. Kept pure and separate from storage so the streak survives restarts
+/// without persisting derived state that could drift from the turn history.
+fn streak_from_history(fingerprints: &[String]) -> (Option<String>, u32) {
+    let Some(most_recent) = fingerprints.first() else {
+        return (None, 0);
+    };
+    let streak = fingerprints
+        .iter()
+        .take_while(|fingerprint| *fingerprint == most_recent)
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    (Some(most_recent.clone()), streak)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalTurnResult {
@@ -108,6 +124,17 @@ impl GoalTracker {
             last_gap_fingerprint: None,
             same_gap_streak: 0,
         }
+    }
+
+    /// Like [`Self::from_record`], but restores the same-gap streak from
+    /// persisted turn history so a restart does not silently reset the
+    /// no-progress watchdog.
+    pub fn from_record_with_history(record: &GoalRecord, history: &[String]) -> Self {
+        let mut tracker = Self::from_record(record);
+        let (fingerprint, streak) = streak_from_history(history);
+        tracker.last_gap_fingerprint = fingerprint;
+        tracker.same_gap_streak = streak;
+        tracker
     }
 
     pub fn goal_id(&self) -> &GoalId {
@@ -468,6 +495,38 @@ mod tests {
 
         assert!(matches!(action, GoalNextAction::Continue { .. }));
         assert_eq!(tracker.state(), &GoalState::Active);
+    }
+
+    #[test]
+    fn streak_is_rebuilt_from_recent_fingerprints() {
+        // Ordered most-recent-first, as returned by the history query.
+        let repeated = vec![
+            "gap:alpha".to_string(),
+            "gap:alpha".to_string(),
+            "gap:beta".to_string(),
+        ];
+        assert_eq!(
+            streak_from_history(&repeated),
+            (Some("gap:alpha".to_string()), 2)
+        );
+
+        let fresh = vec!["gap:beta".to_string(), "gap:alpha".to_string()];
+        assert_eq!(
+            streak_from_history(&fresh),
+            (Some("gap:beta".to_string()), 1)
+        );
+
+        assert_eq!(streak_from_history(&[]), (None, 0));
+
+        let all_same = vec![
+            "gap:alpha".to_string(),
+            "gap:alpha".to_string(),
+            "gap:alpha".to_string(),
+        ];
+        assert_eq!(
+            streak_from_history(&all_same),
+            (Some("gap:alpha".to_string()), 3)
+        );
     }
 
     #[test]
