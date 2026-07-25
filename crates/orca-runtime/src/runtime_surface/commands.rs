@@ -325,6 +325,13 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         operation_id: SurfaceOperationId,
     ) -> Result<MutationReply<CancelOperationOutput>, SurfaceClientCommandError>;
 
+    fn transfer_background(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        target: BackgroundTarget,
+    ) -> Result<MutationReply<TransferBackgroundOutput>, SurfaceClientCommandError>;
+
     fn pause_goal_operation(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -492,6 +499,17 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .cancel_operation(self.clone(), request_id, operation_id)
+    }
+
+    pub fn transfer_background(
+        &self,
+        request_id: SurfaceRequestId,
+        target: BackgroundTarget,
+    ) -> Result<MutationReply<TransferBackgroundOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .transfer_background(self.clone(), request_id, target)
     }
 
     pub fn pause_goal_operation(

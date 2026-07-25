@@ -334,6 +334,66 @@ fn next_operation_batch(
     batch
 }
 
+fn main_session_transfer_batch(
+    seed: u8,
+    cursor_before: SurfaceCursor,
+    fence: SurfaceOperationFence,
+    background_fence: SurfaceBackgroundFence,
+    task: SurfaceTask,
+) -> SurfaceCommitBatch {
+    let durable_revision = match cursor_before.source_revision {
+        CursorSourceRevision::Recorded { durable_revision } => {
+            DurableRevision::try_new(durable_revision.get() + 1).unwrap()
+        }
+        CursorSourceRevision::Ephemeral { .. } => panic!("test requires recorded cursor"),
+    };
+    let class = CommitClass::Recorded {
+        thread_owner_epoch: ThreadOwnerEpoch::new(1),
+        durable_revision,
+        commit_id: SurfaceCommitId::try_from_bytes(uuid(seed)).unwrap(),
+    };
+    let task_id = task.task_id.clone();
+    let events = vec![
+        SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid(seed.wrapping_add(1))).unwrap(),
+            commit_class: class.clone(),
+            scope: SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            event: SurfaceEvent::Operation(OperationPatch::GenerationTransferred {
+                fence,
+                background_fence,
+                task_id: Some(task_id),
+            }),
+        },
+        SurfaceEventEnvelope {
+            ordinal: 1,
+            event_id: SurfaceEventId::try_from_bytes(uuid(seed.wrapping_add(2))).unwrap(),
+            commit_class: class.clone(),
+            scope: SurfaceScope::Thread,
+            event: SurfaceEvent::Task(TaskPatch::Upserted {
+                expected_revision: None,
+                task,
+            }),
+        },
+    ];
+    let mut batch = SurfaceCommitBatch {
+        cursor_after: SurfaceCursor {
+            next_seq: SequenceNumber::new(cursor_before.next_seq.get() + 2),
+            source_revision: CursorSourceRevision::Recorded { durable_revision },
+            ..cursor_before.clone()
+        },
+        cursor_before,
+        commit_class: class,
+        event_count: 2,
+        batch_digest: digest(0),
+        events: NonEmptyVec::try_new(events).unwrap(),
+    };
+    batch.batch_digest = canonical_batch_digest(&batch);
+    batch
+}
+
 fn with_owner_epoch(mut batch: SurfaceCommitBatch, owner_epoch: u64) -> SurfaceCommitBatch {
     let CommitClass::Recorded {
         durable_revision,
@@ -2283,6 +2343,169 @@ fn reopened_transferred_operation_uses_exact_background_fence_for_recovery() {
         .unwrap();
     assert!(matches!(terminal.phase, OperationPhase::Terminal));
     assert!(reopened.state().snapshot().background_operations.is_empty());
+}
+
+#[test]
+fn recover_retries_prepared_main_session_transfer_as_one_owner_batch() {
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let owner_dir = tempfile::tempdir().unwrap();
+    let ledger_path = ledger_dir
+        .path()
+        .join("prepared-main-session-transfer.jsonl");
+    let lock_path = owner_dir.path().join("thread.lock");
+    let epoch_path = owner_dir.path().join("thread.epoch");
+    let clock = FakeClock {
+        clock_id: HostMonotonicClockId::try_from_bytes(uuid(201)).unwrap(),
+        tick: 1,
+        wall_ms: 1,
+    };
+    let owner =
+        ExclusiveOwnerLease::acquire_thread(&lock_path, &epoch_path, cursor(0).thread_id, &clock)
+            .unwrap();
+    let operation = requested_operation(202);
+    let operation_id = operation.operation_id.clone();
+    let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(
+        JsonlSurfaceCommitLedger::new(&ledger_path, cursor(0)),
+        SurfaceReducerState::new(snapshot()),
+        &owner,
+    )
+    .unwrap();
+    coordinator
+        .commit_actor_batch(&operation_batch(203, operation.clone()))
+        .unwrap();
+    let logical_turn_id = SurfaceTurnId::new();
+    let fence = SurfaceOperationFence {
+        thread_id: cursor(0).thread_id,
+        thread_owner_epoch: ThreadOwnerEpoch::new(1),
+        operation_id: operation_id.clone(),
+        generation_id: SurfaceGenerationId::new(0),
+    };
+    let generation = GenerationRecord {
+        fence: fence.clone(),
+        logical_turn_id: logical_turn_id.clone(),
+        input: GenerationInputState::NotApplicable,
+        predecessor: None,
+        attempt: GenerationAttempt::Initial,
+        goal_identity: None,
+        replayability: operation.intent.initial_replayability.clone(),
+        required_capabilities: Default::default(),
+        capability_fingerprint: operation.intent.capability_fingerprint.clone(),
+        phase: GenerationPhase::Reserved,
+        started_witness: None,
+        stop_reason: None,
+    };
+    let admitted = next_operation_batch(
+        205,
+        coordinator.state().snapshot().cursor.clone(),
+        operation_id.clone(),
+        vec![OperationPatch::Admitted {
+            operation_id: operation_id.clone(),
+            logical_turn_id,
+            input: AdmittedInput::NotApplicable,
+            first_generation: generation.clone(),
+        }],
+    );
+    coordinator.commit_actor_batch(&admitted).unwrap();
+    let started = next_operation_batch(
+        207,
+        coordinator.state().snapshot().cursor.clone(),
+        operation_id.clone(),
+        vec![OperationPatch::GenerationStarted {
+            fence: fence.clone(),
+            witness: GenerationStartedWitness {
+                started_commit_id: SurfaceCommitId::try_from_bytes(uuid(207)).unwrap(),
+                settings_revision: SettingsRevision::try_new(1).unwrap(),
+                policy_epoch: PolicyEpoch::try_new(1).unwrap(),
+                durable_replayability_digest: canonical_replayability_digest(
+                    &generation.replayability,
+                ),
+                capability_fingerprint: generation.capability_fingerprint,
+            },
+        }],
+    );
+    coordinator
+        .commit_generation_batch(fence.clone(), &started)
+        .unwrap();
+
+    let background_fence = SurfaceBackgroundFence {
+        operation_fence: fence.clone(),
+        background_owner_token: background_owner_token(),
+    };
+    let task_id = SurfaceTaskId::try_new("prepared-main-session-task").unwrap();
+    let transfer = main_session_transfer_batch(
+        209,
+        coordinator.state().snapshot().cursor.clone(),
+        fence,
+        background_fence.clone(),
+        SurfaceTask {
+            task_id: task_id.clone(),
+            revision: TaskRevision::try_new(1).unwrap(),
+            task_type: SurfaceTaskType::MainSession,
+            status: SurfaceTaskStatus::Running,
+            backgrounded: true,
+            description: DisplayText::new("prepared main-session background"),
+            created_at: UnixMillis::new(1),
+            started_at: Some(UnixMillis::new(1)),
+            completed_at: None,
+            parent_operation: Some(operation_id.clone()),
+            background_fence: Some(background_fence.clone()),
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+        },
+    );
+    let transfer_commit_id = match &transfer.commit_class {
+        CommitClass::Recorded { commit_id, .. } => commit_id.clone(),
+        CommitClass::Ephemeral { .. } => unreachable!(),
+    };
+    coordinator
+        .ledger_mut()
+        .append_complete_batch(&transfer)
+        .unwrap();
+    assert!(matches!(
+        coordinator
+            .ledger()
+            .probe_commit(&transfer_commit_id, &transfer.batch_digest),
+        CommitProbe::Prepared(_)
+    ));
+    drop(coordinator);
+
+    let reopened = RuntimeCommitCoordinator::recover(
+        JsonlSurfaceCommitLedger::new(&ledger_path, cursor(0)),
+        SurfaceReducerState::new(snapshot()),
+        &owner,
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened
+            .ledger()
+            .probe_commit(&transfer_commit_id, &transfer.batch_digest),
+        CommitProbe::Present(_)
+    ));
+    let recovered_background = reopened
+        .state()
+        .snapshot()
+        .background_operations
+        .iter()
+        .find(|background| background.operation_id == operation_id)
+        .expect("prepared transfer restores the background owner");
+    assert!(recovered_background.fence == background_fence);
+    assert_eq!(recovered_background.task_id.as_ref(), Some(&task_id));
+    let recovered_task = reopened
+        .state()
+        .snapshot()
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .expect("prepared transfer restores its main-session task");
+    assert!(recovered_task.background_fence.as_ref() == Some(&background_fence));
+    assert_eq!(
+        recovered_task.parent_operation.as_ref(),
+        Some(&operation_id)
+    );
 }
 
 #[test]

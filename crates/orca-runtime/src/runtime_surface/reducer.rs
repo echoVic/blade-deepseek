@@ -5717,6 +5717,31 @@ fn apply_operation_patch(
             };
             let unique_settlements = expected_settlements.iter().collect::<HashSet<_>>().len()
                 == expected_settlements.len();
+            let consumes_terminalize_control = matches!(
+                (&operation.pending_control, selected_cause),
+                (
+                    Some(PendingControlIntent::Terminalize {
+                        operation_id: control_operation,
+                        cause: control_cause,
+                    }),
+                    OperationFinalizationCause::GenerationStop(
+                        GenerationStopReason::Cancelled {
+                            cause: selected_cause,
+                        },
+                    ),
+                ) if control_operation == operation_id && control_cause == selected_cause
+            ) || matches!(
+                (&operation.pending_control, selected_cause),
+                (
+                    Some(PendingControlIntent::Terminalize {
+                        operation_id: control_operation,
+                        cause: control_cause,
+                    }),
+                    OperationFinalizationCause::Suspended(
+                        SuspendedFinalizationCause::Terminalization(selected_cause),
+                    ),
+                ) if control_operation == operation_id && control_cause == selected_cause
+            );
             if !phase_allowed
                 || !suspended_matches
                 || !unique_settlements
@@ -5748,6 +5773,9 @@ fn apply_operation_patch(
                 expected_settlements: expected_settlements.clone(),
                 settled: Vec::new(),
             });
+            if consumes_terminalize_control {
+                operation.pending_control = None;
+            }
             Ok(())
         }
         OperationPatch::FinalizationSettlementRecorded {

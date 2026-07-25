@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -2615,6 +2616,17 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfaceTransferBackground {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        target: surface::BackgroundTarget,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::TransferBackgroundOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
     SurfacePauseGoalOperation {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
@@ -3329,6 +3341,23 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             client,
             request_id,
             operation_id,
+            reply,
+        })
+    }
+
+    fn transfer_background(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        target: surface::BackgroundTarget,
+    ) -> Result<
+        surface::MutationReply<surface::TransferBackgroundOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceTransferBackground {
+            client,
+            request_id,
+            target,
             reply,
         })
     }
@@ -4472,6 +4501,410 @@ fn reconcile_durable_workflow_outcomes_on_start(
     }
 }
 
+fn reconcile_durable_provider_outcomes_on_start(
+    thread: &RuntimeThread,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<(), RuntimeHostError> {
+    let task_registry = thread.session().task_registry();
+    loop {
+        let snapshot = coordinator.state().snapshot().clone();
+        let durable = snapshot.tasks.iter().find_map(|task| {
+            if task.task_type != surface::SurfaceTaskType::MainSession
+                || !matches!(
+                    task.status,
+                    surface::SurfaceTaskStatus::Queued
+                        | surface::SurfaceTaskStatus::Running
+                        | surface::SurfaceTaskStatus::Paused
+                        | surface::SurfaceTaskStatus::Stopping
+                        | surface::SurfaceTaskStatus::ApprovalRequired
+                )
+                || snapshot
+                    .workflows
+                    .iter()
+                    .any(|workflow| workflow.task_id == task.task_id)
+            {
+                return None;
+            }
+            let background_fence = task.background_fence.as_ref()?;
+            let operation = snapshot.operation_history.iter().find(|operation| {
+                operation.operation_id == background_fence.operation_fence.operation_id
+                    && operation.terminal.is_none()
+                    && operation.finalization.is_none()
+            })?;
+            let record = task_registry.get(task.task_id.as_str())?;
+            if !matches!(
+                record.status,
+                TaskStatus::Completed
+                    | TaskStatus::ApprovalRequired
+                    | TaskStatus::Failed
+                    | TaskStatus::Stopped
+                    | TaskStatus::Cancelled
+            ) {
+                return None;
+            }
+            Some((
+                task.clone(),
+                background_fence.clone(),
+                operation.clone(),
+                record,
+            ))
+        });
+        let Some((task, background_fence, operation, record)) = durable else {
+            return Ok(());
+        };
+        let operation_id = operation.operation_id.clone();
+        let committed_user_cancel = matches!(
+            &operation.pending_control,
+            Some(surface::PendingControlIntent::Terminalize {
+                operation_id: control_operation,
+                cause: surface::TerminalizationCause::UserCancel,
+            }) if control_operation == &operation_id
+        );
+        let usage = surface_usage_totals(record.usage.unwrap_or_default());
+        let failure_message =
+            surface::SafeDiagnosticText::try_new("background provider failed before projection")
+                .expect("fixed diagnostic is bounded");
+        let approval_message =
+            surface::SafeDiagnosticText::try_new("background provider requires approval")
+                .expect("fixed diagnostic is bounded");
+        let (task_status, stop_reason, terminal) = if committed_user_cancel {
+            (
+                surface::SurfaceTaskStatus::Cancelled,
+                surface::GenerationStopReason::Cancelled {
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                },
+            )
+        } else {
+            match record.status {
+                TaskStatus::Completed => (
+                    surface::SurfaceTaskStatus::Completed,
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::Success,
+                    },
+                    surface::OperationTerminal::Succeeded {
+                        usage: usage.clone(),
+                    },
+                ),
+                TaskStatus::ApprovalRequired => (
+                    surface::SurfaceTaskStatus::ApprovalRequired,
+                    surface::GenerationStopReason::ExecutionFailed {
+                        class: surface::GenerationExecutionFailureClass::LegacyApprovalRequired,
+                        message: approval_message.clone(),
+                    },
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::LegacyApprovalRequired,
+                        message: approval_message,
+                    },
+                ),
+                TaskStatus::Stopped | TaskStatus::Cancelled => (
+                    if record.status == TaskStatus::Stopped {
+                        surface::SurfaceTaskStatus::Stopped
+                    } else {
+                        surface::SurfaceTaskStatus::Cancelled
+                    },
+                    surface::GenerationStopReason::Cancelled {
+                        cause: surface::TerminalizationCause::UserCancel,
+                    },
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
+                    },
+                ),
+                TaskStatus::Failed => (
+                    surface::SurfaceTaskStatus::Failed,
+                    surface::GenerationStopReason::ExecutionFailed {
+                        class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
+                        message: failure_message.clone(),
+                    },
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::RuntimeInvariant,
+                        message: failure_message,
+                    },
+                ),
+                _ => unreachable!("candidate durable provider outcome is terminal"),
+            }
+        };
+        let next_task_revision =
+            surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "durable provider task revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "durable provider task revision is invalid".to_string(),
+            })?;
+        let finalize_intent_id =
+            surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let terminal_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let completion_batch = recorded_surface_event_batch(
+            &snapshot,
+            vec![
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        task_id: task.task_id,
+                        expected_revision: task.revision,
+                        next_revision: next_task_revision,
+                        status: task_status,
+                        completed_at: record.completed_at_ms.map(surface::UnixMillis::new),
+                        result: if committed_user_cancel {
+                            Some(surface::DisplayText::new("Background turn cancelled"))
+                        } else {
+                            record.result.map(surface::DisplayText::new)
+                        },
+                        error: if committed_user_cancel {
+                            None
+                        } else {
+                            record.error.map(surface::DisplayText::new)
+                        },
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: background_fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                        fence: background_fence.operation_fence.clone(),
+                        reason: stop_reason.clone(),
+                        usage_delta: usage.clone(),
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: background_fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::FinalizationStarted {
+                            operation_id: operation_id.clone(),
+                            finalize_intent_id: finalize_intent_id.clone(),
+                            terminal_commit_id: terminal_commit_id.clone(),
+                            selected_cause: surface::OperationFinalizationCause::GenerationStop(
+                                stop_reason,
+                            ),
+                            suspended_cause: None,
+                            expected_settlements: Vec::new(),
+                        },
+                    ),
+                ),
+            ],
+            None,
+        );
+        coordinator
+            .commit_provider_background_stop_batch(
+                background_fence.clone(),
+                operation_id.clone(),
+                finalize_intent_id.clone(),
+                &completion_batch,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to project durable provider completion during recovery: {error:?}"
+                ),
+            })?;
+        let terminal_batch = recorded_surface_event_batch(
+            coordinator.state().snapshot(),
+            vec![(
+                surface::SurfaceScope::Background {
+                    fence: background_fence,
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                    record: surface::OperationTerminalRecord {
+                        operation_id: operation_id.clone(),
+                        finalize_intent_id: finalize_intent_id.clone(),
+                        terminal,
+                        usage,
+                        source_diagnostic_digest: None,
+                        settlement_receipts: Vec::new(),
+                        committed_at: surface::UnixMillis::new(
+                            chrono::Utc::now().timestamp_millis(),
+                        ),
+                    },
+                }),
+            )],
+            Some(terminal_commit_id),
+        );
+        coordinator
+            .commit_finalizer_batch(operation_id, finalize_intent_id, &terminal_batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to terminalize durable provider completion during recovery: {error:?}"
+                ),
+            })?;
+    }
+}
+
+fn reconcile_terminal_main_session_tasks_on_start(
+    thread: &RuntimeThread,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<(), RuntimeHostError> {
+    loop {
+        let snapshot = coordinator.state().snapshot().clone();
+        let Some((task, terminal)) = snapshot.tasks.iter().find_map(|task| {
+            if task.task_type != surface::SurfaceTaskType::MainSession
+                || !matches!(
+                    task.status,
+                    surface::SurfaceTaskStatus::Queued
+                        | surface::SurfaceTaskStatus::Running
+                        | surface::SurfaceTaskStatus::Paused
+                        | surface::SurfaceTaskStatus::Stopping
+                        | surface::SurfaceTaskStatus::ApprovalRequired
+                )
+            {
+                return None;
+            }
+            let operation_id = task.parent_operation.as_ref()?;
+            let terminal = snapshot
+                .operation_history
+                .iter()
+                .find(|operation| &operation.operation_id == operation_id)?
+                .terminal
+                .as_ref()?;
+            if task.status == surface::SurfaceTaskStatus::ApprovalRequired
+                && matches!(
+                    terminal.terminal,
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::LegacyApprovalRequired,
+                        ..
+                    }
+                )
+            {
+                return None;
+            }
+            Some((task.clone(), terminal.clone()))
+        }) else {
+            return Ok(());
+        };
+        let next_revision =
+            surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "recovered main-session task revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "recovered main-session task revision is invalid".to_string(),
+            })?;
+        let (status, result, error) = match &terminal.terminal {
+            surface::OperationTerminal::Succeeded { .. } => (
+                surface::SurfaceTaskStatus::Completed,
+                Some(surface::DisplayText::new("Background turn completed")),
+                None,
+            ),
+            surface::OperationTerminal::Cancelled { .. }
+            | surface::OperationTerminal::NotAdmitted { .. } => (
+                surface::SurfaceTaskStatus::Cancelled,
+                Some(surface::DisplayText::new("Background turn cancelled")),
+                None,
+            ),
+            surface::OperationTerminal::Shutdown { .. } => (
+                surface::SurfaceTaskStatus::Stopped,
+                Some(surface::DisplayText::new(
+                    "Background turn stopped during runtime recovery",
+                )),
+                None,
+            ),
+            surface::OperationTerminal::Failed { message, .. } => (
+                surface::SurfaceTaskStatus::Failed,
+                None,
+                Some(surface::DisplayText::new(message.as_str())),
+            ),
+            surface::OperationTerminal::BudgetExhausted { .. } => (
+                surface::SurfaceTaskStatus::Failed,
+                None,
+                Some(surface::DisplayText::new(
+                    "Background turn exhausted its runtime budget",
+                )),
+            ),
+            surface::OperationTerminal::Panicked { message }
+            | surface::OperationTerminal::JoinFailed { message } => (
+                surface::SurfaceTaskStatus::Failed,
+                None,
+                Some(surface::DisplayText::new(message.as_str())),
+            ),
+            surface::OperationTerminal::AbortedByRuntimeRestart { .. } => (
+                surface::SurfaceTaskStatus::Stopped,
+                Some(surface::DisplayText::new(
+                    "Background turn stopped during runtime recovery",
+                )),
+                None,
+            ),
+        };
+        let batch = recorded_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                    task_id: task.task_id.clone(),
+                    expected_revision: task.revision,
+                    next_revision,
+                    status,
+                    completed_at: Some(surface::UnixMillis::new(
+                        chrono::Utc::now().timestamp_millis(),
+                    )),
+                    result: result.clone(),
+                    error: error.clone(),
+                }),
+            )],
+            None,
+        );
+        coordinator.commit_actor_batch(&batch).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to reconcile terminal main-session task during recovery: {error:?}"
+                ),
+            }
+        })?;
+
+        let task_registry = thread.session().task_registry();
+        let legacy_usage = UsageTotals {
+            input_tokens: terminal.usage.input_tokens,
+            output_tokens: terminal.usage.output_tokens,
+            cache_tokens: terminal.usage.cache_tokens,
+            estimated_cost_usd: terminal.usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
+        };
+        match status {
+            surface::SurfaceTaskStatus::Completed => {
+                let _ = task_registry.apply_main_session_terminal_update(
+                    task.task_id.as_str(),
+                    MainSessionTerminalUpdate::Completed {
+                        result: result
+                            .as_ref()
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or_default(),
+                    },
+                    Some(legacy_usage),
+                );
+            }
+            surface::SurfaceTaskStatus::Failed => {
+                let _ = task_registry.apply_main_session_terminal_update(
+                    task.task_id.as_str(),
+                    MainSessionTerminalUpdate::Failed {
+                        error: error
+                            .as_ref()
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or_else(|| "Background turn failed".to_string()),
+                    },
+                    Some(legacy_usage),
+                );
+            }
+            surface::SurfaceTaskStatus::Stopped | surface::SurfaceTaskStatus::Cancelled => {
+                let _ = task_registry.stop(
+                    task.task_id.as_str(),
+                    result
+                        .as_ref()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "Background turn stopped".to_string()),
+                );
+            }
+            _ => unreachable!("recovery maps only terminal main-session task states"),
+        }
+    }
+}
+
 fn bootstrap_recorded_surface(
     thread: &mut RuntimeThread,
     config: &RunConfig,
@@ -4535,6 +4968,7 @@ fn bootstrap_recorded_surface(
                 message: format!("failed to materialize typed surface owner: {error:?}"),
             })?;
         reconcile_durable_workflow_outcomes_on_start(thread, config, &mut coordinator)?;
+        reconcile_durable_provider_outcomes_on_start(thread, &mut coordinator)?;
         let operation_ids = coordinator
             .state()
             .snapshot()
@@ -4602,6 +5036,7 @@ fn bootstrap_recorded_surface(
                 }
             }
         }
+        reconcile_terminal_main_session_tasks_on_start(thread, &mut coordinator)?;
         reconcile_interrupted_workflow_surfaces_on_start(&mut coordinator)?;
     }
     reconcile_goal_surface_outbox_on_start(thread, &mut coordinator)?;
@@ -5053,8 +5488,11 @@ struct ThreadActor {
     resident_surface: ResidentSurfaceSlot,
     pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
     pending_goal_completion_recovery: Option<PendingSurfaceGoalCompletionRecovery>,
+    pending_provider_transfer: Option<PendingTypedProviderTransfer>,
     pending_workflow_completions:
         HashMap<surface::SurfaceOperationId, PendingTypedWorkflowCompletion>,
+    pending_provider_completions:
+        HashMap<surface::SurfaceOperationId, PendingTypedProviderCompletion>,
     surface_terminal_blocked: Option<String>,
 }
 
@@ -5159,7 +5597,9 @@ struct PendingSurfaceAdmissionCommit {
 enum PendingSurfaceTransitionRetry {
     ManualCompactionCompletion,
     GoalCompletionRecovery,
+    ProviderTransfer(surface::SurfaceOperationId),
     WorkflowCompletion(surface::SurfaceOperationId),
+    ProviderCompletion(surface::SurfaceOperationId),
     BackgroundControl(surface::SurfaceOperationId),
     AdmissionCommit(surface::SurfaceOperationId),
     AdmissionRepair(surface::SurfaceOperationId),
@@ -5190,6 +5630,23 @@ struct PendingSurfaceBackgroundControl {
     batch: surface::SurfaceCommitBatch,
     task_id: surface::SurfaceTaskId,
     cancel: CancelToken,
+    retry_at: tokio::time::Instant,
+}
+
+struct PendingTypedProviderTransfer {
+    active: ActiveOperation,
+    state: ThreadActorState,
+    writer: Box<dyn HostedOperationWriter>,
+    usage_delta: UsageTotals,
+    suspension: Box<RuntimeProviderSuspension>,
+    request: PendingSurfaceBackgroundTransfer,
+    fence: surface::SurfaceOperationFence,
+    background_fence: surface::SurfaceBackgroundFence,
+    task_id: String,
+    surface_task_id: surface::SurfaceTaskId,
+    surface_task: surface::SurfaceTask,
+    task_registry: TaskRegistry,
+    batch: surface::SurfaceCommitBatch,
     retry_at: tokio::time::Instant,
 }
 
@@ -6935,6 +7392,61 @@ struct ActiveOperation {
     surface_manual_compaction_prepared: Option<surface::SurfaceCommitBatch>,
     surface_terminalization: Option<surface::TerminalizationCause>,
     surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
+    surface_background_control: Option<Arc<RuntimeSurfaceBackgroundControl>>,
+    pending_surface_background_transfer: Option<PendingSurfaceBackgroundTransfer>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeSurfaceBackgroundControl {
+    requested: AtomicBool,
+    #[cfg(test)]
+    take_delay_ms: std::sync::atomic::AtomicU64,
+}
+
+impl RuntimeSurfaceBackgroundControl {
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn for_canonical_input(_input: &str) -> Self {
+        let control = Self::default();
+        #[cfg(test)]
+        if let Some(delay_ms) = _input
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("test_surface_suspension_delay_ms="))
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            control.take_delay_ms.store(delay_ms, Ordering::Release);
+        }
+        control
+    }
+}
+
+impl RuntimeProviderSuspensionControl for RuntimeSurfaceBackgroundControl {
+    fn take_suspension_request(&self) -> bool {
+        if !self.requested.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            let delay_ms = self.take_delay_ms.swap(0, Ordering::AcqRel);
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+        }
+        true
+    }
+}
+
+struct PendingSurfaceBackgroundTransfer {
+    request_id: surface::SurfaceRequestId,
+    client: surface::RuntimeSurfaceClientHandle,
+    reply: SyncSender<
+        Result<
+            surface::MutationReply<surface::TransferBackgroundOutput>,
+            surface::SurfaceClientCommandError,
+        >,
+    >,
 }
 
 #[derive(Clone)]
@@ -6996,6 +7508,7 @@ struct HostBackgroundTask {
     cancel: CancelToken,
     join: JoinHandle<()>,
     typed_workflow: Option<TypedWorkflowBackground>,
+    typed_provider: Option<TypedProviderBackground>,
 }
 
 #[derive(Clone)]
@@ -7004,6 +7517,36 @@ struct TypedWorkflowBackground {
     task_id: surface::SurfaceTaskId,
     workflow_run_id: surface::SurfaceWorkflowRunId,
     tool_use_id: surface::SurfaceToolCallId,
+}
+
+#[derive(Clone)]
+struct TypedProviderBackground {
+    fence: surface::SurfaceBackgroundFence,
+    task_id: surface::SurfaceTaskId,
+    task_registry: TaskRegistry,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TypedProviderCompletionStage {
+    Completion,
+    Terminal,
+}
+
+#[derive(Clone)]
+struct PendingTypedProviderCompletion {
+    typed: TypedProviderBackground,
+    shutdown_reason: Option<surface::SurfaceShutdownReason>,
+    operation_id: surface::SurfaceOperationId,
+    finalize_intent_id: surface::SurfaceFinalizeIntentId,
+    terminal_commit_id: surface::SurfaceCommitId,
+    completion_batch: surface::SurfaceCommitBatch,
+    terminal: surface::OperationTerminal,
+    usage: surface::UsageTotals,
+    terminal_batch: Option<surface::SurfaceCommitBatch>,
+    terminal_value: Option<surface::OperationTerminalAtCursor>,
+    stage: TypedProviderCompletionStage,
+    rebuild_after_foreign_incomplete: bool,
+    retry_at: tokio::time::Instant,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -11197,7 +11740,17 @@ impl ThreadActor {
                     .map(|pending| pending.retry_at),
             )
             .chain(
+                self.pending_provider_transfer
+                    .iter()
+                    .map(|pending| pending.retry_at),
+            )
+            .chain(
                 self.pending_workflow_completions
+                    .values()
+                    .map(|pending| pending.retry_at),
+            )
+            .chain(
+                self.pending_provider_completions
                     .values()
                     .map(|pending| pending.retry_at),
             )
@@ -11560,6 +12113,12 @@ impl ThreadActor {
                 PendingSurfaceTransitionRetry::GoalCompletionRecovery,
             )
         });
+        let provider_transfer = self.pending_provider_transfer.iter().map(|pending| {
+            (
+                pending.retry_at,
+                PendingSurfaceTransitionRetry::ProviderTransfer(pending.fence.operation_id.clone()),
+            )
+        });
         let workflow_completions =
             self.pending_workflow_completions
                 .iter()
@@ -11569,9 +12128,20 @@ impl ThreadActor {
                         PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id.clone()),
                     )
                 });
+        let provider_completions =
+            self.pending_provider_completions
+                .iter()
+                .map(|(operation_id, pending)| {
+                    (
+                        pending.retry_at,
+                        PendingSurfaceTransitionRetry::ProviderCompletion(operation_id.clone()),
+                    )
+                });
         let Some((_, retry)) = manual_compaction
             .chain(goal_completion)
+            .chain(provider_transfer)
             .chain(workflow_completions)
+            .chain(provider_completions)
             .chain(
                 self.resident_surface
                     .pending_background_controls
@@ -11714,8 +12284,16 @@ impl ThreadActor {
             }
             return;
         }
+        if let PendingSurfaceTransitionRetry::ProviderTransfer(operation_id) = retry {
+            self.retry_typed_provider_transfer(&operation_id);
+            return;
+        }
         if let PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id) = retry {
             self.retry_typed_workflow_completion(&operation_id);
+            return;
+        }
+        if let PendingSurfaceTransitionRetry::ProviderCompletion(operation_id) = retry {
+            self.retry_typed_provider_completion(&operation_id);
             return;
         }
         if let PendingSurfaceTransitionRetry::BackgroundControl(operation_id) = retry {
@@ -13931,10 +14509,29 @@ impl ThreadActor {
 
         let interaction_command_tx = self.handle.command_tx.clone();
         let interaction_fence = fence.clone();
-        let mut hosted_request = HostedTurnRequest::new(resolved_input.canonical_text.as_str())
+        let background_control = Arc::new(RuntimeSurfaceBackgroundControl::for_canonical_input(
+            resolved_input.canonical_text.as_str(),
+        ));
+        let generation_background_control = Arc::clone(&background_control);
+        #[cfg(test)]
+        let provider_input = resolved_input
+            .canonical_text
+            .as_str()
+            .split_whitespace()
+            .filter(|token| {
+                !token.starts_with("test_surface_suspension_delay_ms=")
+                    && !token.starts_with("test_provider_completion_notify_delay_ms=")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        #[cfg(not(test))]
+        let provider_input = resolved_input.canonical_text.as_str().to_string();
+        let mut hosted_request = HostedTurnRequest::new(provider_input)
             .with_backtrack_target(backtrack_target)
+            .with_task_description(resolved_input.canonical_text.as_str())
             .with_generation_handlers(move |_, _| {
                 HostedGenerationHandlers::default()
+                    .with_provider_suspension_control(generation_background_control.clone())
                     .with_provider_response_ingress(Arc::new(
                         RuntimeSurfaceProviderResponseIngress {
                             command_tx: interaction_command_tx.clone(),
@@ -13995,7 +14592,6 @@ impl ThreadActor {
                 .with_surface_goal_owned(surface_goal_turn);
         }
         hosted_request.turn_id = logical_turn_id;
-        hosted_request.task_id = Some(legacy_task_id);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
         self.handle_idle_command(ThreadCommand::StartTurn {
             request: Box::new(hosted_request),
@@ -14044,6 +14640,7 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         };
         active.surface_operation = Some(fence.clone());
+        active.surface_background_control = Some(background_control);
 
         Ok(Self::committed_surface_mutation(
             request_id,
@@ -16791,6 +17388,17 @@ impl ThreadActor {
             .iter()
             .any(|operation| operation.operation_id == operation_id)
         {
+            if self.background_tasks.values().any(|task| {
+                task.typed_provider
+                    .as_ref()
+                    .is_some_and(|typed| typed.fence.operation_fence.operation_id == operation_id)
+            }) {
+                return self.cancel_surface_background_provider(
+                    request_id,
+                    operation_id,
+                    &snapshot,
+                );
+            }
             return self.cancel_surface_background_workflow(request_id, operation_id, &snapshot);
         }
         let operation = snapshot
@@ -16917,6 +17525,122 @@ impl ThreadActor {
             surface::CancelOperationOutput::Accepted {
                 operation_id,
                 accepted_cursor: control_batch.cursor_after.clone(),
+                waiter: surface::OperationWaiterHandle::new(),
+            },
+        ))
+    }
+
+    fn cancel_surface_background_provider(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        snapshot: &surface::SurfaceSnapshot,
+    ) -> Result<
+        surface::MutationReply<surface::CancelOperationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let typed = self
+            .background_tasks
+            .values()
+            .filter_map(|task| task.typed_provider.as_ref())
+            .find(|typed| typed.fence.operation_fence.operation_id == operation_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| {
+                operation.operation_id == operation_id && operation.terminal.is_none()
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == typed.task_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if task.status == surface::SurfaceTaskStatus::Stopping {
+            if let Some(background) = self.background_tasks.get(typed.task_id.as_str()) {
+                background.cancel.cancel();
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let next_task_revision = surface::TaskRevision::try_new(
+            task.revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Background {
+                        fence: typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::ControlIntentCommitted {
+                            operation_id: operation_id.clone(),
+                            request_id: operation.request_id,
+                            intent: surface::PendingControlIntent::Terminalize {
+                                operation_id: operation_id.clone(),
+                                cause: surface::TerminalizationCause::UserCancel,
+                            },
+                        },
+                    ),
+                ),
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        task_id: task.task_id,
+                        expected_revision: task.revision,
+                        next_revision: next_task_revision,
+                        status: surface::SurfaceTaskStatus::Stopping,
+                        completed_at: None,
+                        result: None,
+                        error: None,
+                    }),
+                ),
+            ],
+            None,
+        );
+        let pending = PendingSurfaceBackgroundControl {
+            fence: typed.fence.clone(),
+            batch: batch.clone(),
+            task_id: typed.task_id.clone(),
+            cancel: self
+                .background_tasks
+                .get(typed.task_id.as_str())
+                .expect("typed provider background task remains registered")
+                .cancel
+                .clone(),
+            retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+        };
+        match self
+            .resident_surface
+            .coordinator
+            .commit_actor_background_control_batch(typed.fence, &batch)
+        {
+            Ok(_) => self.apply_committed_surface_background_control(&pending),
+            Err(
+                surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::CheckpointFailed)
+                | surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::PartialAppend),
+            ) => {
+                self.resident_surface
+                    .pending_background_controls
+                    .insert(operation_id, pending);
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+            Err(_) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+        }
+        Ok(Self::committed_surface_mutation(
+            request_id,
+            operation_id.clone(),
+            &batch,
+            surface::CancelOperationOutput::Accepted {
+                operation_id,
+                accepted_cursor: batch.cursor_after.clone(),
                 waiter: surface::OperationWaiterHandle::new(),
             },
         ))
@@ -17553,7 +18277,9 @@ impl ThreadActor {
             resident_surface: ResidentSurfaceSlot(resident_surface),
             pending_manual_compaction_completion: None,
             pending_goal_completion_recovery: None,
+            pending_provider_transfer: None,
             pending_workflow_completions: HashMap::new(),
+            pending_provider_completions: HashMap::new(),
             surface_terminal_blocked: None,
         }
     }
@@ -17594,7 +18320,10 @@ impl ThreadActor {
                             let bounded_goal_recovery =
                                 self.has_pending_goal_completion_recovery_owner();
                             let bounded_workflow_recovery =
-                                !self.pending_workflow_completions.is_empty();
+                                !self.pending_workflow_completions.is_empty()
+                                    || !self.pending_provider_completions.is_empty();
+                            let bounded_provider_transfer_recovery =
+                                self.pending_provider_transfer.is_some();
                             let bounded_background_control_recovery = self
                                 .resident_surface
                                 .0
@@ -17604,6 +18333,7 @@ impl ThreadActor {
                                 });
                             let bounded_surface_recovery = bounded_goal_recovery
                                 || bounded_workflow_recovery
+                                || bounded_provider_transfer_recovery
                                 || bounded_background_control_recovery;
                             let goal_recovery_operation_id =
                                 self.pending_goal_completion_recovery_operation_id();
@@ -17631,7 +18361,10 @@ impl ThreadActor {
                             let goal_recovery_still_pending = bounded_goal_recovery
                                 && self.has_pending_goal_completion_recovery_owner();
                             let workflow_recovery_still_pending =
-                                !self.pending_workflow_completions.is_empty();
+                                !self.pending_workflow_completions.is_empty()
+                                    || !self.pending_provider_completions.is_empty();
+                            let provider_transfer_still_pending =
+                                self.pending_provider_transfer.is_some();
                             let background_control_still_pending = self
                                 .resident_surface
                                 .0
@@ -17641,6 +18374,7 @@ impl ThreadActor {
                                 });
                             if goal_recovery_still_pending
                                 || workflow_recovery_still_pending
+                                || provider_transfer_still_pending
                                 || background_control_still_pending
                             {
                                 if let Some(operation_id) = goal_recovery_operation_id {
@@ -17656,7 +18390,10 @@ impl ThreadActor {
                                     }
                                 }
                                 for operation_id in
-                                    self.pending_workflow_completions.keys().cloned()
+                                    self.pending_workflow_completions
+                                        .keys()
+                                        .chain(self.pending_provider_completions.keys())
+                                        .cloned()
                                 {
                                     for waiter in self
                                         .resident_surface
@@ -17668,6 +18405,24 @@ impl ThreadActor {
                                             surface::SurfaceClientCommandError::RuntimeUnavailable,
                                         ));
                                     }
+                                }
+                                if provider_transfer_still_pending {
+                                    let operation_id = self
+                                        .pending_provider_transfer
+                                        .as_ref()
+                                        .map(|pending| pending.fence.operation_id.clone())
+                                        .expect("checked pending provider transfer");
+                                    for waiter in self
+                                        .resident_surface
+                                        .waiters
+                                        .remove(&operation_id)
+                                        .unwrap_or_default()
+                                    {
+                                        let _ = waiter.try_send(Err(
+                                            surface::SurfaceClientCommandError::RuntimeUnavailable,
+                                        ));
+                                    }
+                                    self.retain_provider_transfer_for_cold_recovery();
                                 }
                                 let background_control_operation_ids = self
                                     .resident_surface
@@ -17690,6 +18445,9 @@ impl ThreadActor {
                                 self.surface_terminal_blocked.get_or_insert_with(|| {
                                     if background_control_still_pending {
                                         "typed workflow cancellation recovery was retained for cold restart"
+                                            .to_string()
+                                    } else if provider_transfer_still_pending {
+                                        "typed provider transfer recovery was retained for cold restart"
                                             .to_string()
                                     } else if workflow_recovery_still_pending {
                                         "typed workflow completion recovery was retained for cold restart"
@@ -17976,6 +18734,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceCancelOperation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceTransferBackground { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfacePauseGoalOperation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -18233,6 +18994,9 @@ impl ThreadActor {
                 };
                 let _ = reply.send(result);
             }
+            ThreadCommand::SurfaceTransferBackground { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            }
             ThreadCommand::SurfacePauseGoalOperation {
                 client,
                 request_id,
@@ -18488,7 +19252,10 @@ impl ThreadActor {
                         .is_some(),
                     pending_workflow_completion: self
                         .pending_workflow_completions
-                        .contains_key(&operation_id),
+                        .contains_key(&operation_id)
+                        || self
+                            .pending_provider_completions
+                            .contains_key(&operation_id),
                     pending_admission_repair: self
                         .resident_surface
                         .pending_admission_repairs
@@ -18632,6 +19399,8 @@ impl ThreadActor {
                     surface_manual_compaction_prepared: None,
                     surface_terminalization: None,
                     surface_execution_failure: None,
+                    surface_background_control: None,
+                    pending_surface_background_transfer: None,
                 });
                 let _ = reply.send(Ok(OperationHandle {
                     operation_id,
@@ -18824,6 +19593,42 @@ impl ThreadActor {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
                 let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceTransferBackground {
+                client,
+                request_id,
+                target,
+                reply,
+            } => {
+                let accepted = self.admits_surface_client(
+                    &client,
+                    surface::SurfaceCapability::ControlBoundOperation,
+                ) && active.pending_surface_background_transfer.is_none()
+                    && !active.request.surface_goal_owned
+                    && self.background_tasks.len() < self.background_capacity
+                    && active.surface_operation.as_ref().is_some_and(|fence| {
+                        matches!(
+                            &target,
+                            surface::BackgroundTarget::ActiveGeneration {
+                                fence: requested,
+                            } if requested == fence
+                        ) && self.bind_surface_operation_controller(&client, &fence.operation_id)
+                    });
+                let Some(control) = active.surface_background_control.as_ref() else {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                    return;
+                };
+                if !accepted {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                    return;
+                }
+                active.pending_surface_background_transfer =
+                    Some(PendingSurfaceBackgroundTransfer {
+                        request_id,
+                        client,
+                        reply,
+                    });
+                control.request();
             }
             ThreadCommand::SurfacePauseGoalOperation {
                 client,
@@ -19135,7 +19940,10 @@ impl ThreadActor {
                         .is_some(),
                     pending_workflow_completion: self
                         .pending_workflow_completions
-                        .contains_key(&operation_id),
+                        .contains_key(&operation_id)
+                        || self
+                            .pending_provider_completions
+                            .contains_key(&operation_id),
                     pending_admission_repair: self
                         .resident_surface
                         .pending_admission_repairs
@@ -19507,12 +20315,373 @@ impl ThreadActor {
         }
     }
 
+    fn finish_surface_background_transfer(
+        &mut self,
+        mut active: ActiveOperation,
+        result: Result<OperationTaskResult, tokio::task::JoinError>,
+        allow_resume: bool,
+    ) -> Result<(), RuntimeHostError> {
+        let pending = active
+            .pending_surface_background_transfer
+            .take()
+            .expect("background transfer is pending");
+        let provider_suspended = matches!(
+            &result,
+            Ok(result)
+                if matches!(
+                    result.outcome,
+                    GenerationTaskOutcome::Executed(
+                        ThreadOperationOutcome::ProviderSuspended { .. }
+                    )
+                )
+        );
+        if !provider_suspended {
+            let _ = pending
+                .reply
+                .send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            return self.finish_generation(active, result, allow_resume);
+        }
+
+        let mut result = result.expect("provider-suspended result was matched");
+        let GenerationTaskOutcome::Executed(ThreadOperationOutcome::ProviderSuspended {
+            suspension,
+            ..
+        }) = result.outcome
+        else {
+            unreachable!("provider-suspended result was matched");
+        };
+        let fence = active.surface_operation.clone().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "typed background transfer lost its generation fence".to_string(),
+            }
+        })?;
+        if !self.bind_surface_operation_controller(&pending.client, &fence.operation_id) {
+            let mut suspension = suspension;
+            cancel_and_join_provider_suspension(&mut suspension);
+            result.outcome = GenerationTaskOutcome::ExecutionFailed {
+                kind: io::ErrorKind::PermissionDenied,
+                message: "typed background transfer lost its controller".to_string(),
+            };
+            let _ = pending
+                .reply
+                .send(Err(surface::SurfaceClientCommandError::Unauthorized));
+            return self.finish_generation(active, Ok(result), false);
+        }
+        let task_id = active.main_session_task_id.clone().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "typed background transfer lacks a main-session task".to_string(),
+            }
+        })?;
+        let task_registry = result.state.thread.session().task_registry().clone();
+        let task_record =
+            task_registry
+                .get(&task_id)
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "typed background transfer task disappeared".to_string(),
+                })?;
+        let surface_task_id = surface::SurfaceTaskId::try_new(task_id.clone()).map_err(|_| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "typed background transfer task id is invalid".to_string(),
+            }
+        })?;
+        if let Err(error) = task_registry.mark_backgrounded(&task_id) {
+            let mut suspension = suspension;
+            cancel_and_join_provider_suspension(&mut suspension);
+            result.outcome = GenerationTaskOutcome::ExecutionFailed {
+                kind: io::ErrorKind::Other,
+                message: error,
+            };
+            let _ = pending
+                .reply
+                .send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            return self.finish_generation(active, Ok(result), false);
+        }
+
+        let owner_seed = uuid::Uuid::now_v7();
+        let background_fence = surface::SurfaceBackgroundFence {
+            operation_fence: fence.clone(),
+            background_owner_token: surface::SurfaceBackgroundOwnerToken::new(
+                *surface_sha256(owner_seed.as_bytes()).as_bytes(),
+            ),
+        };
+        let task = surface::SurfaceTask {
+            task_id: surface_task_id.clone(),
+            revision: surface::TaskRevision::try_new(1).expect("one is valid"),
+            task_type: surface::SurfaceTaskType::MainSession,
+            status: surface::SurfaceTaskStatus::Running,
+            backgrounded: true,
+            description: surface::DisplayText::new(task_record.description),
+            created_at: surface::UnixMillis::new(task_record.created_at_ms),
+            started_at: task_record.started_at_ms.map(surface::UnixMillis::new),
+            completed_at: None,
+            parent_operation: Some(fence.operation_id.clone()),
+            background_fence: Some(background_fence.clone()),
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+        };
+        let transfer_batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::GenerationTransferred {
+                            fence: fence.clone(),
+                            background_fence: background_fence.clone(),
+                            task_id: Some(surface_task_id.clone()),
+                        },
+                    ),
+                ),
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::Upserted {
+                        expected_revision: None,
+                        task: task.clone(),
+                    }),
+                ),
+            ],
+            None,
+        );
+        let pending_transfer = PendingTypedProviderTransfer {
+            active,
+            state: result.state,
+            writer: result.writer,
+            usage_delta: result.usage_delta,
+            suspension,
+            request: pending,
+            fence,
+            background_fence,
+            task_id,
+            surface_task_id,
+            surface_task: task,
+            task_registry,
+            batch: transfer_batch,
+            retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+        };
+        match self
+            .resident_surface
+            .coordinator
+            .commit_actor_batch(&pending_transfer.batch)
+        {
+            Ok(_) => self.complete_typed_provider_transfer(pending_transfer),
+            Err(error) if self.resident_surface.coordinator.has_incomplete_batch() => {
+                self.surface_terminal_blocked = Some(format!(
+                    "typed provider background transfer retry is pending: {error:?}"
+                ));
+                debug_assert!(self.pending_provider_transfer.is_none());
+                self.pending_provider_transfer = Some(pending_transfer);
+                Ok(())
+            }
+            Err(error) => self.fail_uncommitted_typed_provider_transfer(
+                pending_transfer,
+                format!("typed background transfer was not durably committed: {error:?}"),
+            ),
+        }
+    }
+
+    fn complete_typed_provider_transfer(
+        &mut self,
+        mut pending: PendingTypedProviderTransfer,
+    ) -> Result<(), RuntimeHostError> {
+        if let Err(error) = pending.writer.finish_generation(true) {
+            eprintln!(
+                "orca: typed background transfer writer failed after durable handoff: {error}"
+            );
+        }
+        self.usage_ledger.add(pending.usage_delta);
+        self.spawn_provider_background_task(
+            &pending.active,
+            &mut pending.state,
+            pending.suspension,
+            Some(TypedProviderBackground {
+                fence: pending.background_fence.clone(),
+                task_id: pending.surface_task_id,
+                task_registry: pending.task_registry.clone(),
+            }),
+        )
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!(
+                "durably committed typed background transfer could not launch: {error}"
+            ),
+        })?;
+        self.state = Some(pending.state);
+        let completed = pending.active.completion.complete(OperationTerminal {
+            operation_id: pending.active.operation_id,
+            outcome: OperationOutcome::Backgrounded {
+                task_id: pending.task_id,
+            },
+        });
+        debug_assert!(completed);
+        let reply = Self::committed_surface_mutation(
+            pending.request.request_id,
+            pending.fence.operation_id,
+            &pending.batch,
+            surface::TransferBackgroundOutput::HandedOff {
+                background_fence: pending.background_fence,
+                handoff_cursor: pending.batch.cursor_after.clone(),
+                waiter: surface::OperationWaiterHandle::new(),
+            },
+        );
+        let _ = pending.request.reply.send(Ok(reply));
+        if self.pending_provider_completions.is_empty()
+            && self.pending_workflow_completions.is_empty()
+        {
+            self.surface_terminal_blocked = None;
+        }
+        Ok(())
+    }
+
+    fn fail_uncommitted_typed_provider_transfer(
+        &mut self,
+        pending: PendingTypedProviderTransfer,
+        message: String,
+    ) -> Result<(), RuntimeHostError> {
+        let PendingTypedProviderTransfer {
+            active,
+            state,
+            writer,
+            usage_delta,
+            mut suspension,
+            request,
+            task_id,
+            task_registry,
+            ..
+        } = pending;
+        let _ = task_registry.mark_foregrounded(&task_id);
+        cancel_and_join_provider_suspension(&mut suspension);
+        let _ = request
+            .reply
+            .send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+        self.finish_generation(
+            active,
+            Ok(OperationTaskResult {
+                state,
+                writer,
+                outcome: GenerationTaskOutcome::ExecutionFailed {
+                    kind: io::ErrorKind::Other,
+                    message,
+                },
+                usage_delta,
+            }),
+            false,
+        )
+    }
+
+    fn rebase_typed_provider_transfer_batch(
+        &self,
+        pending: &PendingTypedProviderTransfer,
+    ) -> surface::SurfaceCommitBatch {
+        self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Generation {
+                        fence: pending.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::GenerationTransferred {
+                            fence: pending.fence.clone(),
+                            background_fence: pending.background_fence.clone(),
+                            task_id: Some(pending.surface_task_id.clone()),
+                        },
+                    ),
+                ),
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::Upserted {
+                        expected_revision: None,
+                        task: pending.surface_task.clone(),
+                    }),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn retry_typed_provider_transfer(&mut self, operation_id: &surface::SurfaceOperationId) {
+        let Some(mut pending) = self.pending_provider_transfer.take() else {
+            return;
+        };
+        if &pending.fence.operation_id != operation_id {
+            self.pending_provider_transfer = Some(pending);
+            return;
+        }
+        if self.resident_surface.coordinator.has_incomplete_batch()
+            && !self
+                .resident_surface
+                .coordinator
+                .incomplete_batch_is(&pending.batch)
+        {
+            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            self.pending_provider_transfer = Some(pending);
+            return;
+        }
+        if !self.resident_surface.coordinator.has_incomplete_batch() {
+            pending.batch = self.rebase_typed_provider_transfer_batch(&pending);
+        }
+        match self
+            .resident_surface
+            .coordinator
+            .commit_actor_batch(&pending.batch)
+        {
+            Ok(_) => {
+                if let Err(error) = self.complete_typed_provider_transfer(pending) {
+                    self.surface_terminal_blocked = Some(error.to_string());
+                }
+            }
+            Err(error) if self.resident_surface.coordinator.has_incomplete_batch() => {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                self.pending_provider_transfer = Some(pending);
+                self.surface_terminal_blocked = Some(format!(
+                    "typed provider background transfer retry is pending: {error:?}"
+                ));
+            }
+            Err(error) => {
+                if let Err(error) = self.fail_uncommitted_typed_provider_transfer(
+                    pending,
+                    format!("typed background transfer retry failed: {error:?}"),
+                ) {
+                    self.surface_terminal_blocked = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn retain_provider_transfer_for_cold_recovery(&mut self) {
+        let Some(mut pending) = self.pending_provider_transfer.take() else {
+            return;
+        };
+        cancel_and_join_provider_suspension(&mut pending.suspension);
+        let _ = pending
+            .request
+            .reply
+            .send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+        let completed = pending.active.completion.complete(OperationTerminal {
+            operation_id: pending.active.operation_id,
+            outcome: OperationOutcome::ExecutionFailed {
+                kind: io::ErrorKind::Other,
+                message: "typed provider transfer recovery was retained for cold restart"
+                    .to_string(),
+            },
+        });
+        debug_assert!(completed);
+        self.state = Some(pending.state);
+    }
+
     fn finish_generation(
         &mut self,
         mut active: ActiveOperation,
         result: Result<OperationTaskResult, tokio::task::JoinError>,
         allow_resume: bool,
     ) -> Result<(), RuntimeHostError> {
+        if active.pending_surface_background_transfer.is_some() {
+            return self.finish_surface_background_transfer(active, result, allow_resume);
+        }
         let mut surface_usage = UsageTotals::default();
         let mut completed_turn = None;
         let outcome = match result {
@@ -20002,6 +21171,7 @@ impl ThreadActor {
                                     &active,
                                     &mut result.state,
                                     suspension,
+                                    None,
                                 ) {
                                     Ok(task_id) => {
                                         self.state = Some(result.state);
@@ -20550,6 +21720,7 @@ impl ThreadActor {
                     cancel,
                     join,
                     typed_workflow: None,
+                    typed_provider: None,
                 },
             );
         }
@@ -20560,6 +21731,7 @@ impl ThreadActor {
         active: &ActiveOperation,
         state: &mut ThreadActorState,
         suspension: Box<RuntimeProviderSuspension>,
+        typed_provider: Option<TypedProviderBackground>,
     ) -> io::Result<String> {
         let task_id = active
             .main_session_task_id
@@ -20576,15 +21748,24 @@ impl ThreadActor {
         }
 
         let task_registry = state.thread.session().task_registry().clone();
-        task_registry
-            .mark_backgrounded(&task_id)
-            .map_err(io::Error::other)?;
-        emit_task_status_update(
-            active.request.event_observer(),
-            &mut state.events,
-            &task_registry,
-            &task_id,
-        )?;
+        if typed_provider.is_none() {
+            task_registry
+                .mark_backgrounded(&task_id)
+                .map_err(io::Error::other)?;
+            emit_task_status_update(
+                active.request.event_observer(),
+                &mut state.events,
+                &task_registry,
+                &task_id,
+            )?;
+        } else {
+            let _ = emit_task_status_update(
+                active.request.event_observer(),
+                &mut state.events,
+                &task_registry,
+                &task_id,
+            );
+        }
 
         let history_writer = state.thread.session_mut().writer_mut().cloned();
         let context = ProviderBackgroundTaskContext {
@@ -20597,6 +21778,18 @@ impl ThreadActor {
             usage_ledger: self.usage_ledger.clone(),
             response_identity: suspension.identity().clone(),
         };
+        #[cfg(test)]
+        let completion_notify_delay = context
+            .task_registry
+            .get(&task_id)
+            .and_then(|task| {
+                task.description.split_whitespace().find_map(|token| {
+                    token
+                        .strip_prefix("test_provider_completion_notify_delay_ms=")
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+            })
+            .map(Duration::from_millis);
         let cancel = CancelToken::new();
         let worker_cancel = cancel.clone();
         let completion_tx = self.background_completion_tx.clone();
@@ -20616,6 +21809,10 @@ impl ThreadActor {
                     None,
                 );
             }
+            #[cfg(test)]
+            if let Some(delay) = completion_notify_delay {
+                std::thread::sleep(delay);
+            }
             let _ = completion_tx.send(completion_task_id);
         });
         self.background_tasks.insert(
@@ -20624,6 +21821,7 @@ impl ThreadActor {
                 cancel,
                 join,
                 typed_workflow: None,
+                typed_provider,
             },
         );
         Ok(task_id)
@@ -20634,6 +21832,7 @@ impl ThreadActor {
             let HostBackgroundTask {
                 join,
                 typed_workflow,
+                typed_provider,
                 ..
             } = task;
             let _ = join.await;
@@ -20642,6 +21841,362 @@ impl ThreadActor {
             {
                 self.surface_terminal_blocked = Some(error.to_string());
             }
+            if let Some(typed_provider) = typed_provider
+                && let Err(error) = self.commit_typed_provider_completion(typed_provider, None)
+            {
+                self.surface_terminal_blocked = Some(error.to_string());
+            }
+        }
+    }
+
+    fn commit_typed_provider_completion(
+        &mut self,
+        typed: TypedProviderBackground,
+        shutdown_reason: Option<surface::SurfaceShutdownReason>,
+    ) -> Result<(), RuntimeHostError> {
+        let mut pending = self.prepare_typed_provider_completion(typed, shutdown_reason)?;
+        let operation_id = pending.operation_id.clone();
+        match self.settle_typed_provider_completion(&mut pending) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                self.pending_provider_completions
+                    .insert(operation_id, pending);
+                Err(error)
+            }
+        }
+    }
+
+    fn prepare_typed_provider_completion(
+        &self,
+        typed: TypedProviderBackground,
+        shutdown_reason: Option<surface::SurfaceShutdownReason>,
+    ) -> Result<PendingTypedProviderCompletion, RuntimeHostError> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == typed.task_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed provider task disappeared before completion".to_string(),
+            })?;
+        let record = typed
+            .task_registry
+            .get(typed.task_id.as_str())
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed provider task registry record disappeared".to_string(),
+            })?;
+        let committed_user_cancel = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == typed.fence.operation_fence.operation_id)
+            .is_some_and(|operation| {
+                matches!(
+                    &operation.pending_control,
+                    Some(surface::PendingControlIntent::Terminalize {
+                        operation_id,
+                        cause: surface::TerminalizationCause::UserCancel,
+                    }) if operation_id == &typed.fence.operation_fence.operation_id
+                )
+            });
+        let next_task_revision =
+            surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "typed provider task revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "typed provider task revision is invalid".to_string(),
+            })?;
+        let usage = surface_usage_totals(record.usage.unwrap_or_default());
+        let failure_message = surface::SafeDiagnosticText::try_new("background provider failed")
+            .expect("fixed diagnostic is bounded");
+        let approval_message =
+            surface::SafeDiagnosticText::try_new("background provider requires approval")
+                .expect("fixed diagnostic is bounded");
+        let (task_status, stop_reason, terminal) = match (shutdown_reason.clone(), record.status) {
+            (Some(reason), _) => (
+                surface::SurfaceTaskStatus::Stopped,
+                surface::GenerationStopReason::Cancelled {
+                    cause: match reason {
+                        surface::SurfaceShutdownReason::HostShutdown => {
+                            surface::TerminalizationCause::HostShutdown
+                        }
+                        surface::SurfaceShutdownReason::ThreadClose => {
+                            surface::TerminalizationCause::ThreadClose
+                        }
+                    },
+                },
+                surface::OperationTerminal::Shutdown { reason },
+            ),
+            (None, _) if committed_user_cancel => (
+                surface::SurfaceTaskStatus::Cancelled,
+                surface::GenerationStopReason::Cancelled {
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                },
+            ),
+            (None, TaskStatus::Completed) => (
+                surface::SurfaceTaskStatus::Completed,
+                surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::Success,
+                },
+                surface::OperationTerminal::Succeeded {
+                    usage: usage.clone(),
+                },
+            ),
+            (None, TaskStatus::Stopped | TaskStatus::Cancelled) => (
+                if record.status == TaskStatus::Stopped {
+                    surface::SurfaceTaskStatus::Stopped
+                } else {
+                    surface::SurfaceTaskStatus::Cancelled
+                },
+                surface::GenerationStopReason::Cancelled {
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                },
+            ),
+            (None, TaskStatus::ApprovalRequired) => (
+                surface::SurfaceTaskStatus::ApprovalRequired,
+                surface::GenerationStopReason::ExecutionFailed {
+                    class: surface::GenerationExecutionFailureClass::LegacyApprovalRequired,
+                    message: approval_message.clone(),
+                },
+                surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::LegacyApprovalRequired,
+                    message: approval_message,
+                },
+            ),
+            _ => (
+                surface::SurfaceTaskStatus::Failed,
+                surface::GenerationStopReason::ExecutionFailed {
+                    class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
+                    message: failure_message.clone(),
+                },
+                surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message: failure_message,
+                },
+            ),
+        };
+        let finalize_intent_id =
+            surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let terminal_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let operation_id = typed.fence.operation_fence.operation_id.clone();
+        let completion_batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        task_id: typed.task_id.clone(),
+                        expected_revision: task.revision,
+                        next_revision: next_task_revision,
+                        status: task_status,
+                        completed_at: record.completed_at_ms.map(surface::UnixMillis::new),
+                        result: if committed_user_cancel {
+                            Some(surface::DisplayText::new("Background turn cancelled"))
+                        } else {
+                            record.result.map(surface::DisplayText::new)
+                        },
+                        error: if committed_user_cancel {
+                            None
+                        } else {
+                            record.error.map(surface::DisplayText::new)
+                        },
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                        fence: typed.fence.operation_fence.clone(),
+                        reason: stop_reason.clone(),
+                        usage_delta: usage.clone(),
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::FinalizationStarted {
+                            operation_id: operation_id.clone(),
+                            finalize_intent_id: finalize_intent_id.clone(),
+                            terminal_commit_id: terminal_commit_id.clone(),
+                            selected_cause: surface::OperationFinalizationCause::GenerationStop(
+                                stop_reason,
+                            ),
+                            suspended_cause: None,
+                            expected_settlements: Vec::new(),
+                        },
+                    ),
+                ),
+            ],
+            None,
+        );
+        Ok(PendingTypedProviderCompletion {
+            typed,
+            shutdown_reason,
+            operation_id: operation_id.clone(),
+            finalize_intent_id,
+            terminal_commit_id,
+            completion_batch,
+            terminal,
+            usage,
+            terminal_batch: None,
+            terminal_value: None,
+            stage: TypedProviderCompletionStage::Completion,
+            rebuild_after_foreign_incomplete: false,
+            retry_at: tokio::time::Instant::now(),
+        })
+    }
+
+    fn settle_typed_provider_completion(
+        &mut self,
+        pending: &mut PendingTypedProviderCompletion,
+    ) -> Result<(), RuntimeHostError> {
+        if pending.stage == TypedProviderCompletionStage::Completion {
+            if self.resident_surface.coordinator.has_incomplete_batch()
+                && !self
+                    .resident_surface
+                    .coordinator
+                    .incomplete_batch_is(&pending.completion_batch)
+            {
+                pending.rebuild_after_foreign_incomplete = true;
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message:
+                        "typed provider completion is waiting for another prepared surface batch"
+                            .to_string(),
+                });
+            }
+            let current_cursor = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .cursor
+                .clone();
+            if !self.resident_surface.coordinator.has_incomplete_batch()
+                && (pending.rebuild_after_foreign_incomplete
+                    || pending.completion_batch.cursor_before != current_cursor)
+            {
+                *pending = self.prepare_typed_provider_completion(
+                    pending.typed.clone(),
+                    pending.shutdown_reason.clone(),
+                )?;
+            }
+            self.resident_surface
+                .coordinator
+                .commit_provider_background_stop_batch(
+                    pending.typed.fence.clone(),
+                    pending.operation_id.clone(),
+                    pending.finalize_intent_id.clone(),
+                    &pending.completion_batch,
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to commit typed provider completion: {error:?}"),
+                })?;
+            pending.stage = TypedProviderCompletionStage::Terminal;
+        }
+        if self.resident_surface.coordinator.has_incomplete_batch()
+            && !pending
+                .terminal_batch
+                .as_ref()
+                .is_some_and(|batch| self.resident_surface.coordinator.incomplete_batch_is(batch))
+        {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "typed provider terminal is waiting for another prepared surface batch"
+                    .to_string(),
+            });
+        }
+        let current_cursor = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .cursor
+            .clone();
+        let terminal_batch_is_stale = pending
+            .terminal_batch
+            .as_ref()
+            .is_some_and(|batch| batch.cursor_before != current_cursor)
+            && !self.resident_surface.coordinator.has_incomplete_batch();
+        if pending.terminal_batch.is_none() || terminal_batch_is_stale {
+            let terminal_batch = self.surface_event_batch_with_commit_id(
+                vec![(
+                    surface::SurfaceScope::Background {
+                        fence: pending.typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                        record: surface::OperationTerminalRecord {
+                            operation_id: pending.operation_id.clone(),
+                            finalize_intent_id: pending.finalize_intent_id.clone(),
+                            terminal: pending.terminal.clone(),
+                            usage: pending.usage.clone(),
+                            source_diagnostic_digest: None,
+                            settlement_receipts: Vec::new(),
+                            committed_at: surface::UnixMillis::new(
+                                chrono::Utc::now().timestamp_millis(),
+                            ),
+                        },
+                    }),
+                )],
+                Some(pending.terminal_commit_id.clone()),
+            );
+            pending.terminal_value = Some(surface::OperationTerminalAtCursor {
+                operation_id: pending.operation_id.clone(),
+                terminal: pending.terminal.clone(),
+                cursor: terminal_batch.cursor_after.clone(),
+                commit_class: terminal_batch.commit_class.clone(),
+                batch_digest: terminal_batch.batch_digest.clone(),
+            });
+            pending.terminal_batch = Some(terminal_batch);
+        }
+        let terminal_batch = pending
+            .terminal_batch
+            .as_ref()
+            .expect("typed provider terminal owns an exact batch");
+        self.resident_surface
+            .coordinator
+            .commit_finalizer_batch(
+                pending.operation_id.clone(),
+                pending.finalize_intent_id.clone(),
+                terminal_batch,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to commit typed provider terminal: {error:?}"),
+            })?;
+        self.cache_surface_terminal(
+            pending
+                .terminal_value
+                .clone()
+                .expect("typed provider terminal owns its public value"),
+        );
+        Ok(())
+    }
+
+    fn retry_typed_provider_completion(&mut self, operation_id: &surface::SurfaceOperationId) {
+        let Some(mut pending) = self.pending_provider_completions.remove(operation_id) else {
+            return;
+        };
+        if self.settle_typed_provider_completion(&mut pending).is_err() {
+            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            self.pending_provider_completions
+                .insert(operation_id.clone(), pending);
+        } else if self.pending_provider_completions.is_empty()
+            && self.pending_workflow_completions.is_empty()
+        {
+            self.surface_terminal_blocked = None;
         }
     }
 
@@ -21050,7 +22605,9 @@ impl ThreadActor {
             pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
             self.pending_workflow_completions
                 .insert(operation_id.clone(), pending);
-        } else if self.pending_workflow_completions.is_empty() {
+        } else if self.pending_workflow_completions.is_empty()
+            && self.pending_provider_completions.is_empty()
+        {
             self.surface_terminal_blocked = None;
         }
     }
@@ -21072,6 +22629,7 @@ impl ThreadActor {
             let HostBackgroundTask {
                 join,
                 typed_workflow,
+                typed_provider,
                 ..
             } = task;
             let _ = join.await;
@@ -21083,27 +22641,40 @@ impl ThreadActor {
                     first_error.get_or_insert(error);
                 }
             }
+            if let Some(typed_provider) = typed_provider
+                && let Err(error) =
+                    self.commit_typed_provider_completion(typed_provider, Some(reason))
+            {
+                self.surface_terminal_blocked = Some(error.to_string());
+                first_error.get_or_insert(error);
+            }
         }
         for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
-            if self.pending_workflow_completions.is_empty() {
+            if self.pending_workflow_completions.is_empty()
+                && self.pending_provider_completions.is_empty()
+            {
                 return Ok(());
             }
             let operation_ids = self
                 .pending_workflow_completions
                 .keys()
+                .chain(self.pending_provider_completions.keys())
                 .cloned()
                 .collect::<Vec<_>>();
             for operation_id in operation_ids {
                 self.retry_typed_workflow_completion(&operation_id);
+                self.retry_typed_provider_completion(&operation_id);
             }
-            if !self.pending_workflow_completions.is_empty() {
+            if !self.pending_workflow_completions.is_empty()
+                || !self.pending_provider_completions.is_empty()
+            {
                 tokio::time::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL).await;
             }
         }
         first_error.map_or_else(
             || {
                 Err(RuntimeHostError::ThreadStartFailed {
-                    message: "typed workflow completion retry did not converge".to_string(),
+                    message: "typed background completion retry did not converge".to_string(),
                 })
             },
             Err,
@@ -21999,6 +23570,10 @@ mod tests {
         "ORCA_RUNTIME_HOST_EMPTY_THREAD_OWNER_RECOVERY_CHILD";
     const SUSPENDED_OPERATION_RECOVERY_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_SUSPENDED_OPERATION_RECOVERY_CHILD";
+    const BACKGROUND_PROVIDER_RECOVERY_CHILD_ENV: &str =
+        "ORCA_RUNTIME_HOST_BACKGROUND_PROVIDER_RECOVERY_CHILD";
+    const DURABLE_PROVIDER_OUTCOME_RECOVERY_CHILD_ENV: &str =
+        "ORCA_RUNTIME_HOST_DURABLE_PROVIDER_OUTCOME_RECOVERY_CHILD";
     const RESERVATION_TERMINAL_FAILURE_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24560,6 +26135,1168 @@ mod tests {
                 })
         ));
         host.shutdown().expect("shutdown retry runtime host");
+    }
+
+    #[test]
+    fn background_transfer_checkpoint_failure_keeps_live_owner_until_exact_retry() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry typed provider transfer",
+            )
+            .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load runtime transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_delay_ms 1000",
+                    ),
+                )
+                .expect("reserve typed provider operation"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed provider operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("typed provider operation was queued");
+        };
+        surface::JsonlSurfaceCommitLedger::inject_background_transfer_checkpoint_failures(
+            transcript_path,
+            1,
+        );
+        let transferred = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("exact transfer retry must keep the client request alive"),
+        );
+        let surface::TransferBackgroundOutput::HandedOff {
+            background_fence, ..
+        } = transferred
+        else {
+            panic!("active provider transfer returned a queued intent");
+        };
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let background = snapshot
+            .background_operations
+            .iter()
+            .find(|background| background.operation_id == reserved.operation_id)
+            .expect("retried transfer materialized the background owner");
+        assert!(background.fence == background_fence);
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == background.task_id.clone().unwrap())
+            .expect("retried transfer materialized its task");
+        assert!(task.background_fence.as_ref() == Some(&background_fence));
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), reserved.operation_id.clone())
+            .expect("cancel retried provider background");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id)
+            .expect("wait retried provider background terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Cancelled { .. })
+        ));
+        host.shutdown().expect("shutdown retry runtime host");
+    }
+
+    type BackgroundProviderRecoveryFixture =
+        (String, surface::SurfaceOperationId, surface::SurfaceTaskId);
+
+    fn background_provider_recovery_fixture_path() -> PathBuf {
+        PathBuf::from(std::env::var_os("ORCA_HOME").expect("ORCA_HOME for provider recovery child"))
+            .join("background-provider-recovery.json")
+    }
+
+    fn run_background_provider_recovery_seed_child() -> ! {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start provider recovery seed host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "seed typed provider background",
+            )
+            .expect("start provider recovery seed thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_delay_ms 30000",
+                    ),
+                )
+                .expect("reserve provider recovery operation"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit provider recovery operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("provider recovery operation was queued");
+        };
+        let transferred = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer provider recovery operation"),
+        );
+        let surface::TransferBackgroundOutput::HandedOff { .. } = transferred else {
+            panic!("provider recovery operation did not hand off");
+        };
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let background = snapshot
+            .background_operations
+            .iter()
+            .find(|background| background.operation_id == reserved.operation_id)
+            .expect("seed background owner is durable");
+        let task_id = background
+            .task_id
+            .clone()
+            .expect("seed background owns a main-session task");
+        let fixture: BackgroundProviderRecoveryFixture = (
+            thread.thread_id().to_string(),
+            reserved.operation_id,
+            task_id,
+        );
+        std::fs::write(
+            background_provider_recovery_fixture_path(),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .expect("write provider recovery fixture");
+        std::mem::forget(host);
+        std::process::exit(0)
+    }
+
+    fn run_background_provider_recovery_child() -> ! {
+        let (thread_id, operation_id, task_id): BackgroundProviderRecoveryFixture =
+            serde_json::from_slice(
+                &std::fs::read(background_provider_recovery_fixture_path())
+                    .expect("read provider recovery fixture"),
+            )
+            .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start provider recovery host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "recover typed provider background",
+            )
+            .expect("resume provider recovery thread");
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        assert!(snapshot.background_operations.is_empty());
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("cold recovery keeps provider operation history");
+        assert!(operation.terminal.is_some());
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .expect("cold recovery keeps provider task");
+        assert!(matches!(
+            task.status,
+            surface::SurfaceTaskStatus::Stopped
+                | surface::SurfaceTaskStatus::Cancelled
+                | surface::SurfaceTaskStatus::Failed
+        ));
+        assert!(!task.backgrounded || task.background_fence.is_some());
+        host.shutdown().expect("shutdown provider recovery host");
+        std::process::exit(0)
+    }
+
+    #[test]
+    fn cold_restart_terminalizes_transferred_provider_and_main_session_task() {
+        if let Some(phase) = std::env::var_os(BACKGROUND_PROVIDER_RECOVERY_CHILD_ENV) {
+            match phase.to_string_lossy().as_ref() {
+                "seed" => run_background_provider_recovery_seed_child(),
+                "recover" => run_background_provider_recovery_child(),
+                phase => panic!("unknown provider recovery phase: {phase}"),
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        for phase in ["seed", "recover"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    "runtime_host::tests::cold_restart_terminalizes_transferred_provider_and_main_session_task",
+                )
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(BACKGROUND_PROVIDER_RECOVERY_CHILD_ENV, phase)
+                .env("ORCA_HOME", home.path())
+                .status()
+                .expect("start provider recovery child");
+            assert!(
+                status.success(),
+                "provider recovery child failed during {phase}"
+            );
+        }
+    }
+
+    type DurableProviderOutcomeRecoveryFixture = (
+        String,
+        surface::SurfaceOperationId,
+        surface::SurfaceTaskId,
+        String,
+    );
+
+    fn durable_provider_outcome_recovery_fixture_path() -> PathBuf {
+        PathBuf::from(
+            std::env::var_os("ORCA_HOME").expect("ORCA_HOME for durable provider outcome child"),
+        )
+        .join("durable-provider-outcome-recovery.json")
+    }
+
+    fn persisted_task_status(thread_id: &str, task_id: &str) -> Option<String> {
+        let path = PathBuf::from(std::env::var_os("ORCA_HOME")?)
+            .join("task-sessions")
+            .join(thread_id)
+            .join("tasks.json");
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        value
+            .get(task_id)?
+            .get("status")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn run_durable_provider_outcome_seed_child(mode: &str) -> ! {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start durable provider outcome seed host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "seed durable provider outcome",
+            )
+            .expect("start durable provider outcome seed thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let prompt = match mode {
+            "completed" => {
+                "mock_stream_delay_ms 100 test_provider_completion_notify_delay_ms=30000"
+            }
+            "approval" => {
+                "mock_stream_tool_delay_ms 100 task_list test_provider_completion_notify_delay_ms=30000"
+            }
+            "approval-finalizing" => "mock_stream_tool_delay_ms 500 task_list",
+            _ => panic!("unknown durable provider outcome mode: {mode}"),
+        };
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, prompt),
+                )
+                .expect("reserve durable provider outcome"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit durable provider outcome"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("durable provider outcome operation was queued");
+        };
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer durable provider outcome"),
+        );
+        if mode == "approval-finalizing" {
+            let transcript_path = SessionStore::new()
+                .load_session(thread.thread_id())
+                .expect("load durable provider outcome transcript")
+                .path;
+            surface::JsonlSurfaceCommitLedger::inject_terminal_append_failure_once(transcript_path);
+        }
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let background = snapshot
+            .background_operations
+            .iter()
+            .find(|background| background.operation_id == reserved.operation_id)
+            .expect("durable provider outcome background is visible");
+        let task_id = background
+            .task_id
+            .clone()
+            .expect("durable provider outcome owns a task");
+        let expected_status = if mode == "completed" {
+            "completed"
+        } else {
+            "approval_required"
+        };
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while persisted_task_status(thread.thread_id(), task_id.as_str()).as_deref()
+            != Some(expected_status)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "provider outcome did not become durable before crash"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if mode == "approval-finalizing" {
+            loop {
+                let snapshot = fresh_surface_attachment_with_capabilities(
+                    &surface,
+                    BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+                )
+                .baseline
+                .snapshot;
+                let operation = snapshot
+                    .operation_history
+                    .iter()
+                    .find(|operation| operation.operation_id == reserved.operation_id)
+                    .expect("approval provider operation remains in history");
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == task_id)
+                    .expect("approval provider task remains projected");
+                if task.status == surface::SurfaceTaskStatus::ApprovalRequired
+                    && operation.finalization.is_some()
+                    && operation.terminal.is_none()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "approval provider completion did not stop before terminal append"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let fixture: DurableProviderOutcomeRecoveryFixture = (
+            thread.thread_id().to_string(),
+            reserved.operation_id,
+            task_id,
+            mode.to_string(),
+        );
+        std::fs::write(
+            durable_provider_outcome_recovery_fixture_path(),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .expect("write durable provider outcome fixture");
+        std::mem::forget(host);
+        std::process::exit(0)
+    }
+
+    fn run_durable_provider_outcome_recovery_child(mode: &str) -> ! {
+        let (thread_id, operation_id, task_id, fixture_mode):
+            DurableProviderOutcomeRecoveryFixture = serde_json::from_slice(
+            &std::fs::read(durable_provider_outcome_recovery_fixture_path())
+                .expect("read durable provider outcome fixture"),
+        )
+        .unwrap();
+        assert_eq!(fixture_mode, mode);
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start durable provider outcome recovery host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "recover durable provider outcome",
+            )
+            .expect("resume durable provider outcome thread");
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        assert!(snapshot.background_operations.is_empty());
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("durable provider outcome operation remains in history");
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .expect("durable provider outcome task remains projected");
+        match mode {
+            "completed" => {
+                assert!(matches!(
+                    operation.terminal.as_ref().map(|record| &record.terminal),
+                    Some(surface::OperationTerminal::Succeeded { .. })
+                ));
+                assert_eq!(task.status, surface::SurfaceTaskStatus::Completed);
+            }
+            "approval" | "approval-finalizing" => {
+                assert!(matches!(
+                    operation.terminal.as_ref().map(|record| &record.terminal),
+                    Some(surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::LegacyApprovalRequired,
+                        ..
+                    })
+                ));
+                assert_eq!(task.status, surface::SurfaceTaskStatus::ApprovalRequired);
+            }
+            _ => panic!("unknown durable provider outcome mode: {mode}"),
+        }
+        host.shutdown()
+            .expect("shutdown durable provider outcome recovery host");
+        std::process::exit(0)
+    }
+
+    #[test]
+    fn cold_restart_preserves_durable_provider_completed_and_approval_outcomes() {
+        if let Some(phase) = std::env::var_os(DURABLE_PROVIDER_OUTCOME_RECOVERY_CHILD_ENV) {
+            let phase = phase.to_string_lossy();
+            if let Some(mode) = phase.strip_prefix("seed-") {
+                run_durable_provider_outcome_seed_child(mode);
+            }
+            if let Some(mode) = phase.strip_prefix("recover-") {
+                run_durable_provider_outcome_recovery_child(mode);
+            }
+            panic!("unknown durable provider outcome recovery phase: {phase}");
+        }
+        let home = tempfile::tempdir().unwrap();
+        for mode in ["completed", "approval", "approval-finalizing"] {
+            for phase in ["seed", "recover"] {
+                let phase = format!("{phase}-{mode}");
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(
+                        "runtime_host::tests::cold_restart_preserves_durable_provider_completed_and_approval_outcomes",
+                    )
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(DURABLE_PROVIDER_OUTCOME_RECOVERY_CHILD_ENV, &phase)
+                    .env("ORCA_HOME", home.path())
+                    .status()
+                    .expect("start durable provider outcome recovery child");
+                assert!(
+                    status.success(),
+                    "durable provider outcome child failed during {phase}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn background_approval_checkpoint_failure_retries_exact_terminalization() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start approval retry host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry typed provider approval",
+            )
+            .expect("start approval retry thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load approval retry transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_tool_delay_ms 500 task_list",
+                    ),
+                )
+                .expect("reserve approval retry operation"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit approval retry operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("approval retry operation was queued");
+        };
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer approval retry operation"),
+        );
+        surface::JsonlSurfaceCommitLedger::inject_provider_completion_checkpoint_failures(
+            transcript_path,
+            1,
+        );
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id.clone())
+            .expect("wait approval retry terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(
+                    value.terminal,
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::LegacyApprovalRequired,
+                        ..
+                    }
+                )
+        ));
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.parent_operation.as_ref() == Some(&reserved.operation_id))
+            .expect("approval retry keeps its main-session task");
+        assert_eq!(task.status, surface::SurfaceTaskStatus::ApprovalRequired);
+        assert!(
+            snapshot
+                .background_operations
+                .iter()
+                .all(|background| background.operation_id != reserved.operation_id)
+        );
+        host.shutdown().expect("shutdown approval retry host");
+    }
+
+    #[test]
+    fn older_incomplete_background_completion_cannot_orphan_a_new_transfer() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start transfer ordering host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "serialize provider completion before transfer",
+            )
+            .expect("start transfer ordering thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load transfer ordering transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+
+        let first = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_tool_delay_ms 800 task_list",
+                    ),
+                )
+                .expect("reserve first provider operation"),
+        );
+        let first_admission = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    first.operation_id.clone(),
+                    first.lease.lease_id,
+                )
+                .expect("admit first provider operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = first_admission
+        else {
+            panic!("first provider operation was queued");
+        };
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer first provider operation"),
+        );
+        surface::JsonlSurfaceCommitLedger::inject_provider_completion_checkpoint_failures(
+            transcript_path,
+            5,
+        );
+
+        let baseline = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let second = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &baseline,
+                        "mock_stream_delay_ms 2000 test_surface_suspension_delay_ms=1000",
+                    ),
+                )
+                .expect("reserve second provider operation"),
+        );
+        let second_admission = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    second.operation_id.clone(),
+                    second.lease.lease_id,
+                )
+                .expect("admit second provider operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = second_admission
+        else {
+            panic!("second provider operation was queued");
+        };
+        let second_transfer = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("older exact retry must retain the second transfer owner"),
+        );
+        assert!(matches!(
+            second_transfer,
+            surface::TransferBackgroundOutput::HandedOff { .. }
+        ));
+
+        let first_terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), first.operation_id)
+            .expect("wait first provider terminal");
+        assert!(matches!(
+            first_terminal,
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+        let second_terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), second.operation_id)
+            .expect("wait second provider terminal");
+        assert!(matches!(
+            second_terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        host.shutdown().expect("shutdown transfer ordering host");
+    }
+
+    #[test]
+    fn accepted_provider_background_cancel_wins_a_ready_completion() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start provider cancel race host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "cancel ready provider completion",
+            )
+            .expect("start provider cancel race thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_delay_ms 100 test_provider_completion_notify_delay_ms=500",
+                    ),
+                )
+                .expect("reserve provider cancel race operation"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit provider cancel race operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("provider cancel race operation was queued");
+        };
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer provider cancel race operation"),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let cancelled = committed_surface_value(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), reserved.operation_id.clone())
+                .expect("cancel ready provider completion"),
+        );
+        assert!(matches!(
+            cancelled,
+            surface::CancelOperationOutput::Accepted { .. }
+        ));
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id.clone())
+            .expect("wait provider cancel race terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Cancelled { .. })
+        ));
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == reserved.operation_id)
+            .expect("cancelled provider operation remains in history");
+        assert!(
+            operation.pending_control.is_none(),
+            "terminal provider cancel must consume its control intent"
+        );
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.parent_operation.as_ref() == Some(&reserved.operation_id))
+            .expect("cancelled provider task remains projected");
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        host.shutdown().expect("shutdown provider cancel race host");
+    }
+
+    #[test]
+    fn checkpoint_failed_provider_cancel_rebuilds_a_ready_completion() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start provider cancel checkpoint race host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "cancel ready provider completion after checkpoint failure",
+            )
+            .expect("start provider cancel checkpoint race thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load provider cancel checkpoint transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_delay_ms 100 test_provider_completion_notify_delay_ms=500",
+                    ),
+                )
+                .expect("reserve provider cancel checkpoint race operation"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit provider cancel checkpoint race operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("provider cancel checkpoint race operation was queued");
+        };
+        let transfer = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer provider cancel checkpoint race operation"),
+        );
+        let surface::TransferBackgroundOutput::HandedOff {
+            background_fence, ..
+        } = transfer
+        else {
+            panic!("provider cancel checkpoint transfer was queued");
+        };
+        let task_id = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot
+        .background_operations
+        .iter()
+        .find(|background| background.fence == background_fence)
+        .and_then(|background| background.task_id.clone())
+        .expect("provider cancel checkpoint race owns a task");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while thread
+            .task_registry()
+            .get(task_id.as_str())
+            .is_none_or(|task| task.status != TaskStatus::Completed)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "provider completion was not durable before checkpoint-failed cancel"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(transcript_path, 10);
+        assert!(matches!(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), reserved.operation_id.clone()),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+        loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let operation = snapshot
+                .operation_history
+                .iter()
+                .find(|operation| operation.operation_id == reserved.operation_id)
+                .expect("provider cancel checkpoint operation remains in history");
+            if let Some(terminal) = operation.terminal.as_ref() {
+                assert!(matches!(
+                    terminal.terminal,
+                    surface::OperationTerminal::Cancelled { .. }
+                ));
+                assert!(
+                    operation.pending_control.is_none(),
+                    "terminal provider cancel must consume its control intent"
+                );
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == task_id)
+                    .expect("provider cancel checkpoint task remains projected");
+                assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "checkpoint-failed provider cancel left completion permanently pending"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        host.shutdown()
+            .expect("shutdown provider cancel checkpoint race host");
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProviderAppendFailureStage {
+        Completion,
+        Terminal,
+    }
+
+    fn assert_provider_append_failure_rebases_after_foreign_commit(
+        failure_stage: ProviderAppendFailureStage,
+    ) {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start provider append retry host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "rebase provider completion after foreign commit",
+            )
+            .expect("start provider append retry thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load provider append retry transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_delay_ms 100",
+                    ),
+                )
+                .expect("reserve provider append retry operation"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit provider append retry operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("provider append retry operation was queued");
+        };
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer provider append retry operation"),
+        );
+        match failure_stage {
+            ProviderAppendFailureStage::Completion => {
+                surface::JsonlSurfaceCommitLedger::inject_provider_completion_append_failures(
+                    transcript_path,
+                    10,
+                );
+            }
+            ProviderAppendFailureStage::Terminal => {
+                surface::JsonlSurfaceCommitLedger::inject_provider_terminal_append_failures(
+                    transcript_path,
+                    10,
+                );
+            }
+        }
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let operation = snapshot
+                .operation_history
+                .iter()
+                .find(|operation| operation.operation_id == reserved.operation_id)
+                .expect("provider append retry operation remains in history");
+            let expected_stage = match failure_stage {
+                ProviderAppendFailureStage::Completion => operation.finalization.is_none(),
+                ProviderAppendFailureStage::Terminal => {
+                    operation.finalization.is_some() && operation.terminal.is_none()
+                }
+            };
+            if expected_stage
+                && thread
+                    .surface_actor_probe_for_test(reserved.operation_id.clone())
+                    .expect("probe provider append retry")
+                    .pending_workflow_completion
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "provider append failure did not retain its live owner"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before_settings = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let settings = committed_surface_value(
+            attachment
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    before_settings.settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![surface::RuntimeSettingsPatch::SetModel {
+                        model: surface::NonEmptyText::try_new("provider-append-cursor-advance")
+                            .unwrap(),
+                    }])
+                    .unwrap(),
+                )
+                .expect("advance surface cursor after provider append failure"),
+        );
+        assert!(
+            settings.cursor.next_seq > before_settings.cursor.next_seq,
+            "foreign settings commit must advance the surface cursor"
+        );
+        loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let operation = snapshot
+                .operation_history
+                .iter()
+                .find(|operation| operation.operation_id == reserved.operation_id)
+                .expect("provider append retry operation remains in history");
+            if let Some(terminal) = operation.terminal.as_ref() {
+                assert!(matches!(
+                    terminal.terminal,
+                    surface::OperationTerminal::Succeeded { .. }
+                ));
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.parent_operation.as_ref() == Some(&reserved.operation_id))
+                    .expect("provider append retry task remains projected");
+                assert_eq!(task.status, surface::SurfaceTaskStatus::Completed);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "provider append retry kept a stale cursor batch"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !thread
+                .surface_actor_probe_for_test(reserved.operation_id)
+                .expect("probe settled provider append retry")
+                .pending_workflow_completion
+        );
+        host.shutdown()
+            .expect("shutdown provider append retry host");
+    }
+
+    #[test]
+    fn provider_completion_append_failure_rebases_after_foreign_commit() {
+        assert_provider_append_failure_rebases_after_foreign_commit(
+            ProviderAppendFailureStage::Completion,
+        );
+    }
+
+    #[test]
+    fn provider_terminal_append_failure_rebases_after_foreign_commit() {
+        assert_provider_append_failure_rebases_after_foreign_commit(
+            ProviderAppendFailureStage::Terminal,
+        );
     }
 
     #[test]

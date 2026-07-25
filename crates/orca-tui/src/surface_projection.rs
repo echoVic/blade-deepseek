@@ -14,10 +14,10 @@ use orca_runtime::surface::{
     SurfaceAssistantStreamState, SurfaceCommitBatch, SurfaceCompletedModelResponse, SurfaceCursor,
     SurfaceEvent, SurfaceFileChange, SurfaceGoal, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
     SurfaceGoalState, SurfaceHistoryMessage, SurfaceInputPresentation, SurfaceItem,
-    SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult, SurfaceReducerErrorCode,
-    SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus, SurfaceToolResultKind,
-    SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus,
-    ToolPatch, UnixMillis,
+    SurfaceOperationFence, SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult,
+    SurfaceReducerErrorCode, SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus,
+    SurfaceToolResultKind, SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus,
+    SurfaceWorkflowStatus, ToolPatch, UnixMillis,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
@@ -615,6 +615,21 @@ impl TuiSurfaceProjection {
             .iter()
             .find(|workflow| &workflow.workflow_run_id == workflow_run_id)?;
         workflow_terminal_notification(workflow)
+    }
+
+    pub(crate) fn active_generation_fence(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<SurfaceOperationFence> {
+        self.reducer_state
+            .as_ref()?
+            .snapshot()
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| &operation.operation_id == operation_id)?
+            .generations
+            .last()
+            .map(|generation| generation.fence.clone())
     }
 }
 

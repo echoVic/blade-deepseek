@@ -131,12 +131,31 @@ impl TuiOperationController {
         if hosted.shutdown {
             return false;
         }
-        if let Some(operation_id) = hosted.active.as_ref().map(|operation| operation.id()) {
+        if let Some(surface) = hosted.surface_active.as_mut() {
+            surface.background_requested = true;
+        } else if let Some(operation_id) = hosted.active.as_ref().map(|operation| operation.id()) {
             *self.lock_background_current() = Some(operation_id);
         } else {
             hosted.background_requested = true;
         }
+        drop(hosted);
+        self.hosted.changed.notify_all();
         true
+    }
+
+    pub(crate) fn take_surface_background_current(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) -> bool {
+        let mut hosted = self.lock_hosted();
+        let Some(surface) = hosted
+            .surface_active
+            .as_mut()
+            .filter(|surface| &surface.operation_id == operation_id)
+        else {
+            return false;
+        };
+        std::mem::take(&mut surface.background_requested)
     }
 
     pub(crate) fn take_background_current(&self, operation_id: OperationId) -> bool {
@@ -382,7 +401,7 @@ impl TuiOperationController {
         operation_id: orca_runtime::surface::SurfaceOperationId,
         goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
     ) -> io::Result<()> {
-        let interrupt_requested = {
+        let (interrupt_requested, background_requested) = {
             let mut hosted = self.lock_hosted();
             if hosted.shutdown {
                 return Err(io::Error::new(
@@ -393,22 +412,28 @@ impl TuiOperationController {
             if hosted.active.is_some() || hosted.surface_active.is_some() {
                 return Err(io::Error::other("TUI operation is still active"));
             }
+            let background_requested = hosted.background_requested;
+            hosted.background_requested = false;
             hosted.surface_active = Some(SurfaceActiveOperation {
                 client: client.clone(),
                 operation_id: operation_id.clone(),
                 goal_fence,
                 ui_operation_id: self.surface_ids.allocate(),
                 interactions: HashMap::new(),
+                background_requested,
             });
             let requested = hosted.interrupt_requested;
             hosted.surface_activation_armed = false;
             hosted.interrupt_requested = false;
-            requested
+            (requested, background_requested)
         };
         self.hosted.changed.notify_all();
         if interrupt_requested {
             let _ = client
                 .cancel_operation(orca_runtime::surface::SurfaceRequestId::new(), operation_id);
+        }
+        if background_requested {
+            self.hosted.changed.notify_all();
         }
         Ok(())
     }
@@ -694,6 +719,7 @@ struct SurfaceActiveOperation {
     goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
     ui_operation_id: OperationId,
     interactions: HashMap<TuiInteractionKey, SurfaceInteractionBinding>,
+    background_requested: bool,
 }
 
 #[derive(Clone)]

@@ -9,17 +9,19 @@ use orca_core::config::RunConfig;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
-    AttachResult, DisplayText, ExpectedGoal, FreshAttachRequest, GoalMutationAction, GoalRunInput,
-    GoalTokenBudgetUpdate, MutationReply, NonEmptyText, NonEmptyVec, OperationIngressCorrelation,
-    OperationKind, OperationPatch, OperationRequestIntent, OperationSettingsPreparation,
-    OperationTerminal, PinnedContextAction, PinnedContextSourceRevision, PinnedUserRevision,
-    ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
-    RuntimeSurfaceThreadHandle, Sha256Digest, SurfaceAttachmentRole, SurfaceCapability,
-    SurfaceCatalogEntryId, SurfaceEvent, SurfaceGoal, SurfaceGoalFence, SurfaceHistoryMessage,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceUnavailableReason, SurfaceWorkflowRunId,
-    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    AttachResult, BackgroundTarget, DisplayText, ExpectedGoal, FreshAttachRequest,
+    GoalMutationAction, GoalRunInput, GoalTokenBudgetUpdate, MutationReply, NonEmptyText,
+    NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
+    OperationRequestIntent, OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
+    PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
+    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
+    SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId, SurfaceEvent, SurfaceGoal,
+    SurfaceGoalFence, SurfaceHistoryMessage, SurfaceInputRequest, SurfaceInputRequestBlock,
+    SurfaceInteractionKind, SurfaceOperationId, SurfacePinnedContextEntry,
+    SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSnapshot,
+    SurfaceSubscriptionItem, SurfaceUnavailableReason, SurfaceWorkflowRunId,
+    TransferBackgroundOutput, WaitOperationTerminalResult, WorkflowCatalogRevision,
+    WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -1376,7 +1378,52 @@ fn drain_operation(
     let mut failure: Option<io::Error> = None;
     let mut waiter_finished = false;
     let mut projected_terminal_event = None;
+    let mut background_handoff_committed = false;
+    let mut background_handoff_seen = false;
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
+        if !background_handoff_committed
+            && projection.active_generation_fence(operation_id).is_some()
+            && controller.take_surface_background_current(operation_id)
+        {
+            let fence = projection
+                .active_generation_fence(operation_id)
+                .expect("background request checked an active generation");
+            match client
+                .transfer_background(
+                    SurfaceRequestId::new(),
+                    BackgroundTarget::ActiveGeneration { fence },
+                )
+                .map_err(|error| {
+                    io::Error::other(format!("typed TUI background transfer failed: {error:?}"))
+                })? {
+                MutationReply::Committed {
+                    value: TransferBackgroundOutput::HandedOff { .. },
+                    ..
+                } => background_handoff_committed = true,
+                MutationReply::Committed {
+                    value: TransferBackgroundOutput::QueuedOnStart { .. },
+                    ..
+                } => {
+                    failure = Some(io::Error::other(
+                        "typed TUI active turn returned a queued background intent",
+                    ));
+                    sealed = true;
+                }
+                MutationReply::Deferred { mutation, .. } => {
+                    failure = Some(io::Error::other(format!(
+                        "typed TUI background transfer deferred: request={:?} commit={:?}",
+                        mutation.request_id, mutation.commit_id
+                    )));
+                    sealed = true;
+                }
+                MutationReply::Uncommitted { mutation } => {
+                    failure = Some(io::Error::other(format!(
+                        "typed TUI background transfer did not commit: {mutation:?}"
+                    )));
+                    sealed = true;
+                }
+            }
+        }
         let mut next_item = subscription.try_recv();
         if next_item.is_none() && !sealed {
             next_item = subscription.recv_timeout(Duration::from_millis(25));
@@ -1384,6 +1431,15 @@ fn drain_operation(
         while let Some(item) = next_item {
             match item {
                 SurfaceSubscriptionItem::Batch { batch } => {
+                    background_handoff_seen |= batch.events.as_slice().iter().any(|envelope| {
+                        matches!(
+                            &envelope.event,
+                            SurfaceEvent::Operation(OperationPatch::GenerationTransferred {
+                                fence,
+                                ..
+                            }) if &fence.operation_id == operation_id
+                        )
+                    });
                     terminal_seen |= batch.events.as_slice().iter().any(|envelope| {
                         matches!(
                             &envelope.event,
@@ -1420,6 +1476,12 @@ fn drain_operation(
                             sealed = true;
                             break;
                         }
+                    }
+                    if background_handoff_committed && background_handoff_seen {
+                        controller.complete_surface(operation_id);
+                        return Ok(TuiHostedOperationOutcome::Turn {
+                            status: "backgrounded".to_string(),
+                        });
                     }
                 }
                 SurfaceSubscriptionItem::Gap { required } => {
@@ -1809,6 +1871,232 @@ mod tests {
             TuiHostedOperationOutcome::Turn { status } if status == "cancelled"
         ));
         assert!(!controller.has_surface_active());
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_ordinary_turn_backgrounds_only_after_durable_surface_handoff() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed TUI background handoff")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (result_tx, result_rx) = mpsc::bounded(1);
+        let run_thread = thread.clone();
+        let run_controller = controller.clone();
+        let next_config = config.clone();
+        let worker = std::thread::spawn(move || {
+            let result = run_through_dispatch(
+                &run_thread,
+                HostedTurnRequest::new("mock_stream_delay_ms 1000")
+                    .with_task_description("typed background turn"),
+                config,
+                &run_controller,
+                &event_tx,
+            );
+            let _ = result_tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !controller.has_surface_active() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(controller.has_surface_active());
+        assert!(controller.request_background_current());
+
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("typed background handoff")
+            .expect("typed background outcome");
+        worker.join().expect("typed TUI worker");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "backgrounded"
+        ));
+        assert!(!controller.has_surface_active());
+
+        let snapshot = read_snapshot(&thread.typed_surface()).expect("typed snapshot");
+        assert_eq!(snapshot.background_operations.len(), 1);
+        let background = &snapshot.background_operations[0];
+        let background_operation_id = background.operation_id.clone();
+        let task_id = background
+            .task_id
+            .as_ref()
+            .expect("background handoff owns a task")
+            .clone();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .expect("background task is durable");
+        assert_eq!(
+            task.task_type,
+            orca_runtime::surface::SurfaceTaskType::MainSession
+        );
+        assert!(task.backgrounded);
+        assert!(
+            task.background_fence.as_ref() == Some(&background.fence),
+            "task and operation must share the exact background owner"
+        );
+
+        let (next_event_tx, _next_event_rx) = mpsc::unbounded();
+        let next_outcome = run_through_dispatch(
+            &thread,
+            HostedTurnRequest::new("mock_stream_delay_ms 1500"),
+            next_config,
+            &controller,
+            &next_event_tx,
+        )
+        .expect("next typed foreground turn");
+        assert!(matches!(
+            next_outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = read_snapshot(&thread.typed_surface()).expect("terminal snapshot");
+            let task_completed = snapshot.tasks.iter().any(|task| {
+                task.task_id == task_id
+                    && task.status == orca_runtime::surface::SurfaceTaskStatus::Completed
+            });
+            let operation_terminal = snapshot.operation_history.iter().any(|operation| {
+                operation.operation_id == background_operation_id && operation.terminal.is_some()
+            });
+            if task_completed && operation_terminal {
+                assert!(
+                    snapshot
+                        .background_operations
+                        .iter()
+                        .all(|operation| operation.operation_id != background_operation_id)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background provider must durably terminalize"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_background_approval_terminalizes_original_operation_and_keeps_task_actionable() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed background approval")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (result_tx, result_rx) = mpsc::bounded(1);
+        let run_thread = thread.clone();
+        let run_controller = controller.clone();
+        let worker = std::thread::spawn(move || {
+            let result = run_through_dispatch(
+                &run_thread,
+                HostedTurnRequest::new("mock_stream_tool_delay_ms 250 task_list")
+                    .with_task_description("typed approval background"),
+                config,
+                &run_controller,
+                &event_tx,
+            );
+            let _ = result_tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !controller.has_surface_active() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(controller.has_surface_active());
+        assert!(controller.request_background_current());
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("typed background handoff")
+            .expect("typed background outcome");
+        worker.join().expect("typed TUI worker");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "backgrounded"
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = read_snapshot(&thread.typed_surface()).expect("typed snapshot");
+            let observed = snapshot
+                .tasks
+                .iter()
+                .map(|task| {
+                    format!(
+                        "{}:{:?}:{}",
+                        task.task_id.as_str(),
+                        task.status,
+                        task.description.as_str()
+                    )
+                })
+                .collect::<Vec<_>>();
+            let task = snapshot.tasks.iter().find(|task| {
+                task.task_type == orca_runtime::surface::SurfaceTaskType::MainSession
+                    && task.status == orca_runtime::surface::SurfaceTaskStatus::ApprovalRequired
+            });
+            if let Some(task) = task {
+                let operation_id = task
+                    .parent_operation
+                    .as_ref()
+                    .expect("approval task keeps its operation identity");
+                let operation = snapshot
+                    .operation_history
+                    .iter()
+                    .find(|operation| &operation.operation_id == operation_id)
+                    .expect("approval operation remains in durable history");
+                match operation.terminal.as_ref().map(|record| &record.terminal) {
+                    Some(OperationTerminal::Failed {
+                        class: orca_runtime::surface::FailureClass::LegacyApprovalRequired,
+                        ..
+                    }) => {
+                        assert!(
+                            snapshot
+                                .background_operations
+                                .iter()
+                                .all(|background| &background.operation_id != operation_id)
+                        );
+                        break;
+                    }
+                    Some(terminal) => panic!("unexpected approval terminal: {terminal:?}"),
+                    None => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "approval-required task and original terminal must converge; observed {observed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
@@ -2304,6 +2592,100 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, TuiEvent::MessageDelta(text) if !text.is_empty()))
         );
+
+        resumed_thread.shutdown().expect("resumed thread shutdown");
+        resumed_host.shutdown().expect("resumed host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_background_owner_is_terminalized_before_restart_reopens_the_thread() {
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed background restart source")
+            .expect("runtime thread");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let (result_tx, result_rx) = mpsc::bounded(1);
+        let run_thread = thread.clone();
+        let run_controller = controller.clone();
+        let run_config = config.clone();
+        let worker = std::thread::spawn(move || {
+            let result = run_through_dispatch(
+                &run_thread,
+                HostedTurnRequest::new("mock_stream_delay_ms 5000"),
+                run_config,
+                &run_controller,
+                &event_tx,
+            );
+            let _ = result_tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !controller.has_surface_active() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(controller.has_surface_active());
+        assert!(controller.request_background_current());
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("typed background handoff")
+            .expect("typed background outcome");
+        worker.join().expect("typed background worker");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "backgrounded"
+        ));
+        let before = read_snapshot(&thread.typed_surface()).expect("background snapshot");
+        let operation_id = before.background_operations[0].operation_id.clone();
+        let thread_id = thread.thread_id().to_string();
+
+        host.shutdown()
+            .expect("host shutdown settles typed background owner");
+
+        let mut resumed_config = config;
+        resumed_config.history_mode = HistoryMode::Resume(thread_id);
+        let resumed_host = RuntimeHost::start().expect("resumed runtime host");
+        let resumed_thread = resumed_host
+            .start_thread(resumed_config.clone(), "typed background restart resumed")
+            .expect("resumed runtime thread");
+        let resumed_snapshot =
+            read_snapshot(&resumed_thread.typed_surface()).expect("resumed snapshot");
+        assert!(resumed_snapshot.background_operations.is_empty());
+        let recovered = resumed_snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("background operation survives as terminal history");
+        assert!(matches!(
+            recovered.terminal.as_ref().map(|record| &record.terminal),
+            Some(OperationTerminal::Shutdown { .. })
+        ));
+
+        let resumed_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let (resumed_event_tx, _resumed_event_rx) = mpsc::unbounded();
+        let next = run_through_dispatch(
+            &resumed_thread,
+            HostedTurnRequest::new("after background restart"),
+            resumed_config,
+            &resumed_controller,
+            &resumed_event_tx,
+        )
+        .expect("next turn after background restart");
+        assert!(matches!(
+            next,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
 
         resumed_thread.shutdown().expect("resumed thread shutdown");
         resumed_host.shutdown().expect("resumed host shutdown");
