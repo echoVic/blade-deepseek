@@ -211,9 +211,27 @@ pub struct RuntimeActorStartedTurn {
     event: Option<EventDraft>,
 }
 
+/// Why an outer turn ended, kept separate from [`RunStatus`] because one status
+/// is reachable for reasons that differ in whether resuming can make progress:
+/// an inner-turn ceiling resumes cleanly, while a cost ceiling would re-trip
+/// immediately under unchanged config.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TurnEndReason {
+    /// The per-run inner turn ceiling was reached.
+    MaxInnerTurns,
+    /// The configured `max_budget_usd` ceiling was exceeded.
+    CostBudgetExhausted,
+    /// The turn was explicitly cancelled.
+    Cancelled,
+    /// Not yet classified; treated as not automatically resumable.
+    #[default]
+    Unclassified,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTurnStartError {
     pub status: RunStatus,
+    pub reason: TurnEndReason,
     pub message: String,
 }
 
@@ -290,6 +308,7 @@ impl<'a> RuntimeTaskActor<'a> {
         if self.turns_started >= self.max_turns {
             return Err(RuntimeTurnStartError {
                 status: RunStatus::BudgetExhausted,
+                reason: TurnEndReason::MaxInnerTurns,
                 message: "max turns exhausted".to_string(),
             });
         }
@@ -698,6 +717,7 @@ impl<'a> RuntimeTaskActor<'a> {
         {
             return Err(RuntimeTurnStartError {
                 status: RunStatus::BudgetExhausted,
+                reason: TurnEndReason::CostBudgetExhausted,
                 message: format!(
                     "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
                     totals.estimated_cost_usd, max_budget
@@ -1842,5 +1862,23 @@ mod tests {
             "owned bootstrap should seed the user prompt"
         );
         assert!(prepared.history_writer_mut().is_none());
+    }
+
+    #[test]
+    fn budget_exhausted_carries_distinct_reasons() {
+        let max_turns = RuntimeTurnStartError {
+            status: RunStatus::BudgetExhausted,
+            reason: TurnEndReason::MaxInnerTurns,
+            message: "max turns exhausted".to_string(),
+        };
+        let cost = RuntimeTurnStartError {
+            status: RunStatus::BudgetExhausted,
+            reason: TurnEndReason::CostBudgetExhausted,
+            message: "budget exhausted".to_string(),
+        };
+
+        assert_eq!(max_turns.status, cost.status);
+        assert_ne!(max_turns.reason, cost.reason);
+        assert_eq!(TurnEndReason::default(), TurnEndReason::Unclassified);
     }
 }
