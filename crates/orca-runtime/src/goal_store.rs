@@ -213,6 +213,7 @@ pub struct FinishGoalOuterTurnForSurfaceInput {
     pub identity: Box<SurfaceGoalGenerationIdentity>,
     pub status: crate::runtime_surface::GoalOuterTurnStatus,
     pub usage: crate::runtime_surface::GoalUsage,
+    pub progress: GoalSurfaceTurnProgress,
     pub next_action: crate::runtime_surface::GoalOuterTurnNextAction,
     pub verification: Option<crate::runtime_surface::SurfaceGoalVerification>,
     pub continuation: Option<AdmittedGoalContinuationForSurface>,
@@ -220,6 +221,13 @@ pub struct FinishGoalOuterTurnForSurfaceInput {
     pub terminal: crate::runtime_surface::OperationTerminal,
     pub pause_message: String,
     pub finished_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalSurfaceTurnProgress {
+    pub tool_count: u32,
+    pub model_response_count: u32,
+    pub gap_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1675,6 +1683,21 @@ impl GoalStore {
                 "Goal outer-turn settlement replay is incomplete".to_string(),
             ));
         }
+        let continuation_predecessor_is_resumable = matches!(
+            (&input.status, &input.terminal),
+            (
+                crate::runtime_surface::GoalOuterTurnStatus::Success,
+                crate::runtime_surface::OperationTerminal::Succeeded { .. }
+            ) | (
+                crate::runtime_surface::GoalOuterTurnStatus::BudgetExhausted,
+                crate::runtime_surface::OperationTerminal::BudgetExhausted {
+                    budget: crate::runtime_surface::OperationBudget::TurnRequests {
+                        scope: crate::runtime_surface::TurnRequestBudgetScope::AgentLoop,
+                        ..
+                    },
+                }
+            )
+        );
         let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
             GoalStoreError::Invalid("goal surface state does not exist".to_string())
         })?;
@@ -1684,7 +1707,7 @@ impl GoalStore {
             || input.identity.goal_id.as_str() != input.expected_goal_id.as_str()
             || input.identity.objective_revision.get() != state.objective_revision
             || input.continuation.as_ref().is_some_and(|continuation| {
-                input.status != crate::runtime_surface::GoalOuterTurnStatus::Success
+                !continuation_predecessor_is_resumable
                     || input.next_action
                         != crate::runtime_surface::GoalOuterTurnNextAction::Continue
                     || continuation.provider_turn_id.trim().is_empty()
@@ -1781,14 +1804,18 @@ impl GoalStore {
         )?;
         let changed = transaction.execute(
             "UPDATE goal_turns
-             SET status = ?1, charged_input_tokens = ?2, output_tokens = ?3,
-                 verifier_tokens = ?4, finished_at = ?5
-             WHERE outer_turn_id = ?6 AND goal_run_id = ?7 AND status = 'in_flight'",
+             SET status = ?1, tool_count = ?2, model_response_count = ?3,
+                 charged_input_tokens = ?4, output_tokens = ?5,
+                 verifier_tokens = ?6, gap_fingerprint = ?7, finished_at = ?8
+             WHERE outer_turn_id = ?9 AND goal_run_id = ?10 AND status = 'in_flight'",
             params![
                 turn_status_name(core_status),
+                input.progress.tool_count,
+                input.progress.model_response_count,
                 core_usage.charged_input_tokens.max(0),
                 core_usage.output_tokens.max(0),
                 core_usage.verifier_tokens.max(0),
+                input.progress.gap_fingerprint.as_deref(),
                 input.finished_at,
                 input.identity.goal_outer_turn_id.as_str(),
                 current_run.goal_run_id.as_str(),

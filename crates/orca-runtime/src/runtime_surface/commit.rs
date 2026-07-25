@@ -4369,7 +4369,15 @@ fn goal_generation_continue_authorized(
             super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
                 fence,
                 reason: super::GenerationStopReason::Completed {
-                    status: super::GenerationCompletionStatus::Success,
+                    status:
+                        super::GenerationCompletionStatus::Success
+                        | super::GenerationCompletionStatus::BudgetExhausted {
+                            budget:
+                                super::OperationBudget::TurnRequests {
+                                    scope: super::TurnRequestBudgetScope::AgentLoop,
+                                    ..
+                                },
+                        },
                 },
                 ..
             }),

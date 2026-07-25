@@ -38,8 +38,9 @@ use crate::goal_store::{
     CreateGoalAndPrepareRunForSurfaceInput, CreateGoalInput, EditGoalAndPrepareRunForSurfaceInput,
     FinishGoalOuterTurnForSurfaceInput, GoalStore, GoalSurfaceMutation, GoalSurfaceMutationContext,
     GoalSurfaceMutationRecord, GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate,
-    PauseGoalForSurfaceInput, PauseQuiescentGoalForSurfaceInput, PrepareGoalRunForSurfaceInput,
-    RecoverGoalRunForSurfaceInput, ReplaceGoalContinuationForSurfaceInput,
+    GoalSurfaceTurnProgress, PauseGoalForSurfaceInput, PauseQuiescentGoalForSurfaceInput,
+    PrepareGoalRunForSurfaceInput, RecoverGoalRunForSurfaceInput,
+    ReplaceGoalContinuationForSurfaceInput,
 };
 use crate::goal_verifier::{
     DeepSeekGoalVerifier, DeterministicGoalVerifier, GoalVerificationRequest, GoalVerifier,
@@ -1771,6 +1772,35 @@ pub enum OperationOutcome {
     Panicked {
         message: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletedTurnOutcome {
+    status: RunStatus,
+    end_reason: crate::lifecycle::TurnEndReason,
+}
+
+impl CompletedTurnOutcome {
+    fn goal_status(self) -> orca_core::goal_runtime::GoalTurnStatus {
+        match self.status {
+            RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
+            RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
+            RunStatus::ApprovalRequired => {
+                orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
+            }
+            RunStatus::BudgetExhausted => orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted,
+            RunStatus::Failed | RunStatus::VerificationFailed => {
+                orca_core::goal_runtime::GoalTurnStatus::Failed
+            }
+        }
+    }
+
+    fn permits_goal_continuation(self) -> bool {
+        matches!(
+            goal_turn_disposition(self.status, self.end_reason),
+            GoalTurnDisposition::Advanced | GoalTurnDisposition::Interrupted { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4652,6 +4682,40 @@ fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     surface::Sha256Digest::new(hasher.finalize().into())
+}
+
+fn surface_goal_finish_command_digest(input: &FinishGoalOuterTurnForSurfaceInput) -> [u8; 32] {
+    let continuation = input.continuation.as_ref().map(|continuation| {
+        (
+            continuation.reason,
+            continuation.successor.as_ref(),
+            continuation.provider_turn_id.as_str(),
+        )
+    });
+    *surface_sha256(
+        &serde_json::to_vec(&(
+            "goal_outer_turn_finished_v1",
+            input.session_id.as_str(),
+            input.expected_goal_id.as_str(),
+            input.expected_goal_revision,
+            input.identity.as_ref(),
+            input.status,
+            &input.usage,
+            (
+                input.progress.tool_count,
+                input.progress.model_response_count,
+                input.progress.gap_fingerprint.as_deref(),
+            ),
+            input.next_action,
+            &input.verification,
+            continuation,
+            &input.stop_reason,
+            &input.terminal,
+            input.pause_message.as_str(),
+        ))
+        .expect("Goal finish command digest input is serializable"),
+    )
+    .as_bytes()
 }
 
 fn surface_goal_state(
@@ -13416,6 +13480,7 @@ impl ThreadActor {
         active: &ActiveOperation,
         outcome: &OperationOutcome,
         runtime_usage: UsageTotals,
+        completed_turn: Option<CompletedTurnOutcome>,
     ) -> Result<surface::OperationTerminalAtCursor, RuntimeHostError> {
         let surface_usage = surface_usage_totals(runtime_usage);
         let fence = active.surface_operation.clone().ok_or_else(|| {
@@ -13439,8 +13504,14 @@ impl ThreadActor {
                 },
             )
         } else {
-            match outcome {
-                OperationOutcome::Completed(RunStatus::Success) => (
+            match (outcome, completed_turn) {
+                (
+                    OperationOutcome::Completed(RunStatus::Success),
+                    Some(CompletedTurnOutcome {
+                        status: RunStatus::Success,
+                        ..
+                    }),
+                ) => (
                     surface::GenerationStopReason::Completed {
                         status: surface::GenerationCompletionStatus::Success,
                     },
@@ -13448,7 +13519,13 @@ impl ThreadActor {
                         usage: surface_usage.clone(),
                     },
                 ),
-                OperationOutcome::Completed(RunStatus::Cancelled) => {
+                (
+                    OperationOutcome::Completed(RunStatus::Cancelled),
+                    Some(CompletedTurnOutcome {
+                        status: RunStatus::Cancelled,
+                        ..
+                    }),
+                ) => {
                     let cause = active
                         .surface_terminalization
                         .unwrap_or(surface::TerminalizationCause::UserCancel);
@@ -13476,7 +13553,71 @@ impl ThreadActor {
                     };
                     (surface::GenerationStopReason::Cancelled { cause }, terminal)
                 }
-                OperationOutcome::Panicked { message } => (
+                (OperationOutcome::Completed(RunStatus::BudgetExhausted), Some(completed))
+                    if completed.status == RunStatus::BudgetExhausted =>
+                {
+                    let budget = match completed.end_reason {
+                        crate::lifecycle::TurnEndReason::MaxInnerTurns => {
+                            let limit = u64::from(crate::agent_loop::DEFAULT_MAX_TURNS);
+                            surface::OperationBudget::TurnRequests {
+                                scope: surface::TurnRequestBudgetScope::AgentLoop,
+                                limit,
+                                observed: limit,
+                            }
+                        }
+                        crate::lifecycle::TurnEndReason::CostBudgetExhausted => {
+                            let observed = surface_usage.estimated_cost_usd_micros;
+                            let limit = active
+                                .config
+                                .max_budget_usd
+                                .map(|value| {
+                                    (value.max(0.0) * 1_000_000.0).round().min(u64::MAX as f64)
+                                        as u64
+                                })
+                                .unwrap_or(observed);
+                            surface::OperationBudget::MonetaryBudgetUsdMicros { limit, observed }
+                        }
+                        crate::lifecycle::TurnEndReason::Cancelled
+                        | crate::lifecycle::TurnEndReason::Unclassified => {
+                            surface::OperationBudget::ModelTokens {
+                                limit: None,
+                                observed: None,
+                            }
+                        }
+                    };
+                    (
+                        surface::GenerationStopReason::Completed {
+                            status: surface::GenerationCompletionStatus::BudgetExhausted {
+                                budget: budget.clone(),
+                            },
+                        },
+                        surface::OperationTerminal::BudgetExhausted { budget },
+                    )
+                }
+                (
+                    OperationOutcome::Completed(RunStatus::VerificationFailed),
+                    Some(CompletedTurnOutcome {
+                        status: RunStatus::VerificationFailed,
+                        ..
+                    }),
+                ) => {
+                    let message = surface::SafeDiagnosticText::try_new(
+                        "foreground operation verification failed",
+                    )
+                    .expect("fixed diagnostic is bounded");
+                    (
+                        surface::GenerationStopReason::Completed {
+                            status: surface::GenerationCompletionStatus::VerificationFailed {
+                                message: message.clone(),
+                            },
+                        },
+                        surface::OperationTerminal::Failed {
+                            class: surface::FailureClass::Verification,
+                            message,
+                        },
+                    )
+                }
+                (OperationOutcome::Panicked { message }, _) => (
                     surface::GenerationStopReason::Panicked {
                         message: surface::SafeDiagnosticText::try_new(message.clone())
                             .unwrap_or_else(|_| {
@@ -13664,158 +13805,173 @@ impl ThreadActor {
                 elapsed_seconds: 0,
             };
             let mut verification_patch = None;
-            let (next_action, selected_goal_state, decision_message) =
-                if matches!(terminal, surface::OperationTerminal::Succeeded { .. }) {
-                    let core_status = orca_core::goal_runtime::GoalTurnStatus::Success;
-                    let core_usage = orca_core::goal_runtime::GoalUsage {
-                        charged_input_tokens: goal_usage.charged_input_tokens,
-                        output_tokens: goal_usage.output_tokens,
-                        cache_tokens: goal_usage.cache_tokens,
-                        verifier_tokens: goal_usage.verifier_tokens,
-                        cost_micros: goal_usage.cost_micros,
-                        elapsed_seconds: goal_usage.elapsed_seconds,
+            let fallback_progress = GoalSurfaceTurnProgress {
+                tool_count: 0,
+                model_response_count: 0,
+                gap_fingerprint: Some(
+                    crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string(),
+                ),
+            };
+            let (next_action, selected_goal_state, decision_message, turn_progress) = if matches!(
+                terminal,
+                surface::OperationTerminal::Succeeded { .. }
+                    | surface::OperationTerminal::BudgetExhausted { .. }
+            ) {
+                let core_status = completed_turn
+                    .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                        message: "typed Goal finalization lost its completed turn outcome"
+                            .to_string(),
+                    })?
+                    .goal_status();
+                let core_usage = orca_core::goal_runtime::GoalUsage {
+                    charged_input_tokens: goal_usage.charged_input_tokens,
+                    output_tokens: goal_usage.output_tokens,
+                    cache_tokens: goal_usage.cache_tokens,
+                    verifier_tokens: goal_usage.verifier_tokens,
+                    cost_micros: goal_usage.cost_micros,
+                    elapsed_seconds: goal_usage.elapsed_seconds,
+                };
+                let preview = control
+                    .runtime
+                    .preview_outer_turn_for_surface(
+                        &control.session_id,
+                        core_status,
+                        core_usage.clone(),
+                        None,
+                    )
+                    .map_err(|error| RuntimeHostError::GoalControlFailed {
+                        message: error.to_string(),
+                    })?;
+                let decided = if let orca_core::goal_runtime::GoalNextAction::Verify { intent } =
+                    &preview.action
+                {
+                    let record = control
+                        .runtime
+                        .read(&control.session_id)
+                        .map_err(|error| RuntimeHostError::GoalControlFailed {
+                            message: error.to_string(),
+                        })?
+                        .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                            message: "Goal disappeared before terminal verification".to_string(),
+                        })?;
+                    let mut request =
+                        GoalVerificationRequest::new(record.objective.clone(), intent.clone());
+                    request.goal_state = record.state;
+                    request.budget_remaining = record
+                        .token_budget
+                        .map(|budget| budget.saturating_sub(record.usage.charged_tokens()));
+                    request.active_workflow = self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.thread.session().has_active_workflows());
+                    request.last_model_response = self.state.as_ref().and_then(|state| {
+                        state
+                            .thread
+                            .session()
+                            .conversation()
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|message| match message {
+                                Message::Assistant { content, .. } => content.clone(),
+                                _ => None,
+                            })
+                    });
+                    let verifier: Box<dyn GoalVerifier> =
+                        if active.config.provider == orca_core::config::ProviderKind::DeepSeek {
+                            Box::new(DeepSeekGoalVerifier::new(
+                                orca_provider::ProviderConfig {
+                                    api_key: active.config.api_key.clone(),
+                                    base_url: active.config.base_url.clone(),
+                                    model: active.config.model.as_option(),
+                                    reasoning_effort: active.config.reasoning_effort,
+                                    tools_override: Some(Vec::new()),
+                                    mcp_registry: None,
+                                    external_tools: Vec::new(),
+                                },
+                                active.generation.cancel.clone(),
+                            ))
+                        } else {
+                            Box::new(DeterministicGoalVerifier)
+                        };
+                    let result = match verifier.verify(&request) {
+                        Ok(output) => {
+                            goal_usage.verifier_tokens = goal_usage
+                                .verifier_tokens
+                                .saturating_add(output.usage.verifier_tokens);
+                            goal_usage.cost_micros = goal_usage
+                                .cost_micros
+                                .saturating_add(output.usage.cost_micros);
+                            goal_usage.elapsed_seconds = goal_usage
+                                .elapsed_seconds
+                                .saturating_add(output.usage.elapsed_seconds);
+                            output.result
+                        }
+                        Err(error) => {
+                            orca_core::goal_runtime::GoalVerificationResult::Indeterminate {
+                                message: error.to_string(),
+                            }
+                        }
                     };
-                    let preview = control
+                    verification_patch = Some(surface_goal_verification(&result)?);
+                    control
                         .runtime
                         .preview_outer_turn_for_surface(
                             &control.session_id,
                             core_status,
-                            core_usage.clone(),
-                            None,
+                            core_usage,
+                            Some(result),
                         )
                         .map_err(|error| RuntimeHostError::GoalControlFailed {
                             message: error.to_string(),
-                        })?;
-                    let decided =
-                        if let orca_core::goal_runtime::GoalNextAction::Verify { intent } = preview
-                        {
-                            let record = control
-                                .runtime
-                                .read(&control.session_id)
-                                .map_err(|error| RuntimeHostError::GoalControlFailed {
-                                    message: error.to_string(),
-                                })?
-                                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
-                                    message: "Goal disappeared before terminal verification"
-                                        .to_string(),
-                                })?;
-                            let mut request =
-                                GoalVerificationRequest::new(record.objective.clone(), intent);
-                            request.goal_state = record.state;
-                            request.budget_remaining = record
-                                .token_budget
-                                .map(|budget| budget.saturating_sub(record.usage.charged_tokens()));
-                            request.active_workflow = self
-                                .state
-                                .as_ref()
-                                .is_some_and(|state| state.thread.session().has_active_workflows());
-                            request.last_model_response = self.state.as_ref().and_then(|state| {
-                                state
-                                    .thread
-                                    .session()
-                                    .conversation()
-                                    .messages
-                                    .iter()
-                                    .rev()
-                                    .find_map(|message| match message {
-                                        Message::Assistant { content, .. } => content.clone(),
-                                        _ => None,
-                                    })
-                            });
-                            let verifier: Box<dyn GoalVerifier> = if active.config.provider
-                                == orca_core::config::ProviderKind::DeepSeek
-                            {
-                                Box::new(DeepSeekGoalVerifier::new(
-                                    orca_provider::ProviderConfig {
-                                        api_key: active.config.api_key.clone(),
-                                        base_url: active.config.base_url.clone(),
-                                        model: active.config.model.as_option(),
-                                        reasoning_effort: active.config.reasoning_effort,
-                                        tools_override: Some(Vec::new()),
-                                        mcp_registry: None,
-                                        external_tools: Vec::new(),
-                                    },
-                                    active.generation.cancel.clone(),
-                                ))
-                            } else {
-                                Box::new(DeterministicGoalVerifier)
-                            };
-                            let result = match verifier.verify(&request) {
-                                Ok(output) => {
-                                    goal_usage.verifier_tokens = goal_usage
-                                        .verifier_tokens
-                                        .saturating_add(output.usage.verifier_tokens);
-                                    goal_usage.cost_micros = goal_usage
-                                        .cost_micros
-                                        .saturating_add(output.usage.cost_micros);
-                                    goal_usage.elapsed_seconds = goal_usage
-                                        .elapsed_seconds
-                                        .saturating_add(output.usage.elapsed_seconds);
-                                    output.result
-                                }
-                                Err(error) => {
-                                    orca_core::goal_runtime::GoalVerificationResult::Indeterminate {
-                                        message: error.to_string(),
-                                    }
-                                }
-                            };
-                            verification_patch = Some(surface_goal_verification(&result)?);
-                            control
-                                .runtime
-                                .preview_outer_turn_for_surface(
-                                    &control.session_id,
-                                    core_status,
-                                    core_usage,
-                                    Some(result),
-                                )
-                                .map_err(|error| RuntimeHostError::GoalControlFailed {
-                                    message: error.to_string(),
-                                })?
-                        } else {
-                            preview
-                        };
-                    match decided {
-                        orca_core::goal_runtime::GoalNextAction::Complete { evidence } => (
-                            surface::GoalOuterTurnNextAction::Complete,
-                            surface_goal_state(&orca_core::goal_runtime::GoalState::Complete {
-                                evidence,
-                            })?,
-                            "Goal completion verified".to_string(),
-                        ),
-                        orca_core::goal_runtime::GoalNextAction::Blocked { blocker } => (
-                            surface::GoalOuterTurnNextAction::Blocked,
-                            surface_goal_state(&orca_core::goal_runtime::GoalState::Blocked {
-                                blocker,
-                            })?,
-                            "Goal blocked state verified".to_string(),
-                        ),
-                        orca_core::goal_runtime::GoalNextAction::BudgetLimited => (
-                            surface::GoalOuterTurnNextAction::BudgetLimited,
-                            surface::SurfaceGoalState::BudgetLimited,
-                            "Goal token budget exhausted".to_string(),
-                        ),
-                        orca_core::goal_runtime::GoalNextAction::Pause { reason, message } => (
-                            surface::GoalOuterTurnNextAction::Pause,
-                            surface_goal_state(&orca_core::goal_runtime::GoalState::Paused {
-                                reason,
-                                message: message.clone(),
-                            })?,
-                            message,
-                        ),
-                        orca_core::goal_runtime::GoalNextAction::Continue { .. }
-                        | orca_core::goal_runtime::GoalNextAction::Verify { .. } => (
-                            surface::GoalOuterTurnNextAction::Pause,
-                            default_paused_state.clone(),
-                            default_pause_message.to_string(),
-                        ),
-                    }
+                        })?
                 } else {
-                    (
+                    preview
+                };
+                let action = match decided.action {
+                    orca_core::goal_runtime::GoalNextAction::Complete { evidence } => (
+                        surface::GoalOuterTurnNextAction::Complete,
+                        surface_goal_state(&orca_core::goal_runtime::GoalState::Complete {
+                            evidence,
+                        })?,
+                        "Goal completion verified".to_string(),
+                    ),
+                    orca_core::goal_runtime::GoalNextAction::Blocked { blocker } => (
+                        surface::GoalOuterTurnNextAction::Blocked,
+                        surface_goal_state(&orca_core::goal_runtime::GoalState::Blocked {
+                            blocker,
+                        })?,
+                        "Goal blocked state verified".to_string(),
+                    ),
+                    orca_core::goal_runtime::GoalNextAction::BudgetLimited => (
+                        surface::GoalOuterTurnNextAction::BudgetLimited,
+                        surface::SurfaceGoalState::BudgetLimited,
+                        "Goal token budget exhausted".to_string(),
+                    ),
+                    orca_core::goal_runtime::GoalNextAction::Pause { reason, message } => (
+                        surface::GoalOuterTurnNextAction::Pause,
+                        surface_goal_state(&orca_core::goal_runtime::GoalState::Paused {
+                            reason,
+                            message: message.clone(),
+                        })?,
+                        message,
+                    ),
+                    orca_core::goal_runtime::GoalNextAction::Continue { .. }
+                    | orca_core::goal_runtime::GoalNextAction::Verify { .. } => (
                         surface::GoalOuterTurnNextAction::Pause,
                         default_paused_state.clone(),
                         default_pause_message.to_string(),
-                    )
+                    ),
                 };
+                (action.0, action.1, action.2, decided.progress)
+            } else {
+                (
+                    surface::GoalOuterTurnNextAction::Pause,
+                    default_paused_state.clone(),
+                    default_pause_message.to_string(),
+                    fallback_progress,
+                )
+            };
             let stop_binding = match &terminal {
                 surface::OperationTerminal::Succeeded { .. } => {
                     surface::GoalContinuationStopReason::GoalInactive {
@@ -13833,9 +13989,8 @@ impl ThreadActor {
                     )
                 }
                 surface::OperationTerminal::BudgetExhausted { .. } => {
-                    surface::GoalContinuationStopReason::PredecessorNotSuccessful {
-                        status: surface::GoalPredecessorStatus::BudgetExhausted,
-                        terminal: terminal.clone(),
+                    surface::GoalContinuationStopReason::GoalInactive {
+                        state: selected_goal_state,
                     }
                 }
                 _ => surface::GoalContinuationStopReason::PredecessorNotSuccessful {
@@ -13843,21 +13998,33 @@ impl ThreadActor {
                     terminal: terminal.clone(),
                 },
             };
+            let finish_input = FinishGoalOuterTurnForSurfaceInput {
+                session_id: control.session_id.clone(),
+                expected_goal_id: orca_core::goal_runtime::GoalId::parse(identity.goal_id.as_str())
+                    .map_err(|message| RuntimeHostError::GoalControlFailed { message })?,
+                expected_goal_revision: u32::try_from(goal_revision).map_err(|_| {
+                    RuntimeHostError::GoalControlFailed {
+                        message: "Goal revision exceeds durable store range".to_string(),
+                    }
+                })?,
+                identity: Box::new(identity.clone()),
+                status: goal_status,
+                usage: goal_usage,
+                progress: turn_progress,
+                next_action,
+                verification: verification_patch.clone(),
+                continuation: None,
+                stop_reason: stop_binding.clone(),
+                terminal: terminal.clone(),
+                pause_message: decision_message,
+                finished_at: chrono::Utc::now().timestamp(),
+            };
             let finished_commit_id = uuid::Uuid::now_v7().to_string();
             let verification_commit_id = verification_patch
                 .as_ref()
                 .map(|_| uuid::Uuid::now_v7().to_string());
             let decision_commit_id = uuid::Uuid::now_v7().to_string();
-            let finished_digest = *surface_sha256(
-                &serde_json::to_vec(&(
-                    "goal_outer_turn_finished",
-                    &identity,
-                    &goal_status,
-                    &terminal,
-                ))
-                .expect("Goal finish digest input is serializable"),
-            )
-            .as_bytes();
+            let finished_digest = surface_goal_finish_command_digest(&finish_input);
             let verification_digest = verification_patch.as_ref().map(|verification| {
                 *surface_sha256(
                     &serde_json::to_vec(&("goal_verification_completed", &identity, verification))
@@ -13896,31 +14063,7 @@ impl ThreadActor {
             });
             let mutations = control
                 .runtime
-                .finish_outer_turn_for_surface(
-                    FinishGoalOuterTurnForSurfaceInput {
-                        session_id: control.session_id.clone(),
-                        expected_goal_id: orca_core::goal_runtime::GoalId::parse(
-                            identity.goal_id.as_str(),
-                        )
-                        .map_err(|message| RuntimeHostError::GoalControlFailed { message })?,
-                        expected_goal_revision: u32::try_from(goal_revision).map_err(|_| {
-                            RuntimeHostError::GoalControlFailed {
-                                message: "Goal revision exceeds durable store range".to_string(),
-                            }
-                        })?,
-                        identity: Box::new(identity),
-                        status: goal_status,
-                        usage: goal_usage,
-                        next_action,
-                        verification: verification_patch.clone(),
-                        continuation: None,
-                        stop_reason: stop_binding,
-                        terminal: terminal.clone(),
-                        pause_message: decision_message,
-                        finished_at: chrono::Utc::now().timestamp(),
-                    },
-                    contexts,
-                )
+                .finish_outer_turn_for_surface(finish_input, contexts)
                 .map_err(|error| RuntimeHostError::GoalControlFailed {
                     message: error.to_string(),
                 })?;
@@ -14072,6 +14215,7 @@ impl ThreadActor {
         active: &ActiveOperation,
         state: &ThreadActorState,
         runtime_usage: UsageTotals,
+        completed_turn: CompletedTurnOutcome,
     ) -> Result<Option<(surface::SurfaceGoalGenerationIdentity, String, String)>, RuntimeHostError>
     {
         if !active.request.surface_goal_owned
@@ -14134,7 +14278,7 @@ impl ThreadActor {
             .runtime
             .preview_outer_turn_for_surface(
                 &control.session_id,
-                orca_core::goal_runtime::GoalTurnStatus::Success,
+                completed_turn.goal_status(),
                 core_usage.clone(),
                 None,
             )
@@ -14142,83 +14286,85 @@ impl ThreadActor {
                 message: error.to_string(),
             })?;
         let mut verification_patch = None;
-        let decided = if let orca_core::goal_runtime::GoalNextAction::Verify { intent } = preview {
-            let record = control
-                .runtime
-                .read(&control.session_id)
-                .map_err(|error| RuntimeHostError::GoalControlFailed {
-                    message: error.to_string(),
-                })?
-                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
-                    message: "Goal disappeared before continuation verification".to_string(),
-                })?;
-            let mut request = GoalVerificationRequest::new(record.objective.clone(), intent);
-            request.goal_state = record.state;
-            request.budget_remaining = record
-                .token_budget
-                .map(|budget| budget.saturating_sub(record.usage.charged_tokens()));
-            request.active_workflow = state.thread.session().has_active_workflows();
-            request.last_model_response = state
-                .thread
-                .session()
-                .conversation()
-                .messages
-                .iter()
-                .rev()
-                .find_map(|message| match message {
-                    Message::Assistant { content, .. } => content.clone(),
-                    _ => None,
-                });
-            let verifier: Box<dyn GoalVerifier> =
-                if active.config.provider == orca_core::config::ProviderKind::DeepSeek {
-                    Box::new(DeepSeekGoalVerifier::new(
-                        orca_provider::ProviderConfig {
-                            api_key: active.config.api_key.clone(),
-                            base_url: active.config.base_url.clone(),
-                            model: active.config.model.as_option(),
-                            reasoning_effort: active.config.reasoning_effort,
-                            tools_override: Some(Vec::new()),
-                            mcp_registry: None,
-                            external_tools: Vec::new(),
-                        },
-                        active.generation.cancel.clone(),
-                    ))
-                } else {
-                    Box::new(DeterministicGoalVerifier)
+        let decided =
+            if let orca_core::goal_runtime::GoalNextAction::Verify { intent } = &preview.action {
+                let record = control
+                    .runtime
+                    .read(&control.session_id)
+                    .map_err(|error| RuntimeHostError::GoalControlFailed {
+                        message: error.to_string(),
+                    })?
+                    .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                        message: "Goal disappeared before continuation verification".to_string(),
+                    })?;
+                let mut request =
+                    GoalVerificationRequest::new(record.objective.clone(), intent.clone());
+                request.goal_state = record.state;
+                request.budget_remaining = record
+                    .token_budget
+                    .map(|budget| budget.saturating_sub(record.usage.charged_tokens()));
+                request.active_workflow = state.thread.session().has_active_workflows();
+                request.last_model_response = state
+                    .thread
+                    .session()
+                    .conversation()
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|message| match message {
+                        Message::Assistant { content, .. } => content.clone(),
+                        _ => None,
+                    });
+                let verifier: Box<dyn GoalVerifier> =
+                    if active.config.provider == orca_core::config::ProviderKind::DeepSeek {
+                        Box::new(DeepSeekGoalVerifier::new(
+                            orca_provider::ProviderConfig {
+                                api_key: active.config.api_key.clone(),
+                                base_url: active.config.base_url.clone(),
+                                model: active.config.model.as_option(),
+                                reasoning_effort: active.config.reasoning_effort,
+                                tools_override: Some(Vec::new()),
+                                mcp_registry: None,
+                                external_tools: Vec::new(),
+                            },
+                            active.generation.cancel.clone(),
+                        ))
+                    } else {
+                        Box::new(DeterministicGoalVerifier)
+                    };
+                let verification = match verifier.verify(&request) {
+                    Ok(output) => {
+                        goal_usage.verifier_tokens = goal_usage
+                            .verifier_tokens
+                            .saturating_add(output.usage.verifier_tokens);
+                        goal_usage.cost_micros = goal_usage
+                            .cost_micros
+                            .saturating_add(output.usage.cost_micros);
+                        goal_usage.elapsed_seconds = goal_usage
+                            .elapsed_seconds
+                            .saturating_add(output.usage.elapsed_seconds);
+                        output.result
+                    }
+                    Err(error) => orca_core::goal_runtime::GoalVerificationResult::Indeterminate {
+                        message: error.to_string(),
+                    },
                 };
-            let verification = match verifier.verify(&request) {
-                Ok(output) => {
-                    goal_usage.verifier_tokens = goal_usage
-                        .verifier_tokens
-                        .saturating_add(output.usage.verifier_tokens);
-                    goal_usage.cost_micros = goal_usage
-                        .cost_micros
-                        .saturating_add(output.usage.cost_micros);
-                    goal_usage.elapsed_seconds = goal_usage
-                        .elapsed_seconds
-                        .saturating_add(output.usage.elapsed_seconds);
-                    output.result
-                }
-                Err(error) => orca_core::goal_runtime::GoalVerificationResult::Indeterminate {
-                    message: error.to_string(),
-                },
+                verification_patch = Some(surface_goal_verification(&verification)?);
+                control
+                    .runtime
+                    .preview_outer_turn_for_surface(
+                        &control.session_id,
+                        completed_turn.goal_status(),
+                        core_usage,
+                        Some(verification),
+                    )
+                    .map_err(|error| RuntimeHostError::GoalControlFailed {
+                        message: error.to_string(),
+                    })?
+            } else {
+                preview
             };
-            verification_patch = Some(surface_goal_verification(&verification)?);
-            control
-                .runtime
-                .preview_outer_turn_for_surface(
-                    &control.session_id,
-                    orca_core::goal_runtime::GoalTurnStatus::Success,
-                    core_usage,
-                    Some(verification),
-                )
-                .map_err(|error| RuntimeHostError::GoalControlFailed {
-                    message: error.to_string(),
-                })?
-        } else {
-            preview
-        };
-        let reason = match decided {
+        let reason = match &decided.action {
             orca_core::goal_runtime::GoalNextAction::Continue {
                 reason: orca_core::goal_runtime::GoalContinuationReason::Progress,
             } => surface::GoalContinuationAdmitReason::Progress,
@@ -14243,12 +14389,12 @@ impl ThreadActor {
                 }
             })?;
         let conversation = state.thread.session().conversation();
-        let last_gap_fingerprint = control
-            .runtime
-            .recent_gap_fingerprint(&control.session_id)
-            .ok()
-            .flatten();
-        let trigger = if matches!(reason, surface::GoalContinuationAdmitReason::GapFeedback) {
+        let last_gap_fingerprint = decided.progress.gap_fingerprint.clone();
+        let trigger = if completed_turn.status == RunStatus::BudgetExhausted
+            && completed_turn.end_reason == crate::lifecycle::TurnEndReason::MaxInnerTurns
+        {
+            GoalContinuationTrigger::MaxInnerTurns
+        } else if matches!(reason, surface::GoalContinuationAdmitReason::GapFeedback) {
             GoalContinuationTrigger::GapFeedback
         } else {
             GoalContinuationTrigger::Progress
@@ -14260,8 +14406,8 @@ impl ThreadActor {
             tokens_used: record.usage.charged_tokens(),
             token_budget: record.token_budget,
             last_gap_fingerprint,
-            last_outer_status: Some("success"),
-            last_end_reason: Some("unclassified"),
+            last_outer_status: Some(completed_turn.status.as_str()),
+            last_end_reason: Some(completed_turn.end_reason.as_str()),
             plan_snapshot: conversation
                 .internal_context
                 .get(orca_core::conversation::PLAN_CONTEXT_FRAGMENT_ID)
@@ -14377,16 +14523,70 @@ impl ThreadActor {
             .as_ref()
             .map(|_| uuid::Uuid::now_v7().to_string());
         let decision_commit_id = uuid::Uuid::now_v7().to_string();
-        let finished_digest = *surface_sha256(
-            &serde_json::to_vec(&(
-                "goal_outer_turn_finished",
-                &predecessor,
-                surface::GoalOuterTurnStatus::Success,
-                surface::GoalOuterTurnNextAction::Continue,
-            ))
-            .expect("Goal continuation finish digest input is serializable"),
-        )
-        .as_bytes();
+        let (finished_goal_status, predecessor_completion_status, predecessor_terminal) =
+            match completed_turn {
+                CompletedTurnOutcome {
+                    status: RunStatus::Success,
+                    ..
+                } => (
+                    surface::GoalOuterTurnStatus::Success,
+                    surface::GenerationCompletionStatus::Success,
+                    surface::OperationTerminal::Succeeded {
+                        usage: surface_usage.clone(),
+                    },
+                ),
+                CompletedTurnOutcome {
+                    status: RunStatus::BudgetExhausted,
+                    end_reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                } => {
+                    let limit = u64::from(crate::agent_loop::DEFAULT_MAX_TURNS);
+                    let budget = surface::OperationBudget::TurnRequests {
+                        scope: surface::TurnRequestBudgetScope::AgentLoop,
+                        limit,
+                        observed: limit,
+                    };
+                    (
+                        surface::GoalOuterTurnStatus::BudgetExhausted,
+                        surface::GenerationCompletionStatus::BudgetExhausted {
+                            budget: budget.clone(),
+                        },
+                        surface::OperationTerminal::BudgetExhausted { budget },
+                    )
+                }
+                _ => {
+                    return Err(RuntimeHostError::GoalControlFailed {
+                        message:
+                            "typed Goal continuation received a non-resumable completed outcome"
+                                .to_string(),
+                    });
+                }
+            };
+        let finish_input = FinishGoalOuterTurnForSurfaceInput {
+            session_id: control.session_id.clone(),
+            expected_goal_id: orca_core::goal_runtime::GoalId::parse(predecessor.goal_id.as_str())
+                .map_err(|message| RuntimeHostError::GoalControlFailed { message })?,
+            expected_goal_revision: u32::try_from(goal_revision).map_err(|_| {
+                RuntimeHostError::GoalControlFailed {
+                    message: "Goal revision exceeds durable store range".to_string(),
+                }
+            })?,
+            identity: Box::new(predecessor.clone()),
+            status: finished_goal_status,
+            usage: goal_usage,
+            progress: decided.progress,
+            next_action: surface::GoalOuterTurnNextAction::Continue,
+            verification: verification_patch.clone(),
+            continuation: Some(AdmittedGoalContinuationForSurface {
+                reason,
+                successor: Box::new(successor.clone()),
+                provider_turn_id: logical_turn_id.to_string(),
+            }),
+            stop_reason: surface::GoalContinuationStopReason::VerificationPending,
+            terminal: predecessor_terminal,
+            pause_message: "Goal continuation admitted".to_string(),
+            finished_at: chrono::Utc::now().timestamp(),
+        };
+        let finished_digest = surface_goal_finish_command_digest(&finish_input);
         let verification_digest = verification_patch.as_ref().map(|verification| {
             *surface_sha256(
                 &serde_json::to_vec(&("goal_verification_completed", &predecessor, verification))
@@ -14423,40 +14623,9 @@ impl ThreadActor {
             command_digest: decision_digest,
             goal_owner_epoch: snapshot.thread.owner_epoch.get(),
         });
-        let terminal = surface::OperationTerminal::Succeeded {
-            usage: surface_usage.clone(),
-        };
         let mutations = control
             .runtime
-            .finish_outer_turn_for_surface(
-                FinishGoalOuterTurnForSurfaceInput {
-                    session_id: control.session_id.clone(),
-                    expected_goal_id: orca_core::goal_runtime::GoalId::parse(
-                        predecessor.goal_id.as_str(),
-                    )
-                    .map_err(|message| RuntimeHostError::GoalControlFailed { message })?,
-                    expected_goal_revision: u32::try_from(goal_revision).map_err(|_| {
-                        RuntimeHostError::GoalControlFailed {
-                            message: "Goal revision exceeds durable store range".to_string(),
-                        }
-                    })?,
-                    identity: Box::new(predecessor.clone()),
-                    status: surface::GoalOuterTurnStatus::Success,
-                    usage: goal_usage,
-                    next_action: surface::GoalOuterTurnNextAction::Continue,
-                    verification: verification_patch,
-                    continuation: Some(AdmittedGoalContinuationForSurface {
-                        reason,
-                        successor: Box::new(successor.clone()),
-                        provider_turn_id: logical_turn_id.to_string(),
-                    }),
-                    stop_reason: surface::GoalContinuationStopReason::VerificationPending,
-                    terminal,
-                    pause_message: "Goal continuation admitted".to_string(),
-                    finished_at: chrono::Utc::now().timestamp(),
-                },
-                contexts,
-            )
+            .finish_outer_turn_for_surface(finish_input, contexts)
             .map_err(|error| RuntimeHostError::GoalControlFailed {
                 message: error.to_string(),
             })?;
@@ -14498,7 +14667,7 @@ impl ThreadActor {
             surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
                 fence: predecessor.operation_fence.clone(),
                 reason: surface::GenerationStopReason::Completed {
-                    status: surface::GenerationCompletionStatus::Success,
+                    status: predecessor_completion_status,
                 },
                 usage_delta: surface_usage,
             }),
@@ -17674,6 +17843,7 @@ impl ThreadActor {
         allow_resume: bool,
     ) -> Result<(), RuntimeHostError> {
         let mut surface_usage = UsageTotals::default();
+        let mut completed_turn = None;
         let outcome = match result {
             Ok(mut result) => {
                 let manual_compaction = active
@@ -17844,20 +18014,28 @@ impl ThreadActor {
                             return Ok(());
                         }
                     } else {
+                        let continuation_turn = match &result.outcome {
+                            GenerationTaskOutcome::Executed(
+                                ThreadOperationOutcome::Completed {
+                                    status, end_reason, ..
+                                },
+                            ) => {
+                                let completed = CompletedTurnOutcome {
+                                    status: *status,
+                                    end_reason: *end_reason,
+                                };
+                                completed.permits_goal_continuation().then_some(completed)
+                            }
+                            _ => None,
+                        };
                         let surface_goal_continuation = if active.request.surface_goal_owned
-                            && matches!(
-                                result.outcome,
-                                GenerationTaskOutcome::Executed(
-                                    ThreadOperationOutcome::Completed {
-                                        status: RunStatus::Success,
-                                        ..
-                                    }
-                                )
-                            ) {
+                            && continuation_turn.is_some()
+                        {
                             match self.admit_surface_goal_continuation(
                                 &active,
                                 &result.state,
                                 surface_usage,
+                                continuation_turn.expect("guarded continuation outcome"),
                             ) {
                                 Ok(continuation) => continuation,
                                 Err(error) => {
@@ -18128,7 +18306,9 @@ impl ThreadActor {
                         } else {
                             match result.outcome {
                                 GenerationTaskOutcome::Executed(
-                                    ThreadOperationOutcome::Completed { status, .. },
+                                    ThreadOperationOutcome::Completed {
+                                        status, end_reason, ..
+                                    },
                                 ) => {
                                     if active.request.operation_kind()
                                         == &HostedOperationKind::GoalRun
@@ -18139,6 +18319,8 @@ impl ThreadActor {
                                         );
                                     }
                                     self.state = Some(result.state);
+                                    completed_turn =
+                                        Some(CompletedTurnOutcome { status, end_reason });
                                     OperationOutcome::Completed(status)
                                 }
                                 GenerationTaskOutcome::Executed(
@@ -18180,7 +18362,9 @@ impl ThreadActor {
             },
         };
         if active.surface_operation.is_some() {
-            if let Err(error) = self.finish_surface_operation(&active, &outcome, surface_usage) {
+            if let Err(error) =
+                self.finish_surface_operation(&active, &outcome, surface_usage, completed_turn)
+            {
                 let operation_id = active
                     .surface_operation
                     .as_ref()
@@ -19061,6 +19245,7 @@ fn run_hosted_operation(
                         usage,
                         evidence.tool_count,
                         evidence.model_response_count,
+                        evidence.has_substantive_progress(),
                         (!evidence.has_substantive_progress()).then(|| {
                             crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string()
                         }),
@@ -19735,6 +19920,12 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct SurfaceGoalPlanThenUpdateExecutor {
+        calls: AtomicUsize,
+    }
+
+    struct SurfaceGoalCostBudgetExecutor;
+
     struct SharedOutputWriter(Arc<Mutex<Vec<u8>>>);
 
     impl io::Write for SharedOutputWriter {
@@ -19911,10 +20102,64 @@ mod tests {
                 "Goal continuation admitted an unexpected third turn"
             );
             if call == 0 {
+                thread
+                    .lifecycle_mut()
+                    .finish_task(RunStatus::BudgetExhausted);
+                return Ok(ThreadOperationOutcome::Completed {
+                    status: RunStatus::BudgetExhausted,
+                    end_reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                    background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+                });
+            }
+            SurfaceGoalUpdateExecutor.run_turn(thread, request, generation, events, writer, cancel)
+        }
+    }
+
+    impl ThreadOperationExecutor for SurfaceGoalPlanThenUpdateExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            events: &mut EventFactory,
+            writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                call < 2,
+                "plan-only Goal continuation admitted an unexpected third turn"
+            );
+            if call == 0 {
+                thread
+                    .session_mut()
+                    .conversation_mut()
+                    .replace_plan_state("[in_progress] finish typed Goal projection".to_string());
                 thread.lifecycle_mut().finish_task(RunStatus::Success);
                 return Ok(RunStatus::Success.into());
             }
             SurfaceGoalUpdateExecutor.run_turn(thread, request, generation, events, writer, cancel)
+        }
+    }
+
+    impl ThreadOperationExecutor for SurfaceGoalCostBudgetExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            thread
+                .lifecycle_mut()
+                .finish_task(RunStatus::BudgetExhausted);
+            Ok(ThreadOperationOutcome::Completed {
+                status: RunStatus::BudgetExhausted,
+                end_reason: crate::lifecycle::TurnEndReason::CostBudgetExhausted,
+                background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+            })
         }
     }
 
@@ -20286,6 +20531,75 @@ mod tests {
     fn surface_request_id() -> surface::SurfaceRequestId {
         surface::SurfaceRequestId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
             .expect("generated UUID is v7")
+    }
+
+    fn test_goal_finish_input() -> FinishGoalOuterTurnForSurfaceInput {
+        let goal_id = orca_core::goal_runtime::GoalId::new();
+        let goal_run_id = orca_core::goal_runtime::GoalRunId::new();
+        let operation_fence = surface::SurfaceOperationFence {
+            thread_id: surface::SurfaceThreadId::try_from_bytes(*uuid::Uuid::new_v4().as_bytes())
+                .unwrap(),
+            thread_owner_epoch: surface::ThreadOwnerEpoch::new(1),
+            operation_id: surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        };
+        FinishGoalOuterTurnForSurfaceInput {
+            session_id: "goal-finish-digest".to_string(),
+            expected_goal_id: goal_id.clone(),
+            expected_goal_revision: 7,
+            identity: Box::new(surface::SurfaceGoalGenerationIdentity {
+                goal_id: surface::SurfaceGoalId::try_new(goal_id.to_string()).unwrap(),
+                goal_run_id: surface::SurfaceGoalRunId::try_new(goal_run_id.to_string()).unwrap(),
+                operation_fence,
+                goal_outer_turn_id: surface::SurfaceGoalOuterTurnId::try_new(
+                    orca_core::goal_runtime::GoalOuterTurnId::new().to_string(),
+                )
+                .unwrap(),
+                logical_turn_id: TurnId::new(),
+                canonical_input_item_id: surface::SurfaceItemId::new(),
+                outer_turn_origin: surface::GoalOuterTurnOrigin::User,
+                attempt: surface::GenerationAttempt::Initial,
+                predecessor_fence: None,
+                objective_revision: surface::GoalObjectiveRevision::new(3),
+                outer_turn_count: 1,
+            }),
+            status: surface::GoalOuterTurnStatus::Success,
+            usage: surface::GoalUsage {
+                charged_input_tokens: 11,
+                output_tokens: 2,
+                cache_tokens: 3,
+                verifier_tokens: 0,
+                cost_micros: 5,
+                elapsed_seconds: 1,
+            },
+            progress: GoalSurfaceTurnProgress {
+                tool_count: 1,
+                model_response_count: 1,
+                gap_fingerprint: None,
+            },
+            next_action: surface::GoalOuterTurnNextAction::Pause,
+            verification: None,
+            continuation: None,
+            stop_reason: surface::GoalContinuationStopReason::GoalInactive {
+                state: surface::SurfaceGoalState::Paused {
+                    reason: surface::SurfaceGoalPauseReason::NoProgress,
+                    message: surface::DisplayText::new("pause after finish"),
+                },
+            },
+            terminal: surface::OperationTerminal::Succeeded {
+                usage: surface::UsageTotals {
+                    input_tokens: 11,
+                    output_tokens: 2,
+                    cache_tokens: 3,
+                    estimated_cost_usd_micros: 5,
+                },
+            },
+            pause_message: "pause after finish".to_string(),
+            finished_at: 99,
+        }
     }
 
     fn surface_user_turn_intent(
@@ -25502,6 +25816,28 @@ mod tests {
     }
 
     #[test]
+    fn goal_finish_command_digest_binds_progress_and_usage() {
+        let input = test_goal_finish_input();
+        let baseline = surface_goal_finish_command_digest(&input);
+
+        let mut changed_progress = input.clone();
+        changed_progress.progress.gap_fingerprint = Some("gap:changed".to_string());
+        assert_ne!(
+            surface_goal_finish_command_digest(&changed_progress),
+            baseline,
+            "a different restart progress barrier must not replay under the same digest"
+        );
+
+        let mut changed_usage = input;
+        changed_usage.usage.output_tokens += 1;
+        assert_ne!(
+            surface_goal_finish_command_digest(&changed_usage),
+            baseline,
+            "a different durable usage settlement must not replay under the same digest"
+        );
+    }
+
+    #[test]
     fn turn_disposition_allows_success_or_max_inner_turns() {
         use crate::lifecycle::TurnEndReason;
 
@@ -25796,7 +26132,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_goal_continuation_is_durable_before_successor_execution() {
+    fn surface_goal_max_inner_continuation_is_durable_before_successor_execution() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
         let previous_home = std::env::var_os("ORCA_HOME");
@@ -25873,15 +26209,14 @@ mod tests {
                 )
             })
             .expect("wait continued Goal terminal");
-        assert!(matches!(
-            terminal,
-            surface::WaitOperationTerminalResult::Terminal {
-                value: surface::OperationTerminalAtCursor {
-                    terminal: surface::OperationTerminal::Succeeded { .. },
-                    ..
-                }
-            }
-        ));
+        let surface::WaitOperationTerminalResult::Terminal { value } = terminal else {
+            panic!("MaxInnerTurns continuation did not publish a terminal result");
+        };
+        assert!(
+            matches!(value.terminal, surface::OperationTerminal::Succeeded { .. }),
+            "unexpected terminal after MaxInnerTurns continuation: {:?}",
+            value.terminal
+        );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
         let snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
         let operation = snapshot
@@ -25947,12 +26282,9 @@ mod tests {
             continuation_prompt
                 .contains("<objective>\ncontinue once before verified completion\n</objective>")
         );
-        assert!(
-            continuation_prompt.contains("- trigger: progress")
-                || continuation_prompt.contains("- trigger: gap_feedback"),
-            "successful predecessor must continue through progress or fresh gap feedback"
-        );
-        assert!(continuation_prompt.contains("- previous outer-turn status: success"));
+        assert!(continuation_prompt.contains("- trigger: max_inner_turns"));
+        assert!(continuation_prompt.contains("- previous outer-turn status: budget_exhausted"));
+        assert!(continuation_prompt.contains("- previous end reason: max_inner_turns"));
         assert!(matches!(
             snapshot.goal.as_ref().map(|goal| &goal.state),
             Some(surface::SurfaceGoalState::Complete { .. })
@@ -26039,6 +26371,211 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown resumed continued Goal runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn surface_goal_plan_only_progress_continues_without_a_synthetic_gap() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(SurfaceGoalPlanThenUpdateExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let host = RuntimeHost::start_with_executor(executor.clone())
+            .expect("start plan-progress Goal runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "plan-only Goal progress",
+            )
+            .expect("start recorded plan-progress Goal thread");
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new("preserve plan-only progress")
+                            .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "update the plan, then finish",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit plan-progress Goal"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait plan-progress Goal terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Succeeded { .. },
+                    ..
+                }
+            }
+        ));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        let snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("plan-progress Goal operation");
+        let continuation = operation.generations.get(1).expect("Goal continuation");
+        let request = match &continuation.replayability {
+            surface::Replayability::Replayable {
+                request: Some(request),
+                ..
+            } => request,
+            other => panic!("unexpected continuation replayability: {other:?}"),
+        };
+        let prompt = resolve_surface_input(request)
+            .expect("resolve plan-progress continuation")
+            .canonical_text;
+        assert!(prompt.as_str().contains("- trigger: progress"));
+        assert!(
+            prompt
+                .as_str()
+                .contains("[in_progress] finish typed Goal projection")
+        );
+        assert!(!prompt.as_str().contains("- trigger: gap_feedback"));
+        let goal_id = orca_core::goal_runtime::GoalId::parse(
+            snapshot
+                .goal
+                .as_ref()
+                .expect("plan-progress Goal snapshot")
+                .goal_id
+                .as_str()
+                .to_string(),
+        )
+        .unwrap();
+        let progress_history = GoalStore::load_default()
+            .unwrap()
+            .recent_gap_fingerprints(&goal_id, 3)
+            .unwrap();
+        assert_eq!(progress_history.len(), 2);
+        assert!(
+            progress_history.iter().all(Option::is_none),
+            "typed plan/tool progress must persist NULL barriers, got {progress_history:?}"
+        );
+        host.shutdown()
+            .expect("shutdown plan-progress Goal runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn surface_goal_cost_budget_exhaustion_is_usage_limited_not_failed() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalCostBudgetExecutor))
+            .expect("start cost-budget Goal runtime");
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.max_budget_usd = Some(0.0);
+        let thread = host
+            .start_thread(config, "cost-budget Goal")
+            .expect("start recorded cost-budget Goal thread");
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "stop exactly at the cost budget",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "respect the configured cost ceiling",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit cost-budget Goal"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait cost-budget Goal terminal");
+        let surface::WaitOperationTerminalResult::Terminal { value } = terminal else {
+            panic!("cost-budget Goal did not publish a terminal result");
+        };
+        assert!(
+            matches!(
+                value.terminal,
+                surface::OperationTerminal::BudgetExhausted {
+                    budget: surface::OperationBudget::MonetaryBudgetUsdMicros { .. },
+                }
+            ),
+            "unexpected cost-budget terminal: {:?}",
+            value.terminal
+        );
+        let snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
+        assert!(matches!(
+            snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Paused {
+                reason: surface::SurfaceGoalPauseReason::UsageLimit,
+                ..
+            })
+        ));
+        host.shutdown().expect("shutdown cost-budget Goal runtime");
         match previous_home {
             Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
             None => unsafe { std::env::remove_var("ORCA_HOME") },

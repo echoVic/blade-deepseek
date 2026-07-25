@@ -231,13 +231,14 @@ impl RuntimeThread {
             .read(&turn.session_id)
             .ok()
             .and_then(|record| record.map(|record| record.state));
-        let action = binding.handle.finish_outer_turn(
+        let action = binding.handle.finish_outer_turn_with_progress(
             &turn.session_id,
             goal_status,
             end_reason,
             usage.clone(),
             evidence.tool_count,
             evidence.model_response_count,
+            evidence.has_substantive_progress(),
             (!evidence.has_substantive_progress())
                 .then(|| crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string()),
             now_timestamp(),

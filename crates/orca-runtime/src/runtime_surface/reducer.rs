@@ -1873,7 +1873,16 @@ fn validate_batch_pairings(
                                 SurfaceEvent::Operation(OperationPatch::GenerationStopped {
                                     fence,
                                     reason: GenerationStopReason::Completed {
-                                        status: GenerationCompletionStatus::Success,
+                                        status:
+                                            GenerationCompletionStatus::Success
+                                            | GenerationCompletionStatus::BudgetExhausted {
+                                                budget:
+                                                    OperationBudget::TurnRequests {
+                                                        scope:
+                                                            TurnRequestBudgetScope::AgentLoop,
+                                                        ..
+                                                    },
+                                            },
                                     },
                                     ..
                                 }) if fence == &predecessor.operation_fence
@@ -1883,7 +1892,7 @@ fn validate_batch_pairings(
                             return Err(event_error(
                                 envelope,
                                 SurfaceReducerErrorCode::InvalidOrdering,
-                                "admitted goal continuation requires a successful predecessor stop",
+                                "admitted goal continuation requires a resumable predecessor stop",
                             ));
                         }
                         let reserved_count = batch_event_count(batch, |event| {
@@ -2099,6 +2108,18 @@ fn goal_stop_terminal_binding_matches(
     let succeeded = matches!(terminal, OperationTerminal::Succeeded { .. });
     match reason {
         GoalContinuationStopReason::GoalInactive { state } => match state {
+            SurfaceGoalState::Paused {
+                reason: SurfaceGoalPauseReason::UsageLimit,
+                ..
+            } => {
+                state == goal_state
+                    && matches!(
+                        terminal,
+                        OperationTerminal::BudgetExhausted {
+                            budget: OperationBudget::MonetaryBudgetUsdMicros { .. },
+                        }
+                    )
+            }
             SurfaceGoalState::Paused { .. }
             | SurfaceGoalState::Blocked { .. }
             | SurfaceGoalState::Complete { .. } => state == goal_state && succeeded,

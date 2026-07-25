@@ -28,7 +28,7 @@ use crate::lifecycle::{
     RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
 
-const DEFAULT_MAX_TURNS: u32 = 128;
+pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
 
 pub(crate) fn run_agent_loop(
     config: &RunConfig,

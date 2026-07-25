@@ -18,8 +18,8 @@ use crate::goal_store::{
     CreateGoalAndPrepareRunForSurfaceInput, CreateGoalInput, EditGoalAndPrepareRunForSurfaceInput,
     FinishGoalOuterTurnForSurfaceInput, FinishOuterTurnInput, GoalIntentRecord, GoalRecoveryRecord,
     GoalStore, GoalStoreError, GoalSurfaceMutationContext, GoalSurfaceMutationRecord,
-    GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate, GoalUsageEvent, PauseGoalForSurfaceInput,
-    PauseQuiescentGoalForSurfaceInput, PrepareGoalRunForSurfaceInput,
+    GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate, GoalSurfaceTurnProgress, GoalUsageEvent,
+    PauseGoalForSurfaceInput, PauseQuiescentGoalForSurfaceInput, PrepareGoalRunForSurfaceInput,
     RecoverGoalRunForSurfaceInput, ReplaceGoalContinuationForSurfaceInput,
 };
 use crate::goal_tracker::{GoalTracker, GoalTurnResult, SAME_GAP_STREAK_LIMIT};
@@ -223,9 +223,15 @@ struct ActiveGoalTurn {
     context: GoalTurnContext,
     tracker: GoalTracker,
     pending_pause: Option<PendingGoalPause>,
-    surface_result: Option<GoalTurnResult>,
+    surface_result: Option<RecordedSurfaceTurnResult>,
     surface_owned: bool,
     surface_identity: Option<Box<crate::runtime_surface::SurfaceGoalGenerationIdentity>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedSurfaceTurnResult {
+    result: GoalTurnResult,
+    progress: GoalSurfaceTurnProgress,
 }
 
 struct PendingGoalPause {
@@ -245,6 +251,13 @@ struct PendingSurfaceDecision {
     verification: Option<GoalVerificationResult>,
     action: GoalNextAction,
     tracker: GoalTracker,
+    progress: GoalSurfaceTurnProgress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GoalSurfaceDecisionPreview {
+    pub(crate) action: GoalNextAction,
+    pub(crate) progress: GoalSurfaceTurnProgress,
 }
 
 fn surface_evidence_matches(
@@ -523,7 +536,11 @@ fn surface_finish_matches_pending(
         (Some(core), Some(surface)) => surface_verification_matches(core, surface),
         _ => false,
     };
-    status_matches && usage_matches && action_matches && verification_matches
+    status_matches
+        && usage_matches
+        && input.progress == pending.progress
+        && action_matches
+        && verification_matches
 }
 
 enum GoalActorCommand {
@@ -611,7 +628,7 @@ enum GoalActorCommand {
     },
     RecordTurnResultForSurface {
         session_id: String,
-        result: GoalTurnResult,
+        result: RecordedSurfaceTurnResult,
         reply: Reply,
     },
     PauseForSurface {
@@ -700,6 +717,7 @@ enum GoalActorCommand {
         usage: GoalUsage,
         tool_count: u32,
         model_response_count: u32,
+        has_substantive_progress: bool,
         gap_fingerprint: Option<String>,
         finished_at: i64,
         reply: Reply,
@@ -745,6 +763,7 @@ enum GoalActorReply {
     Turn(GoalTurnContext),
     Ack(GoalUpdateAck),
     Action(GoalNextAction),
+    SurfaceDecisionPreview(GoalSurfaceDecisionPreview),
 }
 
 impl GoalRuntimeHandle {
@@ -1128,18 +1147,28 @@ impl GoalRuntimeHandle {
         usage: GoalUsage,
         tool_count: u32,
         model_response_count: u32,
+        has_substantive_progress: bool,
         gap_fingerprint: Option<String>,
     ) -> Result<(), GoalActorError> {
+        let progress = GoalSurfaceTurnProgress {
+            tool_count,
+            model_response_count,
+            gap_fingerprint: gap_fingerprint.clone(),
+        };
         let result = build_turn_result(
             status,
             end_reason,
             tool_count,
             model_response_count,
+            has_substantive_progress,
             gap_fingerprint,
         );
         self.request(|reply| GoalActorCommand::RecordTurnResultForSurface {
             session_id: session_id.to_string(),
-            result: GoalTurnResult { usage, ..result },
+            result: RecordedSurfaceTurnResult {
+                result: GoalTurnResult { usage, ..result },
+                progress,
+            },
             reply,
         })
         .and_then(|reply| match reply {
@@ -1156,7 +1185,7 @@ impl GoalRuntimeHandle {
         status: GoalTurnStatus,
         usage: GoalUsage,
         verification: Option<GoalVerificationResult>,
-    ) -> Result<GoalNextAction, GoalActorError> {
+    ) -> Result<GoalSurfaceDecisionPreview, GoalActorError> {
         self.request(|reply| GoalActorCommand::DecideOuterTurnForSurface {
             session_id: session_id.to_string(),
             status,
@@ -1165,7 +1194,7 @@ impl GoalRuntimeHandle {
             reply,
         })
         .and_then(|reply| match reply {
-            GoalActorReply::Action(action) => Ok(action),
+            GoalActorReply::SurfaceDecisionPreview(preview) => Ok(preview),
             _ => Err(GoalActorError::Invalid(
                 "goal actor returned wrong surface decision preview reply".to_string(),
             )),
@@ -1411,6 +1440,34 @@ impl GoalRuntimeHandle {
         gap_fingerprint: Option<String>,
         finished_at: i64,
     ) -> Result<GoalNextAction, GoalActorError> {
+        let has_substantive_progress =
+            gap_fingerprint.is_none() && (tool_count != 0 || model_response_count != 0);
+        self.finish_outer_turn_with_progress(
+            session_id,
+            status,
+            end_reason,
+            usage,
+            tool_count,
+            model_response_count,
+            has_substantive_progress,
+            gap_fingerprint,
+            finished_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_outer_turn_with_progress(
+        &self,
+        session_id: &str,
+        status: GoalTurnStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
+        usage: GoalUsage,
+        tool_count: u32,
+        model_response_count: u32,
+        has_substantive_progress: bool,
+        gap_fingerprint: Option<String>,
+        finished_at: i64,
+    ) -> Result<GoalNextAction, GoalActorError> {
         self.request(|reply| GoalActorCommand::FinishOuterTurn {
             session_id: session_id.to_string(),
             status,
@@ -1418,6 +1475,7 @@ impl GoalRuntimeHandle {
             usage,
             tool_count,
             model_response_count,
+            has_substantive_progress,
             gap_fingerprint,
             finished_at,
             reply,
@@ -1725,9 +1783,13 @@ impl GoalActor {
                     .map(|continuation| continuation.successor.clone());
                 let pending_decision = self.pending_surface_decisions.remove(&session_id);
                 let result = (|| {
-                    if input.status == crate::runtime_surface::GoalOuterTurnStatus::Success
-                        && pending_decision.is_none()
-                    {
+                    let requires_preview = input.continuation.is_some()
+                        || matches!(
+                            input.status,
+                            crate::runtime_surface::GoalOuterTurnStatus::Success
+                                | crate::runtime_surface::GoalOuterTurnStatus::BudgetExhausted
+                        );
+                    if requires_preview && pending_decision.is_none() {
                         return Err(GoalActorError::Invalid(
                             "surface Goal outer-turn finish lacks its previewed decision"
                                 .to_string(),
@@ -1809,6 +1871,9 @@ impl GoalActor {
                         self.trackers.remove(&session_id);
                     }
                     self.pending_verification.remove(&session_id);
+                } else if let Some(pending_decision) = pending_decision {
+                    self.pending_surface_decisions
+                        .insert(session_id.clone(), pending_decision);
                 }
                 let result = result.map(GoalActorReply::SurfaceMutations);
                 (reply, result)
@@ -1822,7 +1887,7 @@ impl GoalActor {
             } => (
                 reply,
                 self.preview_outer_turn_for_surface(&session_id, status, usage, verification)
-                    .map(GoalActorReply::Action),
+                    .map(GoalActorReply::SurfaceDecisionPreview),
             ),
             GoalActorCommand::RecordTurnResultForSurface {
                 session_id,
@@ -2022,6 +2087,7 @@ impl GoalActor {
                 usage,
                 tool_count,
                 model_response_count,
+                has_substantive_progress,
                 gap_fingerprint,
                 finished_at,
                 reply,
@@ -2034,6 +2100,7 @@ impl GoalActor {
                     usage,
                     tool_count,
                     model_response_count,
+                    has_substantive_progress,
                     gap_fingerprint,
                     finished_at,
                 )
@@ -2329,7 +2396,10 @@ impl GoalActor {
             active.surface_identity = Some(Box::new(identity));
             return Ok(active.context.clone());
         }
-        let mut tracker = GoalTracker::from_record(&record);
+        let history = self
+            .store
+            .recent_gap_fingerprints(&record.goal_id, SAME_GAP_STREAK_LIMIT)?;
+        let mut tracker = GoalTracker::from_record_with_history(&record, &history);
         tracker
             .bind_persisted_outer_turn(outer_turn_id.clone(), origin)
             .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
@@ -2380,7 +2450,7 @@ impl GoalActor {
         status: GoalTurnStatus,
         usage: GoalUsage,
         verification: Option<GoalVerificationResult>,
-    ) -> Result<GoalNextAction, GoalActorError> {
+    ) -> Result<GoalSurfaceDecisionPreview, GoalActorError> {
         let preview_usage = usage.clone();
         let preview_verification = verification.clone();
         let (identity, pending_pause, mut tracker, recorded_result) = {
@@ -2408,23 +2478,38 @@ impl GoalActor {
                 active.surface_result.clone(),
             )
         };
-        let turn_result = match recorded_result {
-            Some(result) if result.status == status && result.usage == usage => result,
+        let fallback_progress = GoalSurfaceTurnProgress {
+            tool_count: 0,
+            model_response_count: 0,
+            gap_fingerprint: Some(
+                crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string(),
+            ),
+        };
+        let (turn_result, progress) = match recorded_result {
+            Some(recorded)
+                if recorded.result.status == status && recorded.result.usage == usage =>
+            {
+                (recorded.result, recorded.progress)
+            }
             Some(_) => {
                 return Err(GoalActorError::Invalid(
                     "surface Goal preview disagrees with its recorded turn result".to_string(),
                 ));
             }
-            None => GoalTurnResult {
-                usage,
-                ..build_turn_result(
-                    status,
-                    crate::lifecycle::TurnEndReason::Unclassified,
-                    0,
-                    0,
-                    None,
-                )
-            },
+            None => (
+                GoalTurnResult {
+                    usage,
+                    ..build_turn_result(
+                        status,
+                        crate::lifecycle::TurnEndReason::Unclassified,
+                        0,
+                        0,
+                        false,
+                        fallback_progress.gap_fingerprint.clone(),
+                    )
+                },
+                fallback_progress,
+            ),
         };
         let tracker_action = tracker
             .finish_outer_turn(turn_result)
@@ -2454,9 +2539,10 @@ impl GoalActor {
                 verification: preview_verification,
                 action: action.clone(),
                 tracker,
+                progress: progress.clone(),
             },
         );
-        Ok(action)
+        Ok(GoalSurfaceDecisionPreview { action, progress })
     }
 
     fn begin_outer_turn(
@@ -2617,11 +2703,12 @@ impl GoalActor {
         usage: GoalUsage,
         tool_count: u32,
         model_response_count: u32,
+        has_substantive_progress: bool,
         gap_fingerprint: Option<String>,
         finished_at: i64,
     ) -> Result<GoalNextAction, GoalActorError> {
         let effective_gap_fingerprint = gap_fingerprint.or_else(|| {
-            (tool_count == 0 && model_response_count == 0)
+            (!has_substantive_progress)
                 .then(|| crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string())
         });
         let mut turn_result = build_turn_result(
@@ -2629,6 +2716,7 @@ impl GoalActor {
             end_reason,
             tool_count,
             model_response_count,
+            has_substantive_progress,
             effective_gap_fingerprint.clone(),
         );
         turn_result.usage = usage.clone();
@@ -2865,14 +2953,17 @@ fn build_turn_result(
     end_reason: crate::lifecycle::TurnEndReason,
     tool_count: u32,
     model_response_count: u32,
+    has_substantive_progress: bool,
     gap_fingerprint: Option<String>,
 ) -> GoalTurnResult {
     // GoalTurnResult::evidence_count is usize; widen from the u32 wire counters.
     let activity_count = tool_count as usize + model_response_count as usize;
     let evidence_count = if gap_fingerprint.is_some() {
         0
+    } else if has_substantive_progress {
+        activity_count.max(1)
     } else {
-        activity_count
+        0
     };
     let gaps = match gap_fingerprint {
         Some(fingerprint) => vec![GoalGap {
@@ -2880,7 +2971,7 @@ fn build_turn_result(
             fingerprint,
             model_fixable: true,
         }],
-        None if activity_count == 0 => vec![GoalGap {
+        None if !has_substantive_progress => vec![GoalGap {
             summary: "outer turn ended without structured progress evidence".to_string(),
             fingerprint: crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string(),
             model_fixable: true,
@@ -2913,6 +3004,46 @@ mod tests {
             .unwrap()
     }
 
+    fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
+        let mut bytes = [seed; 16];
+        bytes[6] = 0x70 | (seed & 0x0f);
+        bytes[8] = 0x80 | (seed & 0x3f);
+        bytes
+    }
+
+    fn test_surface_goal_identity(
+        goal_id: &GoalId,
+        goal_run_id: &orca_core::goal_runtime::GoalRunId,
+    ) -> crate::runtime_surface::SurfaceGoalGenerationIdentity {
+        let operation_fence = crate::runtime_surface::SurfaceOperationFence {
+            thread_id: crate::runtime_surface::SurfaceThreadId::try_from_bytes(uuid_v7_bytes(21))
+                .unwrap(),
+            thread_owner_epoch: crate::runtime_surface::ThreadOwnerEpoch::new(1),
+            operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                uuid_v7_bytes(22),
+            )
+            .unwrap(),
+            generation_id: crate::runtime_surface::SurfaceGenerationId::new(0),
+        };
+        crate::runtime_surface::SurfaceGoalGenerationIdentity {
+            goal_id: crate::runtime_surface::SurfaceGoalId::try_new(goal_id.to_string()).unwrap(),
+            goal_run_id: crate::runtime_surface::SurfaceGoalRunId::try_new(goal_run_id.to_string())
+                .unwrap(),
+            operation_fence,
+            goal_outer_turn_id: crate::runtime_surface::SurfaceGoalOuterTurnId::try_new(
+                GoalOuterTurnId::new().to_string(),
+            )
+            .unwrap(),
+            logical_turn_id: orca_core::thread_identity::TurnId::new(),
+            canonical_input_item_id: orca_core::thread_identity::ConversationItemId::new(),
+            outer_turn_origin: crate::runtime_surface::GoalOuterTurnOrigin::User,
+            attempt: crate::runtime_surface::GenerationAttempt::Initial,
+            predecessor_fence: None,
+            objective_revision: crate::runtime_surface::GoalObjectiveRevision::new(1),
+            outer_turn_count: 1,
+        }
+    }
+
     #[test]
     fn outer_turn_result_reflects_evidence_instead_of_constant_gap() {
         let active = build_turn_result(
@@ -2920,6 +3051,7 @@ mod tests {
             crate::lifecycle::TurnEndReason::Unclassified,
             4,
             2,
+            true,
             None,
         );
         assert_eq!(active.evidence_count, 6);
@@ -2933,6 +3065,7 @@ mod tests {
             crate::lifecycle::TurnEndReason::Unclassified,
             0,
             0,
+            false,
             None,
         );
         assert_eq!(idle.evidence_count, 0);
@@ -2942,11 +3075,26 @@ mod tests {
             crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT
         );
 
+        let plan_only = build_turn_result(
+            GoalTurnStatus::Success,
+            crate::lifecycle::TurnEndReason::Unclassified,
+            0,
+            0,
+            true,
+            None,
+        );
+        assert_eq!(plan_only.evidence_count, 1);
+        assert!(
+            plan_only.gaps.is_empty(),
+            "a changed plan is substantive progress even without new messages"
+        );
+
         let explicit = build_turn_result(
             GoalTurnStatus::Success,
             crate::lifecycle::TurnEndReason::Unclassified,
             5,
             1,
+            false,
             Some("roadmap:next-slice".to_string()),
         );
         assert_eq!(explicit.gaps.len(), 1);
@@ -2961,6 +3109,7 @@ mod tests {
             crate::lifecycle::TurnEndReason::Unclassified,
             7,
             3,
+            false,
             Some("outer_turn:no_substantive_progress".to_string()),
         );
         assert_eq!(exploratory.evidence_count, 0);
@@ -3034,13 +3183,14 @@ mod tests {
         let ack = handle.submit_intent("actor-session", intent, 3).unwrap();
         assert!(matches!(ack, GoalUpdateAck::DeferredToTurnEnd { .. }));
         let action = handle
-            .finish_outer_turn(
+            .finish_outer_turn_with_progress(
                 "actor-session",
                 GoalTurnStatus::Success,
                 crate::lifecycle::TurnEndReason::Unclassified,
                 GoalUsage::default(),
                 1,
                 1,
+                true,
                 None,
                 4,
             )
@@ -3150,6 +3300,245 @@ mod tests {
     }
 
     #[test]
+    fn max_inner_surface_continuation_without_preview_is_rejected_before_store() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let inspection_store = store.clone();
+        let (handle, join) = GoalRuntimeHandle::spawn_surface_owned_for_test(store);
+        let goal_id = GoalId::new();
+        let goal_run_id = orca_core::goal_runtime::GoalRunId::new();
+        let predecessor = test_surface_goal_identity(&goal_id, &goal_run_id);
+        let mut successor = predecessor.clone();
+        successor.operation_fence.generation_id =
+            crate::runtime_surface::SurfaceGenerationId::new(1);
+        successor.goal_outer_turn_id = crate::runtime_surface::SurfaceGoalOuterTurnId::try_new(
+            GoalOuterTurnId::new().to_string(),
+        )
+        .unwrap();
+        successor.logical_turn_id = orca_core::thread_identity::TurnId::new();
+        successor.canonical_input_item_id = orca_core::thread_identity::ConversationItemId::new();
+        successor.outer_turn_origin = crate::runtime_surface::GoalOuterTurnOrigin::Continuation;
+        successor.predecessor_fence = Some(predecessor.operation_fence.clone());
+        successor.outer_turn_count = 2;
+        let terminal = crate::runtime_surface::OperationTerminal::BudgetExhausted {
+            budget: crate::runtime_surface::OperationBudget::TurnRequests {
+                scope: crate::runtime_surface::TurnRequestBudgetScope::AgentLoop,
+                limit: crate::agent_loop::DEFAULT_MAX_TURNS as u64,
+                observed: crate::agent_loop::DEFAULT_MAX_TURNS as u64,
+            },
+        };
+        let before_goal_count = inspection_store.goal_count().unwrap();
+        let before_in_flight = inspection_store.in_flight_run_count().unwrap();
+        let before_outbox = inspection_store
+            .pending_surface_mutations("missing-preview")
+            .unwrap();
+
+        let error = handle
+            .finish_outer_turn_for_surface(
+                FinishGoalOuterTurnForSurfaceInput {
+                    session_id: "missing-preview".to_string(),
+                    expected_goal_id: goal_id,
+                    expected_goal_revision: 1,
+                    identity: Box::new(predecessor),
+                    status: crate::runtime_surface::GoalOuterTurnStatus::BudgetExhausted,
+                    usage: crate::runtime_surface::GoalUsage {
+                        charged_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_tokens: 0,
+                        verifier_tokens: 0,
+                        cost_micros: 0,
+                        elapsed_seconds: 0,
+                    },
+                    progress: GoalSurfaceTurnProgress {
+                        tool_count: 0,
+                        model_response_count: 0,
+                        gap_fingerprint: Some(
+                            crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT
+                                .to_string(),
+                        ),
+                    },
+                    next_action: crate::runtime_surface::GoalOuterTurnNextAction::Continue,
+                    verification: None,
+                    continuation: Some(crate::goal_store::AdmittedGoalContinuationForSurface {
+                        reason: crate::runtime_surface::GoalContinuationAdmitReason::GapFeedback,
+                        successor: Box::new(successor),
+                        provider_turn_id: "provider-must-not-start".to_string(),
+                    }),
+                    stop_reason: crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Active,
+                    },
+                    terminal,
+                    pause_message: "missing preview must reject".to_string(),
+                    finished_at: 2,
+                },
+                vec![
+                    GoalSurfaceMutationContext {
+                        store_commit_id: "019f8b4d-7d73-7b52-8f44-2cfeac060091".to_string(),
+                        command_digest: [91; 32],
+                        goal_owner_epoch: 1,
+                    },
+                    GoalSurfaceMutationContext {
+                        store_commit_id: "019f8b4d-7d73-7b52-8f44-2cfeac060092".to_string(),
+                        command_digest: [92; 32],
+                        goal_owner_epoch: 1,
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("previewed decision"));
+        assert_eq!(inspection_store.goal_count().unwrap(), before_goal_count);
+        assert_eq!(
+            inspection_store.in_flight_run_count().unwrap(),
+            before_in_flight
+        );
+        assert_eq!(
+            inspection_store
+                .pending_surface_mutations("missing-preview")
+                .unwrap(),
+            before_outbox
+        );
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn surface_finish_errors_preserve_the_preview_owner_token() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let record = store
+            .create_goal(CreateGoalInput {
+                session_id: "preview-retry".to_string(),
+                objective: "retain the exact preview owner across retry".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let goal_run_id = orca_core::goal_runtime::GoalRunId::new();
+        let identity = test_surface_goal_identity(&record.goal_id, &goal_run_id);
+        let progress = GoalSurfaceTurnProgress {
+            tool_count: 0,
+            model_response_count: 0,
+            gap_fingerprint: Some(
+                crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string(),
+            ),
+        };
+        let pause_message = "pause after no progress".to_string();
+        let input = FinishGoalOuterTurnForSurfaceInput {
+            session_id: record.session_id.clone(),
+            expected_goal_id: record.goal_id.clone(),
+            expected_goal_revision: 1,
+            identity: Box::new(identity.clone()),
+            status: crate::runtime_surface::GoalOuterTurnStatus::Success,
+            usage: crate::runtime_surface::GoalUsage {
+                charged_input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                verifier_tokens: 0,
+                cost_micros: 0,
+                elapsed_seconds: 0,
+            },
+            progress: progress.clone(),
+            next_action: crate::runtime_surface::GoalOuterTurnNextAction::Pause,
+            verification: None,
+            continuation: None,
+            stop_reason: crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                state: crate::runtime_surface::SurfaceGoalState::Paused {
+                    reason: crate::runtime_surface::SurfaceGoalPauseReason::NoProgress,
+                    message: crate::runtime_surface::DisplayText::new(&pause_message),
+                },
+            },
+            terminal: crate::runtime_surface::OperationTerminal::Succeeded {
+                usage: crate::runtime_surface::UsageTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                    estimated_cost_usd_micros: 0,
+                },
+            },
+            pause_message: pause_message.clone(),
+            finished_at: 2,
+        };
+        let (_sender, receiver) = mpsc::sync_channel(ACTOR_MAILBOX_CAPACITY);
+        let mut actor = GoalActor {
+            store,
+            sender: receiver,
+            active: HashMap::new(),
+            trackers: HashMap::new(),
+            pending_verification: HashMap::new(),
+            pending_surface_decisions: HashMap::from([(
+                record.session_id.clone(),
+                PendingSurfaceDecision {
+                    identity: Box::new(identity),
+                    status: GoalTurnStatus::Success,
+                    usage: GoalUsage::default(),
+                    verification: None,
+                    action: GoalNextAction::Pause {
+                        reason: GoalPauseReason::NoProgress,
+                        message: pause_message,
+                    },
+                    tracker: GoalTracker::from_record(&record),
+                    progress,
+                },
+            )]),
+            pending_recoveries: HashMap::new(),
+            surface_owner_epoch: Some(owner_epoch),
+            _runtime_lease: None,
+        };
+        let contexts = || {
+            vec![
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest: [31; 32],
+                    goal_owner_epoch: owner_epoch,
+                },
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest: [32; 32],
+                    goal_owner_epoch: owner_epoch,
+                },
+            ]
+        };
+
+        let mut mismatched = input.clone();
+        mismatched.progress.tool_count = 1;
+        let (reply, result) = mpsc::sync_channel(1);
+        actor.handle(GoalActorCommand::FinishOuterTurnForSurface {
+            input: mismatched,
+            contexts: contexts(),
+            reply,
+        });
+        assert!(matches!(
+            result.recv().unwrap(),
+            Err(GoalActorError::Invalid(message)) if message.contains("differs")
+        ));
+        assert!(
+            actor
+                .pending_surface_decisions
+                .contains_key("preview-retry")
+        );
+
+        inject_surface_outer_turn_finish_failure_once("preview-retry");
+        let (reply, result) = mpsc::sync_channel(1);
+        actor.handle(GoalActorCommand::FinishOuterTurnForSurface {
+            input,
+            contexts: contexts(),
+            reply,
+        });
+        assert!(matches!(
+            result.recv().unwrap(),
+            Err(GoalActorError::Store(message)) if message.contains("injected")
+        ));
+        assert!(
+            actor
+                .pending_surface_decisions
+                .contains_key("preview-retry"),
+            "a failed durable write must return the exact preview token to its actor owner"
+        );
+    }
+
+    #[test]
     fn duplicate_intent_is_idempotent_and_stale_turn_is_rejected() {
         let dir = tempdir().unwrap();
         let (handle, join) =
@@ -3202,13 +3591,14 @@ mod tests {
             )
             .unwrap();
         handle
-            .finish_outer_turn(
+            .finish_outer_turn_with_progress(
                 "verifier-usage-session",
                 GoalTurnStatus::Success,
                 crate::lifecycle::TurnEndReason::Unclassified,
                 GoalUsage::default(),
                 1,
                 1,
+                true,
                 None,
                 2,
             )
@@ -3276,7 +3666,7 @@ mod tests {
         );
         assert!(matches!(
             handle
-                .finish_outer_turn(
+                .finish_outer_turn_with_progress(
                     "pause-resume-session",
                     GoalTurnStatus::Cancelled,
                     crate::lifecycle::TurnEndReason::Cancelled,
@@ -3287,6 +3677,7 @@ mod tests {
                     },
                     0,
                     0,
+                    false,
                     None,
                     3,
                 )
@@ -3364,13 +3755,14 @@ mod tests {
         ));
         assert!(matches!(
             handle
-                .finish_outer_turn(
+                .finish_outer_turn_with_progress(
                     "active-control-session",
                     GoalTurnStatus::Cancelled,
                     crate::lifecycle::TurnEndReason::Cancelled,
                     GoalUsage::default(),
                     0,
                     0,
+                    false,
                     None,
                     4,
                 )
@@ -3386,87 +3778,91 @@ mod tests {
     }
 
     #[test]
-    fn streak_survives_tracker_eviction() {
-        // Exercises the seam directly rather than end-to-end: GoalTracker's
-        // same_gap_streak field is private, so there is no public way to
-        // observe the in-memory streak of an actor-owned tracker after a
-        // simulated restart. Instead this drives two real outer turns with
-        // the same explicit gap fingerprint through the actor/store, then
-        // proves the cold-start reconstruction (store.recent_gap_fingerprints
-        // + GoalTracker::from_record_with_history) recovers a streak of 2.
+    fn same_gap_streak_survives_two_actor_restarts() {
         let dir = tempdir().unwrap();
-        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
-        let inspection_store = store.clone();
+        let database_path = dir.path().join("goals.sqlite3");
+        let store = GoalStore::open(&database_path).unwrap();
         let (handle, join) = GoalRuntimeHandle::spawn(store);
-        let goal = create(&handle, "streak-eviction-session");
+        create(&handle, "streak-restart-session");
 
         handle
             .begin_outer_turn(
-                "streak-eviction-session",
+                "streak-restart-session",
                 GoalTurnOrigin::User,
                 "provider-1",
                 1,
             )
             .unwrap();
-        handle
-            .finish_outer_turn(
-                "streak-eviction-session",
-                GoalTurnStatus::Success,
-                crate::lifecycle::TurnEndReason::Unclassified,
-                GoalUsage::default(),
-                0,
-                0,
-                Some("gap:repeat".to_string()),
-                2,
-            )
-            .unwrap();
+        assert!(matches!(
+            handle
+                .finish_outer_turn_with_progress(
+                    "streak-restart-session",
+                    GoalTurnStatus::Success,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    GoalUsage::default(),
+                    0,
+                    0,
+                    false,
+                    Some("gap:repeat".to_string()),
+                    2,
+                )
+                .unwrap(),
+            GoalNextAction::Continue { .. }
+        ));
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+        drop(handle);
+
+        let (handle, join) = GoalRuntimeHandle::spawn(GoalStore::open(&database_path).unwrap());
         handle
             .begin_outer_turn(
-                "streak-eviction-session",
+                "streak-restart-session",
                 GoalTurnOrigin::Continuation,
                 "provider-2",
                 3,
             )
             .unwrap();
+        assert!(matches!(
+            handle
+                .finish_outer_turn_with_progress(
+                    "streak-restart-session",
+                    GoalTurnStatus::Success,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    GoalUsage::default(),
+                    0,
+                    0,
+                    false,
+                    Some("gap:repeat".to_string()),
+                    4,
+                )
+                .unwrap(),
+            GoalNextAction::Continue { .. }
+        ));
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+        drop(handle);
+
+        let (handle, join) = GoalRuntimeHandle::spawn(GoalStore::open(&database_path).unwrap());
         handle
-            .finish_outer_turn(
-                "streak-eviction-session",
+            .begin_outer_turn(
+                "streak-restart-session",
+                GoalTurnOrigin::Continuation,
+                "provider-3",
+                5,
+            )
+            .unwrap();
+        let action = handle
+            .finish_outer_turn_with_progress(
+                "streak-restart-session",
                 GoalTurnStatus::Success,
                 crate::lifecycle::TurnEndReason::Unclassified,
                 GoalUsage::default(),
                 0,
                 0,
+                false,
                 Some("gap:repeat".to_string()),
-                4,
+                6,
             )
-            .unwrap();
-
-        let history = inspection_store
-            .recent_gap_fingerprints(&goal.goal_id, SAME_GAP_STREAK_LIMIT)
-            .unwrap();
-        assert_eq!(
-            history,
-            vec![
-                Some("gap:repeat".to_string()),
-                Some("gap:repeat".to_string())
-            ]
-        );
-
-        let record = handle.read("streak-eviction-session").unwrap().unwrap();
-        let mut rebuilt = GoalTracker::from_record_with_history(&record, &history);
-        // If the streak were reset to 0 (the from_record-only bug), a third
-        // matching gap would only bring it to 1 and the tracker would
-        // Continue. Recovering the streak at 2 means this third gap hits
-        // the limit and pauses as NoProgress instead.
-        rebuilt
-            .begin_outer_turn(GoalTurnOrigin::Continuation)
-            .unwrap();
-        let action = rebuilt
-            .finish_outer_turn(GoalTurnResult::successful_with_gaps(vec![GoalGap {
-                summary: "still stuck".to_string(),
-                fingerprint: "gap:repeat".to_string(),
-                model_fixable: true,
-            }]))
             .unwrap();
         assert!(matches!(
             action,
@@ -3476,6 +3872,98 @@ mod tests {
             }
         ));
 
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn substantive_progress_is_a_restart_barrier_for_same_gap_streak() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("goals.sqlite3");
+        let (handle, join) = GoalRuntimeHandle::spawn(GoalStore::open(&database_path).unwrap());
+        create(&handle, "progress-barrier-session");
+        handle
+            .begin_outer_turn(
+                "progress-barrier-session",
+                GoalTurnOrigin::User,
+                "provider-gap-before-progress",
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            handle
+                .finish_outer_turn_with_progress(
+                    "progress-barrier-session",
+                    GoalTurnStatus::Success,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    GoalUsage::default(),
+                    0,
+                    0,
+                    false,
+                    Some("gap:repeat".to_string()),
+                    2,
+                )
+                .unwrap(),
+            GoalNextAction::Continue { .. }
+        ));
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+        drop(handle);
+
+        let (handle, join) = GoalRuntimeHandle::spawn(GoalStore::open(&database_path).unwrap());
+        handle
+            .begin_outer_turn(
+                "progress-barrier-session",
+                GoalTurnOrigin::Continuation,
+                "provider-plan-only-progress",
+                3,
+            )
+            .unwrap();
+        assert!(matches!(
+            handle
+                .finish_outer_turn_with_progress(
+                    "progress-barrier-session",
+                    GoalTurnStatus::Success,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    GoalUsage::default(),
+                    0,
+                    0,
+                    true,
+                    None,
+                    4,
+                )
+                .unwrap(),
+            GoalNextAction::Continue { .. }
+        ));
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+        drop(handle);
+
+        let (handle, join) = GoalRuntimeHandle::spawn(GoalStore::open(&database_path).unwrap());
+        handle
+            .begin_outer_turn(
+                "progress-barrier-session",
+                GoalTurnOrigin::Continuation,
+                "provider-gap-after-progress",
+                5,
+            )
+            .unwrap();
+        assert!(matches!(
+            handle
+                .finish_outer_turn_with_progress(
+                    "progress-barrier-session",
+                    GoalTurnStatus::Success,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    GoalUsage::default(),
+                    0,
+                    0,
+                    false,
+                    Some("gap:repeat".to_string()),
+                    6,
+                )
+                .unwrap(),
+            GoalNextAction::Continue { .. }
+        ));
         handle.shutdown().unwrap();
         join.join().unwrap();
     }
