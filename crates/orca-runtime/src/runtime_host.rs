@@ -19564,6 +19564,20 @@ mod tests {
             ));
         }
         assert_eq!(goal_continuation_preflight(baseline), None);
+
+        // TurnEndReason classification is observability-only for now: a
+        // non-successful outer turn is still rejected regardless of why it
+        // ended. Admitting resumable reasons requires the progress watchdog to
+        // read real evidence first, otherwise a cost-exhausted goal would
+        // retry into the same wall.
+        assert!(matches!(
+            goal_continuation_preflight(GoalContinuationPreflight {
+                successful_turn: false,
+                ..baseline
+            }),
+            Some(GoalContinuationAdmission::Reject { code, .. })
+                if code == GoalContinuationRejectCode::NonSuccessfulTurn
+        ));
     }
 
     #[test]
