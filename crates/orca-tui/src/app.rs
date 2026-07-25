@@ -53,6 +53,7 @@ use crate::runtime_interaction_adapter::{
 use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::submitted_turn::SubmittedTurn;
+use crate::surface_actions::TuiSurfaceActions;
 use crate::terminal_lifecycle::TerminalCleanup;
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
@@ -374,7 +375,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                             mention_search.consume_catalog_dirty(generation, &mut state);
                         }
                         TuiEvent::MentionRuntimeReady(thread) => {
-                            mention_search.install_runtime_thread(thread);
+                            mention_search.install_runtime_actions(TuiSurfaceActions::new(thread));
                         }
                         TuiEvent::SettingsUpdated {
                             model,
@@ -4486,48 +4487,19 @@ fn update_goal_status_for_session(
     };
     match thread {
         Some(thread) => {
-            let runtime = match thread.typed_surface().goal() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                    return false;
-                }
-            };
+            let actions = TuiSurfaceActions::new(thread.typed_surface());
             update_goal_status_with(
                 status,
                 event_tx,
                 {
-                    let runtime = runtime.clone();
-                    move || {
-                        runtime
-                            .resume(
-                                session_id,
-                                orca_core::goal_runtime::GoalTurnOrigin::Resume,
-                                now_timestamp(),
-                            )
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    }
+                    let actions = actions.clone();
+                    move || actions.resume_goal(session_id, now_timestamp())
                 },
                 {
-                    let runtime = runtime.clone();
-                    move || {
-                        runtime
-                            .pause(
-                                session_id,
-                                orca_core::goal_runtime::GoalPauseReason::User,
-                                "paused by user",
-                                now_timestamp(),
-                            )
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    }
+                    let actions = actions.clone();
+                    move || actions.pause_goal(session_id, now_timestamp())
                 },
-                move || {
-                    runtime
-                        .project_thread_goal(session_id)
-                        .map_err(|error| error.to_string())
-                },
+                move || actions.goal(session_id),
             )
         }
         None => {
@@ -4815,10 +4787,8 @@ fn hosted_tui_controller_loop(
                     announce_runtime_ready(thread.as_ref().expect("remember thread"), &event_tx);
                 }
                 if let Some(runtime_thread) = thread.as_ref() {
-                    let typed_thread = runtime_thread.typed_surface();
-                    if let Err(error) =
-                        crate::surface_client::add_pinned_context(&typed_thread, &context)
-                    {
+                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                    if let Err(error) = actions.add_pinned_context(&context) {
                         let _ = event_tx.send(TuiEvent::Error(error.to_string()));
                     }
                 }
@@ -4842,7 +4812,9 @@ fn hosted_tui_controller_loop(
             Ok(UserAction::Backtrack) => {
                 let result = thread
                     .as_ref()
-                    .map(|runtime_thread| runtime_thread.typed_surface().backtrack_last_user())
+                    .map(|runtime_thread| {
+                        TuiSurfaceActions::new(runtime_thread.typed_surface()).backtrack_last_user()
+                    })
                     .transpose();
                 match result {
                     Ok(Some(Some(prompt))) => {
@@ -4930,41 +4902,15 @@ fn hosted_tui_controller_loop(
                     send_goal_history_error(&event_tx);
                     continue;
                 };
-                let runtime = match thread
-                    .as_ref()
-                    .and_then(|thread| thread.typed_surface().goal().ok())
-                {
-                    Some(runtime) => runtime,
-                    None => {
-                        let _ = event_tx.send(TuiEvent::Error(
-                            "failed to initialize runtime-owned goal actor".to_string(),
-                        ));
-                        continue;
-                    }
-                };
-                let result = match runtime.read(&session_id) {
-                    Ok(Some(_)) => runtime
-                        .edit(&session_id, objective.clone(), None, now_timestamp())
-                        .map_err(|error| error.to_string()),
-                    Ok(None) => runtime
-                        .create(orca_runtime::goal_store::CreateGoalInput {
-                            session_id: session_id.clone(),
-                            objective: objective.clone(),
-                            token_budget: None,
-                            now: now_timestamp(),
-                        })
-                        .map(Some)
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
-                };
+                let actions = TuiSurfaceActions::new(
+                    thread
+                        .as_ref()
+                        .expect("goal thread initialized")
+                        .typed_surface(),
+                );
+                let result = actions.set_goal(&session_id, objective.clone(), now_timestamp());
                 match result {
-                    Ok(Some(_)) | Ok(None) => {
-                        let goal = runtime.project_thread_goal(&session_id).ok().flatten();
-                        let Some(goal) = goal else {
-                            let _ = event_tx
-                                .send(TuiEvent::Error("no goal is currently set".to_string()));
-                            continue;
-                        };
+                    Ok(goal) => {
                         let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
                         let _ = event_tx.send(TuiEvent::Notice(
                             "Starting goal. Automatic continuation will keep running while it remains active."
@@ -4996,34 +4942,12 @@ fn hosted_tui_controller_loop(
                 ) else {
                     continue;
                 };
-                let runtime = match thread
-                    .as_ref()
-                    .and_then(|thread| thread.typed_surface().goal().ok())
-                {
-                    Some(runtime) => runtime,
-                    None => {
-                        let _ = event_tx.send(TuiEvent::Error(
-                            "failed to initialize runtime-owned goal actor".to_string(),
-                        ));
-                        continue;
-                    }
+                let Some(runtime_thread) = thread.as_ref() else {
+                    continue;
                 };
-                match runtime.edit(&session_id, objective, None, now_timestamp()) {
-                    Ok(Some(record)) => {
-                        let goal = runtime
-                            .project_thread_goal(&session_id)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| orca_core::goal_types::ThreadGoal {
-                                session_id: record.session_id.clone(),
-                                objective: record.objective.clone(),
-                                status: orca_core::goal_types::ThreadGoalStatus::Active,
-                                token_budget: record.token_budget,
-                                tokens_used: record.usage.charged_tokens(),
-                                time_used_seconds: record.usage.elapsed_seconds,
-                                created_at: 0,
-                                updated_at: now_timestamp(),
-                            });
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                match actions.edit_goal(&session_id, objective, now_timestamp()) {
+                    Ok(Some(goal)) => {
                         let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
                     }
                     Ok(None) => {
@@ -5045,19 +4969,11 @@ fn hosted_tui_controller_loop(
                 ) else {
                     continue;
                 };
-                let runtime = match thread
-                    .as_ref()
-                    .and_then(|thread| thread.typed_surface().goal().ok())
-                {
-                    Some(runtime) => runtime,
-                    None => {
-                        let _ = event_tx.send(TuiEvent::Error(
-                            "failed to initialize runtime-owned goal actor".to_string(),
-                        ));
-                        continue;
-                    }
+                let Some(runtime_thread) = thread.as_ref() else {
+                    continue;
                 };
-                match runtime.clear(&session_id) {
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                match actions.clear_goal(&session_id) {
                     Ok(()) => {
                         let _ = event_tx.send(TuiEvent::GoalCleared);
                     }
@@ -5103,10 +5019,12 @@ fn hosted_tui_controller_loop(
                     orca_core::goal_types::ThreadGoalStatus::Active,
                     &event_tx,
                 );
-                let goal = thread
-                    .as_ref()
-                    .and_then(|runtime_thread| runtime_thread.typed_surface().goal().ok())
-                    .and_then(|runtime| runtime.project_thread_goal(&session_id).ok().flatten());
+                let goal = thread.as_ref().and_then(|runtime_thread| {
+                    TuiSurfaceActions::new(runtime_thread.typed_surface())
+                        .goal(&session_id)
+                        .ok()
+                        .flatten()
+                });
                 if let (Some(runtime_thread), Some(goal)) = (thread.as_ref(), goal) {
                     let cfg = config.lock().unwrap().clone();
                     run_hosted_goal_run(
@@ -5171,11 +5089,9 @@ fn emit_typed_history_snapshot(
     mode: &HistoryMode,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
-    let typed_thread = thread.typed_surface();
-    let snapshot =
-        crate::surface_client::read_snapshot(&typed_thread).map_err(|error| error.to_string())?;
-    let history =
-        crate::surface_client::read_history(&typed_thread).map_err(|error| error.to_string())?;
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
+    let history = actions.read_history().map_err(|error| error.to_string())?;
     let messages = crate::surface_projection::history_messages_from_surface_history(&history);
     let plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
         None
@@ -5289,8 +5205,8 @@ fn handle_hosted_submitted_turn(
         .clone()
         .filter(|roots| !roots.is_empty())
         .unwrap_or_else(|| vec![cwd.clone()]);
-    let typed_thread = runtime_thread.typed_surface();
-    let prompt = match submitted_turn.prompt_for_model(&typed_thread, &cwd, &workspace_roots) {
+    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+    let prompt = match submitted_turn.prompt_for_model(&actions, &cwd, &workspace_roots) {
         Ok(prompt) => prompt,
         Err(error) => {
             send_submission_error(event_tx, rejection_prompt.as_deref(), error);
@@ -5437,14 +5353,8 @@ fn run_hosted_goal_run(
         send_goal_history_error(event_tx);
         return;
     };
-    let runtime = match thread.typed_surface().goal() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-            return;
-        }
-    };
-    let active_goal = match runtime.project_thread_goal(&session_id) {
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    let active_goal = match actions.goal(&session_id) {
         Ok(goal) => goal.filter(|goal| goal.status.should_continue()),
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(error.to_string()));
@@ -5473,8 +5383,7 @@ fn run_hosted_goal_run(
             }
             #[cfg(not(test))]
             {
-                let typed_thread = thread.typed_surface();
-                crate::run_surface(&typed_thread, request, config.clone(), controller, event_tx)
+                actions.run_turn(request, config.clone(), controller, event_tx)
             }
         }
         HostedOperationKind::ManualCompaction
@@ -5495,12 +5404,12 @@ fn run_hosted_goal_run(
             return;
         }
     };
-    match runtime.project_thread_goal(&session_id) {
+    match actions.goal(&session_id) {
         Ok(Some(goal)) => {
             let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
             let _ = event_tx.send(TuiEvent::GoalUpdated(goal.clone()));
             if status != "success" || !goal.status.should_continue() {
-                let notice = match runtime.read(&session_id) {
+                let notice = match actions.goal_record(&session_id) {
                     Ok(Some(record)) => match record.state {
                         orca_core::goal_runtime::GoalState::Paused {
                             reason: orca_core::goal_runtime::GoalPauseReason::NoProgress,
@@ -5592,11 +5501,7 @@ fn show_hosted_goal(
         return;
     };
     let result = match thread.as_ref() {
-        Some(thread) => thread
-            .typed_surface()
-            .goal()
-            .and_then(|runtime| runtime.project_thread_goal(&session_id))
-            .map_err(|error| error.to_string()),
+        Some(thread) => TuiSurfaceActions::new(thread.typed_surface()).goal(&session_id),
         None => {
             let (runtime, join) = match orca_runtime::goal_actor::GoalRuntimeHandle::open_default()
             {
@@ -5695,11 +5600,10 @@ fn resume_latest_active_goal_hosted(
     };
     let active_goal =
         match goal_runtime.resume_into(&goal.session_id, &new_session_id, now_timestamp()) {
-            Ok(Some(_)) => match resumed
-                .typed_surface()
-                .goal()
+            Ok(Some(_)) => match TuiSurfaceActions::new(resumed.typed_surface())
+                .goal(&new_session_id)
                 .ok()
-                .and_then(|runtime| runtime.project_thread_goal(&new_session_id).ok().flatten())
+                .flatten()
             {
                 Some(goal) => goal,
                 None => {
@@ -5879,8 +5783,8 @@ fn apply_hosted_settings_action(
             Ok(patches) => patches,
             Err(_) => return,
         };
-        let typed_thread = thread.typed_surface();
-        let settings = match crate::surface_client::update_settings(&typed_thread, patches) {
+        let actions = TuiSurfaceActions::new(thread.typed_surface());
+        let settings = match actions.update_settings(patches) {
             Ok(settings) => settings,
             Err(error) => {
                 let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));

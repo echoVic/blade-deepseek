@@ -4,6 +4,9 @@ const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
 const TYPES: &str = include_str!("types.rs");
+const APP: &str = include_str!("app.rs");
+const SUBMITTED_TURN: &str = include_str!("submitted_turn.rs");
+const MENTION_SEARCH_MANAGER: &str = include_str!("mention_search_manager.rs");
 
 const CURRENT_ACTIONS: [(&str, &str); 21] = [
     ("Submit", "runtime_mutation"),
@@ -458,4 +461,38 @@ fn mutation_capable_entrypoints_have_a_closed_baseline_route() {
             assert!(!row[7].as_str().expect("Phase 3 disposition").is_empty());
         }
     }
+}
+
+#[test]
+fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
+    let action_source = include_str!("surface_actions.rs");
+
+    for method in [
+        "run_turn",
+        "update_settings",
+        "read_snapshot",
+        "read_history",
+        "add_pinned_context",
+        "expand_mentions",
+        "discover_mention_catalog",
+        "backtrack_last_user",
+        "goal",
+    ] {
+        assert!(
+            action_source.contains(&format!("fn {method}")),
+            "surface action facade is missing {method}"
+        );
+    }
+    assert!(
+        APP.contains("TuiSurfaceActions::new"),
+        "app must construct the closed TUI action facade"
+    );
+    assert!(
+        !SUBMITTED_TURN.contains("RuntimeSurfaceThreadHandle"),
+        "submitted turns must not call the runtime thread facade directly"
+    );
+    assert!(
+        !MENTION_SEARCH_MANAGER.contains("RuntimeSurfaceThreadHandle"),
+        "mention discovery must use the TUI action facade"
+    );
 }

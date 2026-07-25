@@ -1,6 +1,6 @@
 use orca_runtime::mentions;
-use orca_runtime::surface::RuntimeSurfaceThreadHandle;
 
+use crate::surface_actions::TuiSurfaceActions;
 use crate::types::PendingWorkflowNotification;
 
 enum SubmittedTurnKind {
@@ -87,13 +87,13 @@ impl SubmittedTurn {
 
     pub(crate) fn prompt_for_model(
         &self,
-        runtime_thread: &RuntimeSurfaceThreadHandle,
+        actions: &TuiSurfaceActions,
         cwd: &std::path::Path,
         workspace_roots: &[std::path::PathBuf],
     ) -> Result<String, String> {
         match &self.kind {
             SubmittedTurnKind::User { prompt, bindings } => {
-                runtime_thread.expand_mentions(prompt, bindings, cwd, workspace_roots)
+                actions.expand_mentions(prompt, bindings, cwd, workspace_roots)
             }
             SubmittedTurnKind::WorkflowNotification(notification) => {
                 Ok(notification.prompt.clone())

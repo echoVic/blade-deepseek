@@ -8,8 +8,8 @@ use orca_file_search::{
 };
 use orca_runtime::mentions::{self, MentionToken};
 use orca_runtime::mentions::{MentionCandidate, MentionCatalog};
-use orca_runtime::surface::RuntimeSurfaceThreadHandle;
 
+use crate::surface_actions::TuiSurfaceActions;
 use crate::types::{AppState, AppStatus, TuiEvent};
 
 const WARM_IDLE: Duration = Duration::from_secs(30);
@@ -38,7 +38,7 @@ impl From<&MentionToken> for TokenIdentity {
 pub(crate) struct MentionSearchManager {
     roots: Vec<PathBuf>,
     catalog: MentionCatalog,
-    catalog_thread: Option<RuntimeSurfaceThreadHandle>,
+    catalog_actions: Option<TuiSurfaceActions>,
     #[cfg(test)]
     catalog_registry: Option<orca_mcp::McpRegistry>,
     catalog_generation: u64,
@@ -81,7 +81,7 @@ impl MentionSearchManager {
         Self {
             roots: normalize_roots(roots),
             catalog,
-            catalog_thread: None,
+            catalog_actions: None,
             #[cfg(test)]
             catalog_registry: _catalog_registry,
             catalog_generation: 0,
@@ -122,8 +122,8 @@ impl MentionSearchManager {
         self.begin_stop();
     }
 
-    pub(crate) fn install_runtime_thread(&mut self, thread: RuntimeSurfaceThreadHandle) {
-        self.catalog_thread = Some(thread);
+    pub(crate) fn install_runtime_actions(&mut self, actions: TuiSurfaceActions) {
+        self.catalog_actions = Some(actions);
         self.refresh_catalog_async();
     }
 
@@ -311,7 +311,7 @@ impl MentionSearchManager {
 
     fn refresh_catalog_async(&mut self) {
         #[cfg(not(test))]
-        let Some(thread) = self.catalog_thread.clone() else {
+        let Some(actions) = self.catalog_actions.clone() else {
             return;
         };
         #[cfg(test)]
@@ -325,7 +325,7 @@ impl MentionSearchManager {
             .name("orca-mention-catalog".to_string())
             .spawn(move || {
                 #[cfg(not(test))]
-                let catalog = thread.discover_mention_catalog(&roots);
+                let catalog = actions.discover_mention_catalog(&roots);
                 #[cfg(test)]
                 let Some(registry) = registry else {
                     return;
