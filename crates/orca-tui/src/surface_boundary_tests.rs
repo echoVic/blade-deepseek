@@ -482,6 +482,7 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         "stop_task",
         "foreground_task",
         "resolve_background_approval",
+        "launch_workflow",
     ] {
         assert!(
             action_source.contains(&format!("fn {method}")),

@@ -4749,6 +4749,7 @@ fn hosted_tui_controller_loop(
                     announce_runtime_ready(thread.as_ref().expect("workflow thread"), &event_tx);
                 }
                 if let Some(runtime_thread) = thread.as_ref() {
+                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                     let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
                     let _ = observer.finish_foreground();
                     let mut request = HostedWorkflowRequest::new(name).with_config(cfg.clone());
@@ -4762,9 +4763,9 @@ fn hosted_tui_controller_loop(
                         };
                     }
                     if let Err(error) =
-                        runtime_thread.launch_workflow(request.with_event_observer(observer))
+                        actions.launch_workflow(request.with_event_observer(observer))
                     {
-                        let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                        let _ = event_tx.send(TuiEvent::Error(error));
                         continue;
                     }
                 }

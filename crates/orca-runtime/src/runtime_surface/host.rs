@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::goal_actor::GoalRuntimeHandle;
 use crate::goal_store::CreateGoalInput;
 use crate::runtime_host::{
-    RuntimeHost, RuntimeHostError, RuntimeHostHandle, RuntimeThreadHandle,
+    HostedWorkflowRequest, RuntimeHost, RuntimeHostError, RuntimeHostHandle, RuntimeThreadHandle,
     RuntimeThreadStartRequest,
 };
 use orca_core::config::RunConfig;
@@ -227,6 +227,10 @@ impl RuntimeSurfaceThreadHandle {
             registry.finish_denied_pending_tool_approval(&task_id)?;
         }
         Ok((task_id, registry.list()))
+    }
+
+    pub fn launch_workflow(&self, request: HostedWorkflowRequest) -> Result<(), RuntimeHostError> {
+        self.runtime.launch_workflow(request).map(|_| ())
     }
 
     pub(crate) fn legacy(&self) -> RuntimeThreadHandle {

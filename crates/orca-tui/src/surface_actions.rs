@@ -7,7 +7,7 @@ use orca_core::goal_runtime::{GoalPauseReason, GoalRecord, GoalTurnOrigin};
 use orca_core::goal_types::ThreadGoal;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
-use orca_runtime::runtime_host::HostedTurnRequest;
+use orca_runtime::runtime_host::{HostedTurnRequest, HostedWorkflowRequest};
 use orca_runtime::surface::{
     NonEmptyVec, RuntimeSettingsPatch, RuntimeSurfaceThreadHandle, SurfaceHistoryMessage,
     SurfaceSettingsSnapshot, SurfaceSnapshot,
@@ -184,5 +184,11 @@ impl TuiSurfaceActions {
     ) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
         self.thread
             .resolve_background_approval(approval_id, approved)
+    }
+
+    pub(crate) fn launch_workflow(&self, request: HostedWorkflowRequest) -> Result<(), String> {
+        self.thread
+            .launch_workflow(request)
+            .map_err(|error| error.to_string())
     }
 }
