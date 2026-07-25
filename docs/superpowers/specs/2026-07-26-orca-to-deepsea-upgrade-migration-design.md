@@ -17,8 +17,8 @@ An existing Orca installation must provide one guided upgrade flow that:
 4. hands migration authority to DeepSea;
 5. inventories and copies compatible user and current-project state;
 6. validates the migrated state;
-7. launches DeepSea; and
-8. offers, but never requires, removal of the old Orca package.
+7. activates `orca` as a compatibility command that launches DeepSea; and
+8. launches DeepSea.
 
 The migration must be resumable, idempotent, inspectable, and reversible.
 
@@ -27,7 +27,8 @@ The migration must be resumable, idempotent, inspectable, and reversible.
 | Surface | Legacy | New |
 | --- | --- | --- |
 | Product | Orca | DeepSea Code |
-| CLI | `orca` | `deepsea` |
+| Primary CLI | `orca` | `deepsea` |
+| Compatibility CLI | n/a | `orca` forwards to `deepsea` after migration |
 | npm package | `@blade-ai/orca` | `@blade-ai/deepsea` |
 | User home | `~/.orca` / `ORCA_HOME` | `~/.deepsea` / `DEEPSEA_HOME` |
 | Project directory | `.orca/` | `.deepsea/` |
@@ -50,7 +51,9 @@ The old Orca binary owns only:
 - detecting the current installation method;
 - installing the corresponding DeepSea package or binary;
 - verifying that the installed DeepSea executable starts; and
-- launching DeepSea with a short-lived migration handoff.
+- launching DeepSea with a short-lived migration handoff; and
+- activating its own compatibility redirect only after DeepSea reports a
+  validated migration.
 
 The new DeepSea binary exclusively owns:
 
@@ -64,6 +67,58 @@ The new DeepSea binary exclusively owns:
 
 Orca must not write `~/.deepsea` or `.deepsea/`. DeepSea must not require Orca
 to understand the new storage format.
+
+## Legacy Command Compatibility
+
+After a validated migration, the command:
+
+```bash
+orca
+```
+
+must open DeepSea. The compatibility applies to the full command surface, not
+only an argument-free launch:
+
+```bash
+orca exec "fix the failing test"
+orca history list
+orca --mode=acp
+```
+
+Each invocation forwards to the equivalent `deepsea` invocation.
+
+The compatibility command is a launcher, not a second product runtime. It must:
+
+- preserve every argument byte and argument boundary;
+- preserve stdin, stdout, stderr, terminal/PTY attachment, working directory,
+  and environment except for documented legacy-to-new environment mapping;
+- deliver interrupts and termination signals to DeepSea;
+- return DeepSea's exit code;
+- avoid printing a rename notice during normal interactive use;
+- emit at most one concise deprecation notice in appropriate non-interactive
+  contexts, controlled by a persisted user preference; and
+- fail with an exact reinstall/repair command if DeepSea cannot be resolved.
+
+The redirect is activated only after DeepSea returns a versioned,
+handoff-nonce-bound migration-success result to the waiting Orca process. Orca
+then records a compatibility receipt in its update state. Before that receipt
+exists, `orca` continues to run Orca so a failed or cancelled migration cannot
+strand the user.
+
+For npm installations, `@blade-ai/orca` remains installed as the owner of the
+`orca` executable and transitions to a lightweight compatibility launcher.
+It resolves the installed `@blade-ai/deepsea` launcher without depending on an
+untrusted working-directory executable.
+
+For direct installations, the exact old `orca` path becomes a small launcher
+for the verified sibling DeepSea installation. It must not be a shell alias,
+because aliases do not cover scripts, subprocesses, ACP clients, or other
+non-interactive callers.
+
+The compatibility launcher is supported for the migration compatibility
+window and must not be removed by the guided migration. Removing it is a
+separate advanced action that clearly states that the `orca` command will stop
+working.
 
 ## Upgrade Entry
 
@@ -137,6 +192,11 @@ DeepSea is launched as:
 deepsea migrate-from-orca --handoff <path>
 ```
 
+Orca waits for the migration process. Only a protocol-level validated-success
+result activates the legacy-command compatibility receipt. Cancellation,
+partial success, a generic zero exit status without the success result, or any
+validation error leaves Orca behavior unchanged.
+
 ## Migration Inventory
 
 DeepSea inventories the resolved Orca home. It must respect an explicit
@@ -203,8 +263,10 @@ goals, trust, or permission state conflicts.
 
 ## Transaction and Recovery
 
-Migration is copy-based. The source Orca home and project directory are never
-deleted or modified.
+Migration is copy-based. Orca user content and the project `.orca/` directory
+are never deleted or modified. After validated success, the waiting Orca
+process may update only its existing update-state file with the compatibility
+receipt; this receipt is not user content and contains no migrated data.
 
 DeepSea writes a migration journal under its home. Each item progresses through
 explicit states:
@@ -262,15 +324,22 @@ Migration complete
 
 Run: deepsea
 
-Orca remains installed and its data was not modified.
+The orca command now opens DeepSea.
+Orca user data was not modified.
 
-[Launch DeepSea] [Uninstall Orca] [View migration report]
+[Launch DeepSea] [View migration report]
 ```
 
-Uninstallation is a separate, explicit action:
+The guided migration does not uninstall `@blade-ai/orca` or remove the direct
+`orca` launcher, because that would violate the command-compatibility
+contract.
 
-- npm installations may remove `@blade-ai/orca`;
-- direct installations may remove only the exact resolved Orca executable;
+Removing legacy components is a separate, explicit advanced action:
+
+- npm installations may remove `@blade-ai/orca` only after warning that the
+  `orca` command will no longer work;
+- direct installations may remove only the exact compatibility launcher after
+  the same warning;
 - neither path deletes `~/.orca` or project `.orca/` data; and
 - data deletion, if ever supported, requires a separate command and explicit
   target confirmation.
@@ -280,6 +349,12 @@ Uninstallation is a separate, explicit action:
 - **Network or package failure:** keep Orca running and provide the exact retry
   command.
 - **DeepSea probe failure:** do not launch migration or uninstall Orca.
+- **Compatibility activation failure:** report migration success separately,
+  keep the existing Orca command functional, and provide an idempotent
+  `deepsea migrate repair-alias` command.
+- **DeepSea missing after migration:** the `orca` launcher fails safely with
+  the exact `@blade-ai/deepsea` reinstall command; it never falls back to an
+  unrelated executable from the current directory.
 - **Permission failure:** identify the exact destination and leave both
   installations unchanged.
 - **Existing DeepSea state:** enter conflict planning; never overwrite.
@@ -309,12 +384,16 @@ Uninstallation is a separate, explicit action:
 1. Publish and verify all DeepSea platform packages and the main npm package.
 2. Publish a final Orca transition release containing the migration-aware
    update prompt and installer handoff.
-3. Keep ordinary Orca execution available during the transition window.
-4. Stop feature releases under Orca after the transition release; allow
+3. After validated migration, retain `@blade-ai/orca` as the compatibility
+   launcher package for the `orca` command.
+4. Keep ordinary Orca execution available before migration and after failed or
+   cancelled migration.
+5. Stop feature releases under Orca after the transition release; allow
    security fixes when required.
-5. Deprecate `@blade-ai/orca` only after the DeepSea install and migration path
-   has been verified against published artifacts.
-6. Keep `orcaagent.dev` as a migration explanation and eventual permanent
+6. Mark `@blade-ai/orca` as a compatibility package only after the DeepSea
+   install, redirect, and rollback paths have been verified against published
+   artifacts.
+7. Keep `orcaagent.dev` as a migration explanation and eventual permanent
    redirect surface.
 
 ## Verification Matrix
@@ -334,9 +413,15 @@ Automated coverage must include:
 - current project with clean, dirty, and pre-existing `.deepsea/` state;
 - non-interactive invocation;
 - install, probe, and permission failures;
-- uninstall refusal and uninstall success; and
+- `orca` forwarding with no arguments and every supported command mode;
+- argument, stdio, PTY, working-directory, signal, and exit-code preservation;
+- compatibility activation only after protocol-level migration success;
+- missing/tampered DeepSea executable and alias repair;
+- custom `ORCA_HOME` and `DEEPSEA_HOME` compatibility routing;
+- explicit compatibility-launcher removal and warning; and
 - published-package smoke tests that prove `deepsea --version`, history resume,
-  Goal restoration, and Orca rollback all work with real artifacts.
+  Goal restoration, `orca` forwarding, and Orca rollback all work with real
+  artifacts.
 
 ## Non-Goals
 
