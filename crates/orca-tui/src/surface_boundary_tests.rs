@@ -518,4 +518,8 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
             && !SESSION_PICKER_ACTIONS.contains("history::load_session"),
         "session history reads must cross the runtime surface history boundary"
     );
+    assert!(
+        !APP.contains("GoalRuntimeHandle::open_default"),
+        "saved Goal actor ownership must remain behind the runtime surface host"
+    );
 }

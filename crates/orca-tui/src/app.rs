@@ -4566,53 +4566,24 @@ fn update_goal_status_for_session(
             )
         }
         None => {
-            let (runtime, join) = match orca_runtime::goal_actor::GoalRuntimeHandle::open_default()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                    return false;
-                }
-            };
-            let project_runtime = runtime.clone();
             let updated = update_goal_status_with(
                 status,
                 event_tx,
-                {
-                    let runtime = runtime.clone();
-                    move || {
-                        runtime
-                            .resume(
-                                session_id,
-                                orca_core::goal_runtime::GoalTurnOrigin::Resume,
-                                now_timestamp(),
-                            )
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    }
-                },
-                {
-                    let runtime = runtime.clone();
-                    move || {
-                        runtime
-                            .pause(
-                                session_id,
-                                orca_core::goal_runtime::GoalPauseReason::User,
-                                "paused by user",
-                                now_timestamp(),
-                            )
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    }
+                move || {
+                    RuntimeSurfaceHostHandle::resume_saved_goal(session_id, now_timestamp())
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
                 },
                 move || {
-                    project_runtime
-                        .project_thread_goal(session_id)
+                    RuntimeSurfaceHostHandle::pause_saved_goal(session_id, now_timestamp())
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+                move || {
+                    RuntimeSurfaceHostHandle::project_saved_goal(session_id)
                         .map_err(|error| error.to_string())
                 },
             );
-            drop(runtime);
-            let _ = join.join();
             updated
         }
     }
@@ -5593,22 +5564,8 @@ fn show_hosted_goal(
     };
     let result = match thread.as_ref() {
         Some(thread) => TuiSurfaceActions::new(thread.typed_surface()).goal(&session_id),
-        None => {
-            let (runtime, join) = match orca_runtime::goal_actor::GoalRuntimeHandle::open_default()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
-                    return;
-                }
-            };
-            let result = runtime
-                .project_thread_goal(&session_id)
-                .map_err(|error| error.to_string());
-            drop(runtime);
-            let _ = join.join();
-            result
-        }
+        None => RuntimeSurfaceHostHandle::project_saved_goal(&session_id)
+            .map_err(|error| error.to_string()),
     };
     match result {
         Ok(goal) => {
@@ -5641,15 +5598,7 @@ fn resume_latest_active_goal_hosted(
         send_goal_history_error(event_tx);
         return;
     }
-    let (goal_runtime, _goal_actor_join) =
-        match orca_runtime::goal_actor::GoalRuntimeHandle::open_default() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!("failed to read goals: {error}")));
-                return;
-            }
-        };
-    let goal = match goal_runtime.latest_active() {
+    let goal = match RuntimeSurfaceHostHandle::latest_active_saved_goal() {
         Ok(Some(goal)) => goal,
         Ok(None) => {
             let _ = event_tx.send(TuiEvent::GoalStatus(None));
@@ -5689,37 +5638,37 @@ fn resume_latest_active_goal_hosted(
         let _ = resumed.shutdown();
         return;
     };
-    let active_goal =
-        match goal_runtime.resume_into(&goal.session_id, &new_session_id, now_timestamp()) {
-            Ok(Some(_)) => match TuiSurfaceActions::new(resumed.typed_surface())
-                .goal(&new_session_id)
-                .ok()
-                .flatten()
-            {
-                Some(goal) => goal,
-                None => {
-                    let _ = event_tx.send(TuiEvent::Error(
-                        "goal disappeared while projecting the resumed session".to_string(),
-                    ));
-                    let _ = resumed.shutdown();
-                    return;
-                }
-            },
-            Ok(None) => {
+    let resumed_actions = TuiSurfaceActions::new(resumed.typed_surface());
+    let active_goal = match resumed_actions.resume_goal_into(
+        &goal.session_id,
+        &new_session_id,
+        now_timestamp(),
+    ) {
+        Ok(Some(_)) => match resumed_actions.goal(&new_session_id).ok().flatten() {
+            Some(goal) => goal,
+            None => {
                 let _ = event_tx.send(TuiEvent::Error(
-                    "goal disappeared while restoring its session".to_string(),
+                    "goal disappeared while projecting the resumed session".to_string(),
                 ));
                 let _ = resumed.shutdown();
                 return;
             }
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(format!(
-                    "failed to resume goal in restored session: {error}"
-                )));
-                let _ = resumed.shutdown();
-                return;
-            }
-        };
+        },
+        Ok(None) => {
+            let _ = event_tx.send(TuiEvent::Error(
+                "goal disappeared while restoring its session".to_string(),
+            ));
+            let _ = resumed.shutdown();
+            return;
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to resume goal in restored session: {error}"
+            )));
+            let _ = resumed.shutdown();
+            return;
+        }
+    };
     if let Some(previous) = thread.take() {
         let _ = previous.shutdown();
     }

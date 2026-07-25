@@ -102,6 +102,17 @@ impl RuntimeSurfaceGoalHandle {
             .resume(session_id, origin, at)
             .map_err(Self::map_error)
     }
+
+    pub fn resume_into(
+        &self,
+        source_session_id: &str,
+        resumed_session_id: &str,
+        at: i64,
+    ) -> Result<Option<GoalRecord>, RuntimeHostError> {
+        self.runtime
+            .resume_into(source_session_id, resumed_session_id, at)
+            .map_err(Self::map_error)
+    }
 }
 
 impl RuntimeSurfaceHostHandle {
@@ -117,6 +128,27 @@ impl RuntimeSurfaceHostHandle {
         selector: &str,
     ) -> std::io::Result<crate::history::SessionTranscript> {
         crate::history::load_session(selector)
+    }
+
+    pub fn project_saved_goal(session_id: &str) -> Result<Option<ThreadGoal>, RuntimeHostError> {
+        with_saved_goal_runtime(|runtime| runtime.project_thread_goal(session_id))
+    }
+
+    pub fn latest_active_saved_goal() -> Result<Option<ThreadGoal>, RuntimeHostError> {
+        with_saved_goal_runtime(GoalRuntimeHandle::latest_active)
+    }
+
+    pub fn pause_saved_goal(session_id: &str, at: i64) -> Result<GoalNextAction, RuntimeHostError> {
+        with_saved_goal_runtime(|runtime| {
+            runtime.pause(session_id, GoalPauseReason::User, "paused by user", at)
+        })
+    }
+
+    pub fn resume_saved_goal(
+        session_id: &str,
+        at: i64,
+    ) -> Result<GoalNextAction, RuntimeHostError> {
+        with_saved_goal_runtime(|runtime| runtime.resume(session_id, GoalTurnOrigin::Resume, at))
     }
 
     pub fn start_thread(
@@ -137,6 +169,21 @@ impl RuntimeSurfaceHostHandle {
             .start_thread_with_request(request)
             .map(RuntimeSurfaceThreadHandle::from_runtime)
     }
+}
+
+fn with_saved_goal_runtime<T>(
+    run: impl FnOnce(&GoalRuntimeHandle) -> Result<T, crate::goal_actor::GoalActorError>,
+) -> Result<T, RuntimeHostError> {
+    let (runtime, join) =
+        GoalRuntimeHandle::open_default().map_err(RuntimeSurfaceGoalHandle::map_error)?;
+    let result = run(&runtime).map_err(RuntimeSurfaceGoalHandle::map_error);
+    drop(runtime);
+    if join.join().is_err() {
+        return Err(RuntimeHostError::GoalControlFailed {
+            message: "saved Goal actor panicked during shutdown".to_string(),
+        });
+    }
+    result
 }
 
 impl RuntimeSurfaceThreadHandle {

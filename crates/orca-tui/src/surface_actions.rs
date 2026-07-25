@@ -162,6 +162,18 @@ impl TuiSurfaceActions {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn resume_goal_into(
+        &self,
+        source_session_id: &str,
+        resumed_session_id: &str,
+        at: i64,
+    ) -> Result<Option<GoalRecord>, String> {
+        self.thread
+            .goal()
+            .and_then(|goal| goal.resume_into(source_session_id, resumed_session_id, at))
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {
         self.thread.task_summaries()
     }
