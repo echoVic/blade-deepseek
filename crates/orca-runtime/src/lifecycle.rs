@@ -389,11 +389,13 @@ impl<'a> RuntimeTaskActor<'a> {
             if cancel.is_some_and(CancelToken::is_cancelled) {
                 RuntimeTurnStartError {
                     status: RunStatus::Cancelled,
+                    reason: TurnEndReason::Cancelled,
                     message: "turn cancelled".to_string(),
                 }
             } else {
                 RuntimeTurnStartError {
                     status: RunStatus::Failed,
+                    reason: TurnEndReason::Unclassified,
                     message: format!("pre_model_call hook failed: {error}"),
                 }
             }
@@ -1603,6 +1605,7 @@ mod tests {
         let failed = RuntimeTurnStartResultStep::new().fold(RuntimeTurnStartStepOutput {
             error: Some(RuntimeTurnStartError {
                 status: RunStatus::Failed,
+                reason: TurnEndReason::Unclassified,
                 message: "max turns exceeded".to_string(),
             }),
         });

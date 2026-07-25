@@ -30,7 +30,7 @@ use crate::hooks::{HookRunner, conversation_with_hook_context};
 #[cfg(test)]
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnStartError,
+    AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnStartError, TurnEndReason,
 };
 use crate::memory;
 #[cfg(test)]
@@ -241,6 +241,7 @@ impl RuntimeProviderErrorStep {
                 Ok(RuntimeProviderErrorStepOutcome::Failed(
                     RuntimeTurnStartError {
                         status: RunStatus::Failed,
+                        reason: TurnEndReason::Unclassified,
                         message,
                     },
                 ))
@@ -382,6 +383,7 @@ impl RuntimeProviderTurnStep {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
                         status: RunStatus::Failed,
+                        reason: TurnEndReason::Unclassified,
                         message: "provider stream disconnected before completion".to_string(),
                     }));
                 }
@@ -736,6 +738,7 @@ fn cancelled_provider_turn<W: io::Write>(
 ) -> io::Result<RuntimeProviderTurnOutput> {
     Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
         status: RunStatus::Cancelled,
+        reason: TurnEndReason::Cancelled,
         message: "turn cancelled".to_string(),
     }))
 }
@@ -1199,6 +1202,7 @@ mod tests {
         let failed = RuntimeProviderErrorResultStep::new().fold(
             RuntimeProviderErrorStepOutcome::Failed(RuntimeTurnStartError {
                 status: RunStatus::Failed,
+                reason: TurnEndReason::Unclassified,
                 message: "provider failed".to_string(),
             }),
         );
@@ -1523,6 +1527,7 @@ mod tests {
     fn provider_turn_output_preserves_terminal_error() {
         let output = RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
             status: RunStatus::Cancelled,
+            reason: TurnEndReason::Cancelled,
             message: "turn cancelled".to_string(),
         });
 
@@ -1539,6 +1544,7 @@ mod tests {
     fn provider_turn_result_step_suppresses_cancelled_error_event() {
         let output = RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
             status: RunStatus::Cancelled,
+            reason: TurnEndReason::Cancelled,
             message: "turn cancelled".to_string(),
         });
         let mut events = EventFactory::new("provider-turn-result".to_string());
@@ -1590,6 +1596,7 @@ mod tests {
         let failed = RuntimeProviderTurnResultResultStep::new().fold(
             RuntimeProviderTurnResultOutcome::Failed(RuntimeTurnStartError {
                 status: RunStatus::Failed,
+                reason: TurnEndReason::Unclassified,
                 message: "provider failed".to_string(),
             }),
         );
