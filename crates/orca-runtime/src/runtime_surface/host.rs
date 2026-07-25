@@ -29,89 +29,9 @@ impl fmt::Debug for RuntimeSurfaceThreadHandle {
     }
 }
 
-/// A thread-scoped Goal control facade. The actor handle remains private to
-/// `orca-runtime`; clients receive domain values and runtime-owned errors only.
-#[derive(Clone)]
-pub struct RuntimeSurfaceGoalHandle {
-    runtime: GoalRuntimeHandle,
-}
-
-impl RuntimeSurfaceGoalHandle {
-    fn map_error(error: crate::goal_actor::GoalActorError) -> RuntimeHostError {
-        RuntimeHostError::GoalControlFailed {
-            message: error.to_string(),
-        }
-    }
-
-    pub fn read(&self, session_id: &str) -> Result<Option<GoalRecord>, RuntimeHostError> {
-        self.runtime.read(session_id).map_err(Self::map_error)
-    }
-
-    pub fn project_thread_goal(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<ThreadGoal>, RuntimeHostError> {
-        self.runtime
-            .project_thread_goal(session_id)
-            .map_err(Self::map_error)
-    }
-
-    pub fn create(&self, input: CreateGoalInput) -> Result<GoalRecord, RuntimeHostError> {
-        self.runtime.create(input).map_err(Self::map_error)
-    }
-
-    pub fn edit(
-        &self,
-        session_id: &str,
-        objective: impl Into<String>,
-        token_budget: Option<i64>,
-        at: i64,
-    ) -> Result<Option<GoalRecord>, RuntimeHostError> {
-        self.runtime
-            .edit(session_id, objective, token_budget, at)
-            .map_err(Self::map_error)
-    }
-
-    pub fn clear(&self, session_id: &str) -> Result<(), RuntimeHostError> {
-        self.runtime.clear(session_id).map_err(Self::map_error)
-    }
-
-    pub fn latest_active(&self) -> Result<Option<ThreadGoal>, RuntimeHostError> {
-        self.runtime.latest_active().map_err(Self::map_error)
-    }
-
-    pub fn pause(
-        &self,
-        session_id: &str,
-        reason: GoalPauseReason,
-        message: impl Into<String>,
-        at: i64,
-    ) -> Result<GoalNextAction, RuntimeHostError> {
-        self.runtime
-            .pause(session_id, reason, message, at)
-            .map_err(Self::map_error)
-    }
-
-    pub fn resume(
-        &self,
-        session_id: &str,
-        origin: GoalTurnOrigin,
-        at: i64,
-    ) -> Result<GoalNextAction, RuntimeHostError> {
-        self.runtime
-            .resume(session_id, origin, at)
-            .map_err(Self::map_error)
-    }
-
-    pub fn resume_into(
-        &self,
-        source_session_id: &str,
-        resumed_session_id: &str,
-        at: i64,
-    ) -> Result<Option<GoalRecord>, RuntimeHostError> {
-        self.runtime
-            .resume_into(source_session_id, resumed_session_id, at)
-            .map_err(Self::map_error)
+fn map_goal_error(error: crate::goal_actor::GoalActorError) -> RuntimeHostError {
+    RuntimeHostError::GoalControlFailed {
+        message: error.to_string(),
     }
 }
 
@@ -191,9 +111,8 @@ impl RuntimeSurfaceHostHandle {
 fn with_saved_goal_runtime<T>(
     run: impl FnOnce(&GoalRuntimeHandle) -> Result<T, crate::goal_actor::GoalActorError>,
 ) -> Result<T, RuntimeHostError> {
-    let (runtime, join) =
-        GoalRuntimeHandle::open_default().map_err(RuntimeSurfaceGoalHandle::map_error)?;
-    let result = run(&runtime).map_err(RuntimeSurfaceGoalHandle::map_error);
+    let (runtime, join) = GoalRuntimeHandle::open_default().map_err(map_goal_error)?;
+    let result = run(&runtime).map_err(map_goal_error);
     drop(runtime);
     if join.join().is_err() {
         return Err(RuntimeHostError::GoalControlFailed {
@@ -252,10 +171,88 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.backtrack_last_user()
     }
 
-    pub fn goal(&self) -> Result<RuntimeSurfaceGoalHandle, RuntimeHostError> {
-        self.runtime
-            .goal_runtime()
-            .map(|runtime| RuntimeSurfaceGoalHandle { runtime })
+    fn with_goal<T>(
+        &self,
+        run: impl FnOnce(&GoalRuntimeHandle) -> Result<T, crate::goal_actor::GoalActorError>,
+    ) -> Result<T, RuntimeHostError> {
+        let runtime = self.runtime.goal_runtime()?;
+        run(&runtime).map_err(map_goal_error)
+    }
+
+    pub fn project_goal(&self, session_id: &str) -> Result<Option<ThreadGoal>, RuntimeHostError> {
+        self.with_goal(|runtime| runtime.project_thread_goal(session_id))
+    }
+
+    pub fn read_goal(&self, session_id: &str) -> Result<Option<GoalRecord>, RuntimeHostError> {
+        self.with_goal(|runtime| runtime.read(session_id))
+    }
+
+    pub fn set_goal(
+        &self,
+        session_id: &str,
+        objective: String,
+        at: i64,
+    ) -> Result<ThreadGoal, RuntimeHostError> {
+        self.with_goal(|runtime| {
+            if runtime.read(session_id)?.is_some() {
+                runtime.edit(session_id, objective, None, at)?;
+            } else {
+                runtime.create(CreateGoalInput {
+                    session_id: session_id.to_string(),
+                    objective,
+                    token_budget: None,
+                    now: at,
+                })?;
+            }
+            runtime.project_thread_goal(session_id)?.ok_or_else(|| {
+                crate::goal_actor::GoalActorError::Invalid(
+                    "goal disappeared after committed update".to_string(),
+                )
+            })
+        })
+    }
+
+    pub fn edit_goal(
+        &self,
+        session_id: &str,
+        objective: String,
+        at: i64,
+    ) -> Result<Option<ThreadGoal>, RuntimeHostError> {
+        self.with_goal(|runtime| {
+            if runtime.edit(session_id, objective, None, at)?.is_none() {
+                return Ok(None);
+            }
+            runtime.project_thread_goal(session_id)
+        })
+    }
+
+    pub fn clear_goal(&self, session_id: &str) -> Result<(), RuntimeHostError> {
+        self.with_goal(|runtime| runtime.clear(session_id))
+    }
+
+    pub fn pause_goal(&self, session_id: &str, at: i64) -> Result<(), RuntimeHostError> {
+        self.with_goal(|runtime| {
+            runtime
+                .pause(session_id, GoalPauseReason::User, "paused by user", at)
+                .map(|_| ())
+        })
+    }
+
+    pub fn resume_goal(&self, session_id: &str, at: i64) -> Result<(), RuntimeHostError> {
+        self.with_goal(|runtime| {
+            runtime
+                .resume(session_id, GoalTurnOrigin::Resume, at)
+                .map(|_| ())
+        })
+    }
+
+    pub fn resume_goal_into(
+        &self,
+        source_session_id: &str,
+        resumed_session_id: &str,
+        at: i64,
+    ) -> Result<Option<GoalRecord>, RuntimeHostError> {
+        self.with_goal(|runtime| runtime.resume_into(source_session_id, resumed_session_id, at))
     }
 
     pub fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {

@@ -529,6 +529,10 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         "saved Goal actor ownership must remain behind the runtime surface host"
     );
     assert!(
+        !action_source.contains(".goal()"),
+        "the TUI facade must receive Goal values, not a callable Goal actor handle"
+    );
+    assert!(
         !SLASH_COMMAND_ACTIONS.contains("folder_trust::")
             && !SETUP_ACTIONS.contains("orca_core::config::file"),
         "host-scoped trust and credentials must mutate through the TUI surface facade"

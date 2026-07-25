@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use orca_core::config::RunConfig;
-use orca_core::goal_runtime::{GoalPauseReason, GoalRecord, GoalTurnOrigin};
+use orca_core::goal_runtime::GoalRecord;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
@@ -126,15 +126,13 @@ impl TuiSurfaceActions {
 
     pub(crate) fn goal(&self, session_id: &str) -> Result<Option<ThreadGoal>, String> {
         self.thread
-            .goal()
-            .and_then(|goal| goal.project_thread_goal(session_id))
+            .project_goal(session_id)
             .map_err(|error| error.to_string())
     }
 
     pub(crate) fn goal_record(&self, session_id: &str) -> Result<Option<GoalRecord>, String> {
         self.thread
-            .goal()
-            .and_then(|goal| goal.read(session_id))
+            .read_goal(session_id)
             .map_err(|error| error.to_string())
     }
 
@@ -144,26 +142,9 @@ impl TuiSurfaceActions {
         objective: String,
         at: i64,
     ) -> Result<ThreadGoal, String> {
-        let goal = self.thread.goal().map_err(|error| error.to_string())?;
-        if goal
-            .read(session_id)
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            goal.edit(session_id, objective, None, at)
-                .map_err(|error| error.to_string())?;
-        } else {
-            goal.create(orca_runtime::goal_store::CreateGoalInput {
-                session_id: session_id.to_string(),
-                objective,
-                token_budget: None,
-                now: at,
-            })
-            .map_err(|error| error.to_string())?;
-        }
-        goal.project_thread_goal(session_id)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "goal disappeared after the committed update".to_string())
+        self.thread
+            .set_goal(session_id, objective, at)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn edit_goal(
@@ -172,37 +153,26 @@ impl TuiSurfaceActions {
         objective: String,
         at: i64,
     ) -> Result<Option<ThreadGoal>, String> {
-        let goal = self.thread.goal().map_err(|error| error.to_string())?;
-        let updated = goal
-            .edit(session_id, objective, None, at)
-            .map_err(|error| error.to_string())?;
-        if updated.is_none() {
-            return Ok(None);
-        }
-        goal.project_thread_goal(session_id)
+        self.thread
+            .edit_goal(session_id, objective, at)
             .map_err(|error| error.to_string())
     }
 
     pub(crate) fn clear_goal(&self, session_id: &str) -> Result<(), String> {
         self.thread
-            .goal()
-            .and_then(|goal| goal.clear(session_id))
+            .clear_goal(session_id)
             .map_err(|error| error.to_string())
     }
 
     pub(crate) fn pause_goal(&self, session_id: &str, at: i64) -> Result<(), String> {
         self.thread
-            .goal()
-            .and_then(|goal| goal.pause(session_id, GoalPauseReason::User, "paused by user", at))
-            .map(|_| ())
+            .pause_goal(session_id, at)
             .map_err(|error| error.to_string())
     }
 
     pub(crate) fn resume_goal(&self, session_id: &str, at: i64) -> Result<(), String> {
         self.thread
-            .goal()
-            .and_then(|goal| goal.resume(session_id, GoalTurnOrigin::Resume, at))
-            .map(|_| ())
+            .resume_goal(session_id, at)
             .map_err(|error| error.to_string())
     }
 
@@ -213,8 +183,7 @@ impl TuiSurfaceActions {
         at: i64,
     ) -> Result<Option<GoalRecord>, String> {
         self.thread
-            .goal()
-            .and_then(|goal| goal.resume_into(source_session_id, resumed_session_id, at))
+            .resume_goal_into(source_session_id, resumed_session_id, at)
             .map_err(|error| error.to_string())
     }
 
