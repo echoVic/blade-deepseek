@@ -5502,26 +5502,29 @@ fn show_hosted_goal(
         }
         return;
     };
-    let mut detached_join = None;
-    let runtime = match thread.as_ref() {
-        Some(thread) => thread.goal_runtime().map_err(|error| error.to_string()),
-        None => orca_runtime::goal_actor::GoalRuntimeHandle::open_default()
-            .map(|(runtime, join)| {
-                detached_join = Some(join);
-                runtime
-            })
+    let result = match thread.as_ref() {
+        Some(thread) => thread
+            .typed_surface()
+            .goal()
+            .and_then(|runtime| runtime.project_thread_goal(&session_id))
             .map_err(|error| error.to_string()),
+        None => {
+            let (runtime, join) = match orca_runtime::goal_actor::GoalRuntimeHandle::open_default()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
+                    return;
+                }
+            };
+            let result = runtime
+                .project_thread_goal(&session_id)
+                .map_err(|error| error.to_string());
+            drop(runtime);
+            let _ = join.join();
+            result
+        }
     };
-    let result = runtime.and_then(|runtime| {
-        let result = runtime
-            .project_thread_goal(&session_id)
-            .map_err(|error| error.to_string());
-        drop(runtime);
-        result
-    });
-    if let Some(join) = detached_join {
-        let _ = join.join();
-    }
     match result {
         Ok(goal) => {
             let _ = event_tx.send(TuiEvent::GoalStatus(goal));
