@@ -2496,21 +2496,20 @@ mod tests {
 
     #[test]
     fn resumed_uuid_session_emits_typed_history_before_accepting_initial_turn() {
-        with_orca_home(|home| {
-            let mut writer =
-                history::SessionWriter::start(home, "mock", Some("auto".to_string()), "resume")
-                    .unwrap();
-            writer.enter_turn(orca_core::thread_identity::TurnId::new());
-            writer
-                .append_message(&orca_core::conversation::Message::user(
-                    "restored prompt".to_string(),
-                ))
-                .unwrap();
-            writer.complete("success").unwrap();
+        with_orca_home(|_| {
+            let mut source = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            source.send(UserAction::Submit("restored prompt".to_string()));
+            let source_terminal =
+                source.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                source_terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
+            source.shutdown();
             let session_id = history::load_session("latest").unwrap().meta.session_id;
 
             let mut harness =
-                HostedTuiHarness::start(test_config(HistoryMode::Resume(session_id)), None);
+                HostedTuiHarness::start_typed(test_config(HistoryMode::Resume(session_id)), None);
             let event = harness
                 .event_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -2523,6 +2522,32 @@ mod tests {
                         ChatMessage::User(prompt) if prompt == "restored prompt"
                     ))
             ));
+
+            harness.send(UserAction::Submit("mock_history_echo".to_string()));
+            let mut saw_restored_history = false;
+            loop {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("resumed typed TUI event")
+                {
+                    TuiEvent::MessageDelta(text) if text.contains("restored prompt") => {
+                        saw_restored_history = true;
+                    }
+                    TuiEvent::SessionCompleted { status } => {
+                        assert_eq!(status, "success");
+                        break;
+                    }
+                    TuiEvent::Error(message) | TuiEvent::OperationRejected(message) => {
+                        panic!("resumed typed TUI turn failed: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                saw_restored_history,
+                "resumed typed turn must receive durable history"
+            );
             harness.shutdown();
         });
     }
