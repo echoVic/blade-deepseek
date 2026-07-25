@@ -2,7 +2,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::goal_actor::GoalRuntimeHandle;
-use crate::goal_store::CreateGoalInput;
 use crate::runtime_host::{
     HostedWorkflowRequest, RuntimeHost, RuntimeHostError, RuntimeHostHandle, RuntimeThreadHandle,
     RuntimeThreadStartRequest,
@@ -193,23 +192,7 @@ impl RuntimeSurfaceThreadHandle {
         objective: String,
         at: i64,
     ) -> Result<ThreadGoal, RuntimeHostError> {
-        self.with_goal(|runtime| {
-            if runtime.read(session_id)?.is_some() {
-                runtime.edit(session_id, objective, None, at)?;
-            } else {
-                runtime.create(CreateGoalInput {
-                    session_id: session_id.to_string(),
-                    objective,
-                    token_budget: None,
-                    now: at,
-                })?;
-            }
-            runtime.project_thread_goal(session_id)?.ok_or_else(|| {
-                crate::goal_actor::GoalActorError::Invalid(
-                    "goal disappeared after committed update".to_string(),
-                )
-            })
-        })
+        self.runtime.set_goal(session_id, objective, at)
     }
 
     pub fn edit_goal(
@@ -218,16 +201,11 @@ impl RuntimeSurfaceThreadHandle {
         objective: String,
         at: i64,
     ) -> Result<Option<ThreadGoal>, RuntimeHostError> {
-        self.with_goal(|runtime| {
-            if runtime.edit(session_id, objective, None, at)?.is_none() {
-                return Ok(None);
-            }
-            runtime.project_thread_goal(session_id)
-        })
+        self.runtime.edit_goal(session_id, objective, at)
     }
 
     pub fn clear_goal(&self, session_id: &str) -> Result<(), RuntimeHostError> {
-        self.with_goal(|runtime| runtime.clear(session_id))
+        self.runtime.clear_goal(session_id)
     }
 
     pub fn pause_goal(&self, session_id: &str, at: i64) -> Result<(), RuntimeHostError> {

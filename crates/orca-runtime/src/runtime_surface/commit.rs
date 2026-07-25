@@ -617,6 +617,15 @@ enum OwnerLeaseAuthority<'owner> {
 
 enum BatchCommitAuthority<'permit> {
     Single(&'permit SurfacePublisherPermit),
+    ActorGoal {
+        actor: &'permit SurfacePublisherPermit,
+        goal: &'permit SurfacePublisherPermit,
+    },
+    ActorGoals {
+        actor: &'permit SurfacePublisherPermit,
+        first_goal: &'permit SurfacePublisherPermit,
+        second_goal: &'permit SurfacePublisherPermit,
+    },
     ActorGenerationTerminalization {
         actor: &'permit SurfacePublisherPermit,
         generation: &'permit SurfacePublisherPermit,
@@ -630,13 +639,50 @@ enum BatchCommitAuthority<'permit> {
         generation: &'permit SurfacePublisherPermit,
         finalizer: &'permit SurfacePublisherPermit,
     },
+    GoalGenerationStop {
+        finished_goal: &'permit SurfacePublisherPermit,
+        verification_goal: Option<&'permit SurfacePublisherPermit>,
+        decision_goal: &'permit SurfacePublisherPermit,
+        generation: &'permit SurfacePublisherPermit,
+        finalizer: &'permit SurfacePublisherPermit,
+    },
+    GoalGenerationContinue {
+        actor: &'permit SurfacePublisherPermit,
+        finished_goal: &'permit SurfacePublisherPermit,
+        verification_goal: Option<&'permit SurfacePublisherPermit>,
+        decision_goal: &'permit SurfacePublisherPermit,
+        predecessor: &'permit SurfacePublisherPermit,
+    },
 }
 
 enum RecoveredBatchAuthority {
     Single(SurfacePublisherPermit),
+    ActorGoal {
+        actor: SurfacePublisherPermit,
+        goal: SurfacePublisherPermit,
+    },
+    ActorGoals {
+        actor: SurfacePublisherPermit,
+        first_goal: SurfacePublisherPermit,
+        second_goal: SurfacePublisherPermit,
+    },
     ActorGenerationTerminalization {
         actor: SurfacePublisherPermit,
         generation: SurfacePublisherPermit,
+    },
+    GoalGenerationStop {
+        finished_goal: SurfacePublisherPermit,
+        verification_goal: Option<SurfacePublisherPermit>,
+        decision_goal: SurfacePublisherPermit,
+        generation: SurfacePublisherPermit,
+        finalizer: SurfacePublisherPermit,
+    },
+    GoalGenerationContinue {
+        actor: SurfacePublisherPermit,
+        finished_goal: SurfacePublisherPermit,
+        verification_goal: Option<SurfacePublisherPermit>,
+        decision_goal: SurfacePublisherPermit,
+        predecessor: SurfacePublisherPermit,
     },
 }
 
@@ -804,6 +850,31 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
         let committed = recovered.committed;
         let prepared = recovered.prepared;
         let current_owner_epoch = ThreadOwnerEpoch::new(lease.owner_epoch());
+        if let Some(first) = committed.first().or(prepared.as_ref())
+            && first.cursor_before.next_seq.get() == 0
+        {
+            let initial_owner_epoch = first
+                .events
+                .as_slice()
+                .iter()
+                .find_map(|event| match &event.event {
+                    super::SurfaceEvent::Session(super::SessionPatch::OwnerEpochChanged {
+                        previous,
+                        ..
+                    }) => Some(*previous),
+                    _ => None,
+                })
+                .unwrap_or_else(|| match first.commit_class {
+                    CommitClass::Recorded {
+                        thread_owner_epoch, ..
+                    } => thread_owner_epoch,
+                    CommitClass::Ephemeral { .. } => {
+                        unreachable!("JSONL surface ledger cannot contain ephemeral batches")
+                    }
+                });
+            state
+                .align_rematerialization_baseline(first.cursor_before.clone(), initial_owner_epoch);
+        }
         let mut materialized_takeover = None;
         for batch in &committed {
             let candidate_takeover =
@@ -847,11 +918,74 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                 RecoveredBatchAuthority::Single(permit) => {
                     coordinator.commit_batch(&permit, &batch)?;
                 }
+                RecoveredBatchAuthority::ActorGoal { actor, goal } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ActorGoal {
+                            actor: &actor,
+                            goal: &goal,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::ActorGoals {
+                    actor,
+                    first_goal,
+                    second_goal,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ActorGoals {
+                            actor: &actor,
+                            first_goal: &first_goal,
+                            second_goal: &second_goal,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
                 RecoveredBatchAuthority::ActorGenerationTerminalization { actor, generation } => {
                     coordinator.commit_batch_with_authority(
                         BatchCommitAuthority::ActorGenerationTerminalization {
                             actor: &actor,
                             generation: &generation,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::GoalGenerationStop {
+                    finished_goal,
+                    verification_goal,
+                    decision_goal,
+                    generation,
+                    finalizer,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::GoalGenerationStop {
+                            finished_goal: &finished_goal,
+                            verification_goal: verification_goal.as_ref(),
+                            decision_goal: &decision_goal,
+                            generation: &generation,
+                            finalizer: &finalizer,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::GoalGenerationContinue {
+                    actor,
+                    finished_goal,
+                    verification_goal,
+                    decision_goal,
+                    predecessor,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::GoalGenerationContinue {
+                            actor: &actor,
+                            finished_goal: &finished_goal,
+                            verification_goal: verification_goal.as_ref(),
+                            decision_goal: &decision_goal,
+                            predecessor: &predecessor,
                         },
                         &batch,
                         None,
@@ -874,6 +1008,88 @@ impl RuntimeCommitCoordinator<'static, JsonlSurfaceCommitLedger> {
 }
 
 impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
+    pub(crate) fn has_incomplete_batch(&self) -> bool {
+        self.incomplete.is_some()
+    }
+
+    pub(crate) fn retry_incomplete_batch(
+        &mut self,
+    ) -> Result<Option<SurfaceCommitApplied>, SurfaceCommitError> {
+        let Some(batch) = self.incomplete.clone() else {
+            return Ok(None);
+        };
+        let authority = self.issue_exact_recovered_authority(&batch)?;
+        let applied = match authority {
+            RecoveredBatchAuthority::Single(permit) => self.commit_batch(&permit, &batch)?,
+            RecoveredBatchAuthority::ActorGoal { actor, goal } => self
+                .commit_batch_with_authority(
+                    BatchCommitAuthority::ActorGoal {
+                        actor: &actor,
+                        goal: &goal,
+                    },
+                    &batch,
+                    None,
+                )?,
+            RecoveredBatchAuthority::ActorGoals {
+                actor,
+                first_goal,
+                second_goal,
+            } => self.commit_batch_with_authority(
+                BatchCommitAuthority::ActorGoals {
+                    actor: &actor,
+                    first_goal: &first_goal,
+                    second_goal: &second_goal,
+                },
+                &batch,
+                None,
+            )?,
+            RecoveredBatchAuthority::ActorGenerationTerminalization { actor, generation } => self
+                .commit_batch_with_authority(
+                BatchCommitAuthority::ActorGenerationTerminalization {
+                    actor: &actor,
+                    generation: &generation,
+                },
+                &batch,
+                None,
+            )?,
+            RecoveredBatchAuthority::GoalGenerationStop {
+                finished_goal,
+                verification_goal,
+                decision_goal,
+                generation,
+                finalizer,
+            } => self.commit_batch_with_authority(
+                BatchCommitAuthority::GoalGenerationStop {
+                    finished_goal: &finished_goal,
+                    verification_goal: verification_goal.as_ref(),
+                    decision_goal: &decision_goal,
+                    generation: &generation,
+                    finalizer: &finalizer,
+                },
+                &batch,
+                None,
+            )?,
+            RecoveredBatchAuthority::GoalGenerationContinue {
+                actor,
+                finished_goal,
+                verification_goal,
+                decision_goal,
+                predecessor,
+            } => self.commit_batch_with_authority(
+                BatchCommitAuthority::GoalGenerationContinue {
+                    actor: &actor,
+                    finished_goal: &finished_goal,
+                    verification_goal: verification_goal.as_ref(),
+                    decision_goal: &decision_goal,
+                    predecessor: &predecessor,
+                },
+                &batch,
+                None,
+            )?,
+        };
+        Ok(Some(applied))
+    }
+
     pub fn commit_actor_batch(
         &mut self,
         batch: &SurfaceCommitBatch,
@@ -901,6 +1117,72 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.commit_batch(&permit, batch)
     }
 
+    pub(crate) fn commit_goal_batch(
+        &mut self,
+        goal_fence: super::SurfaceGoalFence,
+        receipt_digest: super::Sha256Digest,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let permit = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence,
+            receipt_digest,
+        });
+        self.commit_batch(&permit, batch)
+    }
+
+    pub(crate) fn commit_actor_goal_batch(
+        &mut self,
+        goal_fence: super::SurfaceGoalFence,
+        receipt_digest: super::Sha256Digest,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let goal = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence,
+            receipt_digest,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActorGoal {
+                actor: &actor,
+                goal: &goal,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_actor_two_goal_batch(
+        &mut self,
+        first_goal_fence: super::SurfaceGoalFence,
+        first_receipt_digest: super::Sha256Digest,
+        second_goal_fence: super::SurfaceGoalFence,
+        second_receipt_digest: super::Sha256Digest,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let first_goal = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence: first_goal_fence,
+            receipt_digest: first_receipt_digest,
+        });
+        let second_goal = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence: second_goal_fence,
+            receipt_digest: second_receipt_digest,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActorGoals {
+                actor: &actor,
+                first_goal: &first_goal,
+                second_goal: &second_goal,
+            },
+            batch,
+            None,
+        )
+    }
+
     pub(crate) fn commit_live_generation_stop_disposition_batch(
         &mut self,
         fence: super::SurfaceOperationFence,
@@ -917,6 +1199,100 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             BatchCommitAuthority::LiveGenerationStop {
                 generation: &generation,
                 finalizer: &finalizer,
+            },
+            batch,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_goal_generation_stop_batch(
+        &mut self,
+        finished_goal_fence: super::SurfaceGoalFence,
+        finished_receipt_digest: super::Sha256Digest,
+        verification: Option<(super::SurfaceGoalFence, super::Sha256Digest)>,
+        decision_goal_fence: super::SurfaceGoalFence,
+        decision_receipt_digest: super::Sha256Digest,
+        fence: super::SurfaceOperationFence,
+        operation_id: super::SurfaceOperationId,
+        finalize_intent_id: super::SurfaceFinalizeIntentId,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let finished_goal = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence: finished_goal_fence,
+            receipt_digest: finished_receipt_digest,
+        });
+        let decision_goal = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence: decision_goal_fence,
+            receipt_digest: decision_receipt_digest,
+        });
+        let verification_goal = verification.map(|(goal_fence, receipt_digest)| {
+            self.register_permit(SurfacePublisherPermit::Goal {
+                permit_id: next_permit_id(),
+                goal_fence,
+                receipt_digest,
+            })
+        });
+        let generation = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        let finalizer = self.issue_finalizer_permit(operation_id, finalize_intent_id);
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::GoalGenerationStop {
+                finished_goal: &finished_goal,
+                verification_goal: verification_goal.as_ref(),
+                decision_goal: &decision_goal,
+                generation: &generation,
+                finalizer: &finalizer,
+            },
+            batch,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_goal_generation_continue_batch(
+        &mut self,
+        finished_goal_fence: super::SurfaceGoalFence,
+        finished_receipt_digest: super::Sha256Digest,
+        verification: Option<(super::SurfaceGoalFence, super::Sha256Digest)>,
+        decision_goal_fence: super::SurfaceGoalFence,
+        decision_receipt_digest: super::Sha256Digest,
+        predecessor_fence: super::SurfaceOperationFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let finished_goal = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence: finished_goal_fence,
+            receipt_digest: finished_receipt_digest,
+        });
+        let verification_goal = verification.map(|(goal_fence, receipt_digest)| {
+            self.register_permit(SurfacePublisherPermit::Goal {
+                permit_id: next_permit_id(),
+                goal_fence,
+                receipt_digest,
+            })
+        });
+        let decision_goal = self.register_permit(SurfacePublisherPermit::Goal {
+            permit_id: next_permit_id(),
+            goal_fence: decision_goal_fence,
+            receipt_digest: decision_receipt_digest,
+        });
+        let predecessor = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence: predecessor_fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::GoalGenerationContinue {
+                actor: &actor,
+                finished_goal: &finished_goal,
+                verification_goal: verification_goal.as_ref(),
+                decision_goal: &decision_goal,
+                predecessor: &predecessor,
             },
             batch,
             None,
@@ -941,6 +1317,15 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             batch,
             None,
         )
+    }
+
+    pub(crate) fn commit_resume_abort_batch(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let recovery = self.issue_recovery_permit(fence);
+        self.commit_batch_inner(&recovery, batch, None)
     }
 
     pub(crate) fn commit_actor_generation_terminalization_batch(
@@ -1741,6 +2126,326 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         }
 
         let events = batch.events.as_slice();
+        let admitted_goal_event_count = if events.len() >= 5
+            && matches!(
+                &events[events.len() - 3..],
+                [finished, verification, decision]
+                    if matches!(
+                        &finished.event,
+                        super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                            patch: super::GoalPatch::OuterTurnFinished { .. },
+                            ..
+                        })
+                    ) && matches!(
+                        &verification.event,
+                        super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                            patch: super::GoalPatch::VerificationCompleted { .. },
+                            ..
+                        })
+                    ) && matches!(
+                        &decision.event,
+                        super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                            patch: super::GoalPatch::ContinuationDecided {
+                                decision: super::GoalContinuationDecision::Admitted { .. },
+                                ..
+                            },
+                            ..
+                        })
+                    )
+            ) {
+            Some(3)
+        } else if events.len() >= 4
+            && matches!(
+                &events[events.len() - 2..],
+                [finished, decision]
+                    if matches!(
+                        &finished.event,
+                        super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                            patch: super::GoalPatch::OuterTurnFinished { .. },
+                            ..
+                        })
+                    ) && matches!(
+                        &decision.event,
+                        super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                            patch: super::GoalPatch::ContinuationDecided {
+                                decision: super::GoalContinuationDecision::Admitted { .. },
+                                ..
+                            },
+                            ..
+                        })
+                    )
+            )
+        {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(goal_event_count) = admitted_goal_event_count {
+            let goal_events = &events[events.len() - goal_event_count..];
+            let receipts = goal_events
+                .iter()
+                .map(|event| match &event.event {
+                    super::SurfaceEvent::Goal(envelope) => Some(envelope.receipt.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .expect("admitted Goal suffix contains Goal events");
+            let (finished_receipt, verification_receipt, decision_receipt) =
+                match receipts.as_slice() {
+                    [finished, decision] => (finished, None, decision),
+                    [finished, verification, decision] => (finished, Some(verification), decision),
+                    _ => unreachable!("admitted Goal suffix is closed"),
+                };
+            let predecessor_fence = goal_events.last().and_then(|event| match &event.event {
+                super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                    patch:
+                        super::GoalPatch::ContinuationDecided {
+                            predecessor,
+                            decision: super::GoalContinuationDecision::Admitted { .. },
+                            ..
+                        },
+                    ..
+                }) => Some(predecessor.operation_fence.clone()),
+                _ => None,
+            });
+            if let Some(predecessor_fence) = predecessor_fence {
+                let goal_permit =
+                    |receipt: &super::SurfaceGoalStoreReceipt| SurfacePublisherPermit::Goal {
+                        permit_id: next_permit_id(),
+                        goal_fence: super::SurfaceGoalFence {
+                            goal_id: receipt.goal_id.clone(),
+                            goal_revision: receipt.goal_revision,
+                            goal_owner_epoch: receipt.goal_owner_epoch,
+                        },
+                        receipt_digest: receipt.receipt_digest.clone(),
+                    };
+                let finished_goal = goal_permit(finished_receipt);
+                let verification_goal = verification_receipt.map(goal_permit);
+                let decision_goal = goal_permit(decision_receipt);
+                let predecessor = SurfacePublisherPermit::Generation {
+                    permit_id: next_permit_id(),
+                    fence: predecessor_fence,
+                };
+                let mut issued = self.issued_permits.clone();
+                issued.push(finished_goal.clone());
+                if let Some(verification_goal) = &verification_goal {
+                    issued.push(verification_goal.clone());
+                }
+                issued.extend([decision_goal.clone(), predecessor.clone()]);
+                if goal_generation_continue_authorized(
+                    &self.state,
+                    &issued,
+                    &actor,
+                    &finished_goal,
+                    verification_goal.as_ref(),
+                    &decision_goal,
+                    &predecessor,
+                    batch,
+                    self.owner_epoch,
+                ) {
+                    return Ok(RecoveredBatchAuthority::GoalGenerationContinue {
+                        actor,
+                        finished_goal: self.register_permit(finished_goal),
+                        verification_goal: verification_goal
+                            .map(|permit| self.register_permit(permit)),
+                        decision_goal: self.register_permit(decision_goal),
+                        predecessor: self.register_permit(predecessor),
+                    });
+                }
+            }
+        }
+        if events.len() >= 4 {
+            let goal_event_count = if events.len() >= 5
+                && matches!(
+                    &events[events.len() - 3..],
+                    [finished, verification, decision]
+                        if matches!(
+                            &finished.event,
+                            super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                                patch: super::GoalPatch::OuterTurnFinished { .. },
+                                ..
+                            })
+                        ) && matches!(
+                            &verification.event,
+                            super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                                patch: super::GoalPatch::VerificationCompleted { .. },
+                                ..
+                            })
+                        ) && matches!(
+                            &decision.event,
+                            super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                                patch: super::GoalPatch::ContinuationDecided { .. },
+                                ..
+                            })
+                        )
+                ) {
+                3
+            } else {
+                2
+            };
+            let goal_events = &events[events.len() - goal_event_count..];
+            let goal_receipts = goal_events
+                .iter()
+                .map(|event| match &event.event {
+                    super::SurfaceEvent::Goal(envelope) => Some(envelope.receipt.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            let core_events = &events[..events.len() - goal_event_count];
+            let generation_fence = core_events.iter().find_map(|event| match &event.event {
+                super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+                    fence,
+                    ..
+                }) => Some(fence.clone()),
+                _ => None,
+            });
+            let finalization = core_events.iter().find_map(|event| match &event.event {
+                super::SurfaceEvent::Operation(super::OperationPatch::FinalizationStarted {
+                    operation_id,
+                    finalize_intent_id,
+                    ..
+                }) => Some((operation_id.clone(), finalize_intent_id.clone())),
+                _ => None,
+            });
+            if let (
+                Some(receipts),
+                Some(generation_fence),
+                Some((operation_id, finalize_intent_id)),
+            ) = (goal_receipts, generation_fence, finalization)
+            {
+                let (finished_receipt, verification_receipt, decision_receipt) = match receipts
+                    .as_slice()
+                {
+                    [finished, decision] => (finished, None, decision),
+                    [finished, verification, decision] => (finished, Some(verification), decision),
+                    _ => unreachable!("two or three trailing Goal events are required"),
+                };
+                let finished_goal = SurfacePublisherPermit::Goal {
+                    permit_id: next_permit_id(),
+                    goal_fence: super::SurfaceGoalFence {
+                        goal_id: finished_receipt.goal_id.clone(),
+                        goal_revision: finished_receipt.goal_revision,
+                        goal_owner_epoch: finished_receipt.goal_owner_epoch,
+                    },
+                    receipt_digest: finished_receipt.receipt_digest.clone(),
+                };
+                let verification_goal =
+                    verification_receipt.map(|receipt| SurfacePublisherPermit::Goal {
+                        permit_id: next_permit_id(),
+                        goal_fence: super::SurfaceGoalFence {
+                            goal_id: receipt.goal_id.clone(),
+                            goal_revision: receipt.goal_revision,
+                            goal_owner_epoch: receipt.goal_owner_epoch,
+                        },
+                        receipt_digest: receipt.receipt_digest.clone(),
+                    });
+                let decision_goal = SurfacePublisherPermit::Goal {
+                    permit_id: next_permit_id(),
+                    goal_fence: super::SurfaceGoalFence {
+                        goal_id: decision_receipt.goal_id.clone(),
+                        goal_revision: decision_receipt.goal_revision,
+                        goal_owner_epoch: decision_receipt.goal_owner_epoch,
+                    },
+                    receipt_digest: decision_receipt.receipt_digest.clone(),
+                };
+                let generation = SurfacePublisherPermit::Generation {
+                    permit_id: next_permit_id(),
+                    fence: generation_fence,
+                };
+                let finalizer = SurfacePublisherPermit::Finalizer {
+                    permit_id: next_permit_id(),
+                    operation_id,
+                    finalize_intent_id,
+                    owner_epoch: self.owner_epoch,
+                };
+                let mut issued = self.issued_permits.clone();
+                issued.push(finished_goal.clone());
+                if let Some(verification_goal) = &verification_goal {
+                    issued.push(verification_goal.clone());
+                }
+                issued.extend([decision_goal.clone(), generation.clone(), finalizer.clone()]);
+                if goal_generation_stop_authorized(
+                    &self.state,
+                    &issued,
+                    &finished_goal,
+                    verification_goal.as_ref(),
+                    &decision_goal,
+                    &generation,
+                    &finalizer,
+                    batch,
+                    self.owner_epoch,
+                ) {
+                    return Ok(RecoveredBatchAuthority::GoalGenerationStop {
+                        finished_goal: self.register_permit(finished_goal),
+                        verification_goal: verification_goal
+                            .map(|permit| self.register_permit(permit)),
+                        decision_goal: self.register_permit(decision_goal),
+                        generation: self.register_permit(generation),
+                        finalizer: self.register_permit(finalizer),
+                    });
+                }
+            }
+        }
+        if let [first, second, _] = events
+            && let (
+                super::SurfaceEvent::Goal(first_envelope),
+                super::SurfaceEvent::Goal(second_envelope),
+            ) = (&first.event, &second.event)
+        {
+            let first_goal = SurfacePublisherPermit::Goal {
+                permit_id: next_permit_id(),
+                goal_fence: super::SurfaceGoalFence {
+                    goal_id: first_envelope.receipt.goal_id.clone(),
+                    goal_revision: first_envelope.receipt.goal_revision,
+                    goal_owner_epoch: first_envelope.receipt.goal_owner_epoch,
+                },
+                receipt_digest: first_envelope.receipt.receipt_digest.clone(),
+            };
+            let second_goal = SurfacePublisherPermit::Goal {
+                permit_id: next_permit_id(),
+                goal_fence: super::SurfaceGoalFence {
+                    goal_id: second_envelope.receipt.goal_id.clone(),
+                    goal_revision: second_envelope.receipt.goal_revision,
+                    goal_owner_epoch: second_envelope.receipt.goal_owner_epoch,
+                },
+                receipt_digest: second_envelope.receipt.receipt_digest.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.extend([first_goal.clone(), second_goal.clone()]);
+            if actor_goal_edit_run_authorized(
+                &issued,
+                &actor,
+                &first_goal,
+                &second_goal,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(RecoveredBatchAuthority::ActorGoals {
+                    actor,
+                    first_goal: self.register_permit(first_goal),
+                    second_goal: self.register_permit(second_goal),
+                });
+            }
+        }
+        if let Some(super::SurfaceEvent::Goal(super::GoalPatchEnvelope { receipt, .. })) =
+            events.first().map(|event| &event.event)
+        {
+            let goal = SurfacePublisherPermit::Goal {
+                permit_id: next_permit_id(),
+                goal_fence: super::SurfaceGoalFence {
+                    goal_id: receipt.goal_id.clone(),
+                    goal_revision: receipt.goal_revision,
+                    goal_owner_epoch: receipt.goal_owner_epoch,
+                },
+                receipt_digest: receipt.receipt_digest.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(goal.clone());
+            if actor_goal_run_start_authorized(&issued, &actor, &goal, batch, self.owner_epoch) {
+                let goal = self.register_permit(goal);
+                return Ok(RecoveredBatchAuthority::ActorGoal { actor, goal });
+            }
+        }
         if let Some(SurfaceScope::Generation {
             fence: historical_fence,
         }) = events.get(1).map(|event| &event.scope)
@@ -2348,6 +3053,25 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     && recovery_stream_dispositions_match_state(&self.state, permit, batch)
                     && recovery_manual_compaction_matches_state(&self.state, permit, batch)
             }
+            BatchCommitAuthority::ActorGoal { actor, goal } => actor_goal_run_start_authorized(
+                &self.issued_permits,
+                actor,
+                goal,
+                batch,
+                self.owner_epoch,
+            ),
+            BatchCommitAuthority::ActorGoals {
+                actor,
+                first_goal,
+                second_goal,
+            } => actor_goal_edit_run_authorized(
+                &self.issued_permits,
+                actor,
+                first_goal,
+                second_goal,
+                batch,
+                self.owner_epoch,
+            ),
             BatchCommitAuthority::ActorGenerationTerminalization { actor, generation } => {
                 actor_generation_terminalization_authorized(
                     &self.issued_permits,
@@ -2380,6 +3104,42 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     self.owner_epoch,
                 ) && finalizer_background_scope_matches_state(&self.state, finalizer, batch)
             }
+            BatchCommitAuthority::GoalGenerationStop {
+                finished_goal,
+                verification_goal,
+                decision_goal,
+                generation,
+                finalizer,
+            } => {
+                goal_generation_stop_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    finished_goal,
+                    verification_goal,
+                    decision_goal,
+                    generation,
+                    finalizer,
+                    batch,
+                    self.owner_epoch,
+                ) && finalizer_background_scope_matches_state(&self.state, finalizer, batch)
+            }
+            BatchCommitAuthority::GoalGenerationContinue {
+                actor,
+                finished_goal,
+                verification_goal,
+                decision_goal,
+                predecessor,
+            } => goal_generation_continue_authorized(
+                &self.state,
+                &self.issued_permits,
+                actor,
+                finished_goal,
+                verification_goal,
+                decision_goal,
+                predecessor,
+                batch,
+                self.owner_epoch,
+            ),
         };
         if !authorized {
             return Err(SurfaceCommitError::StalePublisherPermit);
@@ -2656,6 +3416,321 @@ fn permit_authorizes(
     }
 }
 
+fn actor_goal_run_start_authorized(
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    goal: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor) || !issued_permits.contains(goal) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Goal {
+            goal_fence,
+            receipt_digest,
+            ..
+        },
+    ) = (actor, goal)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let events = batch.events.as_slice();
+    if let [operation_event, item_event, goal_event] = events {
+        let (
+            SurfaceScope::Goal {
+                goal_id: scoped_goal_id,
+                causative_generation: Some(causative_generation),
+            },
+            super::SurfaceEvent::Goal(goal_envelope),
+        ) = (&goal_event.scope, &goal_event.event)
+        else {
+            return false;
+        };
+        let super::GoalPatch::OuterTurnStarted { identity } = &goal_envelope.patch else {
+            return false;
+        };
+        if scoped_goal_id != &goal_fence.goal_id
+            || goal_envelope.receipt.goal_id != goal_fence.goal_id
+            || goal_envelope.receipt.goal_revision != goal_fence.goal_revision
+            || goal_envelope.receipt.goal_owner_epoch != goal_fence.goal_owner_epoch
+            || goal_envelope.receipt.receipt_digest != *receipt_digest
+            || causative_generation != &identity.operation_fence
+            || identity.goal_id != goal_fence.goal_id
+        {
+            return false;
+        }
+        let (
+            SurfaceScope::Operation {
+                operation_id: scoped_operation_id,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::Admitted {
+                operation_id,
+                logical_turn_id,
+                input,
+                first_generation,
+            }),
+        ) = (&operation_event.scope, &operation_event.event)
+        else {
+            return false;
+        };
+        let (
+            super::AdmittedInput::PendingUser {
+                item_id: admitted_item_id,
+                presentation: admitted_presentation,
+                correlation_id: admitted_correlation,
+            },
+            super::GenerationInputState::Pending {
+                input_item_id,
+                presentation,
+                correlation_id,
+            },
+        ) = (input, &first_generation.input)
+        else {
+            return false;
+        };
+        let (
+            SurfaceScope::Generation { fence: item_fence },
+            super::SurfaceEvent::Item(super::ItemPatch::Added {
+                item:
+                    super::SurfaceItem::UserMessage {
+                        id: item_id,
+                        turn_id,
+                        input:
+                            super::SurfaceUserInputState::Pending {
+                                presentation: item_presentation,
+                                correlation_id: item_correlation,
+                            },
+                        ..
+                    },
+            }),
+        ) = (&item_event.scope, &item_event.event)
+        else {
+            return false;
+        };
+        return scoped_operation_id == operation_id
+            && operation_id == &identity.operation_fence.operation_id
+            && logical_turn_id == &identity.logical_turn_id
+            && first_generation.fence == identity.operation_fence
+            && first_generation.logical_turn_id == identity.logical_turn_id
+            && first_generation.goal_identity.as_ref() == Some(identity)
+            && item_fence == &identity.operation_fence
+            && admitted_item_id == &identity.canonical_input_item_id
+            && input_item_id == &identity.canonical_input_item_id
+            && item_id == &identity.canonical_input_item_id
+            && turn_id == &identity.logical_turn_id
+            && admitted_presentation == presentation
+            && presentation == item_presentation
+            && admitted_correlation == correlation_id
+            && correlation_id == item_correlation;
+    }
+    let [goal_event, operation_event] = events else {
+        return false;
+    };
+    let (
+        SurfaceScope::Goal {
+            goal_id: scoped_goal_id,
+            causative_generation: None,
+        },
+        super::SurfaceEvent::Goal(goal_envelope),
+    ) = (&goal_event.scope, &goal_event.event)
+    else {
+        return false;
+    };
+    if scoped_goal_id != &goal_fence.goal_id
+        || goal_envelope.receipt.goal_id != goal_fence.goal_id
+        || goal_envelope.receipt.goal_revision != goal_fence.goal_revision
+        || goal_envelope.receipt.goal_owner_epoch != goal_fence.goal_owner_epoch
+        || goal_envelope.receipt.receipt_digest != *receipt_digest
+    {
+        return false;
+    }
+    if let super::GoalPatch::Paused {
+        goal_id,
+        goal_run_id: Some(_),
+        state:
+            super::SurfaceGoalState::Paused {
+                reason: super::SurfaceGoalPauseReason::User,
+                ..
+            },
+        ..
+    } = &goal_envelope.patch
+    {
+        let (
+            SurfaceScope::Operation {
+                operation_id: scoped_operation_id,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::ControlIntentCommitted {
+                operation_id,
+                request_id: _,
+                intent:
+                    super::PendingControlIntent::Terminalize {
+                        operation_id: intent_operation_id,
+                        cause: super::TerminalizationCause::GoalPause,
+                    },
+            }),
+        ) = (&operation_event.scope, &operation_event.event)
+        else {
+            return false;
+        };
+        return goal_id == &goal_fence.goal_id
+            && scoped_operation_id == operation_id
+            && operation_id == intent_operation_id;
+    }
+    let (run, objective_revision) = match &goal_envelope.patch {
+        super::GoalPatch::Created { goal }
+            if goal.goal_id == goal_fence.goal_id
+                && goal.goal_revision == goal_fence.goal_revision
+                && goal.current_run.is_some() =>
+        {
+            (
+                goal.current_run.as_ref().expect("guarded current run"),
+                goal.objective_revision,
+            )
+        }
+        super::GoalPatch::RunStarted { goal_id, goal_run } if goal_id == &goal_fence.goal_id => {
+            (goal_run, goal_envelope.receipt.objective_revision)
+        }
+        _ => return false,
+    };
+    let (
+        SurfaceScope::Operation {
+            operation_id: scoped_operation_id,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::Requested { operation }),
+    ) = (&operation_event.scope, &operation_event.event)
+    else {
+        return false;
+    };
+    scoped_operation_id == &run.operation_id
+        && operation.operation_id == run.operation_id
+        && operation.reservation.operation_id == run.operation_id
+        && operation.phase == super::OperationPhase::Requested
+        && matches!(
+            &operation.intent.kind,
+            super::OperationKind::GoalRun {
+                goal_id,
+                goal_run_id,
+                initial_objective_revision,
+            } if goal_id == &goal_fence.goal_id
+                && goal_run_id == &run.goal_run_id
+                && initial_objective_revision == &objective_revision
+        )
+}
+
+fn actor_goal_edit_run_authorized(
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    first_goal: &SurfacePublisherPermit,
+    second_goal: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor)
+        || !issued_permits.contains(first_goal)
+        || !issued_permits.contains(second_goal)
+    {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Goal {
+            goal_fence: first_fence,
+            receipt_digest: first_digest,
+            ..
+        },
+        SurfacePublisherPermit::Goal {
+            goal_fence: second_fence,
+            receipt_digest: second_digest,
+            ..
+        },
+    ) = (actor, first_goal, second_goal)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+        || first_fence.goal_id != second_fence.goal_id
+        || first_fence.goal_owner_epoch != second_fence.goal_owner_epoch
+        || first_fence.goal_revision.get().checked_add(1) != Some(second_fence.goal_revision.get())
+    {
+        return false;
+    }
+    let [first_event, second_event, operation_event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (super::SurfaceEvent::Goal(first_envelope), super::SurfaceEvent::Goal(second_envelope)) =
+        (&first_event.event, &second_event.event)
+    else {
+        return false;
+    };
+    let first_matches = first_envelope.receipt.goal_id == first_fence.goal_id
+        && first_envelope.receipt.goal_revision == first_fence.goal_revision
+        && first_envelope.receipt.goal_owner_epoch == first_fence.goal_owner_epoch
+        && first_envelope.receipt.receipt_digest == *first_digest
+        && matches!(
+            &first_envelope.patch,
+            super::GoalPatch::Edited {
+                goal_id,
+                goal,
+                ..
+            } if goal_id == &first_fence.goal_id
+                && goal.goal_id == first_fence.goal_id
+                && goal.current_run.is_none()
+        );
+    let run = match &second_envelope.patch {
+        super::GoalPatch::RunStarted { goal_id, goal_run } if goal_id == &second_fence.goal_id => {
+            goal_run
+        }
+        _ => return false,
+    };
+    let second_matches = second_envelope.receipt.goal_id == second_fence.goal_id
+        && second_envelope.receipt.goal_revision == second_fence.goal_revision
+        && second_envelope.receipt.goal_owner_epoch == second_fence.goal_owner_epoch
+        && second_envelope.receipt.receipt_digest == *second_digest;
+    let (
+        SurfaceScope::Operation {
+            operation_id: scoped_operation_id,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::Requested { operation }),
+    ) = (&operation_event.scope, &operation_event.event)
+    else {
+        return false;
+    };
+    first_matches
+        && second_matches
+        && scoped_operation_id == &run.operation_id
+        && operation.operation_id == run.operation_id
+        && operation.phase == super::OperationPhase::Requested
+        && matches!(
+            &operation.intent.kind,
+            super::OperationKind::GoalRun {
+                goal_id,
+                goal_run_id,
+                initial_objective_revision,
+            } if goal_id == &second_fence.goal_id
+                && goal_run_id == &run.goal_run_id
+                && initial_objective_revision == &second_envelope.receipt.objective_revision
+        )
+}
+
 fn actor_generation_terminalization_authorized(
     issued_permits: &[SurfacePublisherPermit],
     actor_permit: &SurfacePublisherPermit,
@@ -2901,6 +3976,443 @@ fn live_generation_stop_disposition_authorized(
             && patch_operation == operation_id
             && patch_intent == finalize_intent_id
             && selected_reason == stop_reason
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn goal_generation_stop_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    finished_goal_permit: &SurfacePublisherPermit,
+    verification_goal_permit: Option<&SurfacePublisherPermit>,
+    decision_goal_permit: &SurfacePublisherPermit,
+    generation_permit: &SurfacePublisherPermit,
+    finalizer_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(finished_goal_permit)
+        || verification_goal_permit.is_some_and(|permit| !issued_permits.contains(permit))
+        || !issued_permits.contains(decision_goal_permit)
+        || !issued_permits.contains(generation_permit)
+        || !issued_permits.contains(finalizer_permit)
+    {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::Goal {
+            goal_fence: finished_fence,
+            receipt_digest: finished_digest,
+            ..
+        },
+        SurfacePublisherPermit::Goal {
+            goal_fence: decision_fence,
+            receipt_digest: decision_digest,
+            ..
+        },
+        SurfacePublisherPermit::Generation { fence, .. },
+        SurfacePublisherPermit::Finalizer {
+            operation_id,
+            finalize_intent_id,
+            owner_epoch: finalizer_owner_epoch,
+            ..
+        },
+    ) = (
+        finished_goal_permit,
+        decision_goal_permit,
+        generation_permit,
+        finalizer_permit,
+    )
+    else {
+        return false;
+    };
+    let verification_parts = verification_goal_permit.and_then(|permit| match permit {
+        SurfacePublisherPermit::Goal {
+            goal_fence,
+            receipt_digest,
+            ..
+        } => Some((goal_fence, receipt_digest)),
+        _ => None,
+    });
+    if verification_goal_permit.is_some() != verification_parts.is_some()
+        || *finalizer_owner_epoch != owner_epoch
+        || operation_id != &fence.operation_id
+        || finished_fence.goal_id != decision_fence.goal_id
+        || match verification_parts {
+            Some((verification_fence, _)) => {
+                finished_fence.goal_id != verification_fence.goal_id
+                    || finished_fence.goal_revision.get().checked_add(1)
+                        != Some(verification_fence.goal_revision.get())
+                    || verification_fence.goal_revision.get().checked_add(1)
+                        != Some(decision_fence.goal_revision.get())
+            }
+            None => {
+                finished_fence.goal_revision.get().checked_add(1)
+                    != Some(decision_fence.goal_revision.get())
+            }
+        }
+    {
+        return false;
+    }
+    let events = batch.events.as_slice();
+    if events.len() < 4 {
+        return false;
+    }
+    let goal_event_count = if verification_parts.is_some() { 3 } else { 2 };
+    let (core_events, goal_events) = events.split_at(events.len() - goal_event_count);
+    let (finished_event, verification_event, decision_event) = match goal_events {
+        [finished, decision] => (finished, None, decision),
+        [finished, verification, decision] => (finished, Some(verification), decision),
+        _ => return false,
+    };
+    let goal_event_matches = |event: &super::SurfaceEventEnvelope,
+                              goal_fence: &super::SurfaceGoalFence,
+                              digest: &super::Sha256Digest| {
+        matches!(
+            (&event.scope, &event.event),
+            (
+                SurfaceScope::Goal {
+                    goal_id,
+                    causative_generation: Some(causative),
+                },
+                super::SurfaceEvent::Goal(envelope),
+            ) if goal_id == &goal_fence.goal_id
+                && causative == fence
+                && envelope.receipt.goal_id == goal_fence.goal_id
+                && envelope.receipt.goal_revision == goal_fence.goal_revision
+                && envelope.receipt.goal_owner_epoch == goal_fence.goal_owner_epoch
+                && envelope.receipt.receipt_digest == *digest
+        )
+    };
+    if !goal_event_matches(finished_event, finished_fence, finished_digest)
+        || match (verification_event, verification_parts) {
+            (Some(event), Some((verification_fence, verification_digest))) => {
+                !goal_event_matches(event, verification_fence, verification_digest)
+            }
+            (None, None) => false,
+            _ => true,
+        }
+        || !goal_event_matches(decision_event, decision_fence, decision_digest)
+    {
+        return false;
+    }
+    let super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+        patch: super::GoalPatch::OuterTurnFinished { identity, .. },
+        ..
+    }) = &finished_event.event
+    else {
+        return false;
+    };
+    let super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+        patch:
+            super::GoalPatch::ContinuationDecided {
+                predecessor,
+                decision: super::GoalContinuationDecision::Stopped { .. },
+                ..
+            },
+        ..
+    }) = &decision_event.event
+    else {
+        return false;
+    };
+    if let Some(event) = verification_event
+        && !matches!(
+            &event.event,
+            super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                patch: super::GoalPatch::VerificationCompleted {
+                    identity: verification_identity,
+                    ..
+                },
+                ..
+            }) if verification_identity == identity
+        )
+    {
+        return false;
+    }
+    if identity != predecessor || &identity.operation_fence != fence {
+        return false;
+    }
+    let Some((finalization, prefix)) = core_events.split_last() else {
+        return false;
+    };
+    let Some((stop, stream_discards)) = prefix.split_last() else {
+        return false;
+    };
+    let stop_reason = match (&stop.scope, &stop.event) {
+        (
+            SurfaceScope::Generation { fence: scope },
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+                fence: patch_fence,
+                reason,
+                ..
+            }),
+        ) if scope == fence && patch_fence == fence => reason,
+        _ => return false,
+    };
+    let expected_discard_reason = match stop_reason {
+        super::GenerationStopReason::Cancelled { .. } => {
+            super::AssistantDiscardReason::GenerationCancelled
+        }
+        super::GenerationStopReason::InterruptedResumable => {
+            super::AssistantDiscardReason::GenerationInterrupted
+        }
+        super::GenerationStopReason::RuntimeRestart
+        | super::GenerationStopReason::NotStarted {
+            reason: super::NotStartedReason::RuntimeRestart,
+        } => super::AssistantDiscardReason::RuntimeRestart,
+        super::GenerationStopReason::ProjectionFailure { .. } => {
+            super::AssistantDiscardReason::ProjectionRepair
+        }
+        _ => super::AssistantDiscardReason::ProviderFailed,
+    };
+    if !stream_discards_cover_open_streams(
+        state,
+        fence,
+        &SurfaceScope::Generation {
+            fence: fence.clone(),
+        },
+        expected_discard_reason,
+        stream_discards,
+    ) {
+        return false;
+    }
+    matches!(
+        (&finalization.scope, &finalization.event),
+        (
+            SurfaceScope::Operation {
+                operation_id: scoped_operation,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::FinalizationStarted {
+                operation_id: patch_operation,
+                finalize_intent_id: patch_intent,
+                selected_cause: super::OperationFinalizationCause::GenerationStop(selected_reason),
+                suspended_cause: None,
+                ..
+            }),
+        ) if scoped_operation == operation_id
+            && patch_operation == operation_id
+            && patch_intent == finalize_intent_id
+            && selected_reason == stop_reason
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn goal_generation_continue_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    finished_goal_permit: &SurfacePublisherPermit,
+    verification_goal_permit: Option<&SurfacePublisherPermit>,
+    decision_goal_permit: &SurfacePublisherPermit,
+    predecessor_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit)
+        || !issued_permits.contains(finished_goal_permit)
+        || verification_goal_permit.is_some_and(|permit| !issued_permits.contains(permit))
+        || !issued_permits.contains(decision_goal_permit)
+        || !issued_permits.contains(predecessor_permit)
+    {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Goal {
+            goal_fence: finished_fence,
+            receipt_digest: finished_digest,
+            ..
+        },
+        SurfacePublisherPermit::Goal {
+            goal_fence: decision_fence,
+            receipt_digest: decision_digest,
+            ..
+        },
+        SurfacePublisherPermit::Generation {
+            fence: predecessor_fence,
+            ..
+        },
+    ) = (
+        actor_permit,
+        finished_goal_permit,
+        decision_goal_permit,
+        predecessor_permit,
+    )
+    else {
+        return false;
+    };
+    let verification_parts = verification_goal_permit.and_then(|permit| match permit {
+        SurfacePublisherPermit::Goal {
+            goal_fence,
+            receipt_digest,
+            ..
+        } => Some((goal_fence, receipt_digest)),
+        _ => None,
+    });
+    if verification_goal_permit.is_some() != verification_parts.is_some()
+        || *actor_epoch != owner_epoch
+        || thread_id != &predecessor_fence.thread_id
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+        || finished_fence.goal_id != decision_fence.goal_id
+        || match verification_parts {
+            Some((verification_fence, _)) => {
+                finished_fence.goal_id != verification_fence.goal_id
+                    || finished_fence.goal_revision.get().checked_add(1)
+                        != Some(verification_fence.goal_revision.get())
+                    || verification_fence.goal_revision.get().checked_add(1)
+                        != Some(decision_fence.goal_revision.get())
+            }
+            None => {
+                finished_fence.goal_revision.get().checked_add(1)
+                    != Some(decision_fence.goal_revision.get())
+            }
+        }
+    {
+        return false;
+    }
+    let goal_event_count = if verification_parts.is_some() { 3 } else { 2 };
+    let events = batch.events.as_slice();
+    if events.len() < goal_event_count + 2 {
+        return false;
+    }
+    let (core_events, goal_events) = events.split_at(events.len() - goal_event_count);
+    let (finished_event, verification_event, decision_event) = match goal_events {
+        [finished, decision] => (finished, None, decision),
+        [finished, verification, decision] => (finished, Some(verification), decision),
+        _ => return false,
+    };
+    let goal_event_matches = |event: &super::SurfaceEventEnvelope,
+                              goal_fence: &super::SurfaceGoalFence,
+                              digest: &super::Sha256Digest| {
+        matches!(
+            (&event.scope, &event.event),
+            (
+                SurfaceScope::Goal {
+                    goal_id,
+                    causative_generation: Some(causative),
+                },
+                super::SurfaceEvent::Goal(envelope),
+            ) if goal_id == &goal_fence.goal_id
+                && causative == predecessor_fence
+                && envelope.receipt.goal_id == goal_fence.goal_id
+                && envelope.receipt.goal_revision == goal_fence.goal_revision
+                && envelope.receipt.goal_owner_epoch == goal_fence.goal_owner_epoch
+                && envelope.receipt.receipt_digest == *digest
+        )
+    };
+    if !goal_event_matches(finished_event, finished_fence, finished_digest)
+        || match (verification_event, verification_parts) {
+            (Some(event), Some((verification_fence, verification_digest))) => {
+                !goal_event_matches(event, verification_fence, verification_digest)
+            }
+            (None, None) => false,
+            _ => true,
+        }
+        || !goal_event_matches(decision_event, decision_fence, decision_digest)
+    {
+        return false;
+    }
+    let super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+        patch: super::GoalPatch::OuterTurnFinished { identity, .. },
+        ..
+    }) = &finished_event.event
+    else {
+        return false;
+    };
+    if let Some(event) = verification_event
+        && !matches!(
+            &event.event,
+            super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                patch: super::GoalPatch::VerificationCompleted {
+                    identity: verification_identity,
+                    ..
+                },
+                ..
+            }) if verification_identity == identity
+        )
+    {
+        return false;
+    }
+    let successor = match &decision_event.event {
+        super::SurfaceEvent::Goal(super::GoalPatchEnvelope {
+            patch:
+                super::GoalPatch::ContinuationDecided {
+                    predecessor,
+                    decision: super::GoalContinuationDecision::Admitted { successor, .. },
+                    ..
+                },
+            ..
+        }) if predecessor == identity => successor,
+        _ => return false,
+    };
+    if &identity.operation_fence != predecessor_fence {
+        return false;
+    }
+    let Some((input_item, prefix)) = core_events.split_last() else {
+        return false;
+    };
+    let Some((reserved, prefix)) = prefix.split_last() else {
+        return false;
+    };
+    let Some((stopped, stream_discards)) = prefix.split_last() else {
+        return false;
+    };
+    if !matches!(
+        (&stopped.scope, &stopped.event),
+        (
+            SurfaceScope::Generation { fence: scope },
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+                fence,
+                reason: super::GenerationStopReason::Completed {
+                    status: super::GenerationCompletionStatus::Success,
+                },
+                ..
+            }),
+        ) if scope == predecessor_fence && fence == predecessor_fence
+    ) || !matches!(
+        (&reserved.scope, &reserved.event),
+        (
+            SurfaceScope::Generation { fence: scope },
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationReserved {
+                generation,
+            }),
+        ) if scope == &successor.operation_fence
+            && generation.fence == successor.operation_fence
+            && generation.predecessor.as_ref() == Some(predecessor_fence)
+            && generation.goal_identity.as_ref() == Some(successor)
+            && generation.phase == super::GenerationPhase::Reserved
+    ) || !matches!(
+        (&input_item.scope, &input_item.event),
+        (
+            SurfaceScope::Generation { fence },
+            super::SurfaceEvent::Item(super::ItemPatch::Added {
+                item: super::SurfaceItem::UserMessage {
+                    id,
+                    turn_id,
+                    input: super::SurfaceUserInputState::Pending { .. },
+                    origin: super::SurfaceItemOrigin::GoalContinuation,
+                    ..
+                },
+            }),
+        ) if fence == &successor.operation_fence
+            && id == &successor.canonical_input_item_id
+            && turn_id == &successor.logical_turn_id
+    ) {
+        return false;
+    }
+    stream_discards_cover_open_streams(
+        state,
+        predecessor_fence,
+        &SurfaceScope::Generation {
+            fence: predecessor_fence.clone(),
+        },
+        super::AssistantDiscardReason::ProviderFailed,
+        stream_discards,
     )
 }
 

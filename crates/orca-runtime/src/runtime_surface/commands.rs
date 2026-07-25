@@ -127,7 +127,10 @@ impl SurfaceSnapshot {
             || operation.pending_control.is_some()
             || operation.finalization.is_some()
             || operation.terminal.is_some()
-            || operation.intent.kind != OperationKind::UserTurn
+            || !matches!(
+                operation.intent.kind,
+                OperationKind::UserTurn | OperationKind::GoalRun { .. }
+            )
         {
             return None;
         }
@@ -135,11 +138,9 @@ impl SurfaceSnapshot {
         if generation.phase != GenerationPhase::Stopped {
             return None;
         }
-        let resume_source = match &operation.intent.initial_replayability {
+        let resume_source = match &generation.replayability {
             Replayability::Replayable { .. } => ResumeSourceWitness::DurableReplay {
-                replayability_digest: canonical_replayability_digest(
-                    &operation.intent.initial_replayability,
-                ),
+                replayability_digest: canonical_replayability_digest(&generation.replayability),
             },
             Replayability::NonReplayable { .. } => return None,
         };
@@ -324,6 +325,13 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         operation_id: SurfaceOperationId,
     ) -> Result<MutationReply<CancelOperationOutput>, SurfaceClientCommandError>;
 
+    fn pause_goal_operation(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        goal_fence: SurfaceGoalFence,
+    ) -> Result<MutationReply<PauseGoalOutput>, SurfaceClientCommandError>;
+
     fn resume_operation(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -361,6 +369,13 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         request_id: SurfaceRequestId,
         action: PinnedContextAction,
     ) -> Result<MutationReply<PinnedContextMutationOutput>, SurfaceClientCommandError>;
+
+    fn goal_mutation(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        action: GoalMutationAction,
+    ) -> Result<MutationReply<GoalMutationOutput>, SurfaceClientCommandError>;
 
     fn respond_interaction_by_id(
         &self,
@@ -472,6 +487,17 @@ impl RuntimeSurfaceClientHandle {
             .cancel_operation(self.clone(), request_id, operation_id)
     }
 
+    pub fn pause_goal_operation(
+        &self,
+        request_id: SurfaceRequestId,
+        goal_fence: SurfaceGoalFence,
+    ) -> Result<MutationReply<PauseGoalOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .pause_goal_operation(self.clone(), request_id, goal_fence)
+    }
+
     pub fn resume_operation(
         &self,
         request_id: SurfaceRequestId,
@@ -547,6 +573,17 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .pinned_context_mutation(self.clone(), request_id, action)
+    }
+
+    pub fn goal_mutation(
+        &self,
+        request_id: SurfaceRequestId,
+        action: GoalMutationAction,
+    ) -> Result<MutationReply<GoalMutationOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .goal_mutation(self.clone(), request_id, action)
     }
 
     pub fn respond_interaction(

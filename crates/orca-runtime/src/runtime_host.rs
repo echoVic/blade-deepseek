@@ -33,6 +33,17 @@ use crate::controller::{
     ThreadTurnToolMode,
 };
 use crate::goal_actor::{GoalContinuationStatus, GoalRuntimeHandle};
+use crate::goal_store::{
+    AdmittedGoalContinuationForSurface, BeginGoalOuterTurnForSurfaceInput,
+    CreateGoalAndPrepareRunForSurfaceInput, CreateGoalInput, EditGoalAndPrepareRunForSurfaceInput,
+    FinishGoalOuterTurnForSurfaceInput, GoalStore, GoalSurfaceMutation, GoalSurfaceMutationContext,
+    GoalSurfaceMutationRecord, GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate,
+    PauseGoalForSurfaceInput, PrepareGoalRunForSurfaceInput, RecoverGoalRunForSurfaceInput,
+    ReplaceGoalContinuationForSurfaceInput,
+};
+use crate::goal_verifier::{
+    DeepSeekGoalVerifier, DeterministicGoalVerifier, GoalVerificationRequest, GoalVerifier,
+};
 use crate::hooks::HookContext;
 use crate::lifecycle::{
     RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeTaskKind,
@@ -55,6 +66,14 @@ pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS: usize = 3;
+#[cfg(test)]
+static PASSTHROUGH_FINISH_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn inject_passthrough_finish_failure_once() {
+    PASSTHROUGH_FINISH_FAILURES.store(1, std::sync::atomic::Ordering::SeqCst);
+}
 
 pub trait HostedOperationWriter: io::Write + Send + 'static {
     fn finish_generation(&mut self, commit_terminal: bool) -> io::Result<()>;
@@ -82,6 +101,19 @@ impl<W: io::Write> io::Write for PassthroughHostedOperationWriter<W> {
 
 impl<W: io::Write + Send + 'static> HostedOperationWriter for PassthroughHostedOperationWriter<W> {
     fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
+        #[cfg(test)]
+        if PASSTHROUGH_FINISH_FAILURES
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(io::Error::other(
+                "injected passthrough generation finish failure",
+            ));
+        }
         self.writer.flush()
     }
 }
@@ -292,6 +324,8 @@ pub struct HostedTurnRequest {
     generation_handler_factory: Option<Arc<HostedGenerationHandlerFactory>>,
     pending_interactions: Option<RuntimePendingInteractionStore>,
     usage_credit: UsageTotals,
+    surface_goal_owned: bool,
+    surface_goal_turn: Option<crate::goal_actor::GoalTurnContext>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -451,6 +485,8 @@ impl HostedTurnRequest {
             generation_handler_factory: None,
             pending_interactions: None,
             usage_credit: UsageTotals::default(),
+            surface_goal_owned: false,
+            surface_goal_turn: None,
         }
     }
 
@@ -526,6 +562,12 @@ impl HostedTurnRequest {
         origin: orca_core::goal_runtime::GoalTurnOrigin,
     ) -> Self {
         self.goal_turn_origin = origin;
+        self
+    }
+
+    fn with_surface_goal_owned(mut self, turn: crate::goal_actor::GoalTurnContext) -> Self {
+        self.surface_goal_owned = true;
+        self.surface_goal_turn = Some(turn);
         self
     }
 
@@ -2163,6 +2205,47 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    pub(crate) fn set_goal(
+        &self,
+        session_id: &str,
+        objective: String,
+        at: i64,
+    ) -> Result<orca_core::goal_types::ThreadGoal, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::SetGoal {
+            session_id: session_id.to_string(),
+            objective,
+            at,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub(crate) fn edit_goal(
+        &self,
+        session_id: &str,
+        objective: String,
+        at: i64,
+    ) -> Result<Option<orca_core::goal_types::ThreadGoal>, RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::EditGoal {
+            session_id: session_id.to_string(),
+            objective,
+            at,
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub(crate) fn clear_goal(&self, session_id: &str) -> Result<(), RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::ClearGoal {
+            session_id: session_id.to_string(),
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     pub fn mutate(&self, mutation: RuntimeThreadMutation) -> Result<(), RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::MutateIdle {
@@ -2502,6 +2585,17 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfacePauseGoalOperation {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        goal_fence: surface::SurfaceGoalFence,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::PauseGoalOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
     SurfaceResumeOperation {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
@@ -2558,6 +2652,17 @@ enum ThreadCommand {
         reply: SyncSender<
             Result<
                 surface::MutationReply<surface::PinnedContextMutationOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
+    SurfaceGoalMutation {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::GoalMutationAction,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::GoalMutationOutput>,
                 surface::SurfaceClientCommandError,
             >,
         >,
@@ -2697,6 +2802,22 @@ enum ThreadCommand {
     GoalRuntime {
         reply: SyncSender<Result<GoalRuntimeHandle, RuntimeHostError>>,
     },
+    SetGoal {
+        session_id: String,
+        objective: String,
+        at: i64,
+        reply: SyncSender<Result<orca_core::goal_types::ThreadGoal, RuntimeHostError>>,
+    },
+    EditGoal {
+        session_id: String,
+        objective: String,
+        at: i64,
+        reply: SyncSender<Result<Option<orca_core::goal_types::ThreadGoal>, RuntimeHostError>>,
+    },
+    ClearGoal {
+        session_id: String,
+        reply: SyncSender<Result<(), RuntimeHostError>>,
+    },
     MutateIdle {
         mutation: RuntimeThreadMutation,
         reply: SyncSender<Result<(), RuntimeHostError>>,
@@ -2721,6 +2842,7 @@ struct SurfaceActorTestProbe {
     waiter_count: usize,
     legacy_completion: Option<OperationCompletion>,
     pending_manual_compaction_completion: bool,
+    pending_admission_repair: bool,
     exact_interaction_selector: Option<surface::InteractionSelector>,
     secret_bearing_interaction_count: usize,
     pending_capability_loss: Option<PendingCapabilityLossTestProbe>,
@@ -3169,6 +3291,21 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         })
     }
 
+    fn pause_goal_operation(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        goal_fence: surface::SurfaceGoalFence,
+    ) -> Result<surface::MutationReply<surface::PauseGoalOutput>, surface::SurfaceClientCommandError>
+    {
+        self.dispatch(|reply| ThreadCommand::SurfacePauseGoalOperation {
+            client,
+            request_id,
+            goal_fence,
+            reply,
+        })
+    }
+
     fn resume_operation(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -3257,6 +3394,23 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         })
     }
 
+    fn goal_mutation(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::GoalMutationAction,
+    ) -> Result<
+        surface::MutationReply<surface::GoalMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceGoalMutation {
+            client,
+            request_id,
+            action,
+            reply,
+        })
+    }
+
     fn respond_interaction_by_id(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -3331,6 +3485,405 @@ fn unavailable_surface_handle(
         BTreeSet::new(),
     );
     surface::RuntimeSurfaceHandle::new(host_incarnation, thread_id, authority)
+}
+
+fn settle_goal_surface_mutation_on_start(
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+    runtime: &GoalRuntimeHandle,
+    mutation: &GoalSurfaceMutationRecord,
+) -> Result<(), RuntimeHostError> {
+    let thread_id = coordinator.state().snapshot().thread.thread_id.clone();
+    let (goal_fence, receipt_digest, commit_id, scope, event) =
+        surface_goal_mutation_event(mutation, thread_id)?;
+    if !coordinator
+        .state()
+        .has_goal_store_receipt(&commit_id, &receipt_digest)
+    {
+        let mut events = vec![(scope, event)];
+        let operation = goal_surface_operation(mutation);
+        if let Some(operation) = operation {
+            events.push((
+                surface::SurfaceScope::Operation {
+                    operation_id: operation.operation_id.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Requested {
+                    operation: operation.clone(),
+                }),
+            ));
+        }
+        let batch =
+            recorded_surface_event_batch(coordinator.state().snapshot(), events, Some(commit_id));
+        let mut committed = false;
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            let result = if operation.is_some() {
+                coordinator.commit_actor_goal_batch(
+                    goal_fence.clone(),
+                    receipt_digest.clone(),
+                    &batch,
+                )
+            } else {
+                coordinator.commit_goal_batch(goal_fence.clone(), receipt_digest.clone(), &batch)
+            };
+            match result {
+                Ok(_) => {
+                    committed = true;
+                    break;
+                }
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) => {}
+                Err(error) => {
+                    return Err(RuntimeHostError::ThreadStartFailed {
+                        message: format!(
+                            "failed to recover durable Goal surface mutation: {error:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        if !committed {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "durable Goal surface mutation did not recover after bounded retries"
+                    .to_string(),
+            });
+        }
+    }
+    let acknowledged = runtime
+        .acknowledge_surface_mutation(
+            &mutation.receipt.store_commit_id,
+            &mutation.receipt.receipt_digest,
+        )
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to settle recovered Goal surface outbox: {error}"),
+        })?;
+    if !acknowledged {
+        return Err(RuntimeHostError::ThreadStartFailed {
+            message: "recovered Goal surface outbox rejected its exact receipt".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn replace_interrupted_goal_continuation_on_start(
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+    runtime: &GoalRuntimeHandle,
+    pending: &[GoalSurfaceMutationRecord],
+) -> Result<BTreeSet<String>, RuntimeHostError> {
+    let interrupted = pending.iter().rev().find(|mutation| {
+        matches!(
+            mutation.mutation,
+            GoalSurfaceMutation::ContinuationStopped { .. }
+                | GoalSurfaceMutation::ContinuationAdmitted { .. }
+        ) && surface_goal_mutation_event(
+            mutation,
+            coordinator.state().snapshot().thread.thread_id.clone(),
+        )
+        .is_ok_and(|(_, receipt_digest, commit_id, _, _)| {
+            !coordinator
+                .state()
+                .has_goal_store_receipt(&commit_id, &receipt_digest)
+        })
+    });
+    let Some(interrupted) = interrupted else {
+        return Ok(BTreeSet::new());
+    };
+    let predecessor = match &interrupted.mutation {
+        GoalSurfaceMutation::ContinuationStopped { predecessor, .. }
+        | GoalSurfaceMutation::ContinuationAdmitted { predecessor, .. } => predecessor.as_ref(),
+        _ => unreachable!("interrupted mutation was filtered"),
+    };
+    let snapshot = coordinator.state().snapshot();
+    let goal = snapshot
+        .goal
+        .as_ref()
+        .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+            message: "interrupted Goal continuation has no typed Goal snapshot".to_string(),
+        })?;
+    let run = goal
+        .current_run
+        .as_ref()
+        .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+            message: "interrupted Goal continuation has no current typed run".to_string(),
+        })?;
+    if goal.goal_id.as_str() != predecessor.goal_id.as_str()
+        || run.goal_run_id.as_str() != predecessor.goal_run_id.as_str()
+        || run.operation_id != predecessor.operation_fence.operation_id
+    {
+        return Err(RuntimeHostError::ThreadStartFailed {
+            message: "interrupted Goal continuation disagrees with the typed run".to_string(),
+        });
+    }
+    let stale_run_settled = match &run.phase {
+        surface::SurfaceGoalRunPhase::InFlight { outer_turn }
+            if outer_turn.outer_turn_id == predecessor.goal_outer_turn_id =>
+        {
+            false
+        }
+        surface::SurfaceGoalRunPhase::Settled {
+            last_outer_turn: Some(outer_turn),
+        } if outer_turn.outer_turn_id == predecessor.goal_outer_turn_id => true,
+        _ => {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "interrupted Goal continuation cannot close a different outer turn"
+                    .to_string(),
+            });
+        }
+    };
+    let surface_previous_revision = u32::try_from(goal.goal_revision.get()).map_err(|_| {
+        RuntimeHostError::ThreadStartFailed {
+            message: "Goal revision exceeds durable store range".to_string(),
+        }
+    })?;
+    let recovery_message =
+        "recovered a committed Goal settlement whose continuation batch was interrupted";
+    let command_digest = *surface_sha256(
+        &serde_json::to_vec(&(
+            "replace_interrupted_goal_continuation",
+            &interrupted.receipt.store_commit_id,
+            &interrupted.receipt.receipt_digest,
+            surface_previous_revision,
+            stale_run_settled,
+        ))
+        .expect("Goal continuation recovery digest input is serializable"),
+    )
+    .as_bytes();
+    let recovery = runtime
+        .replace_continuation_with_recovery_for_surface(
+            ReplaceGoalContinuationForSurfaceInput {
+                interrupted: interrupted.clone(),
+                surface_previous_revision,
+                stale_run_settled,
+                recovery_message: recovery_message.to_string(),
+                recovered_at: chrono::Utc::now().timestamp(),
+            },
+            GoalSurfaceMutationContext {
+                store_commit_id: uuid::Uuid::now_v7().to_string(),
+                command_digest,
+                goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+            },
+        )
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!(
+                "failed to create a durable Goal continuation recovery receipt: {error}"
+            ),
+        })?;
+    settle_goal_surface_mutation_on_start(coordinator, runtime, &recovery)?;
+
+    let mut superseded = BTreeSet::new();
+    for mutation in pending {
+        let same_predecessor = match &mutation.mutation {
+            GoalSurfaceMutation::OuterTurnFinished { identity, .. }
+            | GoalSurfaceMutation::VerificationCompleted { identity, .. } => {
+                identity.as_ref() == predecessor
+            }
+            GoalSurfaceMutation::ContinuationStopped {
+                predecessor: candidate,
+                ..
+            }
+            | GoalSurfaceMutation::ContinuationAdmitted {
+                predecessor: candidate,
+                ..
+            } => candidate.as_ref() == predecessor,
+            _ => false,
+        };
+        if !same_predecessor {
+            continue;
+        }
+        superseded.insert(mutation.receipt.store_commit_id.clone());
+    }
+    Ok(superseded)
+}
+
+fn reconcile_goal_surface_outbox_on_start(
+    thread: &mut RuntimeThread,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<(), RuntimeHostError> {
+    let Some(session_id) = thread.session().session_id().map(str::to_string) else {
+        return Ok(());
+    };
+    let store = GoalStore::load_default().map_err(|error| RuntimeHostError::ThreadStartFailed {
+        message: format!("failed to inspect Goal store for surface recovery: {error}"),
+    })?;
+    let has_pending = !store
+        .pending_surface_mutations(&session_id)
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to inspect durable Goal surface outbox: {error}"),
+        })?
+        .is_empty();
+    let has_goal = store
+        .get_by_session(&session_id)
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to inspect durable Goal for surface recovery: {error}"),
+        })?
+        .is_some();
+    if !has_pending && !has_goal {
+        return Ok(());
+    }
+    drop(store);
+    let runtime =
+        thread
+            .goal_runtime_handle()
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to open Goal runtime for surface recovery: {error}"),
+            })?;
+    let pending = runtime
+        .pending_surface_mutations(&session_id)
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to read durable Goal surface outbox: {error}"),
+        })?;
+    let superseded =
+        replace_interrupted_goal_continuation_on_start(coordinator, &runtime, &pending)?;
+    for mutation in pending {
+        if superseded.contains(&mutation.receipt.store_commit_id) {
+            continue;
+        }
+        settle_goal_surface_mutation_on_start(coordinator, &runtime, &mutation)?;
+    }
+    let stored =
+        runtime
+            .read(&session_id)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to inspect durable Goal during surface recovery: {error}"),
+            })?;
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let surface_goal = coordinator.state().snapshot().goal.clone();
+    match surface_goal {
+        None => {
+            let owner_epoch = coordinator.state().snapshot().thread.owner_epoch.get();
+            let command_digest = *surface_sha256(
+                &serde_json::to_vec(&("adopt_goal", &session_id, &stored))
+                    .expect("Goal adoption digest input is serializable"),
+            )
+            .as_bytes();
+            let mutation = runtime
+                .adopt_for_surface(
+                    &session_id,
+                    GoalSurfaceMutationContext {
+                        store_commit_id: uuid::Uuid::now_v7().to_string(),
+                        command_digest,
+                        goal_owner_epoch: owner_epoch,
+                    },
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to adopt legacy Goal into typed surface: {error}"),
+                })?;
+            settle_goal_surface_mutation_on_start(coordinator, &runtime, &mutation)?;
+        }
+        Some(goal) => {
+            if stored.goal_id.as_str() != goal.goal_id.as_str() {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: "Goal store identity disagrees with recovered typed surface"
+                        .to_string(),
+                });
+            }
+            if let (Some(stored_run), Some(surface_run)) =
+                (stored.current_run.as_ref(), goal.current_run.as_ref())
+            {
+                if stored_run.goal_run_id.as_str() != surface_run.goal_run_id.as_str() {
+                    return Err(RuntimeHostError::ThreadStartFailed {
+                        message: "Goal store run identity disagrees with recovered typed surface"
+                            .to_string(),
+                    });
+                }
+                let operation_terminal = coordinator
+                    .state()
+                    .snapshot()
+                    .operation_history
+                    .iter()
+                    .any(|operation| {
+                        operation.operation_id == surface_run.operation_id
+                            && operation.terminal.is_some()
+                    });
+                if operation_terminal {
+                    let stale_identity = match &surface_run.phase {
+                        surface::SurfaceGoalRunPhase::Preparing => None,
+                        surface::SurfaceGoalRunPhase::InFlight { .. } => Some(
+                            coordinator
+                                .state()
+                                .snapshot()
+                                .operation_history
+                                .iter()
+                                .find(|operation| {
+                                    operation.operation_id == surface_run.operation_id
+                                })
+                                .and_then(|operation| {
+                                    operation
+                                        .generations
+                                        .iter()
+                                        .rev()
+                                        .find_map(|generation| generation.goal_identity.clone())
+                                })
+                                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                                    message: "in-flight Goal recovery lacks its exact generation identity"
+                                        .to_string(),
+                                })?,
+                        ),
+                        surface::SurfaceGoalRunPhase::Settled { .. } => {
+                            return Err(RuntimeHostError::ThreadStartFailed {
+                                message:
+                                    "terminal operation cannot recover an already-settled Goal run"
+                                        .to_string(),
+                            });
+                        }
+                    };
+                    let expected_goal_revision =
+                        u32::try_from(goal.goal_revision.get()).map_err(|_| {
+                            RuntimeHostError::ThreadStartFailed {
+                                message: "Goal revision exceeds durable store range".to_string(),
+                            }
+                        })?;
+                    let recovery_message =
+                        "recovered a Goal run whose runtime operation ended during restart"
+                            .to_string();
+                    let command_digest = *surface_sha256(
+                        &serde_json::to_vec(&(
+                            "recover_goal_run",
+                            &session_id,
+                            goal.goal_id.as_str(),
+                            goal.goal_revision.get(),
+                            surface_run.operation_id.as_bytes(),
+                            &stale_identity,
+                        ))
+                        .expect("Goal recovery digest input is serializable"),
+                    )
+                    .as_bytes();
+                    let mutation = runtime
+                        .recover_run_for_surface(
+                            RecoverGoalRunForSurfaceInput {
+                                session_id: session_id.clone(),
+                                expected_goal_id: stored.goal_id,
+                                expected_goal_revision,
+                                stale_identity: stale_identity.map(Box::new),
+                                recovery_message,
+                                recovered_at: chrono::Utc::now().timestamp(),
+                            },
+                            GoalSurfaceMutationContext {
+                                store_commit_id: uuid::Uuid::now_v7().to_string(),
+                                command_digest,
+                                goal_owner_epoch: coordinator
+                                    .state()
+                                    .snapshot()
+                                    .thread
+                                    .owner_epoch
+                                    .get(),
+                            },
+                        )
+                        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                            message: format!("failed to recover durable Goal run: {error}"),
+                        })?;
+                    settle_goal_surface_mutation_on_start(coordinator, &runtime, &mutation)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bootstrap_recorded_surface(
@@ -3463,6 +4016,7 @@ fn bootstrap_recorded_surface(
             }
         }
     }
+    reconcile_goal_surface_outbox_on_start(thread, &mut coordinator)?;
     hydrate_session_pinned_context_from_surface(
         thread,
         coordinator
@@ -3480,6 +4034,7 @@ fn bootstrap_recorded_surface(
             surface::SurfaceCapability::ReadSnapshot,
             surface::SurfaceCapability::SubmitOperation,
             surface::SurfaceCapability::ControlBoundOperation,
+            surface::SurfaceCapability::ManageGoal,
             surface::SurfaceCapability::ManageThreadSettings,
             surface::SurfaceCapability::ManagePinnedContext,
             surface::SurfaceCapability::RespondGrantedInteraction,
@@ -3906,6 +4461,7 @@ struct ThreadActor {
     usage_ledger: RuntimeUsageLedger,
     resident_surface: ResidentSurfaceSlot,
     pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
+    pending_goal_completion_recovery: Option<PendingSurfaceGoalCompletionRecovery>,
     surface_terminal_blocked: Option<String>,
 }
 
@@ -3981,13 +4537,25 @@ struct PendingSurfaceAdmissionRepair {
     finalize_intent_id: surface::SurfaceFinalizeIntentId,
     terminal_commit_id: surface::SurfaceCommitId,
     terminal: surface::OperationTerminal,
+    legacy_completion: Option<OperationCompletion>,
+    legacy_terminal: Option<OperationTerminal>,
+    goal_recovery_owned: bool,
     retry_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct PendingSurfaceGoalAdmissionCommit {
+    runtime: GoalRuntimeHandle,
+    mutation: GoalSurfaceMutationRecord,
+    goal_fence: surface::SurfaceGoalFence,
+    receipt_digest: surface::Sha256Digest,
 }
 
 #[derive(Clone)]
 struct PendingSurfaceAdmissionCommit {
     fence: surface::SurfaceOperationFence,
     batch: surface::SurfaceCommitBatch,
+    goal: Option<PendingSurfaceGoalAdmissionCommit>,
     message: &'static str,
     retry_at: tokio::time::Instant,
 }
@@ -3995,6 +4563,7 @@ struct PendingSurfaceAdmissionCommit {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PendingSurfaceTransitionRetry {
     ManualCompactionCompletion,
+    GoalCompletionRecovery,
     AdmissionCommit(surface::SurfaceOperationId),
     AdmissionRepair(surface::SurfaceOperationId),
     AdmissionTerminal(surface::SurfaceOperationId),
@@ -4083,6 +4652,962 @@ fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     surface::Sha256Digest::new(hasher.finalize().into())
+}
+
+fn surface_goal_state(
+    state: &orca_core::goal_runtime::GoalState,
+) -> Result<surface::SurfaceGoalState, RuntimeHostError> {
+    use orca_core::goal_runtime::GoalState;
+    Ok(match state {
+        GoalState::Active => surface::SurfaceGoalState::Active,
+        GoalState::Paused { reason, message } => surface::SurfaceGoalState::Paused {
+            reason: match reason {
+                orca_core::goal_runtime::GoalPauseReason::User => {
+                    surface::SurfaceGoalPauseReason::User
+                }
+                orca_core::goal_runtime::GoalPauseReason::NoProgress => {
+                    surface::SurfaceGoalPauseReason::NoProgress
+                }
+                orca_core::goal_runtime::GoalPauseReason::Backoff => {
+                    surface::SurfaceGoalPauseReason::Backoff
+                }
+                orca_core::goal_runtime::GoalPauseReason::Infrastructure => {
+                    surface::SurfaceGoalPauseReason::Infrastructure
+                }
+                orca_core::goal_runtime::GoalPauseReason::WaitingForWorkflow => {
+                    surface::SurfaceGoalPauseReason::WaitingForWorkflow
+                }
+                orca_core::goal_runtime::GoalPauseReason::Recovery => {
+                    surface::SurfaceGoalPauseReason::Recovery
+                }
+                orca_core::goal_runtime::GoalPauseReason::UsageLimit => {
+                    surface::SurfaceGoalPauseReason::UsageLimit
+                }
+            },
+            message: surface::DisplayText::new(message),
+        },
+        GoalState::Blocked { blocker } => surface::SurfaceGoalState::Blocked {
+            blocker: surface_goal_blocker(blocker)?,
+        },
+        GoalState::BudgetLimited => surface::SurfaceGoalState::BudgetLimited,
+        GoalState::Complete { evidence } => surface::SurfaceGoalState::Complete {
+            evidence: evidence
+                .iter()
+                .map(surface_goal_evidence)
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+    })
+}
+
+fn surface_goal_evidence(
+    evidence: &orca_core::goal_runtime::EvidenceItem,
+) -> Result<surface::SurfaceEvidenceItem, RuntimeHostError> {
+    Ok(surface::SurfaceEvidenceItem {
+        kind: match evidence.kind {
+            orca_core::goal_runtime::EvidenceKind::Test => surface::SurfaceEvidenceKind::Test,
+            orca_core::goal_runtime::EvidenceKind::File => surface::SurfaceEvidenceKind::File,
+            orca_core::goal_runtime::EvidenceKind::Command => surface::SurfaceEvidenceKind::Command,
+            orca_core::goal_runtime::EvidenceKind::Observation => {
+                surface::SurfaceEvidenceKind::Observation
+            }
+            orca_core::goal_runtime::EvidenceKind::External => {
+                surface::SurfaceEvidenceKind::External
+            }
+        },
+        summary: surface::NonEmptyText::try_new(evidence.summary.clone())
+            .map_err(surface_goal_value_error)?,
+        target: evidence.target.clone().map(surface::DisplayText::new),
+    })
+}
+
+fn surface_goal_intent(
+    intent: &orca_core::goal_runtime::GoalUpdateIntent,
+) -> Result<surface::SurfaceGoalIntent, RuntimeHostError> {
+    let intent_id = surface::SurfaceGoalIntentId::try_new(intent.intent_id.to_string())
+        .map_err(surface_goal_value_error)?;
+    let reason =
+        surface::NonEmptyText::try_new(intent.reason.clone()).map_err(surface_goal_value_error)?;
+    let evidence = intent
+        .evidence
+        .iter()
+        .map(surface_goal_evidence)
+        .collect::<Result<Vec<_>, _>>()?;
+    match intent.requested_state {
+        orca_core::goal_runtime::GoalRequestedState::Complete => {
+            Ok(surface::SurfaceGoalIntent::Complete {
+                intent_id,
+                reason,
+                evidence: surface::NonEmptyVec::try_new(evidence)
+                    .map_err(surface_goal_value_error)?,
+            })
+        }
+        orca_core::goal_runtime::GoalRequestedState::Blocked => {
+            let blocker =
+                intent
+                    .blocker
+                    .as_ref()
+                    .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                        message: "blocked Goal intent lost its blocker".to_string(),
+                    })?;
+            Ok(surface::SurfaceGoalIntent::Blocked {
+                intent_id,
+                reason,
+                blocker: surface_goal_blocker(blocker)?,
+                evidence,
+            })
+        }
+    }
+}
+
+fn surface_goal_intent_ack(
+    ack: &orca_core::goal_runtime::GoalUpdateAck,
+) -> Result<surface::SurfaceGoalIntentAck, RuntimeHostError> {
+    use orca_core::goal_runtime::{GoalRejectCode, GoalUpdateAck};
+    Ok(match ack {
+        GoalUpdateAck::DeferredToTurnEnd {
+            intent_id,
+            pending_depth,
+        } => surface::SurfaceGoalIntentAck::DeferredToTurnEnd {
+            intent_id: surface::SurfaceGoalIntentId::try_new(intent_id.to_string())
+                .map_err(surface_goal_value_error)?,
+            pending_depth: *pending_depth,
+        },
+        GoalUpdateAck::AlreadyPending { intent_id } => {
+            surface::SurfaceGoalIntentAck::AlreadyPending {
+                intent_id: surface::SurfaceGoalIntentId::try_new(intent_id.to_string())
+                    .map_err(surface_goal_value_error)?,
+            }
+        }
+        GoalUpdateAck::Rejected { code, message } => surface::SurfaceGoalIntentAck::Rejected {
+            code: match code {
+                GoalRejectCode::Inactive | GoalRejectCode::NoActiveOuterTurn => {
+                    surface::GoalIntentRejectionCode::NoActiveOuterTurn
+                }
+                GoalRejectCode::TerminalIntentPending => {
+                    surface::GoalIntentRejectionCode::TerminalIntentPending
+                }
+                GoalRejectCode::MissingEvidence => {
+                    surface::GoalIntentRejectionCode::MissingEvidence
+                }
+                GoalRejectCode::MissingBlocker => surface::GoalIntentRejectionCode::MissingBlocker,
+                GoalRejectCode::StaleIdentity => surface::GoalIntentRejectionCode::StaleIdentity,
+            },
+            message: surface::DisplayText::new(message),
+        },
+        GoalUpdateAck::BlockedAgainstInactive { state } => {
+            surface::SurfaceGoalIntentAck::BlockedAgainstInactive {
+                state: surface_goal_state(state)?,
+            }
+        }
+    })
+}
+
+fn surface_goal_verification(
+    result: &orca_core::goal_runtime::GoalVerificationResult,
+) -> Result<surface::SurfaceGoalVerification, RuntimeHostError> {
+    Ok(match result {
+        orca_core::goal_runtime::GoalVerificationResult::Achieved { evidence } => {
+            surface::SurfaceGoalVerification::Achieved {
+                evidence: evidence
+                    .iter()
+                    .map(surface_goal_evidence)
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        }
+        orca_core::goal_runtime::GoalVerificationResult::NotAchieved { gaps } => {
+            surface::SurfaceGoalVerification::NotAchieved {
+                gaps: gaps
+                    .iter()
+                    .map(|gap| {
+                        Ok(surface::SurfaceGoalGap {
+                            summary: surface::NonEmptyText::try_new(gap.summary.clone())
+                                .map_err(surface_goal_value_error)?,
+                            fingerprint: surface::NonEmptyText::try_new(gap.fingerprint.clone())
+                                .map_err(surface_goal_value_error)?,
+                            model_fixable: gap.model_fixable,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, RuntimeHostError>>()?,
+            }
+        }
+        orca_core::goal_runtime::GoalVerificationResult::Blocked { blocker } => {
+            surface::SurfaceGoalVerification::Blocked {
+                blocker: surface_goal_blocker(blocker)?,
+            }
+        }
+        orca_core::goal_runtime::GoalVerificationResult::Indeterminate { message } => {
+            surface::SurfaceGoalVerification::Indeterminate {
+                message: surface::DisplayText::new(message),
+            }
+        }
+    })
+}
+
+fn surface_goal_blocker(
+    blocker: &orca_core::goal_runtime::BlockerSummary,
+) -> Result<surface::SurfaceBlocker, RuntimeHostError> {
+    Ok(surface::SurfaceBlocker {
+        kind: match blocker.kind {
+            orca_core::goal_runtime::BlockerKind::UserDecision => {
+                surface::SurfaceBlockerKind::UserDecision
+            }
+            orca_core::goal_runtime::BlockerKind::MissingAuthority => {
+                surface::SurfaceBlockerKind::MissingAuthority
+            }
+            orca_core::goal_runtime::BlockerKind::ExternalState => {
+                surface::SurfaceBlockerKind::ExternalState
+            }
+            orca_core::goal_runtime::BlockerKind::EnvironmentContradiction => {
+                surface::SurfaceBlockerKind::EnvironmentContradiction
+            }
+            orca_core::goal_runtime::BlockerKind::UnverifiableRequirement => {
+                surface::SurfaceBlockerKind::UnverifiableRequirement
+            }
+        },
+        summary: surface::NonEmptyText::try_new(blocker.summary.clone())
+            .map_err(surface_goal_value_error)?,
+        fingerprint: surface::NonEmptyText::try_new(blocker.fingerprint.clone())
+            .map_err(surface_goal_value_error)?,
+        evidence: blocker
+            .evidence
+            .iter()
+            .map(surface_goal_evidence)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn surface_goal_value_error(error: surface::SurfaceValueError) -> RuntimeHostError {
+    RuntimeHostError::GoalControlFailed {
+        message: format!("invalid durable Goal projection: {error:?}"),
+    }
+}
+
+fn surface_goal_from_record(
+    record: &orca_core::goal_runtime::GoalRecord,
+    receipt: &crate::goal_store::GoalSurfaceStoreReceipt,
+    thread_id: surface::SurfaceThreadId,
+    current_run: Option<surface::SurfaceGoalRun>,
+) -> Result<surface::SurfaceGoal, RuntimeHostError> {
+    if record.current_run.is_some() != current_run.is_some() {
+        return Err(RuntimeHostError::GoalControlFailed {
+            message: "durable Goal row and typed run binding disagree".to_string(),
+        });
+    }
+    Ok(surface::SurfaceGoal {
+        goal_id: surface::SurfaceGoalId::try_new(record.goal_id.to_string())
+            .map_err(surface_goal_value_error)?,
+        thread_id,
+        goal_revision: surface::GoalRevision::try_new(u64::from(receipt.goal_revision))
+            .map_err(surface_goal_value_error)?,
+        goal_owner_epoch: surface::GoalOwnerEpoch::try_new(receipt.goal_owner_epoch)
+            .map_err(surface_goal_value_error)?,
+        catalog_revision: surface::GoalCatalogRevision::try_new(u64::from(
+            receipt.catalog_revision,
+        ))
+        .map_err(surface_goal_value_error)?,
+        objective: surface::NonEmptyText::try_new(record.objective.clone())
+            .map_err(surface_goal_value_error)?,
+        objective_revision: surface::GoalObjectiveRevision::new(receipt.objective_revision),
+        state: surface_goal_state(&record.state)?,
+        token_budget: record.token_budget,
+        usage: surface::GoalUsage {
+            charged_input_tokens: record.usage.charged_input_tokens,
+            output_tokens: record.usage.output_tokens,
+            cache_tokens: record.usage.cache_tokens,
+            verifier_tokens: record.usage.verifier_tokens,
+            cost_micros: record.usage.cost_micros,
+            elapsed_seconds: record.usage.elapsed_seconds,
+        },
+        current_run,
+        last_transition: record
+            .last_transition
+            .as_ref()
+            .map(|transition| {
+                Ok(surface::SurfaceGoalTransition {
+                    previous: surface_goal_state(&transition.previous_state)?,
+                    next: surface_goal_state(&transition.next_state)?,
+                    reason_code: surface::NonEmptyText::try_new(transition.reason_code.clone())
+                        .map_err(surface_goal_value_error)?,
+                })
+            })
+            .transpose()?,
+    })
+}
+
+fn surface_preparing_goal_run(
+    record: &orca_core::goal_runtime::GoalRecord,
+    goal_run_id: &orca_core::goal_runtime::GoalRunId,
+    operation_id: &surface::SurfaceOperationId,
+    origin: orca_core::goal_runtime::GoalTurnOrigin,
+) -> Result<surface::SurfaceGoalRun, RuntimeHostError> {
+    let stored_run =
+        record
+            .current_run
+            .as_ref()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "durable Goal mutation is missing its preparing run".to_string(),
+            })?;
+    if &stored_run.goal_run_id != goal_run_id
+        || stored_run.origin != origin
+        || stored_run.in_flight
+        || stored_run.outer_turn_id.is_some()
+        || stored_run.continuation_count != 0
+    {
+        return Err(RuntimeHostError::GoalControlFailed {
+            message: "durable Goal mutation has an invalid preparing run".to_string(),
+        });
+    }
+    surface_goal_run_binding(goal_run_id, operation_id, origin)
+}
+
+fn surface_goal_run_binding(
+    goal_run_id: &orca_core::goal_runtime::GoalRunId,
+    operation_id: &surface::SurfaceOperationId,
+    origin: orca_core::goal_runtime::GoalTurnOrigin,
+) -> Result<surface::SurfaceGoalRun, RuntimeHostError> {
+    let run_origin = match origin {
+        orca_core::goal_runtime::GoalTurnOrigin::User => surface::SurfaceGoalRunOrigin::User,
+        orca_core::goal_runtime::GoalTurnOrigin::Resume => surface::SurfaceGoalRunOrigin::Resume,
+        orca_core::goal_runtime::GoalTurnOrigin::WorkflowNotification => {
+            surface::SurfaceGoalRunOrigin::WorkflowNotification
+        }
+        orca_core::goal_runtime::GoalTurnOrigin::Continuation => {
+            return Err(RuntimeHostError::GoalControlFailed {
+                message: "a continuation cannot start a new durable Goal run".to_string(),
+            });
+        }
+    };
+    Ok(surface::SurfaceGoalRun {
+        goal_run_id: surface::SurfaceGoalRunId::try_new(goal_run_id.to_string())
+            .map_err(surface_goal_value_error)?,
+        run_origin,
+        operation_id: operation_id.clone(),
+        phase: surface::SurfaceGoalRunPhase::Preparing,
+    })
+}
+
+fn surface_in_flight_goal_run(
+    record: &orca_core::goal_runtime::GoalRecord,
+    identity: &surface::SurfaceGoalGenerationIdentity,
+) -> Result<surface::SurfaceGoalRun, RuntimeHostError> {
+    let stored_run =
+        record
+            .current_run
+            .as_ref()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "durable Goal outer-turn mutation is missing its run".to_string(),
+            })?;
+    if stored_run.goal_run_id.as_str() != identity.goal_run_id.as_str()
+        || !stored_run.in_flight
+        || stored_run.continuation_count != identity.outer_turn_count
+        || stored_run
+            .outer_turn_id
+            .as_ref()
+            .is_none_or(|outer_turn_id| {
+                outer_turn_id.as_str() != identity.goal_outer_turn_id.as_str()
+            })
+    {
+        return Err(RuntimeHostError::GoalControlFailed {
+            message: "durable Goal outer-turn row disagrees with its typed identity".to_string(),
+        });
+    }
+    let mut run = surface_goal_run_binding(
+        &stored_run.goal_run_id,
+        &identity.operation_fence.operation_id,
+        stored_run.origin,
+    )?;
+    let origin = match identity.outer_turn_origin {
+        surface::GoalOuterTurnOrigin::User => surface::SurfaceGoalOuterTurnReceiptOrigin::User,
+        surface::GoalOuterTurnOrigin::Resume => surface::SurfaceGoalOuterTurnReceiptOrigin::Resume,
+        surface::GoalOuterTurnOrigin::Continuation => {
+            surface::SurfaceGoalOuterTurnReceiptOrigin::Continuation
+        }
+        surface::GoalOuterTurnOrigin::WorkflowNotification => {
+            surface::SurfaceGoalOuterTurnReceiptOrigin::WorkflowNotification
+        }
+    };
+    run.phase = surface::SurfaceGoalRunPhase::InFlight {
+        outer_turn: surface::SurfaceGoalOuterTurnReceipt {
+            outer_turn_id: identity.goal_outer_turn_id.clone(),
+            origin,
+            outer_turn_count: identity.outer_turn_count,
+        },
+    };
+    Ok(run)
+}
+
+fn surface_settled_goal_run(
+    record: &orca_core::goal_runtime::GoalRecord,
+    identity: &surface::SurfaceGoalGenerationIdentity,
+) -> Result<surface::SurfaceGoalRun, RuntimeHostError> {
+    let stored_run =
+        record
+            .current_run
+            .as_ref()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "durable Goal settlement is missing its run".to_string(),
+            })?;
+    if stored_run.goal_run_id.as_str() != identity.goal_run_id.as_str()
+        || stored_run.in_flight
+        || stored_run.outer_turn_id.is_some()
+        || stored_run.continuation_count != identity.outer_turn_count
+    {
+        return Err(RuntimeHostError::GoalControlFailed {
+            message: "durable Goal settlement row disagrees with its typed identity".to_string(),
+        });
+    }
+    let mut run = surface_goal_run_binding(
+        &stored_run.goal_run_id,
+        &identity.operation_fence.operation_id,
+        stored_run.origin,
+    )?;
+    let origin = match identity.outer_turn_origin {
+        surface::GoalOuterTurnOrigin::User => surface::SurfaceGoalOuterTurnReceiptOrigin::User,
+        surface::GoalOuterTurnOrigin::Resume => surface::SurfaceGoalOuterTurnReceiptOrigin::Resume,
+        surface::GoalOuterTurnOrigin::Continuation => {
+            surface::SurfaceGoalOuterTurnReceiptOrigin::Continuation
+        }
+        surface::GoalOuterTurnOrigin::WorkflowNotification => {
+            surface::SurfaceGoalOuterTurnReceiptOrigin::WorkflowNotification
+        }
+    };
+    run.phase = surface::SurfaceGoalRunPhase::Settled {
+        last_outer_turn: Some(surface::SurfaceGoalOuterTurnReceipt {
+            outer_turn_id: identity.goal_outer_turn_id.clone(),
+            origin,
+            outer_turn_count: identity.outer_turn_count,
+        }),
+    };
+    Ok(run)
+}
+
+fn goal_surface_operation(
+    mutation: &GoalSurfaceMutationRecord,
+) -> Option<&surface::OperationRecord> {
+    match &mutation.mutation {
+        GoalSurfaceMutation::CreatedWithRun { operation, .. }
+        | GoalSurfaceMutation::RunStarted { operation, .. } => Some(operation),
+        GoalSurfaceMutation::Created
+        | GoalSurfaceMutation::Edited { .. }
+        | GoalSurfaceMutation::Removed { .. }
+        | GoalSurfaceMutation::OuterTurnStarted { .. }
+        | GoalSurfaceMutation::IntentRequested { .. }
+        | GoalSurfaceMutation::IntentAcknowledged { .. }
+        | GoalSurfaceMutation::OuterTurnFinished { .. }
+        | GoalSurfaceMutation::VerificationCompleted { .. }
+        | GoalSurfaceMutation::Paused { .. }
+        | GoalSurfaceMutation::ContinuationStopped { .. }
+        | GoalSurfaceMutation::ContinuationAdmitted { .. }
+        | GoalSurfaceMutation::Recovered { .. } => None,
+    }
+}
+
+fn surface_goal_mutation_event(
+    mutation: &GoalSurfaceMutationRecord,
+    thread_id: surface::SurfaceThreadId,
+) -> Result<
+    (
+        surface::SurfaceGoalFence,
+        surface::Sha256Digest,
+        surface::SurfaceCommitId,
+        surface::SurfaceScope,
+        surface::SurfaceEvent,
+    ),
+    RuntimeHostError,
+> {
+    let receipt = &mutation.receipt;
+    let goal_id = surface::SurfaceGoalId::try_new(receipt.goal_id.to_string())
+        .map_err(surface_goal_value_error)?;
+    let goal_revision = surface::GoalRevision::try_new(u64::from(receipt.goal_revision))
+        .map_err(surface_goal_value_error)?;
+    let goal_owner_epoch = surface::GoalOwnerEpoch::try_new(receipt.goal_owner_epoch)
+        .map_err(surface_goal_value_error)?;
+    let catalog_revision =
+        surface::GoalCatalogRevision::try_new(u64::from(receipt.catalog_revision))
+            .map_err(surface_goal_value_error)?;
+    let receipt_digest = surface::Sha256Digest::new(receipt.receipt_digest);
+    let raw_commit_id = uuid::Uuid::parse_str(&receipt.store_commit_id).map_err(|error| {
+        RuntimeHostError::GoalControlFailed {
+            message: format!("invalid durable Goal commit identity: {error}"),
+        }
+    })?;
+    let store_commit_id = surface::SurfaceCommitId::try_from_bytes(*raw_commit_id.as_bytes())
+        .map_err(surface_goal_value_error)?;
+    let (row_state, patch) = match (&receipt.row_state, &mutation.mutation) {
+        (GoalSurfaceRowState::Present(record), GoalSurfaceMutation::Created) => {
+            let goal = surface_goal_from_record(record, receipt, thread_id, None)?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: goal.state.clone(),
+                    current_run: goal.current_run.clone(),
+                },
+                surface::GoalPatch::Created { goal },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::CreatedWithRun {
+                goal_run_id,
+                operation,
+                origin,
+            },
+        ) => {
+            let goal_run =
+                surface_preparing_goal_run(record, goal_run_id, &operation.operation_id, *origin)?;
+            let goal =
+                surface_goal_from_record(record, receipt, thread_id, Some(goal_run.clone()))?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: goal.state.clone(),
+                    current_run: Some(goal_run),
+                },
+                surface::GoalPatch::Created { goal },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::Edited { previous_revision },
+        ) => {
+            let goal = surface_goal_from_record(record, receipt, thread_id, None)?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: goal.state.clone(),
+                    current_run: goal.current_run.clone(),
+                },
+                surface::GoalPatch::Edited {
+                    goal_id: goal_id.clone(),
+                    previous_revision: surface::GoalRevision::try_new(u64::from(
+                        *previous_revision,
+                    ))
+                    .map_err(surface_goal_value_error)?,
+                    goal,
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Removed,
+            GoalSurfaceMutation::Removed {
+                previous_revision,
+                tombstone_revision,
+            },
+        ) => {
+            let tombstone_revision = surface::GoalRevision::try_new(u64::from(*tombstone_revision))
+                .map_err(surface_goal_value_error)?;
+            (
+                surface::SurfaceGoalReceiptState::Removed { tombstone_revision },
+                surface::GoalPatch::Removed {
+                    goal_id: goal_id.clone(),
+                    previous_revision: surface::GoalRevision::try_new(u64::from(
+                        *previous_revision,
+                    ))
+                    .map_err(surface_goal_value_error)?,
+                    tombstone_revision,
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::RunStarted {
+                goal_run_id,
+                operation,
+                origin,
+                ..
+            },
+        ) => {
+            let goal_run =
+                surface_preparing_goal_run(record, goal_run_id, &operation.operation_id, *origin)?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: Some(goal_run.clone()),
+                },
+                surface::GoalPatch::RunStarted {
+                    goal_id: goal_id.clone(),
+                    goal_run,
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::OuterTurnStarted { identity, .. },
+        ) => {
+            let goal_run = surface_in_flight_goal_run(record, identity)?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: Some(goal_run),
+                },
+                surface::GoalPatch::OuterTurnStarted {
+                    identity: identity.as_ref().clone(),
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::IntentRequested {
+                identity, intent, ..
+            },
+        ) => (
+            surface::SurfaceGoalReceiptState::Present {
+                state: surface_goal_state(&record.state)?,
+                current_run: Some(surface_in_flight_goal_run(record, identity)?),
+            },
+            surface::GoalPatch::IntentRequested {
+                goal_id: goal_id.clone(),
+                outer_turn_id: identity.goal_outer_turn_id.clone(),
+                intent: surface_goal_intent(intent)?,
+            },
+        ),
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::IntentAcknowledged {
+                identity,
+                intent,
+                ack,
+                ..
+            },
+        ) => (
+            surface::SurfaceGoalReceiptState::Present {
+                state: surface_goal_state(&record.state)?,
+                current_run: Some(surface_in_flight_goal_run(record, identity)?),
+            },
+            surface::GoalPatch::IntentAcknowledged {
+                goal_id: goal_id.clone(),
+                outer_turn_id: identity.goal_outer_turn_id.clone(),
+                intent: surface_goal_intent(intent)?,
+                ack: surface_goal_intent_ack(ack)?,
+            },
+        ),
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::OuterTurnFinished {
+                identity,
+                status,
+                usage,
+                next_action,
+                ..
+            },
+        ) => {
+            let goal_run = surface_settled_goal_run(record, identity)?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: Some(goal_run),
+                },
+                surface::GoalPatch::OuterTurnFinished {
+                    identity: identity.as_ref().clone(),
+                    status: *status,
+                    usage: usage.clone(),
+                    next_action: *next_action,
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::VerificationCompleted {
+                identity, result, ..
+            },
+        ) => {
+            let goal_run = surface_settled_goal_run(record, identity)?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: Some(goal_run),
+                },
+                surface::GoalPatch::VerificationCompleted {
+                    identity: identity.as_ref().clone(),
+                    result: result.clone(),
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::Paused {
+                goal_run_id,
+                operation_id,
+                outer_turn_id,
+                ..
+            },
+        ) => {
+            let stored_run =
+                record
+                    .current_run
+                    .as_ref()
+                    .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                        message: "paused Goal receipt lost its current run".to_string(),
+                    })?;
+            if &stored_run.goal_run_id != goal_run_id
+                || stored_run.outer_turn_id.as_ref() != outer_turn_id.as_ref()
+            {
+                return Err(RuntimeHostError::GoalControlFailed {
+                    message: "paused Goal receipt disagrees with its run identity".to_string(),
+                });
+            }
+            let mut goal_run =
+                surface_goal_run_binding(goal_run_id, operation_id, stored_run.origin)?;
+            goal_run.phase = match outer_turn_id {
+                Some(outer_turn_id) => surface::SurfaceGoalRunPhase::InFlight {
+                    outer_turn: surface::SurfaceGoalOuterTurnReceipt {
+                        outer_turn_id: surface::SurfaceGoalOuterTurnId::try_new(
+                            outer_turn_id.to_string(),
+                        )
+                        .map_err(surface_goal_value_error)?,
+                        origin: match stored_run.origin {
+                            orca_core::goal_runtime::GoalTurnOrigin::User => {
+                                surface::SurfaceGoalOuterTurnReceiptOrigin::User
+                            }
+                            orca_core::goal_runtime::GoalTurnOrigin::Resume => {
+                                surface::SurfaceGoalOuterTurnReceiptOrigin::Resume
+                            }
+                            orca_core::goal_runtime::GoalTurnOrigin::Continuation => {
+                                surface::SurfaceGoalOuterTurnReceiptOrigin::Continuation
+                            }
+                            orca_core::goal_runtime::GoalTurnOrigin::WorkflowNotification => {
+                                surface::SurfaceGoalOuterTurnReceiptOrigin::WorkflowNotification
+                            }
+                        },
+                        outer_turn_count: stored_run.continuation_count,
+                    },
+                },
+                None => surface::SurfaceGoalRunPhase::Preparing,
+            };
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: Some(goal_run),
+                },
+                surface::GoalPatch::Paused {
+                    goal_id: goal_id.clone(),
+                    goal_run_id: Some(
+                        surface::SurfaceGoalRunId::try_new(goal_run_id.to_string())
+                            .map_err(surface_goal_value_error)?,
+                    ),
+                    outer_turn_id: outer_turn_id
+                        .as_ref()
+                        .map(|outer_turn_id| {
+                            surface::SurfaceGoalOuterTurnId::try_new(outer_turn_id.to_string())
+                                .map_err(surface_goal_value_error)
+                        })
+                        .transpose()?,
+                    state: surface_goal_state(&record.state)?,
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::ContinuationStopped {
+                predecessor,
+                decision,
+                ..
+            },
+        ) => {
+            if record.current_run.is_some() {
+                return Err(RuntimeHostError::GoalControlFailed {
+                    message: "stopped Goal continuation retained an open run".to_string(),
+                });
+            }
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: None,
+                },
+                surface::GoalPatch::ContinuationDecided {
+                    goal_id: goal_id.clone(),
+                    predecessor: predecessor.as_ref().clone(),
+                    decision: decision.as_ref().clone(),
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::ContinuationAdmitted {
+                predecessor,
+                decision,
+                ..
+            },
+        ) => {
+            let surface::GoalContinuationDecision::Admitted { successor, .. } = decision.as_ref()
+            else {
+                return Err(RuntimeHostError::GoalControlFailed {
+                    message: "admitted Goal continuation stored a stopped decision".to_string(),
+                });
+            };
+            let goal_run = surface_in_flight_goal_run(record, successor)?;
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: Some(goal_run),
+                },
+                surface::GoalPatch::ContinuationDecided {
+                    goal_id: goal_id.clone(),
+                    predecessor: predecessor.as_ref().clone(),
+                    decision: decision.as_ref().clone(),
+                },
+            )
+        }
+        (
+            GoalSurfaceRowState::Present(record),
+            GoalSurfaceMutation::Recovered {
+                stale_goal_run_id,
+                operation,
+                origin,
+                stale_identity,
+                stale_run_settled,
+                recovery_message,
+                ..
+            },
+        ) => {
+            if record.current_run.is_some() {
+                return Err(RuntimeHostError::GoalControlFailed {
+                    message: "recovered durable Goal still has an open run".to_string(),
+                });
+            }
+            let mut stale_run =
+                surface_goal_run_binding(stale_goal_run_id, &operation.operation_id, *origin)?;
+            if let Some(identity) = stale_identity {
+                let receipt_origin = match identity.outer_turn_origin {
+                    surface::GoalOuterTurnOrigin::User => {
+                        surface::SurfaceGoalOuterTurnReceiptOrigin::User
+                    }
+                    surface::GoalOuterTurnOrigin::Resume => {
+                        surface::SurfaceGoalOuterTurnReceiptOrigin::Resume
+                    }
+                    surface::GoalOuterTurnOrigin::Continuation => {
+                        surface::SurfaceGoalOuterTurnReceiptOrigin::Continuation
+                    }
+                    surface::GoalOuterTurnOrigin::WorkflowNotification => {
+                        surface::SurfaceGoalOuterTurnReceiptOrigin::WorkflowNotification
+                    }
+                };
+                let outer_turn = surface::SurfaceGoalOuterTurnReceipt {
+                    outer_turn_id: identity.goal_outer_turn_id.clone(),
+                    origin: receipt_origin,
+                    outer_turn_count: identity.outer_turn_count,
+                };
+                stale_run.phase = if *stale_run_settled {
+                    surface::SurfaceGoalRunPhase::Settled {
+                        last_outer_turn: Some(outer_turn),
+                    }
+                } else {
+                    surface::SurfaceGoalRunPhase::InFlight { outer_turn }
+                };
+            }
+            (
+                surface::SurfaceGoalReceiptState::Present {
+                    state: surface_goal_state(&record.state)?,
+                    current_run: None,
+                },
+                surface::GoalPatch::Recovered {
+                    goal_id: goal_id.clone(),
+                    stale_run: surface::SurfaceGoalClosedRunReceipt {
+                        run: stale_run,
+                        close_reason: surface::SurfaceGoalCloseReason::Recovery,
+                        store_commit_id: store_commit_id.clone(),
+                        receipt_digest: receipt_digest.clone(),
+                    },
+                    recovery_message: surface::DisplayText::new(recovery_message.clone()),
+                    discarded_continuation: surface::DiscardedContinuation::new(),
+                },
+            )
+        }
+        _ => {
+            return Err(RuntimeHostError::GoalControlFailed {
+                message: "durable Goal mutation and row state disagree".to_string(),
+            });
+        }
+    };
+    let envelope = surface::GoalPatchEnvelope {
+        receipt: surface::SurfaceGoalStoreReceipt {
+            goal_id: goal_id.clone(),
+            goal_revision,
+            objective_revision: surface::GoalObjectiveRevision::new(receipt.objective_revision),
+            catalog_revision,
+            goal_owner_epoch,
+            row_state,
+            store_commit_id: store_commit_id.clone(),
+            receipt_digest: receipt_digest.clone(),
+        },
+        patch,
+    };
+    let causative_generation = match &envelope.patch {
+        surface::GoalPatch::OuterTurnStarted { identity }
+        | surface::GoalPatch::OuterTurnFinished { identity, .. }
+        | surface::GoalPatch::VerificationCompleted { identity, .. } => {
+            Some(identity.operation_fence.clone())
+        }
+        surface::GoalPatch::ContinuationDecided { predecessor, .. } => {
+            Some(predecessor.operation_fence.clone())
+        }
+        _ => None,
+    };
+    Ok((
+        surface::SurfaceGoalFence {
+            goal_id: goal_id.clone(),
+            goal_revision,
+            goal_owner_epoch,
+        },
+        receipt_digest,
+        store_commit_id,
+        surface::SurfaceScope::Goal {
+            goal_id,
+            causative_generation,
+        },
+        surface::SurfaceEvent::Goal(envelope),
+    ))
+}
+
+fn recorded_surface_event_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    events: Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
+    commit_id: Option<surface::SurfaceCommitId>,
+) -> surface::SurfaceCommitBatch {
+    let cursor_before = snapshot.cursor.clone();
+    let durable_revision = match cursor_before.source_revision {
+        surface::CursorSourceRevision::Recorded { durable_revision } => {
+            surface::DurableRevision::try_new(durable_revision.get() + 1)
+                .expect("surface durable revision did not exhaust")
+        }
+        surface::CursorSourceRevision::Ephemeral { .. } => {
+            unreachable!("recorded runtime surface used ephemeral cursor")
+        }
+    };
+    let commit_class = surface::CommitClass::Recorded {
+        thread_owner_epoch: snapshot.thread.owner_epoch,
+        durable_revision,
+        commit_id: commit_id.unwrap_or_else(|| {
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7")
+        }),
+    };
+    let events = events
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (scope, event))| surface::SurfaceEventEnvelope {
+            ordinal: ordinal as u32,
+            event_id: surface::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            commit_class: commit_class.clone(),
+            scope,
+            event,
+        })
+        .collect::<Vec<_>>();
+    let event_count = events.len() as u32;
+    let mut batch = surface::SurfaceCommitBatch {
+        cursor_after: surface::SurfaceCursor {
+            next_seq: surface::SequenceNumber::new(
+                cursor_before.next_seq.get() + u64::from(event_count),
+            ),
+            source_revision: surface::CursorSourceRevision::Recorded { durable_revision },
+            ..cursor_before.clone()
+        },
+        cursor_before,
+        commit_class,
+        event_count,
+        batch_digest: surface::Sha256Digest::new([0; 32]),
+        events: surface::NonEmptyVec::try_new(events).expect("surface batch is non-empty"),
+    };
+    batch.batch_digest = surface::canonical_batch_digest(&batch);
+    batch
 }
 
 fn surface_tool_action(
@@ -4708,6 +6233,7 @@ struct PendingSurfaceTerminalCommit {
 #[derive(Clone)]
 struct PendingSurfaceAdmissionTerminal {
     pending: PendingSurfaceTerminalCommit,
+    goal_recovery_owned: bool,
     retry_at: tokio::time::Instant,
 }
 
@@ -4737,6 +6263,7 @@ struct ActiveOperation {
     surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
 }
 
+#[derive(Clone)]
 struct ActiveGoalControl {
     session_id: String,
     runtime: GoalRuntimeHandle,
@@ -4772,6 +6299,12 @@ struct PendingManualCompactionCompletion {
     batch: surface::SurfaceCommitBatch,
     retry_at: tokio::time::Instant,
     allow_resume: bool,
+}
+
+struct PendingSurfaceGoalCompletionRecovery {
+    active: ActiveOperation,
+    message: String,
+    retry_at: tokio::time::Instant,
 }
 
 enum GenerationTaskOutcome {
@@ -4837,6 +6370,1666 @@ impl RuntimeUsageLedger {
 }
 
 impl ThreadActor {
+    fn goal_runtime_for_surface(&mut self) -> Result<GoalRuntimeHandle, RuntimeHostError> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or(RuntimeHostError::ThreadUnavailable)?;
+        let runtime = state.thread.goal_runtime_handle().map_err(|error| {
+            RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            }
+        })?;
+        Self::publish_goal_recoveries(state, &runtime, None)?;
+        Ok(runtime)
+    }
+
+    fn commit_goal_surface_mutation_with_retry(
+        &mut self,
+        mutation: &GoalSurfaceMutationRecord,
+    ) -> Result<Option<surface::SurfaceCommitBatch>, RuntimeHostError> {
+        let thread_id = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .thread
+            .thread_id
+            .clone();
+        let (goal_fence, receipt_digest, commit_id, scope, event) =
+            surface_goal_mutation_event(mutation, thread_id)?;
+        if self
+            .resident_surface
+            .coordinator
+            .state()
+            .has_goal_store_receipt(&commit_id, &receipt_digest)
+        {
+            return Ok(None);
+        }
+        let operation = goal_surface_operation(mutation);
+        let mut events = vec![(scope, event)];
+        if let Some(operation) = operation {
+            events.push((
+                surface::SurfaceScope::Operation {
+                    operation_id: operation.operation_id.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Requested {
+                    operation: operation.clone(),
+                }),
+            ));
+        }
+        let batch = self.surface_event_batch_with_commit_id(events, Some(commit_id));
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            let result = if operation.is_some() {
+                self.resident_surface.coordinator.commit_actor_goal_batch(
+                    goal_fence.clone(),
+                    receipt_digest.clone(),
+                    &batch,
+                )
+            } else {
+                self.resident_surface.coordinator.commit_goal_batch(
+                    goal_fence.clone(),
+                    receipt_digest.clone(),
+                    &batch,
+                )
+            };
+            match result {
+                Ok(_) => return Ok(Some(batch)),
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) => {}
+                Err(error) => {
+                    return Err(RuntimeHostError::GoalControlFailed {
+                        message: format!("failed to commit typed Goal mutation: {error:?}"),
+                    });
+                }
+            }
+        }
+        Err(RuntimeHostError::GoalControlFailed {
+            message: "typed Goal mutation did not commit after bounded retries".to_string(),
+        })
+    }
+
+    fn commit_goal_edit_and_run_with_retry(
+        &mut self,
+        edited: &GoalSurfaceMutationRecord,
+        started: &GoalSurfaceMutationRecord,
+    ) -> Result<surface::SurfaceCommitBatch, RuntimeHostError> {
+        let thread_id = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .thread
+            .thread_id
+            .clone();
+        let (edited_fence, edited_digest, edited_commit_id, edited_scope, edited_event) =
+            surface_goal_mutation_event(edited, thread_id.clone())?;
+        let (started_fence, started_digest, _, started_scope, started_event) =
+            surface_goal_mutation_event(started, thread_id)?;
+        let operation =
+            goal_surface_operation(started).ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "Goal edit-and-run did not retain its requested operation".to_string(),
+            })?;
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (edited_scope, edited_event),
+                (started_scope, started_event),
+                (
+                    surface::SurfaceScope::Operation {
+                        operation_id: operation.operation_id.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Requested {
+                        operation: operation.clone(),
+                    }),
+                ),
+            ],
+            Some(edited_commit_id),
+        );
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            match self
+                .resident_surface
+                .coordinator
+                .commit_actor_two_goal_batch(
+                    edited_fence.clone(),
+                    edited_digest.clone(),
+                    started_fence.clone(),
+                    started_digest.clone(),
+                    &batch,
+                ) {
+                Ok(_) => return Ok(batch),
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) => {}
+                Err(error) => {
+                    return Err(RuntimeHostError::GoalControlFailed {
+                        message: format!(
+                            "failed to commit typed Goal edit-and-run mutation: {error:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        Err(RuntimeHostError::GoalControlFailed {
+            message: "typed Goal edit-and-run did not commit after bounded retries".to_string(),
+        })
+    }
+
+    fn settle_goal_surface_mutation(
+        &mut self,
+        runtime: &GoalRuntimeHandle,
+        mutation: &GoalSurfaceMutationRecord,
+    ) -> Result<(), RuntimeHostError> {
+        self.settle_goal_surface_mutation_with_batch(runtime, mutation)
+            .map(|_| ())
+    }
+
+    fn settle_goal_surface_mutation_with_batch(
+        &mut self,
+        runtime: &GoalRuntimeHandle,
+        mutation: &GoalSurfaceMutationRecord,
+    ) -> Result<Option<surface::SurfaceCommitBatch>, RuntimeHostError> {
+        let batch = self.commit_goal_surface_mutation_with_retry(mutation)?;
+        Self::acknowledge_goal_surface_mutation_best_effort(runtime, mutation);
+        Ok(batch)
+    }
+
+    fn acknowledge_goal_surface_mutation_best_effort(
+        runtime: &GoalRuntimeHandle,
+        mutation: &GoalSurfaceMutationRecord,
+    ) {
+        match runtime.acknowledge_surface_mutation(
+            &mutation.receipt.store_commit_id,
+            &mutation.receipt.receipt_digest,
+        ) {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "orca: durable Goal outbox deferred exact acknowledgement for {}",
+                mutation.receipt.store_commit_id
+            ),
+            Err(error) => eprintln!(
+                "orca: durable Goal outbox acknowledgement will retry from recovery: {error}"
+            ),
+        }
+    }
+
+    fn reconcile_goal_surface_outbox(
+        &mut self,
+        runtime: &GoalRuntimeHandle,
+        session_id: &str,
+    ) -> Result<(), RuntimeHostError> {
+        let pending = runtime
+            .pending_surface_mutations(session_id)
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        for mutation in pending {
+            self.settle_goal_surface_mutation(runtime, &mutation)?;
+        }
+        Ok(())
+    }
+
+    fn recover_and_terminalize_surface_goal_completion(
+        &mut self,
+        active: &mut ActiveOperation,
+        message: &str,
+    ) -> Result<(), RuntimeHostError> {
+        self.resident_surface
+            .coordinator
+            .retry_incomplete_batch()
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "typed Goal recovery could not reconcile its exact prepared batch: {error:?}"
+                ),
+            })?;
+        let control = active.goal_control.as_ref().cloned().ok_or_else(|| {
+            RuntimeHostError::GoalControlFailed {
+                message: "typed Goal recovery lacks its runtime owner".to_string(),
+            }
+        })?;
+        let operation_id = active
+            .surface_operation
+            .as_ref()
+            .map(|fence| fence.operation_id.clone())
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed Goal recovery lost its operation".to_string(),
+            })?;
+        let pending = control
+            .runtime
+            .pending_surface_mutations(&control.session_id)
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        let superseded = replace_interrupted_goal_continuation_on_start(
+            &mut self.resident_surface.coordinator,
+            &control.runtime,
+            &pending,
+        )?;
+        for mutation in pending {
+            if !superseded.contains(&mutation.receipt.store_commit_id) {
+                self.settle_goal_surface_mutation(&control.runtime, &mutation)?;
+            }
+        }
+
+        let stored = control.runtime.read(&control.session_id).map_err(|error| {
+            RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            }
+        })?;
+        if let Some(stored) = stored
+            && let Some(run) = stored.current_run.as_ref()
+        {
+            let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+            let goal =
+                snapshot
+                    .goal
+                    .as_ref()
+                    .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                        message: "typed Goal recovery lacks its projected Goal".to_string(),
+                    })?;
+            let operation = snapshot
+                .foreground_operation
+                .iter()
+                .chain(snapshot.queued_operations.iter())
+                .chain(snapshot.operation_history.iter())
+                .find(|operation| operation.operation_id == operation_id)
+                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                    message: "typed Goal recovery lacks its bound operation".to_string(),
+                })?;
+            let stale_identity = operation
+                .generations
+                .iter()
+                .rev()
+                .filter_map(|generation| generation.goal_identity.clone())
+                .find(|identity| {
+                    identity.goal_id.as_str() == stored.goal_id.as_str()
+                        && identity.goal_run_id.as_str() == run.goal_run_id.as_str()
+                        && identity.operation_fence.operation_id == operation_id
+                        && run.outer_turn_id.as_ref().is_some_and(|outer_turn_id| {
+                            outer_turn_id.as_str() == identity.goal_outer_turn_id.as_str()
+                        })
+                });
+            let recovery_message =
+                "recovered a Goal completion whose durable surface finalization was interrupted";
+            let command_digest = *surface_sha256(
+                &serde_json::to_vec(&(
+                    "recover_interrupted_goal_completion",
+                    &control.session_id,
+                    &stored.goal_id,
+                    &run.goal_run_id,
+                    &stale_identity,
+                    message,
+                ))
+                .expect("Goal completion recovery digest input is serializable"),
+            )
+            .as_bytes();
+            let mutation = control
+                .runtime
+                .recover_run_for_surface(
+                    RecoverGoalRunForSurfaceInput {
+                        session_id: control.session_id.clone(),
+                        expected_goal_id: stored.goal_id,
+                        expected_goal_revision: u32::try_from(goal.goal_revision.get()).map_err(
+                            |_| RuntimeHostError::GoalControlFailed {
+                                message: "Goal revision exceeds durable store range".to_string(),
+                            },
+                        )?,
+                        stale_identity: stale_identity.map(Box::new),
+                        recovery_message: recovery_message.to_string(),
+                        recovered_at: chrono::Utc::now().timestamp(),
+                    },
+                    GoalSurfaceMutationContext {
+                        store_commit_id: uuid::Uuid::now_v7().to_string(),
+                        command_digest,
+                        goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                    },
+                )
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?;
+            self.settle_goal_surface_mutation(&control.runtime, &mutation)?;
+        }
+
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| operation.operation_id == operation_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed Goal recovery operation is missing".to_string(),
+            })?;
+        if let Some(finalization) = operation.finalization.clone()
+            && matches!(
+                operation.phase,
+                surface::OperationPhase::Finalizing { .. }
+                    | surface::OperationPhase::FinalizingDegraded { .. }
+            )
+        {
+            let terminal = surface::OperationTerminal::Failed {
+                class: surface::FailureClass::RuntimeInvariant,
+                message: surface::SafeDiagnosticText::try_new(
+                    "typed Goal completion failed after durable finalization started",
+                )
+                .expect("static Goal recovery diagnostic is bounded"),
+            };
+            let terminal_batch = self.surface_operation_batch_with_commit_id(
+                &operation_id,
+                vec![surface::OperationPatch::Terminal {
+                    record: surface::OperationTerminalRecord {
+                        operation_id: operation_id.clone(),
+                        finalize_intent_id: finalization.finalize_intent_id.clone(),
+                        terminal: terminal.clone(),
+                        usage: surface::UsageTotals {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_tokens: 0,
+                            estimated_cost_usd_micros: 0,
+                        },
+                        source_diagnostic_digest: None,
+                        settlement_receipts: Vec::new(),
+                        committed_at: surface::UnixMillis::new(0),
+                    },
+                }],
+                Some(finalization.terminal_commit_id.clone()),
+            );
+            let value = surface::OperationTerminalAtCursor {
+                operation_id: operation_id.clone(),
+                terminal,
+                cursor: terminal_batch.cursor_after.clone(),
+                commit_class: terminal_batch.commit_class.clone(),
+                batch_digest: terminal_batch.batch_digest.clone(),
+            };
+            let legacy_terminal = OperationTerminal {
+                operation_id: active.operation_id,
+                outcome: OperationOutcome::ExecutionFailed {
+                    kind: io::ErrorKind::Other,
+                    message: message.to_string(),
+                },
+            };
+            active.request.surface_goal_owned = false;
+            if let Err(error) = self.resident_surface.coordinator.commit_finalizer_batch(
+                operation_id.clone(),
+                finalization.finalize_intent_id.clone(),
+                &terminal_batch,
+            ) {
+                let repair = surface::RetryFinalizationToken::new(
+                    operation.request_id,
+                    snapshot.thread.thread_id,
+                    operation_id.clone(),
+                    finalization.finalize_intent_id.clone(),
+                    finalization.terminal_commit_id.clone(),
+                    snapshot.thread.owner_epoch,
+                    terminal_batch.batch_digest.clone(),
+                );
+                self.cache_surface_terminal_failure(PendingSurfaceTerminalCommit {
+                    batch: terminal_batch,
+                    value,
+                    failure: surface::WaitOperationTerminalResult::TerminalCommitFailure {
+                        operation_id,
+                        finalize_intent_id: finalization.finalize_intent_id,
+                        commit_id: finalization.terminal_commit_id,
+                        repair,
+                    },
+                    legacy_completion: Some(active.completion.clone()),
+                    legacy_terminal: Some(legacy_terminal),
+                });
+                eprintln!("orca: typed Goal recovery terminal commit failed: {error:?}");
+                return Ok(());
+            }
+            self.cache_surface_terminal(value);
+            let completed = active.completion.complete(legacy_terminal);
+            debug_assert!(
+                completed,
+                "Goal recovery terminal must complete exactly once"
+            );
+            self.surface_terminal_blocked = None;
+            return Ok(());
+        }
+        let fence = operation
+            .generations
+            .iter()
+            .rev()
+            .find(|generation| generation.phase != surface::GenerationPhase::Stopped)
+            .or_else(|| operation.generations.last())
+            .map(|generation| generation.fence.clone())
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed Goal recovery operation has no generation".to_string(),
+            })?;
+        active.surface_operation = Some(fence.clone());
+        active.request.surface_goal_owned = false;
+        let outcome = OperationOutcome::ExecutionFailed {
+            kind: io::ErrorKind::Other,
+            message: message.to_string(),
+        };
+        let legacy_terminal = OperationTerminal {
+            operation_id: active.operation_id,
+            outcome,
+        };
+        let legacy = Some((active.completion.clone(), legacy_terminal));
+        match self.repair_surface_admission_failure_with_legacy(
+            &fence,
+            "typed Goal durable completion recovery",
+            legacy,
+            true,
+        ) {
+            Ok(_) => {
+                self.surface_terminal_blocked = None;
+                Ok(())
+            }
+            Err(_)
+                if self
+                    .resident_surface
+                    .pending_admission_repairs
+                    .contains_key(&operation_id)
+                    || self
+                        .resident_surface
+                        .pending_admission_terminals
+                        .contains_key(&operation_id) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(RuntimeHostError::ThreadStartFailed {
+                message: format!("typed Goal recovery could not retain terminal repair: {error:?}"),
+            }),
+        }
+    }
+
+    fn adopt_legacy_goal_surface_if_needed(
+        &mut self,
+        runtime: &GoalRuntimeHandle,
+        session_id: &str,
+    ) -> Result<(), RuntimeHostError> {
+        if self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .goal
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(stored) =
+            runtime
+                .read(session_id)
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?
+        else {
+            return Ok(());
+        };
+        let owner_epoch = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .thread
+            .owner_epoch
+            .get();
+        let mutation = runtime
+            .adopt_for_surface(
+                session_id,
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest: *surface_sha256(
+                        &serde_json::to_vec(&("adopt_goal", session_id, &stored))
+                            .expect("Goal adoption digest input is serializable"),
+                    )
+                    .as_bytes(),
+                    goal_owner_epoch: owner_epoch,
+                },
+            )
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        self.settle_goal_surface_mutation(runtime, &mutation)
+    }
+
+    fn mutate_goal_surface(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::GoalMutationAction,
+    ) -> Result<
+        surface::MutationReply<surface::GoalMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let action = match action {
+            surface::GoalMutationAction::Edit {
+                fence,
+                objective,
+                token_budget,
+            } => {
+                return self.edit_goal_surface_command(request_id, fence, objective, token_budget);
+            }
+            surface::GoalMutationAction::Clear { fence } => {
+                return self.clear_goal_surface_command(request_id, fence);
+            }
+            surface::GoalMutationAction::ResumeAndRun { fence, input } => {
+                return self.resume_goal_surface(client, request_id, fence, input);
+            }
+            action => action,
+        };
+        let surface::GoalMutationAction::SetAndRun {
+            expected_goal,
+            objective,
+            token_budget,
+            input,
+        } = action
+        else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        if let surface::ExpectedGoal::Exact(fence) = expected_goal {
+            return self.replace_and_run_goal_surface(
+                client,
+                request_id,
+                fence,
+                objective,
+                token_budget,
+                input,
+            );
+        }
+        let surface::GoalRunInput::Supplied { request } = input else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        let session_id = self
+            .handle
+            .session_id
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .goal
+            .is_some()
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if resolve_surface_input(&request).is_none() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal_id = orca_core::goal_runtime::GoalId::new();
+        let goal_run_id = orca_core::goal_runtime::GoalRunId::new();
+        let surface_goal_id = surface::SurfaceGoalId::try_new(goal_id.to_string())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let surface_goal_run_id = surface::SurfaceGoalRunId::try_new(goal_run_id.to_string())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let operation_id =
+            surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let lease = surface::ReservationLease::new(
+            surface::SurfaceAdmissionLeaseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            operation_id.clone(),
+            surface::SequenceNumber::new(snapshot.queued_operations.len() as u64 + 1),
+            self.resident_surface
+                .hub
+                .authority()
+                .host_incarnation()
+                .clone(),
+            surface::MonotonicInstant {
+                clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                tick: surface::MonotonicTick::new(0),
+            },
+        );
+        let request_digest = surface_sha256(
+            &serde_json::to_vec(&request).expect("Goal input request is serializable"),
+        );
+        let replayability = surface::Replayability::Replayable {
+            capsule_digest: request_digest.clone(),
+            request: Some(request.clone()),
+            request_digest: Some(request_digest),
+            cwd: snapshot.settings.effective.cwd.clone(),
+            workspace_roots: snapshot.settings.effective.workspace_roots.clone(),
+            settings_revision: snapshot.settings.thread_revision,
+            policy_epoch: snapshot.settings.effective.policy_epoch,
+            tool_schema_digest: surface_sha256(
+                &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+            ),
+        };
+        let operation = surface::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: request_id.clone(),
+            intent: surface::OperationIntent {
+                origin: surface::OperationOrigin::TuiUser,
+                kind: surface::OperationKind::GoalRun {
+                    goal_id: surface_goal_id,
+                    goal_run_id: surface_goal_run_id,
+                    initial_objective_revision: surface::GoalObjectiveRevision::new(1),
+                },
+                initial_replayability: replayability,
+                busy_disposition: surface::BusyDisposition::Queue,
+                interrupt_settlement: surface::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: surface_sha256(
+                    &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+                ),
+                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: surface::OperationPhase::Requested,
+            reservation: lease,
+            ready_for_admission: false,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        };
+        let admission_lease_id = operation.reservation.lease_id.clone();
+        let runtime = self
+            .goal_runtime_for_surface()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.reconcile_goal_surface_outbox(&runtime, &session_id)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let store_commit_id = uuid::Uuid::now_v7().to_string();
+        let command_digest = *surface_sha256(
+            &serde_json::to_vec(&(
+                "goal_set_and_run",
+                request_id.as_bytes(),
+                objective.as_str(),
+                token_budget,
+                &request,
+                operation_id.as_bytes(),
+            ))
+            .expect("Goal set-and-run digest input is serializable"),
+        )
+        .as_bytes();
+        let mutation = runtime
+            .create_and_prepare_run_for_surface(
+                CreateGoalAndPrepareRunForSurfaceInput {
+                    goal: CreateGoalInput {
+                        session_id: session_id.clone(),
+                        objective: objective.as_str().to_string(),
+                        token_budget,
+                        now: chrono::Utc::now().timestamp(),
+                    },
+                    goal_id,
+                    goal_run_id,
+                    operation: Box::new(operation),
+                    origin: orca_core::goal_runtime::GoalTurnOrigin::User,
+                },
+                GoalSurfaceMutationContext {
+                    store_commit_id,
+                    command_digest,
+                    goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                },
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self
+            .settle_goal_surface_mutation_with_batch(&runtime, &mutation)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.resident_surface
+            .operation_origin_attachments
+            .insert(operation_id.clone(), client.attachment_id().clone());
+        let admission = self.admit_surface_operation(
+            client,
+            surface::SurfaceRequestId::new(),
+            operation_id.clone(),
+            admission_lease_id,
+        )?;
+        let (admitted_cursor, waiter) = match admission {
+            surface::MutationReply::Committed {
+                value:
+                    surface::AdmissionOutput::Admitted {
+                        admitted_cursor,
+                        waiter,
+                        ..
+                    },
+                ..
+            } => (admitted_cursor, waiter),
+            _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+        };
+        let (_, _, _, _, event) =
+            surface_goal_mutation_event(&mutation, batch.cursor_after.thread_id.clone())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let surface::SurfaceEvent::Goal(goal_event) = event else {
+            unreachable!("Goal mutation projects a Goal event")
+        };
+        let goal = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .goal
+            .clone();
+        let acknowledgements = batch
+            .events
+            .as_slice()
+            .iter()
+            .zip([
+                surface::SurfaceFactFamily::Goal,
+                surface::SurfaceFactFamily::Operation,
+            ])
+            .map(
+                |(event, family)| surface::MutationCommitAck::ThreadLocalCursor {
+                    cursor: batch.cursor_after.clone(),
+                    family,
+                    event_id: event.event_id.clone(),
+                    commit_class: batch.commit_class.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Goal {
+                    goal_id: goal_event.receipt.goal_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(acknowledgements)
+                    .expect("Goal set-and-run has Goal and operation acknowledgements"),
+            },
+            value: surface::GoalMutationOutput {
+                goal,
+                goal_receipt: goal_event.receipt,
+                change_cursor: admitted_cursor,
+                operation_id: Some(operation_id),
+                waiter: Some(waiter),
+            },
+        })
+    }
+
+    fn replace_and_run_goal_surface(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        fence: surface::SurfaceGoalFence,
+        objective: surface::NonEmptyText,
+        token_budget: Option<i64>,
+        input: surface::GoalRunInput,
+    ) -> Result<
+        surface::MutationReply<surface::GoalMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let session_id = self
+            .handle
+            .session_id
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .filter(|goal| {
+                goal.goal_id == fence.goal_id
+                    && goal.goal_revision == fence.goal_revision
+                    && goal.goal_owner_epoch == fence.goal_owner_epoch
+                    && goal.current_run.is_none()
+                    && !matches!(goal.state, surface::SurfaceGoalState::Complete { .. })
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let request = match input {
+            surface::GoalRunInput::Supplied { request } => request,
+            surface::GoalRunInput::DerivedFromGoal {
+                goal_id,
+                objective_revision,
+                goal_receipt_digest,
+            } => {
+                let current_digest = GoalStore::load_default()
+                    .and_then(|store| store.current_surface_receipt_digest(&session_id))
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                if goal_id != goal.goal_id
+                    || objective_revision != goal.objective_revision
+                    || goal_receipt_digest != surface::Sha256Digest::new(current_digest)
+                {
+                    return Err(surface::SurfaceClientCommandError::Unauthorized);
+                }
+                surface::SurfaceInputRequest {
+                    blocks: surface::NonEmptyVec::try_new(vec![
+                        surface::SurfaceInputRequestBlock::Text {
+                            text: surface::DisplayText::new(objective.as_str()),
+                        },
+                    ])
+                    .expect("Goal objective produces one input block"),
+                }
+            }
+        };
+        if resolve_surface_input(&request).is_none() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let core_goal_id = orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let core_goal_run_id = orca_core::goal_runtime::GoalRunId::new();
+        let surface_goal_run_id = surface::SurfaceGoalRunId::try_new(core_goal_run_id.to_string())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let objective_revision = if goal.objective.as_str() == objective.as_str() {
+            goal.objective_revision
+        } else {
+            surface::GoalObjectiveRevision::new(
+                goal.objective_revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+            )
+        };
+        let operation_id =
+            surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let lease = surface::ReservationLease::new(
+            surface::SurfaceAdmissionLeaseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            operation_id.clone(),
+            surface::SequenceNumber::new(snapshot.queued_operations.len() as u64 + 1),
+            self.resident_surface
+                .hub
+                .authority()
+                .host_incarnation()
+                .clone(),
+            surface::MonotonicInstant {
+                clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                tick: surface::MonotonicTick::new(0),
+            },
+        );
+        let admission_lease_id = lease.lease_id.clone();
+        let request_digest = surface_sha256(
+            &serde_json::to_vec(&request).expect("Goal replacement input is serializable"),
+        );
+        let operation = surface::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: request_id.clone(),
+            intent: surface::OperationIntent {
+                origin: surface::OperationOrigin::TuiUser,
+                kind: surface::OperationKind::GoalRun {
+                    goal_id: goal.goal_id.clone(),
+                    goal_run_id: surface_goal_run_id,
+                    initial_objective_revision: objective_revision,
+                },
+                initial_replayability: surface::Replayability::Replayable {
+                    capsule_digest: request_digest.clone(),
+                    request: Some(request.clone()),
+                    request_digest: Some(request_digest),
+                    cwd: snapshot.settings.effective.cwd.clone(),
+                    workspace_roots: snapshot.settings.effective.workspace_roots.clone(),
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                    tool_schema_digest: surface_sha256(
+                        &serde_json::to_vec(&snapshot.tools)
+                            .expect("surface tools are serializable"),
+                    ),
+                },
+                busy_disposition: surface::BusyDisposition::Queue,
+                interrupt_settlement: surface::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: surface_sha256(
+                    &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+                ),
+                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: surface::OperationPhase::Requested,
+            reservation: lease,
+            ready_for_admission: false,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        };
+        let runtime = self
+            .goal_runtime_for_surface()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.reconcile_goal_surface_outbox(&runtime, &session_id)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let expected_goal_revision = u32::try_from(fence.goal_revision.get())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let common_digest = (
+            "goal_replace_and_run",
+            request_id.as_bytes(),
+            &fence,
+            objective.as_str(),
+            token_budget,
+            &request,
+            operation_id.as_bytes(),
+        );
+        let edited_context = GoalSurfaceMutationContext {
+            store_commit_id: uuid::Uuid::now_v7().to_string(),
+            command_digest: *surface_sha256(
+                &serde_json::to_vec(&(&common_digest, "edit"))
+                    .expect("Goal replacement edit digest input is serializable"),
+            )
+            .as_bytes(),
+            goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+        };
+        let started_context = GoalSurfaceMutationContext {
+            store_commit_id: uuid::Uuid::now_v7().to_string(),
+            command_digest: *surface_sha256(
+                &serde_json::to_vec(&(&common_digest, "run"))
+                    .expect("Goal replacement run digest input is serializable"),
+            )
+            .as_bytes(),
+            goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+        };
+        let mutations = runtime
+            .edit_and_prepare_run_for_surface(
+                EditGoalAndPrepareRunForSurfaceInput {
+                    session_id,
+                    expected_goal_id: core_goal_id,
+                    expected_goal_revision,
+                    objective: objective.as_str().to_string(),
+                    token_budget,
+                    goal_run_id: core_goal_run_id,
+                    operation: Box::new(operation),
+                    origin: orca_core::goal_runtime::GoalTurnOrigin::User,
+                    started_at: chrono::Utc::now().timestamp(),
+                },
+                [edited_context, started_context],
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let [edited, started] = mutations.as_slice() else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        let batch = self
+            .commit_goal_edit_and_run_with_retry(edited, started)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        Self::acknowledge_goal_surface_mutation_best_effort(&runtime, edited);
+        Self::acknowledge_goal_surface_mutation_best_effort(&runtime, started);
+        self.resident_surface
+            .operation_origin_attachments
+            .insert(operation_id.clone(), client.attachment_id().clone());
+        let admission = self.admit_surface_operation(
+            client,
+            surface::SurfaceRequestId::new(),
+            operation_id.clone(),
+            admission_lease_id,
+        )?;
+        let (admitted_cursor, waiter) = match admission {
+            surface::MutationReply::Committed {
+                value:
+                    surface::AdmissionOutput::Admitted {
+                        admitted_cursor,
+                        waiter,
+                        ..
+                    },
+                ..
+            } => (admitted_cursor, waiter),
+            _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+        };
+        let mut reply = self.goal_mutation_reply(
+            request_id,
+            started,
+            &batch,
+            Some(operation_id),
+            Some(waiter),
+        )?;
+        if let surface::MutationReply::Committed { value, .. } = &mut reply {
+            value.goal = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .goal
+                .clone();
+            value.change_cursor = admitted_cursor;
+        }
+        Ok(reply)
+    }
+
+    fn edit_goal_surface_command(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        fence: surface::SurfaceGoalFence,
+        objective: surface::NonEmptyText,
+        token_budget: surface::GoalTokenBudgetUpdate,
+    ) -> Result<
+        surface::MutationReply<surface::GoalMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let session_id = self
+            .handle
+            .session_id
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .filter(|goal| {
+                goal.goal_id == fence.goal_id
+                    && goal.goal_revision == fence.goal_revision
+                    && goal.goal_owner_epoch == fence.goal_owner_epoch
+                    && goal.current_run.is_none()
+            })
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let runtime = self
+            .goal_runtime_for_surface()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.reconcile_goal_surface_outbox(&runtime, &session_id)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let core_goal_id = orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let budget_update = match &token_budget {
+            surface::GoalTokenBudgetUpdate::Keep => GoalSurfaceTokenBudgetUpdate::Keep,
+            surface::GoalTokenBudgetUpdate::Set(budget) => {
+                GoalSurfaceTokenBudgetUpdate::Set(*budget)
+            }
+        };
+        let budget_digest = match &token_budget {
+            surface::GoalTokenBudgetUpdate::Keep => (false, None),
+            surface::GoalTokenBudgetUpdate::Set(budget) => (true, *budget),
+        };
+        let command_digest = *surface_sha256(
+            &serde_json::to_vec(&(
+                "goal_edit",
+                request_id.as_bytes(),
+                &fence,
+                objective.as_str(),
+                budget_digest,
+            ))
+            .expect("Goal edit digest input is serializable"),
+        )
+        .as_bytes();
+        let mutation = runtime
+            .edit_for_surface(
+                &session_id,
+                core_goal_id,
+                u32::try_from(fence.goal_revision.get())
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                objective.as_str(),
+                budget_update,
+                chrono::Utc::now().timestamp(),
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest,
+                    goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                },
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self
+            .settle_goal_surface_mutation_with_batch(&runtime, &mutation)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.goal_mutation_reply(request_id, &mutation, &batch, None, None)
+    }
+
+    fn clear_goal_surface_command(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        fence: surface::SurfaceGoalFence,
+    ) -> Result<
+        surface::MutationReply<surface::GoalMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let session_id = self
+            .handle
+            .session_id
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .filter(|goal| {
+                goal.goal_id == fence.goal_id
+                    && goal.goal_revision == fence.goal_revision
+                    && goal.goal_owner_epoch == fence.goal_owner_epoch
+                    && goal.current_run.is_none()
+            })
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let runtime = self
+            .goal_runtime_for_surface()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.reconcile_goal_surface_outbox(&runtime, &session_id)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let core_goal_id = orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let command_digest = *surface_sha256(
+            &serde_json::to_vec(&("goal_clear", request_id.as_bytes(), &fence))
+                .expect("Goal clear digest input is serializable"),
+        )
+        .as_bytes();
+        let mutation = runtime
+            .clear_for_surface(
+                &session_id,
+                core_goal_id,
+                u32::try_from(fence.goal_revision.get())
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest,
+                    goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                },
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self
+            .settle_goal_surface_mutation_with_batch(&runtime, &mutation)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.goal_mutation_reply(request_id, &mutation, &batch, None, None)
+    }
+
+    fn resume_goal_surface(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        fence: surface::SurfaceGoalFence,
+        input: surface::GoalRunInput,
+    ) -> Result<
+        surface::MutationReply<surface::GoalMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let session_id = self
+            .handle
+            .session_id
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .filter(|goal| {
+                goal.goal_id == fence.goal_id
+                    && goal.goal_revision == fence.goal_revision
+                    && goal.goal_owner_epoch == fence.goal_owner_epoch
+                    && goal.current_run.is_none()
+                    && !matches!(goal.state, surface::SurfaceGoalState::Complete { .. })
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let request = match input {
+            surface::GoalRunInput::Supplied { request } => request,
+            surface::GoalRunInput::DerivedFromGoal {
+                goal_id,
+                objective_revision,
+                goal_receipt_digest,
+            } => {
+                let current_digest = GoalStore::load_default()
+                    .and_then(|store| store.current_surface_receipt_digest(&session_id))
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                if goal_id != goal.goal_id
+                    || objective_revision != goal.objective_revision
+                    || goal_receipt_digest != surface::Sha256Digest::new(current_digest)
+                {
+                    return Err(surface::SurfaceClientCommandError::Unauthorized);
+                }
+                surface::SurfaceInputRequest {
+                    blocks: surface::NonEmptyVec::try_new(vec![
+                        surface::SurfaceInputRequestBlock::Text {
+                            text: surface::DisplayText::new(goal.objective.as_str()),
+                        },
+                    ])
+                    .expect("Goal objective produces one input block"),
+                }
+            }
+        };
+        if resolve_surface_input(&request).is_none() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let core_goal_id = orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let core_goal_run_id = orca_core::goal_runtime::GoalRunId::new();
+        let surface_goal_run_id = surface::SurfaceGoalRunId::try_new(core_goal_run_id.to_string())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let operation_id =
+            surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let lease = surface::ReservationLease::new(
+            surface::SurfaceAdmissionLeaseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            operation_id.clone(),
+            surface::SequenceNumber::new(snapshot.queued_operations.len() as u64 + 1),
+            self.resident_surface
+                .hub
+                .authority()
+                .host_incarnation()
+                .clone(),
+            surface::MonotonicInstant {
+                clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                tick: surface::MonotonicTick::new(0),
+            },
+        );
+        let admission_lease_id = lease.lease_id.clone();
+        let request_digest = surface_sha256(
+            &serde_json::to_vec(&request).expect("Goal resume input is serializable"),
+        );
+        let replayability = surface::Replayability::Replayable {
+            capsule_digest: request_digest.clone(),
+            request: Some(request.clone()),
+            request_digest: Some(request_digest),
+            cwd: snapshot.settings.effective.cwd.clone(),
+            workspace_roots: snapshot.settings.effective.workspace_roots.clone(),
+            settings_revision: snapshot.settings.thread_revision,
+            policy_epoch: snapshot.settings.effective.policy_epoch,
+            tool_schema_digest: surface_sha256(
+                &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+            ),
+        };
+        let operation = surface::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: request_id.clone(),
+            intent: surface::OperationIntent {
+                origin: surface::OperationOrigin::TuiUser,
+                kind: surface::OperationKind::GoalRun {
+                    goal_id: goal.goal_id.clone(),
+                    goal_run_id: surface_goal_run_id,
+                    initial_objective_revision: goal.objective_revision,
+                },
+                initial_replayability: replayability,
+                busy_disposition: surface::BusyDisposition::Queue,
+                interrupt_settlement: surface::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: surface_sha256(
+                    &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+                ),
+                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: surface::OperationPhase::Requested,
+            reservation: lease,
+            ready_for_admission: false,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        };
+        let runtime = self
+            .goal_runtime_for_surface()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.reconcile_goal_surface_outbox(&runtime, &session_id)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let command_digest = *surface_sha256(
+            &serde_json::to_vec(&(
+                "goal_resume_and_run",
+                request_id.as_bytes(),
+                &fence,
+                &request,
+                operation_id.as_bytes(),
+            ))
+            .expect("Goal resume digest input is serializable"),
+        )
+        .as_bytes();
+        let mutation = runtime
+            .prepare_run_for_surface(
+                PrepareGoalRunForSurfaceInput {
+                    session_id,
+                    expected_goal_id: core_goal_id,
+                    expected_goal_revision: u32::try_from(fence.goal_revision.get())
+                        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    goal_run_id: core_goal_run_id,
+                    operation: Box::new(operation),
+                    origin: orca_core::goal_runtime::GoalTurnOrigin::Resume,
+                    started_at: chrono::Utc::now().timestamp(),
+                },
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest,
+                    goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                },
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self
+            .settle_goal_surface_mutation_with_batch(&runtime, &mutation)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.resident_surface
+            .operation_origin_attachments
+            .insert(operation_id.clone(), client.attachment_id().clone());
+        let admission = self.admit_surface_operation(
+            client,
+            surface::SurfaceRequestId::new(),
+            operation_id.clone(),
+            admission_lease_id,
+        )?;
+        let (admitted_cursor, waiter) = match admission {
+            surface::MutationReply::Committed {
+                value:
+                    surface::AdmissionOutput::Admitted {
+                        admitted_cursor,
+                        waiter,
+                        ..
+                    },
+                ..
+            } => (admitted_cursor, waiter),
+            _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+        };
+        let mut reply = self.goal_mutation_reply(
+            request_id,
+            &mutation,
+            &batch,
+            Some(operation_id),
+            Some(waiter),
+        )?;
+        if let surface::MutationReply::Committed { value, .. } = &mut reply {
+            value.goal = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .goal
+                .clone();
+            value.change_cursor = admitted_cursor;
+        }
+        Ok(reply)
+    }
+
+    fn goal_mutation_reply(
+        &self,
+        request_id: surface::SurfaceRequestId,
+        mutation: &GoalSurfaceMutationRecord,
+        batch: &surface::SurfaceCommitBatch,
+        operation_id: Option<surface::SurfaceOperationId>,
+        waiter: Option<surface::OperationWaiterHandle>,
+    ) -> Result<
+        surface::MutationReply<surface::GoalMutationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let (_, _, _, _, event) =
+            surface_goal_mutation_event(mutation, batch.cursor_after.thread_id.clone())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let surface::SurfaceEvent::Goal(goal_event) = event else {
+            unreachable!("Goal mutation projects a Goal event")
+        };
+        let acknowledgements = batch
+            .events
+            .as_slice()
+            .iter()
+            .filter_map(|event| {
+                let family = match &event.event {
+                    surface::SurfaceEvent::Goal(_) => surface::SurfaceFactFamily::Goal,
+                    surface::SurfaceEvent::Operation(_) => surface::SurfaceFactFamily::Operation,
+                    _ => return None,
+                };
+                Some(surface::MutationCommitAck::ThreadLocalCursor {
+                    cursor: batch.cursor_after.clone(),
+                    family,
+                    event_id: event.event_id.clone(),
+                    commit_class: batch.commit_class.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Goal {
+                    goal_id: goal_event.receipt.goal_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(acknowledgements)
+                    .expect("Goal mutation has one acknowledgement"),
+            },
+            value: surface::GoalMutationOutput {
+                goal: self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .goal
+                    .clone(),
+                goal_receipt: goal_event.receipt,
+                change_cursor: batch.cursor_after.clone(),
+                operation_id,
+                waiter,
+            },
+        })
+    }
+
+    fn set_goal_surface(
+        &mut self,
+        session_id: &str,
+        objective: String,
+        at: i64,
+    ) -> Result<orca_core::goal_types::ThreadGoal, RuntimeHostError> {
+        if self.handle.session_id.as_deref() != Some(session_id) {
+            return Err(RuntimeHostError::GoalControlFailed {
+                message: "Goal mutation does not belong to this runtime thread".to_string(),
+            });
+        }
+        let runtime = self.goal_runtime_for_surface()?;
+        self.reconcile_goal_surface_outbox(&runtime, session_id)?;
+        self.adopt_legacy_goal_surface_if_needed(&runtime, session_id)?;
+        let existing =
+            runtime
+                .read(session_id)
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let owner_epoch = snapshot.thread.owner_epoch.get();
+        let command_digest = *surface_sha256(
+            &serde_json::to_vec(&("set_goal", session_id, objective.as_str(), at))
+                .expect("Goal command digest input is serializable"),
+        )
+        .as_bytes();
+        let context = GoalSurfaceMutationContext {
+            store_commit_id: uuid::Uuid::now_v7().to_string(),
+            command_digest,
+            goal_owner_epoch: owner_epoch,
+        };
+        let mutation =
+            match existing {
+                None => runtime
+                    .create_for_surface(
+                        CreateGoalInput {
+                            session_id: session_id.to_string(),
+                            objective,
+                            token_budget: None,
+                            now: at,
+                        },
+                        context,
+                    )
+                    .map_err(|error| RuntimeHostError::GoalControlFailed {
+                        message: error.to_string(),
+                    })?,
+                Some(existing) => {
+                    let goal = snapshot.goal.as_ref().ok_or_else(|| {
+                        RuntimeHostError::GoalControlFailed {
+                        message:
+                            "legacy Goal exists without a durable typed-surface migration receipt"
+                                .to_string(),
+                    }
+                    })?;
+                    if goal.goal_id.as_str() != existing.goal_id.as_str() {
+                        return Err(RuntimeHostError::GoalControlFailed {
+                            message: "Goal store identity disagrees with typed surface state"
+                                .to_string(),
+                        });
+                    }
+                    runtime
+                        .edit_for_surface(
+                            session_id,
+                            existing.goal_id,
+                            goal.goal_revision.get().try_into().map_err(|_| {
+                                RuntimeHostError::GoalControlFailed {
+                                    message: "Goal revision exceeds the durable store range"
+                                        .to_string(),
+                                }
+                            })?,
+                            objective,
+                            GoalSurfaceTokenBudgetUpdate::Keep,
+                            at,
+                            context,
+                        )
+                        .map_err(|error| RuntimeHostError::GoalControlFailed {
+                            message: error.to_string(),
+                        })?
+                }
+            };
+        self.settle_goal_surface_mutation(&runtime, &mutation)?;
+        runtime
+            .project_thread_goal(session_id)
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "Goal disappeared after its typed commit".to_string(),
+            })
+    }
+
+    fn edit_goal_surface(
+        &mut self,
+        session_id: &str,
+        objective: String,
+        at: i64,
+    ) -> Result<Option<orca_core::goal_types::ThreadGoal>, RuntimeHostError> {
+        if self.handle.session_id.as_deref() != Some(session_id) {
+            return Err(RuntimeHostError::GoalControlFailed {
+                message: "Goal mutation does not belong to this runtime thread".to_string(),
+            });
+        }
+        let runtime = self.goal_runtime_for_surface()?;
+        self.reconcile_goal_surface_outbox(&runtime, session_id)?;
+        self.adopt_legacy_goal_surface_if_needed(&runtime, session_id)?;
+        let Some(existing) =
+            runtime
+                .read(session_id)
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?
+        else {
+            return Ok(None);
+        };
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "legacy Goal exists without a durable typed-surface migration receipt"
+                    .to_string(),
+            })?;
+        if goal.goal_id.as_str() != existing.goal_id.as_str() {
+            return Err(RuntimeHostError::GoalControlFailed {
+                message: "Goal store identity disagrees with typed surface state".to_string(),
+            });
+        }
+        let expected_revision = goal.goal_revision.get().try_into().map_err(|_| {
+            RuntimeHostError::GoalControlFailed {
+                message: "Goal revision exceeds the durable store range".to_string(),
+            }
+        })?;
+        let context = GoalSurfaceMutationContext {
+            store_commit_id: uuid::Uuid::now_v7().to_string(),
+            command_digest: *surface_sha256(
+                &serde_json::to_vec(&("edit_goal", session_id, objective.as_str(), at))
+                    .expect("Goal command digest input is serializable"),
+            )
+            .as_bytes(),
+            goal_owner_epoch: goal.goal_owner_epoch.get(),
+        };
+        let mutation = runtime
+            .edit_for_surface(
+                session_id,
+                existing.goal_id,
+                expected_revision,
+                objective,
+                GoalSurfaceTokenBudgetUpdate::Keep,
+                at,
+                context,
+            )
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        self.settle_goal_surface_mutation(&runtime, &mutation)?;
+        runtime.project_thread_goal(session_id).map_err(|error| {
+            RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            }
+        })
+    }
+
+    fn clear_goal_surface(&mut self, session_id: &str) -> Result<(), RuntimeHostError> {
+        if self.handle.session_id.as_deref() != Some(session_id) {
+            return Err(RuntimeHostError::GoalControlFailed {
+                message: "Goal mutation does not belong to this runtime thread".to_string(),
+            });
+        }
+        let runtime = self.goal_runtime_for_surface()?;
+        self.reconcile_goal_surface_outbox(&runtime, session_id)?;
+        self.adopt_legacy_goal_surface_if_needed(&runtime, session_id)?;
+        let Some(existing) =
+            runtime
+                .read(session_id)
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?
+        else {
+            return Ok(());
+        };
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "legacy Goal exists without a durable typed-surface migration receipt"
+                    .to_string(),
+            })?;
+        if goal.goal_id.as_str() != existing.goal_id.as_str() {
+            return Err(RuntimeHostError::GoalControlFailed {
+                message: "Goal store identity disagrees with typed surface state".to_string(),
+            });
+        }
+        let expected_revision = goal.goal_revision.get().try_into().map_err(|_| {
+            RuntimeHostError::GoalControlFailed {
+                message: "Goal revision exceeds the durable store range".to_string(),
+            }
+        })?;
+        let context = GoalSurfaceMutationContext {
+            store_commit_id: uuid::Uuid::now_v7().to_string(),
+            command_digest: *surface_sha256(
+                &serde_json::to_vec(&("clear_goal", session_id))
+                    .expect("Goal command digest input is serializable"),
+            )
+            .as_bytes(),
+            goal_owner_epoch: goal.goal_owner_epoch.get(),
+        };
+        let mutation = runtime
+            .clear_for_surface(session_id, existing.goal_id, expected_revision, context)
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        self.settle_goal_surface_mutation(&runtime, &mutation)
+    }
+
     fn admits_surface_client(
         &self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -4924,54 +8117,11 @@ impl ThreadActor {
         events: Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
         commit_id: Option<surface::SurfaceCommitId>,
     ) -> surface::SurfaceCommitBatch {
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
-        let cursor_before = snapshot.cursor.clone();
-        let durable_revision = match cursor_before.source_revision {
-            surface::CursorSourceRevision::Recorded { durable_revision } => {
-                surface::DurableRevision::try_new(durable_revision.get() + 1)
-                    .expect("surface durable revision did not exhaust")
-            }
-            surface::CursorSourceRevision::Ephemeral { .. } => {
-                unreachable!("recorded runtime surface used ephemeral cursor")
-            }
-        };
-        let commit_class = surface::CommitClass::Recorded {
-            thread_owner_epoch: snapshot.thread.owner_epoch,
-            durable_revision,
-            commit_id: commit_id.unwrap_or_else(|| {
-                surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-                    .expect("generated UUID is v7")
-            }),
-        };
-        let events = events
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, (scope, event))| surface::SurfaceEventEnvelope {
-                ordinal: ordinal as u32,
-                event_id: surface::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-                    .expect("generated UUID is v7"),
-                commit_class: commit_class.clone(),
-                scope,
-                event,
-            })
-            .collect::<Vec<_>>();
-        let event_count = events.len() as u32;
-        let mut batch = surface::SurfaceCommitBatch {
-            cursor_after: surface::SurfaceCursor {
-                next_seq: surface::SequenceNumber::new(
-                    cursor_before.next_seq.get() + event_count as u64,
-                ),
-                source_revision: surface::CursorSourceRevision::Recorded { durable_revision },
-                ..cursor_before.clone()
-            },
-            cursor_before,
-            commit_class,
-            event_count,
-            batch_digest: surface::Sha256Digest::new([0; 32]),
-            events: surface::NonEmptyVec::try_new(events).expect("operation batch is non-empty"),
-        };
-        batch.batch_digest = surface::canonical_batch_digest(&batch);
-        batch
+        recorded_surface_event_batch(
+            self.resident_surface.coordinator.state().snapshot(),
+            events,
+            commit_id,
+        )
     }
 
     fn commit_surface_generation_batch_with_retry(
@@ -5066,7 +8216,7 @@ impl ThreadActor {
             return Ok(());
         }
 
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
         let generation = operation
@@ -7331,11 +10481,68 @@ impl ThreadActor {
                     .iter()
                     .map(|pending| pending.retry_at),
             )
+            .chain(
+                self.pending_goal_completion_recovery
+                    .iter()
+                    .map(|pending| pending.retry_at),
+            )
             .min()
     }
 
     fn has_pending_surface_transition_retry(&self) -> bool {
         self.next_surface_transition_retry_at().is_some()
+    }
+
+    fn has_pending_goal_completion_recovery_owner(&self) -> bool {
+        self.pending_goal_completion_recovery.is_some()
+            || self
+                .resident_surface
+                .0
+                .as_ref()
+                .into_iter()
+                .flat_map(|resident| resident.pending_admission_repairs.values())
+                .any(|pending| pending.goal_recovery_owned)
+            || self
+                .resident_surface
+                .0
+                .as_ref()
+                .into_iter()
+                .flat_map(|resident| resident.pending_admission_terminals.values())
+                .any(|pending| pending.goal_recovery_owned)
+    }
+
+    fn pending_goal_completion_recovery_operation_id(&self) -> Option<surface::SurfaceOperationId> {
+        self.pending_goal_completion_recovery
+            .as_ref()
+            .and_then(|pending| {
+                pending
+                    .active
+                    .surface_operation
+                    .as_ref()
+                    .map(|fence| fence.operation_id.clone())
+            })
+            .or_else(|| {
+                self.resident_surface
+                    .0
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|resident| resident.pending_admission_repairs.iter())
+                    .filter(|(_, pending)| pending.goal_recovery_owned)
+                    .map(|(operation_id, _)| operation_id)
+                    .min()
+                    .cloned()
+            })
+            .or_else(|| {
+                self.resident_surface
+                    .0
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|resident| resident.pending_admission_terminals.iter())
+                    .filter(|(_, pending)| pending.goal_recovery_owned)
+                    .map(|(operation_id, _)| operation_id)
+                    .min()
+                    .cloned()
+            })
     }
 
     fn retry_private_surface_interaction(
@@ -7496,27 +10703,31 @@ impl ThreadActor {
                 pending.fence.thread_owner_epoch,
                 terminal_batch.batch_digest.clone(),
             );
-            self.resident_surface.pending_admission_terminals.insert(
-                operation_id.clone(),
-                PendingSurfaceAdmissionTerminal {
-                    pending: PendingSurfaceTerminalCommit {
-                        batch: terminal_batch,
-                        value,
-                        failure: surface::WaitOperationTerminalResult::TerminalCommitFailure {
-                            operation_id: operation_id.clone(),
-                            finalize_intent_id,
-                            commit_id: terminal_commit_id,
-                            repair,
-                        },
-                        legacy_completion: None,
-                        legacy_terminal: None,
+            self.cache_surface_admission_terminal_failure(PendingSurfaceAdmissionTerminal {
+                pending: PendingSurfaceTerminalCommit {
+                    batch: terminal_batch,
+                    value,
+                    failure: surface::WaitOperationTerminalResult::TerminalCommitFailure {
+                        operation_id: operation_id.clone(),
+                        finalize_intent_id,
+                        commit_id: terminal_commit_id,
+                        repair,
                     },
-                    retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                    legacy_completion: pending.legacy_completion.clone(),
+                    legacy_terminal: pending.legacy_terminal.clone(),
                 },
-            );
+                goal_recovery_owned: pending.goal_recovery_owned,
+                retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+            });
             return;
         }
         self.cache_surface_terminal(value);
+        if let (Some(completion), Some(terminal)) =
+            (pending.legacy_completion, pending.legacy_terminal)
+        {
+            let completed = completion.complete(terminal);
+            debug_assert!(completed, "legacy terminal must complete exactly once");
+        }
         if self.resident_surface.pending_terminal_commits.is_empty() {
             self.surface_terminal_blocked = None;
         }
@@ -7531,12 +10742,18 @@ impl ThreadActor {
         else {
             return;
         };
-        if self
-            .resident_surface
-            .coordinator
-            .commit_actor_batch(&pending.batch)
-            .is_err()
-        {
+        let commit = match pending.goal.as_ref() {
+            Some(goal) => self.resident_surface.coordinator.commit_actor_goal_batch(
+                goal.goal_fence.clone(),
+                goal.receipt_digest.clone(),
+                &pending.batch,
+            ),
+            None => self
+                .resident_surface
+                .coordinator
+                .commit_actor_batch(&pending.batch),
+        };
+        if commit.is_err() {
             if let Some(retained) = self
                 .resident_surface
                 .pending_admission_commits
@@ -7550,6 +10767,9 @@ impl ThreadActor {
         self.resident_surface
             .pending_admission_commits
             .remove(operation_id);
+        if let Some(goal) = pending.goal {
+            Self::acknowledge_goal_surface_mutation_best_effort(&goal.runtime, &goal.mutation);
+        }
         if let Err(error) = self.repair_surface_admission_failure(&pending.fence, pending.message) {
             self.surface_terminal_blocked = Some(format!(
                 "typed surface admission repair failed for {:?}: {error:?}",
@@ -7597,6 +10817,13 @@ impl ThreadActor {
             .pending_admission_terminals
             .remove(operation_id);
         self.cache_surface_terminal(pending.pending.value);
+        if let (Some(completion), Some(terminal)) = (
+            pending.pending.legacy_completion,
+            pending.pending.legacy_terminal,
+        ) {
+            let completed = completion.complete(terminal);
+            debug_assert!(completed, "legacy terminal must complete exactly once");
+        }
         if self.resident_surface.pending_terminal_commits.is_empty() {
             self.surface_terminal_blocked = None;
         }
@@ -7612,8 +10839,15 @@ impl ThreadActor {
                     PendingSurfaceTransitionRetry::ManualCompactionCompletion,
                 )
             });
+        let goal_completion = self.pending_goal_completion_recovery.iter().map(|pending| {
+            (
+                pending.retry_at,
+                PendingSurfaceTransitionRetry::GoalCompletionRecovery,
+            )
+        });
         let Some((_, retry)) =
             manual_compaction
+                .chain(goal_completion)
                 .chain(
                     self.resident_surface
                         .pending_admission_repairs
@@ -7723,6 +10957,23 @@ impl ThreadActor {
                 self.finish_generation(pending.active, Ok(pending.result), pending.allow_resume)
             {
                 self.surface_terminal_blocked = Some(error.to_string());
+            }
+            return;
+        }
+        if retry == PendingSurfaceTransitionRetry::GoalCompletionRecovery {
+            let Some(mut pending) = self.pending_goal_completion_recovery.take() else {
+                return;
+            };
+            if self
+                .recover_and_terminalize_surface_goal_completion(
+                    &mut pending.active,
+                    pending.message.as_str(),
+                )
+                .is_err()
+            {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                self.pending_goal_completion_recovery = Some(pending);
             }
             return;
         }
@@ -8901,8 +12152,10 @@ impl ThreadActor {
                 | surface::OperationOrigin::AcpPrompt { .. }
                 | surface::OperationOrigin::JsonlThreadTurn { .. }
                 | surface::OperationOrigin::JsonlStatelessSubmit { .. }
-        ) || operation.intent.kind != surface::OperationKind::UserTurn
-        {
+        ) || !matches!(
+            operation.intent.kind,
+            surface::OperationKind::UserTurn | surface::OperationKind::GoalRun { .. }
+        ) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         let (input_request, request_digest) = match &operation.intent.initial_replayability {
@@ -8915,7 +12168,7 @@ impl ThreadActor {
         };
         let resolved_input = resolve_surface_input(&input_request)
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let backtrack_target =
             matches!(&operation.intent.origin, surface::OperationOrigin::TuiUser);
         let input_pinned = !backtrack_target;
@@ -8949,13 +12202,63 @@ impl ThreadActor {
             presentation: presentation.clone(),
             correlation_id: correlation_id.clone(),
         };
+        let goal_identity = match &operation.intent.kind {
+            surface::OperationKind::UserTurn => None,
+            surface::OperationKind::GoalRun {
+                goal_id,
+                goal_run_id,
+                initial_objective_revision,
+            } => {
+                let goal = snapshot
+                    .goal
+                    .as_ref()
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                let run = goal
+                    .current_run
+                    .as_ref()
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                if &goal.goal_id != goal_id
+                    || &goal.objective_revision != initial_objective_revision
+                    || &run.goal_run_id != goal_run_id
+                    || run.operation_id != operation_id
+                    || !matches!(run.phase, surface::SurfaceGoalRunPhase::Preparing)
+                {
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
+                let outer_turn_origin = match run.run_origin {
+                    surface::SurfaceGoalRunOrigin::User => surface::GoalOuterTurnOrigin::User,
+                    surface::SurfaceGoalRunOrigin::Resume => surface::GoalOuterTurnOrigin::Resume,
+                    surface::SurfaceGoalRunOrigin::WorkflowNotification => {
+                        surface::GoalOuterTurnOrigin::WorkflowNotification
+                    }
+                };
+                let outer_turn_id = orca_core::goal_runtime::GoalOuterTurnId::new();
+                Some(surface::SurfaceGoalGenerationIdentity {
+                    goal_id: goal_id.clone(),
+                    goal_run_id: goal_run_id.clone(),
+                    operation_fence: fence.clone(),
+                    goal_outer_turn_id: surface::SurfaceGoalOuterTurnId::try_new(
+                        outer_turn_id.to_string(),
+                    )
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    logical_turn_id: logical_turn_id.clone(),
+                    canonical_input_item_id: input_item_id.clone(),
+                    outer_turn_origin,
+                    attempt: surface::GenerationAttempt::Initial,
+                    predecessor_fence: None,
+                    objective_revision: *initial_objective_revision,
+                    outer_turn_count: 1,
+                })
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
         let generation = surface::GenerationRecord {
             fence: fence.clone(),
             logical_turn_id: logical_turn_id.clone(),
             input: generation_input,
             predecessor: None,
             attempt: surface::GenerationAttempt::Initial,
-            goal_identity: None,
+            goal_identity: goal_identity.clone(),
             replayability: operation.intent.initial_replayability.clone(),
             required_capabilities: operation.intent.required_capabilities.clone(),
             capability_fingerprint: operation.intent.capability_fingerprint.clone(),
@@ -8963,72 +12266,184 @@ impl ThreadActor {
             started_witness: None,
             stop_reason: None,
         };
-        let admitted_batch = self.surface_event_batch_with_commit_id(
-            vec![
-                (
-                    surface::SurfaceScope::Operation {
-                        operation_id: operation_id.clone(),
+        let goal_mutation = if let Some(identity) = goal_identity.as_ref() {
+            let session_id = self
+                .handle
+                .session_id
+                .clone()
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let goal_id = orca_core::goal_runtime::GoalId::parse(identity.goal_id.as_str())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let runtime = self
+                .goal_runtime_for_surface()
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let command_digest = *surface_sha256(
+                &serde_json::to_vec(&(
+                    "goal_outer_turn_started",
+                    operation_id.as_bytes(),
+                    &identity,
+                    &request_digest,
+                ))
+                .expect("Goal outer-turn digest input is serializable"),
+            )
+            .as_bytes();
+            let mutation = runtime
+                .begin_outer_turn_for_surface(
+                    BeginGoalOuterTurnForSurfaceInput {
+                        session_id,
+                        expected_goal_id: goal_id,
+                        expected_goal_revision: u32::try_from(
+                            snapshot
+                                .goal
+                                .as_ref()
+                                .expect("Goal identity requires a Goal")
+                                .goal_revision
+                                .get(),
+                        )
+                        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                        identity: Box::new(identity.clone()),
+                        provider_turn_id: logical_turn_id.to_string(),
+                        started_at: chrono::Utc::now().timestamp(),
                     },
-                    surface::SurfaceEvent::Operation(surface::OperationPatch::Admitted {
-                        operation_id: operation_id.clone(),
-                        logical_turn_id: logical_turn_id.clone(),
-                        input: admitted_input,
-                        first_generation: generation,
-                    }),
-                ),
-                (
-                    surface::SurfaceScope::Generation {
-                        fence: fence.clone(),
+                    GoalSurfaceMutationContext {
+                        store_commit_id: uuid::Uuid::now_v7().to_string(),
+                        command_digest,
+                        goal_owner_epoch: snapshot.thread.owner_epoch.get(),
                     },
-                    surface::SurfaceEvent::Item(surface::ItemPatch::Added {
-                        item: surface::SurfaceItem::UserMessage {
-                            id: input_item_id.clone(),
-                            turn_id: logical_turn_id.clone(),
-                            input: surface::SurfaceUserInputState::Pending {
-                                presentation: presentation.clone(),
-                                correlation_id,
-                            },
-                            pinned: input_pinned,
-                            origin: surface::SurfaceItemOrigin::UserInput,
+                )
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            Some((runtime, mutation))
+        } else {
+            None
+        };
+        let mut admitted_events = vec![
+            (
+                surface::SurfaceScope::Operation {
+                    operation_id: operation_id.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Admitted {
+                    operation_id: operation_id.clone(),
+                    logical_turn_id: logical_turn_id.clone(),
+                    input: admitted_input,
+                    first_generation: generation,
+                }),
+            ),
+            (
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Item(surface::ItemPatch::Added {
+                    item: surface::SurfaceItem::UserMessage {
+                        id: input_item_id.clone(),
+                        turn_id: logical_turn_id.clone(),
+                        input: surface::SurfaceUserInputState::Pending {
+                            presentation: presentation.clone(),
+                            correlation_id,
                         },
-                    }),
-                ),
-            ],
-            None,
-        );
-        match self
-            .resident_surface
-            .coordinator
-            .commit_actor_batch(&admitted_batch)
-        {
-            Ok(_) => {}
-            Err(surface::SurfaceCommitError::Ledger(error)) => {
-                eprintln!("orca: typed surface admission commit failed: {error:?}");
-                self.resident_surface.pending_admission_commits.insert(
-                    operation_id.clone(),
-                    PendingSurfaceAdmissionCommit {
-                        fence: fence.clone(),
-                        batch: admitted_batch,
-                        message: "typed surface admission commit failed",
-                        retry_at: tokio::time::Instant::now()
-                            + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                        pinned: input_pinned,
+                        origin: surface::SurfaceItemOrigin::UserInput,
                     },
-                );
-                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
-            }
-            Err(error) => {
-                eprintln!("orca: typed surface admission commit failed: {error:?}");
-                if let Err(repair_error) = self.repair_surface_admission_failure(
-                    &fence,
-                    "typed surface admission commit failed",
-                ) {
-                    self.surface_terminal_blocked = Some(format!(
-                        "typed surface admission repair failed for {:?}: {repair_error:?}",
-                        fence.operation_id
-                    ));
+                }),
+            ),
+        ];
+        let goal_commit_authority = if let Some((_, mutation)) = goal_mutation.as_ref() {
+            let (goal_fence, receipt_digest, _, scope, event) =
+                surface_goal_mutation_event(mutation, snapshot.thread.thread_id.clone())
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            admitted_events.push((scope, event));
+            Some((goal_fence, receipt_digest))
+        } else {
+            None
+        };
+        let admitted_batch = self.surface_event_batch_with_commit_id(admitted_events, None);
+        let mut admitted = false;
+        let mut last_error = None;
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            let result = match goal_commit_authority.as_ref() {
+                Some((goal_fence, receipt_digest)) => {
+                    self.resident_surface.coordinator.commit_actor_goal_batch(
+                        goal_fence.clone(),
+                        receipt_digest.clone(),
+                        &admitted_batch,
+                    )
                 }
-                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                None => self
+                    .resident_surface
+                    .coordinator
+                    .commit_actor_batch(&admitted_batch),
+            };
+            match result {
+                Ok(_) => {
+                    admitted = true;
+                    break;
+                }
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) =>
+                {
+                    last_error = Some(surface::SurfaceCommitError::Ledger(error));
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
             }
+        }
+        if !admitted {
+            match last_error {
+                Some(error) => {
+                    eprintln!("orca: typed surface admission commit failed: {error:?}");
+                    if matches!(error, surface::SurfaceCommitError::Ledger(_)) {
+                        let goal = match (goal_mutation.as_ref(), goal_commit_authority.as_ref()) {
+                            (Some((runtime, mutation)), Some((goal_fence, receipt_digest))) => {
+                                Some(PendingSurfaceGoalAdmissionCommit {
+                                    runtime: runtime.clone(),
+                                    mutation: mutation.clone(),
+                                    goal_fence: goal_fence.clone(),
+                                    receipt_digest: receipt_digest.clone(),
+                                })
+                            }
+                            (None, None) => None,
+                            _ => {
+                                self.surface_terminal_blocked = Some(
+                                    "typed Goal admission lost its exact commit authority"
+                                        .to_string(),
+                                );
+                                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                            }
+                        };
+                        self.resident_surface.pending_admission_commits.insert(
+                            operation_id.clone(),
+                            PendingSurfaceAdmissionCommit {
+                                fence: fence.clone(),
+                                batch: admitted_batch,
+                                goal,
+                                message: "typed surface admission commit failed",
+                                retry_at: tokio::time::Instant::now()
+                                    + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                            },
+                        );
+                    } else if let Err(repair_error) = self.repair_surface_admission_failure(
+                        &fence,
+                        "typed surface admission commit failed",
+                    ) {
+                        self.surface_terminal_blocked = Some(format!(
+                            "typed surface admission repair failed for {:?}: {repair_error:?}",
+                            fence.operation_id
+                        ));
+                    }
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
+                None => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+            }
+        }
+        if let Some((runtime, mutation)) = goal_mutation.as_ref() {
+            Self::acknowledge_goal_surface_mutation_best_effort(runtime, mutation);
         }
 
         let start_commit_id =
@@ -9177,6 +12592,42 @@ impl ThreadActor {
                         fence: interaction_fence.clone(),
                     }))
             });
+        if goal_identity.is_some() {
+            let goal_identity = goal_identity.as_ref().expect("guarded Goal identity");
+            let goal_turn_origin = match goal_identity.outer_turn_origin {
+                surface::GoalOuterTurnOrigin::User => orca_core::goal_runtime::GoalTurnOrigin::User,
+                surface::GoalOuterTurnOrigin::Resume => {
+                    orca_core::goal_runtime::GoalTurnOrigin::Resume
+                }
+                surface::GoalOuterTurnOrigin::Continuation => {
+                    orca_core::goal_runtime::GoalTurnOrigin::Continuation
+                }
+                surface::GoalOuterTurnOrigin::WorkflowNotification => {
+                    orca_core::goal_runtime::GoalTurnOrigin::WorkflowNotification
+                }
+            };
+            let surface_goal_turn = crate::goal_actor::GoalTurnContext {
+                session_id: self.handle.thread_id().to_string(),
+                goal_id: orca_core::goal_runtime::GoalId::parse(goal_identity.goal_id.as_str())
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                goal_run_id: orca_core::goal_runtime::GoalRunId::parse(
+                    goal_identity.goal_run_id.as_str().to_string(),
+                )
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                outer_turn_id: orca_core::goal_runtime::GoalOuterTurnId::parse(
+                    goal_identity.goal_outer_turn_id.as_str().to_string(),
+                )
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                origin: goal_turn_origin,
+                run_started: false,
+            };
+            hosted_request = hosted_request
+                .with_operation_kind(HostedOperationKind::GoalRun)
+                .with_goal_tools(true)
+                .with_goal_usage_tracking(true)
+                .with_goal_turn_origin(goal_turn_origin)
+                .with_surface_goal_owned(surface_goal_turn);
+        }
         hosted_request.turn_id = logical_turn_id;
         hosted_request.task_id = Some(legacy_task_id);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
@@ -9245,6 +12696,16 @@ impl ThreadActor {
         &mut self,
         fence: &surface::SurfaceOperationFence,
         message: &'static str,
+    ) -> Result<surface::OperationTerminalAtCursor, surface::SurfaceClientCommandError> {
+        self.repair_surface_admission_failure_with_legacy(fence, message, None, false)
+    }
+
+    fn repair_surface_admission_failure_with_legacy(
+        &mut self,
+        fence: &surface::SurfaceOperationFence,
+        message: &'static str,
+        legacy: Option<(OperationCompletion, OperationTerminal)>,
+        goal_recovery_owned: bool,
     ) -> Result<surface::OperationTerminalAtCursor, surface::SurfaceClientCommandError> {
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let operation = snapshot
@@ -9359,6 +12820,9 @@ impl ThreadActor {
                     finalize_intent_id,
                     terminal_commit_id,
                     terminal,
+                    legacy_completion: legacy.as_ref().map(|(completion, _)| completion.clone()),
+                    legacy_terminal: legacy.as_ref().map(|(_, terminal)| terminal.clone()),
+                    goal_recovery_owned,
                     retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
                 },
             );
@@ -9407,28 +12871,197 @@ impl ThreadActor {
                 snapshot.thread.owner_epoch,
                 terminal_batch.batch_digest.clone(),
             );
-            self.resident_surface.pending_admission_terminals.insert(
-                fence.operation_id.clone(),
-                PendingSurfaceAdmissionTerminal {
-                    pending: PendingSurfaceTerminalCommit {
-                        batch: terminal_batch,
-                        value,
-                        failure: surface::WaitOperationTerminalResult::TerminalCommitFailure {
-                            operation_id: fence.operation_id.clone(),
-                            finalize_intent_id,
-                            commit_id: terminal_commit_id,
-                            repair,
-                        },
-                        legacy_completion: None,
-                        legacy_terminal: None,
+            self.cache_surface_admission_terminal_failure(PendingSurfaceAdmissionTerminal {
+                pending: PendingSurfaceTerminalCommit {
+                    batch: terminal_batch,
+                    value,
+                    failure: surface::WaitOperationTerminalResult::TerminalCommitFailure {
+                        operation_id: fence.operation_id.clone(),
+                        finalize_intent_id,
+                        commit_id: terminal_commit_id,
+                        repair,
                     },
-                    retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                    legacy_completion: legacy.as_ref().map(|(completion, _)| completion.clone()),
+                    legacy_terminal: legacy.as_ref().map(|(_, terminal)| terminal.clone()),
                 },
-            );
+                goal_recovery_owned,
+                retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+            });
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         self.cache_surface_terminal(value.clone());
+        if let Some((completion, terminal)) = legacy {
+            let completed = completion.complete(terminal);
+            debug_assert!(completed, "legacy terminal must complete exactly once");
+        }
         Ok(value)
+    }
+
+    fn repair_surface_resume_failure(
+        &mut self,
+        fence: &surface::SurfaceOperationFence,
+        restored_goal_binding: Option<(
+            &GoalRuntimeHandle,
+            &str,
+            &surface::SurfaceGoalGenerationIdentity,
+        )>,
+        message: &'static str,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| operation.operation_id == fence.operation_id);
+        let repair = operation
+            .and_then(|operation| {
+                operation
+                    .generations
+                    .iter()
+                    .find(|generation| generation.fence == *fence)
+                    .map(|generation| (operation, generation))
+            })
+            .map(|(operation, generation)| {
+                let mut events = snapshot
+                    .assistant_streams
+                    .iter()
+                    .filter(|stream| {
+                        stream.fence == *fence
+                            && stream.state == surface::SurfaceAssistantStreamState::Open
+                    })
+                    .map(|stream| {
+                        (
+                            surface::SurfaceScope::Generation {
+                                fence: fence.clone(),
+                            },
+                            surface::SurfaceEvent::Assistant(
+                                surface::AssistantPatch::StreamDiscarded {
+                                    stream_id: stream.stream_id.clone(),
+                                    reason: surface::AssistantDiscardReason::RuntimeRestart,
+                                },
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                match generation.phase {
+                    surface::GenerationPhase::Reserved => {
+                        let surface::OperationPhase::Suspended { cause } = &operation.phase else {
+                            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                        };
+                        events.extend([
+                            (
+                                surface::SurfaceScope::Generation {
+                                    fence: fence.clone(),
+                                },
+                                surface::SurfaceEvent::Operation(
+                                    surface::OperationPatch::GenerationStopped {
+                                        fence: fence.clone(),
+                                        reason: surface::GenerationStopReason::NotStarted {
+                                            reason: surface::NotStartedReason::RuntimeRestart,
+                                        },
+                                        usage_delta: surface::UsageTotals {
+                                            input_tokens: 0,
+                                            output_tokens: 0,
+                                            cache_tokens: 0,
+                                            estimated_cost_usd_micros: 0,
+                                        },
+                                    },
+                                ),
+                            ),
+                            (
+                                surface::SurfaceScope::Operation {
+                                    operation_id: fence.operation_id.clone(),
+                                },
+                                surface::SurfaceEvent::Operation(
+                                    surface::OperationPatch::SuspensionRebasedAfterUnstartedResume {
+                                        operation_id: fence.operation_id.clone(),
+                                        previous_cause: cause.clone(),
+                                        replacement_fence: fence.clone(),
+                                        rebased_cause:
+                                            surface::SuspensionCause::RecoveryRequired {
+                                                generation_id: fence.generation_id,
+                                            },
+                                    },
+                                ),
+                            ),
+                        ]);
+                    }
+                    surface::GenerationPhase::Started | surface::GenerationPhase::Transferred => {
+                        events.extend([
+                            (
+                                surface::SurfaceScope::Generation {
+                                    fence: fence.clone(),
+                                },
+                                surface::SurfaceEvent::Operation(
+                                    surface::OperationPatch::GenerationStopped {
+                                        fence: fence.clone(),
+                                        reason: surface::GenerationStopReason::RuntimeRestart,
+                                        usage_delta: surface::UsageTotals {
+                                            input_tokens: 0,
+                                            output_tokens: 0,
+                                            cache_tokens: 0,
+                                            estimated_cost_usd_micros: 0,
+                                        },
+                                    },
+                                ),
+                            ),
+                            (
+                                surface::SurfaceScope::Operation {
+                                    operation_id: fence.operation_id.clone(),
+                                },
+                                surface::SurfaceEvent::Operation(
+                                    surface::OperationPatch::Suspended {
+                                        operation_id: fence.operation_id.clone(),
+                                        cause: surface::SuspensionCause::RecoveryRequired {
+                                            generation_id: fence.generation_id,
+                                        },
+                                    },
+                                ),
+                            ),
+                        ]);
+                    }
+                    surface::GenerationPhase::Stopped => return Ok(()),
+                }
+                let batch = self.surface_event_batch_with_commit_id(events, None);
+                self.resident_surface
+                    .coordinator
+                    .commit_resume_abort_batch(fence.clone(), &batch)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        eprintln!("orca: {message}: typed surface resume repair failed: {error:?}");
+                        surface::SurfaceClientCommandError::RuntimeUnavailable
+                    })
+            })
+            .transpose()
+            .map(|_| ());
+
+        if let Some(active) = self.active.as_mut()
+            && operation
+                .and_then(|operation| {
+                    operation
+                        .generations
+                        .iter()
+                        .find(|generation| generation.fence == *fence)
+                })
+                .map(|generation| generation.logical_turn_id.as_ref())
+                .is_some_and(|turn_id: &str| turn_id == active.request.turn_id.as_ref())
+        {
+            active.generation.cancel.cancel();
+        }
+        let release = restored_goal_binding.map_or(Ok(()), |(runtime, session_id, identity)| {
+            runtime
+                .release_outer_turn_for_surface(session_id, identity.clone())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)
+                .and_then(|released| {
+                    if released {
+                        Ok(())
+                    } else {
+                        Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+                    }
+                })
+        });
+        repair.and(release)
     }
 
     fn wait_surface_operation(
@@ -9451,6 +13084,14 @@ impl ThreadActor {
             .get(&operation_id)
         {
             let _ = reply.try_send(Ok(pending.failure.clone()));
+            return;
+        }
+        if let Some(pending) = self
+            .resident_surface
+            .pending_admission_terminals
+            .get(&operation_id)
+        {
+            let _ = reply.try_send(Ok(pending.pending.failure.clone()));
             return;
         }
         let exists = self
@@ -9514,6 +13155,27 @@ impl ThreadActor {
             Some("typed surface terminal commit failed and requires cold recovery".to_string());
         self.resident_surface
             .pending_terminal_commits
+            .insert(operation_id.clone(), pending);
+        for waiter in self
+            .resident_surface
+            .waiters
+            .remove(&operation_id)
+            .unwrap_or_default()
+        {
+            let _ = waiter.try_send(Ok(failure.clone()));
+        }
+    }
+
+    fn cache_surface_admission_terminal_failure(
+        &mut self,
+        pending: PendingSurfaceAdmissionTerminal,
+    ) {
+        let operation_id = pending.pending.value.operation_id.clone();
+        let failure = pending.pending.failure.clone();
+        self.surface_terminal_blocked =
+            Some("typed surface admission terminal commit is retrying".to_string());
+        self.resident_surface
+            .pending_admission_terminals
             .insert(operation_id.clone(), pending);
         for waiter in self
             .resident_surface
@@ -9733,7 +13395,9 @@ impl ThreadActor {
         &mut self,
         active: &ActiveOperation,
         outcome: &OperationOutcome,
+        runtime_usage: UsageTotals,
     ) -> Result<surface::OperationTerminalAtCursor, RuntimeHostError> {
+        let surface_usage = surface_usage_totals(runtime_usage);
         let fence = active.surface_operation.clone().ok_or_else(|| {
             RuntimeHostError::ThreadStartFailed {
                 message: "typed surface operation fence is missing during finalization".to_string(),
@@ -9761,12 +13425,7 @@ impl ThreadActor {
                         status: surface::GenerationCompletionStatus::Success,
                     },
                     surface::OperationTerminal::Succeeded {
-                        usage: surface::UsageTotals {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_tokens: 0,
-                            estimated_cost_usd_micros: 0,
-                        },
+                        usage: surface_usage.clone(),
                     },
                 ),
                 OperationOutcome::Completed(RunStatus::Cancelled) => {
@@ -9784,9 +13443,16 @@ impl ThreadActor {
                                 reason: surface::SurfaceShutdownReason::ThreadClose,
                             }
                         }
-                        _ => surface::OperationTerminal::Cancelled {
-                            reason: surface::CancelReason::User,
-                        },
+                        surface::TerminalizationCause::GoalPause => {
+                            surface::OperationTerminal::Cancelled {
+                                reason: surface::CancelReason::GoalPause,
+                            }
+                        }
+                        surface::TerminalizationCause::UserCancel => {
+                            surface::OperationTerminal::Cancelled {
+                                reason: surface::CancelReason::User,
+                            }
+                        }
                     };
                     (surface::GenerationStopReason::Cancelled { cause }, terminal)
                 }
@@ -9821,8 +13487,16 @@ impl ThreadActor {
                 }
             }
         };
+        if active.request.surface_goal_owned {
+            let control = active.goal_control.as_ref().ok_or_else(|| {
+                RuntimeHostError::GoalControlFailed {
+                    message: "typed Goal finalization lacks its runtime owner".to_string(),
+                }
+            })?;
+            self.reconcile_goal_surface_outbox(&control.runtime, &control.session_id)?;
+        }
         let operation_id = fence.operation_id.clone();
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let operation = snapshot
             .foreground_operation
             .iter()
@@ -9882,10 +13556,10 @@ impl ThreadActor {
                 fence: fence.clone(),
                 reason: stop_reason.clone(),
                 usage_delta: surface::UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
+                    input_tokens: surface_usage.input_tokens,
+                    output_tokens: surface_usage.output_tokens,
+                    cache_tokens: surface_usage.cache_tokens,
+                    estimated_cost_usd_micros: surface_usage.estimated_cost_usd_micros,
                 },
             }),
         ));
@@ -9902,27 +13576,416 @@ impl ThreadActor {
                 expected_settlements: Vec::new(),
             }),
         ));
+        let goal_settlement = if active.request.surface_goal_owned {
+            let identity = operation
+                .generations
+                .last()
+                .and_then(|generation| generation.goal_identity.clone())
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "typed Goal finalization lacks its generation identity".to_string(),
+                })?;
+            let control = active.goal_control.as_ref().ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "typed Goal finalization lacks its runtime owner".to_string(),
+                }
+            })?;
+            let goal_revision = snapshot
+                .goal
+                .as_ref()
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "typed Goal finalization lacks its snapshot".to_string(),
+                })?
+                .goal_revision
+                .get();
+            let (pause_reason, default_pause_message) = match active.surface_terminalization {
+                Some(
+                    surface::TerminalizationCause::UserCancel
+                    | surface::TerminalizationCause::GoalPause,
+                ) => (
+                    surface::SurfaceGoalPauseReason::User,
+                    "Goal operation paused by user",
+                ),
+                Some(
+                    surface::TerminalizationCause::HostShutdown
+                    | surface::TerminalizationCause::ThreadClose,
+                ) => (
+                    surface::SurfaceGoalPauseReason::Infrastructure,
+                    "Goal operation paused during runtime shutdown",
+                ),
+                None => (
+                    surface::SurfaceGoalPauseReason::NoProgress,
+                    "Goal outer turn ended without an admitted continuation",
+                ),
+            };
+            let default_paused_state = surface::SurfaceGoalState::Paused {
+                reason: pause_reason,
+                message: surface::DisplayText::new(default_pause_message),
+            };
+            let goal_status = match &terminal {
+                surface::OperationTerminal::Succeeded { .. } => {
+                    surface::GoalOuterTurnStatus::Success
+                }
+                surface::OperationTerminal::Cancelled { .. }
+                | surface::OperationTerminal::Shutdown { .. } => {
+                    surface::GoalOuterTurnStatus::Cancelled
+                }
+                surface::OperationTerminal::BudgetExhausted { .. } => {
+                    surface::GoalOuterTurnStatus::BudgetExhausted
+                }
+                _ => surface::GoalOuterTurnStatus::Failed,
+            };
+            let mut goal_usage = surface::GoalUsage {
+                charged_input_tokens: i64::try_from(surface_usage.input_tokens).unwrap_or(i64::MAX),
+                output_tokens: i64::try_from(surface_usage.output_tokens).unwrap_or(i64::MAX),
+                cache_tokens: i64::try_from(surface_usage.cache_tokens).unwrap_or(i64::MAX),
+                verifier_tokens: 0,
+                cost_micros: i64::try_from(surface_usage.estimated_cost_usd_micros)
+                    .unwrap_or(i64::MAX),
+                elapsed_seconds: 0,
+            };
+            let mut verification_patch = None;
+            let (next_action, selected_goal_state, decision_message) =
+                if matches!(terminal, surface::OperationTerminal::Succeeded { .. }) {
+                    let core_status = orca_core::goal_runtime::GoalTurnStatus::Success;
+                    let core_usage = orca_core::goal_runtime::GoalUsage {
+                        charged_input_tokens: goal_usage.charged_input_tokens,
+                        output_tokens: goal_usage.output_tokens,
+                        cache_tokens: goal_usage.cache_tokens,
+                        verifier_tokens: goal_usage.verifier_tokens,
+                        cost_micros: goal_usage.cost_micros,
+                        elapsed_seconds: goal_usage.elapsed_seconds,
+                    };
+                    let preview = control
+                        .runtime
+                        .preview_outer_turn_for_surface(
+                            &control.session_id,
+                            core_status,
+                            core_usage.clone(),
+                            None,
+                        )
+                        .map_err(|error| RuntimeHostError::GoalControlFailed {
+                            message: error.to_string(),
+                        })?;
+                    let decided =
+                        if let orca_core::goal_runtime::GoalNextAction::Verify { intent } = preview
+                        {
+                            let record = control
+                                .runtime
+                                .read(&control.session_id)
+                                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                                    message: error.to_string(),
+                                })?
+                                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                                    message: "Goal disappeared before terminal verification"
+                                        .to_string(),
+                                })?;
+                            let mut request =
+                                GoalVerificationRequest::new(record.objective.clone(), intent);
+                            request.goal_state = record.state;
+                            request.budget_remaining = record
+                                .token_budget
+                                .map(|budget| budget.saturating_sub(record.usage.charged_tokens()));
+                            request.active_workflow = self
+                                .state
+                                .as_ref()
+                                .is_some_and(|state| state.thread.session().has_active_workflows());
+                            request.last_model_response = self.state.as_ref().and_then(|state| {
+                                state
+                                    .thread
+                                    .session()
+                                    .conversation()
+                                    .messages
+                                    .iter()
+                                    .rev()
+                                    .find_map(|message| match message {
+                                        Message::Assistant { content, .. } => content.clone(),
+                                        _ => None,
+                                    })
+                            });
+                            let verifier: Box<dyn GoalVerifier> = if active.config.provider
+                                == orca_core::config::ProviderKind::DeepSeek
+                            {
+                                Box::new(DeepSeekGoalVerifier::new(
+                                    orca_provider::ProviderConfig {
+                                        api_key: active.config.api_key.clone(),
+                                        base_url: active.config.base_url.clone(),
+                                        model: active.config.model.as_option(),
+                                        reasoning_effort: active.config.reasoning_effort,
+                                        tools_override: Some(Vec::new()),
+                                        mcp_registry: None,
+                                        external_tools: Vec::new(),
+                                    },
+                                    active.generation.cancel.clone(),
+                                ))
+                            } else {
+                                Box::new(DeterministicGoalVerifier)
+                            };
+                            let result = match verifier.verify(&request) {
+                                Ok(output) => {
+                                    goal_usage.verifier_tokens = goal_usage
+                                        .verifier_tokens
+                                        .saturating_add(output.usage.verifier_tokens);
+                                    goal_usage.cost_micros = goal_usage
+                                        .cost_micros
+                                        .saturating_add(output.usage.cost_micros);
+                                    goal_usage.elapsed_seconds = goal_usage
+                                        .elapsed_seconds
+                                        .saturating_add(output.usage.elapsed_seconds);
+                                    output.result
+                                }
+                                Err(error) => {
+                                    orca_core::goal_runtime::GoalVerificationResult::Indeterminate {
+                                        message: error.to_string(),
+                                    }
+                                }
+                            };
+                            verification_patch = Some(surface_goal_verification(&result)?);
+                            control
+                                .runtime
+                                .preview_outer_turn_for_surface(
+                                    &control.session_id,
+                                    core_status,
+                                    core_usage,
+                                    Some(result),
+                                )
+                                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                                    message: error.to_string(),
+                                })?
+                        } else {
+                            preview
+                        };
+                    match decided {
+                        orca_core::goal_runtime::GoalNextAction::Complete { evidence } => (
+                            surface::GoalOuterTurnNextAction::Complete,
+                            surface_goal_state(&orca_core::goal_runtime::GoalState::Complete {
+                                evidence,
+                            })?,
+                            "Goal completion verified".to_string(),
+                        ),
+                        orca_core::goal_runtime::GoalNextAction::Blocked { blocker } => (
+                            surface::GoalOuterTurnNextAction::Blocked,
+                            surface_goal_state(&orca_core::goal_runtime::GoalState::Blocked {
+                                blocker,
+                            })?,
+                            "Goal blocked state verified".to_string(),
+                        ),
+                        orca_core::goal_runtime::GoalNextAction::BudgetLimited => (
+                            surface::GoalOuterTurnNextAction::BudgetLimited,
+                            surface::SurfaceGoalState::BudgetLimited,
+                            "Goal token budget exhausted".to_string(),
+                        ),
+                        orca_core::goal_runtime::GoalNextAction::Pause { reason, message } => (
+                            surface::GoalOuterTurnNextAction::Pause,
+                            surface_goal_state(&orca_core::goal_runtime::GoalState::Paused {
+                                reason,
+                                message: message.clone(),
+                            })?,
+                            message,
+                        ),
+                        orca_core::goal_runtime::GoalNextAction::Continue { .. }
+                        | orca_core::goal_runtime::GoalNextAction::Verify { .. } => (
+                            surface::GoalOuterTurnNextAction::Pause,
+                            default_paused_state.clone(),
+                            default_pause_message.to_string(),
+                        ),
+                    }
+                } else {
+                    (
+                        surface::GoalOuterTurnNextAction::Pause,
+                        default_paused_state.clone(),
+                        default_pause_message.to_string(),
+                    )
+                };
+            let stop_binding = match &terminal {
+                surface::OperationTerminal::Succeeded { .. } => {
+                    surface::GoalContinuationStopReason::GoalInactive {
+                        state: selected_goal_state,
+                    }
+                }
+                surface::OperationTerminal::Cancelled { .. }
+                | surface::OperationTerminal::Shutdown { .. } => {
+                    active.surface_terminalization.map_or_else(
+                        || surface::GoalContinuationStopReason::PredecessorNotSuccessful {
+                            status: surface::GoalPredecessorStatus::Cancelled,
+                            terminal: terminal.clone(),
+                        },
+                        |cause| surface::GoalContinuationStopReason::TerminalizingControl { cause },
+                    )
+                }
+                surface::OperationTerminal::BudgetExhausted { .. } => {
+                    surface::GoalContinuationStopReason::PredecessorNotSuccessful {
+                        status: surface::GoalPredecessorStatus::BudgetExhausted,
+                        terminal: terminal.clone(),
+                    }
+                }
+                _ => surface::GoalContinuationStopReason::PredecessorNotSuccessful {
+                    status: surface::GoalPredecessorStatus::Failed,
+                    terminal: terminal.clone(),
+                },
+            };
+            let finished_commit_id = uuid::Uuid::now_v7().to_string();
+            let verification_commit_id = verification_patch
+                .as_ref()
+                .map(|_| uuid::Uuid::now_v7().to_string());
+            let decision_commit_id = uuid::Uuid::now_v7().to_string();
+            let finished_digest = *surface_sha256(
+                &serde_json::to_vec(&(
+                    "goal_outer_turn_finished",
+                    &identity,
+                    &goal_status,
+                    &terminal,
+                ))
+                .expect("Goal finish digest input is serializable"),
+            )
+            .as_bytes();
+            let verification_digest = verification_patch.as_ref().map(|verification| {
+                *surface_sha256(
+                    &serde_json::to_vec(&("goal_verification_completed", &identity, verification))
+                        .expect("Goal verification digest input is serializable"),
+                )
+                .as_bytes()
+            });
+            let decision_digest = *surface_sha256(
+                &serde_json::to_vec(&(
+                    "goal_continuation_stopped",
+                    &identity,
+                    &stop_binding,
+                    &terminal,
+                ))
+                .expect("Goal continuation digest input is serializable"),
+            )
+            .as_bytes();
+            let mut contexts = vec![GoalSurfaceMutationContext {
+                store_commit_id: finished_commit_id,
+                command_digest: finished_digest,
+                goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+            }];
+            if let (Some(store_commit_id), Some(command_digest)) =
+                (verification_commit_id, verification_digest)
+            {
+                contexts.push(GoalSurfaceMutationContext {
+                    store_commit_id,
+                    command_digest,
+                    goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                });
+            }
+            contexts.push(GoalSurfaceMutationContext {
+                store_commit_id: decision_commit_id,
+                command_digest: decision_digest,
+                goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+            });
+            let mutations = control
+                .runtime
+                .finish_outer_turn_for_surface(
+                    FinishGoalOuterTurnForSurfaceInput {
+                        session_id: control.session_id.clone(),
+                        expected_goal_id: orca_core::goal_runtime::GoalId::parse(
+                            identity.goal_id.as_str(),
+                        )
+                        .map_err(|message| RuntimeHostError::GoalControlFailed { message })?,
+                        expected_goal_revision: u32::try_from(goal_revision).map_err(|_| {
+                            RuntimeHostError::GoalControlFailed {
+                                message: "Goal revision exceeds durable store range".to_string(),
+                            }
+                        })?,
+                        identity: Box::new(identity),
+                        status: goal_status,
+                        usage: goal_usage,
+                        next_action,
+                        verification: verification_patch.clone(),
+                        continuation: None,
+                        stop_reason: stop_binding,
+                        terminal: terminal.clone(),
+                        pause_message: decision_message,
+                        finished_at: chrono::Utc::now().timestamp(),
+                    },
+                    contexts,
+                )
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?;
+            let (finished, verification, decision) = match mutations.as_slice() {
+                [finished, decision] => (finished, None, decision),
+                [finished, verification, decision] => (finished, Some(verification), decision),
+                _ => {
+                    return Err(RuntimeHostError::GoalControlFailed {
+                        message: "Goal outer-turn settlement returned an invalid receipt sequence"
+                            .to_string(),
+                    });
+                }
+            };
+            let (finished_fence, finished_digest, _, finished_scope, finished_event) =
+                surface_goal_mutation_event(finished, snapshot.thread.thread_id.clone())?;
+            let (decision_fence, decision_digest, _, decision_scope, decision_event) =
+                surface_goal_mutation_event(decision, snapshot.thread.thread_id.clone())?;
+            stop_and_finalization_events.push((finished_scope, finished_event));
+            let verification_authority = if let Some(verification) = verification {
+                let (fence, digest, _, scope, event) =
+                    surface_goal_mutation_event(verification, snapshot.thread.thread_id.clone())?;
+                stop_and_finalization_events.push((scope, event));
+                Some((fence, digest))
+            } else {
+                None
+            };
+            stop_and_finalization_events.push((decision_scope, decision_event));
+            Some((
+                control.runtime.clone(),
+                mutations,
+                finished_fence,
+                finished_digest,
+                verification_authority,
+                decision_fence,
+                decision_digest,
+            ))
+        } else {
+            None
+        };
         let stop_and_finalization_batch =
             self.surface_event_batch_with_commit_id(stop_and_finalization_events, None);
-        self.resident_surface
-            .coordinator
-            .commit_live_generation_stop_disposition_batch(
-                fence,
-                operation_id.clone(),
-                finalize_intent_id.clone(),
-                &stop_and_finalization_batch,
-            )
-            .map_err(|error| RuntimeHostError::ThreadStartFailed {
-                message: format!(
-                    "typed surface generation stop and finalization start failed: {error:?}"
-                ),
-            })?;
-        let usage = surface::UsageTotals {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_tokens: 0,
-            estimated_cost_usd_micros: 0,
+        let stop_commit = if let Some((
+            _,
+            _,
+            finished_fence,
+            finished_digest,
+            verification_authority,
+            decision_fence,
+            decision_digest,
+        )) = goal_settlement.as_ref()
+        {
+            self.resident_surface
+                .coordinator
+                .commit_goal_generation_stop_batch(
+                    finished_fence.clone(),
+                    finished_digest.clone(),
+                    verification_authority.clone(),
+                    decision_fence.clone(),
+                    decision_digest.clone(),
+                    fence,
+                    operation_id.clone(),
+                    finalize_intent_id.clone(),
+                    &stop_and_finalization_batch,
+                )
+        } else {
+            self.resident_surface
+                .coordinator
+                .commit_live_generation_stop_disposition_batch(
+                    fence,
+                    operation_id.clone(),
+                    finalize_intent_id.clone(),
+                    &stop_and_finalization_batch,
+                )
         };
+        stop_commit.map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!(
+                "typed surface generation stop and finalization start failed: {error:?}"
+            ),
+        })?;
+        if let Some((runtime, mutations, ..)) = goal_settlement {
+            for mutation in mutations {
+                Self::acknowledge_goal_surface_mutation_best_effort(&runtime, &mutation);
+            }
+        }
+        let usage = surface_usage;
         let terminal_batch = self.surface_operation_batch_with_commit_id(
             &operation_id,
             vec![surface::OperationPatch::Terminal {
@@ -9982,6 +14045,579 @@ impl ThreadActor {
         }
         self.cache_surface_terminal(value.clone());
         Ok(value)
+    }
+
+    fn admit_surface_goal_continuation(
+        &mut self,
+        active: &ActiveOperation,
+        state: &ThreadActorState,
+        runtime_usage: UsageTotals,
+    ) -> Result<Option<(surface::SurfaceGoalGenerationIdentity, String, String)>, RuntimeHostError>
+    {
+        if !active.request.surface_goal_owned
+            || active.surface_terminalization.is_some()
+            || active.surface_execution_failure.is_some()
+        {
+            return Ok(None);
+        }
+        let control =
+            active
+                .goal_control
+                .as_ref()
+                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                    message: "typed Goal continuation lacks its runtime owner".to_string(),
+                })?;
+        self.reconcile_goal_surface_outbox(&control.runtime, &control.session_id)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| {
+                active
+                    .surface_operation
+                    .as_ref()
+                    .is_some_and(|fence| operation.operation_id == fence.operation_id)
+            })
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed Goal continuation lost its foreground operation".to_string(),
+            })?;
+        let predecessor_generation = operation.generations.last().cloned().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "typed Goal continuation lost its predecessor generation".to_string(),
+            }
+        })?;
+        let predecessor = predecessor_generation
+            .goal_identity
+            .clone()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "typed Goal continuation lacks its predecessor identity".to_string(),
+            })?;
+        let surface_usage = surface_usage_totals(runtime_usage);
+        let mut goal_usage = surface::GoalUsage {
+            charged_input_tokens: i64::try_from(surface_usage.input_tokens).unwrap_or(i64::MAX),
+            output_tokens: i64::try_from(surface_usage.output_tokens).unwrap_or(i64::MAX),
+            cache_tokens: i64::try_from(surface_usage.cache_tokens).unwrap_or(i64::MAX),
+            verifier_tokens: 0,
+            cost_micros: i64::try_from(surface_usage.estimated_cost_usd_micros).unwrap_or(i64::MAX),
+            elapsed_seconds: 0,
+        };
+        let core_usage = orca_core::goal_runtime::GoalUsage {
+            charged_input_tokens: goal_usage.charged_input_tokens,
+            output_tokens: goal_usage.output_tokens,
+            cache_tokens: goal_usage.cache_tokens,
+            verifier_tokens: 0,
+            cost_micros: goal_usage.cost_micros,
+            elapsed_seconds: 0,
+        };
+        let preview = control
+            .runtime
+            .preview_outer_turn_for_surface(
+                &control.session_id,
+                orca_core::goal_runtime::GoalTurnStatus::Success,
+                core_usage.clone(),
+                None,
+            )
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        let mut verification_patch = None;
+        let decided = if let orca_core::goal_runtime::GoalNextAction::Verify { intent } = preview {
+            let record = control
+                .runtime
+                .read(&control.session_id)
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?
+                .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                    message: "Goal disappeared before continuation verification".to_string(),
+                })?;
+            let mut request = GoalVerificationRequest::new(record.objective.clone(), intent);
+            request.goal_state = record.state;
+            request.budget_remaining = record
+                .token_budget
+                .map(|budget| budget.saturating_sub(record.usage.charged_tokens()));
+            request.active_workflow = state.thread.session().has_active_workflows();
+            request.last_model_response = state
+                .thread
+                .session()
+                .conversation()
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant { content, .. } => content.clone(),
+                    _ => None,
+                });
+            let verifier: Box<dyn GoalVerifier> =
+                if active.config.provider == orca_core::config::ProviderKind::DeepSeek {
+                    Box::new(DeepSeekGoalVerifier::new(
+                        orca_provider::ProviderConfig {
+                            api_key: active.config.api_key.clone(),
+                            base_url: active.config.base_url.clone(),
+                            model: active.config.model.as_option(),
+                            reasoning_effort: active.config.reasoning_effort,
+                            tools_override: Some(Vec::new()),
+                            mcp_registry: None,
+                            external_tools: Vec::new(),
+                        },
+                        active.generation.cancel.clone(),
+                    ))
+                } else {
+                    Box::new(DeterministicGoalVerifier)
+                };
+            let verification = match verifier.verify(&request) {
+                Ok(output) => {
+                    goal_usage.verifier_tokens = goal_usage
+                        .verifier_tokens
+                        .saturating_add(output.usage.verifier_tokens);
+                    goal_usage.cost_micros = goal_usage
+                        .cost_micros
+                        .saturating_add(output.usage.cost_micros);
+                    goal_usage.elapsed_seconds = goal_usage
+                        .elapsed_seconds
+                        .saturating_add(output.usage.elapsed_seconds);
+                    output.result
+                }
+                Err(error) => orca_core::goal_runtime::GoalVerificationResult::Indeterminate {
+                    message: error.to_string(),
+                },
+            };
+            verification_patch = Some(surface_goal_verification(&verification)?);
+            control
+                .runtime
+                .preview_outer_turn_for_surface(
+                    &control.session_id,
+                    orca_core::goal_runtime::GoalTurnStatus::Success,
+                    core_usage,
+                    Some(verification),
+                )
+                .map_err(|error| RuntimeHostError::GoalControlFailed {
+                    message: error.to_string(),
+                })?
+        } else {
+            preview
+        };
+        let reason = match decided {
+            orca_core::goal_runtime::GoalNextAction::Continue {
+                reason: orca_core::goal_runtime::GoalContinuationReason::Progress,
+            } => surface::GoalContinuationAdmitReason::Progress,
+            orca_core::goal_runtime::GoalNextAction::Continue {
+                reason: orca_core::goal_runtime::GoalContinuationReason::GapFeedback,
+            } => surface::GoalContinuationAdmitReason::GapFeedback,
+            _ => return Ok(None),
+        };
+        let record = control
+            .runtime
+            .read(&control.session_id)
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "Goal disappeared before continuation admission".to_string(),
+            })?;
+        let successor_outer_turn_count =
+            predecessor.outer_turn_count.checked_add(1).ok_or_else(|| {
+                RuntimeHostError::GoalControlFailed {
+                    message: "Goal outer-turn count exhausted".to_string(),
+                }
+            })?;
+        let conversation = state.thread.session().conversation();
+        let last_gap_fingerprint = control
+            .runtime
+            .recent_gap_fingerprint(&control.session_id)
+            .ok()
+            .flatten();
+        let trigger = if matches!(reason, surface::GoalContinuationAdmitReason::GapFeedback) {
+            GoalContinuationTrigger::GapFeedback
+        } else {
+            GoalContinuationTrigger::Progress
+        };
+        let continuation_prompt = goal_continuation_envelope_prompt(&GoalContinuationEnvelope {
+            objective: record.objective,
+            continuation: usize::try_from(successor_outer_turn_count).unwrap_or(usize::MAX),
+            trigger,
+            tokens_used: record.usage.charged_tokens(),
+            token_budget: record.token_budget,
+            last_gap_fingerprint,
+            last_outer_status: Some("success"),
+            last_end_reason: Some("unclassified"),
+            plan_snapshot: conversation
+                .internal_context
+                .get(orca_core::conversation::PLAN_CONTEXT_FRAGMENT_ID)
+                .map(|fragment| fragment.content.clone()),
+            previous_checkpoint: previous_assistant_checkpoint(conversation),
+        });
+        let continuation_request = surface::SurfaceInputRequest {
+            blocks: surface::NonEmptyVec::try_new(vec![surface::SurfaceInputRequestBlock::Text {
+                text: surface::DisplayText::new(continuation_prompt.as_str()),
+            }])
+            .expect("Goal continuation produces one input block"),
+        };
+        let continuation_input = resolve_surface_input(&continuation_request).ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "Goal continuation input cannot be resolved".to_string(),
+            }
+        })?;
+        let continuation_request_digest = surface_sha256(
+            &serde_json::to_vec(&continuation_request)
+                .expect("Goal continuation input is serializable"),
+        );
+        let continuation_replayability = match &predecessor_generation.replayability {
+            surface::Replayability::Replayable {
+                cwd,
+                workspace_roots,
+                settings_revision,
+                policy_epoch,
+                tool_schema_digest,
+                ..
+            } => surface::Replayability::Replayable {
+                capsule_digest: continuation_request_digest.clone(),
+                request: Some(continuation_request),
+                request_digest: Some(continuation_request_digest.clone()),
+                cwd: cwd.clone(),
+                workspace_roots: workspace_roots.clone(),
+                settings_revision: *settings_revision,
+                policy_epoch: *policy_epoch,
+                tool_schema_digest: tool_schema_digest.clone(),
+            },
+            surface::Replayability::NonReplayable { .. } => {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: "Goal continuation lacks a replayable predecessor capsule".to_string(),
+                });
+            }
+        };
+        let successor_fence = surface::SurfaceOperationFence {
+            thread_id: predecessor.operation_fence.thread_id.clone(),
+            thread_owner_epoch: predecessor.operation_fence.thread_owner_epoch,
+            operation_id: predecessor.operation_fence.operation_id.clone(),
+            generation_id: surface::SurfaceGenerationId::new(
+                predecessor
+                    .operation_fence
+                    .generation_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                        message: "Goal continuation generation id exhausted".to_string(),
+                    })?,
+            ),
+        };
+        let logical_turn_id = TurnId::new();
+        let input_item_id = surface::SurfaceItemId::new();
+        let presentation = surface::SurfaceInputPresentation::Visible {
+            text: continuation_input.canonical_text.clone(),
+        };
+        let correlation_id =
+            surface::SurfaceInputCorrelationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let successor = surface::SurfaceGoalGenerationIdentity {
+            goal_id: predecessor.goal_id.clone(),
+            goal_run_id: predecessor.goal_run_id.clone(),
+            operation_fence: successor_fence.clone(),
+            goal_outer_turn_id: surface::SurfaceGoalOuterTurnId::try_new(
+                orca_core::goal_runtime::GoalOuterTurnId::new().to_string(),
+            )
+            .map_err(surface_goal_value_error)?,
+            logical_turn_id: logical_turn_id.clone(),
+            canonical_input_item_id: input_item_id.clone(),
+            outer_turn_origin: surface::GoalOuterTurnOrigin::Continuation,
+            attempt: surface::GenerationAttempt::Initial,
+            predecessor_fence: Some(predecessor.operation_fence.clone()),
+            objective_revision: predecessor.objective_revision,
+            outer_turn_count: successor_outer_turn_count,
+        };
+        let successor_generation = surface::GenerationRecord {
+            fence: successor_fence.clone(),
+            logical_turn_id: logical_turn_id.clone(),
+            input: surface::GenerationInputState::Pending {
+                input_item_id: input_item_id.clone(),
+                presentation: presentation.clone(),
+                correlation_id: correlation_id.clone(),
+            },
+            predecessor: Some(predecessor.operation_fence.clone()),
+            attempt: surface::GenerationAttempt::Initial,
+            goal_identity: Some(successor.clone()),
+            replayability: continuation_replayability.clone(),
+            required_capabilities: predecessor_generation.required_capabilities.clone(),
+            capability_fingerprint: predecessor_generation.capability_fingerprint.clone(),
+            phase: surface::GenerationPhase::Reserved,
+            started_witness: None,
+            stop_reason: None,
+        };
+        let goal_revision = snapshot
+            .goal
+            .as_ref()
+            .ok_or_else(|| RuntimeHostError::GoalControlFailed {
+                message: "Goal continuation lacks its snapshot".to_string(),
+            })?
+            .goal_revision
+            .get();
+        let finished_commit_id = uuid::Uuid::now_v7().to_string();
+        let verification_commit_id = verification_patch
+            .as_ref()
+            .map(|_| uuid::Uuid::now_v7().to_string());
+        let decision_commit_id = uuid::Uuid::now_v7().to_string();
+        let finished_digest = *surface_sha256(
+            &serde_json::to_vec(&(
+                "goal_outer_turn_finished",
+                &predecessor,
+                surface::GoalOuterTurnStatus::Success,
+                surface::GoalOuterTurnNextAction::Continue,
+            ))
+            .expect("Goal continuation finish digest input is serializable"),
+        )
+        .as_bytes();
+        let verification_digest = verification_patch.as_ref().map(|verification| {
+            *surface_sha256(
+                &serde_json::to_vec(&("goal_verification_completed", &predecessor, verification))
+                    .expect("Goal continuation verification digest is serializable"),
+            )
+            .as_bytes()
+        });
+        let decision_digest = *surface_sha256(
+            &serde_json::to_vec(&(
+                "goal_continuation_admitted",
+                &predecessor,
+                &successor,
+                reason,
+            ))
+            .expect("Goal continuation admission digest is serializable"),
+        )
+        .as_bytes();
+        let mut contexts = vec![GoalSurfaceMutationContext {
+            store_commit_id: finished_commit_id,
+            command_digest: finished_digest,
+            goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+        }];
+        if let (Some(store_commit_id), Some(command_digest)) =
+            (verification_commit_id, verification_digest)
+        {
+            contexts.push(GoalSurfaceMutationContext {
+                store_commit_id,
+                command_digest,
+                goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+            });
+        }
+        contexts.push(GoalSurfaceMutationContext {
+            store_commit_id: decision_commit_id,
+            command_digest: decision_digest,
+            goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+        });
+        let terminal = surface::OperationTerminal::Succeeded {
+            usage: surface_usage.clone(),
+        };
+        let mutations = control
+            .runtime
+            .finish_outer_turn_for_surface(
+                FinishGoalOuterTurnForSurfaceInput {
+                    session_id: control.session_id.clone(),
+                    expected_goal_id: orca_core::goal_runtime::GoalId::parse(
+                        predecessor.goal_id.as_str(),
+                    )
+                    .map_err(|message| RuntimeHostError::GoalControlFailed { message })?,
+                    expected_goal_revision: u32::try_from(goal_revision).map_err(|_| {
+                        RuntimeHostError::GoalControlFailed {
+                            message: "Goal revision exceeds durable store range".to_string(),
+                        }
+                    })?,
+                    identity: Box::new(predecessor.clone()),
+                    status: surface::GoalOuterTurnStatus::Success,
+                    usage: goal_usage,
+                    next_action: surface::GoalOuterTurnNextAction::Continue,
+                    verification: verification_patch,
+                    continuation: Some(AdmittedGoalContinuationForSurface {
+                        reason,
+                        successor: Box::new(successor.clone()),
+                        provider_turn_id: logical_turn_id.to_string(),
+                    }),
+                    stop_reason: surface::GoalContinuationStopReason::VerificationPending,
+                    terminal,
+                    pause_message: "Goal continuation admitted".to_string(),
+                    finished_at: chrono::Utc::now().timestamp(),
+                },
+                contexts,
+            )
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?;
+        let (finished, verification, decision) = match mutations.as_slice() {
+            [finished, decision] => (finished, None, decision),
+            [finished, verification, decision] => (finished, Some(verification), decision),
+            _ => {
+                return Err(RuntimeHostError::GoalControlFailed {
+                    message: "Goal continuation returned an invalid receipt sequence".to_string(),
+                });
+            }
+        };
+        let (finished_fence, finished_digest, _, finished_scope, finished_event) =
+            surface_goal_mutation_event(finished, snapshot.thread.thread_id.clone())?;
+        let (decision_fence, decision_digest, _, decision_scope, decision_event) =
+            surface_goal_mutation_event(decision, snapshot.thread.thread_id.clone())?;
+        let generation_scope = surface::SurfaceScope::Generation {
+            fence: predecessor.operation_fence.clone(),
+        };
+        let mut events = snapshot
+            .assistant_streams
+            .iter()
+            .filter(|stream| {
+                stream.fence == predecessor.operation_fence
+                    && stream.state == surface::SurfaceAssistantStreamState::Open
+            })
+            .map(|stream| {
+                (
+                    generation_scope.clone(),
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamDiscarded {
+                        stream_id: stream.stream_id.clone(),
+                        reason: surface::AssistantDiscardReason::ProviderFailed,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        events.push((
+            generation_scope,
+            surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                fence: predecessor.operation_fence.clone(),
+                reason: surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::Success,
+                },
+                usage_delta: surface_usage,
+            }),
+        ));
+        events.push((
+            surface::SurfaceScope::Generation {
+                fence: successor_fence.clone(),
+            },
+            surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationReserved {
+                generation: successor_generation,
+            }),
+        ));
+        events.push((
+            surface::SurfaceScope::Generation {
+                fence: successor_fence.clone(),
+            },
+            surface::SurfaceEvent::Item(surface::ItemPatch::Added {
+                item: surface::SurfaceItem::UserMessage {
+                    id: input_item_id.clone(),
+                    turn_id: logical_turn_id.clone(),
+                    input: surface::SurfaceUserInputState::Pending {
+                        presentation,
+                        correlation_id,
+                    },
+                    pinned: true,
+                    origin: surface::SurfaceItemOrigin::GoalContinuation,
+                },
+            }),
+        ));
+        events.push((finished_scope, finished_event));
+        let verification_authority = if let Some(verification) = verification {
+            let (fence, digest, _, scope, event) =
+                surface_goal_mutation_event(verification, snapshot.thread.thread_id.clone())?;
+            events.push((scope, event));
+            Some((fence, digest))
+        } else {
+            None
+        };
+        events.push((decision_scope, decision_event));
+        let continuation_batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_goal_generation_continue_batch(
+                finished_fence,
+                finished_digest,
+                verification_authority,
+                decision_fence,
+                decision_digest,
+                predecessor.operation_fence,
+                &continuation_batch,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("typed Goal continuation commit failed: {error:?}"),
+            })?;
+        for mutation in &mutations {
+            Self::acknowledge_goal_surface_mutation_best_effort(&control.runtime, mutation);
+        }
+        let started_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let started_batch = self.surface_operation_batch_with_commit_id(
+            &successor_fence.operation_id,
+            vec![surface::OperationPatch::GenerationStarted {
+                fence: successor_fence.clone(),
+                witness: surface::GenerationStartedWitness {
+                    started_commit_id: started_commit_id.clone(),
+                    settings_revision: operation.intent.settings_revision,
+                    policy_epoch: operation.intent.policy_epoch,
+                    durable_replayability_digest: surface::canonical_replayability_digest(
+                        &continuation_replayability,
+                    ),
+                    capability_fingerprint: predecessor_generation.capability_fingerprint.clone(),
+                },
+            }],
+            Some(started_commit_id),
+        );
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(successor_fence.clone(), &started_batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("typed Goal continuation start failed: {error:?}"),
+            })?;
+        let resolved_fact = surface::SurfaceResolvedInputFact::Replayable {
+            input: continuation_input,
+            request_digest: continuation_request_digest,
+        };
+        let resolved_batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Generation {
+                        fence: successor_fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::InputBindingsResolved {
+                            fence: successor_fence.clone(),
+                            input_item_id: input_item_id.clone(),
+                            fact: resolved_fact.clone(),
+                        },
+                    ),
+                ),
+                (
+                    surface::SurfaceScope::Generation {
+                        fence: successor_fence.clone(),
+                    },
+                    surface::SurfaceEvent::Item(surface::ItemPatch::InputResolved {
+                        item_id: input_item_id,
+                        fact: resolved_fact,
+                    }),
+                ),
+            ],
+            None,
+        );
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(successor_fence.clone(), &resolved_batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("typed Goal continuation input resolution failed: {error:?}"),
+            })?;
+        let legacy_task_id = format!("typed-goal-continuation-{}", uuid::Uuid::now_v7());
+        let loop_batch = self.surface_operation_batch(
+            &successor_fence.operation_id,
+            vec![surface::OperationPatch::AgentLoopTurnStarted {
+                turn: surface::SurfaceAgentLoopTurn {
+                    turn_id: logical_turn_id,
+                    fence: successor_fence.clone(),
+                    ordinal: 0,
+                    task_id: surface::SurfaceTaskId::try_new(legacy_task_id.clone())
+                        .expect("generated task id is non-empty"),
+                    task_status: surface::SurfaceTaskRunningStatus::Running,
+                },
+            }],
+        );
+        self.resident_surface
+            .coordinator
+            .commit_generation_batch(successor.operation_fence.clone(), &loop_batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("typed Goal continuation loop start failed: {error:?}"),
+            })?;
+        Ok(Some((successor, continuation_prompt, legacy_task_id)))
     }
 
     fn prepare_manual_compaction_completed_batch(
@@ -10181,7 +14817,10 @@ impl ThreadActor {
         ) || operation.pending_control.is_some()
             || operation.finalization.is_some()
             || operation.terminal.is_some()
-            || operation.intent.kind != surface::OperationKind::UserTurn
+            || !matches!(
+                operation.intent.kind,
+                surface::OperationKind::UserTurn | surface::OperationKind::GoalRun { .. }
+            )
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -10195,37 +14834,34 @@ impl ThreadActor {
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let (input_request, request_digest) =
-            match (&operation.intent.initial_replayability, &resume_source) {
-                (
-                    surface::Replayability::Replayable {
-                        request: Some(input),
-                        request_digest: Some(request_digest),
-                        ..
-                    },
-                    surface::ResumeSourceWitness::DurableReplay {
-                        replayability_digest,
-                    },
-                ) if replayability_digest
-                    == &surface::canonical_replayability_digest(
-                        &operation.intent.initial_replayability,
-                    ) =>
-                {
-                    (input.clone(), request_digest.clone())
-                }
-                (
-                    surface::Replayability::NonReplayable {
-                        live_capsule: surface::LiveOperationCapsule::Available { incarnation },
-                        ..
-                    },
-                    surface::ResumeSourceWitness::LiveCapsule {
-                        incarnation: witness,
-                    },
-                ) if incarnation == witness && witness == &snapshot.cursor.incarnation => {
-                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
-                }
-                _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
-            };
+        let (input_request, request_digest) = match (&previous.replayability, &resume_source) {
+            (
+                surface::Replayability::Replayable {
+                    request: Some(input),
+                    request_digest: Some(request_digest),
+                    ..
+                },
+                surface::ResumeSourceWitness::DurableReplay {
+                    replayability_digest,
+                },
+            ) if replayability_digest
+                == &surface::canonical_replayability_digest(&previous.replayability) =>
+            {
+                (input.clone(), request_digest.clone())
+            }
+            (
+                surface::Replayability::NonReplayable {
+                    live_capsule: surface::LiveOperationCapsule::Available { incarnation },
+                    ..
+                },
+                surface::ResumeSourceWitness::LiveCapsule {
+                    incarnation: witness,
+                },
+            ) if incarnation == witness && witness == &snapshot.cursor.incarnation => {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
         let resolved_input = resolve_surface_input(&input_request)
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let generation_id = surface::SurfaceGenerationId::new(
@@ -10242,20 +14878,50 @@ impl ThreadActor {
             operation_id: operation_id.clone(),
             generation_id,
         };
-        let resume_turn_id = TurnId::new();
+        let resume_turn_id = previous.logical_turn_id.clone();
+        let goal_identity = previous.goal_identity.as_ref().map(|identity| {
+            let mut replacement = identity.clone();
+            replacement.operation_fence = fence.clone();
+            replacement.logical_turn_id = resume_turn_id.clone();
+            replacement.attempt = surface::GenerationAttempt::RecoveryReplacement;
+            replacement.predecessor_fence = Some(previous.fence.clone());
+            replacement
+        });
         let generation = surface::GenerationRecord {
             fence: fence.clone(),
             logical_turn_id: resume_turn_id.clone(),
             input: previous.input.clone(),
             predecessor: Some(previous.fence.clone()),
             attempt: surface::GenerationAttempt::RecoveryReplacement,
-            goal_identity: None,
-            replayability: operation.intent.initial_replayability.clone(),
-            required_capabilities: operation.intent.required_capabilities.clone(),
-            capability_fingerprint: operation.intent.capability_fingerprint.clone(),
+            goal_identity,
+            replayability: previous.replayability.clone(),
+            required_capabilities: previous.required_capabilities.clone(),
+            capability_fingerprint: previous.capability_fingerprint.clone(),
             phase: surface::GenerationPhase::Reserved,
             started_witness: None,
             stop_reason: None,
+        };
+        let restored_goal_binding = if let Some(goal_identity) = generation.goal_identity.as_ref() {
+            let session_id = self
+                .handle
+                .session_id
+                .clone()
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let runtime = self
+                .goal_runtime_for_surface()
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let turn = runtime
+                .restore_outer_turn_for_surface(&session_id, goal_identity.clone())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            Some((
+                runtime,
+                session_id,
+                goal_identity.clone(),
+                turn.origin,
+                turn,
+            ))
+        } else {
+            None
         };
         let resume_batch = self.surface_operation_batch(
             &operation_id,
@@ -10272,10 +14938,23 @@ impl ThreadActor {
                 },
             ],
         );
-        self.resident_surface
+        if let Err(error) = self
+            .resident_surface
             .coordinator
             .commit_actor_batch(&resume_batch)
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        {
+            eprintln!("orca: typed surface resume reservation commit failed: {error:?}");
+            let _ = self.repair_surface_resume_failure(
+                &fence,
+                restored_goal_binding
+                    .as_ref()
+                    .map(|(runtime, session_id, identity, _, _)| {
+                        (runtime, session_id.as_str(), identity)
+                    }),
+                "typed surface resume reservation failed",
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
 
         let started_commit_id =
             surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -10289,9 +14968,9 @@ impl ThreadActor {
                     settings_revision: operation.intent.settings_revision,
                     policy_epoch: operation.intent.policy_epoch,
                     durable_replayability_digest: surface::canonical_replayability_digest(
-                        &operation.intent.initial_replayability,
+                        &previous.replayability,
                     ),
-                    capability_fingerprint: operation.intent.capability_fingerprint.clone(),
+                    capability_fingerprint: previous.capability_fingerprint.clone(),
                 },
             }],
             Some(started_commit_id),
@@ -10302,6 +14981,95 @@ impl ThreadActor {
             .commit_generation_batch(fence.clone(), &started_batch)
         {
             eprintln!("orca: typed surface resume Started commit failed: {error:?}");
+            if self
+                .repair_surface_resume_failure(
+                    &fence,
+                    restored_goal_binding
+                        .as_ref()
+                        .map(|(runtime, session_id, identity, _, _)| {
+                            (runtime, session_id.as_str(), identity)
+                        }),
+                    "typed surface resume Started commit failed",
+                )
+                .is_err()
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "typed surface resume repair failed for {:?}",
+                    fence.operation_id
+                ));
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+
+        if let surface::GenerationInputState::Pending { input_item_id, .. } = &generation.input {
+            let resolved_fact = surface::SurfaceResolvedInputFact::Replayable {
+                input: resolved_input.clone(),
+                request_digest: request_digest.clone(),
+            };
+            let resolved_batch = self.surface_event_batch_with_commit_id(
+                vec![
+                    (
+                        surface::SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::InputBindingsResolved {
+                                fence: fence.clone(),
+                                input_item_id: input_item_id.clone(),
+                                fact: resolved_fact.clone(),
+                            },
+                        ),
+                    ),
+                    (
+                        surface::SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        surface::SurfaceEvent::Item(surface::ItemPatch::InputResolved {
+                            item_id: input_item_id.clone(),
+                            fact: resolved_fact,
+                        }),
+                    ),
+                ],
+                None,
+            );
+            if let Err(error) = self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(fence.clone(), &resolved_batch)
+            {
+                eprintln!("orca: typed surface resume input commit failed: {error:?}");
+                if self
+                    .repair_surface_resume_failure(
+                        &fence,
+                        restored_goal_binding.as_ref().map(
+                            |(runtime, session_id, identity, _, _)| {
+                                (runtime, session_id.as_str(), identity)
+                            },
+                        ),
+                        "typed surface resume input resolution failed",
+                    )
+                    .is_err()
+                {
+                    self.surface_terminal_blocked = Some(format!(
+                        "typed surface resume repair failed for {:?}",
+                        fence.operation_id
+                    ));
+                }
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+        } else if !matches!(
+            generation.input,
+            surface::GenerationInputState::Resolved { .. }
+        ) {
+            let _ = self.repair_surface_resume_failure(
+                &fence,
+                restored_goal_binding
+                    .as_ref()
+                    .map(|(runtime, session_id, identity, _, _)| {
+                        (runtime, session_id.as_str(), identity)
+                    }),
+                "typed surface resume input state was invalid",
+            );
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
 
@@ -10325,11 +15093,20 @@ impl ThreadActor {
             .commit_generation_batch(fence.clone(), &loop_started_batch)
         {
             eprintln!("orca: typed surface resume loop commit failed: {error:?}");
-            if let Err(error) =
-                self.repair_surface_admission_failure(&fence, "typed surface resume loop failed")
+            if self
+                .repair_surface_resume_failure(
+                    &fence,
+                    restored_goal_binding
+                        .as_ref()
+                        .map(|(runtime, session_id, identity, _, _)| {
+                            (runtime, session_id.as_str(), identity)
+                        }),
+                    "typed surface resume loop failed",
+                )
+                .is_err()
             {
                 self.surface_terminal_blocked = Some(format!(
-                    "typed surface resume repair failed for {:?}: {error:?}",
+                    "typed surface resume repair failed for {:?}",
                     fence.operation_id
                 ));
             }
@@ -10338,7 +15115,7 @@ impl ThreadActor {
 
         debug_assert_eq!(
             request_digest,
-            match &operation.intent.initial_replayability {
+            match &previous.replayability {
                 surface::Replayability::Replayable {
                     request_digest: Some(request_digest),
                     ..
@@ -10378,6 +15155,14 @@ impl ThreadActor {
                         fence: interaction_fence.clone(),
                     }))
             });
+        if let Some((_, _, _, goal_turn_origin, turn)) = restored_goal_binding.as_ref() {
+            hosted_request = hosted_request
+                .with_operation_kind(HostedOperationKind::GoalRun)
+                .with_goal_tools(true)
+                .with_goal_usage_tracking(true)
+                .with_goal_turn_origin(*goal_turn_origin)
+                .with_surface_goal_owned(turn.clone());
+        }
         hosted_request.turn_id = resume_turn_id;
         hosted_request.task_id = Some(legacy_task_id);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
@@ -10387,24 +15172,53 @@ impl ThreadActor {
             config: None,
             reply: start_tx,
         });
-        let start_result = start_rx
-            .recv()
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let start_result = match start_rx.recv() {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.repair_surface_resume_failure(
+                    &fence,
+                    restored_goal_binding
+                        .as_ref()
+                        .map(|(runtime, session_id, identity, _, _)| {
+                            (runtime, session_id.as_str(), identity)
+                        }),
+                    "typed surface resume start reply channel closed",
+                );
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+        };
         if start_result.is_err() {
-            if let Err(error) =
-                self.repair_surface_admission_failure(&fence, "typed surface resume start failed")
+            if self
+                .repair_surface_resume_failure(
+                    &fence,
+                    restored_goal_binding
+                        .as_ref()
+                        .map(|(runtime, session_id, identity, _, _)| {
+                            (runtime, session_id.as_str(), identity)
+                        }),
+                    "typed surface resume start failed",
+                )
+                .is_err()
             {
                 self.surface_terminal_blocked = Some(format!(
-                    "typed surface resume repair failed for {:?}: {error:?}",
+                    "typed surface resume repair failed for {:?}",
                     fence.operation_id
                 ));
             }
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let active = self
-            .active
-            .as_mut()
-            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let Some(active) = self.active.as_mut() else {
+            let _ = self.repair_surface_resume_failure(
+                &fence,
+                restored_goal_binding
+                    .as_ref()
+                    .map(|(runtime, session_id, identity, _, _)| {
+                        (runtime, session_id.as_str(), identity)
+                    }),
+                "typed surface resume active generation was missing",
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
         active.surface_operation = Some(fence.clone());
         Ok(Self::committed_surface_resume_mutation(
             request_id,
@@ -10672,6 +15486,158 @@ impl ThreadActor {
         ))
     }
 
+    fn pause_goal_surface_running(
+        &mut self,
+        active: &mut ActiveOperation,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        goal_fence: surface::SurfaceGoalFence,
+    ) -> Result<surface::MutationReply<surface::PauseGoalOutput>, surface::SurfaceClientCommandError>
+    {
+        let operation_fence = active
+            .surface_operation
+            .as_ref()
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if active.surface_terminalization.is_some()
+            || !active.request.surface_goal_owned
+            || !self.bind_surface_operation_controller(client, &operation_fence.operation_id)
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let goal = snapshot
+            .goal
+            .as_ref()
+            .filter(|goal| {
+                goal.goal_id == goal_fence.goal_id
+                    && goal.goal_revision == goal_fence.goal_revision
+                    && goal.goal_owner_epoch == goal_fence.goal_owner_epoch
+                    && goal.current_run.as_ref().is_some_and(|run| {
+                        run.operation_id == operation_fence.operation_id
+                            && matches!(run.phase, surface::SurfaceGoalRunPhase::InFlight { .. })
+                    })
+            })
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == operation_fence.operation_id)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let runtime = active
+            .goal_control
+            .as_ref()
+            .map(|control| control.runtime.clone())
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let session_id = active
+            .goal_control
+            .as_ref()
+            .map(|control| control.session_id.clone())
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let message = "paused by user";
+        let command_digest = *surface_sha256(
+            &serde_json::to_vec(&(
+                "pause_goal_operation",
+                request_id.as_bytes(),
+                &goal_fence,
+                &operation_fence,
+            ))
+            .expect("Goal pause digest input is serializable"),
+        )
+        .as_bytes();
+        let mutation = runtime
+            .pause_for_surface(
+                PauseGoalForSurfaceInput {
+                    session_id,
+                    expected_goal_id: orca_core::goal_runtime::GoalId::parse(goal.goal_id.as_str())
+                        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    expected_goal_revision: u32::try_from(goal.goal_revision.get())
+                        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                    expected_operation_id: operation_fence.operation_id.clone(),
+                    message: message.to_string(),
+                    paused_at: chrono::Utc::now().timestamp(),
+                },
+                GoalSurfaceMutationContext {
+                    store_commit_id: uuid::Uuid::now_v7().to_string(),
+                    command_digest,
+                    goal_owner_epoch: snapshot.thread.owner_epoch.get(),
+                },
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let (committed_goal_fence, receipt_digest, _, goal_scope, goal_event) =
+            surface_goal_mutation_event(&mutation, snapshot.thread.thread_id.clone())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let goal_receipt = match &goal_event {
+            surface::SurfaceEvent::Goal(envelope) => envelope.receipt.clone(),
+            _ => unreachable!("Goal pause projects a Goal event"),
+        };
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (goal_scope, goal_event),
+                (
+                    surface::SurfaceScope::Operation {
+                        operation_id: operation_fence.operation_id.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::ControlIntentCommitted {
+                            operation_id: operation_fence.operation_id.clone(),
+                            request_id: operation.request_id.clone(),
+                            intent: surface::PendingControlIntent::Terminalize {
+                                operation_id: operation_fence.operation_id.clone(),
+                                cause: surface::TerminalizationCause::GoalPause,
+                            },
+                        },
+                    ),
+                ),
+            ],
+            None,
+        );
+        self.resident_surface
+            .coordinator
+            .commit_actor_goal_batch(committed_goal_fence, receipt_digest, &batch)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        Self::acknowledge_goal_surface_mutation_best_effort(&runtime, &mutation);
+        active.surface_terminalization = Some(surface::TerminalizationCause::GoalPause);
+        active.generation.cancel.cancel();
+        let goal = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .goal
+            .clone()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let goal_event_id = batch.events.as_slice()[0].event_id.clone();
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Goal {
+                    goal_id: goal.goal_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Goal,
+                        event_id: goal_event_id,
+                        commit_class: batch.commit_class.clone(),
+                    },
+                ])
+                .expect("Goal pause has one acknowledgement"),
+            },
+            value: surface::PauseGoalOutput {
+                goal,
+                goal_receipt,
+                goal_cursor: batch.cursor_after.clone(),
+                operation: surface::PauseGoalOperationOutput::Cancelling {
+                    operation_id: operation_fence.operation_id,
+                    accepted_cursor: batch.cursor_after.clone(),
+                    waiter: surface::OperationWaiterHandle::new(),
+                },
+            },
+        })
+    }
+
     fn commit_surface_terminalization(
         &mut self,
         active: &mut ActiveOperation,
@@ -10774,6 +15740,7 @@ impl ThreadActor {
             usage_ledger,
             resident_surface: ResidentSurfaceSlot(resident_surface),
             pending_manual_compaction_completion: None,
+            pending_goal_completion_recovery: None,
             surface_terminal_blocked: None,
         }
     }
@@ -10807,11 +15774,50 @@ impl ThreadActor {
                             break;
                         };
                         if let ThreadCommand::ShutdownThread { reply, reason } = command {
-                            while self.has_pending_surface_transition_retry() {
+                            let bounded_goal_recovery =
+                                self.has_pending_goal_completion_recovery_owner();
+                            let goal_recovery_operation_id =
+                                self.pending_goal_completion_recovery_operation_id();
+                            let cold_goal_handoff = bounded_goal_recovery
+                                && self
+                                    .resident_surface
+                                    .coordinator
+                                    .has_incomplete_batch();
+                            let mut retry_attempts = 0usize;
+                            while !cold_goal_handoff
+                                && self.has_pending_surface_transition_retry()
+                            {
                                 self.retry_pending_surface_transition(None);
                                 if self.has_pending_surface_transition_retry() {
+                                    retry_attempts = retry_attempts.saturating_add(1);
+                                    if bounded_goal_recovery
+                                        && retry_attempts
+                                            >= SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                                    {
+                                        break;
+                                    }
                                     tokio::time::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL).await;
                                 }
+                            }
+                            if bounded_goal_recovery
+                                && self.has_pending_surface_transition_retry()
+                            {
+                                if let Some(operation_id) = goal_recovery_operation_id {
+                                    for waiter in self
+                                        .resident_surface
+                                        .waiters
+                                        .remove(&operation_id)
+                                        .unwrap_or_default()
+                                    {
+                                        let _ = waiter.try_send(Err(
+                                            surface::SurfaceClientCommandError::RuntimeUnavailable,
+                                        ));
+                                    }
+                                }
+                                self.surface_terminal_blocked.get_or_insert_with(|| {
+                                    "typed Goal completion recovery was retained for cold restart"
+                                        .to_string()
+                                });
                             }
                             if let Some(message) = self.surface_terminal_blocked.as_ref() {
                                 let error = RuntimeHostError::ThreadStartFailed {
@@ -11046,6 +16052,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceCancelOperation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfacePauseGoalOperation { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceResumeOperation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -11065,6 +16074,9 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfacePinnedContextMutation { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceGoalMutation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
@@ -11153,6 +16165,15 @@ impl ThreadActor {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
                 ThreadCommand::GoalRuntime { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::SetGoal { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::EditGoal { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
+                ThreadCommand::ClearGoal { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
                 ThreadCommand::MutateIdle { reply, .. } => {
@@ -11284,6 +16305,9 @@ impl ThreadActor {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
                 let _ = reply.send(result);
+            }
+            ThreadCommand::SurfacePauseGoalOperation { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             ThreadCommand::SurfaceResumeOperation {
                 client,
@@ -11464,6 +16488,31 @@ impl ThreadActor {
                 };
                 let _ = reply.send(result);
             }
+            ThreadCommand::SurfaceGoalMutation {
+                client,
+                request_id,
+                action,
+                reply,
+            } => {
+                let manages_goal =
+                    self.admits_surface_client(&client, surface::SurfaceCapability::ManageGoal);
+                let needs_submit = matches!(
+                    &action,
+                    surface::GoalMutationAction::SetAndRun { .. }
+                        | surface::GoalMutationAction::ResumeAndRun { .. }
+                );
+                let can_submit = !needs_submit
+                    || self.admits_surface_client(
+                        &client,
+                        surface::SurfaceCapability::SubmitOperation,
+                    );
+                let result = if manages_goal && can_submit {
+                    self.mutate_goal_surface(&client, request_id, action)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
             #[cfg(test)]
             ThreadCommand::SurfaceSuspendOperationForTest { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
@@ -11483,6 +16532,10 @@ impl ThreadActor {
                     pending_manual_compaction_completion: self
                         .pending_manual_compaction_completion
                         .is_some(),
+                    pending_admission_repair: self
+                        .resident_surface
+                        .pending_admission_repairs
+                        .contains_key(&operation_id),
                     exact_interaction_selector: exact_interaction_selector_for_test(
                         &self.resident_surface,
                         &operation_id,
@@ -11711,6 +16764,28 @@ impl ThreadActor {
                     });
                 let _ = reply.send(result);
             }
+            ThreadCommand::SetGoal {
+                session_id,
+                objective,
+                at,
+                reply,
+            } => {
+                let result = self.set_goal_surface(&session_id, objective, at);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::EditGoal {
+                session_id,
+                objective,
+                at,
+                reply,
+            } => {
+                let result = self.edit_goal_surface(&session_id, objective, at);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::ClearGoal { session_id, reply } => {
+                let result = self.clear_goal_surface(&session_id);
+                let _ = reply.send(result);
+            }
             ThreadCommand::MutateIdle { mutation, reply } => {
                 let result = self
                     .state
@@ -11776,6 +16851,24 @@ impl ThreadActor {
                     surface::SurfaceCapability::ControlBoundOperation,
                 ) {
                     self.cancel_surface_running(active, &client, request_id, operation_id)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfacePauseGoalOperation {
+                client,
+                request_id,
+                goal_fence,
+                reply,
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::ManageGoal)
+                    && self.admits_surface_client(
+                        &client,
+                        surface::SurfaceCapability::ControlBoundOperation,
+                    ) {
+                    self.pause_goal_surface_running(active, &client, request_id, goal_fence)
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -11874,6 +16967,9 @@ impl ThreadActor {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             ThreadCommand::SurfacePinnedContextMutation { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            }
+            ThreadCommand::SurfaceGoalMutation { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             ThreadCommand::SurfaceCommitProviderResponse {
@@ -12065,6 +17161,10 @@ impl ThreadActor {
                     pending_manual_compaction_completion: self
                         .pending_manual_compaction_completion
                         .is_some(),
+                    pending_admission_repair: self
+                        .resident_surface
+                        .pending_admission_repairs
+                        .contains_key(&operation_id),
                     exact_interaction_selector: exact_interaction_selector_for_test(
                         &self.resident_surface,
                         &operation_id,
@@ -12198,6 +17298,21 @@ impl ThreadActor {
                     operation_id: active.operation_id,
                 }));
             }
+            ThreadCommand::SetGoal { reply, .. } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::EditGoal { reply, .. } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::ClearGoal { reply, .. } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
             ThreadCommand::MutateIdle { reply, .. } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
@@ -12216,6 +17331,9 @@ impl ThreadActor {
         active: &mut ActiveOperation,
         message: &str,
     ) -> Result<(), RuntimeHostError> {
+        if active.request.surface_goal_owned {
+            return Ok(());
+        }
         let Some(control) = active.goal_control.as_ref() else {
             return Ok(());
         };
@@ -12420,6 +17538,7 @@ impl ThreadActor {
         result: Result<OperationTaskResult, tokio::task::JoinError>,
         allow_resume: bool,
     ) -> Result<(), RuntimeHostError> {
+        let mut surface_usage = UsageTotals::default();
         let outcome = match result {
             Ok(mut result) => {
                 let manual_compaction = active
@@ -12489,6 +17608,7 @@ impl ThreadActor {
                     }
                     active.surface_manual_compaction_committed = true;
                 }
+                surface_usage = result.usage_delta;
                 self.usage_ledger.add(result.usage_delta);
                 self.publish_pending_goal_pause_event(&mut result.state, &mut active);
                 let background_error = match &mut result.outcome {
@@ -12589,8 +17709,179 @@ impl ThreadActor {
                             return Ok(());
                         }
                     } else {
+                        let surface_goal_continuation = if active.request.surface_goal_owned
+                            && matches!(
+                                result.outcome,
+                                GenerationTaskOutcome::Executed(
+                                    ThreadOperationOutcome::Completed {
+                                        status: RunStatus::Success,
+                                        ..
+                                    }
+                                )
+                            ) {
+                            match self.admit_surface_goal_continuation(
+                                &active,
+                                &result.state,
+                                surface_usage,
+                            ) {
+                                Ok(continuation) => continuation,
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    let _ = result.writer.finish_generation(true);
+                                    self.state = Some(result.state);
+                                    if self
+                                        .recover_and_terminalize_surface_goal_completion(
+                                            &mut active,
+                                            message.as_str(),
+                                        )
+                                        .is_err()
+                                    {
+                                        self.surface_terminal_blocked = Some(format!(
+                                            "typed Goal completion recovery is pending: {message}"
+                                        ));
+                                        debug_assert!(
+                                            self.pending_goal_completion_recovery.is_none()
+                                        );
+                                        self.pending_goal_completion_recovery =
+                                            Some(PendingSurfaceGoalCompletionRecovery {
+                                                active,
+                                                message,
+                                                retry_at: tokio::time::Instant::now()
+                                                    + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                                            });
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some((successor, continuation_prompt, legacy_task_id)) =
+                            surface_goal_continuation
+                        {
+                            if let Err(error) = result.writer.finish_generation(false) {
+                                let message = format!(
+                                    "typed Goal continuation writer failed after durable admission: {error}"
+                                );
+                                self.state = Some(result.state);
+                                if self
+                                    .recover_and_terminalize_surface_goal_completion(
+                                        &mut active,
+                                        message.as_str(),
+                                    )
+                                    .is_err()
+                                {
+                                    self.surface_terminal_blocked = Some(format!(
+                                        "typed Goal completion recovery is pending: {message}"
+                                    ));
+                                    debug_assert!(self.pending_goal_completion_recovery.is_none());
+                                    self.pending_goal_completion_recovery =
+                                        Some(PendingSurfaceGoalCompletionRecovery {
+                                            active,
+                                            message,
+                                            retry_at: tokio::time::Instant::now()
+                                                + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                                        });
+                                }
+                                return Ok(());
+                            }
+                            if let Some(task_id) = active.runtime_task_id.as_deref() {
+                                result
+                                    .state
+                                    .thread
+                                    .lifecycle_mut()
+                                    .start_task_with_id(RuntimeTaskKind::Agent, task_id);
+                            }
+                            let goal_id =
+                                orca_core::goal_runtime::GoalId::parse(successor.goal_id.as_str())
+                                    .map_err(|message| RuntimeHostError::GoalControlFailed {
+                                        message,
+                                    })?;
+                            let goal_run_id = orca_core::goal_runtime::GoalRunId::parse(
+                                successor.goal_run_id.as_str().to_string(),
+                            )
+                            .map_err(|message| RuntimeHostError::GoalControlFailed { message })?;
+                            let outer_turn_id = orca_core::goal_runtime::GoalOuterTurnId::parse(
+                                successor.goal_outer_turn_id.as_str().to_string(),
+                            )
+                            .map_err(|message| RuntimeHostError::GoalControlFailed { message })?;
+                            active.request.prompt = continuation_prompt;
+                            active.request.turn_id = successor.logical_turn_id.clone();
+                            active.request.task_id = Some(legacy_task_id);
+                            active.request.continuation = None;
+                            active.request.goal_turn_origin =
+                                orca_core::goal_runtime::GoalTurnOrigin::Continuation;
+                            active.request.resumes_existing_turn = false;
+                            active.request.surface_goal_turn =
+                                Some(crate::goal_actor::GoalTurnContext {
+                                    session_id: active
+                                        .goal_control
+                                        .as_ref()
+                                        .expect("surface Goal continuation keeps control")
+                                        .session_id
+                                        .clone(),
+                                    goal_id,
+                                    goal_run_id,
+                                    outer_turn_id,
+                                    origin: orca_core::goal_runtime::GoalTurnOrigin::Continuation,
+                                    run_started: false,
+                                });
+                            let interaction_command_tx = self.handle.command_tx.clone();
+                            let interaction_fence = successor.operation_fence.clone();
+                            active.request.generation_handler_factory =
+                                Some(Arc::new(move |_, _| {
+                                    HostedGenerationHandlers::default()
+                                        .with_provider_response_ingress(Arc::new(
+                                            RuntimeSurfaceProviderResponseIngress {
+                                                command_tx: interaction_command_tx.clone(),
+                                                fence: interaction_fence.clone(),
+                                            },
+                                        ))
+                                        .with_approval_handler(Arc::new(
+                                            RuntimeSurfaceApprovalHandler {
+                                                command_tx: interaction_command_tx.clone(),
+                                                fence: interaction_fence.clone(),
+                                            },
+                                        ))
+                                        .with_permission_handler(Arc::new(
+                                            RuntimeSurfacePermissionHandler {
+                                                command_tx: interaction_command_tx.clone(),
+                                                fence: interaction_fence.clone(),
+                                            },
+                                        ))
+                                        .with_user_input_handler(Arc::new(
+                                            RuntimeSurfaceUserInputHandler {
+                                                command_tx: interaction_command_tx.clone(),
+                                                fence: interaction_fence.clone(),
+                                            },
+                                        ))
+                                        .with_mcp_elicitation_handler(Arc::new(
+                                            RuntimeSurfaceMcpElicitationHandler {
+                                                command_tx: interaction_command_tx.clone(),
+                                                fence: interaction_fence.clone(),
+                                            },
+                                        ))
+                                }));
+                            let context = GenerationContext::new(
+                                active.generation.context.fence().next(),
+                                active.steer_handle.clone(),
+                                false,
+                                HostedGenerationHandlers::default(),
+                                active.config.clone(),
+                            );
+                            active.surface_operation = Some(successor.operation_fence);
+                            active.generation = self.spawn_generation(
+                                result.state,
+                                &active.request,
+                                result.writer,
+                                context,
+                            );
+                            self.active = Some(active);
+                            return Ok(());
+                        }
                         let goal_continuation = (active.request.operation_kind()
-                            == &HostedOperationKind::GoalRun)
+                            == &HostedOperationKind::GoalRun
+                            && !active.request.surface_goal_owned)
                             .then(|| {
                                 self.goal_continuation_admission(
                                     &mut result.state,
@@ -12754,7 +18045,44 @@ impl ThreadActor {
             },
         };
         if active.surface_operation.is_some() {
-            self.finish_surface_operation(&active, &outcome)?;
+            if let Err(error) = self.finish_surface_operation(&active, &outcome, surface_usage) {
+                let operation_id = active
+                    .surface_operation
+                    .as_ref()
+                    .map(|fence| fence.operation_id.clone())
+                    .expect("guarded surface operation");
+                if self
+                    .resident_surface
+                    .pending_terminal_commits
+                    .contains_key(&operation_id)
+                {
+                    return Ok(());
+                }
+                if active.request.surface_goal_owned {
+                    let message = error.to_string();
+                    if self
+                        .recover_and_terminalize_surface_goal_completion(
+                            &mut active,
+                            message.as_str(),
+                        )
+                        .is_err()
+                    {
+                        self.surface_terminal_blocked = Some(format!(
+                            "typed Goal completion recovery is pending: {message}"
+                        ));
+                        debug_assert!(self.pending_goal_completion_recovery.is_none());
+                        self.pending_goal_completion_recovery =
+                            Some(PendingSurfaceGoalCompletionRecovery {
+                                active,
+                                message,
+                                retry_at: tokio::time::Instant::now()
+                                    + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                            });
+                    }
+                    return Ok(());
+                }
+                return Err(error);
+            }
         }
         let completed = active.completion.complete(OperationTerminal {
             operation_id: active.operation_id,
@@ -13516,12 +18844,21 @@ fn run_hosted_operation(
             } else if !request.allows_goal_tools() {
                 thread.session_mut().replace_goal_context(None);
             }
-            let binding = thread.begin_goal_turn(&turn_request)?;
-            RuntimeThread::emit_goal_turn_started(
-                binding.as_ref(),
-                events,
-                event_observer.as_deref(),
-            );
+            let binding = if request.surface_goal_owned {
+                let handle = thread.goal_runtime_handle().map_err(io::Error::other)?;
+                let turn = request.surface_goal_turn.clone().ok_or_else(|| {
+                    io::Error::other("surface-owned Goal turn identity is missing")
+                })?;
+                Some(thread.bind_surface_goal_turn(handle, turn))
+            } else {
+                let binding = thread.begin_goal_turn(&turn_request)?;
+                RuntimeThread::emit_goal_turn_started(
+                    binding.as_ref(),
+                    events,
+                    event_observer.as_deref(),
+                );
+                binding
+            };
             let usage_before = thread.session().aggregate_usage_totals();
             let progress_baseline =
                 crate::thread::TurnProgressBaseline::capture(thread.session().conversation());
@@ -13547,17 +18884,55 @@ fn run_hosted_operation(
                 thread.session().conversation(),
                 &progress_baseline,
             );
-            thread.finish_goal_turn(
-                binding.as_ref(),
-                status,
-                end_reason,
-                usage,
-                Some(events),
-                event_observer.as_deref(),
-                evidence,
-                generation.config(),
-                cancel.clone(),
-            );
+            if !request.surface_goal_owned {
+                thread.finish_goal_turn(
+                    binding.as_ref(),
+                    status,
+                    end_reason,
+                    usage,
+                    Some(events),
+                    event_observer.as_deref(),
+                    evidence,
+                    generation.config(),
+                    cancel.clone(),
+                );
+            } else {
+                let binding = binding.as_ref().ok_or_else(|| {
+                    io::Error::other("surface Goal turn lost its runtime binding")
+                })?;
+                let turn = binding
+                    .turn
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("surface Goal turn lost its actor context"))?;
+                let goal_status = match status {
+                    RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
+                    RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
+                    RunStatus::ApprovalRequired => {
+                        orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
+                    }
+                    RunStatus::BudgetExhausted => {
+                        orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted
+                    }
+                    RunStatus::Failed | RunStatus::VerificationFailed => {
+                        orca_core::goal_runtime::GoalTurnStatus::Failed
+                    }
+                };
+                binding
+                    .handle
+                    .record_turn_result_for_surface(
+                        &turn.session_id,
+                        goal_status,
+                        end_reason,
+                        usage,
+                        evidence.tool_count,
+                        evidence.model_response_count,
+                        (!evidence.has_substantive_progress()).then(|| {
+                            crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string()
+                        }),
+                    )
+                    .map_err(io::Error::other)?;
+                thread.clear_goal_turn_binding();
+            }
             if request.allows_goal_tools()
                 && let Some(session_id) = thread.session().session_id().map(str::to_string)
             {
@@ -14053,6 +19428,22 @@ fn subtract_usage_totals(total: UsageTotals, credit: UsageTotals) -> UsageTotals
     }
 }
 
+fn surface_usage_totals(usage: UsageTotals) -> surface::UsageTotals {
+    let micros = if usage.estimated_cost_usd.is_finite() && usage.estimated_cost_usd > 0.0 {
+        (usage.estimated_cost_usd * 1_000_000.0)
+            .round()
+            .min(u64::MAX as f64) as u64
+    } else {
+        0
+    };
+    surface::UsageTotals {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_tokens: usage.cache_tokens,
+        estimated_cost_usd_micros: micros,
+    }
+}
+
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         return (*message).to_string();
@@ -14114,6 +19505,7 @@ fn send_thread_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_surface::SurfaceCommitLedger;
     use orca_core::approval_types::ActionKind;
     use orca_core::config::{
         ModelRuntimeConfig, OutputFormat, ProviderKind, ThemeName, ToolConfig, WorkflowConfig,
@@ -14201,6 +19593,12 @@ mod tests {
     struct ProviderResponseCheckpointRetryExecutor;
 
     struct OutputWriterExecutor;
+
+    struct SurfaceGoalUpdateExecutor;
+
+    struct SurfaceGoalContinueThenUpdateExecutor {
+        calls: AtomicUsize,
+    }
 
     struct SharedOutputWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -14293,6 +19691,93 @@ mod tests {
             writer.write_all(b"typed output\n")?;
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for SurfaceGoalUpdateExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            events: &mut EventFactory,
+            writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let tool = ToolRequest {
+                id: "surface-goal-complete".to_string(),
+                name: ToolName::UpdateGoal,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(
+                    r#"{"status":"complete","reason":"fixture verified","evidence":[{"kind":"observation","summary":"surface Goal integration fixture passed","target":"runtime_host"}]}"#
+                        .to_string(),
+                ),
+            };
+            let continuation = RuntimeTurnContinuation::from_response(
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool.clone())],
+                    assistant_content: Some("Completing the runtime-owned Goal.".to_string()),
+                    assistant_reasoning: None,
+                    tool_calls: vec![orca_core::conversation::RawToolCall {
+                        id: tool.id.clone(),
+                        function_name: tool.name.as_str().to_string(),
+                        arguments: tool.raw_arguments.clone().unwrap_or_default(),
+                    }],
+                    usage: None,
+                },
+                request.turn_id().clone(),
+            );
+            let turn_request = request
+                .thread_turn_request(generation)
+                .with_continuation(continuation);
+            thread
+                .run_request_with_event_factory_and_cancel_outcome_unbound(
+                    generation.config(),
+                    &turn_request,
+                    writer,
+                    events,
+                    cancel.clone(),
+                )
+                .map(|outcome| match outcome {
+                    crate::controller::ThreadTurnOutcome::Completed {
+                        status,
+                        background_workflows,
+                    } => ThreadOperationOutcome::Completed {
+                        status,
+                        background_workflows,
+                    },
+                    crate::controller::ThreadTurnOutcome::ProviderSuspended {
+                        suspension,
+                        background_workflows,
+                    } => ThreadOperationOutcome::ProviderSuspended {
+                        suspension,
+                        background_workflows,
+                    },
+                })
+        }
+    }
+
+    impl ThreadOperationExecutor for SurfaceGoalContinueThenUpdateExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            events: &mut EventFactory,
+            writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                call < 2,
+                "Goal continuation admitted an unexpected third turn"
+            );
+            if call == 0 {
+                thread.lifecycle_mut().finish_task(RunStatus::Success);
+                return Ok(RunStatus::Success.into());
+            }
+            SurfaceGoalUpdateExecutor.run_turn(thread, request, generation, events, writer, cancel)
         }
     }
 
@@ -15393,6 +20878,10 @@ mod tests {
                 "resume suspended typed operation",
             )
             .expect("start recorded runtime thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded suspended operation")
+            .path;
         let surface = thread.surface();
         let attachment = fresh_surface_attachment(&surface);
         let reserved = committed_surface_value(
@@ -15436,41 +20925,50 @@ mod tests {
             .recoverable_user_operation()
             .expect("suspended operation is publicly recoverable");
         assert_eq!(recovery.operation_id(), &operation_id);
-        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
-        let resumed = loop {
-            match attachment
+        surface::JsonlSurfaceCommitLedger::inject_generation_append_failure_once(transcript_path);
+        assert_eq!(
+            attachment
                 .client
-                .resume_recoverable(surface_request_id(), recovery.clone())
-            {
-                Ok(reply) => break committed_surface_value(reply),
-                Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
-                    if Instant::now() < deadline =>
-                {
-                    std::thread::yield_now();
-                }
-                Err(error) => {
-                    let failed = fresh_surface_attachment_with_capabilities(
-                        &surface,
-                        BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
-                    )
-                    .baseline
-                    .snapshot;
-                    let failed = failed
-                        .foreground_operation
-                        .as_ref()
-                        .filter(|operation| operation.operation_id == operation_id);
-                    panic!(
-                        "resume did not become admissible: {error:?}; runtime={:?}; phase={:?}; pending={:?}; generations={}",
-                        thread.state(),
-                        failed.map(|operation| &operation.phase),
-                        failed.and_then(|operation| operation.pending_control.as_ref()),
-                        failed.map_or(0, |operation| operation.generations.len())
-                    );
-                }
+                .resume_recoverable(surface_request_id(), recovery)
+                .err(),
+            Some(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        );
+        let rebased = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let rebased_operation = rebased
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == operation_id)
+            .expect("failed resume remains a recoverable foreground operation");
+        assert!(matches!(
+            rebased_operation.phase,
+            surface::OperationPhase::Suspended {
+                cause: surface::SuspensionCause::RecoveryRequired { .. }
             }
-        };
+        ));
+        assert!(rebased_operation.pending_control.is_none());
+        assert_eq!(rebased_operation.generations.len(), 2);
+        assert!(matches!(
+            rebased_operation.generations[1].stop_reason,
+            Some(surface::GenerationStopReason::NotStarted {
+                reason: surface::NotStartedReason::RuntimeRestart,
+            })
+        ));
+        let recovery = rebased
+            .recoverable_user_operation()
+            .expect("failed resume is publicly recoverable again");
+        let resumed = committed_surface_value(
+            attachment
+                .client
+                .resume_recoverable(surface_request_id(), recovery)
+                .expect("retry rebased typed operation"),
+        );
         assert_eq!(resumed.operation_id, operation_id);
-        assert_eq!(resumed.generation.generation_id.get(), 1);
+        assert_eq!(resumed.generation.generation_id.get(), 2);
         assert_eq!(
             resumed.resume_starting.role,
             surface::ResumeTransitionRole::ResumeStarting
@@ -15507,9 +21005,9 @@ mod tests {
             .iter()
             .find(|operation| operation.operation_id == operation_id)
             .expect("resumed operation reached history");
-        assert_eq!(operation.generations.len(), 2);
+        assert_eq!(operation.generations.len(), 3);
         assert!(matches!(
-            operation.generations[1].attempt,
+            operation.generations[2].attempt,
             surface::GenerationAttempt::RecoveryReplacement
         ));
     }
@@ -15812,7 +21310,10 @@ mod tests {
                 )
                 .expect("reserve typed operation"),
         );
-        surface::JsonlSurfaceCommitLedger::inject_admission_checkpoint_failures(transcript_path, 2);
+        surface::JsonlSurfaceCommitLedger::inject_admission_checkpoint_failures(
+            transcript_path,
+            SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
+        );
         assert!(
             attachment
                 .client
@@ -19960,6 +25461,1422 @@ mod tests {
         assert!(prompt.contains("[in_progress] wire continuation"));
         assert!(prompt.contains("HookManager APIs differ"));
         assert!(prompt.contains("Do not restart from scratch"));
+    }
+
+    #[test]
+    fn surface_goal_update_tool_is_verified_before_terminal_wake() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalUpdateExecutor))
+            .expect("start Goal tool runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "surface Goal tool completion",
+            )
+            .expect("start recorded Goal thread");
+        let session_id = thread.thread_id().to_string();
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        let client = attachment.client.clone();
+        let mut subscription = surface_handle
+            .claim_subscription(&attachment.subscription)
+            .expect("claim Goal lifecycle subscription");
+        let output = committed_surface_value(
+            client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "verify a real update_goal tool call",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "complete through update_goal",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit typed Goal"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let waiter_client = client;
+        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = terminal_tx
+                .send(waiter_client.wait_operation_terminal(surface_request_id(), operation_id));
+        });
+        let terminal = terminal_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("Goal terminal timed out")
+            .expect("wait Goal terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Succeeded { .. },
+                    ..
+                }
+            }
+        ));
+        let snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
+        assert!(matches!(
+            snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Complete { evidence })
+                if evidence.iter().any(|item| {
+                    item.summary.as_str() == "surface Goal integration fixture passed"
+                })
+        ));
+        let goal_patches = std::iter::from_fn(|| subscription.try_recv())
+            .flat_map(|item| match item {
+                surface::SurfaceSubscriptionItem::Batch { batch } => batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        surface::SurfaceEvent::Goal(patch) => Some(patch.patch.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let requested_index = goal_patches
+            .iter()
+            .position(|patch| matches!(patch, surface::GoalPatch::IntentRequested { .. }))
+            .expect("typed Goal intent requested");
+        let acknowledged_index = goal_patches
+            .iter()
+            .position(|patch| {
+                matches!(
+                    patch,
+                    surface::GoalPatch::IntentAcknowledged {
+                        ack: surface::SurfaceGoalIntentAck::DeferredToTurnEnd { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("typed Goal intent acknowledged");
+        let finished_index = goal_patches
+            .iter()
+            .position(|patch| {
+                matches!(
+                    patch,
+                    surface::GoalPatch::OuterTurnFinished {
+                        next_action: surface::GoalOuterTurnNextAction::Complete,
+                        ..
+                    }
+                )
+            })
+            .expect("typed Goal outer turn completed");
+        let verification_index = goal_patches
+            .iter()
+            .position(|patch| {
+                matches!(
+                    patch,
+                    surface::GoalPatch::VerificationCompleted {
+                        result: surface::SurfaceGoalVerification::Achieved { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("typed Goal verification completed");
+        let decision_index = goal_patches
+            .iter()
+            .position(|patch| {
+                matches!(
+                    patch,
+                    surface::GoalPatch::ContinuationDecided {
+                        decision: surface::GoalContinuationDecision::Stopped { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("typed Goal continuation stopped");
+        assert!(
+            requested_index < acknowledged_index
+                && acknowledged_index < finished_index
+                && finished_index < verification_index
+                && verification_index < decision_index
+        );
+        host.shutdown().expect("shutdown Goal tool runtime");
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("restart completed Goal runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(session_id.clone()),
+                ),
+                "resumed completed Goal",
+            )
+            .expect("resume completed Goal thread");
+        assert!(matches!(
+            fresh_surface_attachment(&resumed.surface())
+                .baseline
+                .snapshot
+                .goal
+                .as_ref()
+                .map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Complete { .. })
+        ));
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty(),
+            "restart must not leave intent or terminal Goal outbox entries pending"
+        );
+        resumed_host
+            .shutdown()
+            .expect("shutdown resumed Goal runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn surface_goal_continuation_is_durable_before_successor_execution() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let host = RuntimeHost::start_with_executor(executor.clone())
+            .expect("start Goal continuation runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "durable Goal continuation",
+            )
+            .expect("start recorded Goal continuation thread");
+        let session_id = thread.thread_id().to_string();
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        let mut subscription = surface_handle
+            .claim_subscription(&attachment.subscription)
+            .expect("claim Goal continuation subscription");
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "continue once before verified completion",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "make progress, then complete",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit continuing Goal"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let waiter_client = attachment.client;
+        let waiter_operation_id = operation_id.clone();
+        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = terminal_tx.send(
+                waiter_client.wait_operation_terminal(surface_request_id(), waiter_operation_id),
+            );
+        });
+        let terminal = terminal_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "continued Goal terminal timed out after {} executor calls",
+                    executor.calls.load(Ordering::SeqCst)
+                )
+            })
+            .expect("wait continued Goal terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Succeeded { .. },
+                    ..
+                }
+            }
+        ));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        let snapshot = fresh_surface_attachment(&surface_handle).baseline.snapshot;
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("continued Goal operation");
+        assert_eq!(operation.generations.len(), 2);
+        assert!(matches!(
+            operation.generations[0].phase,
+            surface::GenerationPhase::Stopped
+        ));
+        assert!(matches!(
+            operation.generations[1].phase,
+            surface::GenerationPhase::Stopped
+        ));
+        let predecessor = &operation.generations[0];
+        let successor = &operation.generations[1];
+        let predecessor_goal = predecessor
+            .goal_identity
+            .as_ref()
+            .expect("predecessor Goal identity");
+        let successor_goal = successor
+            .goal_identity
+            .as_ref()
+            .expect("successor Goal identity");
+        assert_ne!(
+            predecessor_goal.canonical_input_item_id, successor_goal.canonical_input_item_id,
+            "each Goal continuation must own a distinct durable input item"
+        );
+        assert!(
+            snapshot.items.iter().any(|item| {
+                matches!(
+                    item,
+                    surface::SurfaceItem::UserMessage {
+                        id,
+                        turn_id,
+                        input: surface::SurfaceUserInputState::Resolved { .. },
+                        origin: surface::SurfaceItemOrigin::GoalContinuation,
+                        ..
+                    } if id == &successor_goal.canonical_input_item_id
+                        && turn_id == &successor.logical_turn_id
+                )
+            }),
+            "Goal continuation must materialize one resolved GoalContinuation item"
+        );
+        let continuation_request = match &successor.replayability {
+            surface::Replayability::Replayable {
+                request: Some(request),
+                ..
+            } => request,
+            other => panic!("unexpected continuation replayability: {other:?}"),
+        };
+        let continuation_input =
+            resolve_surface_input(continuation_request).expect("resolve continuation capsule");
+        assert_eq!(
+            continuation_input.canonical_text.as_str(),
+            goal_continuation_prompt(
+                "continue once before verified completion",
+                usize::try_from(successor_goal.outer_turn_count).unwrap()
+            )
+        );
+        assert!(matches!(
+            snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Complete { .. })
+        ));
+        let patches = std::iter::from_fn(|| subscription.try_recv())
+            .flat_map(|item| match item {
+                surface::SurfaceSubscriptionItem::Batch { batch } => batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        surface::SurfaceEvent::Goal(envelope) => Some(envelope.patch.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let admitted = patches
+            .iter()
+            .position(|patch| {
+                matches!(
+                    patch,
+                    surface::GoalPatch::ContinuationDecided {
+                        decision: surface::GoalContinuationDecision::Admitted { successor, .. },
+                        ..
+                    } if successor.operation_fence.generation_id
+                        == surface::SurfaceGenerationId::new(1)
+                )
+            })
+            .expect("typed Goal continuation admitted");
+        let successor_finished = patches
+            .iter()
+            .position(|patch| {
+                matches!(
+                    patch,
+                    surface::GoalPatch::OuterTurnFinished {
+                        identity,
+                        next_action: surface::GoalOuterTurnNextAction::Complete,
+                        ..
+                    } if identity.operation_fence.generation_id
+                        == surface::SurfaceGenerationId::new(1)
+                )
+            })
+            .expect("Goal successor completed");
+        assert!(admitted < successor_finished);
+        host.shutdown().expect("shutdown continued Goal runtime");
+
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("restart continued Goal runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(session_id.clone()),
+                ),
+                "resumed continued Goal",
+            )
+            .expect("resume continued Goal thread");
+        let resumed_snapshot = fresh_surface_attachment(&resumed.surface())
+            .baseline
+            .snapshot;
+        assert!(matches!(
+            resumed_snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Complete { .. })
+        ));
+        assert_eq!(
+            resumed_snapshot
+                .operation_history
+                .iter()
+                .find(|operation| operation.operation_id == operation_id)
+                .expect("resumed continued Goal operation")
+                .generations
+                .len(),
+            2
+        );
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        resumed_host
+            .shutdown()
+            .expect("shutdown resumed continued Goal runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn prepared_surface_goal_continuation_recovers_without_reexecuting_successor() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let host = RuntimeHost::start_with_executor(executor.clone())
+            .expect("start prepared Goal continuation runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "recover prepared Goal continuation",
+            )
+            .expect("start prepared Goal continuation thread");
+        let session_id = thread.thread_id().to_string();
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load prepared Goal continuation thread")
+            .path;
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        let initial_cursor = attachment.baseline.cursor.clone();
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(
+            transcript_path.clone(),
+        );
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "recover an admitted continuation conservatively",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "admit one continuation before restart",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit prepared Goal continuation"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let prepared = loop {
+            let recovered =
+                surface::JsonlSurfaceCommitLedger::new(&transcript_path, initial_cursor.clone())
+                    .recover_batches()
+                    .expect("read prepared Goal continuation");
+            if let Some(batch) = recovered.prepared
+                && batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Goal(surface::GoalPatchEnvelope {
+                            patch: surface::GoalPatch::ContinuationDecided {
+                                decision: surface::GoalContinuationDecision::Admitted { .. },
+                                ..
+                            },
+                            ..
+                        })
+                    )
+                })
+            {
+                break batch;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Goal continuation did not reach prepared state"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let prepared_commit = prepared.commit_class.clone();
+        let prepared_digest = prepared.batch_digest.clone();
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait reconciled Goal continuation terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Failed { .. },
+                    ..
+                }
+            }
+        ));
+        host.shutdown()
+            .expect("shutdown live-reconciled Goal continuation runtime");
+
+        let resumed_executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
+            calls: AtomicUsize::new(1),
+        });
+        let resumed_host = RuntimeHost::start_with_executor(resumed_executor.clone())
+            .expect("restart prepared Goal continuation runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(session_id.clone()),
+                ),
+                "resumed prepared Goal continuation",
+            )
+            .expect("resume prepared Goal continuation");
+        let resumed_attachment = fresh_surface_attachment_with_capabilities(
+            &resumed.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        let snapshot = resumed_attachment.baseline.snapshot.clone();
+        assert_eq!(
+            resumed_executor.calls.load(Ordering::SeqCst),
+            1,
+            "restart must not execute a reserved Goal successor"
+        );
+        assert!(
+            matches!(
+                snapshot.goal.as_ref().map(|goal| &goal.state),
+                Some(surface::SurfaceGoalState::Paused {
+                    reason: surface::SurfaceGoalPauseReason::Recovery,
+                    ..
+                })
+            ),
+            "unexpected recovered Goal state: {:?}",
+            snapshot.goal.as_ref().map(|goal| &goal.state)
+        );
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("terminal continued Goal operation");
+        assert_eq!(operation.generations.len(), 2);
+        assert!(matches!(operation.phase, surface::OperationPhase::Terminal));
+        let recovered = surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+            .recover_batches()
+            .expect("read recovered Goal continuation ledger");
+        assert!(recovered.prepared.is_none());
+        let exact = recovered
+            .committed
+            .iter()
+            .find(|batch| batch.commit_class == prepared_commit)
+            .expect("prepared Goal continuation commit recovered exactly");
+        assert_eq!(exact.batch_digest, prepared_digest);
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        resumed_host
+            .shutdown()
+            .expect("shutdown restarted Goal continuation runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn unappended_surface_goal_continuation_terminalizes_live_and_restarts_exactly() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let host = RuntimeHost::start_with_executor(executor.clone())
+            .expect("start unappended Goal continuation runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "recover unappended Goal continuation",
+            )
+            .expect("start unappended Goal continuation thread");
+        let session_id = thread.thread_id().to_string();
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load unappended Goal continuation thread")
+            .path;
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        surface::JsonlSurfaceCommitLedger::inject_goal_continuation_append_failure_once(
+            transcript_path.clone(),
+        );
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "recover an unappended continuation conservatively",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "persist continuation before surface append",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit unappended Goal continuation"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait live Goal recovery terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Failed { .. },
+                    ..
+                }
+            }
+        ));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let live_snapshot = fresh_surface_attachment(&thread.surface())
+            .baseline
+            .snapshot;
+        assert!(matches!(
+            live_snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Paused {
+                reason: surface::SurfaceGoalPauseReason::Recovery,
+                ..
+            })
+        ));
+        assert!(live_snapshot.operation_history.iter().any(|operation| {
+            operation.operation_id == operation_id
+                && matches!(operation.phase, surface::OperationPhase::Terminal)
+        }));
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        host.shutdown()
+            .expect("shutdown live-recovered Goal continuation runtime");
+
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("restart live-recovered Goal continuation runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(session_id.clone()),
+                ),
+                "restart live-recovered Goal continuation",
+            )
+            .expect("resume live-recovered Goal continuation");
+        let snapshot = fresh_surface_attachment(&resumed.surface())
+            .baseline
+            .snapshot;
+        assert!(matches!(
+            snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Paused {
+                reason: surface::SurfaceGoalPauseReason::Recovery,
+                ..
+            })
+        ));
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("restarted live-recovered Goal operation");
+        assert_eq!(operation.generations.len(), 1);
+        assert!(matches!(operation.phase, surface::OperationPhase::Terminal));
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        resumed_host
+            .shutdown()
+            .expect("shutdown restarted Goal recovery runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn surface_goal_store_finish_failure_terminalizes_live_and_restarts_exactly() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let host = RuntimeHost::start_with_executor(executor.clone())
+            .expect("start Goal store-failure runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "recover Goal store finish failure",
+            )
+            .expect("start Goal store-failure thread");
+        let session_id = thread.thread_id().to_string();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        crate::goal_actor::inject_surface_outer_turn_finish_failure_once(&session_id);
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "recover a durable Goal store finish failure",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "finish must fail before continuation admission",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit Goal before store failure"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait Goal store-failure terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Failed { .. },
+                    ..
+                }
+            }
+        ));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let live_snapshot = fresh_surface_attachment(&thread.surface())
+            .baseline
+            .snapshot;
+        assert!(matches!(
+            live_snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Paused {
+                reason: surface::SurfaceGoalPauseReason::Recovery,
+                ..
+            })
+        ));
+        assert!(live_snapshot.operation_history.iter().any(|operation| {
+            operation.operation_id == operation_id
+                && matches!(operation.phase, surface::OperationPhase::Terminal)
+        }));
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        host.shutdown()
+            .expect("shutdown Goal store-failure runtime");
+
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("restart Goal store-failure runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(session_id.clone()),
+                ),
+                "restart Goal store-failure recovery",
+            )
+            .expect("resume Goal store-failure thread");
+        let snapshot = fresh_surface_attachment(&resumed.surface())
+            .baseline
+            .snapshot;
+        assert!(snapshot.operation_history.iter().any(|operation| {
+            operation.operation_id == operation_id
+                && matches!(operation.phase, surface::OperationPhase::Terminal)
+        }));
+        assert!(matches!(
+            snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Paused {
+                reason: surface::SurfaceGoalPauseReason::Recovery,
+                ..
+            })
+        ));
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        resumed_host
+            .shutdown()
+            .expect("shutdown restarted Goal store-failure runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn surface_goal_recovery_admission_repair_failure_shutdown_is_bounded_and_restart_exact() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let host = RuntimeHost::start_with_executor(executor.clone())
+            .expect("start bounded Goal recovery runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "bound Goal recovery admission repair",
+            )
+            .expect("start bounded Goal recovery thread");
+        let session_id = thread.thread_id().to_string();
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load bounded Goal recovery thread")
+            .path;
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        crate::goal_actor::inject_surface_outer_turn_finish_failure_once(&session_id);
+        surface::JsonlSurfaceCommitLedger::inject_admission_repair_append_failures(
+            transcript_path.clone(),
+            10_000,
+        );
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "retain Goal recovery ownership through admission repair",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "fail recovery repair past shutdown budget",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit Goal before persistent recovery failure"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let waiter_client = attachment.client.clone();
+        let waiter_operation_id = operation_id.clone();
+        let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result =
+                waiter_client.wait_operation_terminal(surface_request_id(), waiter_operation_id);
+            let _ = waiter_tx.send(result);
+        });
+        let pending_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let probe = thread
+                .surface_actor_probe_for_test(operation_id.clone())
+                .expect("probe Goal recovery admission repair");
+            if probe.pending_admission_repair && probe.waiter_count == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < pending_deadline,
+                "Goal recovery did not retain the failed admission repair"
+            );
+            std::thread::yield_now();
+        }
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        assert!(
+            matches!(shutdown_rx.recv_timeout(Duration::from_secs(2)), Ok(Err(_))),
+            "Goal recovery shutdown did not fail within the semantic retry budget"
+        );
+        assert!(matches!(
+            waiter_rx.recv_timeout(SURFACE_TEST_TIMEOUT),
+            Ok(Err(surface::SurfaceClientCommandError::RuntimeUnavailable))
+        ));
+
+        surface::JsonlSurfaceCommitLedger::clear_admission_repair_append_failures(
+            transcript_path.clone(),
+        );
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("restart bounded Goal recovery runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(session_id.clone()),
+                ),
+                "restart bounded Goal recovery",
+            )
+            .expect("resume bounded Goal recovery thread");
+        let snapshot = fresh_surface_attachment(&resumed.surface())
+            .baseline
+            .snapshot;
+        assert!(snapshot.operation_history.iter().any(|operation| {
+            operation.operation_id == operation_id
+                && matches!(operation.phase, surface::OperationPhase::Terminal)
+        }));
+        assert!(matches!(
+            snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Paused {
+                reason: surface::SurfaceGoalPauseReason::Recovery,
+                ..
+            })
+        ));
+        resumed_host
+            .shutdown()
+            .expect("shutdown restarted bounded Goal recovery runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn surface_goal_writer_finish_failure_after_admission_terminalizes_live() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let host = RuntimeHost::start_with_executor(executor.clone())
+            .expect("start Goal writer-failure runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "recover Goal writer finish failure",
+            )
+            .expect("start Goal writer-failure thread");
+        let session_id = thread.thread_id().to_string();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        inject_passthrough_finish_failure_once();
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "recover a writer failure after Goal continuation admission",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "admit the successor before writer failure",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit Goal before writer failure"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait Goal writer-failure terminal");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Failed { .. },
+                    ..
+                }
+            }
+        ));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let snapshot = fresh_surface_attachment(&thread.surface())
+            .baseline
+            .snapshot;
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("writer-failed Goal operation reaches history");
+        assert_eq!(operation.generations.len(), 2);
+        assert!(matches!(operation.phase, surface::OperationPhase::Terminal));
+        assert!(matches!(
+            snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Paused {
+                reason: surface::SurfaceGoalPauseReason::Recovery,
+                ..
+            })
+        ));
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        host.shutdown()
+            .expect("shutdown Goal writer-failure runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn surface_goal_terminal_checkpoint_failure_recovers_exact_verified_batch() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalUpdateExecutor))
+            .expect("start Goal checkpoint runtime");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "recover verified Goal checkpoint",
+            )
+            .expect("start recorded Goal checkpoint thread");
+        let session_id = thread.thread_id().to_string();
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load recorded Goal checkpoint thread")
+            .path;
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageGoal,
+            ]),
+        );
+        let initial_snapshot = (*attachment.baseline.snapshot).clone();
+        let initial_cursor = attachment.baseline.cursor.clone();
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(
+            transcript_path.clone(),
+        );
+        let output = committed_surface_value(
+            attachment
+                .client
+                .goal_mutation(
+                    surface_request_id(),
+                    surface::GoalMutationAction::SetAndRun {
+                        expected_goal: surface::ExpectedGoal::None,
+                        objective: surface::NonEmptyText::try_new(
+                            "recover the verified Goal batch exactly",
+                        )
+                        .unwrap(),
+                        token_budget: None,
+                        input: surface::GoalRunInput::Supplied {
+                            request: surface::SurfaceInputRequest {
+                                blocks: surface::NonEmptyVec::try_new(vec![
+                                    surface::SurfaceInputRequestBlock::Text {
+                                        text: surface::DisplayText::new(
+                                            "complete before checkpoint failure",
+                                        ),
+                                    },
+                                ])
+                                .unwrap(),
+                            },
+                        },
+                    },
+                )
+                .expect("submit Goal before checkpoint failure"),
+        );
+        let operation_id = output.operation_id.expect("Goal operation id");
+        let prepared_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let recovered_before_restart = loop {
+            let recovered =
+                surface::JsonlSurfaceCommitLedger::new(&transcript_path, initial_cursor.clone())
+                    .recover_batches()
+                    .expect("read prepared Goal terminal batch");
+            if recovered.prepared.as_ref().is_some_and(|batch| {
+                batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Goal(surface::GoalPatchEnvelope {
+                            patch: surface::GoalPatch::OuterTurnFinished { .. },
+                            ..
+                        })
+                    )
+                })
+            }) {
+                break recovered;
+            }
+            assert!(
+                Instant::now() < prepared_deadline,
+                "Goal terminal batch did not reach durable prepared state"
+            );
+            std::thread::yield_now();
+        };
+        let prepared = recovered_before_restart
+            .prepared
+            .as_ref()
+            .expect("Goal terminal batch must remain prepared");
+        let prepared_patches = prepared
+            .events
+            .as_slice()
+            .iter()
+            .filter_map(|event| match &event.event {
+                surface::SurfaceEvent::Goal(envelope) => Some(&envelope.patch),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                prepared_patches.as_slice(),
+                [
+                    surface::GoalPatch::OuterTurnFinished { .. },
+                    surface::GoalPatch::VerificationCompleted {
+                        result: surface::SurfaceGoalVerification::Achieved { .. },
+                        ..
+                    },
+                    surface::GoalPatch::ContinuationDecided {
+                        decision: surface::GoalContinuationDecision::Stopped { .. },
+                        ..
+                    }
+                ]
+            ),
+            "unexpected prepared Goal patches: {prepared_patches:?}"
+        );
+        let prepared_commit = prepared.commit_class.clone();
+        let prepared_digest = prepared.batch_digest.clone();
+
+        let replay_dir = tempfile::tempdir().unwrap();
+        let replay_path = replay_dir.path().join("prepared-goal-replay.jsonl");
+        let mut replay_ledger =
+            surface::JsonlSurfaceCommitLedger::new(&replay_path, initial_cursor.clone());
+        for batch in recovered_before_restart
+            .committed
+            .iter()
+            .filter(|batch| batch.cursor_before.next_seq.get() >= initial_cursor.next_seq.get())
+        {
+            let receipt = replay_ledger
+                .append_complete_batch(batch)
+                .expect("copy committed Goal prefix");
+            replay_ledger
+                .checkpoint(&receipt)
+                .expect("checkpoint copied Goal prefix");
+        }
+        replay_ledger
+            .append_complete_batch(prepared)
+            .expect("copy prepared Goal terminal batch");
+        drop(replay_ledger);
+        let replay_owner = surface::ExclusiveOwnerLease::acquire_thread(
+            replay_path.with_extension("surface-owner.lock"),
+            replay_path.with_extension("surface-owner.epoch"),
+            initial_snapshot.thread.thread_id.clone(),
+            &HostSurfaceClock::now(),
+        )
+        .expect("acquire replay owner");
+        let mut replayed = surface::RuntimeCommitCoordinator::recover(
+            surface::JsonlSurfaceCommitLedger::new(&replay_path, initial_cursor.clone()),
+            surface::SurfaceReducerState::new(initial_snapshot),
+            &replay_owner,
+        )
+        .expect("recover exact prepared verified Goal batch");
+        assert!(matches!(
+            replayed
+                .state()
+                .snapshot()
+                .goal
+                .as_ref()
+                .map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Complete { .. })
+        ));
+        assert!(matches!(
+            replayed
+                .state()
+                .snapshot()
+                .foreground_operation
+                .as_ref()
+                .map(|operation| &operation.phase),
+            Some(surface::OperationPhase::Finalizing { .. })
+        ));
+        assert!(matches!(
+            replayed.ledger().probe_commit(
+                match &prepared_commit {
+                    surface::CommitClass::Recorded { commit_id, .. } => commit_id,
+                    surface::CommitClass::Ephemeral { .. } => {
+                        unreachable!("Goal terminal commit is recorded")
+                    }
+                },
+                &prepared_digest,
+            ),
+            surface::CommitProbe::Present(_)
+        ));
+        assert!(matches!(
+            replayed
+                .recover_operation(
+                    &operation_id,
+                    &surface::MaterializationCause::SameProcessProjectionReset {
+                        retained_incarnation: initial_cursor.incarnation.clone(),
+                    },
+                )
+                .expect("finish replayed Goal operation"),
+            surface::RecoveryAction::ReconcileOriginalFinalizer
+        ));
+        assert!(
+            replayed
+                .state()
+                .snapshot()
+                .operation_history
+                .iter()
+                .any(|operation| {
+                    operation.operation_id == operation_id
+                        && matches!(operation.phase, surface::OperationPhase::Terminal)
+                })
+        );
+        drop(replayed);
+        drop(replay_owner);
+
+        assert!(
+            host.shutdown().is_err(),
+            "checkpoint failure must remain visible to the original host"
+        );
+
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("restart prepared Goal runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(
+                    cwd.path().to_path_buf(),
+                    HistoryMode::Resume(session_id.clone()),
+                ),
+                "resumed verified Goal checkpoint",
+            )
+            .expect("resume prepared Goal thread");
+        let resumed_snapshot = fresh_surface_attachment(&resumed.surface())
+            .baseline
+            .snapshot;
+        assert!(matches!(
+            resumed_snapshot.goal.as_ref().map(|goal| &goal.state),
+            Some(surface::SurfaceGoalState::Complete { .. })
+        ));
+        let recovered_operation = resumed_snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("recovered Goal operation");
+        assert!(matches!(
+            recovered_operation.phase,
+            surface::OperationPhase::Terminal
+        ));
+        let recovered_after_restart =
+            surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+                .recover_batches()
+                .expect("read committed Goal terminal batch after restart");
+        assert!(recovered_after_restart.prepared.is_none());
+        let exact_batch = recovered_after_restart
+            .committed
+            .iter()
+            .find(|batch| batch.commit_class == prepared_commit)
+            .expect("original prepared Goal commit was recovered");
+        assert_eq!(exact_batch.batch_digest, prepared_digest);
+        assert!(
+            GoalStore::load_default()
+                .unwrap()
+                .pending_surface_mutations(&session_id)
+                .unwrap()
+                .is_empty(),
+            "recovered Goal terminal batch must settle its durable outbox"
+        );
+        resumed_host
+            .shutdown()
+            .expect("shutdown recovered Goal checkpoint runtime");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
     }
 
     #[test]

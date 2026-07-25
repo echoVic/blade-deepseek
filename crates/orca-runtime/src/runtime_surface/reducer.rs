@@ -635,6 +635,7 @@ pub struct SurfaceReducerState {
     snapshot: SurfaceSnapshot,
     applied: BTreeMap<(SurfaceEventId, SurfaceCommitId), AppliedTransitionRecord>,
     applied_batches: BTreeMap<SurfaceCommitId, AppliedBatchRecord>,
+    applied_goal_receipts: HashSet<(SurfaceCommitId, Sha256Digest)>,
     goal_recoveries: Vec<AppliedGoalRecoveryRecord>,
     goal_successor_authorizations: Vec<AppliedGoalSuccessorAuthorization>,
     degraded_finalizations: BTreeMap<SurfaceOperationId, AppliedFinalizationDegradedProof>,
@@ -648,6 +649,7 @@ impl SurfaceReducerState {
             snapshot,
             applied: BTreeMap::new(),
             applied_batches: BTreeMap::new(),
+            applied_goal_receipts: HashSet::new(),
             goal_recoveries: Vec::new(),
             goal_successor_authorizations: Vec::new(),
             degraded_finalizations: BTreeMap::new(),
@@ -660,6 +662,18 @@ impl SurfaceReducerState {
         &self.snapshot
     }
 
+    pub(crate) fn align_rematerialization_baseline(
+        &mut self,
+        cursor: SurfaceCursor,
+        owner_epoch: ThreadOwnerEpoch,
+    ) {
+        debug_assert!(self.applied.is_empty());
+        debug_assert!(self.applied_batches.is_empty());
+        debug_assert_eq!(cursor.next_seq.get(), 0);
+        self.snapshot.cursor = cursor;
+        self.snapshot.thread.owner_epoch = owner_epoch;
+    }
+
     pub(crate) fn finalization_degraded_cause(
         &self,
         operation_id: &SurfaceOperationId,
@@ -667,6 +681,15 @@ impl SurfaceReducerState {
         self.degraded_finalizations
             .get(operation_id)
             .map(|proof| &proof.cause)
+    }
+
+    pub(crate) fn has_goal_store_receipt(
+        &self,
+        store_commit_id: &SurfaceCommitId,
+        receipt_digest: &Sha256Digest,
+    ) -> bool {
+        self.applied_goal_receipts
+            .contains(&(store_commit_id.clone(), receipt_digest.clone()))
     }
 }
 
@@ -1315,7 +1338,14 @@ fn apply_event(
         }
         SurfaceEvent::Workflow(patch) => apply_workflow_patch(&mut state.snapshot, envelope, patch),
         SurfaceEvent::Subagent(patch) => apply_subagent_patch(&mut state.snapshot, envelope, patch),
-        SurfaceEvent::Goal(goal) => apply_goal_patch(state, envelope, goal),
+        SurfaceEvent::Goal(goal) => {
+            apply_goal_patch(state, envelope, goal)?;
+            state.applied_goal_receipts.insert((
+                goal.receipt.store_commit_id.clone(),
+                goal.receipt.receipt_digest.clone(),
+            ));
+            Ok(())
+        }
         SurfaceEvent::Settings(patch) => apply_settings_patch(&mut state.snapshot, envelope, patch),
         SurfaceEvent::McpCatalog(patch) => {
             apply_mcp_catalog_patch(&mut state.snapshot, envelope, patch)
@@ -1423,11 +1453,16 @@ fn validate_batch_pairings(
                                 && turn_id == &generation.logical_turn_id
                         )
                     });
-                    if generation.goal_identity.is_some() && count != 1 {
+                    let invalid_goal_pairing = generation.goal_identity.is_some()
+                        && match generation.attempt {
+                            GenerationAttempt::Initial => count != 1,
+                            GenerationAttempt::RecoveryReplacement => count != 0,
+                        };
+                    if invalid_goal_pairing {
                         return Err(event_error(
                             envelope,
                             SurfaceReducerErrorCode::InvalidOrdering,
-                            "goal generation reservation must pair with exactly one pending user item",
+                            "goal generation reservation has an invalid pending item pairing",
                         ));
                     }
                 }
@@ -3121,7 +3156,8 @@ fn generation_fence_for_turn(
                 .filter(|operation| operation.terminal.is_none()),
         )
         .flat_map(|operation| operation.generations.iter())
-        .find(|generation| generation.logical_turn_id == *turn_id)
+        .filter(|generation| generation.logical_turn_id == *turn_id)
+        .last()
         .map(|generation| generation.fence.clone())
 }
 
@@ -5299,10 +5335,9 @@ fn apply_operation_patch(
                     GenerationInputState::NotApplicable | GenerationInputState::Resolved { .. }
                 )
                 || turn.ordinal != next_ordinal
-                || operation
-                    .agent_loop_turns
-                    .iter()
-                    .any(|existing| existing.turn_id == turn.turn_id)
+                || operation.agent_loop_turns.iter().any(|existing| {
+                    existing.fence == turn.fence && existing.turn_id == turn.turn_id
+                })
             {
                 return Err(event_error(
                     envelope,
@@ -6328,7 +6363,16 @@ fn apply_goal_patch(
                     "goal run does not exist",
                 ));
             };
-            if !matches!(current.state, SurfaceGoalState::Active)
+            let state_can_settle = matches!(
+                current.state,
+                SurfaceGoalState::Active
+                    | SurfaceGoalState::Paused {
+                        reason: SurfaceGoalPauseReason::User
+                            | SurfaceGoalPauseReason::Infrastructure,
+                        ..
+                    }
+            );
+            if !state_can_settle
                 || !goal_run_is_in_flight_for_identity(in_flight, identity)
                 || !goal_usage_is_nonnegative(usage)
             {

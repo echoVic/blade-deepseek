@@ -16,7 +16,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 2;
+use crate::runtime_surface::{
+    GenerationAttempt, OperationKind, OperationPhase, OperationRecord,
+    SurfaceGoalGenerationIdentity, SurfaceOperationId,
+};
+
+const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILENAME: &str = "goals.sqlite3";
 const LEGACY_FILENAME: &str = "goals_1.json";
 const LEGACY_MIGRATION_KEY: &str = "legacy_goals_1_migrated";
@@ -157,6 +162,102 @@ pub struct GoalSurfaceMutationContext {
     pub goal_owner_epoch: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrepareGoalRunForSurfaceInput {
+    pub session_id: String,
+    pub expected_goal_id: GoalId,
+    pub expected_goal_revision: u32,
+    pub goal_run_id: GoalRunId,
+    pub operation: Box<OperationRecord>,
+    pub origin: GoalTurnOrigin,
+    pub started_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateGoalAndPrepareRunForSurfaceInput {
+    pub goal: CreateGoalInput,
+    pub goal_id: GoalId,
+    pub goal_run_id: GoalRunId,
+    pub operation: Box<OperationRecord>,
+    pub origin: GoalTurnOrigin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditGoalAndPrepareRunForSurfaceInput {
+    pub session_id: String,
+    pub expected_goal_id: GoalId,
+    pub expected_goal_revision: u32,
+    pub objective: String,
+    pub token_budget: Option<i64>,
+    pub goal_run_id: GoalRunId,
+    pub operation: Box<OperationRecord>,
+    pub origin: GoalTurnOrigin,
+    pub started_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeginGoalOuterTurnForSurfaceInput {
+    pub session_id: String,
+    pub expected_goal_id: GoalId,
+    pub expected_goal_revision: u32,
+    pub identity: Box<SurfaceGoalGenerationIdentity>,
+    pub provider_turn_id: String,
+    pub started_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinishGoalOuterTurnForSurfaceInput {
+    pub session_id: String,
+    pub expected_goal_id: GoalId,
+    pub expected_goal_revision: u32,
+    pub identity: Box<SurfaceGoalGenerationIdentity>,
+    pub status: crate::runtime_surface::GoalOuterTurnStatus,
+    pub usage: crate::runtime_surface::GoalUsage,
+    pub next_action: crate::runtime_surface::GoalOuterTurnNextAction,
+    pub verification: Option<crate::runtime_surface::SurfaceGoalVerification>,
+    pub continuation: Option<AdmittedGoalContinuationForSurface>,
+    pub stop_reason: crate::runtime_surface::GoalContinuationStopReason,
+    pub terminal: crate::runtime_surface::OperationTerminal,
+    pub pause_message: String,
+    pub finished_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedGoalContinuationForSurface {
+    pub reason: crate::runtime_surface::GoalContinuationAdmitReason,
+    pub successor: Box<SurfaceGoalGenerationIdentity>,
+    pub provider_turn_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseGoalForSurfaceInput {
+    pub session_id: String,
+    pub expected_goal_id: GoalId,
+    pub expected_goal_revision: u32,
+    pub expected_operation_id: SurfaceOperationId,
+    pub message: String,
+    pub paused_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverGoalRunForSurfaceInput {
+    pub session_id: String,
+    pub expected_goal_id: GoalId,
+    pub expected_goal_revision: u32,
+    pub stale_identity: Option<Box<SurfaceGoalGenerationIdentity>>,
+    pub recovery_message: String,
+    pub recovered_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplaceGoalContinuationForSurfaceInput {
+    pub interrupted: GoalSurfaceMutationRecord,
+    pub surface_previous_revision: u32,
+    pub stale_run_settled: bool,
+    pub recovery_message: String,
+    pub recovered_at: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GoalSurfaceTokenBudgetUpdate {
     Keep,
@@ -166,12 +267,76 @@ pub enum GoalSurfaceTokenBudgetUpdate {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum GoalSurfaceMutation {
     Created,
+    CreatedWithRun {
+        goal_run_id: GoalRunId,
+        operation: Box<OperationRecord>,
+        origin: GoalTurnOrigin,
+    },
     Edited {
         previous_revision: u32,
     },
     Removed {
         previous_revision: u32,
         tombstone_revision: u32,
+    },
+    RunStarted {
+        previous_revision: u32,
+        goal_run_id: GoalRunId,
+        operation: Box<OperationRecord>,
+        origin: GoalTurnOrigin,
+    },
+    OuterTurnStarted {
+        previous_revision: u32,
+        identity: Box<SurfaceGoalGenerationIdentity>,
+    },
+    IntentRequested {
+        previous_revision: u32,
+        identity: Box<SurfaceGoalGenerationIdentity>,
+        intent: GoalUpdateIntent,
+    },
+    IntentAcknowledged {
+        previous_revision: u32,
+        identity: Box<SurfaceGoalGenerationIdentity>,
+        intent: GoalUpdateIntent,
+        ack: GoalUpdateAck,
+    },
+    OuterTurnFinished {
+        previous_revision: u32,
+        identity: Box<SurfaceGoalGenerationIdentity>,
+        status: crate::runtime_surface::GoalOuterTurnStatus,
+        usage: crate::runtime_surface::GoalUsage,
+        next_action: crate::runtime_surface::GoalOuterTurnNextAction,
+    },
+    VerificationCompleted {
+        previous_revision: u32,
+        identity: Box<SurfaceGoalGenerationIdentity>,
+        result: crate::runtime_surface::SurfaceGoalVerification,
+    },
+    Paused {
+        previous_revision: u32,
+        goal_run_id: GoalRunId,
+        operation_id: SurfaceOperationId,
+        outer_turn_id: Option<GoalOuterTurnId>,
+        message: String,
+    },
+    ContinuationStopped {
+        previous_revision: u32,
+        predecessor: Box<SurfaceGoalGenerationIdentity>,
+        decision: Box<crate::runtime_surface::GoalContinuationDecision>,
+    },
+    ContinuationAdmitted {
+        previous_revision: u32,
+        predecessor: Box<SurfaceGoalGenerationIdentity>,
+        decision: Box<crate::runtime_surface::GoalContinuationDecision>,
+    },
+    Recovered {
+        previous_revision: u32,
+        stale_goal_run_id: GoalRunId,
+        operation: Box<OperationRecord>,
+        origin: GoalTurnOrigin,
+        stale_identity: Option<Box<SurfaceGoalGenerationIdentity>>,
+        stale_run_settled: bool,
+        recovery_message: String,
     },
 }
 
@@ -276,6 +441,77 @@ impl GoalStore {
         })
     }
 
+    pub fn current_surface_receipt_digest(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<[u8; 32]>, GoalStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT last_receipt_digest
+                 FROM goal_surface_state
+                 WHERE session_id = ?1 AND row_present = 1",
+                [session_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|digest| exact_digest(&digest, "receipt digest"))
+            .transpose()
+    }
+
+    pub(crate) fn validate_surface_outer_turn_binding(
+        &self,
+        session_id: &str,
+        identity: &SurfaceGoalGenerationIdentity,
+    ) -> Result<GoalRecord, GoalStoreError> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn binding requires a session".to_string(),
+            ));
+        }
+        let connection = self.connection()?;
+        let stored = load_stored_goal(&connection, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before outer-turn binding".to_string())
+        })?;
+        let run = stored.record.current_run.as_ref().ok_or_else(|| {
+            GoalStoreError::Invalid("Goal outer-turn binding requires an open run".to_string())
+        })?;
+        if stored.record.goal_id.as_str() != identity.goal_id.as_str()
+            || stored.record.objective_revision != identity.objective_revision.get()
+            || run.goal_run_id.as_str() != identity.goal_run_id.as_str()
+            || !run.in_flight
+            || run.continuation_count != identity.outer_turn_count
+            || run.outer_turn_id.as_ref().is_none_or(|outer_turn_id| {
+                outer_turn_id.as_str() != identity.goal_outer_turn_id.as_str()
+            })
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn binding identity is stale".to_string(),
+            ));
+        }
+        let operation_json: String = connection.query_row(
+            "SELECT surface_operation_json
+             FROM goal_runs
+             WHERE goal_run_id = ?1 AND goal_id = ?2 AND finished_at IS NULL",
+            params![run.goal_run_id.as_str(), stored.record.goal_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let operation: OperationRecord = serde_json::from_str(&operation_json)?;
+        validate_surface_goal_operation(
+            &operation,
+            &stored.record.goal_id,
+            &run.goal_run_id,
+            stored.record.objective_revision,
+        )?;
+        if operation.operation_id != identity.operation_fence.operation_id {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn binding operation identity is stale".to_string(),
+            ));
+        }
+        Ok(stored.record)
+    }
+
     pub(crate) fn claim_surface_owner_epoch(&self) -> Result<u64, GoalStoreError> {
         const OWNER_EPOCH_KEY: &str = "surface_owner_epoch";
         let mut connection = self.connection()?;
@@ -360,7 +596,7 @@ impl GoalStore {
             .expect("created goal must be readable"))
     }
 
-    pub fn create_goal_for_surface(
+    pub(crate) fn create_goal_for_surface(
         &self,
         input: CreateGoalInput,
         context: GoalSurfaceMutationContext,
@@ -462,7 +698,134 @@ impl GoalStore {
         Ok(output)
     }
 
-    pub fn adopt_goal_for_surface(
+    pub(crate) fn create_goal_and_prepare_run_for_surface(
+        &self,
+        input: CreateGoalAndPrepareRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_thread_goal_objective(&input.goal.objective).map_err(GoalStoreError::Invalid)?;
+        if input.goal.session_id.trim().is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "goal session id must not be empty".to_string(),
+            ));
+        }
+        if input.goal.token_budget.is_some_and(|budget| budget <= 0) {
+            return Err(GoalStoreError::Invalid(
+                "goal token budget must be positive".to_string(),
+            ));
+        }
+        if input.origin == GoalTurnOrigin::Continuation {
+            return Err(GoalStoreError::Invalid(
+                "a continuation cannot prepare a new Goal run".to_string(),
+            ));
+        }
+        validate_surface_mutation_context(&context)?;
+        validate_surface_goal_operation(&input.operation, &input.goal_id, &input.goal_run_id, 1)?;
+        let session_id = input.goal.session_id.trim().to_string();
+        let objective = input.goal.objective.trim().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM goals WHERE session_id = ?1",
+                [&session_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal already exists for the surface session".to_string(),
+            ));
+        }
+        let previous_catalog_revision = transaction
+            .query_row(
+                "SELECT catalog_revision FROM goal_surface_state WHERE session_id = ?1",
+                [&session_id],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let catalog_revision = previous_catalog_revision.checked_add(1).ok_or_else(|| {
+            GoalStoreError::Invalid("goal catalog revision exhausted".to_string())
+        })?;
+        let goal_id = input.goal_id;
+        let state = GoalState::Active;
+        transaction.execute(
+            "INSERT INTO goals (
+                goal_id, session_id, objective, objective_revision, state,
+                token_budget, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?6)",
+            params![
+                goal_id.as_str(),
+                session_id,
+                objective,
+                state_json(&state)?,
+                input.goal.token_budget,
+                input.goal.now,
+            ],
+        )?;
+        insert_transition(
+            &transaction,
+            &goal_id,
+            None,
+            &state,
+            &state,
+            "created",
+            input.goal.now,
+        )?;
+        transaction.execute(
+            "INSERT INTO goal_runs (
+                goal_run_id, goal_id, status, origin, current_outer_turn_id,
+                continuation_count, in_flight, started_at, finished_at,
+                surface_operation_id, surface_operation_json
+             ) VALUES (?1, ?2, 'preparing', ?3, NULL, 0, 0, ?4, NULL, ?5, ?6)",
+            params![
+                input.goal_run_id.as_str(),
+                goal_id.as_str(),
+                origin_name(input.origin),
+                input.goal.now,
+                uuid::Uuid::from_bytes(*input.operation.operation_id.as_bytes())
+                    .hyphenated()
+                    .to_string(),
+                serde_json::to_string(&input.operation)?,
+            ],
+        )?;
+        let record = load_stored_goal(&transaction, &session_id)?
+            .expect("surface-created Goal with preparing run must be readable")
+            .record;
+        let mutation = GoalSurfaceMutation::CreatedWithRun {
+            goal_run_id: input.goal_run_id,
+            operation: input.operation,
+            origin: input.origin,
+        };
+        let receipt = goal_surface_receipt(
+            &context,
+            &session_id,
+            &mutation,
+            goal_id,
+            1,
+            1,
+            catalog_revision,
+            GoalSurfaceRowState::Present(record),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.clone(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, input.goal.now)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub(crate) fn adopt_goal_for_surface(
         &self,
         session_id: &str,
         context: GoalSurfaceMutationContext,
@@ -562,7 +925,7 @@ impl GoalStore {
         Ok(output)
     }
 
-    pub fn clear_goal_for_surface(
+    pub(crate) fn clear_goal_for_surface(
         &self,
         session_id: &str,
         expected_goal_id: &GoalId,
@@ -639,7 +1002,7 @@ impl GoalStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn edit_goal_for_surface(
+    pub(crate) fn edit_goal_for_surface(
         &self,
         session_id: &str,
         expected_goal_id: &GoalId,
@@ -759,6 +1122,1509 @@ impl GoalStore {
         Ok(output)
     }
 
+    pub(crate) fn prepare_goal_run_for_surface(
+        &self,
+        input: PrepareGoalRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        let session_id = input.session_id.trim();
+        if session_id.is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "goal session id must not be empty".to_string(),
+            ));
+        }
+        if input.origin == GoalTurnOrigin::Continuation {
+            return Err(GoalStoreError::Invalid(
+                "a continuation cannot prepare a new Goal run".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || state.goal_id != input.expected_goal_id
+            || state.goal_revision != input.expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal surface fence is stale".to_string(),
+            ));
+        }
+        validate_surface_goal_operation(
+            &input.operation,
+            &input.expected_goal_id,
+            &input.goal_run_id,
+            state.objective_revision,
+        )?;
+        let stored = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before surface run preparation".to_string())
+        })?;
+        if input.origin == GoalTurnOrigin::Resume {
+            if matches!(stored.record.state, GoalState::Complete { .. }) {
+                return Err(GoalStoreError::Invalid(
+                    "cannot resume a completed Goal".to_string(),
+                ));
+            }
+            if stored.record.state != GoalState::Active {
+                transaction.execute(
+                    "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+                    params![
+                        state_json(&GoalState::Active)?,
+                        input.started_at,
+                        input.expected_goal_id.as_str()
+                    ],
+                )?;
+                insert_transition(
+                    &transaction,
+                    &input.expected_goal_id,
+                    None,
+                    &stored.record.state,
+                    &GoalState::Active,
+                    "surface_resumed",
+                    input.started_at,
+                )?;
+            }
+        } else if !stored.record.state.should_continue() {
+            return Err(GoalStoreError::Invalid(format!(
+                "cannot prepare a Goal run while state is {:?}",
+                stored.record.state
+            )));
+        }
+        if stored.record.current_run.is_some() {
+            return Err(GoalStoreError::Invalid(
+                "cannot prepare a Goal run while another run is open".to_string(),
+            ));
+        }
+        let operation_id = uuid::Uuid::from_bytes(*input.operation.operation_id.as_bytes())
+            .hyphenated()
+            .to_string();
+        transaction.execute(
+            "INSERT INTO goal_runs (
+                goal_run_id, goal_id, status, origin, current_outer_turn_id,
+                continuation_count, in_flight, started_at, finished_at,
+                surface_operation_id, surface_operation_json
+             ) VALUES (?1, ?2, 'preparing', ?3, NULL, 0, 0, ?4, NULL, ?5, ?6)",
+            params![
+                input.goal_run_id.as_str(),
+                input.expected_goal_id.as_str(),
+                origin_name(input.origin),
+                input.started_at,
+                operation_id,
+                serde_json::to_string(&input.operation)?,
+            ],
+        )?;
+        let record = load_stored_goal(&transaction, session_id)?
+            .expect("surface-prepared Goal run must be readable")
+            .record;
+        let goal_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let mutation = GoalSurfaceMutation::RunStarted {
+            previous_revision: state.goal_revision,
+            goal_run_id: input.goal_run_id,
+            operation: input.operation,
+            origin: input.origin,
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            goal_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(record),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, input.started_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub(crate) fn edit_goal_and_prepare_run_for_surface(
+        &self,
+        input: EditGoalAndPrepareRunForSurfaceInput,
+        contexts: [GoalSurfaceMutationContext; 2],
+    ) -> Result<Vec<GoalSurfaceMutationRecord>, GoalStoreError> {
+        let [edit_context, run_context] = contexts;
+        validate_thread_goal_objective(&input.objective).map_err(GoalStoreError::Invalid)?;
+        if input.token_budget.is_some_and(|budget| budget <= 0)
+            || input.origin == GoalTurnOrigin::Continuation
+            || edit_context.store_commit_id == run_context.store_commit_id
+            || edit_context.goal_owner_epoch != run_context.goal_owner_epoch
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal edit-and-run input is invalid".to_string(),
+            ));
+        }
+        validate_surface_mutation_context(&edit_context)?;
+        validate_surface_mutation_context(&run_context)?;
+        let session_id = input.session_id.trim();
+        if session_id.is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "goal session id must not be empty".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, edit_context.goal_owner_epoch)?;
+        let replay_edit = replay_surface_mutation(&transaction, &edit_context)?;
+        let replay_run = replay_surface_mutation(&transaction, &run_context)?;
+        match (replay_edit, replay_run) {
+            (Some(edit), Some(run)) => {
+                transaction.commit()?;
+                return Ok(vec![edit, run]);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(GoalStoreError::Invalid(
+                    "Goal edit-and-run replay is incomplete".to_string(),
+                ));
+            }
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || state.goal_id != input.expected_goal_id
+            || state.goal_revision != input.expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal edit-and-run fence is stale".to_string(),
+            ));
+        }
+        let stored = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before edit-and-run".to_string())
+        })?;
+        if stored.record.current_run.is_some()
+            || matches!(stored.record.state, GoalState::Complete { .. })
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal edit-and-run requires an inactive Goal without an open run".to_string(),
+            ));
+        }
+        let objective = input.objective.trim();
+        let objective_revision_increment =
+            i64::from(u8::from(stored.record.objective != objective));
+        transaction.execute(
+            "UPDATE goals SET objective = ?1,
+                objective_revision = objective_revision + ?2,
+                state = ?3, token_budget = ?4, updated_at = ?5 WHERE session_id = ?6",
+            params![
+                objective,
+                objective_revision_increment,
+                state_json(&GoalState::Active)?,
+                input.token_budget,
+                input.started_at,
+                session_id
+            ],
+        )?;
+        if stored.record.state != GoalState::Active {
+            insert_transition(
+                &transaction,
+                &input.expected_goal_id,
+                None,
+                &stored.record.state,
+                &GoalState::Active,
+                "surface_set_and_run",
+                input.started_at,
+            )?;
+        }
+        let edited_record = load_stored_goal(&transaction, session_id)?
+            .expect("edited Goal remains readable")
+            .record;
+        let edited_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let edited_mutation = GoalSurfaceMutation::Edited {
+            previous_revision: state.goal_revision,
+        };
+        let retained_edit_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..edit_context.clone()
+        };
+        let edited_receipt = goal_surface_receipt(
+            &retained_edit_context,
+            session_id,
+            &edited_mutation,
+            state.goal_id.clone(),
+            edited_revision,
+            edited_record.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(edited_record.clone()),
+        )?;
+        let edited = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation: edited_mutation,
+            receipt: edited_receipt,
+        };
+        persist_surface_mutation(&transaction, &edit_context, &edited, input.started_at)?;
+        persist_surface_state(&transaction, &edited)?;
+
+        validate_surface_goal_operation(
+            &input.operation,
+            &input.expected_goal_id,
+            &input.goal_run_id,
+            edited_record.objective_revision,
+        )?;
+        let operation_id = uuid::Uuid::from_bytes(*input.operation.operation_id.as_bytes())
+            .hyphenated()
+            .to_string();
+        transaction.execute(
+            "INSERT INTO goal_runs (
+                goal_run_id, goal_id, status, origin, current_outer_turn_id,
+                continuation_count, in_flight, started_at, finished_at,
+                surface_operation_id, surface_operation_json
+             ) VALUES (?1, ?2, 'preparing', ?3, NULL, 0, 0, ?4, NULL, ?5, ?6)",
+            params![
+                input.goal_run_id.as_str(),
+                input.expected_goal_id.as_str(),
+                origin_name(input.origin),
+                input.started_at,
+                operation_id,
+                serde_json::to_string(&input.operation)?,
+            ],
+        )?;
+        let run_record = load_stored_goal(&transaction, session_id)?
+            .expect("Goal run remains readable")
+            .record;
+        let run_revision = edited_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let run_mutation = GoalSurfaceMutation::RunStarted {
+            previous_revision: edited_revision,
+            goal_run_id: input.goal_run_id,
+            operation: input.operation,
+            origin: input.origin,
+        };
+        let retained_run_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..run_context.clone()
+        };
+        let run_receipt = goal_surface_receipt(
+            &retained_run_context,
+            session_id,
+            &run_mutation,
+            state.goal_id,
+            run_revision,
+            run_record.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(run_record),
+        )?;
+        let run = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation: run_mutation,
+            receipt: run_receipt,
+        };
+        persist_surface_mutation(&transaction, &run_context, &run, input.started_at)?;
+        persist_surface_state(&transaction, &run)?;
+        transaction.commit()?;
+        Ok(vec![edited, run])
+    }
+
+    pub(crate) fn begin_goal_outer_turn_for_surface(
+        &self,
+        input: BeginGoalOuterTurnForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        let session_id = input.session_id.trim();
+        if session_id.is_empty() || input.provider_turn_id.trim().is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn admission requires a session and provider turn".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || state.goal_id != input.expected_goal_id
+            || state.goal_revision != input.expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal surface fence is stale".to_string(),
+            ));
+        }
+        let identity = input.identity.as_ref();
+        if identity.goal_id.as_str() != input.expected_goal_id.as_str()
+            || identity.objective_revision.get() != state.objective_revision
+            || identity.operation_fence.generation_id.get() != 0
+            || identity.predecessor_fence.is_some()
+            || identity.outer_turn_count != 1
+            || identity.attempt != GenerationAttempt::Initial
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn identity does not match the initial run fence".to_string(),
+            ));
+        }
+        let stored = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before outer-turn admission".to_string())
+        })?;
+        let current_run = stored.record.current_run.as_ref().ok_or_else(|| {
+            GoalStoreError::Invalid(
+                "Goal outer-turn admission requires a preparing run".to_string(),
+            )
+        })?;
+        if current_run.goal_run_id.as_str() != identity.goal_run_id.as_str()
+            || current_run.in_flight
+            || current_run.outer_turn_id.is_some()
+            || current_run.continuation_count != 0
+            || current_run.origin == GoalTurnOrigin::Continuation
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn admission does not match the preparing run".to_string(),
+            ));
+        }
+        let operation_json: String = transaction.query_row(
+            "SELECT surface_operation_json
+             FROM goal_runs
+             WHERE goal_run_id = ?1 AND goal_id = ?2 AND finished_at IS NULL",
+            params![
+                current_run.goal_run_id.as_str(),
+                input.expected_goal_id.as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        let operation: OperationRecord = serde_json::from_str(&operation_json)?;
+        validate_surface_goal_operation(
+            &operation,
+            &input.expected_goal_id,
+            &current_run.goal_run_id,
+            state.objective_revision,
+        )?;
+        if operation.operation_id != identity.operation_fence.operation_id {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn operation fence is not the durable run binding".to_string(),
+            ));
+        }
+        let outer_turn_id =
+            GoalOuterTurnId::parse(identity.goal_outer_turn_id.as_str().to_string())
+                .map_err(GoalStoreError::Invalid)?;
+        let changed = transaction.execute(
+            "UPDATE goal_runs
+             SET status = 'active',
+                 current_outer_turn_id = ?1,
+                 continuation_count = 1,
+                 in_flight = 1
+             WHERE goal_run_id = ?2 AND goal_id = ?3
+               AND in_flight = 0 AND current_outer_turn_id IS NULL
+               AND continuation_count = 0 AND finished_at IS NULL",
+            params![
+                outer_turn_id.as_str(),
+                current_run.goal_run_id.as_str(),
+                input.expected_goal_id.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(GoalStoreError::Invalid(
+                "Goal preparing run changed before outer-turn admission".to_string(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO goal_turns (
+                outer_turn_id, goal_run_id, origin, provider_turn_id, status,
+                tool_count, model_response_count, charged_input_tokens,
+                output_tokens, verifier_tokens, gap_fingerprint, started_at, finished_at
+             ) VALUES (?1, ?2, ?3, ?4, 'in_flight', 0, 0, 0, 0, 0, NULL, ?5, NULL)",
+            params![
+                outer_turn_id.as_str(),
+                current_run.goal_run_id.as_str(),
+                origin_name(current_run.origin),
+                input.provider_turn_id.trim(),
+                input.started_at,
+            ],
+        )?;
+        let record = load_stored_goal(&transaction, session_id)?
+            .expect("surface-started Goal outer turn remains readable")
+            .record;
+        let goal_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let mutation = GoalSurfaceMutation::OuterTurnStarted {
+            previous_revision: state.goal_revision,
+            identity: input.identity,
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            goal_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(record),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, input.started_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub(crate) fn finish_goal_outer_turn_for_surface(
+        &self,
+        input: FinishGoalOuterTurnForSurfaceInput,
+        contexts: Vec<GoalSurfaceMutationContext>,
+    ) -> Result<Vec<GoalSurfaceMutationRecord>, GoalStoreError> {
+        let expected_contexts = if input.verification.is_some() { 3 } else { 2 };
+        if contexts.len() != expected_contexts {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn settlement context count is invalid".to_string(),
+            ));
+        }
+        let finish_context = contexts[0].clone();
+        let verification_context = input.verification.as_ref().map(|_| contexts[1].clone());
+        let decision_context = contexts[expected_contexts - 1].clone();
+        validate_surface_mutation_context(&finish_context)?;
+        validate_surface_mutation_context(&decision_context)?;
+        if let Some(context) = verification_context.as_ref() {
+            validate_surface_mutation_context(context)?;
+        }
+        if finish_context.store_commit_id == decision_context.store_commit_id
+            || finish_context.goal_owner_epoch != decision_context.goal_owner_epoch
+            || verification_context.as_ref().is_some_and(|context| {
+                context.store_commit_id == finish_context.store_commit_id
+                    || context.store_commit_id == decision_context.store_commit_id
+                    || context.goal_owner_epoch != finish_context.goal_owner_epoch
+            })
+            || input.session_id.trim().is_empty()
+            || input.pause_message.trim().is_empty()
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn settlement contexts are invalid".to_string(),
+            ));
+        }
+        let session_id = input.session_id.trim();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, finish_context.goal_owner_epoch)?;
+        let replay_finish = replay_surface_mutation(&transaction, &finish_context)?;
+        let replay_verification = verification_context
+            .as_ref()
+            .map(|context| replay_surface_mutation(&transaction, context))
+            .transpose()?;
+        let replay_decision = replay_surface_mutation(&transaction, &decision_context)?;
+        if replay_finish.is_some()
+            && replay_decision.is_some()
+            && replay_verification
+                .as_ref()
+                .is_none_or(|verification| verification.is_some())
+        {
+            let mut replayed = vec![replay_finish.expect("checked finish")];
+            if let Some(verification) = replay_verification.flatten() {
+                replayed.push(verification);
+            }
+            replayed.push(replay_decision.expect("checked decision"));
+            transaction.commit()?;
+            return Ok(replayed);
+        }
+        if replay_finish.is_some()
+            || replay_decision.is_some()
+            || replay_verification
+                .as_ref()
+                .is_some_and(|verification| verification.is_some())
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn settlement replay is incomplete".to_string(),
+            ));
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || state.goal_id != input.expected_goal_id
+            || state.goal_revision != input.expected_goal_revision
+            || input.identity.goal_id.as_str() != input.expected_goal_id.as_str()
+            || input.identity.objective_revision.get() != state.objective_revision
+            || input.continuation.as_ref().is_some_and(|continuation| {
+                input.status != crate::runtime_surface::GoalOuterTurnStatus::Success
+                    || input.next_action
+                        != crate::runtime_surface::GoalOuterTurnNextAction::Continue
+                    || continuation.provider_turn_id.trim().is_empty()
+                    || continuation.successor.goal_id != input.identity.goal_id
+                    || continuation.successor.goal_run_id != input.identity.goal_run_id
+                    || continuation.successor.operation_fence.operation_id
+                        != input.identity.operation_fence.operation_id
+                    || continuation.successor.operation_fence.thread_id
+                        != input.identity.operation_fence.thread_id
+                    || continuation.successor.operation_fence.thread_owner_epoch
+                        != input.identity.operation_fence.thread_owner_epoch
+                    || input
+                        .identity
+                        .operation_fence
+                        .generation_id
+                        .get()
+                        .checked_add(1)
+                        != Some(continuation.successor.operation_fence.generation_id.get())
+                    || continuation.successor.predecessor_fence.as_ref()
+                        != Some(&input.identity.operation_fence)
+                    || input.identity.outer_turn_count.checked_add(1)
+                        != Some(continuation.successor.outer_turn_count)
+                    || continuation.successor.objective_revision
+                        != input.identity.objective_revision
+                    || continuation.successor.outer_turn_origin
+                        != crate::runtime_surface::GoalOuterTurnOrigin::Continuation
+            })
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn settlement fence is stale".to_string(),
+            ));
+        }
+        let current = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before outer-turn settlement".to_string())
+        })?;
+        let current_run = current.record.current_run.as_ref().ok_or_else(|| {
+            GoalStoreError::Invalid("Goal outer-turn settlement requires a live run".to_string())
+        })?;
+        let operation_json: String = transaction.query_row(
+            "SELECT surface_operation_json
+             FROM goal_runs
+             WHERE goal_run_id = ?1 AND finished_at IS NULL",
+            [current_run.goal_run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let operation: OperationRecord = serde_json::from_str(&operation_json)?;
+        if current_run.goal_run_id.as_str() != input.identity.goal_run_id.as_str()
+            || !current_run.in_flight
+            || current_run.continuation_count != input.identity.outer_turn_count
+            || operation.operation_id != input.identity.operation_fence.operation_id
+            || current_run
+                .outer_turn_id
+                .as_ref()
+                .is_none_or(|outer_turn_id| {
+                    outer_turn_id.as_str() != input.identity.goal_outer_turn_id.as_str()
+                })
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer-turn settlement identity is stale".to_string(),
+            ));
+        }
+        let core_status = match input.status {
+            crate::runtime_surface::GoalOuterTurnStatus::Success => GoalTurnStatus::Success,
+            crate::runtime_surface::GoalOuterTurnStatus::Failed => GoalTurnStatus::Failed,
+            crate::runtime_surface::GoalOuterTurnStatus::Cancelled => GoalTurnStatus::Cancelled,
+            crate::runtime_surface::GoalOuterTurnStatus::ApprovalRequired => {
+                GoalTurnStatus::ApprovalRequired
+            }
+            crate::runtime_surface::GoalOuterTurnStatus::BudgetExhausted => {
+                GoalTurnStatus::BudgetExhausted
+            }
+        };
+        let core_usage = GoalUsage {
+            charged_input_tokens: input.usage.charged_input_tokens,
+            output_tokens: input.usage.output_tokens,
+            cache_tokens: input.usage.cache_tokens,
+            verifier_tokens: input.usage.verifier_tokens,
+            cost_micros: input.usage.cost_micros,
+            elapsed_seconds: input.usage.elapsed_seconds,
+        };
+        insert_usage_event(
+            &transaction,
+            &GoalUsageEvent {
+                usage_event_id: format!(
+                    "surface-generation:{}:{}",
+                    uuid::Uuid::from_bytes(*input.identity.operation_fence.operation_id.as_bytes()),
+                    input.identity.operation_fence.generation_id.get()
+                ),
+                goal_id: input.expected_goal_id.clone(),
+                source: "surface-generation".to_string(),
+                usage: core_usage.clone(),
+                created_at: input.finished_at,
+            },
+        )?;
+        let changed = transaction.execute(
+            "UPDATE goal_turns
+             SET status = ?1, charged_input_tokens = ?2, output_tokens = ?3,
+                 verifier_tokens = ?4, finished_at = ?5
+             WHERE outer_turn_id = ?6 AND goal_run_id = ?7 AND status = 'in_flight'",
+            params![
+                turn_status_name(core_status),
+                core_usage.charged_input_tokens.max(0),
+                core_usage.output_tokens.max(0),
+                core_usage.verifier_tokens.max(0),
+                input.finished_at,
+                input.identity.goal_outer_turn_id.as_str(),
+                current_run.goal_run_id.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(GoalStoreError::Invalid(
+                "Goal outer turn was concurrently settled".to_string(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE goal_runs SET current_outer_turn_id = NULL, in_flight = 0
+             WHERE goal_run_id = ?1 AND goal_id = ?2 AND in_flight = 1",
+            params![
+                current_run.goal_run_id.as_str(),
+                input.expected_goal_id.as_str()
+            ],
+        )?;
+        let settled_record = load_stored_goal(&transaction, session_id)?
+            .expect("settled surface Goal remains readable")
+            .record;
+        let finished_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let finished_mutation = GoalSurfaceMutation::OuterTurnFinished {
+            previous_revision: state.goal_revision,
+            identity: input.identity.clone(),
+            status: input.status,
+            usage: input.usage.clone(),
+            next_action: input.next_action,
+        };
+        let retained_finish_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..finish_context.clone()
+        };
+        let finished_receipt = goal_surface_receipt(
+            &retained_finish_context,
+            session_id,
+            &finished_mutation,
+            state.goal_id.clone(),
+            finished_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(settled_record.clone()),
+        )?;
+        let finished_record = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation: finished_mutation,
+            receipt: finished_receipt,
+        };
+        persist_surface_mutation(
+            &transaction,
+            &finish_context,
+            &finished_record,
+            input.finished_at,
+        )?;
+        persist_surface_state(&transaction, &finished_record)?;
+        let mut outputs = vec![finished_record];
+        let mut decision_previous_revision = finished_revision;
+        if let (Some(result), Some(context)) =
+            (input.verification.clone(), verification_context.as_ref())
+        {
+            let verification_revision = finished_revision
+                .checked_add(1)
+                .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+            let verification_mutation = GoalSurfaceMutation::VerificationCompleted {
+                previous_revision: finished_revision,
+                identity: input.identity.clone(),
+                result,
+            };
+            let verification_receipt = goal_surface_receipt(
+                &GoalSurfaceMutationContext {
+                    goal_owner_epoch: state.goal_owner_epoch,
+                    ..context.clone()
+                },
+                session_id,
+                &verification_mutation,
+                state.goal_id.clone(),
+                verification_revision,
+                state.objective_revision,
+                state.catalog_revision,
+                GoalSurfaceRowState::Present(settled_record),
+            )?;
+            let verification_record = GoalSurfaceMutationRecord {
+                session_id: session_id.to_string(),
+                mutation: verification_mutation,
+                receipt: verification_receipt,
+            };
+            persist_surface_mutation(
+                &transaction,
+                context,
+                &verification_record,
+                input.finished_at,
+            )?;
+            persist_surface_state(&transaction, &verification_record)?;
+            decision_previous_revision = verification_revision;
+            outputs.push(verification_record);
+        }
+
+        let previous_state = current.record.state;
+        if let Some(continuation) = input.continuation {
+            let successor_outer_turn_id = GoalOuterTurnId::parse(
+                continuation
+                    .successor
+                    .goal_outer_turn_id
+                    .as_str()
+                    .to_string(),
+            )
+            .map_err(GoalStoreError::Invalid)?;
+            let changed = transaction.execute(
+                "UPDATE goal_runs
+                 SET status = 'active', current_outer_turn_id = ?1,
+                     continuation_count = ?2, in_flight = 1
+                 WHERE goal_run_id = ?3 AND goal_id = ?4
+                   AND in_flight = 0 AND current_outer_turn_id IS NULL
+                   AND continuation_count = ?5 AND finished_at IS NULL",
+                params![
+                    successor_outer_turn_id.as_str(),
+                    continuation.successor.outer_turn_count,
+                    current_run.goal_run_id.as_str(),
+                    input.expected_goal_id.as_str(),
+                    input.identity.outer_turn_count,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(GoalStoreError::Invalid(
+                    "Goal continuation successor lost its durable predecessor fence".to_string(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO goal_turns (
+                    outer_turn_id, goal_run_id, origin, provider_turn_id, status,
+                    tool_count, model_response_count, charged_input_tokens,
+                    output_tokens, verifier_tokens, gap_fingerprint, started_at, finished_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'in_flight', 0, 0, 0, 0, 0, NULL, ?5, NULL)",
+                params![
+                    successor_outer_turn_id.as_str(),
+                    current_run.goal_run_id.as_str(),
+                    origin_name(GoalTurnOrigin::Continuation),
+                    continuation.provider_turn_id.trim(),
+                    input.finished_at,
+                ],
+            )?;
+            let decision = crate::runtime_surface::GoalContinuationDecision::Admitted {
+                reason: continuation.reason,
+                successor: continuation.successor.as_ref().clone(),
+            };
+            let decision_record = load_stored_goal(&transaction, session_id)?
+                .expect("admitted surface Goal continuation remains readable")
+                .record;
+            let decision_revision = decision_previous_revision
+                .checked_add(1)
+                .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+            let decision_mutation = GoalSurfaceMutation::ContinuationAdmitted {
+                previous_revision: decision_previous_revision,
+                predecessor: input.identity,
+                decision: Box::new(decision),
+            };
+            let retained_decision_context = GoalSurfaceMutationContext {
+                goal_owner_epoch: state.goal_owner_epoch,
+                ..decision_context.clone()
+            };
+            let decision_receipt = goal_surface_receipt(
+                &retained_decision_context,
+                session_id,
+                &decision_mutation,
+                state.goal_id,
+                decision_revision,
+                state.objective_revision,
+                state.catalog_revision,
+                GoalSurfaceRowState::Present(decision_record),
+            )?;
+            let decision_record = GoalSurfaceMutationRecord {
+                session_id: session_id.to_string(),
+                mutation: decision_mutation,
+                receipt: decision_receipt,
+            };
+            persist_surface_mutation(
+                &transaction,
+                &decision_context,
+                &decision_record,
+                input.finished_at,
+            )?;
+            persist_surface_state(&transaction, &decision_record)?;
+            transaction.commit()?;
+            outputs.push(decision_record);
+            return Ok(outputs);
+        }
+        let pause_reason = match &input.stop_reason {
+            crate::runtime_surface::GoalContinuationStopReason::TerminalizingControl {
+                cause:
+                    crate::runtime_surface::TerminalizationCause::UserCancel
+                    | crate::runtime_surface::TerminalizationCause::GoalPause,
+            }
+            | crate::runtime_surface::GoalContinuationStopReason::QueuedUserInput { .. } => {
+                GoalPauseReason::User
+            }
+            crate::runtime_surface::GoalContinuationStopReason::TerminalizingControl {
+                cause:
+                    crate::runtime_surface::TerminalizationCause::HostShutdown
+                    | crate::runtime_surface::TerminalizationCause::ThreadClose,
+            }
+            | crate::runtime_surface::GoalContinuationStopReason::PendingInteraction { .. }
+            | crate::runtime_surface::GoalContinuationStopReason::RuntimeFailure { .. } => {
+                GoalPauseReason::Infrastructure
+            }
+            crate::runtime_surface::GoalContinuationStopReason::WorkflowOwned { .. } => {
+                GoalPauseReason::WaitingForWorkflow
+            }
+            crate::runtime_surface::GoalContinuationStopReason::BudgetLimited { .. } => {
+                GoalPauseReason::UsageLimit
+            }
+            crate::runtime_surface::GoalContinuationStopReason::GoalInactive { state } => {
+                match state {
+                    crate::runtime_surface::SurfaceGoalState::Paused { reason, .. } => match reason
+                    {
+                        crate::runtime_surface::SurfaceGoalPauseReason::User => {
+                            GoalPauseReason::User
+                        }
+                        crate::runtime_surface::SurfaceGoalPauseReason::Backoff => {
+                            GoalPauseReason::Backoff
+                        }
+                        crate::runtime_surface::SurfaceGoalPauseReason::Infrastructure => {
+                            GoalPauseReason::Infrastructure
+                        }
+                        crate::runtime_surface::SurfaceGoalPauseReason::WaitingForWorkflow => {
+                            GoalPauseReason::WaitingForWorkflow
+                        }
+                        crate::runtime_surface::SurfaceGoalPauseReason::Recovery => {
+                            GoalPauseReason::Recovery
+                        }
+                        crate::runtime_surface::SurfaceGoalPauseReason::UsageLimit => {
+                            GoalPauseReason::UsageLimit
+                        }
+                        crate::runtime_surface::SurfaceGoalPauseReason::NoProgress => {
+                            GoalPauseReason::NoProgress
+                        }
+                    },
+                    _ => GoalPauseReason::NoProgress,
+                }
+            }
+            crate::runtime_surface::GoalContinuationStopReason::PredecessorNotSuccessful {
+                terminal,
+                ..
+            } => match terminal {
+                crate::runtime_surface::OperationTerminal::Cancelled {
+                    reason:
+                        crate::runtime_surface::CancelReason::User
+                        | crate::runtime_surface::CancelReason::GoalPause,
+                } => GoalPauseReason::User,
+                crate::runtime_surface::OperationTerminal::Shutdown { .. } => {
+                    GoalPauseReason::Infrastructure
+                }
+                _ => GoalPauseReason::NoProgress,
+            },
+            crate::runtime_surface::GoalContinuationStopReason::PlanModeDisallowsContinuation
+            | crate::runtime_surface::GoalContinuationStopReason::VerificationPending => {
+                GoalPauseReason::NoProgress
+            }
+        };
+        let decision_state = match &input.stop_reason {
+            crate::runtime_surface::GoalContinuationStopReason::GoalInactive { state } => {
+                state.clone()
+            }
+            _ => crate::runtime_surface::SurfaceGoalState::Paused {
+                reason: match pause_reason {
+                    GoalPauseReason::User => crate::runtime_surface::SurfaceGoalPauseReason::User,
+                    GoalPauseReason::NoProgress => {
+                        crate::runtime_surface::SurfaceGoalPauseReason::NoProgress
+                    }
+                    GoalPauseReason::Backoff => {
+                        crate::runtime_surface::SurfaceGoalPauseReason::Backoff
+                    }
+                    GoalPauseReason::Infrastructure => {
+                        crate::runtime_surface::SurfaceGoalPauseReason::Infrastructure
+                    }
+                    GoalPauseReason::WaitingForWorkflow => {
+                        crate::runtime_surface::SurfaceGoalPauseReason::WaitingForWorkflow
+                    }
+                    GoalPauseReason::Recovery => {
+                        crate::runtime_surface::SurfaceGoalPauseReason::Recovery
+                    }
+                    GoalPauseReason::UsageLimit => {
+                        crate::runtime_surface::SurfaceGoalPauseReason::UsageLimit
+                    }
+                },
+                message: crate::runtime_surface::DisplayText::new(input.pause_message.trim()),
+            },
+        };
+        let next_state = core_goal_state_from_surface(&decision_state);
+        transaction.execute(
+            "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+            params![
+                state_json(&next_state)?,
+                input.finished_at,
+                input.expected_goal_id.as_str()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE goal_runs
+             SET status = 'paused', finished_at = ?1
+             WHERE goal_run_id = ?2 AND goal_id = ?3 AND finished_at IS NULL",
+            params![
+                input.finished_at,
+                current_run.goal_run_id.as_str(),
+                input.expected_goal_id.as_str()
+            ],
+        )?;
+        if previous_state != next_state {
+            insert_transition(
+                &transaction,
+                &input.expected_goal_id,
+                Some(input.identity.goal_outer_turn_id.as_str()),
+                &previous_state,
+                &next_state,
+                "surface_continuation_stopped",
+                input.finished_at,
+            )?;
+        }
+        let decision = crate::runtime_surface::GoalContinuationDecision::Stopped {
+            reason: input.stop_reason,
+            outer_turn_count: input.identity.outer_turn_count,
+            goal_state: decision_state,
+            terminal: input.terminal,
+        };
+        let decision_record = load_stored_goal(&transaction, session_id)?
+            .expect("stopped surface Goal remains readable")
+            .record;
+        let decision_revision = decision_previous_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let decision_mutation = GoalSurfaceMutation::ContinuationStopped {
+            previous_revision: decision_previous_revision,
+            predecessor: input.identity,
+            decision: Box::new(decision),
+        };
+        let retained_decision_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..decision_context.clone()
+        };
+        let decision_receipt = goal_surface_receipt(
+            &retained_decision_context,
+            session_id,
+            &decision_mutation,
+            state.goal_id,
+            decision_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(decision_record),
+        )?;
+        let decision_record = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation: decision_mutation,
+            receipt: decision_receipt,
+        };
+        persist_surface_mutation(
+            &transaction,
+            &decision_context,
+            &decision_record,
+            input.finished_at,
+        )?;
+        persist_surface_state(&transaction, &decision_record)?;
+        transaction.commit()?;
+        outputs.push(decision_record);
+        Ok(outputs)
+    }
+
+    pub(crate) fn pause_goal_for_surface(
+        &self,
+        input: PauseGoalForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        if input.session_id.trim().is_empty() || input.message.trim().is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "Goal surface pause input is invalid".to_string(),
+            ));
+        }
+        let session_id = input.session_id.trim();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || state.goal_id != input.expected_goal_id
+            || state.goal_revision != input.expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal surface pause fence is stale".to_string(),
+            ));
+        }
+        let current = load_stored_goal(&transaction, session_id)?
+            .ok_or_else(|| GoalStoreError::Invalid("goal disappeared before pause".to_string()))?;
+        let current_run = current.record.current_run.as_ref().ok_or_else(|| {
+            GoalStoreError::Invalid("Goal surface pause requires a current run".to_string())
+        })?;
+        let stored_operation_id: String = transaction.query_row(
+            "SELECT surface_operation_id FROM goal_runs
+             WHERE goal_run_id = ?1 AND goal_id = ?2 AND finished_at IS NULL",
+            params![
+                current_run.goal_run_id.as_str(),
+                input.expected_goal_id.as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        if stored_operation_id
+            != uuid::Uuid::from_bytes(*input.expected_operation_id.as_bytes()).to_string()
+            || matches!(current.record.state, GoalState::Complete { .. })
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal surface pause operation binding is stale".to_string(),
+            ));
+        }
+        let previous_state = current.record.state.clone();
+        let next_state = GoalState::Paused {
+            reason: GoalPauseReason::User,
+            message: input.message.trim().to_string(),
+        };
+        transaction.execute(
+            "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+            params![
+                state_json(&next_state)?,
+                input.paused_at,
+                input.expected_goal_id.as_str()
+            ],
+        )?;
+        if previous_state != next_state {
+            insert_transition(
+                &transaction,
+                &input.expected_goal_id,
+                current_run
+                    .outer_turn_id
+                    .as_ref()
+                    .map(GoalOuterTurnId::as_str),
+                &previous_state,
+                &next_state,
+                "surface_goal_paused",
+                input.paused_at,
+            )?;
+        }
+        let paused = load_stored_goal(&transaction, session_id)?
+            .expect("paused surface Goal remains readable")
+            .record;
+        let next_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let mutation = GoalSurfaceMutation::Paused {
+            previous_revision: state.goal_revision,
+            goal_run_id: current_run.goal_run_id.clone(),
+            operation_id: input.expected_operation_id,
+            outer_turn_id: current_run.outer_turn_id.clone(),
+            message: input.message.trim().to_string(),
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            next_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(paused),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, input.paused_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub(crate) fn recover_goal_run_for_surface(
+        &self,
+        input: RecoverGoalRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        let session_id = input.session_id.trim();
+        if session_id.is_empty() || input.recovery_message.trim().is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "Goal recovery requires a session and message".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || state.goal_id != input.expected_goal_id
+            || state.goal_revision != input.expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal surface fence is stale".to_string(),
+            ));
+        }
+        let stored = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before surface recovery".to_string())
+        })?;
+        let current_run = stored.record.current_run.as_ref().ok_or_else(|| {
+            GoalStoreError::Invalid("Goal recovery requires an open run".to_string())
+        })?;
+        let operation_json: String = transaction.query_row(
+            "SELECT surface_operation_json
+             FROM goal_runs
+             WHERE goal_run_id = ?1 AND finished_at IS NULL",
+            [current_run.goal_run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let operation: OperationRecord = serde_json::from_str(&operation_json)?;
+        validate_surface_goal_operation(
+            &operation,
+            &input.expected_goal_id,
+            &current_run.goal_run_id,
+            state.objective_revision,
+        )?;
+        match (&input.stale_identity, current_run.in_flight) {
+            (Some(identity), true)
+                if identity.goal_id.as_str() == input.expected_goal_id.as_str()
+                    && identity.goal_run_id.as_str() == current_run.goal_run_id.as_str()
+                    && identity.operation_fence.operation_id == operation.operation_id
+                    && identity.objective_revision.get() == state.objective_revision
+                    && current_run
+                        .outer_turn_id
+                        .as_ref()
+                        .is_some_and(|outer_turn_id| {
+                            outer_turn_id.as_str() == identity.goal_outer_turn_id.as_str()
+                        }) => {}
+            (None, false) if current_run.outer_turn_id.is_none() => {}
+            _ => {
+                return Err(GoalStoreError::Invalid(
+                    "Goal recovery identity does not match the durable open run".to_string(),
+                ));
+            }
+        }
+        let stale_goal_run_id = current_run.goal_run_id.clone();
+        let stale_origin = current_run.origin;
+        let previous_state = stored.record.state;
+        let next_state = GoalState::Paused {
+            reason: GoalPauseReason::Recovery,
+            message: input.recovery_message.trim().to_string(),
+        };
+        transaction.execute(
+            "UPDATE goal_runs
+             SET status = 'recovered', in_flight = 0, finished_at = ?1
+             WHERE goal_run_id = ?2 AND finished_at IS NULL",
+            params![input.recovered_at, stale_goal_run_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+            params![
+                state_json(&next_state)?,
+                input.recovered_at,
+                input.expected_goal_id.as_str()
+            ],
+        )?;
+        insert_transition(
+            &transaction,
+            &input.expected_goal_id,
+            None,
+            &previous_state,
+            &next_state,
+            "surface_recovered",
+            input.recovered_at,
+        )?;
+        let record = load_stored_goal(&transaction, session_id)?
+            .expect("surface-recovered Goal remains readable")
+            .record;
+        let goal_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let mutation = GoalSurfaceMutation::Recovered {
+            previous_revision: state.goal_revision,
+            stale_goal_run_id,
+            operation: Box::new(operation),
+            origin: stale_origin,
+            stale_identity: input.stale_identity,
+            stale_run_settled: false,
+            recovery_message: input.recovery_message.trim().to_string(),
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            goal_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(record),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, input.recovered_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub(crate) fn replace_goal_continuation_with_recovery_for_surface(
+        &self,
+        input: ReplaceGoalContinuationForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        if input.recovery_message.trim().is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "Goal continuation recovery requires a message".to_string(),
+            ));
+        }
+        let (predecessor, admitted_successor) = match &input.interrupted.mutation {
+            GoalSurfaceMutation::ContinuationStopped { predecessor, .. } => (predecessor, None),
+            GoalSurfaceMutation::ContinuationAdmitted {
+                predecessor,
+                decision,
+                ..
+            } => {
+                let crate::runtime_surface::GoalContinuationDecision::Admitted {
+                    successor, ..
+                } = decision.as_ref()
+                else {
+                    return Err(GoalStoreError::Invalid(
+                        "admitted Goal continuation carries a stopped decision".to_string(),
+                    ));
+                };
+                (predecessor, Some(successor))
+            }
+            _ => {
+                return Err(GoalStoreError::Invalid(
+                    "Goal continuation recovery requires an interrupted decision".to_string(),
+                ));
+            }
+        };
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let stored_interrupted = transaction
+            .query_row(
+                "SELECT session_id, store_commit_id, command_digest, receipt_digest, payload_json
+                 FROM goal_surface_outbox
+                 WHERE store_commit_id = ?1 AND acknowledged = 0",
+                [&input.interrupted.receipt.store_commit_id],
+                |row| {
+                    Ok(StoredSurfaceMutation {
+                        session_id: row.get(0)?,
+                        store_commit_id: row.get(1)?,
+                        command_digest: row.get(2)?,
+                        receipt_digest: row.get(3)?,
+                        payload_json: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                GoalStoreError::Invalid(
+                    "interrupted Goal continuation is no longer pending".to_string(),
+                )
+            })?;
+        let (_, canonical_interrupted) = validate_stored_surface_mutation(&stored_interrupted)?;
+        if canonical_interrupted != input.interrupted {
+            return Err(GoalStoreError::Invalid(
+                "interrupted Goal continuation receipt changed".to_string(),
+            ));
+        }
+        let session_id = input.interrupted.session_id.as_str();
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        let last_receipt_digest: Vec<u8> = transaction.query_row(
+            "SELECT last_receipt_digest FROM goal_surface_state WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if state.goal_revision != input.interrupted.receipt.goal_revision
+            || exact_digest(&last_receipt_digest, "receipt digest")?
+                != input.interrupted.receipt.receipt_digest
+            || state.goal_id != input.interrupted.receipt.goal_id
+            || input.surface_previous_revision >= input.interrupted.receipt.goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "interrupted Goal continuation is not the current durable state".to_string(),
+            ));
+        }
+        let stored = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before continuation recovery".to_string())
+        })?;
+        match (stored.record.current_run.as_ref(), admitted_successor) {
+            (None, None) => {}
+            (Some(run), Some(successor))
+                if run.goal_run_id.as_str() == successor.goal_run_id.as_str()
+                    && run.in_flight
+                    && run.outer_turn_id.as_ref().is_some_and(|outer_turn_id| {
+                        outer_turn_id.as_str() == successor.goal_outer_turn_id.as_str()
+                    }) =>
+            {
+                transaction.execute(
+                    "UPDATE goal_runs
+                     SET status = 'recovered', current_outer_turn_id = NULL,
+                         in_flight = 0, finished_at = ?1
+                     WHERE goal_run_id = ?2 AND goal_id = ?3
+                       AND finished_at IS NULL AND in_flight = 1",
+                    params![
+                        input.recovered_at,
+                        predecessor.goal_run_id.as_str(),
+                        input.interrupted.receipt.goal_id.as_str()
+                    ],
+                )?;
+                transaction.execute(
+                    "UPDATE goal_turns
+                     SET status = 'recovered', finished_at = ?1
+                     WHERE outer_turn_id = ?2 AND goal_run_id = ?3
+                       AND status = 'in_flight'",
+                    params![
+                        input.recovered_at,
+                        successor.goal_outer_turn_id.as_str(),
+                        predecessor.goal_run_id.as_str()
+                    ],
+                )?;
+            }
+            (Some(_), None) => {
+                return Err(GoalStoreError::Invalid(
+                    "interrupted stopped Goal continuation retained an open run".to_string(),
+                ));
+            }
+            _ => {
+                return Err(GoalStoreError::Invalid(
+                    "interrupted admitted Goal continuation run identity changed".to_string(),
+                ));
+            }
+        }
+        let (operation_json, origin): (String, String) = transaction.query_row(
+            "SELECT surface_operation_json, origin
+             FROM goal_runs
+             WHERE goal_run_id = ?1 AND goal_id = ?2",
+            params![
+                predecessor.goal_run_id.as_str(),
+                input.interrupted.receipt.goal_id.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let operation: OperationRecord = serde_json::from_str(&operation_json)?;
+        if operation.operation_id != predecessor.operation_fence.operation_id {
+            return Err(GoalStoreError::Invalid(
+                "interrupted Goal continuation operation identity changed".to_string(),
+            ));
+        }
+        let origin = parse_origin(&origin)?;
+        let previous_state = stored.record.state;
+        let next_state = GoalState::Paused {
+            reason: GoalPauseReason::Recovery,
+            message: input.recovery_message.trim().to_string(),
+        };
+        transaction.execute(
+            "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+            params![
+                state_json(&next_state)?,
+                input.recovered_at,
+                input.interrupted.receipt.goal_id.as_str()
+            ],
+        )?;
+        if previous_state != next_state {
+            insert_transition(
+                &transaction,
+                &input.interrupted.receipt.goal_id,
+                Some(predecessor.goal_outer_turn_id.as_str()),
+                &previous_state,
+                &next_state,
+                "surface_continuation_recovered",
+                input.recovered_at,
+            )?;
+        }
+        let record = load_stored_goal(&transaction, session_id)?
+            .expect("recovered Goal remains readable")
+            .record;
+        let mutation = GoalSurfaceMutation::Recovered {
+            previous_revision: input.surface_previous_revision,
+            stale_goal_run_id: GoalRunId::parse(predecessor.goal_run_id.as_str().to_string())
+                .map_err(GoalStoreError::Invalid)?,
+            operation: Box::new(operation),
+            origin,
+            stale_identity: Some(predecessor.clone()),
+            stale_run_settled: input.stale_run_settled,
+            recovery_message: input.recovery_message.trim().to_string(),
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            input
+                .surface_previous_revision
+                .checked_add(1)
+                .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(record),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        supersede_goal_continuation_outbox(
+            &transaction,
+            session_id,
+            predecessor.as_ref(),
+            &input.interrupted.receipt.store_commit_id,
+        )?;
+        persist_surface_mutation(&transaction, &context, &output, input.recovered_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
     pub fn pending_surface_mutations(
         &self,
         session_id: &str,
@@ -787,7 +2653,7 @@ impl GoalStore {
             .collect()
     }
 
-    pub fn acknowledge_surface_mutation(
+    pub(crate) fn acknowledge_surface_mutation(
         &self,
         store_commit_id: &str,
         receipt_digest: &[u8; 32],
@@ -1303,13 +3169,186 @@ impl GoalStore {
     }
 
     pub fn record_intent(&self, record: GoalIntentRecord) -> Result<GoalUpdateAck, GoalStoreError> {
+        self.record_intent_with_owner(record, false)
+    }
+
+    pub(crate) fn record_intent_for_surface(
+        &self,
+        record: GoalIntentRecord,
+        identity: Box<SurfaceGoalGenerationIdentity>,
+        contexts: [GoalSurfaceMutationContext; 2],
+    ) -> Result<(GoalUpdateAck, Vec<GoalSurfaceMutationRecord>), GoalStoreError> {
+        let [requested_context, acknowledged_context] = contexts;
+        validate_surface_mutation_context(&requested_context)?;
+        validate_surface_mutation_context(&acknowledged_context)?;
+        if requested_context.store_commit_id == acknowledged_context.store_commit_id
+            || requested_context.goal_owner_epoch != acknowledged_context.goal_owner_epoch
+        {
+            return Err(GoalStoreError::Invalid(
+                "Goal intent surface contexts are invalid".to_string(),
+            ));
+        }
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_outer_turn_not_surface_owned(
-            &transaction,
-            &record.outer_turn_id,
-            "record an intent for",
+        validate_surface_owner_epoch(&transaction, requested_context.goal_owner_epoch)?;
+        ensure_outer_turn_surface_owned(&transaction, &record.outer_turn_id)?;
+        if identity.goal_outer_turn_id.as_str() != record.outer_turn_id.as_str() {
+            return Err(GoalStoreError::Invalid(
+                "Goal intent identity does not match its outer turn".to_string(),
+            ));
+        }
+        let replay_requested = replay_surface_mutation(&transaction, &requested_context)?;
+        let replay_acknowledged = replay_surface_mutation(&transaction, &acknowledged_context)?;
+        match (replay_requested, replay_acknowledged) {
+            (Some(requested), Some(acknowledged)) => {
+                let ack = match &acknowledged.mutation {
+                    GoalSurfaceMutation::IntentAcknowledged { ack, .. } => ack.clone(),
+                    _ => {
+                        return Err(GoalStoreError::Invalid(
+                            "Goal intent replay has the wrong mutation kind".to_string(),
+                        ));
+                    }
+                };
+                transaction.commit()?;
+                return Ok((ack, vec![requested, acknowledged]));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(GoalStoreError::Invalid(
+                    "Goal intent surface replay is incomplete".to_string(),
+                ));
+            }
+        }
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO goal_intents (
+                intent_id, outer_turn_id, requested_state, payload_json,
+                ack_code, ack_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.intent.intent_id.as_str(),
+                record.outer_turn_id.as_str(),
+                requested_state_name(record.intent.requested_state),
+                serde_json::to_string(&record.intent)?,
+                ack_code(&record.ack),
+                serde_json::to_string(&record.ack)?,
+                record.created_at,
+            ],
         )?;
+        let ack: GoalUpdateAck = if inserted == 1 {
+            record.ack.clone()
+        } else {
+            let ack_json: String = transaction.query_row(
+                "SELECT ack_json FROM goal_intents WHERE intent_id = ?1",
+                [record.intent.intent_id.as_str()],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str(&ack_json)?
+        };
+        let session_id: String = transaction.query_row(
+            "SELECT goals.session_id
+             FROM goal_turns AS turns
+             JOIN goal_runs AS runs ON runs.goal_run_id = turns.goal_run_id
+             JOIN goals ON goals.goal_id = runs.goal_id
+             WHERE turns.outer_turn_id = ?1
+               AND turns.status = 'in_flight'
+               AND runs.in_flight = 1",
+            [record.outer_turn_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let state = load_goal_surface_state(&transaction, &session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("Goal intent has no surface state".to_string())
+        })?;
+        let goal = load_stored_goal(&transaction, &session_id)?
+            .ok_or_else(|| GoalStoreError::Invalid("Goal intent lost its Goal".to_string()))?
+            .record;
+        let requested_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let requested_mutation = GoalSurfaceMutation::IntentRequested {
+            previous_revision: state.goal_revision,
+            identity: identity.clone(),
+            intent: record.intent.clone(),
+        };
+        let requested_receipt = goal_surface_receipt(
+            &GoalSurfaceMutationContext {
+                goal_owner_epoch: state.goal_owner_epoch,
+                ..requested_context.clone()
+            },
+            &session_id,
+            &requested_mutation,
+            state.goal_id.clone(),
+            requested_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(goal.clone()),
+        )?;
+        let requested = GoalSurfaceMutationRecord {
+            session_id: session_id.clone(),
+            mutation: requested_mutation,
+            receipt: requested_receipt,
+        };
+        persist_surface_mutation(
+            &transaction,
+            &requested_context,
+            &requested,
+            record.created_at,
+        )?;
+        persist_surface_state(&transaction, &requested)?;
+        let acknowledged_revision = requested_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let acknowledged_mutation = GoalSurfaceMutation::IntentAcknowledged {
+            previous_revision: requested_revision,
+            identity,
+            intent: record.intent,
+            ack: ack.clone(),
+        };
+        let acknowledged_receipt = goal_surface_receipt(
+            &GoalSurfaceMutationContext {
+                goal_owner_epoch: state.goal_owner_epoch,
+                ..acknowledged_context.clone()
+            },
+            &session_id,
+            &acknowledged_mutation,
+            state.goal_id,
+            acknowledged_revision,
+            state.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(goal),
+        )?;
+        let acknowledged = GoalSurfaceMutationRecord {
+            session_id,
+            mutation: acknowledged_mutation,
+            receipt: acknowledged_receipt,
+        };
+        persist_surface_mutation(
+            &transaction,
+            &acknowledged_context,
+            &acknowledged,
+            record.created_at,
+        )?;
+        persist_surface_state(&transaction, &acknowledged)?;
+        transaction.commit()?;
+        Ok((ack, vec![requested, acknowledged]))
+    }
+
+    fn record_intent_with_owner(
+        &self,
+        record: GoalIntentRecord,
+        surface_owned: bool,
+    ) -> Result<GoalUpdateAck, GoalStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if surface_owned {
+            ensure_outer_turn_surface_owned(&transaction, &record.outer_turn_id)?;
+        } else {
+            ensure_outer_turn_not_surface_owned(
+                &transaction,
+                &record.outer_turn_id,
+                "record an intent for",
+            )?;
+        }
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO goal_intents (
                 intent_id, outer_turn_id, requested_state, payload_json,
@@ -1707,7 +3746,9 @@ impl GoalStore {
                 continuation_count INTEGER NOT NULL,
                 in_flight INTEGER NOT NULL,
                 started_at INTEGER NOT NULL,
-                finished_at INTEGER
+                finished_at INTEGER,
+                surface_operation_id TEXT,
+                surface_operation_json TEXT
              );
              CREATE TABLE IF NOT EXISTS goal_turns (
                 outer_turn_id TEXT PRIMARY KEY,
@@ -1777,6 +3818,42 @@ impl GoalStore {
                 created_at INTEGER NOT NULL
              );",
         )?;
+        let has_surface_operation_id = {
+            let mut statement = transaction.prepare("PRAGMA table_info(goal_runs)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in columns {
+                if column? == "surface_operation_id" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_surface_operation_id {
+            transaction.execute(
+                "ALTER TABLE goal_runs ADD COLUMN surface_operation_id TEXT",
+                [],
+            )?;
+        }
+        let has_surface_operation_json = {
+            let mut statement = transaction.prepare("PRAGMA table_info(goal_runs)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in columns {
+                if column? == "surface_operation_json" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_surface_operation_json {
+            transaction.execute(
+                "ALTER TABLE goal_runs ADD COLUMN surface_operation_json TEXT",
+                [],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO goal_meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1888,30 +3965,15 @@ impl GoalStore {
     pub(crate) fn recover_in_flight_runs(&self) -> Result<Vec<GoalRecoveryRecord>, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let surface_owned_in_flight: bool = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM goal_runs AS runs
-                JOIN goals ON goals.goal_id = runs.goal_id
-                JOIN goal_surface_state AS surface
-                  ON surface.session_id = goals.session_id
-                WHERE runs.in_flight = 1
-            )",
-            [],
-            |row| row.get(0),
-        )?;
-        if surface_owned_in_flight {
-            return Err(GoalStoreError::Invalid(
-                "surface-owned Goal recovery requires the typed recovery path".to_string(),
-            ));
-        }
         let recoveries = {
             let mut statement = transaction.prepare(
                 "SELECT runs.goal_run_id, runs.goal_id, runs.current_outer_turn_id,
                         goals.session_id
                  FROM goal_runs AS runs
                  JOIN goals ON goals.goal_id = runs.goal_id
-                 WHERE runs.in_flight = 1",
+                 LEFT JOIN goal_surface_state AS surface
+                   ON surface.session_id = goals.session_id
+                 WHERE runs.in_flight = 1 AND surface.session_id IS NULL",
             )?;
             statement
                 .query_map([], |row| {
@@ -2198,6 +4260,78 @@ fn closed_run_status(state: &GoalState) -> Option<&'static str> {
     }
 }
 
+fn core_goal_state_from_surface(state: &crate::runtime_surface::SurfaceGoalState) -> GoalState {
+    use crate::runtime_surface::{
+        SurfaceBlockerKind, SurfaceEvidenceKind, SurfaceGoalPauseReason, SurfaceGoalState,
+    };
+    let convert_evidence = |items: &[crate::runtime_surface::SurfaceEvidenceItem]| {
+        items
+            .iter()
+            .map(|item| orca_core::goal_runtime::EvidenceItem {
+                kind: match item.kind {
+                    SurfaceEvidenceKind::Test => orca_core::goal_runtime::EvidenceKind::Test,
+                    SurfaceEvidenceKind::File => orca_core::goal_runtime::EvidenceKind::File,
+                    SurfaceEvidenceKind::Command => orca_core::goal_runtime::EvidenceKind::Command,
+                    SurfaceEvidenceKind::Observation => {
+                        orca_core::goal_runtime::EvidenceKind::Observation
+                    }
+                    SurfaceEvidenceKind::External => {
+                        orca_core::goal_runtime::EvidenceKind::External
+                    }
+                },
+                summary: item.summary.as_str().to_string(),
+                target: item
+                    .target
+                    .as_ref()
+                    .map(|target| target.as_str().to_string()),
+            })
+            .collect::<Vec<_>>()
+    };
+    match state {
+        SurfaceGoalState::Active => GoalState::Active,
+        SurfaceGoalState::Paused { reason, message } => GoalState::Paused {
+            reason: match reason {
+                SurfaceGoalPauseReason::User => GoalPauseReason::User,
+                SurfaceGoalPauseReason::NoProgress => GoalPauseReason::NoProgress,
+                SurfaceGoalPauseReason::Backoff => GoalPauseReason::Backoff,
+                SurfaceGoalPauseReason::Infrastructure => GoalPauseReason::Infrastructure,
+                SurfaceGoalPauseReason::WaitingForWorkflow => GoalPauseReason::WaitingForWorkflow,
+                SurfaceGoalPauseReason::Recovery => GoalPauseReason::Recovery,
+                SurfaceGoalPauseReason::UsageLimit => GoalPauseReason::UsageLimit,
+            },
+            message: message.as_str().to_string(),
+        },
+        SurfaceGoalState::Blocked { blocker } => GoalState::Blocked {
+            blocker: orca_core::goal_runtime::BlockerSummary {
+                kind: match blocker.kind {
+                    SurfaceBlockerKind::UserDecision => {
+                        orca_core::goal_runtime::BlockerKind::UserDecision
+                    }
+                    SurfaceBlockerKind::MissingAuthority => {
+                        orca_core::goal_runtime::BlockerKind::MissingAuthority
+                    }
+                    SurfaceBlockerKind::ExternalState => {
+                        orca_core::goal_runtime::BlockerKind::ExternalState
+                    }
+                    SurfaceBlockerKind::EnvironmentContradiction => {
+                        orca_core::goal_runtime::BlockerKind::EnvironmentContradiction
+                    }
+                    SurfaceBlockerKind::UnverifiableRequirement => {
+                        orca_core::goal_runtime::BlockerKind::UnverifiableRequirement
+                    }
+                },
+                summary: blocker.summary.as_str().to_string(),
+                fingerprint: blocker.fingerprint.as_str().to_string(),
+                evidence: convert_evidence(&blocker.evidence),
+            },
+        },
+        SurfaceGoalState::BudgetLimited => GoalState::BudgetLimited,
+        SurfaceGoalState::Complete { evidence } => GoalState::Complete {
+            evidence: convert_evidence(evidence),
+        },
+    }
+}
+
 fn validate_surface_mutation_context(
     context: &GoalSurfaceMutationContext,
 ) -> Result<(), GoalStoreError> {
@@ -2209,6 +4343,35 @@ fn validate_surface_mutation_context(
     if context.goal_owner_epoch == 0 || context.goal_owner_epoch > i64::MAX as u64 {
         return Err(GoalStoreError::Invalid(
             "goal surface owner epoch must fit a positive SQLite integer".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_surface_goal_operation(
+    operation: &OperationRecord,
+    goal_id: &GoalId,
+    goal_run_id: &GoalRunId,
+    objective_revision: u32,
+) -> Result<(), GoalStoreError> {
+    let OperationKind::GoalRun {
+        goal_id: operation_goal_id,
+        goal_run_id: operation_goal_run_id,
+        initial_objective_revision,
+    } = &operation.intent.kind
+    else {
+        return Err(GoalStoreError::Invalid(
+            "Goal surface run requires a GoalRun operation".to_string(),
+        ));
+    };
+    if operation.phase != OperationPhase::Requested
+        || operation.reservation.operation_id != operation.operation_id
+        || operation_goal_id.as_str() != goal_id.as_str()
+        || operation_goal_run_id.as_str() != goal_run_id.as_str()
+        || initial_objective_revision.get() != objective_revision
+    {
+        return Err(GoalStoreError::Invalid(
+            "Goal surface operation binding is inconsistent".to_string(),
         ));
     }
     Ok(())
@@ -2396,6 +4559,35 @@ fn validate_stored_surface_mutation(
                 && goal.goal_id == receipt.goal_id
                 && goal.objective_revision == receipt.objective_revision
         }
+        (
+            GoalSurfaceMutation::CreatedWithRun {
+                goal_run_id,
+                operation,
+                origin,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            receipt.goal_revision == 1
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && validate_surface_goal_operation(
+                    operation,
+                    &receipt.goal_id,
+                    goal_run_id,
+                    receipt.objective_revision,
+                )
+                .is_ok()
+                && matches!(
+                    goal.current_run,
+                    Some(ref run)
+                        if &run.goal_run_id == goal_run_id
+                            && run.origin == *origin
+                            && !run.in_flight
+                            && run.continuation_count == 0
+                            && run.outer_turn_id.is_none()
+                )
+        }
         (GoalSurfaceMutation::Edited { previous_revision }, GoalSurfaceRowState::Present(goal)) => {
             previous_revision.checked_add(1) == Some(receipt.goal_revision)
                 && goal.session_id == mutation.session_id
@@ -2411,6 +4603,280 @@ fn validate_stored_surface_mutation(
         ) => {
             previous_revision.checked_add(1) == Some(*tombstone_revision)
                 && receipt.goal_revision == *tombstone_revision
+        }
+        (
+            GoalSurfaceMutation::RunStarted {
+                previous_revision,
+                goal_run_id,
+                operation,
+                origin,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && validate_surface_goal_operation(
+                    operation,
+                    &receipt.goal_id,
+                    goal_run_id,
+                    receipt.objective_revision,
+                )
+                .is_ok()
+                && matches!(
+                    goal.current_run,
+                    Some(ref run)
+                        if &run.goal_run_id == goal_run_id
+                            && run.origin == *origin
+                            && !run.in_flight
+                            && run.continuation_count == 0
+                            && run.outer_turn_id.is_none()
+                )
+        }
+        (
+            GoalSurfaceMutation::OuterTurnStarted {
+                previous_revision,
+                identity,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && identity.goal_id.as_str() == receipt.goal_id.as_str()
+                && identity.objective_revision.get() == receipt.objective_revision
+                && identity.operation_fence.generation_id.get() == 0
+                && identity.predecessor_fence.is_none()
+                && identity.outer_turn_count == 1
+                && identity.attempt == GenerationAttempt::Initial
+                && matches!(
+                    goal.current_run,
+                    Some(ref run)
+                        if run.goal_run_id.as_str() == identity.goal_run_id.as_str()
+                            && run.in_flight
+                            && run.continuation_count == 1
+                            && run.outer_turn_id.as_ref().is_some_and(
+                                |outer_turn_id| outer_turn_id.as_str()
+                                    == identity.goal_outer_turn_id.as_str()
+                            )
+                )
+        }
+        (
+            GoalSurfaceMutation::OuterTurnFinished {
+                previous_revision,
+                identity,
+                usage,
+                ..
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && identity.goal_id.as_str() == receipt.goal_id.as_str()
+                && identity.objective_revision.get() == receipt.objective_revision
+                && usage.charged_input_tokens >= 0
+                && usage.output_tokens >= 0
+                && usage.cache_tokens >= 0
+                && usage.verifier_tokens >= 0
+                && usage.cost_micros >= 0
+                && usage.elapsed_seconds >= 0
+                && matches!(
+                    goal.current_run,
+                    Some(ref run)
+                        if run.goal_run_id.as_str() == identity.goal_run_id.as_str()
+                            && !run.in_flight
+                            && run.outer_turn_id.is_none()
+                            && run.continuation_count == identity.outer_turn_count
+                )
+        }
+        (
+            GoalSurfaceMutation::IntentRequested {
+                previous_revision,
+                identity,
+                ..
+            }
+            | GoalSurfaceMutation::IntentAcknowledged {
+                previous_revision,
+                identity,
+                ..
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && identity.goal_id.as_str() == receipt.goal_id.as_str()
+                && identity.objective_revision.get() == receipt.objective_revision
+                && matches!(
+                    goal.current_run,
+                    Some(ref run)
+                        if run.goal_run_id.as_str() == identity.goal_run_id.as_str()
+                            && run.in_flight
+                            && run.continuation_count == identity.outer_turn_count
+                            && run.outer_turn_id.as_ref().is_some_and(
+                                |outer_turn_id| outer_turn_id.as_str()
+                                    == identity.goal_outer_turn_id.as_str()
+                            )
+                )
+        }
+        (
+            GoalSurfaceMutation::VerificationCompleted {
+                previous_revision,
+                identity,
+                ..
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && identity.goal_id.as_str() == receipt.goal_id.as_str()
+                && identity.objective_revision.get() == receipt.objective_revision
+                && matches!(
+                    goal.current_run,
+                    Some(ref run)
+                        if run.goal_run_id.as_str() == identity.goal_run_id.as_str()
+                            && !run.in_flight
+                            && run.outer_turn_id.is_none()
+                            && run.continuation_count == identity.outer_turn_count
+                )
+        }
+        (
+            GoalSurfaceMutation::Paused {
+                previous_revision,
+                goal_run_id,
+                operation_id: _,
+                outer_turn_id,
+                message,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && matches!(
+                    (&goal.state, &goal.current_run),
+                    (
+                        GoalState::Paused {
+                            reason: GoalPauseReason::User,
+                            message: stored_message,
+                        },
+                        Some(run),
+                    ) if stored_message == message
+                        && &run.goal_run_id == goal_run_id
+                        && run.outer_turn_id.as_ref() == outer_turn_id.as_ref()
+                )
+        }
+        (
+            GoalSurfaceMutation::ContinuationStopped {
+                previous_revision,
+                predecessor,
+                decision,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && goal.current_run.is_none()
+                && predecessor.goal_id.as_str() == receipt.goal_id.as_str()
+                && matches!(
+                    decision.as_ref(),
+                    crate::runtime_surface::GoalContinuationDecision::Stopped {
+                        outer_turn_count,
+                        goal_state,
+                        ..
+                    } if *outer_turn_count == predecessor.outer_turn_count
+                        && !matches!(
+                            goal_state,
+                            crate::runtime_surface::SurfaceGoalState::Active
+                        )
+                        && goal.state == core_goal_state_from_surface(goal_state)
+                )
+        }
+        (
+            GoalSurfaceMutation::ContinuationAdmitted {
+                previous_revision,
+                predecessor,
+                decision,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && predecessor.goal_id.as_str() == receipt.goal_id.as_str()
+                && matches!(
+                    (decision.as_ref(), goal.current_run.as_ref()),
+                    (
+                        crate::runtime_surface::GoalContinuationDecision::Admitted {
+                            successor,
+                            ..
+                        },
+                        Some(run),
+                    ) if successor.goal_id == predecessor.goal_id
+                        && successor.goal_run_id == predecessor.goal_run_id
+                        && successor.operation_fence.operation_id
+                            == predecessor.operation_fence.operation_id
+                        && successor.predecessor_fence.as_ref()
+                            == Some(&predecessor.operation_fence)
+                        && predecessor.outer_turn_count.checked_add(1)
+                            == Some(successor.outer_turn_count)
+                        && run.goal_run_id.as_str() == successor.goal_run_id.as_str()
+                        && run.in_flight
+                        && run.outer_turn_id.as_ref().is_some_and(|outer_turn_id| {
+                            outer_turn_id.as_str() == successor.goal_outer_turn_id.as_str()
+                        })
+                        && run.continuation_count == successor.outer_turn_count
+                )
+        }
+        (
+            GoalSurfaceMutation::Recovered {
+                previous_revision,
+                stale_goal_run_id,
+                operation,
+                origin,
+                stale_identity,
+                stale_run_settled: _,
+                recovery_message,
+            },
+            GoalSurfaceRowState::Present(goal),
+        ) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+                && goal.current_run.is_none()
+                && *origin != GoalTurnOrigin::Continuation
+                && matches!(
+                    &goal.state,
+                    GoalState::Paused {
+                        reason: GoalPauseReason::Recovery,
+                        message,
+                    } if message == recovery_message
+                )
+                && validate_surface_goal_operation(
+                    operation,
+                    &receipt.goal_id,
+                    stale_goal_run_id,
+                    receipt.objective_revision,
+                )
+                .is_ok()
+                && stale_identity.as_ref().is_none_or(|identity| {
+                    identity.goal_id.as_str() == receipt.goal_id.as_str()
+                        && identity.goal_run_id.as_str() == stale_goal_run_id.as_str()
+                        && identity.operation_fence.operation_id == operation.operation_id
+                        && identity.objective_revision.get() == receipt.objective_revision
+                })
         }
         _ => false,
     };
@@ -2447,6 +4913,73 @@ fn persist_surface_mutation(
             created_at,
         ],
     )?;
+    Ok(())
+}
+
+fn supersede_goal_continuation_outbox(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    predecessor: &SurfaceGoalGenerationIdentity,
+    interrupted_store_commit_id: &str,
+) -> Result<(), GoalStoreError> {
+    let pending = {
+        let mut statement = transaction.prepare(
+            "SELECT session_id, store_commit_id, command_digest, receipt_digest, payload_json
+             FROM goal_surface_outbox
+             WHERE session_id = ?1 AND acknowledged = 0
+             ORDER BY sequence ASC",
+        )?;
+        statement
+            .query_map([session_id], |row| {
+                Ok(StoredSurfaceMutation {
+                    session_id: row.get(0)?,
+                    store_commit_id: row.get(1)?,
+                    command_digest: row.get(2)?,
+                    receipt_digest: row.get(3)?,
+                    payload_json: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut superseded_interrupted = false;
+    for stored in pending {
+        let (_, mutation) = validate_stored_surface_mutation(&stored)?;
+        let same_predecessor = match &mutation.mutation {
+            GoalSurfaceMutation::OuterTurnFinished { identity, .. }
+            | GoalSurfaceMutation::VerificationCompleted { identity, .. } => {
+                identity.as_ref() == predecessor
+            }
+            GoalSurfaceMutation::ContinuationStopped {
+                predecessor: candidate,
+                ..
+            }
+            | GoalSurfaceMutation::ContinuationAdmitted {
+                predecessor: candidate,
+                ..
+            } => candidate.as_ref() == predecessor,
+            _ => false,
+        };
+        if !same_predecessor {
+            continue;
+        }
+        superseded_interrupted |= stored.store_commit_id == interrupted_store_commit_id;
+        let changed = transaction.execute(
+            "UPDATE goal_surface_outbox
+             SET acknowledged = 1
+             WHERE store_commit_id = ?1 AND receipt_digest = ?2 AND acknowledged = 0",
+            params![stored.store_commit_id, stored.receipt_digest],
+        )?;
+        if changed != 1 {
+            return Err(GoalStoreError::Invalid(
+                "Goal continuation supersession lost an exact outbox row".to_string(),
+            ));
+        }
+    }
+    if !superseded_interrupted {
+        return Err(GoalStoreError::Invalid(
+            "Goal continuation recovery did not supersede its interrupted receipt".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -2649,6 +5182,31 @@ fn ensure_outer_turn_not_surface_owned(
     Ok(())
 }
 
+fn ensure_outer_turn_surface_owned(
+    transaction: &Transaction<'_>,
+    outer_turn_id: &GoalOuterTurnId,
+) -> Result<(), GoalStoreError> {
+    let surface_owned: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM goal_turns AS turns
+            JOIN goal_runs AS runs ON runs.goal_run_id = turns.goal_run_id
+            JOIN goals ON goals.goal_id = runs.goal_id
+            JOIN goal_surface_state AS surface
+              ON surface.session_id = goals.session_id
+            WHERE turns.outer_turn_id = ?1
+        )",
+        [outer_turn_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if !surface_owned {
+        return Err(GoalStoreError::Invalid(
+            "surface Goal intent does not name a surface-owned outer turn".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn insert_transition(
     transaction: &Transaction<'_>,
     goal_id: &GoalId,
@@ -2805,6 +5363,79 @@ mod tests {
         }
     }
 
+    fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
+        let mut bytes = [seed; 16];
+        bytes[6] = 0x70 | (seed & 0x0f);
+        bytes[8] = 0x80 | (seed & 0x3f);
+        bytes
+    }
+
+    fn requested_goal_operation(
+        goal_id: &GoalId,
+        goal_run_id: &GoalRunId,
+        operation_id: crate::runtime_surface::SurfaceOperationId,
+        objective_revision: u32,
+    ) -> crate::runtime_surface::OperationRecord {
+        use crate::runtime_surface as surface;
+
+        let settings_revision = surface::SettingsRevision::try_new(1).unwrap();
+        let policy_epoch = surface::PolicyEpoch::try_new(1).unwrap();
+        let replayability = surface::Replayability::NonReplayable {
+            reason: surface::NonReplayableReason::Missing,
+            live_capsule: surface::LiveOperationCapsule::Available {
+                incarnation: surface::SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(42))
+                    .unwrap(),
+            },
+        };
+        surface::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: surface::SurfaceRequestId::try_from_bytes(uuid_v7_bytes(43)).unwrap(),
+            intent: surface::OperationIntent {
+                origin: surface::OperationOrigin::TuiUser,
+                kind: surface::OperationKind::GoalRun {
+                    goal_id: surface::SurfaceGoalId::try_new(goal_id.to_string()).unwrap(),
+                    goal_run_id: surface::SurfaceGoalRunId::try_new(goal_run_id.to_string())
+                        .unwrap(),
+                    initial_objective_revision: surface::GoalObjectiveRevision::new(
+                        objective_revision,
+                    ),
+                },
+                initial_replayability: replayability,
+                busy_disposition: surface::BusyDisposition::Queue,
+                interrupt_settlement: surface::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision,
+                policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: surface::Sha256Digest::new([44; 32]),
+                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                    settings_revision,
+                    policy_epoch,
+                },
+            },
+            phase: surface::OperationPhase::Requested,
+            reservation: surface::ReservationLease::new(
+                surface::SurfaceAdmissionLeaseId::try_from_bytes(uuid_v7_bytes(45)).unwrap(),
+                operation_id,
+                surface::SequenceNumber::new(1),
+                surface::HostIncarnation::try_from_bytes(uuid_v7_bytes(46)).unwrap(),
+                surface::MonotonicInstant {
+                    clock_id: surface::HostMonotonicClockId::try_from_bytes(uuid_v7_bytes(47))
+                        .unwrap(),
+                    tick: surface::MonotonicTick::new(0),
+                },
+            ),
+            ready_for_admission: false,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        }
+    }
+
     #[test]
     fn sqlite_store_creates_and_projects_goal_state() {
         let dir = tempdir().unwrap();
@@ -2818,7 +5449,7 @@ mod tests {
         assert_eq!(record.state, GoalState::Active);
         assert_eq!(projection.status, ThreadGoalStatus::Active);
         assert_eq!(projection.tokens_used, 0);
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -2918,6 +5549,136 @@ mod tests {
                 )
                 .unwrap(),
             first
+        );
+    }
+
+    #[test]
+    fn surface_run_preparation_atomically_binds_the_exact_operation_and_replays_after_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("goals.sqlite3");
+        let store = GoalStore::open(&path).unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let created = store
+            .create_goal_for_surface(
+                CreateGoalInput {
+                    session_id: "surface-run-preparation".to_string(),
+                    objective: "run through one runtime-owned operation".to_string(),
+                    token_budget: Some(20_000),
+                    now: 100,
+                },
+                surface_context(
+                    "019f8b4d-7d73-7b52-8f44-2cfeac060110",
+                    [40; 32],
+                    owner_epoch,
+                ),
+            )
+            .unwrap();
+        assert!(
+            store
+                .acknowledge_surface_mutation(
+                    &created.receipt.store_commit_id,
+                    &created.receipt.receipt_digest,
+                    owner_epoch,
+                )
+                .unwrap()
+        );
+        let mut operation_bytes = [41; 16];
+        operation_bytes[6] = 0x79;
+        operation_bytes[8] = 0xa9;
+        let operation_id =
+            crate::runtime_surface::SurfaceOperationId::try_from_bytes(operation_bytes).unwrap();
+        let goal_run_id = GoalRunId::new();
+        let operation = requested_goal_operation(
+            &created.receipt.goal_id,
+            &goal_run_id,
+            operation_id.clone(),
+            created.receipt.objective_revision,
+        );
+        let context = surface_context(
+            "019f8b4d-7d73-7b52-8f44-2cfeac060111",
+            [41; 32],
+            owner_epoch,
+        );
+
+        let prepared = store
+            .prepare_goal_run_for_surface(
+                PrepareGoalRunForSurfaceInput {
+                    session_id: "surface-run-preparation".to_string(),
+                    expected_goal_id: created.receipt.goal_id.clone(),
+                    expected_goal_revision: created.receipt.goal_revision,
+                    goal_run_id: goal_run_id.clone(),
+                    operation: Box::new(operation.clone()),
+                    origin: GoalTurnOrigin::User,
+                    started_at: 101,
+                },
+                context.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(prepared.receipt.goal_revision, 2);
+        assert!(matches!(
+            prepared.mutation,
+            GoalSurfaceMutation::RunStarted {
+                goal_run_id: ref recorded_run_id,
+                operation: ref recorded_operation,
+                origin: GoalTurnOrigin::User,
+                ..
+            } if recorded_run_id == &goal_run_id
+                && recorded_operation.operation_id == operation_id
+        ));
+        assert!(matches!(
+            prepared.receipt.row_state,
+            GoalSurfaceRowState::Present(ref goal)
+                if matches!(
+                    goal.current_run,
+                    Some(ref run)
+                        if run.goal_run_id == goal_run_id
+                            && run.origin == GoalTurnOrigin::User
+                            && !run.in_flight
+                            && run.continuation_count == 0
+                )
+        ));
+        let stored_operation_id: String = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT surface_operation_id FROM goal_runs WHERE goal_run_id = ?1",
+                [goal_run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_operation_id,
+            uuid::Uuid::from_bytes(*operation_id.as_bytes())
+                .hyphenated()
+                .to_string()
+        );
+        drop(store);
+
+        let reopened = GoalStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .prepare_goal_run_for_surface(
+                    PrepareGoalRunForSurfaceInput {
+                        session_id: "surface-run-preparation".to_string(),
+                        expected_goal_id: created.receipt.goal_id,
+                        expected_goal_revision: created.receipt.goal_revision,
+                        goal_run_id,
+                        operation: Box::new(operation),
+                        origin: GoalTurnOrigin::User,
+                        started_at: 101,
+                    },
+                    context,
+                )
+                .unwrap(),
+            prepared,
+            "the run preparation commit identity must replay exactly after restart"
+        );
+        assert_eq!(
+            reopened
+                .pending_surface_mutations("surface-run-preparation")
+                .unwrap(),
+            vec![prepared]
         );
     }
 

@@ -2472,6 +2472,8 @@ pub struct JsonlSurfaceCommitLedger {
 #[cfg(test)]
 static TERMINAL_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
+static GOAL_CONTINUATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
 static INTERACTION_ROUTE_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static INTERACTION_REQUEST_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -2498,7 +2500,7 @@ static PENDING_SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usi
 #[cfg(test)]
 static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
-static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
 static MANUAL_COMPACTION_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
@@ -2676,6 +2678,15 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_goal_continuation_append_failure_once(path: impl Into<PathBuf>) {
+        GOAL_CONTINUATION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into());
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_interaction_route_append_failure_once(path: impl Into<PathBuf>) {
         INTERACTION_ROUTE_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -2743,11 +2754,25 @@ impl JsonlSurfaceCommitLedger {
 
     #[cfg(test)]
     pub(crate) fn inject_admission_repair_append_failure_once(path: impl Into<PathBuf>) {
+        Self::inject_admission_repair_append_failures(path, 1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_admission_repair_append_failures(path: impl Into<PathBuf>, count: usize) {
         ADMISSION_REPAIR_APPEND_FAILURES
-            .get_or_init(|| Mutex::new(HashSet::new()))
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(path.into());
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_admission_repair_append_failures(path: impl Into<PathBuf>) {
+        ADMISSION_REPAIR_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path.into());
     }
 
     #[cfg(test)]
@@ -2772,6 +2797,25 @@ impl JsonlSurfaceCommitLedger {
         });
         is_terminal
             && TERMINAL_APPEND_FAILURES
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.path)
+    }
+
+    #[cfg(test)]
+    fn take_goal_continuation_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let is_goal_continuation = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                    patch: super::GoalPatch::ContinuationDecided { .. },
+                    ..
+                })
+            )
+        });
+        is_goal_continuation
+            && GOAL_CONTINUATION_APPEND_FAILURES
                 .get_or_init(|| Mutex::new(HashSet::new()))
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2842,12 +2886,22 @@ impl JsonlSurfaceCommitLedger {
                 SurfaceEvent::Operation(OperationPatch::GenerationStopped { .. })
             )
         });
-        repairs_admission
-            && ADMISSION_REPAIR_APPEND_FAILURES
-                .get_or_init(|| Mutex::new(HashSet::new()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&self.path)
+        if !repairs_admission {
+            return false;
+        }
+        let mut failures = ADMISSION_REPAIR_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
     }
 
     #[cfg(test)]
@@ -2861,7 +2915,10 @@ impl JsonlSurfaceCommitLedger {
                             intent: super::PendingControlIntent::Terminalize { .. },
                             ..
                         }
-                )
+                ) | SurfaceEvent::Goal(super::GoalPatchEnvelope {
+                    patch: super::GoalPatch::OuterTurnFinished { .. },
+                    ..
+                })
             )
         });
         if is_terminal
@@ -3076,6 +3133,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
     ) -> Result<DurableBatchReceipt, SurfaceLedgerError> {
         #[cfg(test)]
         if self.take_terminal_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_goal_continuation_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
         #[cfg(test)]

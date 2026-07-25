@@ -11,17 +11,50 @@ use orca_core::goal_runtime::{
     GoalTurnStatus, GoalUpdateAck, GoalUpdateIntent, GoalUsage, GoalVerificationResult,
 };
 use orca_core::goal_types::ThreadGoal;
+use sha2::{Digest, Sha256};
 
 use crate::goal_store::{
-    BeginGoalRunInput, BeginOuterTurnInput, CreateGoalInput, FinishOuterTurnInput,
-    GoalIntentRecord, GoalRecoveryRecord, GoalStore, GoalStoreError, GoalSurfaceMutationContext,
-    GoalSurfaceMutationRecord, GoalSurfaceTokenBudgetUpdate, GoalUsageEvent,
+    BeginGoalOuterTurnForSurfaceInput, BeginGoalRunInput, BeginOuterTurnInput,
+    CreateGoalAndPrepareRunForSurfaceInput, CreateGoalInput, EditGoalAndPrepareRunForSurfaceInput,
+    FinishGoalOuterTurnForSurfaceInput, FinishOuterTurnInput, GoalIntentRecord, GoalRecoveryRecord,
+    GoalStore, GoalStoreError, GoalSurfaceMutationContext, GoalSurfaceMutationRecord,
+    GoalSurfaceRowState, GoalSurfaceTokenBudgetUpdate, GoalUsageEvent, PauseGoalForSurfaceInput,
+    PrepareGoalRunForSurfaceInput, RecoverGoalRunForSurfaceInput,
+    ReplaceGoalContinuationForSurfaceInput,
 };
 use crate::goal_tracker::{GoalTracker, GoalTurnResult, SAME_GAP_STREAK_LIMIT};
 
 const ACTOR_MAILBOX_CAPACITY: usize = 32;
 static GOAL_RUNTIME_LEASES: OnceLock<Mutex<HashMap<PathBuf, Weak<GoalRuntimeLeaseInner>>>> =
     OnceLock::new();
+#[cfg(test)]
+static SURFACE_OUTER_TURN_FINISH_FAILURES: OnceLock<Mutex<HashMap<String, usize>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn inject_surface_outer_turn_finish_failure_once(session_id: &str) {
+    SURFACE_OUTER_TURN_FINISH_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(session_id.to_string(), 1);
+}
+
+#[cfg(test)]
+fn take_surface_outer_turn_finish_failure(session_id: &str) -> bool {
+    let mut failures = SURFACE_OUTER_TURN_FINISH_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(remaining) = failures.get_mut(session_id) else {
+        return false;
+    };
+    *remaining -= 1;
+    if *remaining == 0 {
+        failures.remove(session_id);
+    }
+    true
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalTurnContext {
@@ -102,6 +135,7 @@ pub struct GoalActor {
     active: HashMap<String, ActiveGoalTurn>,
     trackers: HashMap<String, GoalTracker>,
     pending_verification: HashMap<String, PendingVerification>,
+    pending_surface_decisions: HashMap<String, PendingSurfaceDecision>,
     pending_recoveries: HashMap<String, Vec<GoalRecoveryRecord>>,
     surface_owner_epoch: Option<u64>,
     _runtime_lease: Option<GoalRuntimeLease>,
@@ -189,6 +223,9 @@ struct ActiveGoalTurn {
     context: GoalTurnContext,
     tracker: GoalTracker,
     pending_pause: Option<PendingGoalPause>,
+    surface_result: Option<GoalTurnResult>,
+    surface_owned: bool,
+    surface_identity: Option<Box<crate::runtime_surface::SurfaceGoalGenerationIdentity>>,
 }
 
 struct PendingGoalPause {
@@ -199,6 +236,294 @@ struct PendingGoalPause {
 struct PendingVerification {
     context: GoalTurnContext,
     tracker: GoalTracker,
+}
+
+struct PendingSurfaceDecision {
+    identity: Box<crate::runtime_surface::SurfaceGoalGenerationIdentity>,
+    status: GoalTurnStatus,
+    usage: GoalUsage,
+    verification: Option<GoalVerificationResult>,
+    action: GoalNextAction,
+    tracker: GoalTracker,
+}
+
+fn surface_evidence_matches(
+    core: &orca_core::goal_runtime::EvidenceItem,
+    surface: &crate::runtime_surface::SurfaceEvidenceItem,
+) -> bool {
+    let kind_matches = matches!(
+        (core.kind, surface.kind),
+        (
+            orca_core::goal_runtime::EvidenceKind::Test,
+            crate::runtime_surface::SurfaceEvidenceKind::Test
+        ) | (
+            orca_core::goal_runtime::EvidenceKind::File,
+            crate::runtime_surface::SurfaceEvidenceKind::File
+        ) | (
+            orca_core::goal_runtime::EvidenceKind::Command,
+            crate::runtime_surface::SurfaceEvidenceKind::Command
+        ) | (
+            orca_core::goal_runtime::EvidenceKind::Observation,
+            crate::runtime_surface::SurfaceEvidenceKind::Observation
+        ) | (
+            orca_core::goal_runtime::EvidenceKind::External,
+            crate::runtime_surface::SurfaceEvidenceKind::External
+        )
+    );
+    kind_matches
+        && core.summary == surface.summary.as_str()
+        && core.target.as_deref() == surface.target.as_ref().map(|target| target.as_str())
+}
+
+fn surface_evidence_list_matches(
+    core: &[orca_core::goal_runtime::EvidenceItem],
+    surface: &[crate::runtime_surface::SurfaceEvidenceItem],
+) -> bool {
+    core.len() == surface.len()
+        && core
+            .iter()
+            .zip(surface)
+            .all(|(core, surface)| surface_evidence_matches(core, surface))
+}
+
+fn surface_blocker_matches(
+    core: &orca_core::goal_runtime::BlockerSummary,
+    surface: &crate::runtime_surface::SurfaceBlocker,
+) -> bool {
+    let kind_matches = matches!(
+        (core.kind, surface.kind),
+        (
+            orca_core::goal_runtime::BlockerKind::UserDecision,
+            crate::runtime_surface::SurfaceBlockerKind::UserDecision
+        ) | (
+            orca_core::goal_runtime::BlockerKind::MissingAuthority,
+            crate::runtime_surface::SurfaceBlockerKind::MissingAuthority
+        ) | (
+            orca_core::goal_runtime::BlockerKind::ExternalState,
+            crate::runtime_surface::SurfaceBlockerKind::ExternalState
+        ) | (
+            orca_core::goal_runtime::BlockerKind::EnvironmentContradiction,
+            crate::runtime_surface::SurfaceBlockerKind::EnvironmentContradiction
+        ) | (
+            orca_core::goal_runtime::BlockerKind::UnverifiableRequirement,
+            crate::runtime_surface::SurfaceBlockerKind::UnverifiableRequirement
+        )
+    );
+    kind_matches
+        && core.summary == surface.summary.as_str()
+        && core.fingerprint == surface.fingerprint.as_str()
+        && surface_evidence_list_matches(&core.evidence, &surface.evidence)
+}
+
+fn surface_verification_matches(
+    core: &GoalVerificationResult,
+    surface: &crate::runtime_surface::SurfaceGoalVerification,
+) -> bool {
+    match (core, surface) {
+        (
+            GoalVerificationResult::Achieved { evidence: core },
+            crate::runtime_surface::SurfaceGoalVerification::Achieved { evidence: surface },
+        ) => surface_evidence_list_matches(core, surface),
+        (
+            GoalVerificationResult::NotAchieved { gaps: core },
+            crate::runtime_surface::SurfaceGoalVerification::NotAchieved { gaps: surface },
+        ) => {
+            core.len() == surface.len()
+                && core.iter().zip(surface).all(|(core, surface)| {
+                    core.summary == surface.summary.as_str()
+                        && core.fingerprint == surface.fingerprint.as_str()
+                        && core.model_fixable == surface.model_fixable
+                })
+        }
+        (
+            GoalVerificationResult::Blocked { blocker: core },
+            crate::runtime_surface::SurfaceGoalVerification::Blocked { blocker: surface },
+        ) => surface_blocker_matches(core, surface),
+        (
+            GoalVerificationResult::Indeterminate { message: core },
+            crate::runtime_surface::SurfaceGoalVerification::Indeterminate { message: surface },
+        ) => core == surface.as_str(),
+        _ => false,
+    }
+}
+
+fn surface_finish_matches_pending(
+    input: &FinishGoalOuterTurnForSurfaceInput,
+    pending: &PendingSurfaceDecision,
+) -> bool {
+    let status_matches = matches!(
+        (pending.status, input.status),
+        (
+            GoalTurnStatus::Success,
+            crate::runtime_surface::GoalOuterTurnStatus::Success
+        ) | (
+            GoalTurnStatus::Failed,
+            crate::runtime_surface::GoalOuterTurnStatus::Failed
+        ) | (
+            GoalTurnStatus::Cancelled,
+            crate::runtime_surface::GoalOuterTurnStatus::Cancelled
+        ) | (
+            GoalTurnStatus::ApprovalRequired,
+            crate::runtime_surface::GoalOuterTurnStatus::ApprovalRequired
+        ) | (
+            GoalTurnStatus::BudgetExhausted,
+            crate::runtime_surface::GoalOuterTurnStatus::BudgetExhausted
+        )
+    );
+    let usage_matches = pending.usage.charged_input_tokens == input.usage.charged_input_tokens
+        && pending.usage.output_tokens == input.usage.output_tokens
+        && pending.usage.cache_tokens == input.usage.cache_tokens
+        && pending.usage.verifier_tokens == input.usage.verifier_tokens
+        && pending.usage.cost_micros == input.usage.cost_micros
+        && pending.usage.elapsed_seconds == input.usage.elapsed_seconds;
+    let action_matches = match (&pending.action, input.next_action) {
+        (
+            GoalNextAction::Continue { reason },
+            crate::runtime_surface::GoalOuterTurnNextAction::Continue,
+        ) => input.continuation.as_ref().is_some_and(|continuation| {
+            matches!(
+                (reason, continuation.reason),
+                (
+                    orca_core::goal_runtime::GoalContinuationReason::Progress,
+                    crate::runtime_surface::GoalContinuationAdmitReason::Progress
+                ) | (
+                    orca_core::goal_runtime::GoalContinuationReason::GapFeedback,
+                    crate::runtime_surface::GoalContinuationAdmitReason::GapFeedback
+                )
+            )
+        }),
+        (
+            GoalNextAction::Verify { .. },
+            crate::runtime_surface::GoalOuterTurnNextAction::Verify,
+        ) => input.continuation.is_none(),
+        (
+            GoalNextAction::Pause { reason, message },
+            crate::runtime_surface::GoalOuterTurnNextAction::Pause,
+        ) => {
+            let reason_matches = matches!(
+                (reason, &input.stop_reason),
+                (
+                    orca_core::goal_runtime::GoalPauseReason::User,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Paused {
+                            reason: crate::runtime_surface::SurfaceGoalPauseReason::User,
+                            ..
+                        },
+                    }
+                ) | (
+                    orca_core::goal_runtime::GoalPauseReason::NoProgress,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Paused {
+                            reason: crate::runtime_surface::SurfaceGoalPauseReason::NoProgress,
+                            ..
+                        },
+                    }
+                ) | (
+                    orca_core::goal_runtime::GoalPauseReason::Backoff,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Paused {
+                            reason: crate::runtime_surface::SurfaceGoalPauseReason::Backoff,
+                            ..
+                        },
+                    }
+                ) | (
+                    orca_core::goal_runtime::GoalPauseReason::Infrastructure,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Paused {
+                            reason: crate::runtime_surface::SurfaceGoalPauseReason::Infrastructure,
+                            ..
+                        },
+                    }
+                ) | (
+                    orca_core::goal_runtime::GoalPauseReason::WaitingForWorkflow,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Paused {
+                            reason:
+                                crate::runtime_surface::SurfaceGoalPauseReason::WaitingForWorkflow,
+                            ..
+                        },
+                    }
+                ) | (
+                    orca_core::goal_runtime::GoalPauseReason::Recovery,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Paused {
+                            reason: crate::runtime_surface::SurfaceGoalPauseReason::Recovery,
+                            ..
+                        },
+                    }
+                ) | (
+                    orca_core::goal_runtime::GoalPauseReason::UsageLimit,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Paused {
+                            reason: crate::runtime_surface::SurfaceGoalPauseReason::UsageLimit,
+                            ..
+                        },
+                    }
+                )
+            );
+            let state_message_matches = matches!(
+                &input.stop_reason,
+                crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                    state: crate::runtime_surface::SurfaceGoalState::Paused {
+                        message: surface,
+                        ..
+                    },
+                } if surface.as_str() == message
+            );
+            input.continuation.is_none()
+                && input.pause_message == *message
+                && reason_matches
+                && state_message_matches
+        }
+        (
+            GoalNextAction::Blocked { blocker },
+            crate::runtime_surface::GoalOuterTurnNextAction::Blocked,
+        ) => {
+            input.continuation.is_none()
+                && matches!(
+                    &input.stop_reason,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Blocked {
+                            blocker: surface,
+                        },
+                    } if surface_blocker_matches(blocker, surface)
+                )
+        }
+        (
+            GoalNextAction::BudgetLimited,
+            crate::runtime_surface::GoalOuterTurnNextAction::BudgetLimited,
+        ) => {
+            input.continuation.is_none()
+                && matches!(
+                    input.stop_reason,
+                    crate::runtime_surface::GoalContinuationStopReason::BudgetLimited { .. }
+                        | crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                            state: crate::runtime_surface::SurfaceGoalState::BudgetLimited,
+                        }
+                )
+        }
+        (
+            GoalNextAction::Complete { evidence },
+            crate::runtime_surface::GoalOuterTurnNextAction::Complete,
+        ) => {
+            input.continuation.is_none()
+                && matches!(
+                    &input.stop_reason,
+                    crate::runtime_surface::GoalContinuationStopReason::GoalInactive {
+                        state: crate::runtime_surface::SurfaceGoalState::Complete {
+                            evidence: surface,
+                        },
+                    } if surface_evidence_list_matches(evidence, surface)
+                )
+        }
+        _ => false,
+    };
+    let verification_matches = match (&pending.verification, &input.verification) {
+        (None, None) => true,
+        (Some(core), Some(surface)) => surface_verification_matches(core, surface),
+        _ => false,
+    };
+    status_matches && usage_matches && action_matches && verification_matches
 }
 
 enum GoalActorCommand {
@@ -232,6 +557,11 @@ enum GoalActorCommand {
         context: GoalSurfaceMutationContext,
         reply: Reply,
     },
+    CreateAndPrepareRunForSurface {
+        input: CreateGoalAndPrepareRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
     AdoptForSurface {
         session_id: String,
         context: GoalSurfaceMutationContext,
@@ -251,6 +581,63 @@ enum GoalActorCommand {
         session_id: String,
         expected_goal_id: GoalId,
         expected_goal_revision: u32,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    PrepareRunForSurface {
+        input: PrepareGoalRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    EditAndPrepareRunForSurface {
+        input: EditGoalAndPrepareRunForSurfaceInput,
+        contexts: [GoalSurfaceMutationContext; 2],
+        reply: Reply,
+    },
+    BeginOuterTurnForSurface {
+        input: BeginGoalOuterTurnForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    RestoreOuterTurnForSurface {
+        session_id: String,
+        identity: Box<crate::runtime_surface::SurfaceGoalGenerationIdentity>,
+        reply: Reply,
+    },
+    ReleaseOuterTurnForSurface {
+        session_id: String,
+        identity: Box<crate::runtime_surface::SurfaceGoalGenerationIdentity>,
+        reply: Reply,
+    },
+    RecordTurnResultForSurface {
+        session_id: String,
+        result: GoalTurnResult,
+        reply: Reply,
+    },
+    PauseForSurface {
+        input: PauseGoalForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    FinishOuterTurnForSurface {
+        input: FinishGoalOuterTurnForSurfaceInput,
+        contexts: Vec<GoalSurfaceMutationContext>,
+        reply: Reply,
+    },
+    DecideOuterTurnForSurface {
+        session_id: String,
+        status: GoalTurnStatus,
+        usage: GoalUsage,
+        verification: Option<GoalVerificationResult>,
+        reply: Reply,
+    },
+    RecoverRunForSurface {
+        input: RecoverGoalRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    ReplaceContinuationWithRecoveryForSurface {
+        input: ReplaceGoalContinuationForSurfaceInput,
         context: GoalSurfaceMutationContext,
         reply: Reply,
     },
@@ -389,6 +776,7 @@ impl GoalRuntimeHandle {
             active: HashMap::new(),
             trackers: HashMap::new(),
             pending_verification: HashMap::new(),
+            pending_surface_decisions: HashMap::new(),
             pending_recoveries,
             surface_owner_epoch,
             _runtime_lease: runtime_lease,
@@ -513,7 +901,7 @@ impl GoalRuntimeHandle {
             })
     }
 
-    pub fn create_for_surface(
+    pub(crate) fn create_for_surface(
         &self,
         input: CreateGoalInput,
         context: GoalSurfaceMutationContext,
@@ -531,7 +919,25 @@ impl GoalRuntimeHandle {
         })
     }
 
-    pub fn adopt_for_surface(
+    pub(crate) fn create_and_prepare_run_for_surface(
+        &self,
+        input: CreateGoalAndPrepareRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::CreateAndPrepareRunForSurface {
+            input,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface create-and-run reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn adopt_for_surface(
         &self,
         session_id: &str,
         context: GoalSurfaceMutationContext,
@@ -550,7 +956,7 @@ impl GoalRuntimeHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn edit_for_surface(
+    pub(crate) fn edit_for_surface(
         &self,
         session_id: &str,
         expected_goal_id: GoalId,
@@ -578,7 +984,7 @@ impl GoalRuntimeHandle {
         })
     }
 
-    pub fn clear_for_surface(
+    pub(crate) fn clear_for_surface(
         &self,
         session_id: &str,
         expected_goal_id: GoalId,
@@ -600,6 +1006,223 @@ impl GoalRuntimeHandle {
         })
     }
 
+    pub(crate) fn prepare_run_for_surface(
+        &self,
+        input: PrepareGoalRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::PrepareRunForSurface {
+            input,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface run-preparation reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn edit_and_prepare_run_for_surface(
+        &self,
+        input: EditGoalAndPrepareRunForSurfaceInput,
+        contexts: [GoalSurfaceMutationContext; 2],
+    ) -> Result<Vec<GoalSurfaceMutationRecord>, GoalActorError> {
+        self.request(|reply| GoalActorCommand::EditAndPrepareRunForSurface {
+            input,
+            contexts,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutations(mutations) => Ok(mutations),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface edit-and-run reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn begin_outer_turn_for_surface(
+        &self,
+        input: BeginGoalOuterTurnForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::BeginOuterTurnForSurface {
+            input,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface outer-turn reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn restore_outer_turn_for_surface(
+        &self,
+        session_id: &str,
+        identity: crate::runtime_surface::SurfaceGoalGenerationIdentity,
+    ) -> Result<GoalTurnContext, GoalActorError> {
+        self.request(|reply| GoalActorCommand::RestoreOuterTurnForSurface {
+            session_id: session_id.to_string(),
+            identity: Box::new(identity),
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::Turn(context) => Ok(context),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface restoration reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn release_outer_turn_for_surface(
+        &self,
+        session_id: &str,
+        identity: crate::runtime_surface::SurfaceGoalGenerationIdentity,
+    ) -> Result<bool, GoalActorError> {
+        self.request(|reply| GoalActorCommand::ReleaseOuterTurnForSurface {
+            session_id: session_id.to_string(),
+            identity: Box::new(identity),
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::Bool(released) => Ok(released),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface release reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn finish_outer_turn_for_surface(
+        &self,
+        input: FinishGoalOuterTurnForSurfaceInput,
+        contexts: Vec<GoalSurfaceMutationContext>,
+    ) -> Result<Vec<GoalSurfaceMutationRecord>, GoalActorError> {
+        self.request(|reply| GoalActorCommand::FinishOuterTurnForSurface {
+            input,
+            contexts,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutations(mutations) => Ok(mutations),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface outer-turn settlement reply".to_string(),
+            )),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_turn_result_for_surface(
+        &self,
+        session_id: &str,
+        status: GoalTurnStatus,
+        end_reason: crate::lifecycle::TurnEndReason,
+        usage: GoalUsage,
+        tool_count: u32,
+        model_response_count: u32,
+        gap_fingerprint: Option<String>,
+    ) -> Result<(), GoalActorError> {
+        let result = build_turn_result(
+            status,
+            end_reason,
+            tool_count,
+            model_response_count,
+            gap_fingerprint,
+        );
+        self.request(|reply| GoalActorCommand::RecordTurnResultForSurface {
+            session_id: session_id.to_string(),
+            result: GoalTurnResult { usage, ..result },
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::Bool(true) => Ok(()),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface turn-result reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn preview_outer_turn_for_surface(
+        &self,
+        session_id: &str,
+        status: GoalTurnStatus,
+        usage: GoalUsage,
+        verification: Option<GoalVerificationResult>,
+    ) -> Result<GoalNextAction, GoalActorError> {
+        self.request(|reply| GoalActorCommand::DecideOuterTurnForSurface {
+            session_id: session_id.to_string(),
+            status,
+            usage,
+            verification,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::Action(action) => Ok(action),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface decision preview reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn pause_for_surface(
+        &self,
+        input: PauseGoalForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::PauseForSurface {
+            input,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface pause reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn recover_run_for_surface(
+        &self,
+        input: RecoverGoalRunForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::RecoverRunForSurface {
+            input,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface recovery reply".to_string(),
+            )),
+        })
+    }
+
+    pub(crate) fn replace_continuation_with_recovery_for_surface(
+        &self,
+        input: ReplaceGoalContinuationForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(
+            |reply| GoalActorCommand::ReplaceContinuationWithRecoveryForSurface {
+                input,
+                context,
+                reply,
+            },
+        )
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong continuation-recovery reply".to_string(),
+            )),
+        })
+    }
+
     pub fn pending_surface_mutations(
         &self,
         session_id: &str,
@@ -616,7 +1239,7 @@ impl GoalRuntimeHandle {
         })
     }
 
-    pub fn acknowledge_surface_mutation(
+    pub(crate) fn acknowledge_surface_mutation(
         &self,
         store_commit_id: &str,
         receipt_digest: &[u8; 32],
@@ -869,11 +1492,15 @@ impl GoalActor {
         &self,
         mut context: GoalSurfaceMutationContext,
     ) -> Result<GoalSurfaceMutationContext, GoalActorError> {
-        context.goal_owner_epoch = self.surface_owner_epoch.ok_or_else(|| {
+        let owner_epoch = self.surface_owner_epoch.ok_or_else(|| {
             GoalActorError::Invalid(
                 "Goal surface mutation requires the durable runtime owner lease".to_string(),
             )
         })?;
+        // Thread surface epochs and the process-wide Goal lease epoch are distinct
+        // counters. Surface write entry points are crate-private; the actor lease is
+        // the capability and stamps its own durable epoch at the storage boundary.
+        context.goal_owner_epoch = owner_epoch;
         Ok(context)
     }
 
@@ -943,6 +1570,20 @@ impl GoalActor {
                     })
                     .map(GoalActorReply::SurfaceMutation),
             ),
+            GoalActorCommand::CreateAndPrepareRunForSurface {
+                input,
+                context,
+                reply,
+            } => (
+                reply,
+                self.authorize_surface_context(context)
+                    .and_then(|context| {
+                        self.store
+                            .create_goal_and_prepare_run_for_surface(input, context)
+                            .map_err(Into::into)
+                    })
+                    .map(GoalActorReply::SurfaceMutation),
+            ),
             GoalActorCommand::AdoptForSurface {
                 session_id,
                 context,
@@ -990,6 +1631,258 @@ impl GoalActor {
                 )
                 .map(GoalActorReply::SurfaceMutation),
             ),
+            GoalActorCommand::PrepareRunForSurface {
+                input,
+                context,
+                reply,
+            } => (
+                reply,
+                self.authorize_surface_context(context)
+                    .and_then(|context| {
+                        self.store
+                            .prepare_goal_run_for_surface(input, context)
+                            .map_err(Into::into)
+                    })
+                    .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::EditAndPrepareRunForSurface {
+                input,
+                mut contexts,
+                reply,
+            } => {
+                let result = (|| {
+                    contexts[0] = self.authorize_surface_context(contexts[0].clone())?;
+                    contexts[1] = self.authorize_surface_context(contexts[1].clone())?;
+                    self.store
+                        .edit_goal_and_prepare_run_for_surface(input, contexts)
+                        .map_err(Into::into)
+                })()
+                .map(GoalActorReply::SurfaceMutations);
+                (reply, result)
+            }
+            GoalActorCommand::BeginOuterTurnForSurface {
+                input,
+                context,
+                reply,
+            } => (
+                reply,
+                self.authorize_surface_context(context)
+                    .and_then(|context| self.begin_outer_turn_for_surface(input, context))
+                    .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::RestoreOuterTurnForSurface {
+                session_id,
+                identity,
+                reply,
+            } => (
+                reply,
+                self.restore_outer_turn_for_surface(&session_id, *identity)
+                    .map(GoalActorReply::Turn),
+            ),
+            GoalActorCommand::ReleaseOuterTurnForSurface {
+                session_id,
+                identity,
+                reply,
+            } => (
+                reply,
+                Ok(GoalActorReply::Bool(
+                    self.release_outer_turn_for_surface(&session_id, &identity),
+                )),
+            ),
+            GoalActorCommand::FinishOuterTurnForSurface {
+                input,
+                mut contexts,
+                reply,
+            } => {
+                let session_id = input.session_id.clone();
+                let identity = input.identity.clone();
+                let successor = input
+                    .continuation
+                    .as_ref()
+                    .map(|continuation| continuation.successor.clone());
+                let pending_decision = self.pending_surface_decisions.remove(&session_id);
+                let result = (|| {
+                    if input.status == crate::runtime_surface::GoalOuterTurnStatus::Success
+                        && pending_decision.is_none()
+                    {
+                        return Err(GoalActorError::Invalid(
+                            "surface Goal outer-turn finish lacks its previewed decision"
+                                .to_string(),
+                        ));
+                    }
+                    if pending_decision.as_ref().is_some_and(|decision| {
+                        decision.identity.as_ref() != identity.as_ref()
+                            || !surface_finish_matches_pending(&input, decision)
+                    }) {
+                        return Err(GoalActorError::Invalid(
+                            "surface Goal outer-turn finish differs from its previewed decision"
+                                .to_string(),
+                        ));
+                    }
+                    for context in &mut contexts {
+                        *context = self.authorize_surface_context(context.clone())?;
+                    }
+                    #[cfg(test)]
+                    if take_surface_outer_turn_finish_failure(&session_id) {
+                        return Err(GoalActorError::Store(
+                            "injected surface Goal outer-turn finish failure".to_string(),
+                        ));
+                    }
+                    self.store
+                        .finish_goal_outer_turn_for_surface(input, contexts)
+                        .map_err(Into::into)
+                })();
+                if result.is_ok() {
+                    if let Some(successor) = successor {
+                        let record = result
+                            .as_ref()
+                            .expect("checked Goal continuation result")
+                            .last()
+                            .and_then(|mutation| match &mutation.receipt.row_state {
+                                GoalSurfaceRowState::Present(record) => Some(record),
+                                GoalSurfaceRowState::Removed => None,
+                            })
+                            .expect("admitted Goal continuation retains its Goal");
+                        let outer_turn_id = GoalOuterTurnId::parse(
+                            successor.goal_outer_turn_id.as_str().to_string(),
+                        )
+                        .expect("validated Goal successor outer-turn id");
+                        let goal_run_id = orca_core::goal_runtime::GoalRunId::parse(
+                            successor.goal_run_id.as_str().to_string(),
+                        )
+                        .expect("validated Goal successor run id");
+                        let mut tracker = pending_decision
+                            .as_ref()
+                            .expect("successful Goal finish has its previewed decision")
+                            .tracker
+                            .clone();
+                        tracker
+                            .bind_persisted_outer_turn(
+                                outer_turn_id.clone(),
+                                GoalTurnOrigin::Continuation,
+                            )
+                            .expect("durable Goal successor binds to its tracker");
+                        self.active.insert(
+                            session_id.clone(),
+                            ActiveGoalTurn {
+                                context: GoalTurnContext {
+                                    session_id: session_id.clone(),
+                                    goal_id: record.goal_id.clone(),
+                                    goal_run_id,
+                                    outer_turn_id,
+                                    origin: GoalTurnOrigin::Continuation,
+                                    run_started: false,
+                                },
+                                tracker: tracker.clone(),
+                                pending_pause: None,
+                                surface_result: None,
+                                surface_owned: true,
+                                surface_identity: Some(successor),
+                            },
+                        );
+                        self.trackers.insert(session_id.clone(), tracker);
+                    } else {
+                        self.active.remove(&session_id);
+                        self.trackers.remove(&session_id);
+                    }
+                    self.pending_verification.remove(&session_id);
+                }
+                let result = result.map(GoalActorReply::SurfaceMutations);
+                (reply, result)
+            }
+            GoalActorCommand::DecideOuterTurnForSurface {
+                session_id,
+                status,
+                usage,
+                verification,
+                reply,
+            } => (
+                reply,
+                self.preview_outer_turn_for_surface(&session_id, status, usage, verification)
+                    .map(GoalActorReply::Action),
+            ),
+            GoalActorCommand::RecordTurnResultForSurface {
+                session_id,
+                result,
+                reply,
+            } => {
+                let recorded = self
+                    .active
+                    .get_mut(&session_id)
+                    .ok_or_else(|| GoalActorError::Invalid("no active Goal outer turn".to_string()))
+                    .and_then(|active| {
+                        if !active.surface_owned {
+                            return Err(GoalActorError::Invalid(
+                                "Goal outer turn is not owned by the typed surface".to_string(),
+                            ));
+                        }
+                        match active.surface_result.as_ref() {
+                            Some(existing) if existing != &result => Err(GoalActorError::Invalid(
+                                "surface Goal turn result conflicts with the recorded result"
+                                    .to_string(),
+                            )),
+                            Some(_) => Ok(true),
+                            None => {
+                                active.surface_result = Some(result);
+                                Ok(true)
+                            }
+                        }
+                    })
+                    .map(GoalActorReply::Bool);
+                (reply, recorded)
+            }
+            GoalActorCommand::PauseForSurface {
+                input,
+                context,
+                reply,
+            } => (
+                reply,
+                self.authorize_surface_context(context)
+                    .and_then(|context| {
+                        self.store
+                            .pause_goal_for_surface(input, context)
+                            .map_err(Into::into)
+                    })
+                    .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::RecoverRunForSurface {
+                input,
+                context,
+                reply,
+            } => {
+                let session_id = input.session_id.clone();
+                let result = self.authorize_surface_context(context).and_then(|context| {
+                    self.store
+                        .recover_goal_run_for_surface(input, context)
+                        .map_err(Into::into)
+                });
+                if result.is_ok() {
+                    self.active.remove(&session_id);
+                    self.trackers.remove(&session_id);
+                    self.pending_verification.remove(&session_id);
+                    self.pending_surface_decisions.remove(&session_id);
+                }
+                (reply, result.map(GoalActorReply::SurfaceMutation))
+            }
+            GoalActorCommand::ReplaceContinuationWithRecoveryForSurface {
+                input,
+                context,
+                reply,
+            } => {
+                let session_id = input.interrupted.session_id.clone();
+                let result = self.authorize_surface_context(context).and_then(|context| {
+                    self.store
+                        .replace_goal_continuation_with_recovery_for_surface(input, context)
+                        .map_err(Into::into)
+                });
+                if result.is_ok() {
+                    self.active.remove(&session_id);
+                    self.trackers.remove(&session_id);
+                    self.pending_verification.remove(&session_id);
+                    self.pending_surface_decisions.remove(&session_id);
+                }
+                (reply, result.map(GoalActorReply::SurfaceMutation))
+            }
             GoalActorCommand::PendingSurfaceMutations { session_id, reply } => (
                 reply,
                 self.store
@@ -1284,6 +2177,251 @@ impl GoalActor {
         Ok(())
     }
 
+    fn begin_outer_turn_for_surface(
+        &mut self,
+        input: BeginGoalOuterTurnForSurfaceInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        if self.active.contains_key(&input.session_id) {
+            return Err(GoalActorError::Invalid(
+                "goal already has an active outer turn".to_string(),
+            ));
+        }
+        if self.pending_verification.contains_key(&input.session_id) {
+            return Err(GoalActorError::Invalid(
+                "goal has a terminal intent pending verification".to_string(),
+            ));
+        }
+        let identity = input.identity.clone();
+        self.pending_surface_decisions.remove(&input.session_id);
+        let mutation = self
+            .store
+            .begin_goal_outer_turn_for_surface(input, context)?;
+        let GoalSurfaceRowState::Present(record) = &mutation.receipt.row_state else {
+            return Err(GoalActorError::Invalid(
+                "surface outer-turn receipt removed its Goal".to_string(),
+            ));
+        };
+        let origin = match identity.outer_turn_origin {
+            crate::runtime_surface::GoalOuterTurnOrigin::User => GoalTurnOrigin::User,
+            crate::runtime_surface::GoalOuterTurnOrigin::Resume => GoalTurnOrigin::Resume,
+            crate::runtime_surface::GoalOuterTurnOrigin::Continuation => {
+                GoalTurnOrigin::Continuation
+            }
+            crate::runtime_surface::GoalOuterTurnOrigin::WorkflowNotification => {
+                GoalTurnOrigin::WorkflowNotification
+            }
+        };
+        let outer_turn_id =
+            GoalOuterTurnId::parse(identity.goal_outer_turn_id.as_str().to_string())
+                .map_err(GoalActorError::Invalid)?;
+        let goal_run_id =
+            orca_core::goal_runtime::GoalRunId::parse(identity.goal_run_id.as_str().to_string())
+                .map_err(GoalActorError::Invalid)?;
+        if record
+            .current_run
+            .as_ref()
+            .is_none_or(|run| run.goal_run_id != goal_run_id || !run.in_flight)
+        {
+            return Err(GoalActorError::Invalid(
+                "surface outer-turn receipt lost its in-flight run".to_string(),
+            ));
+        }
+        let mut tracker = GoalTracker::from_record(record);
+        tracker
+            .bind_persisted_outer_turn(outer_turn_id.clone(), origin)
+            .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
+        let turn = GoalTurnContext {
+            session_id: mutation.session_id.clone(),
+            goal_id: record.goal_id.clone(),
+            goal_run_id,
+            outer_turn_id,
+            origin,
+            run_started: false,
+        };
+        self.active.insert(
+            mutation.session_id.clone(),
+            ActiveGoalTurn {
+                context: turn,
+                tracker,
+                pending_pause: None,
+                surface_result: None,
+                surface_owned: true,
+                surface_identity: Some(identity),
+            },
+        );
+        Ok(mutation)
+    }
+
+    fn restore_outer_turn_for_surface(
+        &mut self,
+        session_id: &str,
+        identity: crate::runtime_surface::SurfaceGoalGenerationIdentity,
+    ) -> Result<GoalTurnContext, GoalActorError> {
+        self.pending_surface_decisions.remove(session_id);
+        let record = self
+            .store
+            .validate_surface_outer_turn_binding(session_id, &identity)?;
+        let origin = match identity.outer_turn_origin {
+            crate::runtime_surface::GoalOuterTurnOrigin::User => GoalTurnOrigin::User,
+            crate::runtime_surface::GoalOuterTurnOrigin::Resume => GoalTurnOrigin::Resume,
+            crate::runtime_surface::GoalOuterTurnOrigin::Continuation => {
+                GoalTurnOrigin::Continuation
+            }
+            crate::runtime_surface::GoalOuterTurnOrigin::WorkflowNotification => {
+                GoalTurnOrigin::WorkflowNotification
+            }
+        };
+        let outer_turn_id =
+            GoalOuterTurnId::parse(identity.goal_outer_turn_id.as_str().to_string())
+                .map_err(GoalActorError::Invalid)?;
+        let goal_run_id =
+            orca_core::goal_runtime::GoalRunId::parse(identity.goal_run_id.as_str().to_string())
+                .map_err(GoalActorError::Invalid)?;
+        if let Some(active) = self.active.get_mut(session_id) {
+            if !active.surface_owned
+                || active.context.goal_id != record.goal_id
+                || active.context.goal_run_id != goal_run_id
+                || active.context.outer_turn_id != outer_turn_id
+                || active.context.origin != origin
+            {
+                return Err(GoalActorError::Invalid(
+                    "active Goal outer turn differs from its recovery binding".to_string(),
+                ));
+            }
+            active.surface_identity = Some(Box::new(identity));
+            return Ok(active.context.clone());
+        }
+        let mut tracker = GoalTracker::from_record(&record);
+        tracker
+            .bind_persisted_outer_turn(outer_turn_id.clone(), origin)
+            .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
+        let turn = GoalTurnContext {
+            session_id: session_id.to_string(),
+            goal_id: record.goal_id,
+            goal_run_id,
+            outer_turn_id,
+            origin,
+            run_started: false,
+        };
+        self.active.insert(
+            session_id.to_string(),
+            ActiveGoalTurn {
+                context: turn.clone(),
+                tracker: tracker.clone(),
+                pending_pause: None,
+                surface_result: None,
+                surface_owned: true,
+                surface_identity: Some(Box::new(identity)),
+            },
+        );
+        self.trackers.insert(session_id.to_string(), tracker);
+        Ok(turn)
+    }
+
+    fn release_outer_turn_for_surface(
+        &mut self,
+        session_id: &str,
+        identity: &crate::runtime_surface::SurfaceGoalGenerationIdentity,
+    ) -> bool {
+        let exact = self.active.get(session_id).is_some_and(|active| {
+            active.surface_owned
+                && active.surface_identity.as_deref() == Some(identity)
+                && active.context.outer_turn_id.as_str() == identity.goal_outer_turn_id.as_str()
+        });
+        if exact {
+            self.active.remove(session_id);
+            self.trackers.remove(session_id);
+            self.pending_surface_decisions.remove(session_id);
+        }
+        exact
+    }
+
+    fn preview_outer_turn_for_surface(
+        &mut self,
+        session_id: &str,
+        status: GoalTurnStatus,
+        usage: GoalUsage,
+        verification: Option<GoalVerificationResult>,
+    ) -> Result<GoalNextAction, GoalActorError> {
+        let preview_usage = usage.clone();
+        let preview_verification = verification.clone();
+        let (identity, pending_pause, mut tracker, recorded_result) = {
+            let active = self
+                .active
+                .get(session_id)
+                .ok_or_else(|| GoalActorError::Invalid("no active Goal outer turn".to_string()))?;
+            if !active.surface_owned {
+                return Err(GoalActorError::Invalid(
+                    "Goal outer turn is not owned by the typed surface".to_string(),
+                ));
+            }
+            let identity = active.surface_identity.clone().ok_or_else(|| {
+                GoalActorError::Invalid(
+                    "surface Goal outer turn lacks its generation identity".to_string(),
+                )
+            })?;
+            (
+                identity,
+                active
+                    .pending_pause
+                    .as_ref()
+                    .map(|pause| (pause.reason, pause.message.clone())),
+                active.tracker.clone(),
+                active.surface_result.clone(),
+            )
+        };
+        let turn_result = match recorded_result {
+            Some(result) if result.status == status && result.usage == usage => result,
+            Some(_) => {
+                return Err(GoalActorError::Invalid(
+                    "surface Goal preview disagrees with its recorded turn result".to_string(),
+                ));
+            }
+            None => GoalTurnResult {
+                usage,
+                ..build_turn_result(
+                    status,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    0,
+                    0,
+                    None,
+                )
+            },
+        };
+        let tracker_action = tracker
+            .finish_outer_turn(turn_result)
+            .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
+        let action = if let Some((reason, message)) = pending_pause {
+            tracker.pause(reason, message)
+        } else {
+            tracker_action
+        };
+        let action = match (action, verification) {
+            (GoalNextAction::Verify { .. }, Some(result)) => {
+                tracker.apply_verification(result).clone()
+            }
+            (action, None) => action,
+            (_, Some(_)) => {
+                return Err(GoalActorError::Invalid(
+                    "surface verification does not match a pending terminal intent".to_string(),
+                ));
+            }
+        };
+        self.pending_surface_decisions.insert(
+            session_id.to_string(),
+            PendingSurfaceDecision {
+                identity,
+                status,
+                usage: preview_usage,
+                verification: preview_verification,
+                action: action.clone(),
+                tracker,
+            },
+        );
+        Ok(action)
+    }
+
     fn begin_outer_turn(
         &mut self,
         session_id: &str,
@@ -1364,6 +2502,9 @@ impl GoalActor {
                 context: context.clone(),
                 tracker,
                 pending_pause: None,
+                surface_result: None,
+                surface_owned: false,
+                surface_identity: None,
             },
         );
         Ok(context)
@@ -1381,12 +2522,52 @@ impl GoalActor {
             .ok_or_else(|| GoalActorError::Invalid("no active goal outer turn".to_string()))?;
         let ack = active.tracker.submit_terminal_intent(intent.clone());
         if matches!(ack, GoalUpdateAck::DeferredToTurnEnd { .. }) {
-            self.store.record_intent(GoalIntentRecord {
+            let record = GoalIntentRecord {
                 outer_turn_id: active.context.outer_turn_id.clone(),
                 intent,
                 ack: ack.clone(),
                 created_at,
-            })?;
+            };
+            if active.surface_owned {
+                let owner_epoch = self.surface_owner_epoch.ok_or_else(|| {
+                    GoalActorError::Invalid(
+                        "surface Goal intent lacks its runtime owner epoch".to_string(),
+                    )
+                })?;
+                let digest_input = serde_json::to_vec(&(
+                    &record.outer_turn_id,
+                    &record.intent,
+                    &record.ack,
+                    record.created_at,
+                ))
+                .map_err(|error| GoalActorError::Invalid(error.to_string()))?;
+                let context = |kind: &[u8]| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(kind);
+                    hasher.update(&digest_input);
+                    GoalSurfaceMutationContext {
+                        store_commit_id: uuid::Uuid::now_v7().to_string(),
+                        command_digest: hasher.finalize().into(),
+                        goal_owner_epoch: owner_epoch,
+                    }
+                };
+                let identity = active.surface_identity.clone().ok_or_else(|| {
+                    GoalActorError::Invalid(
+                        "surface Goal intent lacks its generation identity".to_string(),
+                    )
+                })?;
+                let (persisted_ack, _) = self.store.record_intent_for_surface(
+                    record,
+                    identity,
+                    [
+                        context(b"intent_requested"),
+                        context(b"intent_acknowledged"),
+                    ],
+                )?;
+                return Ok(persisted_ack);
+            } else {
+                self.store.record_intent(record)?;
+            }
         }
         Ok(ack)
     }
@@ -1853,7 +3034,7 @@ mod tests {
         let context = crate::goal_store::GoalSurfaceMutationContext {
             store_commit_id: "019f8b4d-7d73-7b52-8f44-2cfeac060007".to_string(),
             command_digest: [8; 32],
-            goal_owner_epoch: 17,
+            goal_owner_epoch: 1,
         };
         let created = handle
             .create_for_surface(

@@ -213,6 +213,29 @@ impl GoalTracker {
         Ok(outer_turn_id)
     }
 
+    pub fn bind_persisted_outer_turn(
+        &mut self,
+        outer_turn_id: GoalOuterTurnId,
+        origin: GoalTurnOrigin,
+    ) -> Result<(), GoalTrackerError> {
+        if !self.state.should_continue() {
+            return Err(GoalTrackerError::GoalInactive);
+        }
+        if self.current_outer_turn.is_some() {
+            return Err(GoalTrackerError::OuterTurnAlreadyActive);
+        }
+        self.current_outer_turn = Some(GoalOuterTurnSnapshot {
+            outer_turn_id,
+            goal_run_id: self.run_id.clone(),
+            origin,
+            model_response_count: 0,
+            tool_attempt_count: 0,
+            tool_names: Vec::new(),
+            status: None,
+        });
+        Ok(())
+    }
+
     pub fn record_model_response(&mut self) {
         if let Some(turn) = self.current_outer_turn.as_mut() {
             turn.model_response_count = turn.model_response_count.saturating_add(1);

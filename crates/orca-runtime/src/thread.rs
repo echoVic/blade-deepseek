@@ -179,6 +179,23 @@ impl RuntimeThread {
             .clone())
     }
 
+    pub(crate) fn bind_surface_goal_turn(
+        &mut self,
+        handle: GoalRuntimeHandle,
+        turn: crate::goal_actor::GoalTurnContext,
+    ) -> GoalRuntimeBinding {
+        let binding = GoalRuntimeBinding {
+            handle,
+            turn: Some(turn),
+        };
+        self.thread_extensions.insert(binding.clone());
+        binding
+    }
+
+    pub(crate) fn clear_goal_turn_binding(&mut self) {
+        self.thread_extensions.remove::<GoalRuntimeBinding>();
+    }
+
     pub(crate) fn finish_goal_turn(
         &mut self,
         binding: Option<&GoalRuntimeBinding>,
