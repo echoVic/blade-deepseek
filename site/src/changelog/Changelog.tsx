@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.52":
+        "Goal continuation now distinguishes an advanced turn, a resumable interruption, and a true blocker. Reaching the inner-turn limit preserves a MaxInnerTurns reason, emits soft-landing reminders, and continues with a structured handoff containing the objective, budget state, open gap, current task plan, and bounded assistant checkpoint. Cost-budget exhaustion, cancellation, approval, verification failure, and other blocking outcomes still pause. A separate durable watchdog counts only substantive tool or plan progress, preserves progress barriers across SQLite recovery, pauses after three repeated model-fixable gaps, and caps eight consecutive inner-turn interruptions.",
       "v0.2.51":
         "Ordinary TUI turns now run end to end through a runtime-owned typed surface: prompt admission, atomic durable commit, assistant and tool projection, approval and permission decisions, cancellation, terminal cleanup, snapshot replay, and restart recovery share one RuntimeHost truth. Recovered controls remain bound to the original operation and generation, interaction responses are durable before waiters wake, and production tests cover real Record-to-Resume history plus PTY terminal restoration. ACP typed prompt, replay, permission, and bounded RPC bridges are included without changing Goal, workflow, or JSONL compatibility.",
       "v0.2.50":
@@ -546,6 +548,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.52":
+        "Goal continuation 现在区分已推进、可恢复中断和真正阻塞。触达 inner-turn 上限会保留 MaxInnerTurns 原因，提前注入软着陆提醒，并通过结构化交接继续下一轮；交接包含目标、预算状态、未解决 gap、当前 task plan 和有界 assistant checkpoint。成本预算耗尽、取消、审批、验证失败等阻塞结果仍会暂停。独立的 durable watchdog 只把实质工具执行或结构化计划变化计为进展，在 SQLite 恢复后保留进展屏障，连续三次重复同一 model-fixable gap 或连续八次 inner-turn 中断时暂停。",
       "v0.2.51":
         "普通 TUI turn 现在端到端运行在 runtime-owned typed surface 上：prompt 准入、原子 durable commit、assistant 与 tool 投影、审批与权限响应、取消、terminal 清理、snapshot replay 和重启恢复共用同一份 RuntimeHost 事实。恢复后的控制仍绑定原 operation 与 generation，交互响应会先持久化再唤醒 waiter；生产测试覆盖真实 Record-to-Resume 历史与 PTY 终端恢复。本版本同时包含 ACP typed prompt、replay、permission 与有界 RPC bridge，但不改变 Goal、workflow 或 JSONL compatibility。",
       "v0.2.50":

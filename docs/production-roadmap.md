@@ -3,8 +3,24 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-07-19
-Current baseline: v0.2.50 completes the runtime-owned Goal continuation model.
+Last updated: 2026-07-25
+Current baseline: v0.2.52 separates Goal continuation admission from
+cross-turn progress detection. A turn now ends as advanced, resumably
+interrupted, or blocked. Reaching the inner-turn limit preserves a typed
+`MaxInnerTurns` reason and continues with a structured handoff; cost-budget
+exhaustion, cancellation, approval, and verification failure still pause.
+Soft-landing reminders ask the model to finish its current atomic step and
+update the task plan before the limit is reached.
+
+The durable no-progress watchdog remains a separate safety boundary. It counts
+completed mutating tools and structured plan changes as substantive progress,
+keeps productive-turn barriers across SQLite recovery, pauses after three
+repeated model-fixable gaps, and independently caps eight consecutive
+`MaxInnerTurns` interruptions. The continuation envelope carries the objective,
+budget state, open gap, task plan, and a bounded assistant checkpoint so a new
+session can resume without repeating repository exploration.
+
+Earlier v0.2.50 completed the runtime-owned Goal continuation model.
 A per-thread `GoalActor` owns state transitions, run and outer-turn ledgers,
 usage, terminal verification, recovery, and SQLite persistence. `RuntimeHost`
 owns the composite Goal run, cancellation, and continuation admission. The TUI
@@ -2088,7 +2104,7 @@ instruction and capability system.
 | P1.3 | Durable interaction broker | Lets approval, user input, and MCP elicitation survive process loss as idempotent continuations | High |
 | P1.4 | Unified task supervisor, cancellation tree, lease, and fencing | Makes stop, pause, shutdown, reattach, stale-owner takeover, and stale-commit rejection verifiable | High |
 | P2.1 | Checkpointable workflow and subagent resume | Resumes the same run from a safe cursor instead of replaying only completed cache entries | High |
-| P2.2 | Runtime goal orchestrator | Complete in v0.2.50: Goal state, runs, outer turns, usage, leases, terminal verification, recovery, cancellation, and continuation policy are runtime-owned; the fixed continuation ceiling is removed | Done |
+| P2.2 | Runtime goal orchestrator | Complete in v0.2.52: Goal state, runs, outer turns, usage, leases, terminal verification, recovery, cancellation, and continuation policy are runtime-owned; the fixed continuation ceiling is removed, resumable interruption is distinct from blocking, and a durable progress watchdog guards repeated stalls | Done |
 | P2.3 | App-server dependency inversion | Lets processors depend on operation/thread handles and stores instead of full mutable server state | Medium |
 | P2.4 | Context and cache identity | Adds deterministic compatibility repair ids, immutable cache-critical prefixes, isolated fork state, and explicit checkpoints | Medium/High |
 | P3 | Crate cleanup, plugins, remote compaction, worktree automation, richer PTY, multi-format reading | Remove source-text architecture tests and compatibility shims only after compiler-enforced ownership; build product breadth on stable contracts | Medium/High |
