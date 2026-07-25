@@ -357,7 +357,7 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
     fs::create_dir_all(&workflow_dir).expect("workflow directory");
     fs::write(
         workflow_dir.join("typed-launch.js"),
-        "export const meta = { name: 'typed-launch', description: 'typed launch', phases: ['main'] };\nexport default await phase('main', async () => agent('inspect repo'));",
+        "export const meta = { name: 'typed-launch', description: 'typed launch', phases: ['main'] };\nexport const args = { label: { type: 'string', required: true }, count: { type: 'number', required: true }, enabled: { type: 'boolean', required: true }, payload: { type: 'json', required: true } };\nexport default await phase('main', async () => agent('inspect repo'));",
     )
     .expect("saved workflow");
     orca_core::config::folder_trust::set_trust_with_config_dir(
@@ -400,7 +400,24 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
             WorkflowControlAction::Launch {
                 catalog_entry_id: SurfaceCatalogEntryId::try_new("typed-launch").unwrap(),
                 observed_catalog_revision: WorkflowCatalogRevision::try_new(1).unwrap(),
-                args: Vec::new(),
+                args: vec![
+                    (
+                        NonEmptyText::try_new("label").unwrap(),
+                        DisplayText::new(r#""alpha""#),
+                    ),
+                    (
+                        NonEmptyText::try_new("count").unwrap(),
+                        DisplayText::new("2"),
+                    ),
+                    (
+                        NonEmptyText::try_new("enabled").unwrap(),
+                        DisplayText::new("true"),
+                    ),
+                    (
+                        NonEmptyText::try_new("payload").unwrap(),
+                        DisplayText::new("null"),
+                    ),
+                ],
                 parent: None,
             },
         )
@@ -420,7 +437,24 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
             WorkflowControlAction::Launch {
                 catalog_entry_id: SurfaceCatalogEntryId::try_new("typed-launch").unwrap(),
                 observed_catalog_revision: WorkflowCatalogRevision::try_new(1).unwrap(),
-                args: Vec::new(),
+                args: vec![
+                    (
+                        NonEmptyText::try_new("label").unwrap(),
+                        DisplayText::new(r#""alpha""#),
+                    ),
+                    (
+                        NonEmptyText::try_new("count").unwrap(),
+                        DisplayText::new("2"),
+                    ),
+                    (
+                        NonEmptyText::try_new("enabled").unwrap(),
+                        DisplayText::new("true"),
+                    ),
+                    (
+                        NonEmptyText::try_new("payload").unwrap(),
+                        DisplayText::new("null"),
+                    ),
+                ],
                 parent: None,
             },
         )
@@ -448,8 +482,8 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
                 catalog_entry_id: SurfaceCatalogEntryId::try_new("typed-launch").unwrap(),
                 observed_catalog_revision: WorkflowCatalogRevision::try_new(1).unwrap(),
                 args: vec![(
-                    NonEmptyText::try_new("mode").unwrap(),
-                    DisplayText::new("different"),
+                    NonEmptyText::try_new("label").unwrap(),
+                    DisplayText::new(r#""different""#),
                 )],
                 parent: None,
             },
@@ -532,7 +566,24 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
             WorkflowControlAction::Launch {
                 catalog_entry_id: SurfaceCatalogEntryId::try_new("typed-launch").unwrap(),
                 observed_catalog_revision: WorkflowCatalogRevision::try_new(1).unwrap(),
-                args: Vec::new(),
+                args: vec![
+                    (
+                        NonEmptyText::try_new("label").unwrap(),
+                        DisplayText::new(r#""alpha""#),
+                    ),
+                    (
+                        NonEmptyText::try_new("count").unwrap(),
+                        DisplayText::new("2"),
+                    ),
+                    (
+                        NonEmptyText::try_new("enabled").unwrap(),
+                        DisplayText::new("true"),
+                    ),
+                    (
+                        NonEmptyText::try_new("payload").unwrap(),
+                        DisplayText::new("null"),
+                    ),
+                ],
                 parent: None,
             },
         )
@@ -584,6 +635,139 @@ fn typed_workflow_launch_commits_task_workflow_and_operation_before_returning() 
     restarted_host.shutdown().expect("shutdown restarted host");
     match previous_home {
         Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+        None => unsafe { std::env::remove_var("ORCA_HOME") },
+    }
+}
+
+#[test]
+fn typed_workflow_background_cancel_commits_stop_and_terminalizes() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+    let _lock = ORCA_HOME_TEST_LOCK.lock().unwrap();
+    let home = tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempdir().expect("workflow cwd");
+    let workflow_dir = cwd.path().join(".orca").join("workflows");
+    fs::create_dir_all(&workflow_dir).expect("workflow directory");
+    fs::write(
+        workflow_dir.join("typed-cancel.js"),
+        "export const meta = { name: 'typed-cancel', description: 'typed cancel', phases: ['main'] };\nexport default await phase('main', async () => agent('mock_stream_delay_ms 30000'));",
+    )
+    .expect("saved workflow");
+    orca_core::config::folder_trust::set_trust_with_config_dir(
+        cwd.path(),
+        home.path(),
+        orca_core::config::folder_trust::TrustLevel::Trusted,
+    )
+    .expect("trusted workflow workspace");
+    let previous_home = std::env::var_os("ORCA_HOME");
+    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("runtime host");
+    let thread = host
+        .surface_handle()
+        .start_thread(config, "typed workflow cancel")
+        .expect("typed thread");
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::ManageWorkflow,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("unexpected attachment result"),
+    };
+    let output = match attachment
+        .client
+        .workflow_control(
+            SurfaceRequestId::new(),
+            WorkflowControlAction::Launch {
+                catalog_entry_id: SurfaceCatalogEntryId::try_new("typed-cancel").unwrap(),
+                observed_catalog_revision: WorkflowCatalogRevision::try_new(1).unwrap(),
+                args: Vec::new(),
+                parent: None,
+            },
+        )
+        .expect("typed workflow launch")
+    {
+        MutationReply::Committed { value, .. } => value,
+        _ => panic!("workflow launch must commit"),
+    };
+    let operation_id = output.operation_id.expect("workflow operation");
+    let before_cancel = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment.baseline.snapshot,
+        _ => panic!("pre-cancel snapshot attachment failed"),
+    };
+    assert!(
+        before_cancel
+            .background_operations
+            .iter()
+            .any(|operation| operation.operation_id == operation_id),
+        "launched workflow operation must be background-owned before cancel"
+    );
+    let cancelled = attachment
+        .client
+        .cancel_operation(SurfaceRequestId::new(), operation_id.clone())
+        .expect("background workflow cancel");
+    match cancelled {
+        MutationReply::Committed { mutation, value } => {
+            assert!(matches!(
+                value,
+                orca_runtime::surface::CancelOperationOutput::Accepted { .. }
+            ));
+            assert_eq!(
+                mutation.acknowledgements.as_slice().len(),
+                3,
+                "cancel acceptance must acknowledge operation, task, and workflow durable facts"
+            );
+        }
+        _ => panic!("background workflow cancellation must durably commit"),
+    }
+    let terminal = attachment
+        .client
+        .wait_operation_terminal(SurfaceRequestId::new(), operation_id)
+        .expect("wait cancelled workflow");
+    assert!(matches!(
+        terminal,
+        WaitOperationTerminalResult::Terminal { value }
+            if matches!(
+                value.terminal,
+                OperationTerminal::Cancelled { .. }
+            )
+    ));
+    let snapshot = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment.baseline.snapshot,
+        _ => panic!("snapshot attachment failed"),
+    };
+    assert!(snapshot.workflows.iter().any(|workflow| {
+        workflow.workflow_run_id == output.workflow.workflow_run_id
+            && matches!(
+                workflow.status,
+                orca_runtime::surface::SurfaceWorkflowStatus::Stopped
+                    | orca_runtime::surface::SurfaceWorkflowStatus::Cancelled
+            )
+    }));
+
+    host.shutdown().expect("shutdown runtime host");
+    match previous_home {
+        Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
         None => unsafe { std::env::remove_var("ORCA_HOME") },
     }
 }

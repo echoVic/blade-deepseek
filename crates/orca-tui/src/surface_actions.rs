@@ -6,7 +6,7 @@ use orca_core::config::RunConfig;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
-use orca_runtime::runtime_host::{HostedTurnRequest, HostedWorkflowRequest};
+use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
     NonEmptyVec, RuntimeSettingsPatch, RuntimeSurfaceThreadHandle, SurfaceHistoryMessage,
     SurfaceSettingsSnapshot, SurfaceSnapshot,
@@ -197,9 +197,13 @@ impl TuiSurfaceActions {
             .resolve_background_approval(approval_id, approved)
     }
 
-    pub(crate) fn launch_workflow(&self, request: HostedWorkflowRequest) -> Result<(), String> {
-        self.thread
-            .launch_workflow(request)
+    pub(crate) fn launch_workflow(
+        &self,
+        name: &str,
+        args: Option<&str>,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> Result<(), String> {
+        crate::surface_client::launch_workflow(&self.thread, name, args, event_tx)
             .map_err(|error| error.to_string())
     }
 

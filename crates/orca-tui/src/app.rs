@@ -21,8 +21,8 @@ use orca_core::conversation::Message;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
 use orca_runtime::runtime_host::{
-    HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, HostedWorkflowRequest,
-    OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
+    HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, OperationOutcome,
+    RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
@@ -698,7 +698,7 @@ mod tests {
             )
             .expect("trust workflow workspace");
 
-            let mut config = test_config(HistoryMode::Disabled);
+            let mut config = test_config(HistoryMode::Record);
             config.cwd = Some(temp.path().to_path_buf());
             config.output_format = OutputFormat::Jsonl;
             config.approval_mode = ApprovalMode::FullAuto;
@@ -738,22 +738,198 @@ mod tests {
                     events.push(event);
                 }
             }
-            assert!(
-            events
+            while let Ok(event) = event_rx.recv_timeout(Duration::from_millis(100)) {
+                events.push(event);
+            }
+            let action_completed_at = events
                 .iter()
-                .any(|event| matches!(event, TuiEvent::ToolCompleted { name, status, .. } if name == "Workflow" && status == "completed")),
-            "saved workflow should publish a typed tool completion"
-        );
+                .position(|event| {
+                    matches!(
+                        event,
+                        TuiEvent::SessionCompleted { status } if status == "success"
+                    )
+                })
+                .expect("workflow slash action should complete after durable launch");
+            let workflow_completed_at = events
+                .iter()
+                .position(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
+                .expect("workflow should publish a terminal notification");
+            assert!(
+                action_completed_at < workflow_completed_at,
+                "slash action completion must precede background workflow terminal: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    TuiEvent::WorkflowTasksUpdated { tasks }
+                        if tasks.iter().any(|task| task.name.as_deref() == Some("runtime-owned"))
+                )),
+                "saved workflow should publish a typed task projection: {events:?}"
+            );
             assert!(
             events
                 .iter()
                 .any(|event| matches!(event, TuiEvent::WorkflowNotification { status, .. } if status == "completed")),
             "saved workflow should publish a terminal notification"
         );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
+                    .count(),
+                1,
+                "one workflow run must produce exactly one terminal notification: {events:?}"
+            );
             action_tx
                 .send(UserAction::Cancel)
                 .expect("stop TUI test loop");
             handle.join().expect("hosted TUI test loop joined");
+        });
+    }
+
+    #[test]
+    fn typed_workflow_launch_rejects_disabled_history_without_waiting_for_surface_readiness() {
+        let (host, _thread, actions) = test_task_surface();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let started = Instant::now();
+        let error = actions
+            .launch_workflow("missing", None, &event_tx)
+            .expect_err("durable workflow must require a recorded session");
+        assert!(error.contains("requires recorded conversation history"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn hosted_tui_failed_workflow_launch_rejects_the_foreground_action() {
+        with_orca_home(|home| {
+            let temp = tempdir().expect("workflow workspace");
+            orca_core::config::folder_trust::set_trust_with_config_dir(
+                temp.path(),
+                home,
+                orca_core::config::folder_trust::TrustLevel::Trusted,
+            )
+            .expect("trust workflow workspace");
+
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(temp.path().to_path_buf());
+            let config = Arc::new(Mutex::new(config));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                move || {
+                    run_hosted_tui_controller_for_test(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        CancelToken::new(),
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::RunWorkflow {
+                    name: "missing-workflow".to_string(),
+                    args: None,
+                })
+                .expect("run missing saved workflow action");
+            let rejected = loop {
+                match event_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(TuiEvent::OperationRejected(error)) => break error,
+                    Ok(_) => {}
+                    Err(error) => panic!("workflow launch rejection missing: {error}"),
+                }
+            };
+            assert!(rejected.contains("typed TUI workflow launch failed"));
+
+            action_tx
+                .send(UserAction::Cancel)
+                .expect("stop TUI test loop");
+            handle.join().expect("hosted TUI test loop joined");
+        });
+    }
+
+    #[test]
+    fn resumed_tui_hydrates_durable_workflow_tasks_from_surface_snapshot() {
+        if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+            return;
+        }
+        with_orca_home(|home| {
+            let temp = tempdir().expect("workflow workspace");
+            let workflow_dir = temp.path().join(".orca").join("workflows");
+            std::fs::create_dir_all(&workflow_dir).expect("workflow directory");
+            std::fs::write(
+                workflow_dir.join("restart-visible.js"),
+                "export const meta = { name: 'restart-visible', description: 'Restart visible', phases: ['main'] };\nexport default await phase('main', async () => agent('inspect repo'));",
+            )
+            .expect("saved workflow");
+            orca_core::config::folder_trust::set_trust_with_config_dir(
+                temp.path(),
+                home,
+                orca_core::config::folder_trust::TrustLevel::Trusted,
+            )
+            .expect("trust workflow workspace");
+
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(temp.path().to_path_buf());
+            config.output_format = OutputFormat::Jsonl;
+            config.approval_mode = ApprovalMode::FullAuto;
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "restart workflow projection")
+                .expect("runtime thread");
+            let session_id = thread.session_id().expect("recorded session").to_string();
+            let (workflow_tx, workflow_rx) = mpsc::unbounded();
+            TuiSurfaceActions::new(thread.typed_surface())
+                .launch_workflow("restart-visible", None, &workflow_tx)
+                .expect("typed workflow launch");
+            loop {
+                match workflow_rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(TuiEvent::WorkflowNotification { status, .. }) => {
+                        assert_eq!(status, "completed");
+                        break;
+                    }
+                    Ok(TuiEvent::Error(error)) => panic!("typed workflow failed: {error}"),
+                    Ok(_) => {}
+                    Err(error) => panic!("typed workflow terminal event missing: {error}"),
+                }
+            }
+            host.shutdown().expect("shutdown original runtime");
+
+            let transcript =
+                orca_runtime::history::load_session(&session_id).expect("saved transcript");
+            let mut resumed_config = test_config(HistoryMode::Resume(session_id.clone()));
+            resumed_config.cwd = Some(temp.path().to_path_buf());
+            resumed_config.output_format = OutputFormat::Jsonl;
+            resumed_config.approval_mode = ApprovalMode::FullAuto;
+            let resumed_host =
+                orca_runtime::runtime_host::RuntimeHost::start().expect("resumed runtime host");
+            let resumed = resumed_host
+                .handle()
+                .start_thread_with_request(
+                    RuntimeThreadStartRequest::new(resumed_config, "resume workflow projection")
+                        .with_preloaded(transcript),
+                )
+                .expect("resumed runtime thread");
+            let (event_tx, event_rx) = mpsc::unbounded();
+            emit_typed_history_snapshot(&resumed, &HistoryMode::Resume(session_id), &event_tx)
+                .expect("typed restart snapshot");
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                    if tasks.iter().any(|task| {
+                        task.name.as_deref() == Some("restart-visible")
+                            && task.status == orca_core::task_types::TaskStatus::Completed
+                    })
+            )));
+            resumed_host.shutdown().expect("shutdown resumed runtime");
         });
     }
 
@@ -5076,25 +5252,14 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 }
                 if let Some(runtime_thread) = thread.as_ref() {
                     let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                    let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
-                    let _ = observer.finish_foreground();
-                    let mut request = HostedWorkflowRequest::new(name).with_config(cfg.clone());
-                    if let Some(args) = args.as_deref() {
-                        request = match request.with_command_args(args) {
-                            Ok(request) => request,
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::Error(error));
-                                continue;
-                            }
-                        };
-                    }
-                    if let Err(error) =
-                        actions.launch_workflow(request.with_event_observer(observer))
-                    {
-                        let _ = event_tx.send(TuiEvent::Error(error));
+                    if let Err(error) = actions.launch_workflow(&name, args.as_deref(), &event_tx) {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
                         continue;
                     }
                 }
+                let _ = event_tx.send(TuiEvent::SessionCompleted {
+                    status: "success".to_string(),
+                });
                 if cfg.desktop_notifications {
                     let _ = orca_runtime::notify::notify("Orca", "Workflow launched");
                 }
@@ -5586,7 +5751,14 @@ fn emit_typed_history_snapshot(
             plan,
             label: label.to_string(),
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let tasks = crate::surface_projection::workflow_task_summaries(&snapshot);
+    if !tasks.is_empty() {
+        event_tx
+            .send(TuiEvent::WorkflowTasksUpdated { tasks })
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn typed_history_startup_eligible(

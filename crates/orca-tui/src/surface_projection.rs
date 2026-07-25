@@ -4,13 +4,20 @@ use std::collections::BTreeMap;
 
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::{PlanItem, PlanStatus};
+use orca_core::task_types::{
+    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+    WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+};
+use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_runtime::surface::{
     AssistantChannel, AssistantPatch, OperationPatch, OperationTerminal, SurfaceAssistantStream,
     SurfaceAssistantStreamState, SurfaceCommitBatch, SurfaceCompletedModelResponse, SurfaceCursor,
     SurfaceEvent, SurfaceFileChange, SurfaceGoal, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
     SurfaceGoalState, SurfaceHistoryMessage, SurfaceInputPresentation, SurfaceItem,
-    SurfaceOperationId, SurfaceStreamId, SurfaceToolResultKind, SurfaceUserInputState, ToolPatch,
-    UnixMillis,
+    SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult, SurfaceReducerErrorCode,
+    SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus, SurfaceToolResultKind,
+    SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus,
+    ToolPatch, UnixMillis,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
@@ -167,6 +174,9 @@ pub(crate) enum SurfaceProjectionError {
     UnknownAssistantStream {
         stream_id: SurfaceStreamId,
     },
+    ReducerRejected {
+        code: SurfaceReducerErrorCode,
+    },
 }
 
 pub(crate) struct TuiSurfaceProjection {
@@ -177,6 +187,7 @@ pub(crate) struct TuiSurfaceProjection {
     goal: Option<SurfaceGoal>,
     thread_created_at: UnixMillis,
     thread_updated_at: UnixMillis,
+    reducer_state: Option<SurfaceReducerState>,
 }
 
 impl TuiSurfaceProjection {
@@ -192,6 +203,7 @@ impl TuiSurfaceProjection {
             goal: None,
             thread_created_at: UnixMillis::new(0),
             thread_updated_at: UnixMillis::new(0),
+            reducer_state: None,
         }
     }
 
@@ -218,6 +230,7 @@ impl TuiSurfaceProjection {
         projection.goal = snapshot.goal.clone();
         projection.thread_created_at = snapshot.thread.created_at;
         projection.thread_updated_at = snapshot.thread.updated_at;
+        projection.reducer_state = Some(SurfaceReducerState::new(snapshot.clone()));
         projection
     }
 
@@ -272,6 +285,18 @@ impl TuiSurfaceProjection {
                 observed: batch.cursor_before.clone(),
             });
         }
+        let next_reducer_state = match self.reducer_state.as_ref() {
+            Some(state) => {
+                match orca_runtime::surface::reduce_batch(SurfaceReduceMode::Live, state, batch) {
+                    SurfaceReduceResult::Applied { state } => Some(state),
+                    SurfaceReduceResult::AlreadyApplied { .. } => Some(state.clone()),
+                    SurfaceReduceResult::Rejected { error } => {
+                        return Err(SurfaceProjectionError::ReducerRejected { code: error.code });
+                    }
+                }
+            }
+            None => None,
+        };
 
         let mut assistant_streams = self.assistant_streams.clone();
         let mut focused_operation = self.focused_operation.clone();
@@ -557,11 +582,286 @@ impl TuiSurfaceProjection {
                 _ => {}
             }
         }
+        if let Some(state) = next_reducer_state.as_ref() {
+            let snapshot = state.snapshot();
+            if batch.events.as_slice().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    SurfaceEvent::Task(_) | SurfaceEvent::Workflow(_)
+                )
+            }) {
+                projected.push(TuiEvent::WorkflowTasksUpdated {
+                    tasks: workflow_task_summaries(snapshot),
+                });
+            }
+        }
         self.assistant_streams = assistant_streams;
         self.focused_operation = focused_operation;
         self.goal = goal;
+        self.reducer_state = next_reducer_state;
         self.cursor = batch.cursor_after.clone();
         Ok(projected)
+    }
+
+    pub(crate) fn terminal_workflow_notification(
+        &self,
+        workflow_run_id: &orca_runtime::surface::SurfaceWorkflowRunId,
+    ) -> Option<TuiEvent> {
+        let workflow = self
+            .reducer_state
+            .as_ref()?
+            .snapshot()
+            .workflows
+            .iter()
+            .find(|workflow| &workflow.workflow_run_id == workflow_run_id)?;
+        workflow_terminal_notification(workflow)
+    }
+}
+
+pub(crate) fn workflow_task_summaries(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+) -> Vec<BackgroundTaskSummary> {
+    snapshot
+        .tasks
+        .iter()
+        .map(|task| {
+            let workflow = task.workflow_run_id.as_ref().and_then(|run_id| {
+                snapshot
+                    .workflows
+                    .iter()
+                    .find(|workflow| &workflow.workflow_run_id == run_id)
+            });
+            BackgroundTaskSummary {
+                id: task.task_id.as_str().to_string(),
+                task_type: task_type(task.task_type),
+                status: task_status(task.status),
+                is_backgrounded: task.backgrounded,
+                description: task.description.as_str().to_string(),
+                created_at_ms: task.created_at.get(),
+                started_at_ms: task.started_at.map(UnixMillis::get),
+                completed_at_ms: task.completed_at.map(UnixMillis::get),
+                command: None,
+                agent_type: None,
+                server: None,
+                tool: workflow.map(|_| "workflow".to_string()),
+                pending_tool_call: None,
+                name: workflow.map(|workflow| workflow.name.as_str().to_string()),
+                workflow_run_id: task
+                    .workflow_run_id
+                    .as_ref()
+                    .map(|run_id| run_id.as_str().to_string()),
+                phase_count: workflow.map(|workflow| workflow.phases.len()),
+                workflow_progress: workflow.map(workflow_progress),
+                workflow_phases: workflow
+                    .map(|workflow| {
+                        workflow
+                            .phases
+                            .iter()
+                            .map(|phase| WorkflowPhaseTaskSummary {
+                                name: phase.name.as_str().to_string(),
+                                status: workflow_status(phase.status),
+                                agent_count: phase.agent_count,
+                                error: phase.error.as_ref().map(|error| error.as_str().to_string()),
+                                fallback: None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                workflow_agents: workflow
+                    .map(|workflow| {
+                        workflow
+                            .agents
+                            .iter()
+                            .map(|agent| WorkflowAgentTaskSummary {
+                                call_id: agent.agent_id.as_str().to_string(),
+                                call_path: agent.agent_id.as_str().to_string(),
+                                team: None,
+                                status: workflow_agent_status(agent.status),
+                                attempt: agent.attempt,
+                                max_attempts: agent.attempt.max(1),
+                                previous_errors: Vec::new(),
+                                error: agent.error.as_ref().map(|error| error.as_str().to_string()),
+                                transcript_path: None,
+                                started_at_ms: None,
+                                completed_at_ms: None,
+                                usage: agent.usage.as_ref().map(core_usage_totals),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                workflow_script_path: None,
+                workflow_launch_input: None,
+                workflow_final_summary: workflow.and_then(|workflow| {
+                    workflow
+                        .result
+                        .as_ref()
+                        .map(|result| result.content.as_str().to_string())
+                }),
+                workflow_failure_count: workflow
+                    .map(|workflow| {
+                        workflow
+                            .agents
+                            .iter()
+                            .filter(|agent| agent.status == SurfaceWorkflowAgentStatus::Failed)
+                            .count() as u32
+                    })
+                    .unwrap_or_default(),
+                usage: task.usage.as_ref().map(core_usage_totals),
+                subagent_current_activity: None,
+                subagent_turn: None,
+                last_activity_at_ms: task.completed_at.or(task.started_at).map(UnixMillis::get),
+                result: task.result.as_ref().map(|value| value.as_str().to_string()),
+                error: task.error.as_ref().map(|value| value.as_str().to_string()),
+            }
+        })
+        .collect()
+}
+
+fn workflow_progress(workflow: &SurfaceWorkflow) -> WorkflowTaskProgress {
+    WorkflowTaskProgress {
+        total_agents: workflow.agents.len() as u32,
+        running_agents: workflow
+            .agents
+            .iter()
+            .filter(|agent| agent.status == SurfaceWorkflowAgentStatus::Running)
+            .count() as u32,
+        completed_agents: workflow
+            .agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent.status,
+                    SurfaceWorkflowAgentStatus::Completed | SurfaceWorkflowAgentStatus::Cached
+                )
+            })
+            .count() as u32,
+        failed_agents: workflow
+            .agents
+            .iter()
+            .filter(|agent| agent.status == SurfaceWorkflowAgentStatus::Failed)
+            .count() as u32,
+        completed_phases: workflow
+            .phases
+            .iter()
+            .filter(|phase| phase.status == SurfaceWorkflowStatus::Completed)
+            .count(),
+        running_phases: workflow
+            .phases
+            .iter()
+            .filter(|phase| phase.status == SurfaceWorkflowStatus::Running)
+            .count(),
+        failed_phases: workflow
+            .phases
+            .iter()
+            .filter(|phase| phase.status == SurfaceWorkflowStatus::Failed)
+            .count(),
+    }
+}
+
+fn workflow_terminal_notification(workflow: &SurfaceWorkflow) -> Option<TuiEvent> {
+    let status = match workflow.status {
+        SurfaceWorkflowStatus::Completed => "completed",
+        SurfaceWorkflowStatus::Failed => "failed",
+        SurfaceWorkflowStatus::Stopped => "stopped",
+        SurfaceWorkflowStatus::Cancelled => "cancelled",
+        _ => return None,
+    };
+    let summary = workflow
+        .result
+        .as_ref()
+        .map(|result| result.content.as_str())
+        .or_else(|| workflow.error.as_ref().map(|error| error.as_str()))
+        .unwrap_or(status);
+    let tool_use_id = workflow
+        .result
+        .as_ref()
+        .and_then(|result| result.tool_use_id.as_ref())
+        .map(|tool_use_id| tool_use_id.as_str())
+        .unwrap_or("");
+    let id = format!(
+        "{}:{}:{}",
+        workflow.workflow_run_id.as_str(),
+        workflow.task_id.as_str(),
+        tool_use_id
+    );
+    let prompt = format!(
+        "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>{}</tool-use-id>\n<run-id>{}</run-id>\n<status>{}</status>\n<summary>{}</summary>\n</task-notification>\n\nA background workflow finished. Use this result to continue the current task.",
+        xml_escape(workflow.task_id.as_str()),
+        xml_escape(tool_use_id),
+        xml_escape(workflow.workflow_run_id.as_str()),
+        status,
+        xml_escape(summary),
+    );
+    Some(TuiEvent::WorkflowNotification {
+        id,
+        prompt,
+        status: status.to_string(),
+        summary: format!("{}: {summary}", workflow.name.as_str()),
+    })
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn task_type(task_type: orca_runtime::surface::SurfaceTaskType) -> TaskType {
+    match task_type {
+        orca_runtime::surface::SurfaceTaskType::MainSession => TaskType::MainSession,
+        orca_runtime::surface::SurfaceTaskType::Workflow => TaskType::Workflow,
+        orca_runtime::surface::SurfaceTaskType::Subagent => TaskType::Subagent,
+        orca_runtime::surface::SurfaceTaskType::Shell => TaskType::Shell,
+        orca_runtime::surface::SurfaceTaskType::Monitor => TaskType::Monitor,
+    }
+}
+
+fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
+    match status {
+        SurfaceTaskStatus::Queued => TaskStatus::Queued,
+        SurfaceTaskStatus::Running => TaskStatus::Running,
+        SurfaceTaskStatus::Paused => TaskStatus::Paused,
+        SurfaceTaskStatus::Stopping => TaskStatus::Stopping,
+        SurfaceTaskStatus::Stopped => TaskStatus::Stopped,
+        SurfaceTaskStatus::Completed => TaskStatus::Completed,
+        SurfaceTaskStatus::Failed => TaskStatus::Failed,
+        SurfaceTaskStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
+        SurfaceTaskStatus::Cancelled => TaskStatus::Cancelled,
+    }
+}
+
+fn workflow_status(status: SurfaceWorkflowStatus) -> WorkflowRunStatus {
+    match status {
+        SurfaceWorkflowStatus::Queued => WorkflowRunStatus::Queued,
+        SurfaceWorkflowStatus::Running => WorkflowRunStatus::Running,
+        SurfaceWorkflowStatus::Paused => WorkflowRunStatus::Paused,
+        SurfaceWorkflowStatus::Stopping => WorkflowRunStatus::Stopping,
+        SurfaceWorkflowStatus::Stopped => WorkflowRunStatus::Stopped,
+        SurfaceWorkflowStatus::Completed => WorkflowRunStatus::Completed,
+        SurfaceWorkflowStatus::Failed => WorkflowRunStatus::Failed,
+        SurfaceWorkflowStatus::Cancelled => WorkflowRunStatus::Cancelled,
+        SurfaceWorkflowStatus::AsyncLaunched => WorkflowRunStatus::AsyncLaunched,
+    }
+}
+
+fn workflow_agent_status(status: SurfaceWorkflowAgentStatus) -> WorkflowAgentStatus {
+    match status {
+        SurfaceWorkflowAgentStatus::Pending => WorkflowAgentStatus::Pending,
+        SurfaceWorkflowAgentStatus::Running => WorkflowAgentStatus::Running,
+        SurfaceWorkflowAgentStatus::Cached => WorkflowAgentStatus::Cached,
+        SurfaceWorkflowAgentStatus::Completed => WorkflowAgentStatus::Completed,
+        SurfaceWorkflowAgentStatus::Failed => WorkflowAgentStatus::Failed,
+        SurfaceWorkflowAgentStatus::Cancelled => WorkflowAgentStatus::Cancelled,
+    }
+}
+
+fn core_usage_totals(usage: &orca_runtime::surface::UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_tokens: usage.cache_tokens,
+        estimated_cost_usd: usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
     }
 }
 
@@ -949,6 +1249,7 @@ mod tests {
             goal: None,
             thread_created_at: UnixMillis::new(0),
             thread_updated_at: UnixMillis::new(0),
+            reducer_state: None,
         };
 
         assert!(matches!(

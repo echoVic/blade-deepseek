@@ -87,14 +87,17 @@ pub mod surface {
         SurfaceItemOrigin, SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest,
         SurfaceOperationId, SurfacePermissionClientDecision, SurfacePermissionProfile,
         SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfacePlanStatus,
-        SurfaceReasoningEffort, SurfaceRecoverableOperation, SurfaceRequestId,
+        SurfaceReasoningEffort, SurfaceRecoverableOperation, SurfaceReduceMode,
+        SurfaceReduceResult, SurfaceReducerErrorCode, SurfaceReducerState, SurfaceRequestId,
         SurfaceResolvedInputFact, SurfaceScope, SurfaceSettingsSnapshot, SurfaceShutdownReason,
         SurfaceSnapshot, SurfaceStreamId, SurfaceSubscriptionHandle, SurfaceSubscriptionItem,
-        SurfaceSubscriptionReceiver, SurfaceTask, SurfaceTaskStatus, SurfaceThreadId,
-        SurfaceToolResultKind, SurfaceTurnId, SurfaceUserInputDecision, SurfaceUserInputState,
-        SurfaceWorkflow, SurfaceWorkflowStatus, ThreadOwnerEpoch, ToolPatch, UnixMillis,
-        WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction,
-        WorkflowControlOutput,
+        SurfaceSubscriptionReceiver, SurfaceTask, SurfaceTaskId, SurfaceTaskStatus,
+        SurfaceTaskType, SurfaceThreadId, SurfaceToolResultKind, SurfaceTurnId,
+        SurfaceUnavailableReason, SurfaceUserInputDecision, SurfaceUserInputState, SurfaceWorkflow,
+        SurfaceWorkflowAgentStatus, SurfaceWorkflowRunId, SurfaceWorkflowStatus, TaskPatch,
+        ThreadOwnerEpoch, ToolPatch, UnixMillis, UsageTotals, WaitOperationTerminalResult,
+        WorkflowCatalogRevision, WorkflowControlAction, WorkflowControlOutput, WorkflowPatch,
+        reduce_batch,
     };
 }
 mod runtime_tool_actor;

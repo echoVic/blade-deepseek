@@ -1064,6 +1064,10 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
             ) => &scoped.operation_fence == fence,
             (
                 SurfaceScope::Background { fence: scoped },
+                OperationPatch::ControlIntentCommitted { operation_id, .. },
+            ) => &scoped.operation_fence.operation_id == operation_id,
+            (
+                SurfaceScope::Background { fence: scoped },
                 OperationPatch::FinalizationStarted { operation_id, .. }
                 | OperationPatch::FinalizationSettlementRecorded { operation_id, .. }
                 | OperationPatch::FinalizationDegraded { operation_id, .. },

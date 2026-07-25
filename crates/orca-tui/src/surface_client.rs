@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orca_core::config::RunConfig;
 use orca_runtime::runtime_host::HostedTurnRequest;
@@ -17,7 +17,8 @@ use orca_runtime::surface::{
     SurfaceCatalogEntryId, SurfaceEvent, SurfaceGoal, SurfaceGoalFence, SurfaceHistoryMessage,
     SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
     SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
+    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceUnavailableReason, SurfaceWorkflowRunId,
+    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -614,6 +615,235 @@ fn goal_fence(goal: &SurfaceGoal) -> SurfaceGoalFence {
         goal_revision: goal.goal_revision,
         goal_owner_epoch: goal.goal_owner_epoch,
     }
+}
+
+pub(crate) fn launch_workflow(
+    thread: &RuntimeSurfaceThreadHandle,
+    name: &str,
+    raw_args: Option<&str>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<()> {
+    if thread.session_id().is_none() {
+        return Err(io::Error::other(
+            "typed workflow launch requires recorded conversation history",
+        ));
+    }
+    let surface = thread.surface();
+    let attach_deadline = Instant::now() + Duration::from_secs(5);
+    let attachment = loop {
+        match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::ControlBoundOperation,
+                SurfaceCapability::ManageWorkflow,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => break attachment,
+            AttachResult::Unavailable {
+                reason: SurfaceUnavailableReason::RuntimeUnavailable,
+            } if Instant::now() < attach_deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            AttachResult::Denied { reason } => {
+                return Err(io::Error::other(format!(
+                    "typed TUI workflow attachment denied: {reason:?}"
+                )));
+            }
+            AttachResult::Unavailable { reason } => {
+                return Err(io::Error::other(format!(
+                    "typed TUI workflow attachment unavailable: {reason:?}"
+                )));
+            }
+            AttachResult::ThreadClosed { .. } => {
+                return Err(io::Error::other(
+                    "typed TUI workflow attachment found a closed thread",
+                ));
+            }
+            AttachResult::CursorAttached { .. }
+            | AttachResult::SnapshotRequired { .. }
+            | AttachResult::InvalidCursor { .. } => {
+                return Err(io::Error::other(
+                    "typed TUI workflow fresh attachment returned an invalid result",
+                ));
+            }
+        }
+    };
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .ok_or_else(|| io::Error::other("typed TUI workflow subscription unavailable"))?;
+    let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
+    let result = attachment.client.workflow_control(
+        SurfaceRequestId::new(),
+        WorkflowControlAction::Launch {
+            catalog_entry_id: SurfaceCatalogEntryId::try_new(name)
+                .map_err(|error| io::Error::other(error.to_string()))?,
+            observed_catalog_revision: WorkflowCatalogRevision::try_new(1)
+                .expect("initial workflow catalog revision is positive"),
+            args: parse_workflow_args(raw_args)?,
+            parent: None,
+        },
+    );
+    let output = match result
+        .map_err(|error| io::Error::other(format!("typed TUI workflow launch failed: {error:?}")))?
+    {
+        MutationReply::Committed { value, .. } => value,
+        MutationReply::Deferred { mutation, .. } => {
+            detach(&surface, &attachment.client);
+            return Err(io::Error::other(format!(
+                "typed TUI workflow launch deferred: request={:?} commit={:?}",
+                mutation.request_id, mutation.commit_id
+            )));
+        }
+        MutationReply::Uncommitted { mutation } => {
+            detach(&surface, &attachment.client);
+            return Err(io::Error::other(format!(
+                "typed TUI workflow launch did not commit: {mutation:?}"
+            )));
+        }
+    };
+    let operation_id = output
+        .operation_id
+        .ok_or_else(|| io::Error::other("typed TUI workflow launch has no operation"))?;
+    let monitor_client = attachment.client.clone();
+    let monitor_surface = surface.clone();
+    let monitor_events = event_tx.clone();
+    let monitor_operation_id = operation_id.clone();
+    let monitor_workflow_run_id = output.workflow.workflow_run_id.clone();
+    std::thread::Builder::new()
+        .name(format!("tui-workflow-{}", output.workflow.task_id.as_str()))
+        .spawn(move || {
+            let mut notification_sent = false;
+            loop {
+                let Some(item) = subscription.recv_timeout(Duration::from_millis(100)) else {
+                    continue;
+                };
+                match item {
+                    SurfaceSubscriptionItem::Batch { batch } => {
+                        let terminal = batch.events.as_slice().iter().any(|envelope| {
+                            matches!(
+                                &envelope.event,
+                                SurfaceEvent::Operation(OperationPatch::Terminal { record })
+                                    if record.operation_id == monitor_operation_id
+                            )
+                        });
+                        let workflow_terminal =
+                            batch_contains_workflow_terminal(&batch, &monitor_workflow_run_id);
+                        match projection.reduce_typed_batch(&batch) {
+                            Ok(events) => {
+                                for event in events {
+                                    let _ = monitor_events.send(event);
+                                }
+                                if workflow_terminal && !notification_sent {
+                                    if let Some(event) = projection
+                                        .terminal_workflow_notification(&monitor_workflow_run_id)
+                                    {
+                                        let _ = monitor_events.send(event);
+                                        notification_sent = true;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = monitor_events.send(TuiEvent::Error(format!(
+                                    "typed TUI workflow projection failed: {error:?}"
+                                )));
+                                let _ = monitor_client.cancel_operation(
+                                    SurfaceRequestId::new(),
+                                    monitor_operation_id.clone(),
+                                );
+                                break;
+                            }
+                        }
+                        if terminal {
+                            break;
+                        }
+                    }
+                    SurfaceSubscriptionItem::Gap { required } => {
+                        let _ = monitor_events.send(TuiEvent::Error(format!(
+                            "typed TUI workflow subscription gap requires {:?}",
+                            required.reason
+                        )));
+                        let _ = monitor_client.cancel_operation(
+                            SurfaceRequestId::new(),
+                            monitor_operation_id.clone(),
+                        );
+                        break;
+                    }
+                    SurfaceSubscriptionItem::Sealed { .. } => break,
+                }
+            }
+            detach(&monitor_surface, &monitor_client);
+        })
+        .map_err(|error| {
+            let _ = attachment
+                .client
+                .cancel_operation(SurfaceRequestId::new(), operation_id);
+            detach(&surface, &attachment.client);
+            io::Error::other(format!(
+                "failed to start typed TUI workflow monitor: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn batch_contains_workflow_terminal(
+    batch: &orca_runtime::surface::SurfaceCommitBatch,
+    workflow_run_id: &SurfaceWorkflowRunId,
+) -> bool {
+    batch.events.as_slice().iter().any(|event| {
+        matches!(
+            &event.event,
+            SurfaceEvent::Workflow(
+                WorkflowPatch::Completed { fence, .. }
+                    | WorkflowPatch::Failed { fence, .. }
+                    | WorkflowPatch::Stopped { fence, .. }
+                    | WorkflowPatch::Cancelled { fence, .. }
+            ) if &fence.workflow_run_id == workflow_run_id
+        )
+    })
+}
+
+fn parse_workflow_args(raw_args: Option<&str>) -> io::Result<Vec<(NonEmptyText, DisplayText)>> {
+    let Some(raw) = raw_args.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut args = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    if raw.starts_with('{') {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|error| io::Error::other(error.to_string()))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| io::Error::other("workflow args JSON must be an object"))?;
+        for (name, value) in object {
+            args.insert(name.clone(), value.clone());
+        }
+    } else {
+        for part in raw.split_whitespace() {
+            let (name, value) = part.split_once('=').ok_or_else(|| {
+                io::Error::other(format!("workflow arg `{part}` must use key=value"))
+            })?;
+            if name.trim().is_empty() {
+                return Err(io::Error::other("workflow arg key cannot be empty"));
+            }
+            let value = serde_json::from_str(value)
+                .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+            if args.insert(name.to_string(), value).is_some() {
+                return Err(io::Error::other(format!(
+                    "workflow arg `{name}` was provided more than once"
+                )));
+            }
+        }
+    }
+    args.into_iter()
+        .map(|(name, value)| {
+            Ok((
+                NonEmptyText::try_new(name).map_err(|error| io::Error::other(error.to_string()))?,
+                DisplayText::new(value.to_string()),
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn read_history(
@@ -1240,6 +1470,44 @@ fn detach(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceClientHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_args_preserve_json_scalar_types() {
+        let args = parse_workflow_args(Some(
+            r#"{"label":"alpha","count":2,"enabled":true,"empty":null}"#,
+        ))
+        .expect("typed workflow args");
+        let decoded = args
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    serde_json::from_str::<serde_json::Value>(value.as_str())
+                        .expect("canonical JSON value"),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(decoded["label"], serde_json::json!("alpha"));
+        assert_eq!(decoded["count"], serde_json::json!(2));
+        assert_eq!(decoded["enabled"], serde_json::json!(true));
+        assert_eq!(decoded["empty"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn workflow_key_value_args_keep_strings_and_parse_json_literals() {
+        let args = parse_workflow_args(Some("label=alpha count=2 enabled=true empty=null"))
+            .expect("key value workflow args");
+        let encoded = args
+            .into_iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(encoded["label"], r#""alpha""#);
+        assert_eq!(encoded["count"], "2");
+        assert_eq!(encoded["enabled"], "true");
+        assert_eq!(encoded["empty"], "null");
+    }
 
     #[test]
     fn manual_compaction_failed_terminal_is_not_reported_as_success() {

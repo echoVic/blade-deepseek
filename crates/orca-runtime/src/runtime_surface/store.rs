@@ -2478,9 +2478,10 @@ static INTERACTION_ROUTE_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = On
 #[cfg(test)]
 static INTERACTION_REQUEST_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
-static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
-static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
 #[cfg(test)]
 static ADMISSION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
@@ -2709,11 +2710,31 @@ impl JsonlSurfaceCommitLedger {
 
     #[cfg(test)]
     pub(crate) fn inject_terminal_checkpoint_failure_once(path: impl Into<PathBuf>) {
+        Self::inject_terminal_checkpoint_failures(path, 1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_terminal_checkpoint_failures(path: impl Into<PathBuf>, count: usize) {
         TERMINAL_CHECKPOINT_FAILURES
-            .get_or_init(|| Mutex::new(HashSet::new()))
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(path.into());
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_terminal_checkpoint_failures(path: impl Into<PathBuf>) {
+        let path = path.into();
+        TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+        PENDING_TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
     }
 
     #[cfg(test)]
@@ -2936,28 +2957,40 @@ impl JsonlSurfaceCommitLedger {
                 })
             )
         });
-        if is_terminal
-            && TERMINAL_CHECKPOINT_FAILURES
-                .get_or_init(|| Mutex::new(HashSet::new()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&self.path)
-        {
+        if !is_terminal {
+            return;
+        }
+        let count = TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path);
+        if let Some(count) = count {
             PENDING_TERMINAL_CHECKPOINT_FAILURES
-                .get_or_init(|| Mutex::new(HashSet::new()))
+                .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(self.path.clone());
+                .entry(self.path.clone())
+                .and_modify(|pending| *pending += count)
+                .or_insert(count);
         }
     }
 
     #[cfg(test)]
     fn take_pending_terminal_checkpoint_failure(&self) -> bool {
-        PENDING_TERMINAL_CHECKPOINT_FAILURES
-            .get_or_init(|| Mutex::new(HashSet::new()))
+        let mut failures = PENDING_TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.path)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
     }
 
     #[cfg(test)]

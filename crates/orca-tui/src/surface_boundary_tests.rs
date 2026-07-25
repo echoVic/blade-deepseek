@@ -5,6 +5,7 @@ const MANIFEST: &str = include_str!(
 );
 const TYPES: &str = include_str!("types.rs");
 const APP: &str = include_str!("app.rs");
+const SURFACE_PROJECTION: &str = include_str!("surface_projection.rs");
 const SUBMITTED_TURN: &str = include_str!("submitted_turn.rs");
 const MENTION_SEARCH_MANAGER: &str = include_str!("mention_search_manager.rs");
 const BACKGROUND_TASKS: &str = include_str!("background_tasks.rs");
@@ -531,6 +532,17 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
     assert!(
         !action_source.contains(".goal()"),
         "the TUI facade must receive Goal values, not a callable Goal actor handle"
+    );
+    assert!(
+        action_source.contains("crate::surface_client::launch_workflow")
+            && !action_source.contains("self.thread\n            .launch_workflow"),
+        "saved workflow launch must use the typed runtime surface client"
+    );
+    assert!(
+        !APP.contains("HostedWorkflowRequest")
+            && SURFACE_PROJECTION.contains("SurfaceEvent::Task")
+            && SURFACE_PROJECTION.contains("SurfaceEvent::Workflow"),
+        "TUI workflow task and lifecycle updates must come from typed surface batches"
     );
     assert!(
         !SLASH_COMMAND_ACTIONS.contains("folder_trust::")

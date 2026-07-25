@@ -4230,6 +4230,11 @@ fn reconcile_durable_workflow_outcomes_on_start(
         let diagnostic =
             surface::SafeDiagnosticText::try_new("background workflow failed before projection")
                 .expect("fixed diagnostic is bounded");
+        let projected_status = if workflow.status == surface::SurfaceWorkflowStatus::Stopping {
+            TaskStatus::Stopped
+        } else {
+            record.status
+        };
         let (
             task_status,
             workflow_patches,
@@ -4237,7 +4242,7 @@ fn reconcile_durable_workflow_outcomes_on_start(
             result_status,
             stop_reason,
             terminal,
-        ) = match record.status {
+        ) = match projected_status {
             TaskStatus::Completed => (
                 surface::SurfaceTaskStatus::Completed,
                 vec![surface::WorkflowPatch::Completed {
@@ -4665,6 +4670,7 @@ fn bootstrap_recorded_surface(
             operation_origin_attachments: HashMap::new(),
             pending_detaches: HashMap::new(),
             pending_capability_losses: HashMap::new(),
+            pending_background_controls: HashMap::new(),
             pending_terminalization: None,
             pending_admission_commits: HashMap::new(),
             pending_admission_repairs: HashMap::new(),
@@ -5090,6 +5096,8 @@ struct ResidentSurfaceState {
         HashMap<surface::SurfaceOperationId, surface::SurfaceAttachmentId>,
     pending_detaches: HashMap<surface::SurfaceAttachmentId, PendingSurfaceDetach>,
     pending_capability_losses: HashMap<surface::SurfaceAttachmentId, PendingSurfaceCapabilityLoss>,
+    pending_background_controls:
+        HashMap<surface::SurfaceOperationId, PendingSurfaceBackgroundControl>,
     pending_terminalization: Option<PreparedSurfaceTerminalization>,
     pending_admission_commits: HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionCommit>,
     pending_admission_repairs: HashMap<surface::SurfaceOperationId, PendingSurfaceAdmissionRepair>,
@@ -5152,6 +5160,7 @@ enum PendingSurfaceTransitionRetry {
     ManualCompactionCompletion,
     GoalCompletionRecovery,
     WorkflowCompletion(surface::SurfaceOperationId),
+    BackgroundControl(surface::SurfaceOperationId),
     AdmissionCommit(surface::SurfaceOperationId),
     AdmissionRepair(surface::SurfaceOperationId),
     AdmissionTerminal(surface::SurfaceOperationId),
@@ -5172,6 +5181,15 @@ struct PendingSurfaceDetach {
 #[derive(Clone)]
 struct PendingSurfaceCapabilityLoss {
     transition: PreparedSurfaceAttachmentTransition,
+    retry_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct PendingSurfaceBackgroundControl {
+    fence: surface::SurfaceBackgroundFence,
+    batch: surface::SurfaceCommitBatch,
+    task_id: surface::SurfaceTaskId,
+    cancel: CancelToken,
     retry_at: tokio::time::Instant,
 }
 
@@ -11161,6 +11179,12 @@ impl ThreadActor {
                             .values()
                             .map(|pending| pending.retry_at),
                     )
+                    .chain(
+                        resident
+                            .pending_background_controls
+                            .values()
+                            .map(|pending| pending.retry_at),
+                    )
             })
             .chain(
                 self.pending_manual_compaction_completion
@@ -11545,91 +11569,103 @@ impl ThreadActor {
                         PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id.clone()),
                     )
                 });
-        let Some((_, retry)) =
-            manual_compaction
-                .chain(goal_completion)
-                .chain(workflow_completions)
-                .chain(
-                    self.resident_surface
-                        .pending_admission_repairs
-                        .values()
-                        .map(|pending| {
-                            (
-                                pending.retry_at,
-                                PendingSurfaceTransitionRetry::AdmissionRepair(
-                                    pending.fence.operation_id.clone(),
-                                ),
-                            )
-                        })
-                        .chain(self.resident_surface.pending_admission_commits.iter().map(
-                            |(operation_id, pending)| {
+        let Some((_, retry)) = manual_compaction
+            .chain(goal_completion)
+            .chain(workflow_completions)
+            .chain(
+                self.resident_surface
+                    .pending_background_controls
+                    .iter()
+                    .map(|(operation_id, pending)| {
+                        (
+                            pending.retry_at,
+                            PendingSurfaceTransitionRetry::BackgroundControl(operation_id.clone()),
+                        )
+                    })
+                    .chain(
+                        self.resident_surface
+                            .pending_admission_repairs
+                            .values()
+                            .map(|pending| {
                                 (
                                     pending.retry_at,
-                                    PendingSurfaceTransitionRetry::AdmissionCommit(
-                                        operation_id.clone(),
-                                    ),
-                                )
-                            },
-                        ))
-                        .chain(self.resident_surface.pending_terminalization.iter().map(
-                            |pending| {
-                                (
-                                    pending.retry_at,
-                                    PendingSurfaceTransitionRetry::PreparedTerminalization(
+                                    PendingSurfaceTransitionRetry::AdmissionRepair(
                                         pending.fence.operation_id.clone(),
                                     ),
                                 )
-                            },
-                        ))
-                        .chain(
-                            self.resident_surface
-                                .pending_admission_terminals
-                                .iter()
-                                .map(|(operation_id, pending)| {
+                            })
+                            .chain(self.resident_surface.pending_admission_commits.iter().map(
+                                |(operation_id, pending)| {
                                     (
                                         pending.retry_at,
-                                        PendingSurfaceTransitionRetry::AdmissionTerminal(
+                                        PendingSurfaceTransitionRetry::AdmissionCommit(
                                             operation_id.clone(),
                                         ),
                                     )
-                                }),
-                        )
-                        .chain(self.resident_surface.interactions.iter().filter_map(
-                            |(interaction_id, interaction)| {
-                                interaction
-                                    .private_response
-                                    .as_ref()
-                                    .and_then(|private| private.retry_at)
-                                    .map(|retry_at| {
+                                },
+                            ))
+                            .chain(self.resident_surface.pending_terminalization.iter().map(
+                                |pending| {
+                                    (
+                                        pending.retry_at,
+                                        PendingSurfaceTransitionRetry::PreparedTerminalization(
+                                            pending.fence.operation_id.clone(),
+                                        ),
+                                    )
+                                },
+                            ))
+                            .chain(
+                                self.resident_surface
+                                    .pending_admission_terminals
+                                    .iter()
+                                    .map(|(operation_id, pending)| {
                                         (
-                                            retry_at,
-                                            PendingSurfaceTransitionRetry::PrivateResponse(
-                                                interaction_id.clone(),
+                                            pending.retry_at,
+                                            PendingSurfaceTransitionRetry::AdmissionTerminal(
+                                                operation_id.clone(),
                                             ),
                                         )
-                                    })
-                            },
-                        ))
-                        .chain(self.resident_surface.pending_detaches.iter().map(
-                            |(attachment_id, pending)| {
-                                (
-                                    pending.retry_at,
-                                    PendingSurfaceTransitionRetry::Detach(attachment_id.clone()),
-                                )
-                            },
-                        ))
-                        .chain(self.resident_surface.pending_capability_losses.iter().map(
-                            |(attachment_id, pending)| {
-                                (
-                                    pending.retry_at,
-                                    PendingSurfaceTransitionRetry::CapabilityLoss(
-                                        attachment_id.clone(),
-                                    ),
-                                )
-                            },
-                        )),
-                )
-                .min()
+                                    }),
+                            )
+                            .chain(self.resident_surface.interactions.iter().filter_map(
+                                |(interaction_id, interaction)| {
+                                    interaction
+                                        .private_response
+                                        .as_ref()
+                                        .and_then(|private| private.retry_at)
+                                        .map(|retry_at| {
+                                            (
+                                                retry_at,
+                                                PendingSurfaceTransitionRetry::PrivateResponse(
+                                                    interaction_id.clone(),
+                                                ),
+                                            )
+                                        })
+                                },
+                            ))
+                            .chain(self.resident_surface.pending_detaches.iter().map(
+                                |(attachment_id, pending)| {
+                                    (
+                                        pending.retry_at,
+                                        PendingSurfaceTransitionRetry::Detach(
+                                            attachment_id.clone(),
+                                        ),
+                                    )
+                                },
+                            ))
+                            .chain(self.resident_surface.pending_capability_losses.iter().map(
+                                |(attachment_id, pending)| {
+                                    (
+                                        pending.retry_at,
+                                        PendingSurfaceTransitionRetry::CapabilityLoss(
+                                            attachment_id.clone(),
+                                        ),
+                                    )
+                                },
+                            )),
+                    ),
+            )
+            .min()
         else {
             return;
         };
@@ -11680,6 +11716,10 @@ impl ThreadActor {
         }
         if let PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id) = retry {
             self.retry_typed_workflow_completion(&operation_id);
+            return;
+        }
+        if let PendingSurfaceTransitionRetry::BackgroundControl(operation_id) = retry {
+            self.retry_surface_background_control(&operation_id);
             return;
         }
         if let PendingSurfaceTransitionRetry::AdmissionCommit(operation_id) = retry {
@@ -12543,13 +12583,9 @@ impl ThreadActor {
         }
         let mut raw_args = serde_json::Map::new();
         for (name, value) in args {
-            if raw_args
-                .insert(
-                    name.as_str().to_string(),
-                    serde_json::Value::String(value.as_str().to_string()),
-                )
-                .is_some()
-            {
+            let value = serde_json::from_str(value.as_str())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            if raw_args.insert(name.as_str().to_string(), value).is_some() {
                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
             }
         }
@@ -16626,7 +16662,7 @@ impl ThreadActor {
         if !self.bind_surface_operation_controller(client, &operation_id) {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         if snapshot
             .queued_operations
             .iter()
@@ -16655,6 +16691,13 @@ impl ThreadActor {
                 },
                 value: surface::CancelOperationOutput::AlreadyTerminal { terminal },
             });
+        }
+        if snapshot
+            .background_operations
+            .iter()
+            .any(|operation| operation.operation_id == operation_id)
+        {
+            return self.cancel_surface_background_workflow(request_id, operation_id, &snapshot);
         }
         let operation = snapshot
             .foreground_operation
@@ -16783,6 +16826,237 @@ impl ThreadActor {
                 waiter: surface::OperationWaiterHandle::new(),
             },
         ))
+    }
+
+    fn cancel_surface_background_workflow(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        snapshot: &surface::SurfaceSnapshot,
+    ) -> Result<
+        surface::MutationReply<surface::CancelOperationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let typed = self
+            .background_tasks
+            .values()
+            .filter_map(|task| task.typed_workflow.as_ref())
+            .find(|typed| typed.fence.operation_fence.operation_id == operation_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| {
+                operation.operation_id == operation_id && operation.terminal.is_none()
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == typed.task_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let workflow = snapshot
+            .workflows
+            .iter()
+            .find(|workflow| workflow.workflow_run_id == typed.workflow_run_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if task.status == surface::SurfaceTaskStatus::Stopping
+            && workflow.status == surface::SurfaceWorkflowStatus::Stopping
+        {
+            if let Some(background) = self.background_tasks.get(typed.task_id.as_str()) {
+                background.cancel.cancel();
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let next_task_revision = surface::TaskRevision::try_new(
+            task.revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let next_workflow_revision = surface::WorkflowRevision::try_new(
+            workflow
+                .revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let workflow_fence = surface::SurfaceWorkflowFence {
+            workflow_run_id: workflow.workflow_run_id.clone(),
+            workflow_revision: workflow.revision,
+            parent: workflow.parent.clone(),
+        };
+        let reason = surface::DisplayText::new("Workflow cancellation requested");
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Background {
+                        fence: typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::ControlIntentCommitted {
+                            operation_id: operation_id.clone(),
+                            request_id: operation.request_id,
+                            intent: surface::PendingControlIntent::Terminalize {
+                                operation_id: operation_id.clone(),
+                                cause: surface::TerminalizationCause::UserCancel,
+                            },
+                        },
+                    ),
+                ),
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        task_id: task.task_id,
+                        expected_revision: task.revision,
+                        next_revision: next_task_revision,
+                        status: surface::SurfaceTaskStatus::Stopping,
+                        completed_at: None,
+                        result: None,
+                        error: None,
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Workflow(surface::WorkflowPatch::Stopping {
+                        fence: workflow_fence,
+                        next_revision: next_workflow_revision,
+                        reason,
+                    }),
+                ),
+            ],
+            None,
+        );
+        let pending = PendingSurfaceBackgroundControl {
+            fence: typed.fence.clone(),
+            batch: batch.clone(),
+            task_id: typed.task_id.clone(),
+            cancel: self
+                .background_tasks
+                .get(typed.task_id.as_str())
+                .expect("typed workflow background task remains registered")
+                .cancel
+                .clone(),
+            retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+        };
+        match self
+            .resident_surface
+            .coordinator
+            .commit_actor_background_control_batch(typed.fence.clone(), &batch)
+        {
+            Ok(_) => self.apply_committed_surface_background_control(&pending),
+            Err(
+                surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::CheckpointFailed)
+                | surface::SurfaceCommitError::Ledger(surface::SurfaceLedgerError::PartialAppend),
+            ) => {
+                self.resident_surface
+                    .pending_background_controls
+                    .insert(operation_id, pending);
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+            Err(_) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+        }
+        let operation_event = &batch.events.as_slice()[0];
+        let task_event = &batch.events.as_slice()[1];
+        let workflow_event = &batch.events.as_slice()[2];
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Operation {
+                    thread_id: batch.cursor_after.thread_id.clone(),
+                    operation_id: operation_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Operation,
+                        event_id: operation_event.event_id.clone(),
+                        commit_class: batch.commit_class.clone(),
+                    },
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Task,
+                        event_id: task_event.event_id.clone(),
+                        commit_class: batch.commit_class.clone(),
+                    },
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Workflow,
+                        event_id: workflow_event.event_id.clone(),
+                        commit_class: batch.commit_class.clone(),
+                    },
+                ])
+                .expect("workflow cancellation commits task and workflow facts"),
+            },
+            value: surface::CancelOperationOutput::Accepted {
+                operation_id,
+                accepted_cursor: batch.cursor_after,
+                waiter: surface::OperationWaiterHandle::new(),
+            },
+        })
+    }
+
+    fn retry_surface_background_control(&mut self, operation_id: &surface::SurfaceOperationId) {
+        let Some(mut pending) = self
+            .resident_surface
+            .pending_background_controls
+            .remove(operation_id)
+        else {
+            return;
+        };
+        if self
+            .resident_surface
+            .coordinator
+            .commit_actor_background_control_batch(pending.fence.clone(), &pending.batch)
+            .is_err()
+        {
+            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            self.resident_surface
+                .pending_background_controls
+                .insert(operation_id.clone(), pending);
+            return;
+        }
+        self.apply_committed_surface_background_control(&pending);
+    }
+
+    fn settle_surface_background_controls_for_shutdown(&mut self) -> bool {
+        for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            if self.resident_surface.pending_background_controls.is_empty() {
+                return true;
+            }
+            let mut operation_ids = self
+                .resident_surface
+                .pending_background_controls
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            operation_ids.sort();
+            for operation_id in operation_ids {
+                self.retry_surface_background_control(&operation_id);
+            }
+        }
+        self.resident_surface.pending_background_controls.is_empty()
+    }
+
+    fn apply_committed_surface_background_control(
+        &self,
+        pending: &PendingSurfaceBackgroundControl,
+    ) {
+        if let Some(state) = self.state.as_ref() {
+            let _ = state
+                .thread
+                .session()
+                .task_registry()
+                .request_stop(pending.task_id.as_str());
+        }
+        pending.cancel.cancel();
     }
 
     fn cancel_surface_running(
@@ -17227,8 +17501,16 @@ impl ThreadActor {
                                 self.has_pending_goal_completion_recovery_owner();
                             let bounded_workflow_recovery =
                                 !self.pending_workflow_completions.is_empty();
-                            let bounded_surface_recovery =
-                                bounded_goal_recovery || bounded_workflow_recovery;
+                            let bounded_background_control_recovery = self
+                                .resident_surface
+                                .0
+                                .as_ref()
+                                .is_some_and(|resident| {
+                                    !resident.pending_background_controls.is_empty()
+                                });
+                            let bounded_surface_recovery = bounded_goal_recovery
+                                || bounded_workflow_recovery
+                                || bounded_background_control_recovery;
                             let goal_recovery_operation_id =
                                 self.pending_goal_completion_recovery_operation_id();
                             let cold_goal_handoff = bounded_goal_recovery
@@ -17256,7 +17538,17 @@ impl ThreadActor {
                                 && self.has_pending_goal_completion_recovery_owner();
                             let workflow_recovery_still_pending =
                                 !self.pending_workflow_completions.is_empty();
-                            if goal_recovery_still_pending || workflow_recovery_still_pending {
+                            let background_control_still_pending = self
+                                .resident_surface
+                                .0
+                                .as_ref()
+                                .is_some_and(|resident| {
+                                    !resident.pending_background_controls.is_empty()
+                                });
+                            if goal_recovery_still_pending
+                                || workflow_recovery_still_pending
+                                || background_control_still_pending
+                            {
                                 if let Some(operation_id) = goal_recovery_operation_id {
                                     for waiter in self
                                         .resident_surface
@@ -17283,8 +17575,29 @@ impl ThreadActor {
                                         ));
                                     }
                                 }
+                                let background_control_operation_ids = self
+                                    .resident_surface
+                                    .pending_background_controls
+                                    .keys()
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for operation_id in background_control_operation_ids {
+                                    for waiter in self
+                                        .resident_surface
+                                        .waiters
+                                        .remove(&operation_id)
+                                        .unwrap_or_default()
+                                    {
+                                        let _ = waiter.try_send(Err(
+                                            surface::SurfaceClientCommandError::RuntimeUnavailable,
+                                        ));
+                                    }
+                                }
                                 self.surface_terminal_blocked.get_or_insert_with(|| {
-                                    if workflow_recovery_still_pending {
+                                    if background_control_still_pending {
+                                        "typed workflow cancellation recovery was retained for cold restart"
+                                            .to_string()
+                                    } else if workflow_recovery_still_pending {
                                         "typed workflow completion recovery was retained for cold restart"
                                             .to_string()
                                     } else {
@@ -17391,6 +17704,31 @@ impl ThreadActor {
                                 self.active = Some(active);
                                 continue;
                             }
+                            if self.resident_surface.0.is_some()
+                                && !self.settle_surface_background_controls_for_shutdown()
+                            {
+                                let error = RuntimeHostError::ThreadStartFailed {
+                                    message: "typed workflow cancellation recovery was retained for cold restart"
+                                        .to_string(),
+                                };
+                                self.surface_terminal_blocked = Some(error.to_string());
+                                if reason == surface::SurfaceShutdownReason::HostShutdown {
+                                    command_rx.close();
+                                    active.generation.cancel.cancel();
+                                    Self::drain_closed_thread_commands(&mut command_rx);
+                                    let _ = (&mut active.generation.join).await;
+                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(ThreadShutdownAck::Failed(error));
+                                    }
+                                    break;
+                                }
+                                if let Some(reply) = reply.as_ref() {
+                                    let _ = reply.send(ThreadShutdownAck::Failed(error));
+                                }
+                                self.active = Some(active);
+                                continue;
+                            }
                             if let Err(error) = self
                                 .commit_surface_terminalization(&mut active, terminalization)
                             {
@@ -17405,7 +17743,6 @@ impl ThreadActor {
                                     command_rx.close();
                                     active.generation.cancel.cancel();
                                     Self::drain_closed_thread_commands(&mut command_rx);
-                                    self.resident_surface.0.take();
                                     let _ = (&mut active.generation.join).await;
                                     let _ = self.shutdown_background_tasks(reason).await;
                                     if let Some(reply) = reply {
@@ -18376,7 +18713,19 @@ impl ThreadActor {
                     &client,
                     surface::SurfaceCapability::ControlBoundOperation,
                 ) {
-                    self.cancel_surface_running(active, &client, request_id, operation_id)
+                    let is_background = self
+                        .resident_surface
+                        .coordinator
+                        .state()
+                        .snapshot()
+                        .background_operations
+                        .iter()
+                        .any(|operation| operation.operation_id == operation_id);
+                    if is_background {
+                        self.cancel_surface_idle(&client, request_id, operation_id)
+                    } else {
+                        self.cancel_surface_running(active, &client, request_id, operation_id)
+                    }
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -20280,6 +20629,11 @@ impl ThreadActor {
                 .or_else(|| record.result.clone())
                 .unwrap_or_else(|| "Workflow stopped".to_string()),
         );
+        let projected_status = if workflow.status == surface::SurfaceWorkflowStatus::Stopping {
+            TaskStatus::Stopped
+        } else {
+            record.status
+        };
         let (
             task_status,
             workflow_patches,
@@ -20288,7 +20642,7 @@ impl ThreadActor {
             result_content,
             stop_reason,
             terminal,
-        ) = match record.status {
+        ) = match projected_status {
             TaskStatus::Completed => (
                 surface::SurfaceTaskStatus::Completed,
                 vec![surface::WorkflowPatch::Completed {
@@ -20310,49 +20664,67 @@ impl ThreadActor {
                     usage: usage.clone(),
                 },
             ),
-            TaskStatus::Stopped => (
-                surface::SurfaceTaskStatus::Stopped,
-                vec![
-                    surface::WorkflowPatch::Stopping {
-                        fence: workflow_fence.clone(),
-                        next_revision: next_workflow_revision,
-                        reason: display_reason.clone(),
-                    },
-                    surface::WorkflowPatch::Stopped {
-                        fence: surface::SurfaceWorkflowFence {
-                            workflow_run_id: workflow.workflow_run_id.clone(),
-                            workflow_revision: next_workflow_revision,
-                            parent: workflow.parent.clone(),
+            TaskStatus::Stopped => {
+                let (patches, terminal_revision) =
+                    if workflow.status == surface::SurfaceWorkflowStatus::Stopping {
+                        (
+                            vec![surface::WorkflowPatch::Stopped {
+                                fence: workflow_fence.clone(),
+                                next_revision: next_workflow_revision,
+                                reason: display_reason.clone(),
+                            }],
+                            next_workflow_revision,
+                        )
+                    } else {
+                        (
+                            vec![
+                                surface::WorkflowPatch::Stopping {
+                                    fence: workflow_fence.clone(),
+                                    next_revision: next_workflow_revision,
+                                    reason: display_reason.clone(),
+                                },
+                                surface::WorkflowPatch::Stopped {
+                                    fence: surface::SurfaceWorkflowFence {
+                                        workflow_run_id: workflow.workflow_run_id.clone(),
+                                        workflow_revision: next_workflow_revision,
+                                        parent: workflow.parent.clone(),
+                                    },
+                                    next_revision: second_workflow_revision,
+                                    reason: display_reason.clone(),
+                                },
+                            ],
+                            second_workflow_revision,
+                        )
+                    };
+                (
+                    surface::SurfaceTaskStatus::Stopped,
+                    patches,
+                    terminal_revision,
+                    surface::SurfaceWorkflowResultStatus::Failed,
+                    display_reason.clone(),
+                    shutdown_reason.map_or(
+                        surface::GenerationStopReason::Cancelled {
+                            cause: surface::TerminalizationCause::UserCancel,
                         },
-                        next_revision: second_workflow_revision,
-                        reason: display_reason.clone(),
-                    },
-                ],
-                second_workflow_revision,
-                surface::SurfaceWorkflowResultStatus::Failed,
-                display_reason.clone(),
-                shutdown_reason.map_or(
-                    surface::GenerationStopReason::Cancelled {
-                        cause: surface::TerminalizationCause::UserCancel,
-                    },
-                    |reason| surface::GenerationStopReason::Cancelled {
-                        cause: match reason {
-                            surface::SurfaceShutdownReason::HostShutdown => {
-                                surface::TerminalizationCause::HostShutdown
-                            }
-                            surface::SurfaceShutdownReason::ThreadClose => {
-                                surface::TerminalizationCause::ThreadClose
-                            }
+                        |reason| surface::GenerationStopReason::Cancelled {
+                            cause: match reason {
+                                surface::SurfaceShutdownReason::HostShutdown => {
+                                    surface::TerminalizationCause::HostShutdown
+                                }
+                                surface::SurfaceShutdownReason::ThreadClose => {
+                                    surface::TerminalizationCause::ThreadClose
+                                }
+                            },
                         },
-                    },
-                ),
-                shutdown_reason.map_or(
-                    surface::OperationTerminal::Cancelled {
-                        reason: surface::CancelReason::User,
-                    },
-                    |reason| surface::OperationTerminal::Shutdown { reason },
-                ),
-            ),
+                    ),
+                    shutdown_reason.map_or(
+                        surface::OperationTerminal::Cancelled {
+                            reason: surface::CancelReason::User,
+                        },
+                        |reason| surface::OperationTerminal::Shutdown { reason },
+                    ),
+                )
+            }
             TaskStatus::Cancelled => (
                 surface::SurfaceTaskStatus::Cancelled,
                 vec![surface::WorkflowPatch::Cancelled {
@@ -22373,6 +22745,144 @@ mod tests {
         }
     }
 
+    struct WorkflowCancelShutdownFixture {
+        host: RuntimeHost,
+        thread: RuntimeThreadHandle,
+        _home: tempfile::TempDir,
+        cwd: tempfile::TempDir,
+        transcript_path: PathBuf,
+        workflow_operation_id: surface::SurfaceOperationId,
+        task_id: surface::SurfaceTaskId,
+        workflow_run_id: surface::SurfaceWorkflowRunId,
+        prepared_control: surface::SurfaceCommitBatch,
+        foreground_cancel_observed: Receiver<()>,
+        foreground_completed: Receiver<()>,
+    }
+
+    fn checkpoint_failed_workflow_cancel_with_active_foreground(
+        checkpoint_failures: usize,
+    ) -> WorkflowCancelShutdownFixture {
+        let home = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let workflow_dir = cwd.path().join(".orca").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("shutdown-cancel.js"),
+            "export const meta = { name: 'shutdown-cancel', description: 'shutdown cancel', phases: ['main'] };\nexport default await phase('main', async () => agent('mock_stream_delay_ms 30000'));",
+        )
+        .unwrap();
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            cwd.path(),
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (cancel_observed_tx, cancel_observed_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(CancelAwareShutdownExecutor {
+            entered: entered_tx,
+            cancel_observed: cancel_observed_tx,
+            completed: completed_tx,
+        }))
+        .expect("start workflow shutdown runtime");
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let thread = host
+            .start_thread(config, "workflow cancel during shutdown")
+            .expect("start recorded workflow shutdown thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load workflow shutdown transcript")
+            .path;
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageWorkflow,
+            ]),
+        );
+        let workflow = committed_surface_value(
+            attachment
+                .client
+                .workflow_control(
+                    surface_request_id(),
+                    surface::WorkflowControlAction::Launch {
+                        catalog_entry_id: surface::SurfaceCatalogEntryId::try_new(
+                            "shutdown-cancel",
+                        )
+                        .unwrap(),
+                        observed_catalog_revision: surface::WorkflowCatalogRevision::try_new(1)
+                            .unwrap(),
+                        args: Vec::new(),
+                        parent: None,
+                    },
+                )
+                .expect("launch workflow for shutdown cancellation"),
+        );
+        let workflow_operation_id = workflow.operation_id.expect("workflow operation");
+        let task_id = workflow.workflow.task_id;
+        let workflow_run_id = workflow.workflow.workflow_run_id;
+        let foreground = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "keep active until host shutdown",
+                    ),
+                )
+                .expect("reserve active foreground turn"),
+        );
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    foreground.operation_id,
+                    foreground.lease.lease_id,
+                )
+                .expect("admit active foreground turn"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground turn did not enter executor");
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(
+            transcript_path.clone(),
+            checkpoint_failures,
+        );
+        assert!(matches!(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), workflow_operation_id.clone()),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+        let prepared_control =
+            surface::JsonlSurfaceCommitLedger::new(&transcript_path, attachment.baseline.cursor)
+                .recover_batches()
+                .expect("read prepared workflow control")
+                .prepared
+                .expect("workflow cancellation checkpoint failure must retain its exact batch");
+        WorkflowCancelShutdownFixture {
+            host,
+            thread,
+            _home: home,
+            cwd,
+            transcript_path,
+            workflow_operation_id,
+            task_id,
+            workflow_run_id,
+            prepared_control,
+            foreground_cancel_observed: cancel_observed_rx,
+            foreground_completed: completed_rx,
+        }
+    }
+
     fn collect_requested_surface_interaction(
         receiver: &mut surface::SurfaceSubscriptionReceiver,
     ) -> surface::SurfaceInteractionView {
@@ -23007,6 +23517,391 @@ mod tests {
             shutdown_started.elapsed() < Duration::from_secs(3),
             "workflow completion recovery must not keep HostShutdown pending forever"
         );
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn workflow_cancel_checkpoint_failure_retries_exact_batch_before_signalling_worker() {
+        if !crate::workflow::host::WorkflowHost::node_available() {
+            return;
+        }
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let workflow_dir = cwd.path().join(".orca").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("retry-cancel.js"),
+            "export const meta = { name: 'retry-cancel', description: 'retry cancel', phases: ['main'] };\nexport default await phase('main', async () => agent('mock_stream_delay_ms 30000'));",
+        )
+        .unwrap();
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            cwd.path(),
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let (foreground_entered_tx, foreground_entered_rx) = mpsc::sync_channel(1);
+        let (foreground_release_tx, foreground_release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedSuccessExecutor {
+            entered: foreground_entered_tx,
+            release: Mutex::new(foreground_release_rx),
+        }))
+        .expect("start workflow cancel retry runtime");
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let thread = host
+            .start_thread(config, "retry workflow cancellation")
+            .expect("start recorded workflow thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load workflow transcript")
+            .path;
+        let surface_handle = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageWorkflow,
+            ]),
+        );
+        let initial_cursor = attachment.baseline.cursor.clone();
+        let mut subscription = surface_handle
+            .claim_subscription(&attachment.subscription)
+            .expect("claim workflow cancellation subscription");
+        let workflow = committed_surface_value(
+            attachment
+                .client
+                .workflow_control(
+                    surface_request_id(),
+                    surface::WorkflowControlAction::Launch {
+                        catalog_entry_id: surface::SurfaceCatalogEntryId::try_new("retry-cancel")
+                            .unwrap(),
+                        observed_catalog_revision: surface::WorkflowCatalogRevision::try_new(1)
+                            .unwrap(),
+                        args: Vec::new(),
+                        parent: None,
+                    },
+                )
+                .expect("launch cancellable workflow"),
+        );
+        let workflow_operation_id = workflow.operation_id.expect("workflow operation");
+        let foreground = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "keep foreground active during workflow cancel recovery",
+                    ),
+                )
+                .expect("reserve foreground turn"),
+        );
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    foreground.operation_id.clone(),
+                    foreground.lease.lease_id,
+                )
+                .expect("admit foreground turn"),
+        );
+        foreground_entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground turn did not enter executor");
+
+        surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(
+            transcript_path.clone(),
+        );
+        assert!(matches!(
+            attachment
+                .client
+                .cancel_operation(surface_request_id(), workflow_operation_id.clone()),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
+
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let recovered_control = loop {
+            let mut found = None;
+            while let Some(item) = subscription.try_recv() {
+                let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                    continue;
+                };
+                if batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::ControlIntentCommitted {
+                                operation_id,
+                                intent: surface::PendingControlIntent::Terminalize {
+                                    cause: surface::TerminalizationCause::UserCancel,
+                                    ..
+                                },
+                                ..
+                            }
+                        ) if operation_id == &workflow_operation_id
+                    )
+                }) {
+                    found = Some(batch);
+                    break;
+                }
+            }
+            if found.is_some() || Instant::now() >= deadline {
+                break found;
+            }
+            std::thread::yield_now();
+        };
+        if recovered_control.is_none() {
+            foreground_release_tx
+                .send(())
+                .expect("release foreground after failed assertion");
+            let _ = host.shutdown();
+            match previous_home {
+                Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+                None => unsafe { std::env::remove_var("ORCA_HOME") },
+            }
+            panic!("prepared workflow cancellation was not retried");
+        }
+        let recovered_control = recovered_control.expect("checked recovered workflow control");
+        let during_cancel = fresh_surface_attachment_with_capabilities(
+            &surface_handle,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        assert_eq!(
+            during_cancel
+                .foreground_operation
+                .as_ref()
+                .map(|operation| &operation.operation_id),
+            Some(&foreground.operation_id),
+            "background recovery must not cancel the active foreground operation"
+        );
+        foreground_release_tx
+            .send(())
+            .expect("release foreground after background cancellation");
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), foreground.operation_id)
+            .expect("wait foreground terminal");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), workflow_operation_id.clone())
+            .expect("wait recovered workflow cancellation");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal {
+                value: surface::OperationTerminalAtCursor {
+                    terminal: surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User
+                    },
+                    ..
+                }
+            }
+        ));
+        let recovered =
+            surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor.clone())
+                .recover_batches()
+                .expect("read recovered workflow cancellation ledger");
+        let exact = recovered
+            .committed
+            .iter()
+            .filter(|batch| {
+                batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::ControlIntentCommitted {
+                                operation_id,
+                                ..
+                            }
+                        ) if operation_id == &workflow_operation_id
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].commit_class, recovered_control.commit_class);
+        assert_eq!(exact[0].cursor_before, recovered_control.cursor_before);
+        assert_eq!(exact[0].cursor_after, recovered_control.cursor_after);
+        assert_eq!(exact[0].batch_digest, recovered_control.batch_digest);
+
+        host.shutdown()
+            .expect("shutdown workflow cancel retry host");
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn active_host_shutdown_settles_prepared_workflow_cancel_before_terminalizing_foreground() {
+        if !crate::workflow::host::WorkflowHost::node_available() {
+            return;
+        }
+        let _env = crate::history::lock_test_env();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        let fixture = checkpoint_failed_workflow_cancel_with_active_foreground(2);
+        let shutdown_started = Instant::now();
+        fixture
+            .host
+            .shutdown()
+            .expect("transient prepared workflow cancel must settle during host shutdown");
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(3),
+            "prepared workflow cancel must not make host shutdown unbounded"
+        );
+        fixture
+            .foreground_cancel_observed
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground executor did not observe host shutdown");
+        fixture
+            .foreground_completed
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground executor did not join during host shutdown");
+        let recovered = surface::JsonlSurfaceCommitLedger::new(
+            fixture.transcript_path,
+            fixture.prepared_control.cursor_before.clone(),
+        )
+        .recover_batches()
+        .expect("read settled workflow cancel");
+        assert!(recovered.prepared.is_none());
+        assert_eq!(
+            recovered
+                .committed
+                .iter()
+                .filter(|batch| {
+                    batch.commit_class == fixture.prepared_control.commit_class
+                        && batch.batch_digest == fixture.prepared_control.batch_digest
+                })
+                .count(),
+            1
+        );
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn persistent_workflow_cancel_wins_completed_before_reap_during_cold_restart() {
+        if !crate::workflow::host::WorkflowHost::node_available() {
+            return;
+        }
+        let _env = crate::history::lock_test_env();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        let fixture = checkpoint_failed_workflow_cancel_with_active_foreground(100);
+        let session_id = fixture.thread.thread_id().to_string();
+        let resume_cwd = fixture.cwd.path().to_path_buf();
+        let transcript_path = fixture.transcript_path.clone();
+        let operation_id = fixture.workflow_operation_id.clone();
+        let task_id = fixture.task_id.clone();
+        let workflow_run_id = fixture.workflow_run_id.clone();
+        let prepared = fixture.prepared_control.clone();
+        let shutdown_started = Instant::now();
+        let error = fixture
+            .host
+            .shutdown()
+            .expect_err("persistent workflow cancel recovery must retain cold-restart ownership");
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(3),
+            "persistent workflow cancel recovery must leave live shutdown in bounded time"
+        );
+        assert!(
+            matches!(
+                error,
+                RuntimeHostError::ThreadStartFailed { ref message }
+                    if message.contains(
+                        "typed workflow cancellation recovery was retained for cold restart"
+                    )
+            ),
+            "unexpected cold-handoff error: {error}"
+        );
+        fixture
+            .foreground_cancel_observed
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground executor did not observe bounded host shutdown");
+        fixture
+            .foreground_completed
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("foreground executor did not join before cold handoff");
+
+        surface::JsonlSurfaceCommitLedger::clear_terminal_checkpoint_failures(
+            transcript_path.clone(),
+        );
+        TaskRegistry::new_persistent(
+            session_id.clone(),
+            fixture._home.path().join("task-sessions"),
+        )
+        .expect("reopen durable workflow task registry")
+        .complete(
+            task_id.as_str(),
+            "worker completed before actor reaped the outcome".to_string(),
+        )
+        .expect("persist completed-before-reap workflow outcome");
+        let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+            .expect("start cold recovery runtime");
+        let resumed = resumed_host
+            .start_thread(
+                surface_test_config(resume_cwd, HistoryMode::Resume(session_id)),
+                "recover prepared workflow cancellation",
+            )
+            .expect("resume prepared workflow cancellation");
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &resumed.surface(),
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("cold recovery must retain the workflow operation");
+        assert!(matches!(
+            operation
+                .terminal
+                .as_ref()
+                .map(|terminal| &terminal.terminal),
+            Some(surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User
+            })
+        ));
+        assert!(snapshot.tasks.iter().any(|task| {
+            task.task_id == task_id && task.status == surface::SurfaceTaskStatus::Stopped
+        }));
+        assert!(snapshot.workflows.iter().any(|workflow| {
+            workflow.workflow_run_id == workflow_run_id
+                && workflow.status == surface::SurfaceWorkflowStatus::Stopped
+        }));
+        let recovered =
+            surface::JsonlSurfaceCommitLedger::new(transcript_path, prepared.cursor_before.clone())
+                .recover_batches()
+                .expect("read cold-recovered workflow cancellation");
+        assert!(recovered.prepared.is_none());
+        let exact = recovered
+            .committed
+            .iter()
+            .filter(|batch| {
+                batch.commit_class == prepared.commit_class
+                    && batch.batch_digest == prepared.batch_digest
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].cursor_before, prepared.cursor_before);
+        assert_eq!(exact[0].cursor_after, prepared.cursor_after);
+        resumed_host
+            .shutdown()
+            .expect("shutdown cold recovery runtime");
         match previous_home {
             Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
             None => unsafe { std::env::remove_var("ORCA_HOME") },
