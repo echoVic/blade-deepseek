@@ -2102,6 +2102,21 @@ impl RuntimeThreadHandle {
     }
 
     #[cfg(test)]
+    fn suspend_surface_operation_for_test(
+        &self,
+        operation_id: surface::SurfaceOperationId,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::SurfaceSuspendOperationForTest {
+            operation_id,
+            reply: reply_tx,
+        })
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        receive_reply(reply_rx, "runtime thread")
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+    }
+
+    #[cfg(test)]
     fn respond_surface_interaction_for_test(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -2397,6 +2412,19 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfaceResumeOperation {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        expected_last_generation: surface::SurfaceGenerationId,
+        resume_source: surface::ResumeSourceWitness,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::ResumeOperationOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
     SurfaceWaitOperationTerminal {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
@@ -2512,6 +2540,11 @@ enum ThreadCommand {
                 surface::SurfaceClientCommandError,
             >,
         >,
+    },
+    #[cfg(test)]
+    SurfaceSuspendOperationForTest {
+        operation_id: surface::SurfaceOperationId,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
     },
     #[cfg(test)]
     SurfaceActorTestProbe {
@@ -3029,6 +3062,27 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         })
     }
 
+    fn resume_operation(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        expected_last_generation: surface::SurfaceGenerationId,
+        resume_source: surface::ResumeSourceWitness,
+    ) -> Result<
+        surface::MutationReply<surface::ResumeOperationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceResumeOperation {
+            client,
+            request_id,
+            operation_id,
+            expected_last_generation,
+            resume_source,
+            reply,
+        })
+    }
+
     fn wait_operation_terminal(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
@@ -3236,11 +3290,20 @@ fn bootstrap_recorded_surface(
                 })?;
             loop {
                 let before = coordinator.state().snapshot().cursor.clone();
-                coordinator
+                let action = coordinator
                     .recover_operation(&operation_id, &materialization)
                     .map_err(|error| RuntimeHostError::ThreadStartFailed {
                         message: format!("failed to reconcile typed operation: {error:?}"),
                     })?;
+                if matches!(
+                    action,
+                    surface::RecoveryAction::ExposeRecoveryRequired
+                        | surface::RecoveryAction::ExposeRetryFinalization
+                        | surface::RecoveryAction::ExposeRetryProjection
+                        | surface::RecoveryAction::NoOp
+                ) {
+                    break;
+                }
                 let terminal = coordinator
                     .state()
                     .snapshot()
@@ -5326,6 +5389,74 @@ impl ThreadActor {
                 .expect("operation commit has one acknowledgement"),
             },
             value,
+        }
+    }
+
+    fn committed_surface_resume_mutation(
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        generation: surface::SurfaceOperationFence,
+        resume_batch: &surface::SurfaceCommitBatch,
+        started_batch: &surface::SurfaceCommitBatch,
+    ) -> surface::MutationReply<surface::ResumeOperationOutput> {
+        let reserved_event = &resume_batch.events.as_slice()[0];
+        let resume_event = &resume_batch.events.as_slice()[1];
+        let started_event = &started_batch.events.as_slice()[0];
+        let receipt =
+            |role, event: &surface::SurfaceEventEnvelope, batch: &surface::SurfaceCommitBatch| {
+                surface::ResumeTransitionReceipt {
+                    role,
+                    event_id: event.event_id.clone(),
+                    cursor: batch.cursor_after.clone(),
+                    commit_class: batch.commit_class.clone(),
+                }
+            };
+        let resume_starting = receipt(
+            surface::ResumeTransitionRole::ResumeStarting,
+            resume_event,
+            resume_batch,
+        );
+        let generation_reserved = receipt(
+            surface::ResumeTransitionRole::GenerationReserved,
+            reserved_event,
+            resume_batch,
+        );
+        let generation_started = receipt(
+            surface::ResumeTransitionRole::GenerationStarted,
+            started_event,
+            started_batch,
+        );
+        let acknowledgement = |receipt: &surface::ResumeTransitionReceipt| {
+            surface::MutationCommitAck::ThreadLocalCursor {
+                cursor: receipt.cursor.clone(),
+                family: surface::SurfaceFactFamily::Operation,
+                event_id: receipt.event_id.clone(),
+                commit_class: receipt.commit_class.clone(),
+            }
+        };
+        surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Operation {
+                    thread_id: generation.thread_id.clone(),
+                    operation_id: operation_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    acknowledgement(&resume_starting),
+                    acknowledgement(&generation_reserved),
+                    acknowledgement(&generation_started),
+                ])
+                .expect("resume commit has three acknowledgements"),
+            },
+            value: surface::ResumeOperationOutput {
+                operation_id,
+                generation,
+                resume_starting,
+                generation_reserved,
+                generation_started,
+                waiter: surface::OperationWaiterHandle::new(),
+            },
         }
     }
 
@@ -9230,6 +9361,302 @@ impl ThreadActor {
         Ok(value)
     }
 
+    fn bind_surface_operation_controller(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        operation_id: &surface::SurfaceOperationId,
+    ) -> bool {
+        match self
+            .resident_surface
+            .operation_origin_attachments
+            .get(operation_id)
+        {
+            Some(bound) => bound == client.attachment_id(),
+            None => {
+                let snapshot = self.resident_surface.coordinator.state().snapshot();
+                let visible = snapshot
+                    .foreground_operation
+                    .iter()
+                    .chain(snapshot.queued_operations.iter())
+                    .chain(snapshot.operation_history.iter())
+                    .any(|operation| &operation.operation_id == operation_id);
+                if visible {
+                    self.resident_surface
+                        .operation_origin_attachments
+                        .insert(operation_id.clone(), client.attachment_id().clone());
+                }
+                visible
+            }
+        }
+    }
+
+    fn resume_surface_operation(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        expected_last_generation: surface::SurfaceGenerationId,
+        resume_source: surface::ResumeSourceWitness,
+    ) -> Result<
+        surface::MutationReply<surface::ResumeOperationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        if !self.bind_surface_operation_controller(client, &operation_id)
+            || !self.resident_surface.pending_terminal_commits.is_empty()
+            || !self.resident_surface.pending_admission_commits.is_empty()
+            || !self.resident_surface.pending_admission_repairs.is_empty()
+            || !self.resident_surface.pending_admission_terminals.is_empty()
+            || self.surface_terminal_blocked.is_some()
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == operation_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if !matches!(
+            operation.phase,
+            surface::OperationPhase::Suspended {
+                cause: surface::SuspensionCause::Interrupted { .. }
+                    | surface::SuspensionCause::RecoveryRequired { .. }
+                    | surface::SuspensionCause::ProviderSuspended { .. }
+            }
+        ) || operation.pending_control.is_some()
+            || operation.finalization.is_some()
+            || operation.terminal.is_some()
+            || operation.intent.kind != surface::OperationKind::UserTurn
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let previous = operation
+            .generations
+            .last()
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if previous.fence.generation_id != expected_last_generation
+            || previous.phase != surface::GenerationPhase::Stopped
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let (input_request, request_digest) =
+            match (&operation.intent.initial_replayability, &resume_source) {
+                (
+                    surface::Replayability::Replayable {
+                        request: Some(input),
+                        request_digest: Some(request_digest),
+                        ..
+                    },
+                    surface::ResumeSourceWitness::DurableReplay {
+                        replayability_digest,
+                    },
+                ) if replayability_digest
+                    == &surface::canonical_replayability_digest(
+                        &operation.intent.initial_replayability,
+                    ) =>
+                {
+                    (input.clone(), request_digest.clone())
+                }
+                (
+                    surface::Replayability::NonReplayable {
+                        live_capsule: surface::LiveOperationCapsule::Available { incarnation },
+                        ..
+                    },
+                    surface::ResumeSourceWitness::LiveCapsule {
+                        incarnation: witness,
+                    },
+                ) if incarnation == witness && witness == &snapshot.cursor.incarnation => {
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
+                _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+            };
+        let resolved_input = resolve_surface_input(&input_request)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let generation_id = surface::SurfaceGenerationId::new(
+            previous
+                .fence
+                .generation_id
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        );
+        let fence = surface::SurfaceOperationFence {
+            thread_id: snapshot.thread.thread_id.clone(),
+            thread_owner_epoch: snapshot.thread.owner_epoch,
+            operation_id: operation_id.clone(),
+            generation_id,
+        };
+        let resume_turn_id = TurnId::new();
+        let generation = surface::GenerationRecord {
+            fence: fence.clone(),
+            logical_turn_id: resume_turn_id.clone(),
+            input: previous.input.clone(),
+            predecessor: Some(previous.fence.clone()),
+            attempt: surface::GenerationAttempt::RecoveryReplacement,
+            goal_identity: None,
+            replayability: operation.intent.initial_replayability.clone(),
+            required_capabilities: operation.intent.required_capabilities.clone(),
+            capability_fingerprint: operation.intent.capability_fingerprint.clone(),
+            phase: surface::GenerationPhase::Reserved,
+            started_witness: None,
+            stop_reason: None,
+        };
+        let resume_batch = self.surface_operation_batch(
+            &operation_id,
+            vec![
+                surface::OperationPatch::GenerationReserved {
+                    generation: generation.clone(),
+                },
+                surface::OperationPatch::ControlIntentCommitted {
+                    operation_id: operation_id.clone(),
+                    request_id: operation.request_id.clone(),
+                    intent: surface::PendingControlIntent::ResumeStarting {
+                        generation_fence: fence.clone(),
+                    },
+                },
+            ],
+        );
+        self.resident_surface
+            .coordinator
+            .commit_actor_batch(&resume_batch)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+
+        let started_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let started_batch = self.surface_operation_batch_with_commit_id(
+            &operation_id,
+            vec![surface::OperationPatch::GenerationStarted {
+                fence: fence.clone(),
+                witness: surface::GenerationStartedWitness {
+                    started_commit_id: started_commit_id.clone(),
+                    settings_revision: operation.intent.settings_revision,
+                    policy_epoch: operation.intent.policy_epoch,
+                    durable_replayability_digest: surface::canonical_replayability_digest(
+                        &operation.intent.initial_replayability,
+                    ),
+                    capability_fingerprint: operation.intent.capability_fingerprint.clone(),
+                },
+            }],
+            Some(started_commit_id),
+        );
+        if let Err(error) = self
+            .resident_surface
+            .coordinator
+            .commit_generation_batch(fence.clone(), &started_batch)
+        {
+            eprintln!("orca: typed surface resume Started commit failed: {error:?}");
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+
+        let legacy_task_id = format!("typed-resume-{}", uuid::Uuid::now_v7());
+        let loop_started_batch = self.surface_operation_batch(
+            &operation_id,
+            vec![surface::OperationPatch::AgentLoopTurnStarted {
+                turn: surface::SurfaceAgentLoopTurn {
+                    turn_id: resume_turn_id.clone(),
+                    fence: fence.clone(),
+                    ordinal: 0,
+                    task_id: surface::SurfaceTaskId::try_new(legacy_task_id.clone())
+                        .expect("generated task id is non-empty"),
+                    task_status: surface::SurfaceTaskRunningStatus::Running,
+                },
+            }],
+        );
+        if let Err(error) = self
+            .resident_surface
+            .coordinator
+            .commit_generation_batch(fence.clone(), &loop_started_batch)
+        {
+            eprintln!("orca: typed surface resume loop commit failed: {error:?}");
+            if let Err(error) =
+                self.repair_surface_admission_failure(&fence, "typed surface resume loop failed")
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "typed surface resume repair failed for {:?}: {error:?}",
+                    fence.operation_id
+                ));
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+
+        debug_assert_eq!(
+            request_digest,
+            match &operation.intent.initial_replayability {
+                surface::Replayability::Replayable {
+                    request_digest: Some(request_digest),
+                    ..
+                } => request_digest.clone(),
+                _ => unreachable!("resume replayability was checked"),
+            }
+        );
+        let interaction_command_tx = self.handle.command_tx.clone();
+        let interaction_fence = fence.clone();
+        let mut hosted_request = HostedTurnRequest::new(resolved_input.canonical_text.as_str())
+            .with_generation_handlers(move |_, _| {
+                HostedGenerationHandlers::default()
+                    .with_provider_response_ingress(Arc::new(
+                        RuntimeSurfaceProviderResponseIngress {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        },
+                    ))
+                    .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
+                    .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
+                    .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
+                    .with_mcp_elicitation_handler(Arc::new(RuntimeSurfaceMcpElicitationHandler {
+                        command_tx: interaction_command_tx.clone(),
+                        fence: interaction_fence.clone(),
+                    }))
+            });
+        hosted_request.turn_id = resume_turn_id;
+        hosted_request.task_id = Some(legacy_task_id);
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        self.handle_idle_command(ThreadCommand::StartTurn {
+            request: Box::new(hosted_request),
+            writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+            config: None,
+            reply: start_tx,
+        });
+        let start_result = start_rx
+            .recv()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if start_result.is_err() {
+            if let Err(error) =
+                self.repair_surface_admission_failure(&fence, "typed surface resume start failed")
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "typed surface resume repair failed for {:?}: {error:?}",
+                    fence.operation_id
+                ));
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        active.surface_operation = Some(fence.clone());
+        Ok(Self::committed_surface_resume_mutation(
+            request_id,
+            operation_id,
+            fence,
+            &resume_batch,
+            &started_batch,
+        ))
+    }
+
     fn cancel_surface_before_admission(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -9268,6 +9695,177 @@ impl ThreadActor {
             operation_id,
             &terminal_batch,
             surface::CancelOperationOutput::CancelledBeforeAdmission { terminal: value },
+        ))
+    }
+
+    fn cancel_surface_idle(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+    ) -> Result<
+        surface::MutationReply<surface::CancelOperationOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        if !self.bind_surface_operation_controller(client, &operation_id) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        if snapshot
+            .queued_operations
+            .iter()
+            .any(|operation| operation.operation_id == operation_id)
+        {
+            return self.cancel_surface_before_admission(client, request_id, operation_id);
+        }
+        if let Some(terminal) = self.resident_surface.terminals.get(&operation_id).cloned() {
+            return Ok(surface::MutationReply::Committed {
+                mutation: surface::CommittedMutation {
+                    request_id,
+                    target: surface::MutationTarget::Operation {
+                        thread_id: terminal.cursor.thread_id.clone(),
+                        operation_id: operation_id.clone(),
+                    },
+                    disposition: surface::MutationDisposition::AlreadyApplied,
+                    acknowledgements: surface::NonEmptyVec::try_new(vec![
+                        surface::MutationCommitAck::OperationTerminalAck {
+                            thread_id: terminal.cursor.thread_id.clone(),
+                            thread_owner_epoch: snapshot.thread.owner_epoch,
+                            operation_id: operation_id.clone(),
+                            value: terminal.clone(),
+                        },
+                    ])
+                    .expect("terminal replay has one acknowledgement"),
+                },
+                value: surface::CancelOperationOutput::AlreadyTerminal { terminal },
+            });
+        }
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == operation_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if let Some(finalization) = operation.finalization.as_ref() {
+            return Ok(surface::MutationReply::Committed {
+                mutation: surface::CommittedMutation {
+                    request_id,
+                    target: surface::MutationTarget::Operation {
+                        thread_id: snapshot.thread.thread_id.clone(),
+                        operation_id: operation_id.clone(),
+                    },
+                    disposition: surface::MutationDisposition::AlreadyApplied,
+                    acknowledgements: surface::NonEmptyVec::try_new(vec![
+                        surface::MutationCommitAck::ThreadLocalCursor {
+                            cursor: finalization.started_at.cursor.clone(),
+                            family: surface::SurfaceFactFamily::Operation,
+                            event_id: finalization.started_at.event_id.clone(),
+                            commit_class: finalization.started_at.commit_class.clone(),
+                        },
+                    ])
+                    .expect("finalization replay has one acknowledgement"),
+                },
+                value: surface::CancelOperationOutput::FinalizationPending {
+                    operation_id,
+                    finalize_intent_id: finalization.finalize_intent_id.clone(),
+                    finalization_cursor: finalization.started_at.clone(),
+                    waiter: surface::OperationWaiterHandle::new(),
+                },
+            });
+        }
+        let surface::OperationPhase::Suspended { .. } = operation.phase else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        let finalize_intent_id =
+            surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let terminal_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let suspended_cause = surface::SuspendedFinalizationCause::Terminalization(
+            surface::TerminalizationCause::UserCancel,
+        );
+        let control_batch = self.surface_operation_batch(
+            &operation_id,
+            vec![surface::OperationPatch::ControlIntentCommitted {
+                operation_id: operation_id.clone(),
+                request_id: operation.request_id.clone(),
+                intent: surface::PendingControlIntent::Terminalize {
+                    operation_id: operation_id.clone(),
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+            }],
+        );
+        self.resident_surface
+            .coordinator
+            .commit_actor_batch(&control_batch)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let finalization_batch = self.surface_operation_batch_with_commit_id(
+            &operation_id,
+            vec![surface::OperationPatch::FinalizationStarted {
+                operation_id: operation_id.clone(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                terminal_commit_id: terminal_commit_id.clone(),
+                selected_cause: surface::OperationFinalizationCause::Suspended(
+                    suspended_cause.clone(),
+                ),
+                suspended_cause: Some(suspended_cause),
+                expected_settlements: Vec::new(),
+            }],
+            None,
+        );
+        self.resident_surface
+            .coordinator
+            .commit_finalizer_batch(
+                operation_id.clone(),
+                finalize_intent_id.clone(),
+                &finalization_batch,
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let terminal = surface::OperationTerminal::Cancelled {
+            reason: surface::CancelReason::User,
+        };
+        let terminal_batch = self.surface_operation_batch_with_commit_id(
+            &operation_id,
+            vec![surface::OperationPatch::Terminal {
+                record: surface::OperationTerminalRecord {
+                    operation_id: operation_id.clone(),
+                    finalize_intent_id: finalize_intent_id.clone(),
+                    terminal: terminal.clone(),
+                    usage: surface::UsageTotals {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_tokens: 0,
+                        estimated_cost_usd_micros: 0,
+                    },
+                    source_diagnostic_digest: None,
+                    settlement_receipts: Vec::new(),
+                    committed_at: surface::UnixMillis::new(0),
+                },
+            }],
+            Some(terminal_commit_id),
+        );
+        self.resident_surface
+            .coordinator
+            .commit_finalizer_batch(operation_id.clone(), finalize_intent_id, &terminal_batch)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let terminal_at_cursor = surface::OperationTerminalAtCursor {
+            operation_id: operation_id.clone(),
+            terminal,
+            cursor: terminal_batch.cursor_after.clone(),
+            commit_class: terminal_batch.commit_class.clone(),
+            batch_digest: terminal_batch.batch_digest.clone(),
+        };
+        self.cache_surface_terminal(terminal_at_cursor);
+        Ok(Self::committed_surface_mutation(
+            request_id,
+            operation_id.clone(),
+            &control_batch,
+            surface::CancelOperationOutput::Accepted {
+                operation_id,
+                accepted_cursor: control_batch.cursor_after.clone(),
+                waiter: surface::OperationWaiterHandle::new(),
+            },
         ))
     }
 
@@ -9675,6 +10273,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceCancelOperation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceResumeOperation { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceWaitOperationTerminal { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -9734,6 +10335,10 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceRetryFinalization { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                #[cfg(test)]
+                ThreadCommand::SurfaceSuspendOperationForTest { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 #[cfg(test)]
@@ -9869,7 +10474,31 @@ impl ThreadActor {
                     &client,
                     surface::SurfaceCapability::ControlBoundOperation,
                 ) {
-                    self.cancel_surface_before_admission(&client, request_id, operation_id)
+                    self.cancel_surface_idle(&client, request_id, operation_id)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceResumeOperation {
+                client,
+                request_id,
+                operation_id,
+                expected_last_generation,
+                resume_source,
+                reply,
+            } => {
+                let result = if self.admits_surface_client(
+                    &client,
+                    surface::SurfaceCapability::ControlBoundOperation,
+                ) {
+                    self.resume_surface_operation(
+                        &client,
+                        request_id,
+                        operation_id,
+                        expected_last_generation,
+                        resume_source,
+                    )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -10008,6 +10637,10 @@ impl ThreadActor {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
                 let _ = reply.send(result);
+            }
+            #[cfg(test)]
+            ThreadCommand::SurfaceSuspendOperationForTest { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             #[cfg(test)]
             ThreadCommand::SurfaceActorTestProbe {
@@ -10302,6 +10935,9 @@ impl ThreadActor {
                 };
                 let _ = reply.send(result);
             }
+            ThreadCommand::SurfaceResumeOperation { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            }
             ThreadCommand::SurfaceWaitOperationTerminal {
                 client,
                 request_id,
@@ -10442,6 +11078,52 @@ impl ThreadActor {
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
+                let _ = reply.send(result);
+            }
+            #[cfg(test)]
+            ThreadCommand::SurfaceSuspendOperationForTest {
+                operation_id,
+                reply,
+            } => {
+                let result = (|| {
+                    let fence = active
+                        .surface_operation
+                        .as_ref()
+                        .filter(|fence| fence.operation_id == operation_id)
+                        .cloned()
+                        .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+                    let batch = self.surface_operation_batch(
+                        &operation_id,
+                        vec![
+                            surface::OperationPatch::GenerationStopped {
+                                fence: fence.clone(),
+                                reason: surface::GenerationStopReason::InterruptedResumable,
+                                usage_delta: surface::UsageTotals {
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cache_tokens: 0,
+                                    estimated_cost_usd_micros: 0,
+                                },
+                            },
+                            surface::OperationPatch::Suspended {
+                                operation_id: operation_id.clone(),
+                                cause: surface::SuspensionCause::Interrupted {
+                                    generation_id: fence.generation_id,
+                                },
+                            },
+                        ],
+                    );
+                    self.resident_surface
+                        .coordinator
+                        .commit_live_generation_suspend_batch(fence, &batch)
+                        .map_err(|error| {
+                            eprintln!("orca: test suspension commit failed: {error:?}");
+                            surface::SurfaceClientCommandError::RuntimeUnavailable
+                        })?;
+                    active.surface_operation = None;
+                    active.generation.cancel.cancel();
+                    Ok(())
+                })();
                 let _ = reply.send(result);
             }
             #[cfg(test)]
@@ -12233,6 +12915,7 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest};
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender};
     use std::time::Instant;
 
@@ -12244,6 +12927,8 @@ mod tests {
         "ORCA_RUNTIME_HOST_PREPARED_TERMINALIZATION_RESTART_CHILD";
     const EMPTY_THREAD_OWNER_RECOVERY_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_EMPTY_THREAD_OWNER_RECOVERY_CHILD";
+    const SUSPENDED_OPERATION_RECOVERY_CHILD_ENV: &str =
+        "ORCA_RUNTIME_HOST_SUSPENDED_OPERATION_RECOVERY_CHILD";
     const RESERVATION_TERMINAL_FAILURE_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -12251,6 +12936,11 @@ mod tests {
     struct GatedSuccessExecutor {
         entered: SyncSender<()>,
         release: Mutex<Receiver<()>>,
+    }
+
+    struct SuspendThenResumeExecutor {
+        calls: AtomicUsize,
+        entered: SyncSender<usize>,
     }
 
     struct CancelAwareShutdownExecutor {
@@ -12453,6 +13143,30 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .recv()
                 .expect("release successful executor");
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for SuspendThenResumeExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(call).expect("report executor entry");
+            if call == 0 {
+                while !cancel.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                thread.lifecycle_mut().finish_task(RunStatus::Cancelled);
+                return Ok(RunStatus::Cancelled.into());
+            }
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
         }
@@ -13147,6 +13861,367 @@ mod tests {
                 if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
         ));
         host.shutdown().expect("shutdown repaired runtime host");
+    }
+
+    #[test]
+    fn suspended_surface_operation_resumes_same_identity_after_durable_barriers() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let host = RuntimeHost::start_with_executor(Arc::new(SuspendThenResumeExecutor {
+            calls: AtomicUsize::new(0),
+            entered: entered_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "resume suspended typed operation",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "resume the same operation",
+                    ),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("operation was queued instead of admitted");
+        };
+        assert_eq!(entered_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), 0);
+        thread
+            .suspend_surface_operation_for_test(operation_id.clone())
+            .expect("suspend typed operation");
+
+        let suspended_snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let replayability_digest = surface::canonical_replayability_digest(
+            &suspended_snapshot
+                .foreground_operation
+                .as_ref()
+                .filter(|operation| operation.operation_id == operation_id)
+                .expect("suspended operation remains visible")
+                .intent
+                .initial_replayability,
+        );
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let resumed = loop {
+            match attachment.client.resume_operation(
+                surface_request_id(),
+                operation_id.clone(),
+                first_generation.generation_id,
+                surface::ResumeSourceWitness::DurableReplay {
+                    replayability_digest: replayability_digest.clone(),
+                },
+            ) {
+                Ok(reply) => break committed_surface_value(reply),
+                Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) => {
+                    let failed = fresh_surface_attachment_with_capabilities(
+                        &surface,
+                        BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+                    )
+                    .baseline
+                    .snapshot;
+                    let failed = failed
+                        .foreground_operation
+                        .as_ref()
+                        .filter(|operation| operation.operation_id == operation_id);
+                    panic!(
+                        "resume did not become admissible: {error:?}; runtime={:?}; phase={:?}; pending={:?}; generations={}",
+                        thread.state(),
+                        failed.map(|operation| &operation.phase),
+                        failed.and_then(|operation| operation.pending_control.as_ref()),
+                        failed.map_or(0, |operation| operation.generations.len())
+                    );
+                }
+            }
+        };
+        assert_eq!(resumed.operation_id, operation_id);
+        assert_eq!(resumed.generation.generation_id.get(), 1);
+        assert_eq!(
+            resumed.resume_starting.role,
+            surface::ResumeTransitionRole::ResumeStarting
+        );
+        assert_eq!(
+            resumed.generation_reserved.role,
+            surface::ResumeTransitionRole::GenerationReserved
+        );
+        assert_eq!(
+            resumed.generation_started.role,
+            surface::ResumeTransitionRole::GenerationStarted
+        );
+        assert_eq!(entered_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), 1);
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait resumed operation terminal");
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if value.operation_id == operation_id
+                    && matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("resumed operation reached history");
+        assert_eq!(operation.generations.len(), 2);
+        assert!(matches!(
+            operation.generations[1].attempt,
+            surface::GenerationAttempt::RecoveryReplacement
+        ));
+    }
+
+    type SuspendedOperationFixture = (
+        String,
+        surface::SurfaceOperationId,
+        surface::SurfaceGenerationId,
+        surface::Sha256Digest,
+    );
+
+    fn suspended_operation_fixture_path() -> PathBuf {
+        PathBuf::from(std::env::var_os("ORCA_HOME").expect("ORCA_HOME for recovery child"))
+            .join("suspended-operation-recovery.json")
+    }
+
+    fn run_suspended_operation_seed_child() -> ! {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(SuspendThenResumeExecutor {
+            calls: AtomicUsize::new(0),
+            entered: entered_tx,
+        }))
+        .expect("start suspended-operation seed host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "seed suspended operation",
+            )
+            .expect("start suspended-operation seed thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "recover this operation after restart",
+                    ),
+                )
+                .expect("reserve suspended-operation fixture"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit suspended-operation fixture"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("fixture operation was queued");
+        };
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("fixture executor did not start");
+        thread
+            .suspend_surface_operation_for_test(operation_id.clone())
+            .expect("durably suspend fixture operation");
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == operation_id)
+            .expect("fixture operation remains suspended");
+        let fixture: SuspendedOperationFixture = (
+            thread.thread_id().to_string(),
+            operation_id,
+            first_generation.generation_id,
+            surface::canonical_replayability_digest(&operation.intent.initial_replayability),
+        );
+        std::fs::write(
+            suspended_operation_fixture_path(),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .expect("write suspended operation fixture");
+        std::mem::forget(host);
+        std::process::exit(0)
+    }
+
+    fn run_suspended_operation_recovery_child(resume: bool) -> ! {
+        let (thread_id, operation_id, generation_id, replayability_digest):
+            SuspendedOperationFixture = serde_json::from_slice(
+            &std::fs::read(suspended_operation_fixture_path())
+                .expect("read suspended operation fixture"),
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let executor = SuspendThenResumeExecutor {
+            calls: AtomicUsize::new(1),
+            entered: entered_tx,
+        };
+        let host = RuntimeHost::start_with_executor(Arc::new(executor))
+            .expect("start suspended-operation recovery host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                "recover suspended operation",
+            )
+            .expect("resume suspended-operation thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let operation = attachment
+            .baseline
+            .snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == operation_id)
+            .expect("cold-recovered operation remains visible");
+        assert!(matches!(
+            operation.phase,
+            surface::OperationPhase::Suspended { .. }
+        ));
+
+        if resume {
+            let resumed = committed_surface_value(
+                attachment
+                    .client
+                    .resume_operation(
+                        surface_request_id(),
+                        operation_id.clone(),
+                        generation_id,
+                        surface::ResumeSourceWitness::DurableReplay {
+                            replayability_digest,
+                        },
+                    )
+                    .expect("resume cold-recovered operation"),
+            );
+            assert_eq!(resumed.operation_id, operation_id);
+            assert_eq!(entered_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), 1);
+            let terminal = attachment
+                .client
+                .wait_operation_terminal(surface_request_id(), operation_id)
+                .expect("wait resumed cold-recovered operation");
+            assert!(matches!(
+                terminal,
+                surface::WaitOperationTerminalResult::Terminal { value }
+                    if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+            ));
+        } else {
+            let cancelled = committed_surface_value(
+                attachment
+                    .client
+                    .cancel_operation(surface_request_id(), operation_id.clone())
+                    .expect("cancel cold-recovered operation"),
+            );
+            assert!(matches!(
+                cancelled,
+                surface::CancelOperationOutput::Accepted { .. }
+            ));
+            let terminal = attachment
+                .client
+                .wait_operation_terminal(surface_request_id(), operation_id)
+                .expect("wait cancelled cold-recovered operation");
+            assert!(matches!(
+                terminal,
+                surface::WaitOperationTerminalResult::Terminal { value }
+                    if matches!(
+                        value.terminal,
+                        surface::OperationTerminal::Cancelled {
+                            reason: surface::CancelReason::User,
+                        }
+                    )
+            ));
+            assert!(entered_rx.try_recv().is_err());
+        }
+        host.shutdown().expect("shutdown recovery host");
+        std::process::exit(0)
+    }
+
+    #[test]
+    fn cold_restart_exposes_exact_resume_and_cancel_for_suspended_operation() {
+        if let Some(phase) = std::env::var_os(SUSPENDED_OPERATION_RECOVERY_CHILD_ENV) {
+            match phase.to_string_lossy().as_ref() {
+                "seed" => run_suspended_operation_seed_child(),
+                "resume" => run_suspended_operation_recovery_child(true),
+                "cancel" => run_suspended_operation_recovery_child(false),
+                phase => panic!("unknown suspended-operation recovery phase: {phase}"),
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        for recovery in ["resume", "cancel"] {
+            for phase in ["seed", recovery] {
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg(
+                        "runtime_host::tests::cold_restart_exposes_exact_resume_and_cancel_for_suspended_operation",
+                    )
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(SUSPENDED_OPERATION_RECOVERY_CHILD_ENV, phase)
+                    .env("ORCA_HOME", home.path())
+                    .status()
+                    .expect("start suspended-operation recovery child");
+                assert!(
+                    status.success(),
+                    "suspended-operation recovery child failed during {phase}"
+                );
+            }
+        }
     }
 
     #[test]

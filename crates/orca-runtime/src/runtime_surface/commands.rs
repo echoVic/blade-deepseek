@@ -293,6 +293,15 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         operation_id: SurfaceOperationId,
     ) -> Result<MutationReply<CancelOperationOutput>, SurfaceClientCommandError>;
 
+    fn resume_operation(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+        expected_last_generation: SurfaceGenerationId,
+        resume_source: ResumeSourceWitness,
+    ) -> Result<MutationReply<ResumeOperationOutput>, SurfaceClientCommandError>;
+
     fn wait_operation_terminal(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -423,6 +432,25 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .cancel_operation(self.clone(), request_id, operation_id)
+    }
+
+    pub fn resume_operation(
+        &self,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+        expected_last_generation: SurfaceGenerationId,
+        resume_source: ResumeSourceWitness,
+    ) -> Result<MutationReply<ResumeOperationOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .resume_operation(
+                self.clone(),
+                request_id,
+                operation_id,
+                expected_last_generation,
+                resume_source,
+            )
     }
 
     pub fn wait_operation_terminal(

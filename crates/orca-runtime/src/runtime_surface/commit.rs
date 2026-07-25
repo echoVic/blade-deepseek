@@ -179,6 +179,11 @@ enum BatchCommitAuthority<'permit> {
         actor: &'permit SurfacePublisherPermit,
         generation: &'permit SurfacePublisherPermit,
     },
+    #[allow(dead_code)]
+    LiveGenerationSuspend {
+        actor: &'permit SurfacePublisherPermit,
+        generation: &'permit SurfacePublisherPermit,
+    },
     LiveGenerationStop {
         generation: &'permit SurfacePublisherPermit,
         finalizer: &'permit SurfacePublisherPermit,
@@ -470,6 +475,26 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             BatchCommitAuthority::LiveGenerationStop {
                 generation: &generation,
                 finalizer: &finalizer,
+            },
+            batch,
+            None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_live_generation_suspend_batch(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let generation = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::LiveGenerationSuspend {
+                actor: &self.actor_control_permit.clone(),
+                generation: &generation,
             },
             batch,
             None,
@@ -1690,6 +1715,16 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     self.owner_epoch,
                 )
             }
+            BatchCommitAuthority::LiveGenerationSuspend { actor, generation } => {
+                live_generation_suspend_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    generation,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
             BatchCommitAuthority::LiveGenerationStop {
                 generation,
                 finalizer,
@@ -1925,7 +1960,8 @@ fn permit_authorizes(
                                     | super::OperationPatch::Terminal { .. }
                             )
                         )
-                }) || actor_control_admission_pair_authorized(batch))
+                }) || actor_control_admission_pair_authorized(batch)
+                    || actor_control_resume_pair_authorized(batch))
         }
         SurfacePublisherPermit::Generation { fence, .. } => batch
             .events
@@ -2061,6 +2097,78 @@ fn actor_generation_terminalization_authorized(
             ),
             _ => false,
         })
+}
+
+fn live_generation_suspend_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    generation_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(generation_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_owner_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Generation { fence, .. },
+    ) = (actor_permit, generation_permit)
+    else {
+        return false;
+    };
+    if *actor_owner_epoch != owner_epoch
+        || thread_id != &fence.thread_id
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let Some((suspended, prefix)) = batch.events.as_slice().split_last() else {
+        return false;
+    };
+    let Some((stopped, stream_discards)) = prefix.split_last() else {
+        return false;
+    };
+    if !matches!(
+        (&stopped.scope, &stopped.event),
+        (
+            SurfaceScope::Generation { fence: scope },
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+                fence: patch_fence,
+                reason: super::GenerationStopReason::InterruptedResumable,
+                ..
+            }),
+        ) if scope == fence && patch_fence == fence
+    ) || !matches!(
+        (&suspended.scope, &suspended.event),
+        (
+            SurfaceScope::Operation {
+                operation_id: scoped_operation,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::Suspended {
+                operation_id,
+                cause: super::SuspensionCause::Interrupted { generation_id },
+            }),
+        ) if scoped_operation == &fence.operation_id
+            && operation_id == &fence.operation_id
+            && generation_id == &fence.generation_id
+    ) {
+        return false;
+    }
+    stream_discards_cover_open_streams(
+        state,
+        fence,
+        &SurfaceScope::Generation {
+            fence: fence.clone(),
+        },
+        super::AssistantDiscardReason::GenerationInterrupted,
+        stream_discards,
+    )
 }
 
 fn live_generation_stop_disposition_authorized(
@@ -2203,6 +2311,36 @@ fn actor_control_admission_pair_authorized(batch: &SurfaceCommitBatch) -> bool {
         && turn_id == logical_turn_id
         && item_presentation == presentation
         && item_correlation == correlation_id
+}
+
+fn actor_control_resume_pair_authorized(batch: &SurfaceCommitBatch) -> bool {
+    let [reserved, resume] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Generation { fence },
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationReserved { generation }),
+    ) = (&reserved.scope, &reserved.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Operation {
+            operation_id: scoped_operation,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::ControlIntentCommitted {
+            operation_id,
+            intent: super::PendingControlIntent::ResumeStarting { generation_fence },
+            ..
+        }),
+    ) = (&resume.scope, &resume.event)
+    else {
+        return false;
+    };
+    fence == &generation.fence
+        && scoped_operation == operation_id
+        && operation_id == &fence.operation_id
+        && generation_fence == fence
 }
 
 fn finalizer_event_authorized(
