@@ -12566,14 +12566,20 @@ impl ThreadActor {
         surface::MutationReply<surface::WorkflowControlOutput>,
         surface::SurfaceClientCommandError,
     > {
-        let surface::WorkflowControlAction::Launch {
-            catalog_entry_id,
-            observed_catalog_revision,
-            args,
-            parent,
-        } = action
-        else {
-            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        let (catalog_entry_id, observed_catalog_revision, args, parent) = match action {
+            surface::WorkflowControlAction::Launch {
+                catalog_entry_id,
+                observed_catalog_revision,
+                args,
+                parent,
+            } => (catalog_entry_id, observed_catalog_revision, args, parent),
+            surface::WorkflowControlAction::Stop { fence } => {
+                return self.stop_surface_workflow(request_id, fence);
+            }
+            surface::WorkflowControlAction::Pause { .. }
+            | surface::WorkflowControlAction::Resume { .. } => {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
         };
         if observed_catalog_revision
             != surface::WorkflowCatalogRevision::try_new(1).expect("one is valid")
@@ -12926,6 +12932,94 @@ impl ThreadActor {
                 waiter: Some(surface::OperationWaiterHandle::new()),
             },
         })
+    }
+
+    fn stop_surface_workflow(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        fence: surface::SurfaceWorkflowFence,
+    ) -> Result<
+        surface::MutationReply<surface::WorkflowControlOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let workflow = snapshot
+            .workflows
+            .iter()
+            .find(|workflow| {
+                workflow.workflow_run_id == fence.workflow_run_id
+                    && workflow.revision == fence.workflow_revision
+                    && workflow.parent == fence.parent
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let operation_id = snapshot
+            .tasks
+            .iter()
+            .find(|task| {
+                task.task_id == workflow.task_id
+                    && task.workflow_run_id.as_ref() == Some(&workflow.workflow_run_id)
+            })
+            .and_then(|task| task.background_fence.as_ref())
+            .map(|background| background.operation_fence.operation_id.clone())
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let reply =
+            self.cancel_surface_background_workflow(request_id, operation_id.clone(), &snapshot)?;
+        match reply {
+            surface::MutationReply::Committed {
+                mut mutation,
+                value,
+            } => {
+                let (cursor, waiter) = match value {
+                    surface::CancelOperationOutput::CancelledBeforeAdmission { terminal }
+                    | surface::CancelOperationOutput::AlreadyTerminal { terminal } => {
+                        (terminal.cursor, None)
+                    }
+                    surface::CancelOperationOutput::Accepted {
+                        accepted_cursor,
+                        waiter,
+                        ..
+                    } => (accepted_cursor, Some(waiter)),
+                    surface::CancelOperationOutput::FinalizationPending {
+                        finalization_cursor,
+                        waiter,
+                        ..
+                    } => (finalization_cursor.cursor, Some(waiter)),
+                };
+                let workflow = self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .workflows
+                    .iter()
+                    .find(|workflow| workflow.workflow_run_id == fence.workflow_run_id)
+                    .cloned()
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                mutation.target = surface::MutationTarget::Workflow {
+                    thread_id: snapshot.thread.thread_id,
+                    workflow_run_id: workflow.workflow_run_id.clone(),
+                };
+                Ok(surface::MutationReply::Committed {
+                    mutation,
+                    value: surface::WorkflowControlOutput {
+                        workflow,
+                        operation_id: Some(operation_id),
+                        cursor,
+                        waiter,
+                    },
+                })
+            }
+            surface::MutationReply::Deferred { mutation, .. } => {
+                Ok(surface::MutationReply::Deferred {
+                    mutation,
+                    partial: surface::DeferredCommandValue::NoValue,
+                })
+            }
+            surface::MutationReply::Uncommitted { mutation } => {
+                Ok(surface::MutationReply::Uncommitted { mutation })
+            }
+        }
     }
 
     fn replay_surface_workflow_launch(

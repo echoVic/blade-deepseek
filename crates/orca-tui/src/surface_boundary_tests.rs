@@ -539,6 +539,11 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         "saved workflow launch must use the typed runtime surface client"
     );
     assert!(
+        action_source.contains("crate::surface_client::stop_task")
+            && !action_source.contains("self.thread.stop_task"),
+        "workflow task stop must cancel its runtime-owned typed operation"
+    );
+    assert!(
         !APP.contains("HostedWorkflowRequest")
             && SURFACE_PROJECTION.contains("SurfaceEvent::Task")
             && SURFACE_PROJECTION.contains("SurfaceEvent::Workflow"),

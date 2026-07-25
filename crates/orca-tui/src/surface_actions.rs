@@ -178,7 +178,7 @@ impl TuiSurfaceActions {
     }
 
     pub(crate) fn stop_task(&self, task_id: &str) -> Result<Vec<BackgroundTaskSummary>, String> {
-        self.thread.stop_task(task_id)
+        crate::surface_client::stop_task(&self.thread, task_id)
     }
 
     pub(crate) fn foreground_task(

@@ -2059,6 +2059,18 @@ pub enum WorkflowControlAction {
     },
 }
 
+impl WorkflowControlAction {
+    pub fn stop(workflow: &SurfaceWorkflow) -> Self {
+        Self::Stop {
+            fence: SurfaceWorkflowFence {
+                workflow_run_id: workflow.workflow_run_id.clone(),
+                workflow_revision: workflow.revision,
+                parent: workflow.parent.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GoalRunInput {
     Supplied {

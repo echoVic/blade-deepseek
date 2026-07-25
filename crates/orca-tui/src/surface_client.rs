@@ -6,6 +6,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use orca_core::config::RunConfig;
+use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
     AttachResult, DisplayText, ExpectedGoal, FreshAttachRequest, GoalMutationAction, GoalRunInput,
@@ -355,6 +356,114 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
     let snapshot = (*attachment.baseline.snapshot).clone();
     detach(&surface, &attachment.client);
     Ok(snapshot)
+}
+
+pub(crate) fn stop_task(
+    thread: &RuntimeSurfaceThreadHandle,
+    task_id: &str,
+) -> Result<Vec<BackgroundTaskSummary>, String> {
+    if thread.session_id().is_none() {
+        return thread.stop_task(task_id);
+    }
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManageWorkflow,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { reason } => {
+            return Err(format!("typed TUI task-stop attachment denied: {reason:?}"));
+        }
+        AttachResult::Unavailable { reason } => {
+            return Err(format!(
+                "typed TUI task-stop attachment unavailable: {reason:?}"
+            ));
+        }
+        AttachResult::ThreadClosed { .. } => {
+            return Err("typed TUI task-stop thread is closed".to_string());
+        }
+        AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. } => {
+            return Err(
+                "typed TUI task-stop attachment returned an invalid fresh-attach result"
+                    .to_string(),
+            );
+        }
+    };
+    let Some(task) = attachment
+        .baseline
+        .snapshot
+        .tasks
+        .iter()
+        .find(|task| task.task_id.as_str() == task_id)
+    else {
+        detach(&surface, &attachment.client);
+        return thread.stop_task(task_id);
+    };
+    if task.task_type != orca_runtime::surface::SurfaceTaskType::Workflow
+        && task.workflow_run_id.is_none()
+    {
+        detach(&surface, &attachment.client);
+        return thread.stop_task(task_id);
+    }
+    let workflow = task
+        .workflow_run_id
+        .as_ref()
+        .and_then(|run_id| {
+            attachment
+                .baseline
+                .snapshot
+                .workflows
+                .iter()
+                .find(|workflow| &workflow.workflow_run_id == run_id)
+        })
+        .cloned();
+    let result = match workflow {
+        Some(workflow) => attachment.client.workflow_control(
+            SurfaceRequestId::new(),
+            WorkflowControlAction::stop(&workflow),
+        ),
+        None => {
+            detach(&surface, &attachment.client);
+            return Err(format!(
+                "surface task '{task_id}' has no runtime-owned workflow"
+            ));
+        }
+    };
+    detach(&surface, &attachment.client);
+    let result = result.map_err(|error| format!("typed TUI task stop failed: {error:?}"))?;
+    match result {
+        MutationReply::Committed { .. } => {}
+        MutationReply::Deferred { mutation, .. } => {
+            return Err(format!(
+                "typed TUI task stop deferred: request={:?} commit={:?}",
+                mutation.request_id, mutation.commit_id
+            ));
+        }
+        MutationReply::Uncommitted { mutation } => {
+            return Err(format!("typed TUI task stop did not commit: {mutation:?}"));
+        }
+    }
+
+    let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
+    let mut summaries = crate::surface_projection::workflow_task_summaries(&snapshot);
+    let surface_ids = summaries
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    summaries.extend(
+        thread
+            .task_summaries()
+            .into_iter()
+            .filter(|task| !surface_ids.contains(&task.id)),
+    );
+    Ok(summaries)
 }
 
 pub(crate) fn read_goal(
@@ -1700,6 +1809,118 @@ mod tests {
             TuiHostedOperationOutcome::Turn { status } if status == "cancelled"
         ));
         assert!(!controller.has_surface_active());
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_workflow_stop_routes_through_operation_cancel() {
+        if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+            return;
+        }
+        let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let workflow_dir = cwd.path().join(".orca").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow directory");
+        std::fs::write(
+            workflow_dir.join("tui-stop.js"),
+            "export const meta = { name: 'tui-stop', description: 'tui stop', phases: ['main'] };\nexport default await phase('main', async () => agent('mock_stream_delay_ms 30000'));",
+        )
+        .expect("workflow source");
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            cwd.path(),
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .expect("trusted workflow workspace");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        config.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config, "typed TUI workflow stop")
+            .expect("runtime thread");
+        let actions = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface());
+        let (event_tx, _event_rx) = mpsc::unbounded();
+
+        actions
+            .launch_workflow("tui-stop", None, &event_tx)
+            .expect("typed workflow launch");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (task_id, operation_id, workflow_run_id) = loop {
+            let snapshot = actions.read_snapshot().expect("workflow snapshot");
+            if let Some(task) = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.workflow_run_id.is_some() && task.background_fence.is_some())
+            {
+                break (
+                    task.task_id.as_str().to_string(),
+                    task.background_fence
+                        .as_ref()
+                        .expect("background fence")
+                        .operation_fence
+                        .operation_id
+                        .clone(),
+                    task.workflow_run_id.clone().expect("workflow run"),
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "typed workflow never became background-owned"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let summaries = actions.stop_task(&task_id).expect("typed workflow stop");
+        assert!(
+            summaries.iter().any(|task| {
+                task.id == task_id
+                    && matches!(
+                        task.status,
+                        orca_core::task_types::TaskStatus::Stopping
+                            | orca_core::task_types::TaskStatus::Stopped
+                            | orca_core::task_types::TaskStatus::Cancelled
+                    )
+            }),
+            "TUI stop result must come from the typed task projection"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = actions.read_snapshot().expect("terminal workflow snapshot");
+            let cancelled = snapshot.operation_history.iter().any(|operation| {
+                operation.operation_id == operation_id
+                    && operation.terminal.as_ref().is_some_and(|record| {
+                        matches!(record.terminal, OperationTerminal::Cancelled { .. })
+                    })
+            });
+            let workflow_stopped = snapshot.workflows.iter().any(|workflow| {
+                workflow.workflow_run_id == workflow_run_id
+                    && matches!(
+                        workflow.status,
+                        orca_runtime::surface::SurfaceWorkflowStatus::Stopped
+                            | orca_runtime::surface::SurfaceWorkflowStatus::Cancelled
+                    )
+            });
+            if cancelled && workflow_stopped {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "typed workflow stop never reached cancelled terminal"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
