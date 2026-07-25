@@ -4486,44 +4486,119 @@ fn update_goal_status_for_session(
         ));
         return false;
     };
-    let mut detached_join = None;
-    let runtime = match thread {
-        Some(thread) => match thread.goal_runtime() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                return false;
-            }
-        },
-        None => match orca_runtime::goal_actor::GoalRuntimeHandle::open_default() {
-            Ok((runtime, join)) => {
-                detached_join = Some(join);
-                runtime
-            }
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                return false;
-            }
-        },
-    };
+    match thread {
+        Some(thread) => {
+            let runtime = match thread.typed_surface().goal() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                    return false;
+                }
+            };
+            update_goal_status_with(
+                status,
+                event_tx,
+                {
+                    let runtime = runtime.clone();
+                    move || {
+                        runtime
+                            .resume(
+                                session_id,
+                                orca_core::goal_runtime::GoalTurnOrigin::Resume,
+                                now_timestamp(),
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                },
+                {
+                    let runtime = runtime.clone();
+                    move || {
+                        runtime
+                            .pause(
+                                session_id,
+                                orca_core::goal_runtime::GoalPauseReason::User,
+                                "paused by user",
+                                now_timestamp(),
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                },
+                move || {
+                    runtime
+                        .project_thread_goal(session_id)
+                        .map_err(|error| error.to_string())
+                },
+            )
+        }
+        None => {
+            let (runtime, join) = match orca_runtime::goal_actor::GoalRuntimeHandle::open_default()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                    return false;
+                }
+            };
+            let project_runtime = runtime.clone();
+            let updated = update_goal_status_with(
+                status,
+                event_tx,
+                {
+                    let runtime = runtime.clone();
+                    move || {
+                        runtime
+                            .resume(
+                                session_id,
+                                orca_core::goal_runtime::GoalTurnOrigin::Resume,
+                                now_timestamp(),
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                },
+                {
+                    let runtime = runtime.clone();
+                    move || {
+                        runtime
+                            .pause(
+                                session_id,
+                                orca_core::goal_runtime::GoalPauseReason::User,
+                                "paused by user",
+                                now_timestamp(),
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                },
+                move || {
+                    project_runtime
+                        .project_thread_goal(session_id)
+                        .map_err(|error| error.to_string())
+                },
+            );
+            drop(runtime);
+            let _ = join.join();
+            updated
+        }
+    }
+}
+
+fn update_goal_status_with(
+    status: orca_core::goal_types::ThreadGoalStatus,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    resume: impl FnOnce() -> Result<(), String>,
+    pause: impl FnOnce() -> Result<(), String>,
+    project: impl FnOnce() -> Result<Option<orca_core::goal_types::ThreadGoal>, String>,
+) -> bool {
     let result = match status {
-        orca_core::goal_types::ThreadGoalStatus::Active => runtime.resume(
-            session_id,
-            orca_core::goal_runtime::GoalTurnOrigin::Resume,
-            now_timestamp(),
-        ),
-        orca_core::goal_types::ThreadGoalStatus::Paused => runtime.pause(
-            session_id,
-            orca_core::goal_runtime::GoalPauseReason::User,
-            "paused by user",
-            now_timestamp(),
-        ),
-        _ => Err(orca_runtime::goal_actor::GoalActorError::Invalid(
-            "TUI can only pause or resume a goal through this command".to_string(),
-        )),
+        orca_core::goal_types::ThreadGoalStatus::Active => resume(),
+        orca_core::goal_types::ThreadGoalStatus::Paused => pause(),
+        _ => Err("TUI can only pause or resume a goal through this command".to_string()),
     };
-    let updated = match result {
-        Ok(_) => match runtime.project_thread_goal(session_id) {
+    match result {
+        Ok(()) => match project() {
             Ok(Some(goal)) => {
                 let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
                 true
@@ -4533,7 +4608,7 @@ fn update_goal_status_for_session(
                 false
             }
             Err(error) => {
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                let _ = event_tx.send(TuiEvent::Error(error));
                 false
             }
         },
@@ -4541,12 +4616,7 @@ fn update_goal_status_for_session(
             let _ = event_tx.send(TuiEvent::Error(format!("failed to update goal: {error}")));
             false
         }
-    };
-    drop(runtime);
-    if let Some(join) = detached_join {
-        let _ = join.join();
     }
-    updated
 }
 
 fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
