@@ -19877,9 +19877,11 @@ mod tests {
                 .map(|outcome| match outcome {
                     crate::controller::ThreadTurnOutcome::Completed {
                         status,
+                        end_reason,
                         background_workflows,
                     } => ThreadOperationOutcome::Completed {
                         status,
+                        end_reason,
                         background_workflows,
                     },
                     crate::controller::ThreadTurnOutcome::ProviderSuspended {
@@ -25935,13 +25937,22 @@ mod tests {
         };
         let continuation_input =
             resolve_surface_input(continuation_request).expect("resolve continuation capsule");
-        assert_eq!(
-            continuation_input.canonical_text.as_str(),
-            goal_continuation_prompt(
-                "continue once before verified completion",
-                usize::try_from(successor_goal.outer_turn_count).unwrap()
-            )
+        let continuation_number =
+            usize::try_from(successor_goal.outer_turn_count).expect("continuation number");
+        let continuation_prompt = continuation_input.canonical_text.as_str();
+        assert!(
+            continuation_prompt.contains(&format!("[Goal continuation #{continuation_number}]"))
         );
+        assert!(
+            continuation_prompt
+                .contains("<objective>\ncontinue once before verified completion\n</objective>")
+        );
+        assert!(
+            continuation_prompt.contains("- trigger: progress")
+                || continuation_prompt.contains("- trigger: gap_feedback"),
+            "successful predecessor must continue through progress or fresh gap feedback"
+        );
+        assert!(continuation_prompt.contains("- previous outer-turn status: success"));
         assert!(matches!(
             snapshot.goal.as_ref().map(|goal| &goal.state),
             Some(surface::SurfaceGoalState::Complete { .. })
