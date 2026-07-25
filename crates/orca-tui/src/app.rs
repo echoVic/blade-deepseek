@@ -17,6 +17,7 @@ use ratatui::backend::CrosstermBackend;
 #[cfg(test)]
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
+#[cfg(test)]
 use orca_core::conversation::Message;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
@@ -160,26 +161,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
         Some(config.prompt.clone())
     };
 
-    let startup_preloaded_transcript = if matches!(
-        config.history_mode,
-        HistoryMode::Resume(_) | HistoryMode::Fork(_)
-    ) {
-        if let Ok(transcript) = orca_runtime::history::load_session(match &config.history_mode {
-            HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
-            HistoryMode::Record | HistoryMode::Disabled => "",
-        }) {
-            Some(transcript)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let shared_config = Arc::new(Mutex::new(config.clone()));
     let agent_config = Arc::clone(&shared_config);
+    // Session selectors are resolved by RuntimeHost. Keeping this lane empty
+    // prevents the TUI from becoming the history owner before the runtime
+    // can establish its lease and typed surface.
     let preloaded_transcript: Arc<Mutex<Option<history::SessionTranscript>>> =
-        Arc::new(Mutex::new(startup_preloaded_transcript));
+        Arc::new(Mutex::new(None));
     let agent_preloaded = Arc::clone(&preloaded_transcript);
     let agent_event_tx = event_tx.clone();
     let agent_workflow_notifications = pending_workflow_notifications.clone();
@@ -205,14 +193,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             );
         },
     )?;
-    let mut pending_initial_prompt = if typed_history_startup_eligible(
-        &config.history_mode,
-        &preloaded_transcript,
-    ) {
-        initial_prompt.clone()
-    } else {
-        None
-    };
+    let mut pending_initial_prompt =
+        if typed_history_startup_eligible(&config.history_mode, &preloaded_transcript) {
+            initial_prompt.clone()
+        } else {
+            None
+        };
     // These moved bindings are declared after the runtime so unwinding drops
     // the event receiver and restores the terminal before the runtime joins.
     let terminal_cleanup = pending_terminal_cleanup;
@@ -2222,12 +2208,9 @@ mod tests {
                 .unwrap();
             writer.complete("success").unwrap();
             let session_id = history::load_session("latest").unwrap().meta.session_id;
-            let preloaded = history::load_session(&session_id).unwrap();
 
-            let mut harness = HostedTuiHarness::start(
-                test_config(HistoryMode::Resume(session_id)),
-                Some(preloaded),
-            );
+            let mut harness =
+                HostedTuiHarness::start(test_config(HistoryMode::Resume(session_id)), None);
             let event = harness
                 .event_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -5068,22 +5051,27 @@ fn ensure_hosted_thread(
     thread: &mut Option<RuntimeThreadHandle>,
     host: &RuntimeHostHandle,
     config: &RunConfig,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     title: &str,
     mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
     if thread.is_none() {
-        let transcript = preloaded.lock().unwrap().clone();
-        let mut request = RuntimeThreadStartRequest::new(config.clone(), title)
+        let request = RuntimeThreadStartRequest::new(config.clone(), title)
             .with_mcp_registry(mcp_registry.clone());
-        if let Some(transcript) = transcript {
-            request = request.with_preloaded(transcript);
-        }
+        #[cfg(test)]
+        let request = if let Some(transcript) = _preloaded.lock().unwrap().clone() {
+            request.with_preloaded(transcript)
+        } else {
+            request
+        };
         let started = host
             .start_thread_with_request(request)
             .map_err(|error| format!("failed to initialize conversation history: {error}"))?;
-        *preloaded.lock().unwrap() = None;
+        #[cfg(test)]
+        {
+            *_preloaded.lock().unwrap() = None;
+        }
         notify_recovered_background_approvals_for_tui(&started.task_registry(), event_tx);
         *thread = Some(started);
     }
@@ -5145,18 +5133,12 @@ fn emit_typed_history_snapshot(
 
 fn typed_history_startup_eligible(
     mode: &HistoryMode,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
 ) -> bool {
-    let HistoryMode::Resume(selector) = mode else {
+    let (HistoryMode::Resume(selector) | HistoryMode::Fork(selector)) = mode else {
         return false;
     };
-    let session_id = preloaded
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|transcript| transcript.meta.session_id.clone())
-        .unwrap_or_else(|| selector.clone());
-    looks_like_uuid_session_id(&session_id)
+    selector == "latest" || looks_like_uuid_session_id(selector)
 }
 
 fn looks_like_uuid_session_id(value: &str) -> bool {
@@ -5675,6 +5657,7 @@ fn resume_latest_active_goal_hosted(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage> {
     match message {
         Message::System { .. } => None,

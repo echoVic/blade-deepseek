@@ -4,11 +4,9 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{KeyCode, KeyEvent};
 
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_runtime::history;
 use orca_runtime::history::SessionTranscript;
 
-use crate::app::chat_message_from_history;
-use crate::types::{AppState, AppStatus, ChatMessage};
+use crate::types::{AppState, AppStatus};
 
 pub(crate) fn handle_session_picker_key<F>(
     key: &KeyEvent,
@@ -62,31 +60,19 @@ where
     if let Ok(mut cfg) = shared_config.lock() {
         cfg.history_mode = HistoryMode::Resume(session_id.clone());
     }
-    if let Ok(transcript) = history::load_session(&session_id) {
-        let restored_messages = transcript
-            .messages
-            .iter()
-            .cloned()
-            .filter_map(chat_message_from_history)
-            .collect::<Vec<_>>();
-        state.replace_messages(restored_messages);
-        state.scroll_offset = 0;
-        state.auto_scroll = true;
-        if let Some((explanation, plan)) = &transcript.plan {
-            state.current_plan = Some((explanation.clone(), plan.clone()));
-        } else {
-            state.current_plan = None;
-        }
-        state.plan_update_failed = false;
-        state.push_message(ChatMessage::System(
-            "Resumed saved conversation.".to_string(),
-        ));
-        state.finalized_count = state.messages.len();
-        if let Ok(mut preloaded) = preloaded_transcript.lock() {
-            *preloaded = Some(transcript);
-        }
-        clear_terminal()?;
+    // The runtime owns session resolution and typed history projection. Clear
+    // the old view now; the controller emits HistoryLoaded after it acquires
+    // the resumed thread and reads its durable surface snapshot.
+    state.replace_messages(Vec::new());
+    state.scroll_offset = 0;
+    state.auto_scroll = true;
+    state.current_plan = None;
+    state.plan_update_failed = false;
+    state.finalized_count = 0;
+    if let Ok(mut preloaded) = preloaded_transcript.lock() {
+        *preloaded = None;
     }
+    clear_terminal()?;
     state.set_status(AppStatus::Idle);
     Ok(())
 }
