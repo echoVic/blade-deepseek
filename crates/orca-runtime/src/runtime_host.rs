@@ -13401,6 +13401,7 @@ fn run_hosted_operation(
                 event_observer.as_deref(),
             );
             let usage_before = thread.session().aggregate_usage_totals();
+            let messages_before = thread.session().conversation().messages.len();
             let outcome = executor.run_turn(thread, request, generation, events, writer, cancel);
             let status = match &outcome {
                 Ok(ThreadOperationOutcome::Completed { status, .. }) => *status,
@@ -13411,12 +13412,17 @@ fn run_hosted_operation(
                 usage_before,
                 thread.session().aggregate_usage_totals(),
             );
+            let evidence = crate::thread::turn_progress_evidence_since(
+                thread.session().conversation(),
+                messages_before,
+            );
             thread.finish_goal_turn(
                 binding.as_ref(),
                 status,
                 usage,
                 Some(events),
                 event_observer.as_deref(),
+                evidence,
                 generation.config(),
                 cancel.clone(),
             );

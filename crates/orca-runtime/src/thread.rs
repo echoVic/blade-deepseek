@@ -30,6 +30,22 @@ pub struct RuntimeThread {
     goal_actor_join: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Per-outer-turn activity counters used by the goal no-progress watchdog.
+/// Counts observable runtime activity, not semantic success: a turn that ran
+/// many tools but achieved nothing still reports activity here, and is
+/// distinguished later by gap fingerprint repetition rather than by volume.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TurnProgressEvidence {
+    pub(crate) tool_count: u32,
+    pub(crate) model_response_count: u32,
+}
+
+impl TurnProgressEvidence {
+    pub(crate) fn has_activity(&self) -> bool {
+        self.tool_count > 0 || self.model_response_count > 0
+    }
+}
+
 impl RuntimeThread {
     pub fn start(config: &RunConfig, title: impl Into<String>) -> io::Result<Self> {
         let session = InteractiveSession::new_with_preloaded(config, &title.into(), None)?;
@@ -149,6 +165,7 @@ impl RuntimeThread {
         usage: orca_core::goal_runtime::GoalUsage,
         mut events: Option<&mut EventFactory>,
         observer: Option<&dyn orca_core::event_sink::EventObserver>,
+        evidence: TurnProgressEvidence,
         config: &RunConfig,
         cancel: CancelToken,
     ) {
@@ -179,8 +196,8 @@ impl RuntimeThread {
             &turn.session_id,
             goal_status,
             usage.clone(),
-            0,
-            0,
+            evidence.tool_count,
+            evidence.model_response_count,
             None,
             now_timestamp(),
         );
@@ -402,6 +419,7 @@ impl RuntimeThread {
     ) -> io::Result<RunStatus> {
         let binding = self.begin_goal_turn(request)?;
         let usage_before = self.session.aggregate_usage_totals();
+        let messages_before = self.session.conversation().messages.len();
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -412,12 +430,14 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request(request, writer);
+        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
         self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             None,
             None,
+            evidence,
             config,
             CancelToken::new(),
         );
@@ -434,6 +454,7 @@ impl RuntimeThread {
         let binding = self.begin_goal_turn(request)?;
         let verifier_cancel = cancel.clone();
         let usage_before = self.session.aggregate_usage_totals();
+        let messages_before = self.session.conversation().messages.len();
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -444,12 +465,14 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request_with_cancel(request, writer, cancel);
+        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
         self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             None,
             None,
+            evidence,
             config,
             verifier_cancel,
         );
@@ -485,6 +508,7 @@ impl RuntimeThread {
         Self::emit_goal_turn_started(binding.as_ref(), events, observer);
         let verifier_cancel = cancel.clone();
         let usage_before = self.session.aggregate_usage_totals();
+        let messages_before = self.session.conversation().messages.len();
         let thread_extensions = self.thread_extensions_handle();
         let turn_extension_id = self.next_turn_extension_id();
         let result = ThreadTurnExecutor::new_with_thread_extensions(
@@ -495,12 +519,14 @@ impl RuntimeThread {
             turn_extension_id,
         )
         .run_request_with_event_factory_and_cancel(request, writer, events, cancel);
+        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
         self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             Some(events),
             observer,
+            evidence,
             config,
             verifier_cancel,
         );
@@ -540,9 +566,11 @@ impl RuntimeThread {
         Self::emit_goal_turn_started(binding.as_ref(), events, observer);
         let verifier_cancel = cancel.clone();
         let usage_before = self.session.aggregate_usage_totals();
+        let messages_before = self.session.conversation().messages.len();
         let result = self.run_request_with_event_factory_and_cancel_outcome_unbound(
             config, request, writer, events, cancel,
         );
+        let evidence = turn_progress_evidence_since(self.session.conversation(), messages_before);
         self.finish_goal_turn(
             binding.as_ref(),
             match &result {
@@ -553,6 +581,7 @@ impl RuntimeThread {
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             Some(events),
             observer,
+            evidence,
             config,
             verifier_cancel,
         );
@@ -593,6 +622,32 @@ pub(crate) fn goal_usage_delta(
         ..orca_core::goal_runtime::GoalUsage::default()
     }
 }
+
+/// Counts assistant responses and tool results added after `since_index`.
+/// Compaction can shrink the conversation mid-turn, so a shrunk log yields
+/// zero rather than a bogus count from a negative delta.
+pub(crate) fn turn_progress_evidence_since(
+    conversation: &orca_core::conversation::Conversation,
+    since_index: usize,
+) -> TurnProgressEvidence {
+    let Some(added) = conversation.messages.get(since_index..) else {
+        return TurnProgressEvidence::default();
+    };
+    let mut evidence = TurnProgressEvidence::default();
+    for message in added {
+        match message {
+            orca_core::conversation::Message::Assistant { .. } => {
+                evidence.model_response_count = evidence.model_response_count.saturating_add(1);
+            }
+            orca_core::conversation::Message::Tool { .. } => {
+                evidence.tool_count = evidence.tool_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    evidence
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -645,6 +700,60 @@ mod tests {
             desktop_notifications: false,
             auto_memory: false,
         }
+    }
+
+    #[test]
+    fn turn_progress_evidence_reports_activity() {
+        let empty = TurnProgressEvidence::default();
+        assert_eq!(empty.tool_count, 0);
+        assert_eq!(empty.model_response_count, 0);
+        assert!(!empty.has_activity());
+
+        let active = TurnProgressEvidence {
+            tool_count: 3,
+            model_response_count: 1,
+        };
+        assert!(active.has_activity());
+
+        let responses_only = TurnProgressEvidence {
+            tool_count: 0,
+            model_response_count: 2,
+        };
+        assert!(responses_only.has_activity());
+    }
+
+    #[test]
+    fn turn_progress_evidence_since_counts_only_new_messages() {
+        use orca_core::conversation::Conversation;
+
+        let mut conversation = Conversation::new();
+        conversation.messages.push(orca_core::conversation::Message::User {
+            content: "before".to_string(),
+            pinned: false,
+        });
+        let baseline = conversation.messages.len();
+
+        conversation.messages.push(orca_core::conversation::Message::Assistant {
+            content: Some("hi".to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            pinned: false,
+        });
+        conversation.messages.push(orca_core::conversation::Message::Tool {
+            tool_call_id: "call-1".to_string(),
+            content: "ok".to_string(),
+            terminal: None,
+            pinned: false,
+        });
+
+        let evidence = turn_progress_evidence_since(&conversation, baseline);
+        assert_eq!(evidence.model_response_count, 1);
+        assert_eq!(evidence.tool_count, 1);
+        assert!(evidence.has_activity());
+
+        // A conversation shrunk by compaction must not panic or overcount.
+        let shrunk = turn_progress_evidence_since(&conversation, 99);
+        assert_eq!(shrunk, TurnProgressEvidence::default());
     }
 
     #[test]
