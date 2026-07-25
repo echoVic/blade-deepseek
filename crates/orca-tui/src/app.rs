@@ -17,7 +17,6 @@ use ratatui::backend::CrosstermBackend;
 #[cfg(test)]
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
-#[cfg(test)]
 use orca_core::conversation::Message;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
@@ -5657,7 +5656,6 @@ fn resume_latest_active_goal_hosted(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage> {
     match message {
         Message::System { .. } => None,
