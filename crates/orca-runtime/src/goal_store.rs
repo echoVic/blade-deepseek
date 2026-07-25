@@ -14,8 +14,9 @@ use orca_core::goal_runtime::{
 use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus, validate_thread_goal_objective};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DATABASE_FILENAME: &str = "goals.sqlite3";
 const LEGACY_FILENAME: &str = "goals_1.json";
 const LEGACY_MIGRATION_KEY: &str = "legacy_goals_1_migrated";
@@ -149,6 +150,56 @@ pub struct FinishOuterTurnOutcome {
     pub usage: GoalUsage,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalSurfaceMutationContext {
+    pub store_commit_id: String,
+    pub command_digest: [u8; 32],
+    pub goal_owner_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoalSurfaceTokenBudgetUpdate {
+    Keep,
+    Set(Option<i64>),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GoalSurfaceMutation {
+    Created,
+    Edited {
+        previous_revision: u32,
+    },
+    Removed {
+        previous_revision: u32,
+        tombstone_revision: u32,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GoalSurfaceRowState {
+    Present(GoalRecord),
+    Removed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GoalSurfaceStoreReceipt {
+    pub store_commit_id: String,
+    pub goal_id: GoalId,
+    pub goal_revision: u32,
+    pub objective_revision: u32,
+    pub catalog_revision: u32,
+    pub goal_owner_epoch: u64,
+    pub row_state: GoalSurfaceRowState,
+    pub receipt_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GoalSurfaceMutationRecord {
+    pub session_id: String,
+    pub mutation: GoalSurfaceMutation,
+    pub receipt: GoalSurfaceStoreReceipt,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct LegacyGoalDb {
     goals: BTreeMap<String, ThreadGoal>,
@@ -158,6 +209,23 @@ struct StoredGoal {
     record: GoalRecord,
     created_at: i64,
     updated_at: i64,
+}
+
+struct StoredGoalSurfaceState {
+    goal_id: GoalId,
+    goal_revision: u32,
+    objective_revision: u32,
+    catalog_revision: u32,
+    goal_owner_epoch: u64,
+    row_present: bool,
+}
+
+struct StoredSurfaceMutation {
+    session_id: String,
+    store_commit_id: String,
+    command_digest: Vec<u8>,
+    receipt_digest: Vec<u8>,
+    payload_json: String,
 }
 
 impl GoalStore {
@@ -208,6 +276,43 @@ impl GoalStore {
         })
     }
 
+    pub(crate) fn claim_surface_owner_epoch(&self) -> Result<u64, GoalStoreError> {
+        const OWNER_EPOCH_KEY: &str = "surface_owner_epoch";
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT value FROM goal_meta WHERE key = ?1",
+                [OWNER_EPOCH_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    GoalStoreError::Invalid(
+                        "stored Goal surface owner epoch is not a u64".to_string(),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let next = current.checked_add(1).ok_or_else(|| {
+            GoalStoreError::Invalid("Goal surface owner epoch exhausted".to_string())
+        })?;
+        if next > i64::MAX as u64 {
+            return Err(GoalStoreError::Invalid(
+                "Goal surface owner epoch exceeds SQLite range".to_string(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO goal_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![OWNER_EPOCH_KEY, next.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
     pub fn create_goal(&self, input: CreateGoalInput) -> Result<GoalRecord, GoalStoreError> {
         validate_thread_goal_objective(&input.objective).map_err(GoalStoreError::Invalid)?;
         if input.session_id.trim().is_empty() {
@@ -225,6 +330,7 @@ impl GoalStore {
         let state = GoalState::Active;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session_not_surface_owned(&transaction, input.session_id.trim(), "create")?;
         transaction.execute(
             "INSERT INTO goals (
                 goal_id, session_id, objective, objective_revision, state,
@@ -252,6 +358,485 @@ impl GoalStore {
         Ok(self
             .get_by_session(input.session_id.trim())?
             .expect("created goal must be readable"))
+    }
+
+    pub fn create_goal_for_surface(
+        &self,
+        input: CreateGoalInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_thread_goal_objective(&input.objective).map_err(GoalStoreError::Invalid)?;
+        if input.session_id.trim().is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "goal session id must not be empty".to_string(),
+            ));
+        }
+        if input.token_budget.is_some_and(|budget| budget <= 0) {
+            return Err(GoalStoreError::Invalid(
+                "goal token budget must be positive".to_string(),
+            ));
+        }
+        validate_surface_mutation_context(&context)?;
+
+        let session_id = input.session_id.trim().to_string();
+        let objective = input.objective.trim().to_string();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM goals WHERE session_id = ?1",
+                [&session_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal already exists for the surface session".to_string(),
+            ));
+        }
+        let previous_catalog_revision = transaction
+            .query_row(
+                "SELECT catalog_revision FROM goal_surface_state WHERE session_id = ?1",
+                [&session_id],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let catalog_revision = previous_catalog_revision.checked_add(1).ok_or_else(|| {
+            GoalStoreError::Invalid("goal catalog revision exhausted".to_string())
+        })?;
+        let goal_id = GoalId::new();
+        let state = GoalState::Active;
+        transaction.execute(
+            "INSERT INTO goals (
+                goal_id, session_id, objective, objective_revision, state,
+                token_budget, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?6)",
+            params![
+                goal_id.as_str(),
+                session_id,
+                objective,
+                state_json(&state)?,
+                input.token_budget,
+                input.now,
+            ],
+        )?;
+        insert_transition(
+            &transaction,
+            &goal_id,
+            None,
+            &state,
+            &state,
+            "created",
+            input.now,
+        )?;
+        let record = load_stored_goal(&transaction, &session_id)?
+            .expect("surface-created goal must be readable")
+            .record;
+        let mutation = GoalSurfaceMutation::Created;
+        let row_state = GoalSurfaceRowState::Present(record);
+        let receipt = goal_surface_receipt(
+            &context,
+            &session_id,
+            &mutation,
+            goal_id.clone(),
+            1,
+            1,
+            catalog_revision,
+            row_state,
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.clone(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, input.now)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub fn adopt_goal_for_surface(
+        &self,
+        session_id: &str,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "goal session id must not be empty".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let previous_state = load_goal_surface_state(&transaction, session_id)?;
+        if previous_state
+            .as_ref()
+            .is_some_and(|state| state.row_present)
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal already has a durable surface owner".to_string(),
+            ));
+        }
+        let mut stored = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("legacy goal does not exist for adoption".to_string())
+        })?;
+        ensure_goal_not_in_flight(&transaction, stored.record.goal_id.as_str(), "adopt")?;
+        if stored.record.current_run.is_some() {
+            let adopted_at = Utc::now().timestamp();
+            let previous = stored.record.state.clone();
+            let next = if matches!(previous, GoalState::Complete { .. }) {
+                previous.clone()
+            } else {
+                GoalState::Paused {
+                    reason: GoalPauseReason::Recovery,
+                    message: "closed a legacy Goal run without typed operation ownership"
+                        .to_string(),
+                }
+            };
+            transaction.execute(
+                "UPDATE goal_runs
+                 SET status = 'recovered', in_flight = 0,
+                     finished_at = COALESCE(finished_at, ?1)
+                 WHERE goal_id = ?2 AND finished_at IS NULL",
+                params![adopted_at, stored.record.goal_id.as_str()],
+            )?;
+            if previous != next {
+                transaction.execute(
+                    "UPDATE goals SET state = ?1, updated_at = ?2 WHERE goal_id = ?3",
+                    params![
+                        state_json(&next)?,
+                        adopted_at,
+                        stored.record.goal_id.as_str()
+                    ],
+                )?;
+                insert_transition(
+                    &transaction,
+                    &stored.record.goal_id,
+                    None,
+                    &previous,
+                    &next,
+                    "surface_adoption_recovery",
+                    adopted_at,
+                )?;
+            }
+            stored = load_stored_goal(&transaction, session_id)?
+                .expect("adopted legacy Goal remains readable");
+        }
+        let catalog_revision = previous_state.map_or(Ok(1), |state| {
+            state.catalog_revision.checked_add(1).ok_or_else(|| {
+                GoalStoreError::Invalid("goal catalog revision exhausted".to_string())
+            })
+        })?;
+        let mutation = GoalSurfaceMutation::Created;
+        let receipt = goal_surface_receipt(
+            &context,
+            session_id,
+            &mutation,
+            stored.record.goal_id.clone(),
+            1,
+            stored.record.objective_revision,
+            catalog_revision,
+            GoalSurfaceRowState::Present(stored.record),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, stored.updated_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub fn clear_goal_for_surface(
+        &self,
+        session_id: &str,
+        expected_goal_id: &GoalId,
+        expected_goal_revision: u32,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_surface_mutation_context(&context)?;
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "goal session id must not be empty".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || &state.goal_id != expected_goal_id
+            || state.goal_revision != expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal surface fence is stale".to_string(),
+            ));
+        }
+        ensure_goal_not_in_flight(&transaction, expected_goal_id.as_str(), "clear")?;
+        let changed =
+            transaction.execute("DELETE FROM goals WHERE session_id = ?1", [session_id])?;
+        if changed != 1 {
+            return Err(GoalStoreError::Invalid(
+                "goal disappeared before surface clear".to_string(),
+            ));
+        }
+        let tombstone_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let catalog_revision = state.catalog_revision.checked_add(1).ok_or_else(|| {
+            GoalStoreError::Invalid("goal catalog revision exhausted".to_string())
+        })?;
+        let mutation = GoalSurfaceMutation::Removed {
+            previous_revision: state.goal_revision,
+            tombstone_revision,
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            tombstone_revision,
+            state.objective_revision,
+            catalog_revision,
+            GoalSurfaceRowState::Removed,
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, Utc::now().timestamp())?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_goal_for_surface(
+        &self,
+        session_id: &str,
+        expected_goal_id: &GoalId,
+        expected_goal_revision: u32,
+        objective: &str,
+        token_budget_update: GoalSurfaceTokenBudgetUpdate,
+        updated_at: i64,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalStoreError> {
+        validate_thread_goal_objective(objective).map_err(GoalStoreError::Invalid)?;
+        if matches!(
+            token_budget_update,
+            GoalSurfaceTokenBudgetUpdate::Set(Some(budget)) if budget <= 0
+        ) {
+            return Err(GoalStoreError::Invalid(
+                "goal token budget must be positive".to_string(),
+            ));
+        }
+        validate_surface_mutation_context(&context)?;
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err(GoalStoreError::Invalid(
+                "goal session id must not be empty".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, context.goal_owner_epoch)?;
+        if let Some(replay) = replay_surface_mutation(&transaction, &context)? {
+            transaction.commit()?;
+            return Ok(replay);
+        }
+        let state = load_goal_surface_state(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal surface state does not exist".to_string())
+        })?;
+        if !state.row_present
+            || &state.goal_id != expected_goal_id
+            || state.goal_revision != expected_goal_revision
+        {
+            return Err(GoalStoreError::Invalid(
+                "goal surface fence is stale".to_string(),
+            ));
+        }
+        let stored = load_stored_goal(&transaction, session_id)?.ok_or_else(|| {
+            GoalStoreError::Invalid("goal disappeared before surface edit".to_string())
+        })?;
+        ensure_goal_not_in_flight(&transaction, expected_goal_id.as_str(), "edit")?;
+        let token_budget = match token_budget_update {
+            GoalSurfaceTokenBudgetUpdate::Keep => stored.record.token_budget,
+            GoalSurfaceTokenBudgetUpdate::Set(token_budget) => token_budget,
+        };
+        let objective = objective.trim();
+        let objective_revision_increment =
+            i64::from(u8::from(stored.record.objective != objective));
+        let previous_state = stored.record.state;
+        let next_state = GoalState::Active;
+        transaction.execute(
+            "UPDATE goals SET objective = ?1,
+                objective_revision = objective_revision + ?2,
+                state = ?3, token_budget = ?4, updated_at = ?5 WHERE session_id = ?6",
+            params![
+                objective,
+                objective_revision_increment,
+                state_json(&next_state)?,
+                token_budget,
+                updated_at,
+                session_id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE goal_runs
+             SET status = 'edited', in_flight = 0, finished_at = COALESCE(finished_at, ?1)
+             WHERE goal_id = ?2 AND finished_at IS NULL",
+            params![updated_at, expected_goal_id.as_str()],
+        )?;
+        insert_transition(
+            &transaction,
+            expected_goal_id,
+            None,
+            &previous_state,
+            &next_state,
+            "edited",
+            updated_at,
+        )?;
+        let record = load_stored_goal(&transaction, session_id)?
+            .expect("surface-edited goal must be readable")
+            .record;
+        let goal_revision = state
+            .goal_revision
+            .checked_add(1)
+            .ok_or_else(|| GoalStoreError::Invalid("goal revision exhausted".to_string()))?;
+        let mutation = GoalSurfaceMutation::Edited {
+            previous_revision: state.goal_revision,
+        };
+        let retained_context = GoalSurfaceMutationContext {
+            goal_owner_epoch: state.goal_owner_epoch,
+            ..context.clone()
+        };
+        let receipt = goal_surface_receipt(
+            &retained_context,
+            session_id,
+            &mutation,
+            state.goal_id,
+            goal_revision,
+            record.objective_revision,
+            state.catalog_revision,
+            GoalSurfaceRowState::Present(record),
+        )?;
+        let output = GoalSurfaceMutationRecord {
+            session_id: session_id.to_string(),
+            mutation,
+            receipt,
+        };
+        persist_surface_mutation(&transaction, &context, &output, updated_at)?;
+        persist_surface_state(&transaction, &output)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
+    pub fn pending_surface_mutations(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<GoalSurfaceMutationRecord>, GoalStoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT session_id, store_commit_id, command_digest, receipt_digest, payload_json
+             FROM goal_surface_outbox
+             WHERE session_id = ?1 AND acknowledged = 0
+             ORDER BY sequence ASC",
+        )?;
+        statement
+            .query_map([session_id], |row| {
+                Ok(StoredSurfaceMutation {
+                    session_id: row.get(0)?,
+                    store_commit_id: row.get(1)?,
+                    command_digest: row.get(2)?,
+                    receipt_digest: row.get(3)?,
+                    payload_json: row.get(4)?,
+                })
+            })?
+            .map(|stored| {
+                let stored = stored?;
+                validate_stored_surface_mutation(&stored).map(|(_, mutation)| mutation)
+            })
+            .collect()
+    }
+
+    pub fn acknowledge_surface_mutation(
+        &self,
+        store_commit_id: &str,
+        receipt_digest: &[u8; 32],
+        goal_owner_epoch: u64,
+    ) -> Result<bool, GoalStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_surface_owner_epoch(&transaction, goal_owner_epoch)?;
+        let stored = transaction
+            .query_row(
+                "SELECT session_id, store_commit_id, command_digest, receipt_digest, payload_json
+                 FROM goal_surface_outbox
+                 WHERE store_commit_id = ?1",
+                [store_commit_id],
+                |row| {
+                    Ok(StoredSurfaceMutation {
+                        session_id: row.get(0)?,
+                        store_commit_id: row.get(1)?,
+                        command_digest: row.get(2)?,
+                        receipt_digest: row.get(3)?,
+                        payload_json: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(false);
+        };
+        let (_, mutation) = validate_stored_surface_mutation(&stored)?;
+        if &mutation.receipt.receipt_digest != receipt_digest {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE goal_surface_outbox SET acknowledged = 1
+             WHERE store_commit_id = ?1",
+            [store_commit_id],
+        )?;
+        let acknowledged: i64 = transaction.query_row(
+            "SELECT acknowledged FROM goal_surface_outbox WHERE store_commit_id = ?1",
+            [store_commit_id],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        if acknowledged != 1 {
+            return Err(GoalStoreError::Invalid(format!(
+                "Goal surface acknowledgement did not persist (changed={changed}, value={acknowledged})"
+            )));
+        }
+        Ok(true)
     }
 
     pub fn get_by_session(&self, session_id: &str) -> Result<Option<GoalRecord>, GoalStoreError> {
@@ -335,6 +920,7 @@ impl GoalStore {
         }
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session_not_surface_owned(&transaction, session_id, "edit")?;
         let row: Option<(String, String)> = transaction
             .query_row(
                 "SELECT goal_id, state FROM goals WHERE session_id = ?1",
@@ -388,6 +974,8 @@ impl GoalStore {
     ) -> Result<Option<GoalRecord>, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session_not_surface_owned(&transaction, source_session_id, "resume")?;
+        ensure_session_not_surface_owned(&transaction, resumed_session_id, "resume into")?;
         let source = transaction
             .query_row(
                 "SELECT goal_id, objective, token_budget, created_at, state
@@ -522,6 +1110,7 @@ impl GoalStore {
     pub fn begin_run(&self, input: BeginGoalRunInput) -> Result<(), GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_not_surface_owned(&transaction, &input.goal_id, "begin a run for")?;
         let state = goal_state_by_id(&transaction, &input.goal_id)?;
         if !state.should_continue() {
             return Err(GoalStoreError::Invalid(format!(
@@ -547,6 +1136,7 @@ impl GoalStore {
     pub fn begin_outer_turn(&self, input: BeginOuterTurnInput) -> Result<(), GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_not_surface_owned(&transaction, &input.goal_id, "begin an outer turn for")?;
         let changed = transaction.execute(
             "UPDATE goal_runs
              SET current_outer_turn_id = ?1,
@@ -585,6 +1175,7 @@ impl GoalStore {
     pub fn record_usage_once(&self, event: GoalUsageEvent) -> Result<GoalUsage, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_not_surface_owned(&transaction, &event.goal_id, "record usage for")?;
         transaction.execute(
             "INSERT OR IGNORE INTO goal_usage_events (
                 usage_event_id, goal_id, source, charged_input_tokens,
@@ -640,6 +1231,7 @@ impl GoalStore {
     ) -> Result<GoalUsage, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_not_surface_owned(&transaction, &event.goal_id, "record verifier usage for")?;
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO goal_usage_events (
                 usage_event_id, goal_id, source, charged_input_tokens,
@@ -713,6 +1305,11 @@ impl GoalStore {
     pub fn record_intent(&self, record: GoalIntentRecord) -> Result<GoalUpdateAck, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_outer_turn_not_surface_owned(
+            &transaction,
+            &record.outer_turn_id,
+            "record an intent for",
+        )?;
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO goal_intents (
                 intent_id, outer_turn_id, requested_state, payload_json,
@@ -752,6 +1349,7 @@ impl GoalStore {
     ) -> Result<FinishOuterTurnOutcome, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_not_surface_owned(&transaction, &input.goal_id, "finish an outer turn for")?;
         let status: Option<String> = transaction
             .query_row(
                 "SELECT status FROM goal_turns
@@ -898,6 +1496,7 @@ impl GoalStore {
     ) -> Result<(), GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_not_surface_owned(&transaction, goal_id, "transition")?;
         let previous = goal_state_by_id(&transaction, goal_id).map_err(|error| match error {
             GoalStoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
                 GoalStoreError::Invalid("goal does not exist".to_string())
@@ -948,6 +1547,7 @@ impl GoalStore {
     ) -> Result<(), GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_not_surface_owned(&transaction, goal_id, "transition")?;
         let previous = goal_state_by_id(&transaction, goal_id).map_err(|error| match error {
             GoalStoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
                 GoalStoreError::Invalid("goal does not exist".to_string())
@@ -1063,6 +1663,7 @@ impl GoalStore {
     pub fn clear_goal(&self, session_id: &str) -> Result<bool, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session_not_surface_owned(&transaction, session_id, "clear")?;
         let goal_id = transaction
             .query_row(
                 "SELECT goal_id FROM goals WHERE session_id = ?1",
@@ -1152,6 +1753,27 @@ impl GoalStore {
                 next_state TEXT NOT NULL,
                 reason_code TEXT NOT NULL,
                 evidence_json TEXT,
+                created_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS goal_surface_state (
+                session_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                goal_revision INTEGER NOT NULL,
+                objective_revision INTEGER NOT NULL,
+                catalog_revision INTEGER NOT NULL,
+                goal_owner_epoch INTEGER NOT NULL,
+                row_present INTEGER NOT NULL,
+                last_store_commit_id TEXT NOT NULL,
+                last_receipt_digest BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS goal_surface_outbox (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_commit_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                command_digest BLOB NOT NULL,
+                receipt_digest BLOB NOT NULL,
+                payload_json TEXT NOT NULL,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
              );",
         )?;
@@ -1266,6 +1888,23 @@ impl GoalStore {
     pub(crate) fn recover_in_flight_runs(&self) -> Result<Vec<GoalRecoveryRecord>, GoalStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let surface_owned_in_flight: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM goal_runs AS runs
+                JOIN goals ON goals.goal_id = runs.goal_id
+                JOIN goal_surface_state AS surface
+                  ON surface.session_id = goals.session_id
+                WHERE runs.in_flight = 1
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if surface_owned_in_flight {
+            return Err(GoalStoreError::Invalid(
+                "surface-owned Goal recovery requires the typed recovery path".to_string(),
+            ));
+        }
         let recoveries = {
             let mut statement = transaction.prepare(
                 "SELECT runs.goal_run_id, runs.goal_id, runs.current_outer_turn_id,
@@ -1559,6 +2198,355 @@ fn closed_run_status(state: &GoalState) -> Option<&'static str> {
     }
 }
 
+fn validate_surface_mutation_context(
+    context: &GoalSurfaceMutationContext,
+) -> Result<(), GoalStoreError> {
+    if context.store_commit_id.trim().is_empty() {
+        return Err(GoalStoreError::Invalid(
+            "goal surface store commit id must not be empty".to_string(),
+        ));
+    }
+    if context.goal_owner_epoch == 0 || context.goal_owner_epoch > i64::MAX as u64 {
+        return Err(GoalStoreError::Invalid(
+            "goal surface owner epoch must fit a positive SQLite integer".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_surface_owner_epoch(
+    transaction: &Transaction<'_>,
+    expected_epoch: u64,
+) -> Result<(), GoalStoreError> {
+    let current = transaction
+        .query_row(
+            "SELECT value FROM goal_meta WHERE key = 'surface_owner_epoch'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            GoalStoreError::Invalid("Goal surface owner lease has not been acquired".to_string())
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            GoalStoreError::Invalid("stored Goal surface owner epoch is not a u64".to_string())
+        })?;
+    if current != expected_epoch {
+        return Err(GoalStoreError::Invalid(format!(
+            "Goal surface owner epoch is stale: expected {current}, received {expected_epoch}"
+        )));
+    }
+    Ok(())
+}
+
+fn replay_surface_mutation(
+    transaction: &Transaction<'_>,
+    context: &GoalSurfaceMutationContext,
+) -> Result<Option<GoalSurfaceMutationRecord>, GoalStoreError> {
+    let existing = transaction
+        .query_row(
+            "SELECT session_id, store_commit_id, command_digest, receipt_digest, payload_json
+             FROM goal_surface_outbox
+             WHERE store_commit_id = ?1",
+            [&context.store_commit_id],
+            |row| {
+                Ok(StoredSurfaceMutation {
+                    session_id: row.get(0)?,
+                    store_commit_id: row.get(1)?,
+                    command_digest: row.get(2)?,
+                    receipt_digest: row.get(3)?,
+                    payload_json: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(stored) = existing else {
+        return Ok(None);
+    };
+    let (command_digest, mutation) = validate_stored_surface_mutation(&stored)?;
+    if command_digest != context.command_digest {
+        return Err(GoalStoreError::Invalid(
+            "goal surface store commit id was reused for a different command".to_string(),
+        ));
+    }
+    Ok(Some(mutation))
+}
+
+fn goal_surface_receipt(
+    context: &GoalSurfaceMutationContext,
+    session_id: &str,
+    mutation: &GoalSurfaceMutation,
+    goal_id: GoalId,
+    goal_revision: u32,
+    objective_revision: u32,
+    catalog_revision: u32,
+    row_state: GoalSurfaceRowState,
+) -> Result<GoalSurfaceStoreReceipt, GoalStoreError> {
+    let receipt_digest = goal_surface_receipt_digest(
+        &context.store_commit_id,
+        &context.command_digest,
+        session_id,
+        mutation,
+        &goal_id,
+        goal_revision,
+        objective_revision,
+        catalog_revision,
+        context.goal_owner_epoch,
+        &row_state,
+    )?;
+    Ok(GoalSurfaceStoreReceipt {
+        store_commit_id: context.store_commit_id.clone(),
+        goal_id,
+        goal_revision,
+        objective_revision,
+        catalog_revision,
+        goal_owner_epoch: context.goal_owner_epoch,
+        row_state,
+        receipt_digest,
+    })
+}
+
+fn goal_surface_receipt_digest(
+    store_commit_id: &str,
+    command_digest: &[u8; 32],
+    session_id: &str,
+    mutation: &GoalSurfaceMutation,
+    goal_id: &GoalId,
+    goal_revision: u32,
+    objective_revision: u32,
+    catalog_revision: u32,
+    goal_owner_epoch: u64,
+    row_state: &GoalSurfaceRowState,
+) -> Result<[u8; 32], GoalStoreError> {
+    #[derive(Serialize)]
+    struct DigestInput<'a> {
+        store_commit_id: &'a str,
+        command_digest: &'a [u8; 32],
+        session_id: &'a str,
+        mutation: &'a GoalSurfaceMutation,
+        goal_id: &'a GoalId,
+        goal_revision: u32,
+        objective_revision: u32,
+        catalog_revision: u32,
+        goal_owner_epoch: u64,
+        row_state: &'a GoalSurfaceRowState,
+    }
+
+    let digest = Sha256::digest(serde_json::to_vec(&DigestInput {
+        store_commit_id,
+        command_digest,
+        session_id,
+        mutation,
+        goal_id,
+        goal_revision,
+        objective_revision,
+        catalog_revision,
+        goal_owner_epoch,
+        row_state,
+    })?);
+    Ok(digest.into())
+}
+
+fn exact_digest(bytes: &[u8], label: &str) -> Result<[u8; 32], GoalStoreError> {
+    bytes.try_into().map_err(|_| {
+        GoalStoreError::Invalid(format!(
+            "stored Goal surface {label} is not exactly 32 bytes"
+        ))
+    })
+}
+
+fn validate_stored_surface_mutation(
+    stored: &StoredSurfaceMutation,
+) -> Result<([u8; 32], GoalSurfaceMutationRecord), GoalStoreError> {
+    let command_digest = exact_digest(&stored.command_digest, "command digest")?;
+    let stored_receipt_digest = exact_digest(&stored.receipt_digest, "receipt digest")?;
+    let mutation: GoalSurfaceMutationRecord = serde_json::from_str(&stored.payload_json)?;
+    let receipt = &mutation.receipt;
+
+    if mutation.session_id != stored.session_id
+        || receipt.store_commit_id != stored.store_commit_id
+        || receipt.receipt_digest != stored_receipt_digest
+    {
+        return Err(GoalStoreError::Invalid(
+            "stored Goal surface outbox metadata disagrees with its payload".to_string(),
+        ));
+    }
+    let canonical_receipt_digest = goal_surface_receipt_digest(
+        &receipt.store_commit_id,
+        &command_digest,
+        &mutation.session_id,
+        &mutation.mutation,
+        &receipt.goal_id,
+        receipt.goal_revision,
+        receipt.objective_revision,
+        receipt.catalog_revision,
+        receipt.goal_owner_epoch,
+        &receipt.row_state,
+    )?;
+    if canonical_receipt_digest != receipt.receipt_digest {
+        return Err(GoalStoreError::Invalid(
+            "stored Goal surface receipt failed canonical digest validation".to_string(),
+        ));
+    }
+    let shape_matches = match (&mutation.mutation, &receipt.row_state) {
+        (GoalSurfaceMutation::Created, GoalSurfaceRowState::Present(goal)) => {
+            receipt.goal_revision == 1
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+        }
+        (GoalSurfaceMutation::Edited { previous_revision }, GoalSurfaceRowState::Present(goal)) => {
+            previous_revision.checked_add(1) == Some(receipt.goal_revision)
+                && goal.session_id == mutation.session_id
+                && goal.goal_id == receipt.goal_id
+                && goal.objective_revision == receipt.objective_revision
+        }
+        (
+            GoalSurfaceMutation::Removed {
+                previous_revision,
+                tombstone_revision,
+            },
+            GoalSurfaceRowState::Removed,
+        ) => {
+            previous_revision.checked_add(1) == Some(*tombstone_revision)
+                && receipt.goal_revision == *tombstone_revision
+        }
+        _ => false,
+    };
+    if !shape_matches
+        || receipt.goal_revision == 0
+        || receipt.objective_revision == 0
+        || receipt.catalog_revision == 0
+        || receipt.goal_owner_epoch == 0
+    {
+        return Err(GoalStoreError::Invalid(
+            "stored Goal surface mutation payload is structurally inconsistent".to_string(),
+        ));
+    }
+    Ok((command_digest, mutation))
+}
+
+fn persist_surface_mutation(
+    transaction: &Transaction<'_>,
+    context: &GoalSurfaceMutationContext,
+    output: &GoalSurfaceMutationRecord,
+    created_at: i64,
+) -> Result<(), GoalStoreError> {
+    transaction.execute(
+        "INSERT INTO goal_surface_outbox (
+            store_commit_id, session_id, command_digest, receipt_digest,
+            payload_json, acknowledged, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        params![
+            context.store_commit_id,
+            output.session_id,
+            context.command_digest.as_slice(),
+            output.receipt.receipt_digest.as_slice(),
+            serde_json::to_string(output)?,
+            created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_surface_state(
+    transaction: &Transaction<'_>,
+    output: &GoalSurfaceMutationRecord,
+) -> Result<(), GoalStoreError> {
+    let row_present = i64::from(matches!(
+        output.receipt.row_state,
+        GoalSurfaceRowState::Present(_)
+    ));
+    transaction.execute(
+        "INSERT INTO goal_surface_state (
+            session_id, goal_id, goal_revision, objective_revision,
+            catalog_revision, goal_owner_epoch, row_present,
+            last_store_commit_id, last_receipt_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(session_id) DO UPDATE SET
+            goal_id = excluded.goal_id,
+            goal_revision = excluded.goal_revision,
+            objective_revision = excluded.objective_revision,
+            catalog_revision = excluded.catalog_revision,
+            goal_owner_epoch = excluded.goal_owner_epoch,
+            row_present = excluded.row_present,
+            last_store_commit_id = excluded.last_store_commit_id,
+            last_receipt_digest = excluded.last_receipt_digest",
+        params![
+            output.session_id,
+            output.receipt.goal_id.as_str(),
+            output.receipt.goal_revision,
+            output.receipt.objective_revision,
+            output.receipt.catalog_revision,
+            i64::try_from(output.receipt.goal_owner_epoch).map_err(|_| {
+                GoalStoreError::Invalid("goal surface owner epoch overflowed SQLite".to_string())
+            })?,
+            row_present,
+            output.receipt.store_commit_id,
+            output.receipt.receipt_digest.as_slice(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_goal_surface_state(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<StoredGoalSurfaceState>, GoalStoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT goal_id, goal_revision, objective_revision, catalog_revision,
+                    goal_owner_epoch, row_present
+             FROM goal_surface_state WHERE session_id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        goal_id,
+        goal_revision,
+        objective_revision,
+        catalog_revision,
+        goal_owner_epoch,
+        row_present,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    let positive_u32 = |value: i64, name: &str| {
+        u32::try_from(value)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                GoalStoreError::Invalid(format!("stored goal surface {name} is not a positive u32"))
+            })
+    };
+    let goal_owner_epoch = u64::try_from(goal_owner_epoch)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            GoalStoreError::Invalid("stored goal surface owner epoch is not positive".to_string())
+        })?;
+    Ok(Some(StoredGoalSurfaceState {
+        goal_id: GoalId::parse(goal_id).map_err(GoalStoreError::Invalid)?,
+        goal_revision: positive_u32(goal_revision, "revision")?,
+        objective_revision: positive_u32(objective_revision, "objective revision")?,
+        catalog_revision: positive_u32(catalog_revision, "catalog revision")?,
+        goal_owner_epoch,
+        row_present: row_present == 1,
+    }))
+}
+
 fn goal_state_by_id(
     connection: &Connection,
     goal_id: &GoalId,
@@ -1586,6 +2574,76 @@ fn ensure_goal_not_in_flight(
     if in_flight {
         return Err(GoalStoreError::Invalid(format!(
             "cannot {action} goal while an outer turn is in flight"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_session_not_surface_owned(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    action: &str,
+) -> Result<(), GoalStoreError> {
+    let surface_owned: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM goal_surface_state WHERE session_id = ?1
+        )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    if surface_owned {
+        return Err(GoalStoreError::Invalid(format!(
+            "cannot {action} a surface-owned Goal through the legacy store path"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_goal_not_surface_owned(
+    transaction: &Transaction<'_>,
+    goal_id: &GoalId,
+    action: &str,
+) -> Result<(), GoalStoreError> {
+    let surface_owned: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM goals
+            JOIN goal_surface_state AS surface
+              ON surface.session_id = goals.session_id
+            WHERE goals.goal_id = ?1
+        )",
+        [goal_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if surface_owned {
+        return Err(GoalStoreError::Invalid(format!(
+            "cannot {action} a surface-owned Goal through the legacy store path"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_outer_turn_not_surface_owned(
+    transaction: &Transaction<'_>,
+    outer_turn_id: &GoalOuterTurnId,
+    action: &str,
+) -> Result<(), GoalStoreError> {
+    let surface_owned: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM goal_turns AS turns
+            JOIN goal_runs AS runs ON runs.goal_run_id = turns.goal_run_id
+            JOIN goals ON goals.goal_id = runs.goal_id
+            JOIN goal_surface_state AS surface
+              ON surface.session_id = goals.session_id
+            WHERE turns.outer_turn_id = ?1
+        )",
+        [outer_turn_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if surface_owned {
+        return Err(GoalStoreError::Invalid(format!(
+            "cannot {action} a surface-owned Goal through the legacy store path"
         )));
     }
     Ok(())
@@ -1735,6 +2793,18 @@ mod tests {
             .unwrap()
     }
 
+    fn surface_context(
+        store_commit_id: &str,
+        command_digest: [u8; 32],
+        goal_owner_epoch: u64,
+    ) -> GoalSurfaceMutationContext {
+        GoalSurfaceMutationContext {
+            store_commit_id: store_commit_id.to_string(),
+            command_digest,
+            goal_owner_epoch,
+        }
+    }
+
     #[test]
     fn sqlite_store_creates_and_projects_goal_state() {
         let dir = tempdir().unwrap();
@@ -1748,7 +2818,615 @@ mod tests {
         assert_eq!(record.state, GoalState::Active);
         assert_eq!(projection.status, ThreadGoalStatus::Active);
         assert_eq!(projection.tokens_used, 0);
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn surface_create_is_atomic_replayable_and_acknowledged_by_exact_receipt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("goals.sqlite3");
+        let store = GoalStore::open(&path).unwrap();
+        let input = CreateGoalInput {
+            session_id: "surface-create".to_string(),
+            objective: "ship a recoverable Goal surface".to_string(),
+            token_budget: Some(42_000),
+            now: 100,
+        };
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let context = surface_context("019f8b4d-7d73-7b52-8f44-2cfeac060001", [1; 32], owner_epoch);
+
+        let first = store
+            .create_goal_for_surface(input.clone(), context.clone())
+            .unwrap();
+        let replay = store
+            .create_goal_for_surface(input, context.clone())
+            .unwrap();
+
+        assert_eq!(replay, first);
+        assert_eq!(store.goal_count().unwrap(), 1);
+        assert_eq!(first.receipt.goal_revision, 1);
+        assert_eq!(first.receipt.catalog_revision, 1);
+        assert_eq!(first.receipt.goal_owner_epoch, owner_epoch);
+        assert!(matches!(first.mutation, GoalSurfaceMutation::Created));
+        assert!(matches!(
+            first.receipt.row_state,
+            GoalSurfaceRowState::Present(ref goal)
+                if goal.session_id == "surface-create"
+                    && goal.objective == "ship a recoverable Goal surface"
+        ));
+
+        let conflict = store
+            .create_goal_for_surface(
+                CreateGoalInput {
+                    session_id: "surface-create".to_string(),
+                    objective: "different command".to_string(),
+                    token_budget: Some(42_000),
+                    now: 100,
+                },
+                GoalSurfaceMutationContext {
+                    command_digest: [2; 32],
+                    ..context.clone()
+                },
+            )
+            .unwrap_err();
+        assert!(conflict.to_string().contains("different command"));
+
+        drop(store);
+        let reopened = GoalStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .pending_surface_mutations("surface-create")
+                .unwrap(),
+            vec![first.clone()]
+        );
+        assert!(
+            !reopened
+                .acknowledge_surface_mutation(&context.store_commit_id, &[9; 32], owner_epoch,)
+                .unwrap()
+        );
+        assert_eq!(
+            reopened
+                .pending_surface_mutations("surface-create")
+                .unwrap(),
+            vec![first.clone()]
+        );
+        assert!(
+            reopened
+                .acknowledge_surface_mutation(
+                    &context.store_commit_id,
+                    &first.receipt.receipt_digest,
+                    owner_epoch,
+                )
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .pending_surface_mutations("surface-create")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .create_goal_for_surface(
+                    CreateGoalInput {
+                        session_id: "surface-create".to_string(),
+                        objective: "ship a recoverable Goal surface".to_string(),
+                        token_budget: Some(42_000),
+                        now: 100,
+                    },
+                    context,
+                )
+                .unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn stale_surface_owner_epoch_cannot_mutate_or_append_an_outbox_record() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let first_owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let created = store
+            .create_goal_for_surface(
+                CreateGoalInput {
+                    session_id: "stale-surface-owner".to_string(),
+                    objective: "retain the first committed objective".to_string(),
+                    token_budget: None,
+                    now: 100,
+                },
+                surface_context(
+                    "019f8b4d-7d73-7b52-8f44-2cfeac060020",
+                    [20; 32],
+                    first_owner_epoch,
+                ),
+            )
+            .unwrap();
+        let next_owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        assert!(next_owner_epoch > first_owner_epoch);
+        let stale_ack_error = store
+            .acknowledge_surface_mutation(
+                &created.receipt.store_commit_id,
+                &created.receipt.receipt_digest,
+                first_owner_epoch,
+            )
+            .unwrap_err();
+
+        let error = store
+            .edit_goal_for_surface(
+                "stale-surface-owner",
+                &created.receipt.goal_id,
+                created.receipt.goal_revision,
+                "must not commit from the stale owner",
+                GoalSurfaceTokenBudgetUpdate::Keep,
+                101,
+                surface_context(
+                    "019f8b4d-7d73-7b52-8f44-2cfeac060021",
+                    [21; 32],
+                    first_owner_epoch,
+                ),
+            )
+            .unwrap_err();
+
+        assert!(stale_ack_error.to_string().contains("owner epoch is stale"));
+        assert!(error.to_string().contains("owner epoch is stale"));
+        assert_eq!(
+            store
+                .get_by_session("stale-surface-owner")
+                .unwrap()
+                .unwrap()
+                .objective,
+            "retain the first committed objective"
+        );
+        assert_eq!(
+            store
+                .pending_surface_mutations("stale-surface-owner")
+                .unwrap(),
+            vec![created]
+        );
+    }
+
+    #[test]
+    fn legacy_mutation_paths_cannot_bypass_a_surface_owned_goal() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let created = store
+            .create_goal_for_surface(
+                CreateGoalInput {
+                    session_id: "surface-owned-legacy-guard".to_string(),
+                    objective: "keep one durable Goal owner".to_string(),
+                    token_budget: Some(1_000),
+                    now: 100,
+                },
+                surface_context(
+                    "019f8b4d-7d73-7b52-8f44-2cfeac060023",
+                    [23; 32],
+                    owner_epoch,
+                ),
+            )
+            .unwrap();
+
+        let edit_error = store
+            .edit_goal(
+                "surface-owned-legacy-guard",
+                "legacy edit must not commit",
+                None,
+                101,
+            )
+            .unwrap_err();
+        let clear_error = store.clear_goal("surface-owned-legacy-guard").unwrap_err();
+        let begin_run_error = store
+            .begin_run(BeginGoalRunInput {
+                goal_id: created.receipt.goal_id.clone(),
+                goal_run_id: GoalRunId::new(),
+                origin: GoalTurnOrigin::User,
+                started_at: 102,
+            })
+            .unwrap_err();
+        let usage_error = store
+            .record_usage_once(GoalUsageEvent {
+                usage_event_id: "legacy-usage-must-not-commit".to_string(),
+                goal_id: created.receipt.goal_id.clone(),
+                source: "model".to_string(),
+                usage: GoalUsage {
+                    charged_input_tokens: 10,
+                    output_tokens: 5,
+                    ..GoalUsage::default()
+                },
+                created_at: 103,
+            })
+            .unwrap_err();
+        let transition_error = store
+            .transition_state(
+                &created.receipt.goal_id,
+                GoalState::Paused {
+                    reason: GoalPauseReason::User,
+                    message: "legacy transition must not commit".to_string(),
+                },
+                "legacy_pause",
+                None,
+                104,
+            )
+            .unwrap_err();
+
+        for error in [
+            edit_error,
+            clear_error,
+            begin_run_error,
+            usage_error,
+            transition_error,
+        ] {
+            assert!(error.to_string().contains("legacy store path"));
+        }
+        let stored = store
+            .get_by_session("surface-owned-legacy-guard")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.objective, "keep one durable Goal owner");
+        assert_eq!(stored.state, GoalState::Active);
+        assert_eq!(stored.usage, GoalUsage::default());
+        assert!(stored.current_run.is_none());
+        assert_eq!(
+            store
+                .pending_surface_mutations("surface-owned-legacy-guard")
+                .unwrap(),
+            vec![created]
+        );
+    }
+
+    #[test]
+    fn corrupted_surface_outbox_payload_fails_replay_scan_and_acknowledgement_closed() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let input = CreateGoalInput {
+            session_id: "corrupted-surface-outbox".to_string(),
+            objective: "canonical objective".to_string(),
+            token_budget: None,
+            now: 100,
+        };
+        let context = surface_context(
+            "019f8b4d-7d73-7b52-8f44-2cfeac060022",
+            [22; 32],
+            owner_epoch,
+        );
+        let created = store
+            .create_goal_for_surface(input.clone(), context.clone())
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE goal_surface_outbox SET command_digest = ?1
+                 WHERE store_commit_id = ?2",
+                params![[99_u8; 32].as_slice(), context.store_commit_id],
+            )
+            .unwrap();
+        let command_digest_error = store
+            .pending_surface_mutations("corrupted-surface-outbox")
+            .unwrap_err();
+        assert!(
+            command_digest_error
+                .to_string()
+                .contains("canonical digest")
+        );
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE goal_surface_outbox SET command_digest = ?1
+                 WHERE store_commit_id = ?2",
+                params![context.command_digest.as_slice(), context.store_commit_id],
+            )
+            .unwrap();
+        let mut corrupted = created.clone();
+        let GoalSurfaceRowState::Present(goal) = &mut corrupted.receipt.row_state else {
+            panic!("created surface mutation must contain the Goal row");
+        };
+        goal.objective = "tampered objective".to_string();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE goal_surface_outbox SET payload_json = ?1
+                 WHERE store_commit_id = ?2",
+                params![
+                    serde_json::to_string(&corrupted).unwrap(),
+                    context.store_commit_id
+                ],
+            )
+            .unwrap();
+
+        let scan_error = store
+            .pending_surface_mutations("corrupted-surface-outbox")
+            .unwrap_err();
+        assert!(scan_error.to_string().contains("canonical digest"));
+        let replay_error = store
+            .create_goal_for_surface(input, context.clone())
+            .unwrap_err();
+        assert!(replay_error.to_string().contains("canonical digest"));
+        let acknowledge_error = store
+            .acknowledge_surface_mutation(
+                &context.store_commit_id,
+                &created.receipt.receipt_digest,
+                owner_epoch,
+            )
+            .unwrap_err();
+        assert!(acknowledge_error.to_string().contains("canonical digest"));
+    }
+
+    #[test]
+    fn surface_adoption_preserves_a_legacy_goal_and_creates_the_recovery_outbox() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let legacy = store
+            .create_goal(CreateGoalInput {
+                session_id: "legacy-surface-goal".to_string(),
+                objective: "preserve the existing Goal".to_string(),
+                token_budget: Some(7_000),
+                now: 50,
+            })
+            .unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let context = surface_context(
+            "019f8b4d-7d73-7b52-8f44-2cfeac060102",
+            [22; 32],
+            owner_epoch,
+        );
+
+        let adopted = store
+            .adopt_goal_for_surface("legacy-surface-goal", context.clone())
+            .unwrap();
+
+        assert!(matches!(adopted.mutation, GoalSurfaceMutation::Created));
+        assert_eq!(adopted.receipt.goal_id, legacy.goal_id);
+        assert_eq!(adopted.receipt.goal_revision, 1);
+        assert_eq!(
+            adopted.receipt.objective_revision,
+            legacy.objective_revision
+        );
+        assert_eq!(adopted.receipt.goal_owner_epoch, owner_epoch);
+        assert!(matches!(
+            adopted.receipt.row_state,
+            GoalSurfaceRowState::Present(ref goal)
+                if goal.objective == "preserve the existing Goal"
+                    && goal.token_budget == Some(7_000)
+        ));
+        assert_eq!(
+            store
+                .adopt_goal_for_surface("legacy-surface-goal", context)
+                .unwrap(),
+            adopted,
+            "the adoption commit identity must replay exactly"
+        );
+        assert_eq!(
+            store
+                .pending_surface_mutations("legacy-surface-goal")
+                .unwrap(),
+            vec![adopted]
+        );
+    }
+
+    #[test]
+    fn surface_adoption_closes_an_unowned_quiescent_legacy_run() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let legacy = create_goal(&store, "legacy-quiescent-run");
+        let goal_run_id = GoalRunId::new();
+        let outer_turn_id = GoalOuterTurnId::new();
+        store
+            .begin_run(BeginGoalRunInput {
+                goal_id: legacy.goal_id.clone(),
+                goal_run_id: goal_run_id.clone(),
+                origin: GoalTurnOrigin::User,
+                started_at: 60,
+            })
+            .unwrap();
+        store
+            .begin_outer_turn(BeginOuterTurnInput {
+                goal_id: legacy.goal_id.clone(),
+                goal_run_id: goal_run_id.clone(),
+                outer_turn_id: outer_turn_id.clone(),
+                origin: GoalTurnOrigin::User,
+                provider_turn_id: "legacy-provider-turn".to_string(),
+                started_at: 61,
+            })
+            .unwrap();
+        store
+            .finish_outer_turn(FinishOuterTurnInput {
+                goal_id: legacy.goal_id,
+                goal_run_id,
+                outer_turn_id,
+                status: GoalTurnStatus::Success,
+                tool_count: 0,
+                model_response_count: 1,
+                gap_fingerprint: None,
+                usage_event: None,
+                finished_at: 62,
+            })
+            .unwrap();
+        assert!(
+            store
+                .get_by_session("legacy-quiescent-run")
+                .unwrap()
+                .unwrap()
+                .current_run
+                .is_some()
+        );
+
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let adopted = store
+            .adopt_goal_for_surface(
+                "legacy-quiescent-run",
+                surface_context(
+                    "019f8b4d-7d73-7b52-8f44-2cfeac060103",
+                    [23; 32],
+                    owner_epoch,
+                ),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            adopted.receipt.row_state,
+            GoalSurfaceRowState::Present(GoalRecord {
+                state: GoalState::Paused {
+                    reason: GoalPauseReason::Recovery,
+                    ..
+                },
+                current_run: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn surface_clear_keeps_a_restart_recoverable_tombstone_after_goal_deletion() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("goals.sqlite3");
+        let store = GoalStore::open(&path).unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let created = store
+            .create_goal_for_surface(
+                CreateGoalInput {
+                    session_id: "surface-clear".to_string(),
+                    objective: "remove without losing the terminal receipt".to_string(),
+                    token_budget: None,
+                    now: 100,
+                },
+                surface_context("019f8b4d-7d73-7b52-8f44-2cfeac060002", [3; 32], owner_epoch),
+            )
+            .unwrap();
+        let removed = store
+            .clear_goal_for_surface(
+                "surface-clear",
+                &created.receipt.goal_id,
+                created.receipt.goal_revision,
+                surface_context("019f8b4d-7d73-7b52-8f44-2cfeac060003", [4; 32], owner_epoch),
+            )
+            .unwrap();
+
+        assert!(store.get_by_session("surface-clear").unwrap().is_none());
+        assert_eq!(removed.receipt.goal_id, created.receipt.goal_id);
+        assert_eq!(removed.receipt.goal_revision, 2);
+        assert_eq!(removed.receipt.catalog_revision, 2);
+        assert_eq!(
+            removed.receipt.goal_owner_epoch, created.receipt.goal_owner_epoch,
+            "a restart cannot silently replace the durable Goal owner epoch"
+        );
+        assert!(matches!(
+            removed.mutation,
+            GoalSurfaceMutation::Removed {
+                previous_revision: 1,
+                tombstone_revision: 2,
+            }
+        ));
+        assert!(matches!(
+            removed.receipt.row_state,
+            GoalSurfaceRowState::Removed
+        ));
+
+        drop(store);
+        let reopened = GoalStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.pending_surface_mutations("surface-clear").unwrap(),
+            vec![created, removed]
+        );
+    }
+
+    #[test]
+    fn surface_edit_requires_the_exact_fence_and_preserves_the_token_budget() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let created = store
+            .create_goal_for_surface(
+                CreateGoalInput {
+                    session_id: "surface-edit".to_string(),
+                    objective: "original objective".to_string(),
+                    token_budget: Some(8_000),
+                    now: 100,
+                },
+                surface_context("019f8b4d-7d73-7b52-8f44-2cfeac060004", [5; 32], owner_epoch),
+            )
+            .unwrap();
+
+        let stale = store
+            .edit_goal_for_surface(
+                "surface-edit",
+                &created.receipt.goal_id,
+                created.receipt.goal_revision + 1,
+                "must not commit",
+                GoalSurfaceTokenBudgetUpdate::Keep,
+                101,
+                surface_context("019f8b4d-7d73-7b52-8f44-2cfeac060005", [6; 32], owner_epoch),
+            )
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale"));
+        assert_eq!(
+            store
+                .get_by_session("surface-edit")
+                .unwrap()
+                .unwrap()
+                .objective,
+            "original objective"
+        );
+
+        let edited = store
+            .edit_goal_for_surface(
+                "surface-edit",
+                &created.receipt.goal_id,
+                created.receipt.goal_revision,
+                "edited objective",
+                GoalSurfaceTokenBudgetUpdate::Keep,
+                102,
+                surface_context("019f8b4d-7d73-7b52-8f44-2cfeac060006", [7; 32], owner_epoch),
+            )
+            .unwrap();
+
+        assert_eq!(edited.receipt.goal_revision, 2);
+        assert_eq!(edited.receipt.objective_revision, 2);
+        assert_eq!(
+            edited.receipt.catalog_revision,
+            created.receipt.catalog_revision
+        );
+        assert_eq!(
+            edited.receipt.goal_owner_epoch,
+            created.receipt.goal_owner_epoch
+        );
+        assert!(matches!(
+            edited.mutation,
+            GoalSurfaceMutation::Edited {
+                previous_revision: 1
+            }
+        ));
+        assert!(matches!(
+            edited.receipt.row_state,
+            GoalSurfaceRowState::Present(ref goal)
+                if goal.objective == "edited objective" && goal.token_budget == Some(8_000)
+        ));
+
+        let same_objective = store
+            .edit_goal_for_surface(
+                "surface-edit",
+                &edited.receipt.goal_id,
+                edited.receipt.goal_revision,
+                "edited objective",
+                GoalSurfaceTokenBudgetUpdate::Set(Some(9_000)),
+                103,
+                surface_context("019f8b4d-7d73-7b52-8f44-2cfeac060007", [8; 32], owner_epoch),
+            )
+            .unwrap();
+
+        assert_eq!(same_objective.receipt.goal_revision, 3);
+        assert_eq!(
+            same_objective.receipt.objective_revision, 2,
+            "changing only the token budget must not invent an objective revision"
+        );
+        assert!(matches!(
+            same_objective.receipt.row_state,
+            GoalSurfaceRowState::Present(ref goal)
+                if goal.objective == "edited objective" && goal.token_budget == Some(9_000)
+        ));
     }
 
     #[test]

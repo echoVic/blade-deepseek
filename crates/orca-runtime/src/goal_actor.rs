@@ -14,7 +14,8 @@ use orca_core::goal_types::ThreadGoal;
 
 use crate::goal_store::{
     BeginGoalRunInput, BeginOuterTurnInput, CreateGoalInput, FinishOuterTurnInput,
-    GoalIntentRecord, GoalRecoveryRecord, GoalStore, GoalStoreError, GoalUsageEvent,
+    GoalIntentRecord, GoalRecoveryRecord, GoalStore, GoalStoreError, GoalSurfaceMutationContext,
+    GoalSurfaceMutationRecord, GoalSurfaceTokenBudgetUpdate, GoalUsageEvent,
 };
 use crate::goal_tracker::{GoalTracker, GoalTurnResult, SAME_GAP_STREAK_LIMIT};
 
@@ -102,6 +103,7 @@ pub struct GoalActor {
     trackers: HashMap<String, GoalTracker>,
     pending_verification: HashMap<String, PendingVerification>,
     pending_recoveries: HashMap<String, Vec<GoalRecoveryRecord>>,
+    surface_owner_epoch: Option<u64>,
     _runtime_lease: Option<GoalRuntimeLease>,
 }
 
@@ -111,10 +113,12 @@ struct GoalRuntimeLease {
 
 struct GoalRuntimeLeaseInner {
     _file: File,
+    owner_epoch: u64,
 }
 
 impl GoalRuntimeLease {
-    fn acquire(database_path: &Path) -> Result<(Self, bool), GoalActorError> {
+    fn acquire(store: &GoalStore) -> Result<(Self, bool), GoalActorError> {
+        let database_path = store.path();
         let database_path =
             absolute_path(database_path).map_err(|error| GoalActorError::OwnerActive {
                 path: database_path.display().to_string(),
@@ -142,9 +146,17 @@ impl GoalRuntimeLease {
             path: lock_path.display().to_string(),
             message: error.to_string(),
         })?;
-        let inner = Arc::new(GoalRuntimeLeaseInner { _file: file });
+        let owner_epoch = store.claim_surface_owner_epoch()?;
+        let inner = Arc::new(GoalRuntimeLeaseInner {
+            _file: file,
+            owner_epoch,
+        });
         registry.insert(database_path, Arc::downgrade(&inner));
         Ok((Self { _inner: inner }, true))
+    }
+
+    fn owner_epoch(&self) -> u64 {
+        self._inner.owner_epoch
     }
 }
 
@@ -213,6 +225,42 @@ enum GoalActorCommand {
     },
     Create {
         input: CreateGoalInput,
+        reply: Reply,
+    },
+    CreateForSurface {
+        input: CreateGoalInput,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    AdoptForSurface {
+        session_id: String,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    EditForSurface {
+        session_id: String,
+        expected_goal_id: GoalId,
+        expected_goal_revision: u32,
+        objective: String,
+        token_budget_update: GoalSurfaceTokenBudgetUpdate,
+        at: i64,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    ClearForSurface {
+        session_id: String,
+        expected_goal_id: GoalId,
+        expected_goal_revision: u32,
+        context: GoalSurfaceMutationContext,
+        reply: Reply,
+    },
+    PendingSurfaceMutations {
+        session_id: String,
+        reply: Reply,
+    },
+    AcknowledgeSurfaceMutation {
+        store_commit_id: String,
+        receipt_digest: [u8; 32],
         reply: Reply,
     },
     RecordVerifierUsage {
@@ -296,6 +344,9 @@ enum GoalActorReply {
     GapFingerprints(Vec<Option<String>>),
     Recoveries(Vec<GoalRecoveryRecord>),
     Created(GoalRecord),
+    SurfaceMutation(GoalSurfaceMutationRecord),
+    SurfaceMutations(Vec<GoalSurfaceMutationRecord>),
+    Bool(bool),
     Usage(GoalUsage),
     Edited(Option<GoalRecord>),
     Latest(Option<ThreadGoal>),
@@ -306,12 +357,22 @@ enum GoalActorReply {
 
 impl GoalRuntimeHandle {
     pub fn spawn(store: GoalStore) -> (Self, thread::JoinHandle<()>) {
-        Self::spawn_with_lease(store, None, Vec::new())
+        Self::spawn_with_owner(store, None, None, Vec::new())
     }
 
     fn spawn_with_lease(
         store: GoalStore,
         runtime_lease: Option<GoalRuntimeLease>,
+        recoveries: Vec<GoalRecoveryRecord>,
+    ) -> (Self, thread::JoinHandle<()>) {
+        let surface_owner_epoch = runtime_lease.as_ref().map(GoalRuntimeLease::owner_epoch);
+        Self::spawn_with_owner(store, runtime_lease, surface_owner_epoch, recoveries)
+    }
+
+    fn spawn_with_owner(
+        store: GoalStore,
+        runtime_lease: Option<GoalRuntimeLease>,
+        surface_owner_epoch: Option<u64>,
         recoveries: Vec<GoalRecoveryRecord>,
     ) -> (Self, thread::JoinHandle<()>) {
         let (sender, receiver) = mpsc::sync_channel(ACTOR_MAILBOX_CAPACITY);
@@ -329,6 +390,7 @@ impl GoalRuntimeHandle {
             trackers: HashMap::new(),
             pending_verification: HashMap::new(),
             pending_recoveries,
+            surface_owner_epoch,
             _runtime_lease: runtime_lease,
         };
         let join = thread::Builder::new()
@@ -338,9 +400,17 @@ impl GoalRuntimeHandle {
         (Self { sender }, join)
     }
 
+    #[cfg(test)]
+    fn spawn_surface_owned_for_test(store: GoalStore) -> (Self, thread::JoinHandle<()>) {
+        let surface_owner_epoch = store
+            .claim_surface_owner_epoch()
+            .expect("test Goal surface owner epoch");
+        Self::spawn_with_owner(store, None, Some(surface_owner_epoch), Vec::new())
+    }
+
     pub fn open_default() -> Result<(Self, thread::JoinHandle<()>), GoalActorError> {
         let store = GoalStore::load_default()?;
-        let (lease, first_owner_in_process) = GoalRuntimeLease::acquire(store.path())?;
+        let (lease, first_owner_in_process) = GoalRuntimeLease::acquire(&store)?;
         let recoveries = if first_owner_in_process {
             store.recover_in_flight_runs()?
         } else {
@@ -441,6 +511,127 @@ impl GoalRuntimeHandle {
                     "goal actor returned wrong create reply".to_string(),
                 )),
             })
+    }
+
+    pub fn create_for_surface(
+        &self,
+        input: CreateGoalInput,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::CreateForSurface {
+            input,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface-create reply".to_string(),
+            )),
+        })
+    }
+
+    pub fn adopt_for_surface(
+        &self,
+        session_id: &str,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::AdoptForSurface {
+            session_id: session_id.to_string(),
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface-adoption reply".to_string(),
+            )),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_for_surface(
+        &self,
+        session_id: &str,
+        expected_goal_id: GoalId,
+        expected_goal_revision: u32,
+        objective: impl Into<String>,
+        token_budget_update: GoalSurfaceTokenBudgetUpdate,
+        at: i64,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::EditForSurface {
+            session_id: session_id.to_string(),
+            expected_goal_id,
+            expected_goal_revision,
+            objective: objective.into(),
+            token_budget_update,
+            at,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface-edit reply".to_string(),
+            )),
+        })
+    }
+
+    pub fn clear_for_surface(
+        &self,
+        session_id: &str,
+        expected_goal_id: GoalId,
+        expected_goal_revision: u32,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        self.request(|reply| GoalActorCommand::ClearForSurface {
+            session_id: session_id.to_string(),
+            expected_goal_id,
+            expected_goal_revision,
+            context,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutation(mutation) => Ok(mutation),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface-clear reply".to_string(),
+            )),
+        })
+    }
+
+    pub fn pending_surface_mutations(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<GoalSurfaceMutationRecord>, GoalActorError> {
+        self.request(|reply| GoalActorCommand::PendingSurfaceMutations {
+            session_id: session_id.to_string(),
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::SurfaceMutations(mutations) => Ok(mutations),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong pending surface-mutation reply".to_string(),
+            )),
+        })
+    }
+
+    pub fn acknowledge_surface_mutation(
+        &self,
+        store_commit_id: &str,
+        receipt_digest: &[u8; 32],
+    ) -> Result<bool, GoalActorError> {
+        self.request(|reply| GoalActorCommand::AcknowledgeSurfaceMutation {
+            store_commit_id: store_commit_id.to_string(),
+            receipt_digest: *receipt_digest,
+            reply,
+        })
+        .and_then(|reply| match reply {
+            GoalActorReply::Bool(acknowledged) => Ok(acknowledged),
+            _ => Err(GoalActorError::Invalid(
+                "goal actor returned wrong surface acknowledgement reply".to_string(),
+            )),
+        })
     }
 
     pub fn record_verifier_usage_once(
@@ -674,6 +865,18 @@ impl GoalRuntimeHandle {
 }
 
 impl GoalActor {
+    fn authorize_surface_context(
+        &self,
+        mut context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationContext, GoalActorError> {
+        context.goal_owner_epoch = self.surface_owner_epoch.ok_or_else(|| {
+            GoalActorError::Invalid(
+                "Goal surface mutation requires the durable runtime owner lease".to_string(),
+            )
+        })?;
+        Ok(context)
+    }
+
     fn run(mut self) {
         while let Ok(command) = self.sender.recv() {
             if matches!(command, GoalActorCommand::Shutdown) {
@@ -726,6 +929,99 @@ impl GoalActor {
                     .map(GoalActorReply::Created)
                     .map_err(Into::into),
             ),
+            GoalActorCommand::CreateForSurface {
+                input,
+                context,
+                reply,
+            } => (
+                reply,
+                self.authorize_surface_context(context)
+                    .and_then(|context| {
+                        self.store
+                            .create_goal_for_surface(input, context)
+                            .map_err(Into::into)
+                    })
+                    .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::AdoptForSurface {
+                session_id,
+                context,
+                reply,
+            } => (
+                reply,
+                self.adopt_for_surface(&session_id, context)
+                    .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::EditForSurface {
+                session_id,
+                expected_goal_id,
+                expected_goal_revision,
+                objective,
+                token_budget_update,
+                at,
+                context,
+                reply,
+            } => (
+                reply,
+                self.edit_for_surface(
+                    &session_id,
+                    expected_goal_id,
+                    expected_goal_revision,
+                    &objective,
+                    token_budget_update,
+                    at,
+                    context,
+                )
+                .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::ClearForSurface {
+                session_id,
+                expected_goal_id,
+                expected_goal_revision,
+                context,
+                reply,
+            } => (
+                reply,
+                self.clear_for_surface(
+                    &session_id,
+                    expected_goal_id,
+                    expected_goal_revision,
+                    context,
+                )
+                .map(GoalActorReply::SurfaceMutation),
+            ),
+            GoalActorCommand::PendingSurfaceMutations { session_id, reply } => (
+                reply,
+                self.store
+                    .pending_surface_mutations(&session_id)
+                    .map(GoalActorReply::SurfaceMutations)
+                    .map_err(Into::into),
+            ),
+            GoalActorCommand::AcknowledgeSurfaceMutation {
+                store_commit_id,
+                receipt_digest,
+                reply,
+            } => {
+                let result = self
+                    .surface_owner_epoch
+                    .ok_or_else(|| {
+                        GoalActorError::Invalid(
+                            "Goal surface acknowledgement requires the durable runtime owner lease"
+                                .to_string(),
+                        )
+                    })
+                    .and_then(|owner_epoch| {
+                        self.store
+                            .acknowledge_surface_mutation(
+                                &store_commit_id,
+                                &receipt_digest,
+                                owner_epoch,
+                            )
+                            .map(GoalActorReply::Bool)
+                            .map_err(Into::into)
+                    });
+                (reply, result)
+            }
             GoalActorCommand::RecordVerifierUsage {
                 outer_turn_id,
                 event,
@@ -855,11 +1151,44 @@ impl GoalActor {
 
     fn clear(&mut self, session_id: &str) -> Result<(), GoalActorError> {
         self.ensure_no_active_turn(session_id, "clear")?;
+        self.store.clear_goal(session_id)?;
         self.active.remove(session_id);
         self.trackers.remove(session_id);
         self.pending_verification.remove(session_id);
-        self.store.clear_goal(session_id)?;
         Ok(())
+    }
+
+    fn clear_for_surface(
+        &mut self,
+        session_id: &str,
+        expected_goal_id: GoalId,
+        expected_goal_revision: u32,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        let context = self.authorize_surface_context(context)?;
+        self.ensure_no_active_turn(session_id, "clear")?;
+        let mutation = self.store.clear_goal_for_surface(
+            session_id,
+            &expected_goal_id,
+            expected_goal_revision,
+            context,
+        )?;
+        self.active.remove(session_id);
+        self.trackers.remove(session_id);
+        self.pending_verification.remove(session_id);
+        Ok(mutation)
+    }
+
+    fn adopt_for_surface(
+        &mut self,
+        session_id: &str,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        let context = self.authorize_surface_context(context)?;
+        self.ensure_no_active_turn(session_id, "adopt")?;
+        self.store
+            .adopt_goal_for_surface(session_id, context)
+            .map_err(Into::into)
     }
 
     fn edit(
@@ -870,12 +1199,41 @@ impl GoalActor {
         at: i64,
     ) -> Result<Option<GoalRecord>, GoalActorError> {
         self.ensure_no_active_turn(session_id, "edit")?;
+        let record = self
+            .store
+            .edit_goal(session_id, objective, token_budget, at)?;
         self.active.remove(session_id);
         self.trackers.remove(session_id);
         self.pending_verification.remove(session_id);
-        self.store
-            .edit_goal(session_id, objective, token_budget, at)
-            .map_err(Into::into)
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn edit_for_surface(
+        &mut self,
+        session_id: &str,
+        expected_goal_id: GoalId,
+        expected_goal_revision: u32,
+        objective: &str,
+        token_budget_update: GoalSurfaceTokenBudgetUpdate,
+        at: i64,
+        context: GoalSurfaceMutationContext,
+    ) -> Result<GoalSurfaceMutationRecord, GoalActorError> {
+        let context = self.authorize_surface_context(context)?;
+        self.ensure_no_active_turn(session_id, "edit")?;
+        let mutation = self.store.edit_goal_for_surface(
+            session_id,
+            &expected_goal_id,
+            expected_goal_revision,
+            objective,
+            token_budget_update,
+            at,
+            context,
+        )?;
+        self.active.remove(session_id);
+        self.trackers.remove(session_id);
+        self.pending_verification.remove(session_id);
+        Ok(mutation)
     }
 
     fn resume_into(
@@ -886,15 +1244,16 @@ impl GoalActor {
     ) -> Result<Option<GoalRecord>, GoalActorError> {
         self.ensure_no_active_turn(source_session_id, "resume")?;
         self.ensure_no_active_turn(resumed_session_id, "resume")?;
+        let record = self
+            .store
+            .resume_into(source_session_id, resumed_session_id, at)?;
         self.active.remove(source_session_id);
         self.trackers.remove(source_session_id);
         self.pending_verification.remove(source_session_id);
         self.active.remove(resumed_session_id);
         self.trackers.remove(resumed_session_id);
         self.pending_verification.remove(resumed_session_id);
-        self.store
-            .resume_into(source_session_id, resumed_session_id, at)
-            .map_err(Into::into)
+        Ok(record)
     }
 
     fn continuation_state(
@@ -1394,8 +1753,9 @@ mod tests {
         let Ok(path) = std::env::var("ORCA_TEST_GOAL_RUNTIME_LEASE_PATH") else {
             return;
         };
+        let store = GoalStore::open(&path).unwrap();
         assert!(matches!(
-            GoalRuntimeLease::acquire(Path::new(&path)),
+            GoalRuntimeLease::acquire(&store),
             Err(GoalActorError::OwnerActive { .. })
         ));
     }
@@ -1405,8 +1765,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let database_path = dir.path().join("goals.sqlite3");
         let store = GoalStore::open(&database_path).unwrap();
-        let (first, first_in_process) = GoalRuntimeLease::acquire(store.path()).unwrap();
-        let (second, second_in_process) = GoalRuntimeLease::acquire(store.path()).unwrap();
+        let (first, first_in_process) = GoalRuntimeLease::acquire(&store).unwrap();
+        let (second, second_in_process) = GoalRuntimeLease::acquire(&store).unwrap();
         assert!(first_in_process);
         assert!(!second_in_process);
 
@@ -1426,14 +1786,14 @@ mod tests {
         );
 
         drop(first);
-        let (third, third_in_process) = GoalRuntimeLease::acquire(store.path()).unwrap();
+        let (third, third_in_process) = GoalRuntimeLease::acquire(&store).unwrap();
         assert!(
             !third_in_process,
             "second in-process lease still owns the lock"
         );
         drop(second);
         drop(third);
-        let (_fourth, fourth_in_process) = GoalRuntimeLease::acquire(store.path()).unwrap();
+        let (_fourth, fourth_in_process) = GoalRuntimeLease::acquire(&store).unwrap();
         assert!(fourth_in_process);
     }
 
@@ -1481,6 +1841,92 @@ mod tests {
         let record = handle.read("actor-session").unwrap().unwrap();
         assert_eq!(record.goal_id, goal.goal_id);
         assert!(matches!(record.state, GoalState::Complete { .. }));
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn surface_receipts_and_outbox_settlement_remain_actor_owned() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let (handle, join) = GoalRuntimeHandle::spawn_surface_owned_for_test(store);
+        let context = crate::goal_store::GoalSurfaceMutationContext {
+            store_commit_id: "019f8b4d-7d73-7b52-8f44-2cfeac060007".to_string(),
+            command_digest: [8; 32],
+            goal_owner_epoch: 17,
+        };
+        let created = handle
+            .create_for_surface(
+                CreateGoalInput {
+                    session_id: "actor-surface".to_string(),
+                    objective: "keep the durable receipt behind the actor".to_string(),
+                    token_budget: None,
+                    now: 100,
+                },
+                context.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            handle.pending_surface_mutations("actor-surface").unwrap(),
+            vec![created.clone()]
+        );
+        assert!(
+            handle
+                .acknowledge_surface_mutation(
+                    &context.store_commit_id,
+                    &created.receipt.receipt_digest,
+                )
+                .unwrap()
+        );
+        assert!(
+            handle
+                .pending_surface_mutations("actor-surface")
+                .unwrap()
+                .is_empty()
+        );
+
+        handle.shutdown().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn actor_without_runtime_lease_cannot_acknowledge_surface_recovery_work() {
+        let dir = tempdir().unwrap();
+        let store = GoalStore::open(dir.path().join("goals.sqlite3")).unwrap();
+        let owner_epoch = store.claim_surface_owner_epoch().unwrap();
+        let context = crate::goal_store::GoalSurfaceMutationContext {
+            store_commit_id: "019f8b4d-7d73-7b52-8f44-2cfeac060008".to_string(),
+            command_digest: [9; 32],
+            goal_owner_epoch: owner_epoch,
+        };
+        let created = store
+            .create_goal_for_surface(
+                CreateGoalInput {
+                    session_id: "unleased-actor-ack".to_string(),
+                    objective: "retain recovery until the runtime owner commits it".to_string(),
+                    token_budget: None,
+                    now: 100,
+                },
+                context,
+            )
+            .unwrap();
+        let (handle, join) = GoalRuntimeHandle::spawn(store);
+
+        let error = handle
+            .acknowledge_surface_mutation(
+                &created.receipt.store_commit_id,
+                &created.receipt.receipt_digest,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("durable runtime owner lease"));
+        assert_eq!(
+            handle
+                .pending_surface_mutations("unleased-actor-ack")
+                .unwrap(),
+            vec![created]
+        );
         handle.shutdown().unwrap();
         join.join().unwrap();
     }
