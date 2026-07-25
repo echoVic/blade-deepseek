@@ -5052,12 +5052,13 @@ fn ensure_hosted_thread(
     config: &RunConfig,
     _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     title: &str,
-    mcp_registry: &orca_mcp::McpRegistry,
+    _mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
     if thread.is_none() {
-        let request = RuntimeThreadStartRequest::new(config.clone(), title)
-            .with_mcp_registry(mcp_registry.clone());
+        let request = RuntimeThreadStartRequest::new(config.clone(), title);
+        #[cfg(test)]
+        let request = request.with_mcp_registry(_mcp_registry.clone());
         #[cfg(test)]
         let request = if let Some(transcript) = _preloaded.lock().unwrap().clone() {
             request.with_preloaded(transcript)
