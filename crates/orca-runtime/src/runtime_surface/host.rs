@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use crate::goal_actor::GoalRuntimeHandle;
 use crate::goal_store::CreateGoalInput;
 use crate::runtime_host::{
@@ -131,6 +133,24 @@ impl RuntimeSurfaceThreadHandle {
 
     pub fn read_history(&self) -> Result<Vec<super::SurfaceHistoryMessage>, RuntimeHostError> {
         self.runtime.read_surface_history()
+    }
+
+    /// Expand an input's immutable mention bindings using the registry owned by
+    /// the runtime thread. TUI and other clients do not receive the registry.
+    pub fn expand_mentions(
+        &self,
+        input: &str,
+        bindings: &crate::mentions::MentionBindings,
+        cwd: &Path,
+        workspace_roots: &[PathBuf],
+    ) -> Result<String, String> {
+        crate::mentions::expand_mentions(
+            input,
+            bindings,
+            cwd,
+            workspace_roots,
+            &self.runtime.mcp_registry(),
+        )
     }
 
     pub fn backtrack_last_user(&self) -> Result<Option<String>, RuntimeHostError> {

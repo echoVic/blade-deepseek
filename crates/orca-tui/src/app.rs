@@ -5267,11 +5267,8 @@ fn handle_hosted_submitted_turn(
         .clone()
         .filter(|roots| !roots.is_empty())
         .unwrap_or_else(|| vec![cwd.clone()]);
-    let prompt = match submitted_turn.prompt_for_model(
-        &cwd,
-        &workspace_roots,
-        &runtime_thread.mcp_registry(),
-    ) {
+    let typed_thread = runtime_thread.typed_surface();
+    let prompt = match submitted_turn.prompt_for_model(&typed_thread, &cwd, &workspace_roots) {
         Ok(prompt) => prompt,
         Err(error) => {
             send_submission_error(event_tx, rejection_prompt.as_deref(), error);

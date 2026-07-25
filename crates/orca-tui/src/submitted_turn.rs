@@ -1,4 +1,5 @@
 use orca_runtime::mentions;
+use orca_runtime::surface::RuntimeSurfaceThreadHandle;
 
 use crate::types::PendingWorkflowNotification;
 
@@ -86,13 +87,13 @@ impl SubmittedTurn {
 
     pub(crate) fn prompt_for_model(
         &self,
+        runtime_thread: &RuntimeSurfaceThreadHandle,
         cwd: &std::path::Path,
         workspace_roots: &[std::path::PathBuf],
-        mcp_registry: &orca_mcp::McpRegistry,
     ) -> Result<String, String> {
         match &self.kind {
             SubmittedTurnKind::User { prompt, bindings } => {
-                mentions::expand_mentions(prompt, bindings, cwd, workspace_roots, mcp_registry)
+                runtime_thread.expand_mentions(prompt, bindings, cwd, workspace_roots)
             }
             SubmittedTurnKind::WorkflowNotification(notification) => {
                 Ok(notification.prompt.clone())

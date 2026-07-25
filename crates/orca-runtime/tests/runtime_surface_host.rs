@@ -13,6 +13,7 @@ use orca_runtime::surface::{
     SurfaceInteractionKind, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
 use tempfile::tempdir;
 
 #[test]
@@ -121,6 +122,39 @@ fn tui_surface_can_commit_and_publish_pinned_context() {
         PinnedContextRevision::try_new(2).unwrap()
     );
     assert_eq!(output.snapshot.entries, vec![entry]);
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn typed_thread_expands_mentions_with_runtime_owned_registry() {
+    let cwd = tempdir().expect("temp cwd");
+    fs::write(cwd.path().join("context.txt"), "runtime-owned context").expect("context file");
+    let root = cwd.path().canonicalize().expect("canonical cwd");
+    let input = "read @context.txt";
+    let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+        input,
+        vec![orca_runtime::mentions::MentionBinding {
+            start: 5,
+            end: input.len(),
+            visible: "@context.txt".to_string(),
+            target: orca_runtime::mentions::MentionTarget::File {
+                root: root.clone(),
+                path: "context.txt".to_string(),
+                kind: orca_runtime::mentions::MentionFileKind::File,
+            },
+        }],
+    );
+    let host = RuntimeHost::start().expect("runtime host");
+    let thread = host
+        .surface_handle()
+        .start_thread(test_config(root.clone()), "mention expansion")
+        .expect("typed thread");
+
+    let expanded = thread
+        .expand_mentions(input, &bindings, &root, std::slice::from_ref(&root))
+        .expect("runtime mention expansion");
+
+    assert!(expanded.contains("runtime-owned context"));
     host.shutdown().expect("shutdown runtime host");
 }
 
