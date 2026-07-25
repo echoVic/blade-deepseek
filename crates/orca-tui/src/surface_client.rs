@@ -14,9 +14,9 @@ use orca_runtime::surface::{
     PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
     SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId, SurfaceEvent,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
+    SurfaceHistoryMessage, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
+    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -204,6 +204,14 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
     let snapshot = (*attachment.baseline.snapshot).clone();
     detach(&surface, &attachment.client);
     Ok(snapshot)
+}
+
+pub(crate) fn read_history(
+    thread: &RuntimeSurfaceThreadHandle,
+) -> io::Result<Vec<SurfaceHistoryMessage>> {
+    thread
+        .read_history()
+        .map_err(|error| io::Error::other(format!("typed TUI history read failed: {error}")))
 }
 
 pub(crate) fn add_pinned_context(

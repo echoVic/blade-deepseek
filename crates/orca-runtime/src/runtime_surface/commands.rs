@@ -2617,6 +2617,10 @@ impl SurfaceHistoryId {
     pub fn try_new(value: impl Into<String>) -> Result<Self, SurfaceValueError> {
         NonEmptyText::try_new(value).map(Self)
     }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

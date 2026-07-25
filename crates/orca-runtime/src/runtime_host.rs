@@ -1546,6 +1546,86 @@ impl RuntimeThreadSnapshot {
     }
 }
 
+fn surface_history_messages(
+    messages: &[Message],
+) -> Result<Vec<crate::runtime_surface::SurfaceHistoryMessage>, RuntimeHostError> {
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::System { content, .. } => {
+                Ok(crate::runtime_surface::SurfaceHistoryMessage::System {
+                    role: crate::runtime_surface::SurfaceHistorySystemRole::System,
+                    content: crate::runtime_surface::DisplayText::new(content.clone()),
+                })
+            }
+            Message::User { content, .. } => {
+                Ok(crate::runtime_surface::SurfaceHistoryMessage::User {
+                    role: crate::runtime_surface::SurfaceHistoryUserRole::User,
+                    content: crate::runtime_surface::DisplayText::new(content.clone()),
+                })
+            }
+            Message::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                ..
+            } => Ok(crate::runtime_surface::SurfaceHistoryMessage::Assistant {
+                role: crate::runtime_surface::SurfaceHistoryAssistantRole::Assistant,
+                content: content
+                    .as_ref()
+                    .map(|value| crate::runtime_surface::DisplayText::new(value.clone())),
+                reasoning_content: reasoning_content
+                    .as_ref()
+                    .map(|value| crate::runtime_surface::DisplayText::new(value.clone())),
+                tool_calls: tool_calls
+                    .iter()
+                    .map(|tool_call| {
+                        crate::runtime_surface::SurfaceDataValue::Object(vec![
+                            crate::runtime_surface::SurfaceDataProperty {
+                                name: crate::runtime_surface::DisplayText::new("id"),
+                                value: Box::new(crate::runtime_surface::SurfaceDataValue::String(
+                                    crate::runtime_surface::DisplayText::new(tool_call.id.clone()),
+                                )),
+                            },
+                            crate::runtime_surface::SurfaceDataProperty {
+                                name: crate::runtime_surface::DisplayText::new("name"),
+                                value: Box::new(crate::runtime_surface::SurfaceDataValue::String(
+                                    crate::runtime_surface::DisplayText::new(
+                                        tool_call.function_name.clone(),
+                                    ),
+                                )),
+                            },
+                            crate::runtime_surface::SurfaceDataProperty {
+                                name: crate::runtime_surface::DisplayText::new("arguments"),
+                                value: Box::new(crate::runtime_surface::SurfaceDataValue::String(
+                                    crate::runtime_surface::DisplayText::new(
+                                        tool_call.arguments.clone(),
+                                    ),
+                                )),
+                            },
+                        ])
+                    })
+                    .collect(),
+            }),
+            Message::Tool {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                let id = crate::runtime_surface::SurfaceHistoryId::try_new(tool_call_id.clone())
+                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                        message: format!("invalid persisted tool call id: {error:?}"),
+                    })?;
+                Ok(crate::runtime_surface::SurfaceHistoryMessage::Tool {
+                    role: crate::runtime_surface::SurfaceHistoryToolRole::Tool,
+                    tool_call_id: id,
+                    content: crate::runtime_surface::DisplayText::new(content.clone()),
+                })
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationOutcome {
     Completed(RunStatus),
@@ -1978,6 +2058,13 @@ impl RuntimeThreadHandle {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::ReadSnapshot { reply: reply_tx })?;
         receive_reply(reply_rx, "runtime thread")?
+    }
+
+    pub fn read_surface_history(
+        &self,
+    ) -> Result<Vec<crate::runtime_surface::SurfaceHistoryMessage>, RuntimeHostError> {
+        let snapshot = self.snapshot()?;
+        surface_history_messages(snapshot.messages())
     }
 
     pub fn goal_runtime(&self) -> Result<GoalRuntimeHandle, RuntimeHostError> {

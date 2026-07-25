@@ -7,8 +7,8 @@ use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::surface::{
     AssistantChannel, AssistantPatch, OperationPatch, OperationTerminal, SurfaceAssistantStream,
     SurfaceAssistantStreamState, SurfaceCommitBatch, SurfaceCompletedModelResponse, SurfaceCursor,
-    SurfaceEvent, SurfaceFileChange, SurfaceInputPresentation, SurfaceItem, SurfaceOperationId,
-    SurfaceStreamId, SurfaceToolResultKind, SurfaceUserInputState, ToolPatch,
+    SurfaceEvent, SurfaceFileChange, SurfaceHistoryMessage, SurfaceInputPresentation, SurfaceItem,
+    SurfaceOperationId, SurfaceStreamId, SurfaceToolResultKind, SurfaceUserInputState, ToolPatch,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
@@ -17,6 +17,73 @@ pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
 ) -> Vec<crate::types::ChatMessage> {
     history_messages_from_surface_items(&snapshot.items)
+}
+
+pub(crate) fn history_messages_from_surface_history(
+    messages: &[SurfaceHistoryMessage],
+) -> Vec<crate::types::ChatMessage> {
+    messages
+        .iter()
+        .flat_map(|message| match message {
+            SurfaceHistoryMessage::System { .. } => Vec::new(),
+            SurfaceHistoryMessage::User { content, .. } => {
+                vec![crate::types::ChatMessage::User(
+                    content.as_str().to_string(),
+                )]
+            }
+            SurfaceHistoryMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                ..
+            } => {
+                let mut projected = Vec::new();
+                if let Some(reasoning) = reasoning_content
+                    .as_ref()
+                    .filter(|text| !text.as_str().trim().is_empty())
+                {
+                    projected.push(crate::types::ChatMessage::Reasoning(
+                        reasoning.as_str().to_string(),
+                    ));
+                }
+                if let Some(content) = content
+                    .as_ref()
+                    .filter(|text| !text.as_str().trim().is_empty())
+                {
+                    projected.push(crate::types::ChatMessage::Assistant(
+                        content.as_str().to_string(),
+                    ));
+                }
+                if content
+                    .as_ref()
+                    .is_none_or(|text| text.as_str().trim().is_empty())
+                    && reasoning_content
+                        .as_ref()
+                        .is_none_or(|text| text.as_str().trim().is_empty())
+                    && !tool_calls.is_empty()
+                {
+                    projected.push(crate::types::ChatMessage::System(
+                        "Previous assistant requested tools".to_string(),
+                    ));
+                }
+                projected
+            }
+            SurfaceHistoryMessage::Tool {
+                tool_call_id,
+                content,
+                ..
+            } => vec![crate::types::ChatMessage::ToolCall {
+                id: tool_call_id.as_str().to_string(),
+                name: format!("tool:{}", tool_call_id.as_str()),
+                target: None,
+                status: "completed".to_string(),
+                output: (!content.as_str().is_empty()).then(|| content.as_str().to_string()),
+                diff: None,
+                kind: None,
+                expanded: false,
+            }],
+        })
+        .collect()
 }
 
 fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
@@ -516,6 +583,46 @@ mod tests {
                 && answer == "answer"
                 && reasoning == "reasoning"
                 && plan == "plan"
+        ));
+    }
+
+    #[test]
+    fn runtime_history_projection_preserves_message_order_and_tool_identity() {
+        let tool_id = orca_runtime::surface::SurfaceHistoryId::try_new("call-1").unwrap();
+        let history = vec![
+            SurfaceHistoryMessage::User {
+                role: orca_runtime::surface::SurfaceHistoryUserRole::User,
+                content: DisplayText::new("hello"),
+            },
+            SurfaceHistoryMessage::Assistant {
+                role: orca_runtime::surface::SurfaceHistoryAssistantRole::Assistant,
+                content: Some(DisplayText::new("hi")),
+                reasoning_content: Some(DisplayText::new("reason")),
+                tool_calls: Vec::new(),
+            },
+            SurfaceHistoryMessage::Tool {
+                role: orca_runtime::surface::SurfaceHistoryToolRole::Tool,
+                tool_call_id: tool_id,
+                content: DisplayText::new("done"),
+            },
+        ];
+
+        let messages = history_messages_from_surface_history(&history);
+        assert!(matches!(
+            messages[0],
+            crate::types::ChatMessage::User(ref text) if text == "hello"
+        ));
+        assert!(matches!(
+            messages[1],
+            crate::types::ChatMessage::Reasoning(ref text) if text == "reason"
+        ));
+        assert!(matches!(
+            messages[2],
+            crate::types::ChatMessage::Assistant(ref text) if text == "hi"
+        ));
+        assert!(matches!(
+            messages[3],
+            crate::types::ChatMessage::ToolCall { ref id, .. } if id == "call-1"
         ));
     }
 

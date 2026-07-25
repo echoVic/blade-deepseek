@@ -4605,7 +4605,6 @@ fn hosted_tui_controller_loop(
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
         let cfg = config.lock().unwrap().clone();
-        let fallback_transcript = preloaded.lock().unwrap().clone();
         let selector = match &startup_history_mode {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
             HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
@@ -4624,7 +4623,6 @@ fn hosted_tui_controller_loop(
             emit_typed_history_snapshot(
                 thread.as_ref().expect("startup hosted thread"),
                 &startup_history_mode,
-                fallback_transcript.as_ref(),
                 &event_tx,
             )
         });
@@ -5095,14 +5093,15 @@ fn ensure_hosted_thread(
 fn emit_typed_history_snapshot(
     thread: &RuntimeThreadHandle,
     mode: &HistoryMode,
-    fallback: Option<&history::SessionTranscript>,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
     let typed_thread = thread.typed_surface();
     let snapshot =
         crate::surface_client::read_snapshot(&typed_thread).map_err(|error| error.to_string())?;
-    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
-    let mut plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
+    let history =
+        crate::surface_client::read_history(&typed_thread).map_err(|error| error.to_string())?;
+    let messages = crate::surface_projection::history_messages_from_surface_history(&history);
+    let plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
         None
     } else {
         Some((
@@ -5130,21 +5129,6 @@ fn emit_typed_history_snapshot(
                 .collect(),
         ))
     };
-    if messages.is_empty()
-        && let Some(transcript) = fallback
-    {
-        messages = transcript
-            .messages
-            .iter()
-            .filter_map(|message| chat_message_from_history(message.clone()))
-            .collect();
-        if plan.is_none() {
-            plan = transcript
-                .plan
-                .as_ref()
-                .map(|(explanation, items)| (explanation.clone(), items.clone()));
-        }
-    }
     let label = if matches!(mode, HistoryMode::Fork(_)) {
         "Forked saved conversation."
     } else {

@@ -1656,6 +1656,14 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
     assert!(snapshot.messages().iter().any(
         |message| matches!(message, Message::User { content, .. } if content == "resumed prompt")
     ));
+    let typed_history = thread
+        .read_surface_history()
+        .expect("read runtime-owned typed history");
+    assert!(typed_history.iter().any(|message| matches!(
+        message,
+        orca_runtime::surface::SurfaceHistoryMessage::User { content, .. }
+            if content.as_str() == "resumed prompt"
+    )));
     assert_eq!(
         thread
             .backtrack_last_user()

@@ -50,6 +50,10 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.acp_surface()
     }
 
+    pub fn read_history(&self) -> Result<Vec<super::SurfaceHistoryMessage>, RuntimeHostError> {
+        self.runtime.read_surface_history()
+    }
+
     pub(crate) fn legacy(&self) -> RuntimeThreadHandle {
         self.runtime.clone()
     }
