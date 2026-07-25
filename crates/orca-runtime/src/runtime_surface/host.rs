@@ -233,6 +233,14 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.launch_workflow(request).map(|_| ())
     }
 
+    pub fn remember_user(&self, note: &str) -> Result<PathBuf, String> {
+        crate::memory::remember_user(note)
+    }
+
+    pub fn remember_project(&self, root: &Path, note: &str) -> Result<PathBuf, String> {
+        crate::memory::remember_project(root, note)
+    }
+
     pub(crate) fn legacy(&self) -> RuntimeThreadHandle {
         self.runtime.clone()
     }

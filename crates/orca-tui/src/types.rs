@@ -332,6 +332,12 @@ pub enum TuiEvent {
 }
 
 #[derive(Debug, Clone)]
+pub enum TuiMemoryScope {
+    User,
+    Project,
+}
+
+#[derive(Debug, Clone)]
 pub enum UserAction {
     Submit(String),
     SubmitWithMentions {
@@ -344,7 +350,10 @@ pub enum UserAction {
         args: Option<String>,
     },
     SetModel(String),
-    Remember(String),
+    Remember {
+        scope: TuiMemoryScope,
+        note: String,
+    },
     Compact,
     GoalShow,
     GoalSet(String),

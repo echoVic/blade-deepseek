@@ -15,7 +15,7 @@ use orca_runtime::surface::{
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::TuiOperationController;
-use crate::types::TuiEvent;
+use crate::types::{TuiEvent, TuiMemoryScope};
 
 /// The only TUI-facing entry point for thread-scoped runtime commands and
 /// authoritative reads. Presentation modules receive this facade instead of a
@@ -190,5 +190,17 @@ impl TuiSurfaceActions {
         self.thread
             .launch_workflow(request)
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn remember(
+        &self,
+        scope: TuiMemoryScope,
+        cwd: &Path,
+        note: &str,
+    ) -> Result<PathBuf, String> {
+        match scope {
+            TuiMemoryScope::User => self.thread.remember_user(note),
+            TuiMemoryScope::Project => self.thread.remember_project(cwd, note),
+        }
     }
 }

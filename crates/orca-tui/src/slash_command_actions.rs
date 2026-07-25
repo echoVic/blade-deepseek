@@ -6,7 +6,7 @@ use orca_core::config::RunConfig;
 use orca_runtime::history;
 
 use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
-use crate::types::{AppState, ChatMessage, UserAction};
+use crate::types::{AppState, ChatMessage, TuiMemoryScope, UserAction};
 
 pub(crate) enum SlashOutcome {
     Continue,
@@ -158,32 +158,12 @@ pub(crate) fn handle_slash_command(
             state.show_agents();
         }
         SlashCommand::Remember(note) => {
-            let remembered_note = note
-                .strip_prefix("project:")
-                .map(str::trim)
-                .unwrap_or(note.as_str())
-                .to_string();
-            let result = if let Some(project_note) = note.strip_prefix("project:") {
-                let cwd = config
-                    .cwd
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                orca_runtime::memory::remember_project(&cwd, project_note)
+            let (scope, note) = if let Some(project_note) = note.strip_prefix("project:") {
+                (TuiMemoryScope::Project, project_note.trim().to_string())
             } else {
-                orca_runtime::memory::remember_user(&note)
+                (TuiMemoryScope::User, note)
             };
-            match &result {
-                Ok(path) => state.push_message(ChatMessage::System(format!(
-                    "Remembered in {}.",
-                    path.display()
-                ))),
-                Err(error) => {
-                    state.push_message(ChatMessage::Error(format!("failed to remember: {error}")))
-                }
-            }
-            if result.is_ok() {
-                let _ = action_tx.send(UserAction::Remember(remembered_note));
-            }
+            let _ = action_tx.send(UserAction::Remember { scope, note });
         }
         SlashCommand::Compact => {
             state.enter_running();

@@ -1958,11 +1958,22 @@ mod tests {
             .expect("runtime-owned thread starts for remember");
             let runtime_thread = thread.as_ref().expect("thread is initialized");
             let typed_thread = runtime_thread.typed_surface();
-            crate::surface_client::add_pinned_context(
-                &typed_thread,
-                "[Pinned remembered note]\nprefer durable runtime ownership",
-            )
-            .expect("typed pinned context mutation");
+            let actions = TuiSurfaceActions::new(typed_thread.clone());
+            let memory_path = actions
+                .remember(
+                    crate::types::TuiMemoryScope::User,
+                    home,
+                    "prefer durable runtime ownership",
+                )
+                .expect("runtime-owned memory mutation");
+            assert!(
+                std::fs::read_to_string(memory_path)
+                    .expect("saved memory")
+                    .contains("prefer durable runtime ownership")
+            );
+            actions
+                .add_pinned_context("[Pinned remembered note]\nprefer durable runtime ownership")
+                .expect("typed pinned context mutation");
 
             let attachment = match typed_thread.surface().attach_fresh(
                 orca_runtime::surface::FreshAttachRequest {
@@ -1995,6 +2006,37 @@ mod tests {
 
             thread.unwrap().shutdown().unwrap();
             host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn remember_slash_command_dispatches_scope_without_writing_memory() {
+        with_orca_home(|home| {
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(home.to_path_buf());
+            let shared_config = Arc::new(Mutex::new(config.clone()));
+            let (mut state, _) = test_state();
+            let (action_tx, action_rx) = mpsc::unbounded();
+
+            handle_slash_command(
+                "/remember project: prefer runtime ownership",
+                &mut config,
+                &shared_config,
+                &mut state,
+                &action_tx,
+            );
+
+            assert!(matches!(
+                action_rx.try_recv(),
+                Ok(UserAction::Remember {
+                    scope: crate::types::TuiMemoryScope::Project,
+                    note,
+                }) if note == "prefer runtime ownership"
+            ));
+            assert!(
+                orca_runtime::memory::load_for_cwd(home).is_empty(),
+                "the renderer-side slash action must not persist memory"
+            );
         });
     }
 
@@ -4786,11 +4828,11 @@ fn hosted_tui_controller_loop(
                     });
                 apply_hosted_settings_action(thread.as_ref(), &config, &event_tx, patches);
             }
-            Ok(UserAction::Remember(note)) => {
+            Ok(UserAction::Remember { scope, note }) => {
                 let context = format!("[Pinned remembered note]\n{}", note.trim());
                 let thread_was_missing = thread.is_none();
+                let cfg = config.lock().unwrap().clone();
                 if thread.is_none() {
-                    let cfg = config.lock().unwrap().clone();
                     if let Err(error) = ensure_hosted_thread(
                         &mut thread,
                         &host,
@@ -4809,8 +4851,26 @@ fn hosted_tui_controller_loop(
                 }
                 if let Some(runtime_thread) = thread.as_ref() {
                     let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                    if let Err(error) = actions.add_pinned_context(&context) {
-                        let _ = event_tx.send(TuiEvent::Error(error.to_string()));
+                    let cwd = cfg
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    match actions.remember(scope, &cwd, &note) {
+                        Ok(path) => {
+                            let _ = event_tx.send(TuiEvent::Notice(format!(
+                                "Remembered in {}.",
+                                path.display()
+                            )));
+                            if let Err(error) = actions.add_pinned_context(&context) {
+                                let _ = event_tx.send(TuiEvent::Error(format!(
+                                    "memory was saved but could not be pinned: {error}"
+                                )));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = event_tx
+                                .send(TuiEvent::Error(format!("failed to remember: {error}")));
+                        }
                     }
                 }
             }
