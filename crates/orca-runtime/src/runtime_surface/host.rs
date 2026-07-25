@@ -10,6 +10,7 @@ use crate::runtime_host::{
 use orca_core::config::RunConfig;
 use orca_core::goal_runtime::{GoalNextAction, GoalPauseReason, GoalRecord, GoalTurnOrigin};
 use orca_core::goal_types::ThreadGoal;
+use orca_core::task_types::{BackgroundTaskSummary, TaskStatus};
 
 use super::{RuntimeSurfaceHandle, RuntimeSurfaceHostHandle};
 
@@ -179,6 +180,55 @@ impl RuntimeSurfaceThreadHandle {
             .map(|runtime| RuntimeSurfaceGoalHandle { runtime })
     }
 
+    pub fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {
+        self.runtime.task_registry().list()
+    }
+
+    pub fn stop_task(&self, task_id: &str) -> Result<Vec<BackgroundTaskSummary>, String> {
+        let registry = self.runtime.task_registry();
+        let task = registry
+            .get(task_id)
+            .ok_or_else(|| format!("task '{task_id}' not found"))?;
+        if matches!(
+            task.status,
+            TaskStatus::Completed
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
+                | TaskStatus::Stopped
+        ) {
+            return Err(format!(
+                "task '{task_id}' is already {}",
+                task_status_label(task.status)
+            ));
+        }
+        if task.status == TaskStatus::ApprovalRequired {
+            registry.stop(task_id, "Task stopped".to_string())?;
+        } else {
+            registry.request_stop(task_id)?;
+        }
+        Ok(registry.list())
+    }
+
+    pub fn foreground_task(&self, task_id: &str) -> Result<Vec<BackgroundTaskSummary>, String> {
+        let registry = self.runtime.task_registry();
+        registry.mark_foregrounded(task_id)?;
+        Ok(registry.list())
+    }
+
+    pub fn resolve_background_approval(
+        &self,
+        approval_id: &str,
+        approved: bool,
+    ) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
+        let registry = self.runtime.task_registry();
+        let task_id =
+            registry.submit_pending_tool_approval_response_by_request_id(approval_id, approved)?;
+        if !approved {
+            registry.finish_denied_pending_tool_approval(&task_id)?;
+        }
+        Ok((task_id, registry.list()))
+    }
+
     pub(crate) fn legacy(&self) -> RuntimeThreadHandle {
         self.runtime.clone()
     }
@@ -199,5 +249,19 @@ impl RuntimeHost {
 impl RuntimeHostHandle {
     pub fn surface_handle(&self) -> RuntimeSurfaceHostHandle {
         RuntimeSurfaceHostHandle::from_runtime(self.clone())
+    }
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Running => "running",
+        TaskStatus::ApprovalRequired => "approval_required",
+        TaskStatus::Paused => "paused",
+        TaskStatus::Stopping => "stopping",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Stopped => "stopped",
     }
 }

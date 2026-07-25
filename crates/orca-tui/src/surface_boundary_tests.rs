@@ -7,6 +7,8 @@ const TYPES: &str = include_str!("types.rs");
 const APP: &str = include_str!("app.rs");
 const SUBMITTED_TURN: &str = include_str!("submitted_turn.rs");
 const MENTION_SEARCH_MANAGER: &str = include_str!("mention_search_manager.rs");
+const BACKGROUND_TASKS: &str = include_str!("background_tasks.rs");
+const BACKGROUND_APPROVAL: &str = include_str!("background_approval.rs");
 
 const CURRENT_ACTIONS: [(&str, &str); 21] = [
     ("Submit", "runtime_mutation"),
@@ -477,6 +479,9 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         "discover_mention_catalog",
         "backtrack_last_user",
         "goal",
+        "stop_task",
+        "foreground_task",
+        "resolve_background_approval",
     ] {
         assert!(
             action_source.contains(&format!("fn {method}")),
@@ -494,5 +499,9 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
     assert!(
         !MENTION_SEARCH_MANAGER.contains("RuntimeSurfaceThreadHandle"),
         "mention discovery must use the TUI action facade"
+    );
+    assert!(
+        !BACKGROUND_TASKS.contains("TaskRegistry") && !BACKGROUND_APPROVAL.contains("TaskRegistry"),
+        "background controls must not retain the runtime task registry"
     );
 }

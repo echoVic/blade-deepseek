@@ -661,6 +661,20 @@ mod tests {
         bridge::PendingWorkflowNotifications::new()
     }
 
+    fn test_task_surface() -> (
+        orca_runtime::runtime_host::RuntimeHost,
+        RuntimeThreadHandle,
+        TuiSurfaceActions,
+    ) {
+        let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .handle()
+            .start_thread(test_config(HistoryMode::Disabled), "task surface test")
+            .expect("runtime thread");
+        let actions = TuiSurfaceActions::new(thread.typed_surface());
+        (host, thread, actions)
+    }
+
     #[test]
     fn hosted_tui_saved_workflow_routes_through_runtime_host() {
         if !orca_runtime::workflow::host::WorkflowHost::node_available() {
@@ -1114,7 +1128,8 @@ mod tests {
 
     #[test]
     fn recovered_background_approval_notifies_tui_user() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
@@ -1134,7 +1149,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
 
         assert_eq!(
-            notify_recovered_background_approvals_for_tui(&registry, &event_tx),
+            notify_recovered_background_approvals_for_tui(&actions, &event_tx),
             1
         );
 
@@ -1152,6 +1167,7 @@ mod tests {
                     && message.contains("task_list")
                     && message.contains("waiting for approval")
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
@@ -1258,7 +1274,8 @@ mod tests {
 
     #[test]
     fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
@@ -1278,7 +1295,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
 
         let continuation_request = submit_background_approval_response_for_tui(
-            Some(&registry),
+            Some(&actions),
             "mock-tool-1",
             false,
             &event_tx,
@@ -1301,17 +1318,19 @@ mod tests {
             Ok(TuiEvent::Notice(message))
                 if message.contains("Background approval denied")
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
     fn stop_task_for_tui_requests_stop_and_refreshes_tasks() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Running in background".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
+        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
 
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopping);
@@ -1327,11 +1346,13 @@ mod tests {
                 if message.contains("Task stop requested")
                     && message.contains(&task.id)
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
     fn stop_task_for_tui_stops_approval_required_task_immediately() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
@@ -1350,7 +1371,7 @@ mod tests {
             .unwrap();
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        assert!(stop_task_for_tui(Some(&registry), &task.id, &event_tx));
+        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
 
         let record = registry.get(&task.id).unwrap();
         assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
@@ -1364,21 +1385,19 @@ mod tests {
                     && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
                     && tasks[0].pending_tool_call.is_none()
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
     fn foreground_task_for_tui_marks_backgrounded_task_and_refreshes_tasks() {
-        let registry = orca_runtime::tasks::TaskRegistry::new("session-1".to_string());
+        let (host, thread, actions) = test_task_surface();
+        let registry = thread.task_registry();
         let task = registry.create_main_session("Long answer".to_string());
         registry.mark_running(&task.id).unwrap();
         registry.mark_backgrounded(&task.id).unwrap();
         let (event_tx, event_rx) = mpsc::unbounded();
 
-        assert!(foreground_task_for_tui(
-            Some(&registry),
-            &task.id,
-            &event_tx
-        ));
+        assert!(foreground_task_for_tui(Some(&actions), &task.id, &event_tx));
 
         let record = registry.get(&task.id).unwrap();
         assert!(!record.is_backgrounded);
@@ -1391,6 +1410,7 @@ mod tests {
             event_rx.try_recv(),
             Ok(TuiEvent::Notice(message)) if message.contains("returned to foreground")
         ));
+        host.shutdown().expect("runtime host shutdown");
     }
 
     fn transcript(session_id: &str) -> history::SessionTranscript {
@@ -4829,17 +4849,23 @@ fn hosted_tui_controller_loop(
                 }
             }
             Ok(UserAction::StopTask { task_id }) => {
-                let registry = thread.as_ref().map(RuntimeThreadHandle::task_registry);
-                let _ = stop_task_for_tui(registry.as_ref(), &task_id, &event_tx);
+                let actions = thread
+                    .as_ref()
+                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
+                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &event_tx);
             }
             Ok(UserAction::ForegroundTask { task_id }) => {
-                let registry = thread.as_ref().map(RuntimeThreadHandle::task_registry);
-                let _ = foreground_task_for_tui(registry.as_ref(), &task_id, &event_tx);
+                let actions = thread
+                    .as_ref()
+                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
+                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &event_tx);
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
-                let registry = thread.as_ref().map(RuntimeThreadHandle::task_registry);
+                let actions = thread
+                    .as_ref()
+                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
                 let continuation = submit_background_approval_response_for_tui(
-                    registry.as_ref(),
+                    actions.as_ref(),
                     &id,
                     approved,
                     &event_tx,
@@ -5074,7 +5100,10 @@ fn ensure_hosted_thread(
         {
             *_preloaded.lock().unwrap() = None;
         }
-        notify_recovered_background_approvals_for_tui(&started.task_registry(), event_tx);
+        notify_recovered_background_approvals_for_tui(
+            &TuiSurfaceActions::new(started.typed_surface()),
+            event_tx,
+        );
         *thread = Some(started);
     }
     Ok(())
@@ -5632,7 +5661,10 @@ fn resume_latest_active_goal_hosted(
     if let Some(previous) = thread.take() {
         let _ = previous.shutdown();
     }
-    notify_recovered_background_approvals_for_tui(&resumed.task_registry(), event_tx);
+    notify_recovered_background_approvals_for_tui(
+        &TuiSurfaceActions::new(resumed.typed_surface()),
+        event_tx,
+    );
     *thread = Some(resumed);
     *preloaded.lock().unwrap() = None;
     if let Ok(mut shared) = config.lock() {

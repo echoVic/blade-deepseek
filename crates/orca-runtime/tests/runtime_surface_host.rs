@@ -1,3 +1,4 @@
+use orca_core::approval_types::ActionKind;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
     HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig,
@@ -5,6 +6,7 @@ use orca_core::config::{
 };
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
+use orca_core::task_types::{PendingToolCallSummary, TaskStatus};
 use orca_runtime::runtime_host::RuntimeHost;
 use orca_runtime::surface::{
     AttachResult, DisplayText, FreshAttachRequest, MutationReply, NonEmptyText,
@@ -183,6 +185,67 @@ fn typed_thread_discovers_mention_catalog_with_runtime_owned_registry() {
             .iter()
             .any(|candidate| candidate.display == "GitHub")
     );
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn closed_thread_facade_owns_task_control_and_background_approval() {
+    let cwd = tempdir().expect("temp cwd");
+    let host = RuntimeHost::start().expect("runtime host");
+    let runtime_thread = host
+        .handle()
+        .start_thread(test_config(cwd.path().to_path_buf()), "task facade")
+        .expect("runtime thread");
+    let registry = runtime_thread.task_registry();
+    let foreground = registry.create_main_session("background turn".to_string());
+    registry.mark_running(&foreground.id).expect("running task");
+    registry
+        .mark_backgrounded(&foreground.id)
+        .expect("backgrounded task");
+    let approval = registry.create_main_session("approval turn".to_string());
+    registry
+        .approval_required_for_pending_tool(
+            &approval.id,
+            "approval required".to_string(),
+            Some(PendingToolCallSummary {
+                id: "approval-request".to_string(),
+                name: "shell".to_string(),
+                action: ActionKind::Shell,
+                target: None,
+                arguments: "{}".to_string(),
+            }),
+        )
+        .expect("approval task");
+    let surface = runtime_thread.typed_surface();
+
+    let foregrounded = surface
+        .foreground_task(&foreground.id)
+        .expect("foreground through facade");
+    assert!(
+        foregrounded
+            .iter()
+            .any(|task| task.id == foreground.id && !task.is_backgrounded)
+    );
+
+    let (task_id, denied) = surface
+        .resolve_background_approval("approval-request", false)
+        .expect("deny approval through facade");
+    assert_eq!(task_id, approval.id);
+    assert!(
+        denied
+            .iter()
+            .any(|task| task.id == approval.id && task.status == TaskStatus::Stopped)
+    );
+
+    let stopped = surface
+        .stop_task(&foreground.id)
+        .expect("stop through facade");
+    assert!(
+        stopped
+            .iter()
+            .any(|task| task.id == foreground.id && task.status == TaskStatus::Stopping)
+    );
+
     host.shutdown().expect("shutdown runtime host");
 }
 

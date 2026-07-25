@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use orca_core::config::RunConfig;
 use orca_core::goal_runtime::{GoalPauseReason, GoalRecord, GoalTurnOrigin};
 use orca_core::goal_types::ThreadGoal;
+use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
@@ -159,5 +160,29 @@ impl TuiSurfaceActions {
             .and_then(|goal| goal.resume(session_id, GoalTurnOrigin::Resume, at))
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {
+        self.thread.task_summaries()
+    }
+
+    pub(crate) fn stop_task(&self, task_id: &str) -> Result<Vec<BackgroundTaskSummary>, String> {
+        self.thread.stop_task(task_id)
+    }
+
+    pub(crate) fn foreground_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<BackgroundTaskSummary>, String> {
+        self.thread.foreground_task(task_id)
+    }
+
+    pub(crate) fn resolve_background_approval(
+        &self,
+        approval_id: &str,
+        approved: bool,
+    ) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
+        self.thread
+            .resolve_background_approval(approval_id, approved)
     }
 }
