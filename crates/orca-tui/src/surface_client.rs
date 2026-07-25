@@ -765,7 +765,7 @@ fn drain_operation(
     let mut terminal_receipt = None;
     let mut failure: Option<io::Error> = None;
     let mut waiter_finished = false;
-    let mut terminal_event_emitted = false;
+    let mut projected_terminal_event = None;
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
         let mut next_item = subscription.try_recv();
         if next_item.is_none() && !sealed {
@@ -797,9 +797,10 @@ fn drain_operation(
                         Ok(events) => {
                             for event in events {
                                 if matches!(event, TuiEvent::SessionCompleted { .. }) {
-                                    terminal_event_emitted = true;
+                                    projected_terminal_event = Some(event);
+                                } else {
+                                    let _ = event_tx.send(event);
                                 }
-                                let _ = event_tx.send(event);
                             }
                         }
                         Err(error) => {
@@ -869,11 +870,12 @@ fn drain_operation(
         }
     }
     if let Some(terminal) = terminal_receipt {
-        if !terminal_event_emitted {
-            let _ = event_tx.send(TuiEvent::SessionCompleted {
+        controller.complete_surface(operation_id);
+        let terminal_event =
+            projected_terminal_event.unwrap_or_else(|| TuiEvent::SessionCompleted {
                 status: terminal_status(terminal.terminal.clone()).to_string(),
             });
-        }
+        let _ = event_tx.send(terminal_event);
         let _ = waiter.join();
         return Ok(TuiHostedOperationOutcome::Turn {
             status: terminal_status(terminal.terminal).to_string(),
@@ -891,11 +893,12 @@ fn drain_operation(
                 Ok(Ok(WaitOperationTerminalResult::Terminal { value }))
                     if &value.operation_id == operation_id =>
                 {
-                    if !terminal_event_emitted {
-                        let _ = event_tx.send(TuiEvent::SessionCompleted {
+                    controller.complete_surface(operation_id);
+                    let terminal_event =
+                        projected_terminal_event.unwrap_or_else(|| TuiEvent::SessionCompleted {
                             status: terminal_status(value.terminal.clone()).to_string(),
                         });
-                    }
+                    let _ = event_tx.send(terminal_event);
                     let _ = waiter.join();
                     return Ok(TuiHostedOperationOutcome::Turn {
                         status: terminal_status(value.terminal).to_string(),

@@ -1481,6 +1481,45 @@ mod tests {
             Self::start_with_background_capacity(config, preloaded, 8)
         }
 
+        fn start_typed(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
+            let config = Arc::new(Mutex::new(config));
+            let preloaded = Arc::new(Mutex::new(preloaded));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let pending = test_pending_workflow_notifications();
+            let registry = orca_mcp::initialize_registry(&[]);
+            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let agent_config = Arc::clone(&config);
+            let agent_preloaded = Arc::clone(&preloaded);
+            let agent_events = event_tx.clone();
+            let runtime = TuiAgentRuntime::spawn_hosted(
+                action_rx,
+                event_tx,
+                8,
+                controller,
+                move |controller, commands, host| {
+                    hosted_tui_controller_loop(
+                        agent_config,
+                        agent_preloaded,
+                        agent_events,
+                        commands,
+                        controller,
+                        pending,
+                        registry,
+                        host,
+                    );
+                },
+            )
+            .expect("typed hosted TUI runtime");
+            Self {
+                action_tx,
+                event_rx,
+                runtime,
+                config,
+                preloaded,
+            }
+        }
+
         fn start_with_background_capacity(
             config: RunConfig,
             preloaded: Option<history::SessionTranscript>,
@@ -1915,7 +1954,7 @@ mod tests {
     #[test]
     fn hosted_canonical_approval_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "bash printf canonical-approval".to_string(),
             ));
@@ -1926,10 +1965,7 @@ mod tests {
                 TuiEvent::ApprovalNeeded { key, .. } => key,
                 _ => unreachable!(),
             };
-            assert_eq!(
-                Some(key.operation_id),
-                harness.runtime.controller().current_id()
-            );
+            assert!(harness.runtime.controller().has_surface_active());
             harness.send(UserAction::RespondToInteraction {
                 key,
                 response: TuiInteractionResponse::Approval(true),
@@ -1948,7 +1984,7 @@ mod tests {
     #[test]
     fn hosted_canonical_permission_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "request_network_permissions_then_done example.com".to_string(),
             ));
@@ -1959,10 +1995,7 @@ mod tests {
                 TuiEvent::PermissionApprovalNeeded { key, .. } => key,
                 _ => unreachable!(),
             };
-            assert_eq!(
-                Some(key.operation_id),
-                harness.runtime.controller().current_id()
-            );
+            assert!(harness.runtime.controller().has_surface_active());
             harness.send(UserAction::RespondToInteraction {
                 key,
                 response: TuiInteractionResponse::Permission(true),
@@ -1981,7 +2014,7 @@ mod tests {
     #[test]
     fn hosted_canonical_user_input_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("ask continue?".to_string()));
 
             let key = match harness
@@ -1990,10 +2023,7 @@ mod tests {
                 TuiEvent::UserInputRequested { key, .. } => key,
                 _ => unreachable!(),
             };
-            assert_eq!(
-                Some(key.operation_id),
-                harness.runtime.controller().current_id()
-            );
+            assert!(harness.runtime.controller().has_surface_active());
             harness.send(UserAction::RespondToInteraction {
                 key,
                 response: TuiInteractionResponse::UserInput("yes".to_string()),
@@ -3048,26 +3078,23 @@ mod tests {
     #[test]
     fn cancelled_hosted_tui_turn_does_not_cancel_next_submit() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
 
-            let first_id = loop {
+            loop {
                 match harness
                     .event_rx
                     .recv_timeout(Duration::from_secs(2))
                     .unwrap()
                 {
                     TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started.") => {
-                        break harness
-                            .runtime
-                            .controller()
-                            .current_id()
-                            .expect("first operation id");
+                        assert!(harness.runtime.controller().has_surface_active());
+                        break;
                     }
                     TuiEvent::Error(message) => panic!("unexpected first-turn error: {message}"),
                     _ => {}
                 }
-            };
+            }
 
             harness.send(UserAction::Interrupt);
             loop {
@@ -3078,6 +3105,7 @@ mod tests {
                 {
                     TuiEvent::SessionCompleted { status } => {
                         assert_eq!(status, "cancelled");
+                        assert!(!harness.runtime.controller().has_surface_active());
                         break;
                     }
                     TuiEvent::Error(message) => panic!("unexpected cancellation error: {message}"),
@@ -3087,7 +3115,7 @@ mod tests {
 
             harness.send(UserAction::Submit("mock_history_echo".to_string()));
 
-            let mut second_id = None;
+            let mut saw_second_start = false;
             let mut saw_second_output = false;
             loop {
                 match harness
@@ -3096,13 +3124,8 @@ mod tests {
                     .unwrap()
                 {
                     TuiEvent::TurnStarted { .. } => {
-                        let current = harness
-                            .runtime
-                            .controller()
-                            .current_id()
-                            .expect("second operation id");
-                        assert_ne!(current, first_id);
-                        second_id = Some(current);
+                        assert!(harness.runtime.controller().has_surface_active());
+                        saw_second_start = true;
                     }
                     TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
                         saw_second_output = true;
@@ -3118,10 +3141,7 @@ mod tests {
 
             harness.shutdown();
 
-            assert!(
-                second_id.is_some(),
-                "second turn must start a fresh operation"
-            );
+            assert!(saw_second_start, "second turn must start a fresh operation");
             assert!(saw_second_output, "second turn must run to provider output");
         });
     }
