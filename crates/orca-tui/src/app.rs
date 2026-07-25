@@ -5135,7 +5135,7 @@ fn typed_history_startup_eligible(
     mode: &HistoryMode,
     _preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
 ) -> bool {
-    let (HistoryMode::Resume(selector) | HistoryMode::Fork(selector)) = mode else {
+    let HistoryMode::Resume(selector) = mode else {
         return false;
     };
     selector == "latest" || looks_like_uuid_session_id(selector)
