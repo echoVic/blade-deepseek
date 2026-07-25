@@ -281,6 +281,11 @@ pub enum TuiEvent {
         url: Option<String>,
         requested_schema_json: Option<String>,
     },
+    HistoryLoaded {
+        messages: Vec<ChatMessage>,
+        plan: Option<(Option<String>, Vec<PlanItem>)>,
+        label: String,
+    },
     Notice(String),
     MentionSearchDirty {
         generation: SessionGeneration,
@@ -1476,6 +1481,20 @@ impl AppState {
 
     pub fn update(&mut self, event: TuiEvent) {
         match event {
+            TuiEvent::HistoryLoaded {
+                messages,
+                plan,
+                label,
+            } => {
+                self.replace_messages(messages);
+                if let Some(plan) = plan {
+                    self.current_plan = Some(plan);
+                }
+                self.push_message(ChatMessage::System(label));
+                self.finalized_count = self.messages.len();
+                self.flushed_count = self.messages.len();
+                self.set_status(AppStatus::Idle);
+            }
             TuiEvent::TurnStarted { .. } => {
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
@@ -2469,6 +2488,45 @@ mod tests {
         state.selection = Some(dummy_selection());
         state.clear_messages();
         assert_eq!(state.selection, None);
+    }
+
+    #[test]
+    fn history_loaded_replaces_legacy_prefix_and_freezes_snapshot() {
+        let mut state = state();
+        state.push_message(ChatMessage::User("legacy".to_string()));
+
+        state.update(TuiEvent::HistoryLoaded {
+            messages: vec![
+                ChatMessage::User("restored".to_string()),
+                ChatMessage::Assistant("answer".to_string()),
+            ],
+            plan: Some((
+                Some("resume plan".to_string()),
+                vec![PlanItem {
+                    step: "continue".to_string(),
+                    status: PlanStatus::InProgress,
+                }],
+            )),
+            label: "Resumed saved conversation.".to_string(),
+        });
+
+        assert!(matches!(
+            state.messages.as_slice(),
+            [
+                ChatMessage::User(prompt),
+                ChatMessage::Assistant(answer),
+                ChatMessage::System(label),
+            ] if prompt == "restored"
+                && answer == "answer"
+                && label == "Resumed saved conversation."
+        ));
+        assert_eq!(state.finalized_count, state.messages.len());
+        assert_eq!(state.flushed_count, state.messages.len());
+        assert_eq!(
+            state.current_plan.as_ref().unwrap().0.as_deref(),
+            Some("resume plan")
+        );
+        assert_eq!(state.status, AppStatus::Idle);
     }
 
     fn session(id: &str, title: &str) -> SessionSummary {

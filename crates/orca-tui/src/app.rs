@@ -18,6 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
+use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
 use orca_runtime::runtime_host::{
     HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, HostedWorkflowRequest,
@@ -167,25 +168,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
             HistoryMode::Record | HistoryMode::Disabled => "",
         }) {
-            for message in &transcript.messages {
-                if let Some(chat_message) = chat_message_from_history(message.clone()) {
-                    state.push_message(chat_message);
-                }
-            }
-            if let Some((explanation, plan)) = &transcript.plan {
-                state.current_plan = Some((explanation.clone(), plan.clone()));
-            }
-            if !state.messages.is_empty() {
-                let label = if matches!(config.history_mode, HistoryMode::Fork(_)) {
-                    "Forked saved conversation."
-                } else {
-                    "Resumed saved conversation."
-                };
-                state.push_message(ChatMessage::System(label.to_string()));
-            }
-            // The preloaded transcript is entirely past turns; freeze it so the next
-            // turn (or an initial prompt) starts a fresh live suffix.
-            state.finalized_count = state.messages.len();
             Some(transcript)
         } else {
             None
@@ -223,6 +205,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
             );
         },
     )?;
+    let mut pending_initial_prompt = if typed_history_startup_eligible(
+        &config.history_mode,
+        &preloaded_transcript,
+    ) {
+        initial_prompt.clone()
+    } else {
+        None
+    };
     // These moved bindings are declared after the runtime so unwinding drops
     // the event receiver and restores the terminal before the runtime joins.
     let terminal_cleanup = pending_terminal_cleanup;
@@ -232,7 +222,9 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
     let mut textarea = if needs_setup {
         make_setup_textarea(&theme)
     } else {
-        if let Some(prompt) = initial_prompt.clone() {
+        if let Some(prompt) = initial_prompt.clone()
+            && pending_initial_prompt.is_none()
+        {
             state.push_message(ChatMessage::User(prompt.clone()));
             state.enter_running();
             let _ = action_tx.send(UserAction::Submit(prompt));
@@ -376,6 +368,22 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<i32> {
                         }
                     },
                     IterationEvent::Runtime(tui_event) => match tui_event {
+                        TuiEvent::HistoryLoaded { .. } => {
+                            handle_runtime_event(
+                                tui_event,
+                                &mut state,
+                                &action_tx,
+                                &pending_workflow_notifications,
+                                &mut textarea,
+                                &mut vim_state,
+                                &theme,
+                            );
+                            if let Some(prompt) = pending_initial_prompt.take() {
+                                state.push_message(ChatMessage::User(prompt.clone()));
+                                state.enter_running();
+                                let _ = action_tx.send(UserAction::Submit(prompt));
+                            }
+                        }
                         TuiEvent::MentionSearchDirty { generation } => {
                             let text = textarea_text(&textarea);
                             let cursor = textarea_cursor_byte_index(&textarea);
@@ -2197,6 +2205,42 @@ mod tests {
             handle.join().unwrap();
 
             assert!(matches!(event, TuiEvent::GoalStatus(None)));
+        });
+    }
+
+    #[test]
+    fn resumed_uuid_session_emits_typed_history_before_accepting_initial_turn() {
+        with_orca_home(|home| {
+            let mut writer =
+                history::SessionWriter::start(home, "mock", Some("auto".to_string()), "resume")
+                    .unwrap();
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
+            writer
+                .append_message(&orca_core::conversation::Message::user(
+                    "restored prompt".to_string(),
+                ))
+                .unwrap();
+            writer.complete("success").unwrap();
+            let session_id = history::load_session("latest").unwrap().meta.session_id;
+            let preloaded = history::load_session(&session_id).unwrap();
+
+            let mut harness = HostedTuiHarness::start(
+                test_config(HistoryMode::Resume(session_id)),
+                Some(preloaded),
+            );
+            let event = harness
+                .event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("typed history event");
+            assert!(matches!(
+                event,
+                TuiEvent::HistoryLoaded { messages, .. }
+                    if messages.iter().any(|message| matches!(
+                        message,
+                        ChatMessage::User(prompt) if prompt == "restored prompt"
+                    ))
+            ));
+            harness.shutdown();
         });
     }
 
@@ -4558,6 +4602,44 @@ fn hosted_tui_controller_loop(
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut pending_actions = VecDeque::new();
 
+    let startup_history_mode = config.lock().unwrap().history_mode.clone();
+    if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
+        let cfg = config.lock().unwrap().clone();
+        let fallback_transcript = preloaded.lock().unwrap().clone();
+        let selector = match &startup_history_mode {
+            HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
+            HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
+        };
+        let title = format!("Restored session {selector}");
+        let result = ensure_hosted_thread(
+            &mut thread,
+            &host,
+            &cfg,
+            &preloaded,
+            &title,
+            &mcp_registry,
+            &event_tx,
+        )
+        .and_then(|_| {
+            emit_typed_history_snapshot(
+                thread.as_ref().expect("startup hosted thread"),
+                &startup_history_mode,
+                fallback_transcript.as_ref(),
+                &event_tx,
+            )
+        });
+        if let Err(error) = result {
+            if !cfg.prompt.trim().is_empty() {
+                emit_empty_history_snapshot(&event_tx, "Unable to restore saved conversation.");
+            }
+            if !error.contains("typed TUI snapshot attachment unavailable") {
+                let _ = event_tx.send(TuiEvent::Error(format!(
+                    "failed to restore typed conversation snapshot: {error}"
+                )));
+            }
+        }
+    }
+
     loop {
         let action = if controller.is_shutdown() {
             Ok(UserAction::Cancel)
@@ -5008,6 +5090,108 @@ fn ensure_hosted_thread(
         *thread = Some(started);
     }
     Ok(())
+}
+
+fn emit_typed_history_snapshot(
+    thread: &RuntimeThreadHandle,
+    mode: &HistoryMode,
+    fallback: Option<&history::SessionTranscript>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let typed_thread = thread.typed_surface();
+    let snapshot =
+        crate::surface_client::read_snapshot(&typed_thread).map_err(|error| error.to_string())?;
+    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
+    let mut plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
+        None
+    } else {
+        Some((
+            snapshot
+                .plan
+                .explanation
+                .as_ref()
+                .map(|text| text.as_str().to_string()),
+            snapshot
+                .plan
+                .items
+                .iter()
+                .map(|item| PlanItem {
+                    step: item.step.as_str().to_string(),
+                    status: match item.status {
+                        orca_runtime::surface::SurfacePlanStatus::Pending => PlanStatus::Pending,
+                        orca_runtime::surface::SurfacePlanStatus::InProgress => {
+                            PlanStatus::InProgress
+                        }
+                        orca_runtime::surface::SurfacePlanStatus::Completed => {
+                            PlanStatus::Completed
+                        }
+                    },
+                })
+                .collect(),
+        ))
+    };
+    if messages.is_empty()
+        && let Some(transcript) = fallback
+    {
+        messages = transcript
+            .messages
+            .iter()
+            .filter_map(|message| chat_message_from_history(message.clone()))
+            .collect();
+        if plan.is_none() {
+            plan = transcript
+                .plan
+                .as_ref()
+                .map(|(explanation, items)| (explanation.clone(), items.clone()));
+        }
+    }
+    let label = if matches!(mode, HistoryMode::Fork(_)) {
+        "Forked saved conversation."
+    } else {
+        "Resumed saved conversation."
+    };
+    event_tx
+        .send(TuiEvent::HistoryLoaded {
+            messages,
+            plan,
+            label: label.to_string(),
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn typed_history_startup_eligible(
+    mode: &HistoryMode,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+) -> bool {
+    let HistoryMode::Resume(selector) = mode else {
+        return false;
+    };
+    let session_id = preloaded
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|transcript| transcript.meta.session_id.clone())
+        .unwrap_or_else(|| selector.clone());
+    looks_like_uuid_session_id(&session_id)
+}
+
+fn looks_like_uuid_session_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn emit_empty_history_snapshot(event_tx: &mpsc::Sender<TuiEvent>, label: &str) {
+    let _ = event_tx.send(TuiEvent::HistoryLoaded {
+        messages: Vec::new(),
+        plan: None,
+        label: label.to_string(),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -16,7 +16,7 @@ use orca_runtime::surface::{
     SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId, SurfaceEvent,
     SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
     SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSubscriptionItem, WaitOperationTerminalResult,
+    SurfaceSnapshot, SurfaceSubscriptionItem, WaitOperationTerminalResult,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -179,6 +179,31 @@ pub(crate) fn update_settings(
             Err(io::Error::other("typed TUI settings update deferred"))
         }
     }
+}
+
+pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<SurfaceSnapshot> {
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { .. }
+        | AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. }
+        | AttachResult::ThreadClosed { .. }
+        | AttachResult::Unavailable { .. } => {
+            return Err(io::Error::other(
+                "typed TUI snapshot attachment unavailable",
+            ));
+        }
+    };
+    let snapshot = (*attachment.baseline.snapshot).clone();
+    detach(&surface, &attachment.client);
+    Ok(snapshot)
 }
 
 pub(crate) fn add_pinned_context(
