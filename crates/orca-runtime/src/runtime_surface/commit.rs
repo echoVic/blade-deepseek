@@ -630,6 +630,11 @@ enum BatchCommitAuthority<'permit> {
         actor: &'permit SurfacePublisherPermit,
         generation: &'permit SurfacePublisherPermit,
     },
+    WorkflowBackgroundStop {
+        actor: &'permit SurfacePublisherPermit,
+        background: &'permit SurfacePublisherPermit,
+        finalizer: &'permit SurfacePublisherPermit,
+    },
     #[allow(dead_code)]
     LiveGenerationSuspend {
         actor: &'permit SurfacePublisherPermit,
@@ -669,6 +674,11 @@ enum RecoveredBatchAuthority {
     ActorGenerationTerminalization {
         actor: SurfacePublisherPermit,
         generation: SurfacePublisherPermit,
+    },
+    WorkflowBackgroundStop {
+        actor: SurfacePublisherPermit,
+        background: SurfacePublisherPermit,
+        finalizer: SurfacePublisherPermit,
     },
     GoalGenerationStop {
         finished_goal: SurfacePublisherPermit,
@@ -953,6 +963,21 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                         None,
                     )?;
                 }
+                RecoveredBatchAuthority::WorkflowBackgroundStop {
+                    actor,
+                    background,
+                    finalizer,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::WorkflowBackgroundStop {
+                            actor: &actor,
+                            background: &background,
+                            finalizer: &finalizer,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
                 RecoveredBatchAuthority::GoalGenerationStop {
                     finished_goal,
                     verification_goal,
@@ -1048,6 +1073,19 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 BatchCommitAuthority::ActorGenerationTerminalization {
                     actor: &actor,
                     generation: &generation,
+                },
+                &batch,
+                None,
+            )?,
+            RecoveredBatchAuthority::WorkflowBackgroundStop {
+                actor,
+                background,
+                finalizer,
+            } => self.commit_batch_with_authority(
+                BatchCommitAuthority::WorkflowBackgroundStop {
+                    actor: &actor,
+                    background: &background,
+                    finalizer: &finalizer,
                 },
                 &batch,
                 None,
@@ -1198,6 +1236,30 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.commit_batch_with_authority(
             BatchCommitAuthority::LiveGenerationStop {
                 generation: &generation,
+                finalizer: &finalizer,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_workflow_background_stop_batch(
+        &mut self,
+        fence: super::SurfaceBackgroundFence,
+        operation_id: super::SurfaceOperationId,
+        finalize_intent_id: super::SurfaceFinalizeIntentId,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let background = self.register_permit(SurfacePublisherPermit::Background {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        let finalizer = self.issue_finalizer_permit(operation_id, finalize_intent_id);
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::WorkflowBackgroundStop {
+                actor: &actor,
+                background: &background,
                 finalizer: &finalizer,
             },
             batch,
@@ -2126,6 +2188,46 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         }
 
         let events = batch.events.as_slice();
+        if events.len() >= 5
+            && let [.., stop, finalization] = events
+            && let (
+                SurfaceScope::Background { fence },
+                super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped { .. }),
+            ) = (&stop.scope, &stop.event)
+            && let super::SurfaceEvent::Operation(super::OperationPatch::FinalizationStarted {
+                operation_id,
+                finalize_intent_id,
+                ..
+            }) = &finalization.event
+        {
+            let background = SurfacePublisherPermit::Background {
+                permit_id: next_permit_id(),
+                fence: fence.clone(),
+            };
+            let finalizer = SurfacePublisherPermit::Finalizer {
+                permit_id: next_permit_id(),
+                operation_id: operation_id.clone(),
+                finalize_intent_id: finalize_intent_id.clone(),
+                owner_epoch: self.owner_epoch,
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.extend([background.clone(), finalizer.clone()]);
+            if workflow_background_stop_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &background,
+                &finalizer,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(RecoveredBatchAuthority::WorkflowBackgroundStop {
+                    actor,
+                    background: self.register_permit(background),
+                    finalizer: self.register_permit(finalizer),
+                });
+            }
+        }
         let admitted_goal_event_count = if events.len() >= 5
             && matches!(
                 &events[events.len() - 3..],
@@ -3081,6 +3183,19 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     self.owner_epoch,
                 )
             }
+            BatchCommitAuthority::WorkflowBackgroundStop {
+                actor,
+                background,
+                finalizer,
+            } => workflow_background_stop_authorized(
+                &self.state,
+                &self.issued_permits,
+                actor,
+                background,
+                finalizer,
+                batch,
+                self.owner_epoch,
+            ),
             BatchCommitAuthority::LiveGenerationSuspend { actor, generation } => {
                 live_generation_suspend_authorized(
                     &self.state,
@@ -3253,7 +3368,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
     ) -> bool {
         self.recovered_prepared.as_ref() == Some(batch)
             && self.state.snapshot().thread.owner_epoch == *historical_epoch
-            && historical_epoch.get().checked_add(1) == Some(self.owner_epoch.get())
+            && historical_epoch.get() < self.owner_epoch.get()
     }
 
     pub fn retry_projection(
@@ -3362,7 +3477,8 @@ fn permit_authorizes(
                                     | super::OperationPatch::Terminal { .. }
                             )
                         )
-                }) || actor_control_admission_pair_authorized(batch)
+                }) || actor_control_workflow_launch_authorized(batch)
+                    || actor_control_admission_pair_authorized(batch)
                     || actor_control_resume_pair_authorized(batch))
         }
         SurfacePublisherPermit::Generation { fence, .. } => batch
@@ -3979,6 +4095,212 @@ fn live_generation_stop_disposition_authorized(
     )
 }
 
+fn workflow_background_stop_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    background_permit: &SurfacePublisherPermit,
+    finalizer_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit)
+        || !issued_permits.contains(background_permit)
+        || !issued_permits.contains(finalizer_permit)
+    {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Background {
+            fence: background_fence,
+            ..
+        },
+        SurfacePublisherPermit::Finalizer {
+            operation_id,
+            finalize_intent_id,
+            owner_epoch: finalizer_epoch,
+            ..
+        },
+    ) = (actor_permit, background_permit, finalizer_permit)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || *finalizer_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+        || operation_id != &background_fence.operation_fence.operation_id
+    {
+        return false;
+    }
+    let events = batch.events.as_slice();
+    if !matches!(events.len(), 5 | 6) {
+        return false;
+    }
+    let task_event = &events[0];
+    let workflow_events = &events[1..events.len() - 3];
+    let result_event = &events[events.len() - 3];
+    let stop_event = &events[events.len() - 2];
+    let finalization_event = &events[events.len() - 1];
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
+            task_id,
+            expected_revision: task_expected,
+            next_revision: task_next,
+            status: task_status,
+            ..
+        }),
+    ) = (&task_event.scope, &task_event.event)
+    else {
+        return false;
+    };
+    let (workflow_fence, terminal_workflow_revision) = match workflow_events {
+        [workflow_event] => match (&workflow_event.scope, &workflow_event.event) {
+            (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Workflow(super::WorkflowPatch::Completed {
+                    fence,
+                    next_revision,
+                }),
+            )
+            | (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Workflow(super::WorkflowPatch::Failed {
+                    fence,
+                    next_revision,
+                    ..
+                }),
+            )
+            | (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Workflow(super::WorkflowPatch::Stopped {
+                    fence,
+                    next_revision,
+                    ..
+                }),
+            )
+            | (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Workflow(super::WorkflowPatch::Cancelled {
+                    fence,
+                    next_revision,
+                    ..
+                }),
+            ) => (fence, *next_revision),
+            _ => return false,
+        },
+        [stopping_event, stopped_event] => {
+            let (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Workflow(super::WorkflowPatch::Stopping {
+                    fence,
+                    next_revision: stopping_revision,
+                    ..
+                }),
+            ) = (&stopping_event.scope, &stopping_event.event)
+            else {
+                return false;
+            };
+            let (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Workflow(super::WorkflowPatch::Stopped {
+                    fence: stopped_fence,
+                    next_revision: stopped_revision,
+                    ..
+                }),
+            ) = (&stopped_event.scope, &stopped_event.event)
+            else {
+                return false;
+            };
+            if stopped_fence.workflow_run_id != fence.workflow_run_id
+                || stopped_fence.parent != fence.parent
+                || stopped_fence.workflow_revision != *stopping_revision
+                || stopping_revision.get().checked_add(1) != Some(stopped_revision.get())
+            {
+                return false;
+            }
+            (fence, *stopped_revision)
+        }
+        _ => return false,
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Workflow(super::WorkflowPatch::ResultReady {
+            fence: result_fence,
+            next_revision: result_next,
+            result,
+        }),
+    ) = (&result_event.scope, &result_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background { fence: stop_scope },
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+            fence: stop_fence,
+            reason: stop_reason,
+            ..
+        }),
+    ) = (&stop_event.scope, &stop_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background {
+            fence: finalization_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::FinalizationStarted {
+            operation_id: patch_operation,
+            finalize_intent_id: patch_intent,
+            selected_cause: super::OperationFinalizationCause::GenerationStop(selected_reason),
+            suspended_cause: None,
+            ..
+        }),
+    ) = (&finalization_event.scope, &finalization_event.event)
+    else {
+        return false;
+    };
+    let snapshot = state.snapshot();
+    let Some(task) = snapshot.tasks.iter().find(|task| &task.task_id == task_id) else {
+        return false;
+    };
+    let Some(workflow) = snapshot
+        .workflows
+        .iter()
+        .find(|workflow| workflow.workflow_run_id == workflow_fence.workflow_run_id)
+    else {
+        return false;
+    };
+    matches!(
+        task_status,
+        super::SurfaceTaskStatus::Stopped
+            | super::SurfaceTaskStatus::Completed
+            | super::SurfaceTaskStatus::Failed
+            | super::SurfaceTaskStatus::Cancelled
+    ) && task.revision == *task_expected
+        && task_expected.get().checked_add(1) == Some(task_next.get())
+        && task.background_fence.as_ref() == Some(background_fence)
+        && workflow.task_id == *task_id
+        && workflow.revision == workflow_fence.workflow_revision
+        && terminal_workflow_revision.get().checked_add(1) == Some(result_next.get())
+        && result_fence.workflow_run_id == workflow_fence.workflow_run_id
+        && result_fence.workflow_revision == terminal_workflow_revision
+        && result_fence.parent == workflow_fence.parent
+        && result.acknowledged_by_operation.is_none()
+        && stop_scope == background_fence
+        && finalization_scope == background_fence
+        && stop_fence == &background_fence.operation_fence
+        && patch_operation == operation_id
+        && patch_intent == finalize_intent_id
+        && selected_reason == stop_reason
+}
+
 #[allow(clippy::too_many_arguments)]
 fn goal_generation_stop_authorized(
     state: &SurfaceReducerState,
@@ -4422,6 +4744,119 @@ fn goal_generation_continue_authorized(
         super::AssistantDiscardReason::ProviderFailed,
         stream_discards,
     )
+}
+
+fn actor_control_workflow_launch_authorized(batch: &SurfaceCommitBatch) -> bool {
+    let [
+        requested,
+        admitted,
+        started,
+        task,
+        workflow_started,
+        async_launched,
+        transferred,
+    ] = batch.events.as_slice()
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Operation {
+            operation_id: requested_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::Requested { operation }),
+    ) = (&requested.scope, &requested.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Operation {
+            operation_id: admitted_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::Admitted {
+            operation_id,
+            logical_turn_id,
+            input: super::AdmittedInput::NotApplicable,
+            first_generation,
+        }),
+    ) = (&admitted.scope, &admitted.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: started_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationStarted {
+            fence: started_fence,
+            ..
+        }),
+    ) = (&started.scope, &started.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::Upserted {
+            expected_revision: None,
+            task: surface_task,
+        }),
+    ) = (&task.scope, &task.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Workflow(super::WorkflowPatch::Started { workflow }),
+    ) = (&workflow_started.scope, &workflow_started.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Workflow(super::WorkflowPatch::AsyncLaunched {
+            fence: workflow_fence,
+            next_revision,
+        }),
+    ) = (&async_launched.scope, &async_launched.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: transferred_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationTransferred {
+            fence: transferred_fence,
+            background_fence,
+            task_id,
+        }),
+    ) = (&transferred.scope, &transferred.event)
+    else {
+        return false;
+    };
+    requested_scope == &operation.operation_id
+        && admitted_scope == requested_scope
+        && operation_id == requested_scope
+        && matches!(
+            operation.intent.kind,
+            super::OperationKind::StandaloneWorkflow { .. }
+        )
+        && first_generation.logical_turn_id == *logical_turn_id
+        && started_scope == &first_generation.fence
+        && started_fence == started_scope
+        && transferred_scope == started_scope
+        && transferred_fence == started_scope
+        && background_fence.operation_fence == *started_scope
+        && task_id.as_ref() == Some(&surface_task.task_id)
+        && surface_task.parent_operation.as_ref() == Some(requested_scope)
+        && surface_task.background_fence.as_ref() == Some(background_fence)
+        && surface_task.workflow_run_id.as_ref() == Some(&workflow.workflow_run_id)
+        && workflow.task_id == surface_task.task_id
+        && workflow.revision.get() == 1
+        && workflow_fence.workflow_run_id == workflow.workflow_run_id
+        && workflow_fence.workflow_revision == workflow.revision
+        && workflow_fence.parent == workflow.parent
+        && next_revision.get() == 2
 }
 
 fn actor_control_admission_pair_authorized(batch: &SurfaceCommitBatch) -> bool {

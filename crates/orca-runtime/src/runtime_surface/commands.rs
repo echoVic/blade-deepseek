@@ -377,6 +377,13 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         action: GoalMutationAction,
     ) -> Result<MutationReply<GoalMutationOutput>, SurfaceClientCommandError>;
 
+    fn workflow_control(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        action: WorkflowControlAction,
+    ) -> Result<MutationReply<WorkflowControlOutput>, SurfaceClientCommandError>;
+
     fn respond_interaction_by_id(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -584,6 +591,17 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .goal_mutation(self.clone(), request_id, action)
+    }
+
+    pub fn workflow_control(
+        &self,
+        request_id: SurfaceRequestId,
+        action: WorkflowControlAction,
+    ) -> Result<MutationReply<WorkflowControlOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .workflow_control(self.clone(), request_id, action)
     }
 
     pub fn respond_interaction(

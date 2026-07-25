@@ -954,6 +954,95 @@ fn later_successor_recovers_prepared_terminal_before_any_owner_transition() {
 }
 
 #[test]
+fn later_successor_recovers_prepared_batch_after_intermediate_owner_crash() {
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let owner_dir = tempfile::tempdir().unwrap();
+    let ledger_path = ledger_dir.path().join("multi-successor-prepared.jsonl");
+    let lock_path = owner_dir.path().join("thread.lock");
+    let epoch_path = owner_dir.path().join("thread.epoch");
+    let first_clock = FakeClock {
+        clock_id: HostMonotonicClockId::try_from_bytes(uuid(157)).unwrap(),
+        tick: 1,
+        wall_ms: 1,
+    };
+    let first_owner = ExclusiveOwnerLease::acquire_thread(
+        &lock_path,
+        &epoch_path,
+        cursor(0).thread_id,
+        &first_clock,
+    )
+    .unwrap();
+    assert_eq!(first_owner.owner_epoch(), 1);
+
+    let operation = requested_operation(158);
+    let operation_id = operation.operation_id.clone();
+    let prepared_batch = operation_batch(159, operation);
+    let prepared_digest = prepared_batch.batch_digest.clone();
+    let prepared_commit_id = match &prepared_batch.commit_class {
+        CommitClass::Recorded { commit_id, .. } => commit_id.clone(),
+        CommitClass::Ephemeral { .. } => unreachable!(),
+    };
+    let mut ledger = JsonlSurfaceCommitLedger::new(&ledger_path, cursor(0));
+    ledger.append_complete_batch(&prepared_batch).unwrap();
+    assert!(matches!(
+        ledger.probe_commit(&prepared_commit_id, &prepared_digest),
+        CommitProbe::Prepared(_)
+    ));
+    drop(ledger);
+    drop(first_owner);
+
+    let second_clock = FakeClock {
+        clock_id: HostMonotonicClockId::try_from_bytes(uuid(160)).unwrap(),
+        tick: 2,
+        wall_ms: 2,
+    };
+    let second_owner = ExclusiveOwnerLease::acquire_thread(
+        &lock_path,
+        &epoch_path,
+        cursor(0).thread_id,
+        &second_clock,
+    )
+    .unwrap();
+    assert_eq!(second_owner.owner_epoch(), 2);
+    drop(second_owner);
+
+    let third_clock = FakeClock {
+        clock_id: HostMonotonicClockId::try_from_bytes(uuid(161)).unwrap(),
+        tick: 3,
+        wall_ms: 3,
+    };
+    let third_owner = ExclusiveOwnerLease::acquire_thread(
+        &lock_path,
+        &epoch_path,
+        cursor(0).thread_id,
+        &third_clock,
+    )
+    .unwrap();
+    assert_eq!(third_owner.owner_epoch(), 3);
+    let recovered = RuntimeCommitCoordinator::recover(
+        JsonlSurfaceCommitLedger::new(&ledger_path, cursor(0)),
+        SurfaceReducerState::new(snapshot()),
+        &third_owner,
+    )
+    .unwrap();
+
+    assert!(
+        recovered
+            .state()
+            .snapshot()
+            .queued_operations
+            .iter()
+            .any(|operation| operation.operation_id == operation_id)
+    );
+    assert!(matches!(
+        recovered
+            .ledger()
+            .probe_commit(&prepared_commit_id, &prepared_digest),
+        CommitProbe::Present(_)
+    ));
+}
+
+#[test]
 fn reopened_finalizing_reuses_persisted_finalizer_and_terminal_identity() {
     let dir = tempfile::tempdir().unwrap();
     let (_owner_dir, owner) = test_owner_lease();

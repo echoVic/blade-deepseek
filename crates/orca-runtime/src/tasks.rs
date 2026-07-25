@@ -251,7 +251,26 @@ impl TaskRegistry {
         phase_count: usize,
     ) -> TaskHandle {
         let id = new_task_id();
-        let created_at_ms = now_ms();
+        self.activate_prepared_workflow(
+            id,
+            workflow_run_id,
+            name,
+            description,
+            phase_count,
+            now_ms(),
+        )
+        .expect("task registry insert failed")
+    }
+
+    pub(crate) fn activate_prepared_workflow(
+        &self,
+        id: String,
+        workflow_run_id: String,
+        name: String,
+        description: String,
+        phase_count: usize,
+        created_at_ms: i64,
+    ) -> Result<TaskHandle, String> {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
@@ -292,14 +311,20 @@ impl TaskRegistry {
             control,
         };
 
-        self.insert_task(id.clone(), record)
-            .expect("task registry insert failed");
+        self.with_tasks(|tasks| {
+            if tasks.contains_key(&id) {
+                return Err(format!("task '{id}' already exists"));
+            }
+            tasks.insert(id.clone(), record);
+            self.persist_current_session(tasks)
+        })
+        .map_err(|_| "task registry lock poisoned".to_string())??;
 
-        TaskHandle {
+        Ok(TaskHandle {
             id,
             task_type: TaskType::Workflow,
             workflow_run_id: Some(workflow_run_id),
-        }
+        })
     }
 
     pub fn create_subagent(&self, description: String, agent_type: Option<String>) -> TaskHandle {

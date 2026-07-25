@@ -2697,6 +2697,17 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfaceWorkflowControl {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::WorkflowControlAction,
+        reply: SyncSender<
+            Result<
+                surface::MutationReply<surface::WorkflowControlOutput>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
         response: crate::model_response::RuntimeModelResponse,
@@ -2872,6 +2883,7 @@ struct SurfaceActorTestProbe {
     waiter_count: usize,
     legacy_completion: Option<OperationCompletion>,
     pending_manual_compaction_completion: bool,
+    pending_workflow_completion: bool,
     pending_admission_repair: bool,
     exact_interaction_selector: Option<surface::InteractionSelector>,
     secret_bearing_interaction_count: usize,
@@ -3497,6 +3509,23 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             reply,
         })
     }
+
+    fn workflow_control(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::WorkflowControlAction,
+    ) -> Result<
+        surface::MutationReply<surface::WorkflowControlOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceWorkflowControl {
+            client,
+            request_id,
+            action,
+            reply,
+        })
+    }
 }
 
 fn unavailable_surface_handle(
@@ -3916,6 +3945,528 @@ fn reconcile_goal_surface_outbox_on_start(
     Ok(())
 }
 
+fn reconcile_interrupted_workflow_surfaces_on_start(
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<(), RuntimeHostError> {
+    loop {
+        let snapshot = coordinator.state().snapshot().clone();
+        let Some((task, workflow)) = snapshot.tasks.iter().find_map(|task| {
+            let background_fence = task.background_fence.as_ref()?;
+            let operation_terminal = snapshot.operation_history.iter().any(|operation| {
+                operation.operation_id == background_fence.operation_fence.operation_id
+                    && operation.terminal.is_some()
+            });
+            if !operation_terminal
+                || !matches!(
+                    task.status,
+                    surface::SurfaceTaskStatus::Queued
+                        | surface::SurfaceTaskStatus::Running
+                        | surface::SurfaceTaskStatus::Paused
+                        | surface::SurfaceTaskStatus::Stopping
+                        | surface::SurfaceTaskStatus::ApprovalRequired
+                )
+            {
+                return None;
+            }
+            let workflow = snapshot.workflows.iter().find(|workflow| {
+                workflow.task_id == task.task_id
+                    && matches!(
+                        workflow.status,
+                        surface::SurfaceWorkflowStatus::Queued
+                            | surface::SurfaceWorkflowStatus::Running
+                            | surface::SurfaceWorkflowStatus::Paused
+                            | surface::SurfaceWorkflowStatus::Stopping
+                            | surface::SurfaceWorkflowStatus::AsyncLaunched
+                    )
+            })?;
+            Some((task.clone(), workflow.clone()))
+        }) else {
+            return Ok(());
+        };
+
+        let next_task_revision =
+            surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "recovered workflow task revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "recovered workflow task revision is invalid".to_string(),
+            })?;
+        let stopping_revision = if workflow.status == surface::SurfaceWorkflowStatus::Stopping {
+            workflow.revision
+        } else {
+            surface::WorkflowRevision::try_new(workflow.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "recovered workflow stopping revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "recovered workflow stopping revision is invalid".to_string(),
+            })?
+        };
+        let stopped_revision =
+            surface::WorkflowRevision::try_new(stopping_revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "recovered workflow stopped revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "recovered workflow stopped revision is invalid".to_string(),
+            })?;
+        let result_revision =
+            surface::WorkflowRevision::try_new(stopped_revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "recovered workflow result revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "recovered workflow result revision is invalid".to_string(),
+            })?;
+        let reason =
+            surface::DisplayText::new("Workflow interrupted by runtime owner restart".to_string());
+        let mut events = vec![(
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                task_id: task.task_id,
+                expected_revision: task.revision,
+                next_revision: next_task_revision,
+                status: surface::SurfaceTaskStatus::Stopped,
+                completed_at: Some(surface::UnixMillis::new(
+                    chrono::Utc::now().timestamp_millis(),
+                )),
+                result: Some(reason.clone()),
+                error: None,
+            }),
+        )];
+        if workflow.status != surface::SurfaceWorkflowStatus::Stopping {
+            events.push((
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::Stopping {
+                    fence: surface::SurfaceWorkflowFence {
+                        workflow_run_id: workflow.workflow_run_id.clone(),
+                        workflow_revision: workflow.revision,
+                        parent: workflow.parent.clone(),
+                    },
+                    next_revision: stopping_revision,
+                    reason: reason.clone(),
+                }),
+            ));
+        }
+        events.extend([
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::Stopped {
+                    fence: surface::SurfaceWorkflowFence {
+                        workflow_run_id: workflow.workflow_run_id.clone(),
+                        workflow_revision: stopping_revision,
+                        parent: workflow.parent.clone(),
+                    },
+                    next_revision: stopped_revision,
+                    reason: reason.clone(),
+                }),
+            ),
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::ResultReady {
+                    fence: surface::SurfaceWorkflowFence {
+                        workflow_run_id: workflow.workflow_run_id.clone(),
+                        workflow_revision: stopped_revision,
+                        parent: workflow.parent,
+                    },
+                    next_revision: result_revision,
+                    result: surface::SurfaceWorkflowResult {
+                        result_id: surface::SurfaceWorkflowResultId::try_new(format!(
+                            "workflow-result-{}",
+                            workflow.workflow_run_id.as_str()
+                        ))
+                        .map_err(|_| {
+                            RuntimeHostError::ThreadStartFailed {
+                                message: "recovered workflow result identity is invalid"
+                                    .to_string(),
+                            }
+                        })?,
+                        tool_use_id: None,
+                        status: surface::SurfaceWorkflowResultStatus::Failed,
+                        content: reason,
+                        acknowledged_by_operation: None,
+                    },
+                }),
+            ),
+        ]);
+        let batch = recorded_surface_event_batch(&snapshot, events, None);
+        coordinator.commit_actor_batch(&batch).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to reconcile interrupted typed workflow surface: {error:?}"
+                ),
+            }
+        })?;
+    }
+}
+
+fn reconcile_durable_workflow_outcomes_on_start(
+    thread: &RuntimeThread,
+    config: &RunConfig,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<(), RuntimeHostError> {
+    let cwd = config
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+            message: "workflow recovery requires a working directory".to_string(),
+        })?;
+    let task_registry = thread.session().task_registry().clone();
+    let session_dir = cwd
+        .join(".orca")
+        .join("workflow-sessions")
+        .join(task_registry.session_id());
+    let runner = WorkflowRunner::new(config.clone(), task_registry, session_dir);
+    loop {
+        let snapshot = coordinator.state().snapshot().clone();
+        let mut durable_outcome = None;
+        for task in &snapshot.tasks {
+            let Some(background_fence) = task.background_fence.as_ref() else {
+                continue;
+            };
+            if snapshot.operation_history.iter().any(|operation| {
+                operation.operation_id == background_fence.operation_fence.operation_id
+                    && operation.terminal.is_some()
+            }) || !matches!(
+                task.status,
+                surface::SurfaceTaskStatus::Queued
+                    | surface::SurfaceTaskStatus::Running
+                    | surface::SurfaceTaskStatus::Paused
+                    | surface::SurfaceTaskStatus::Stopping
+                    | surface::SurfaceTaskStatus::ApprovalRequired
+            ) {
+                continue;
+            }
+            let Some(workflow) = snapshot.workflows.iter().find(|workflow| {
+                workflow.task_id == task.task_id
+                    && matches!(
+                        workflow.status,
+                        surface::SurfaceWorkflowStatus::Running
+                            | surface::SurfaceWorkflowStatus::Stopping
+                            | surface::SurfaceWorkflowStatus::AsyncLaunched
+                    )
+            }) else {
+                continue;
+            };
+            let record = runner
+                .reconcile_durable_terminal_outcome(
+                    task.task_id.as_str(),
+                    workflow.workflow_run_id.as_str(),
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!(
+                        "failed to reconcile durable workflow outcome stores: {error}"
+                    ),
+                })?;
+            if let Some(record) = record {
+                durable_outcome = Some((task.clone(), workflow.clone(), record));
+                break;
+            }
+            runner
+                .settle_runtime_restart_without_durable_outcome(
+                    task.task_id.as_str(),
+                    workflow.workflow_run_id.as_str(),
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to settle interrupted workflow persistence: {error}"),
+                })?;
+        }
+        let Some((task, workflow, record)) = durable_outcome else {
+            return Ok(());
+        };
+
+        let background_fence = task
+            .background_fence
+            .clone()
+            .expect("typed workflow task owns a background fence");
+        let operation_id = background_fence.operation_fence.operation_id.clone();
+        let next_task_revision =
+            surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "durable workflow task revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "durable workflow task revision is invalid".to_string(),
+            })?;
+        let next_workflow_revision =
+            surface::WorkflowRevision::try_new(workflow.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "durable workflow revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "durable workflow revision is invalid".to_string(),
+            })?;
+        let second_workflow_revision = surface::WorkflowRevision::try_new(
+            next_workflow_revision.get().checked_add(1).ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "durable workflow second revision exhausted".to_string(),
+                }
+            })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "durable workflow second revision is invalid".to_string(),
+        })?;
+        let workflow_fence = surface::SurfaceWorkflowFence {
+            workflow_run_id: workflow.workflow_run_id.clone(),
+            workflow_revision: workflow.revision,
+            parent: workflow.parent.clone(),
+        };
+        let content = surface::DisplayText::new(
+            record
+                .result
+                .clone()
+                .or_else(|| record.error.clone())
+                .unwrap_or_else(|| "Workflow stopped".to_string()),
+        );
+        let usage = surface_usage_totals(record.usage.clone().unwrap_or_default());
+        let diagnostic =
+            surface::SafeDiagnosticText::try_new("background workflow failed before projection")
+                .expect("fixed diagnostic is bounded");
+        let (
+            task_status,
+            workflow_patches,
+            terminal_workflow_revision,
+            result_status,
+            stop_reason,
+            terminal,
+        ) = match record.status {
+            TaskStatus::Completed => (
+                surface::SurfaceTaskStatus::Completed,
+                vec![surface::WorkflowPatch::Completed {
+                    fence: workflow_fence,
+                    next_revision: next_workflow_revision,
+                }],
+                next_workflow_revision,
+                surface::SurfaceWorkflowResultStatus::Success,
+                surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::Success,
+                },
+                surface::OperationTerminal::Succeeded {
+                    usage: usage.clone(),
+                },
+            ),
+            TaskStatus::Stopped => {
+                let (patches, terminal_revision) =
+                    if workflow.status == surface::SurfaceWorkflowStatus::Stopping {
+                        (
+                            vec![surface::WorkflowPatch::Stopped {
+                                fence: workflow_fence,
+                                next_revision: next_workflow_revision,
+                                reason: content.clone(),
+                            }],
+                            next_workflow_revision,
+                        )
+                    } else {
+                        (
+                            vec![
+                                surface::WorkflowPatch::Stopping {
+                                    fence: workflow_fence,
+                                    next_revision: next_workflow_revision,
+                                    reason: content.clone(),
+                                },
+                                surface::WorkflowPatch::Stopped {
+                                    fence: surface::SurfaceWorkflowFence {
+                                        workflow_run_id: workflow.workflow_run_id.clone(),
+                                        workflow_revision: next_workflow_revision,
+                                        parent: workflow.parent.clone(),
+                                    },
+                                    next_revision: second_workflow_revision,
+                                    reason: content.clone(),
+                                },
+                            ],
+                            second_workflow_revision,
+                        )
+                    };
+                (
+                    surface::SurfaceTaskStatus::Stopped,
+                    patches,
+                    terminal_revision,
+                    surface::SurfaceWorkflowResultStatus::Failed,
+                    surface::GenerationStopReason::Cancelled {
+                        cause: surface::TerminalizationCause::UserCancel,
+                    },
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
+                    },
+                )
+            }
+            TaskStatus::Cancelled => (
+                surface::SurfaceTaskStatus::Cancelled,
+                vec![surface::WorkflowPatch::Cancelled {
+                    fence: workflow_fence,
+                    next_revision: next_workflow_revision,
+                    reason: content.clone(),
+                }],
+                next_workflow_revision,
+                surface::SurfaceWorkflowResultStatus::Failed,
+                surface::GenerationStopReason::Cancelled {
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                },
+            ),
+            TaskStatus::Failed => (
+                surface::SurfaceTaskStatus::Failed,
+                vec![surface::WorkflowPatch::Failed {
+                    fence: workflow_fence,
+                    next_revision: next_workflow_revision,
+                    error: content.clone(),
+                }],
+                next_workflow_revision,
+                surface::SurfaceWorkflowResultStatus::Failed,
+                surface::GenerationStopReason::ExecutionFailed {
+                    class: surface::GenerationExecutionFailureClass::Workflow,
+                    message: diagnostic.clone(),
+                },
+                surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::Workflow,
+                    message: diagnostic,
+                },
+            ),
+            _ => unreachable!("candidate durable workflow outcome is terminal"),
+        };
+        let result_revision = surface::WorkflowRevision::try_new(
+            terminal_workflow_revision
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "durable workflow result revision exhausted".to_string(),
+                })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "durable workflow result revision is invalid".to_string(),
+        })?;
+        let finalize_intent_id =
+            surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let terminal_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let mut completion_events = vec![(
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                task_id: task.task_id,
+                expected_revision: task.revision,
+                next_revision: next_task_revision,
+                status: task_status,
+                completed_at: record.completed_at_ms.map(surface::UnixMillis::new),
+                result: record.result.map(surface::DisplayText::new),
+                error: record.error.map(surface::DisplayText::new),
+            }),
+        )];
+        completion_events.extend(workflow_patches.into_iter().map(|patch| {
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(patch),
+            )
+        }));
+        completion_events.extend([
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::ResultReady {
+                    fence: surface::SurfaceWorkflowFence {
+                        workflow_run_id: workflow.workflow_run_id.clone(),
+                        workflow_revision: terminal_workflow_revision,
+                        parent: workflow.parent.clone(),
+                    },
+                    next_revision: result_revision,
+                    result: surface::SurfaceWorkflowResult {
+                        result_id: surface::SurfaceWorkflowResultId::try_new(format!(
+                            "workflow-result-{}",
+                            workflow.workflow_run_id.as_str()
+                        ))
+                        .map_err(|_| {
+                            RuntimeHostError::ThreadStartFailed {
+                                message: "durable workflow result identity is invalid".to_string(),
+                            }
+                        })?,
+                        tool_use_id: None,
+                        status: result_status,
+                        content,
+                        acknowledged_by_operation: None,
+                    },
+                }),
+            ),
+            (
+                surface::SurfaceScope::Background {
+                    fence: background_fence.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                    fence: background_fence.operation_fence.clone(),
+                    reason: stop_reason.clone(),
+                    usage_delta: usage.clone(),
+                }),
+            ),
+            (
+                surface::SurfaceScope::Background {
+                    fence: background_fence.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::FinalizationStarted {
+                    operation_id: operation_id.clone(),
+                    finalize_intent_id: finalize_intent_id.clone(),
+                    terminal_commit_id: terminal_commit_id.clone(),
+                    selected_cause: surface::OperationFinalizationCause::GenerationStop(
+                        stop_reason,
+                    ),
+                    suspended_cause: None,
+                    expected_settlements: Vec::new(),
+                }),
+            ),
+        ]);
+        let completion_batch = recorded_surface_event_batch(&snapshot, completion_events, None);
+        coordinator
+            .commit_workflow_background_stop_batch(
+                background_fence.clone(),
+                operation_id.clone(),
+                finalize_intent_id.clone(),
+                &completion_batch,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to project durable workflow completion during recovery: {error:?}"
+                ),
+            })?;
+        let terminal_batch = recorded_surface_event_batch(
+            coordinator.state().snapshot(),
+            vec![(
+                surface::SurfaceScope::Background {
+                    fence: background_fence,
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                    record: surface::OperationTerminalRecord {
+                        operation_id: operation_id.clone(),
+                        finalize_intent_id: finalize_intent_id.clone(),
+                        terminal,
+                        usage,
+                        source_diagnostic_digest: None,
+                        settlement_receipts: Vec::new(),
+                        committed_at: surface::UnixMillis::new(
+                            chrono::Utc::now().timestamp_millis(),
+                        ),
+                    },
+                }),
+            )],
+            Some(terminal_commit_id),
+        );
+        coordinator
+            .commit_finalizer_batch(operation_id, finalize_intent_id, &terminal_batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to terminalize durable workflow completion during recovery: {error:?}"
+                ),
+            })?;
+    }
+}
+
 fn bootstrap_recorded_surface(
     thread: &mut RuntimeThread,
     config: &RunConfig,
@@ -3978,6 +4529,7 @@ fn bootstrap_recorded_surface(
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
                 message: format!("failed to materialize typed surface owner: {error:?}"),
             })?;
+        reconcile_durable_workflow_outcomes_on_start(thread, config, &mut coordinator)?;
         let operation_ids = coordinator
             .state()
             .snapshot()
@@ -4045,6 +4597,7 @@ fn bootstrap_recorded_surface(
                 }
             }
         }
+        reconcile_interrupted_workflow_surfaces_on_start(&mut coordinator)?;
     }
     reconcile_goal_surface_outbox_on_start(thread, &mut coordinator)?;
     hydrate_session_pinned_context_from_surface(
@@ -4064,6 +4617,8 @@ fn bootstrap_recorded_surface(
             surface::SurfaceCapability::ReadSnapshot,
             surface::SurfaceCapability::SubmitOperation,
             surface::SurfaceCapability::ControlBoundOperation,
+            surface::SurfaceCapability::ManageTask,
+            surface::SurfaceCapability::ManageWorkflow,
             surface::SurfaceCapability::ManageGoal,
             surface::SurfaceCapability::ManageThreadSettings,
             surface::SurfaceCapability::ManagePinnedContext,
@@ -4492,6 +5047,8 @@ struct ThreadActor {
     resident_surface: ResidentSurfaceSlot,
     pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
     pending_goal_completion_recovery: Option<PendingSurfaceGoalCompletionRecovery>,
+    pending_workflow_completions:
+        HashMap<surface::SurfaceOperationId, PendingTypedWorkflowCompletion>,
     surface_terminal_blocked: Option<String>,
 }
 
@@ -4594,6 +5151,7 @@ struct PendingSurfaceAdmissionCommit {
 enum PendingSurfaceTransitionRetry {
     ManualCompactionCompletion,
     GoalCompletionRecovery,
+    WorkflowCompletion(surface::SurfaceOperationId),
     AdmissionCommit(surface::SurfaceOperationId),
     AdmissionRepair(surface::SurfaceOperationId),
     AdmissionTerminal(surface::SurfaceOperationId),
@@ -4682,6 +5240,20 @@ fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     surface::Sha256Digest::new(hasher.finalize().into())
+}
+
+fn surface_workflow_launch_fingerprint(
+    catalog_entry_id: &surface::SurfaceCatalogEntryId,
+    args: &serde_json::Value,
+) -> surface::Sha256Digest {
+    surface_sha256(
+        &serde_json::to_vec(&(
+            "standalone_workflow_launch_v1",
+            catalog_entry_id.as_str(),
+            args,
+        ))
+        .expect("workflow launch identity is serializable"),
+    )
 }
 
 fn surface_goal_finish_command_digest(input: &FinishGoalOuterTurnForSurfaceInput) -> [u8; 32] {
@@ -6405,6 +6977,36 @@ enum GenerationTaskOutcome {
 struct HostBackgroundTask {
     cancel: CancelToken,
     join: JoinHandle<()>,
+    typed_workflow: Option<TypedWorkflowBackground>,
+}
+
+#[derive(Clone)]
+struct TypedWorkflowBackground {
+    fence: surface::SurfaceBackgroundFence,
+    task_id: surface::SurfaceTaskId,
+    workflow_run_id: surface::SurfaceWorkflowRunId,
+    tool_use_id: surface::SurfaceToolCallId,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TypedWorkflowCompletionStage {
+    Completion,
+    Terminal,
+}
+
+#[derive(Clone)]
+struct PendingTypedWorkflowCompletion {
+    typed: TypedWorkflowBackground,
+    operation_id: surface::SurfaceOperationId,
+    finalize_intent_id: surface::SurfaceFinalizeIntentId,
+    terminal_commit_id: surface::SurfaceCommitId,
+    completion_batch: surface::SurfaceCommitBatch,
+    terminal: surface::OperationTerminal,
+    usage: surface::UsageTotals,
+    terminal_batch: Option<surface::SurfaceCommitBatch>,
+    terminal_value: Option<surface::OperationTerminalAtCursor>,
+    stage: TypedWorkflowCompletionStage,
+    retry_at: tokio::time::Instant,
 }
 
 struct ProviderBackgroundTaskContext {
@@ -10570,6 +11172,11 @@ impl ThreadActor {
                     .iter()
                     .map(|pending| pending.retry_at),
             )
+            .chain(
+                self.pending_workflow_completions
+                    .values()
+                    .map(|pending| pending.retry_at),
+            )
             .min()
     }
 
@@ -10929,9 +11536,19 @@ impl ThreadActor {
                 PendingSurfaceTransitionRetry::GoalCompletionRecovery,
             )
         });
+        let workflow_completions =
+            self.pending_workflow_completions
+                .iter()
+                .map(|(operation_id, pending)| {
+                    (
+                        pending.retry_at,
+                        PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id.clone()),
+                    )
+                });
         let Some((_, retry)) =
             manual_compaction
                 .chain(goal_completion)
+                .chain(workflow_completions)
                 .chain(
                     self.resident_surface
                         .pending_admission_repairs
@@ -11059,6 +11676,10 @@ impl ThreadActor {
                     tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
                 self.pending_goal_completion_recovery = Some(pending);
             }
+            return;
+        }
+        if let PendingSurfaceTransitionRetry::WorkflowCompletion(operation_id) = retry {
+            self.retry_typed_workflow_completion(&operation_id);
             return;
         }
         if let PendingSurfaceTransitionRetry::AdmissionCommit(operation_id) = retry {
@@ -11894,6 +12515,537 @@ impl ThreadActor {
                 waiter: surface::OperationWaiterHandle::new(),
             },
         ))
+    }
+
+    fn control_surface_workflow(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        action: surface::WorkflowControlAction,
+    ) -> Result<
+        surface::MutationReply<surface::WorkflowControlOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let surface::WorkflowControlAction::Launch {
+            catalog_entry_id,
+            observed_catalog_revision,
+            args,
+            parent,
+        } = action
+        else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        if observed_catalog_revision
+            != surface::WorkflowCatalogRevision::try_new(1).expect("one is valid")
+            || parent.is_some()
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let mut raw_args = serde_json::Map::new();
+        for (name, value) in args {
+            if raw_args
+                .insert(
+                    name.as_str().to_string(),
+                    serde_json::Value::String(value.as_str().to_string()),
+                )
+                .is_some()
+            {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+        }
+        let workflow_args = serde_json::Value::Object(raw_args);
+        if let Some(replay) = self.replay_surface_workflow_launch(
+            client,
+            request_id.clone(),
+            &catalog_entry_id,
+            &workflow_args,
+        )? {
+            return Ok(replay);
+        }
+        if self.active.is_some() || self.pending_manual_compaction_completion.is_some() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        self.ensure_background_capacity(1)
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let config = self.config.clone();
+        if !config.workflows.enabled {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let cwd = config
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let task_registry = self
+            .state
+            .as_ref()
+            .map(|state| state.thread.session().task_registry().clone())
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let session_dir = cwd
+            .join(".orca")
+            .join("workflow-sessions")
+            .join(task_registry.session_id());
+        let runner = WorkflowRunner::new(config, task_registry.clone(), session_dir);
+        let prepared = runner
+            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                name: Some(catalog_entry_id.as_str().to_string()),
+                args: Some(workflow_args.clone()),
+                ..Default::default()
+            }))
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let tool_use_id = format!("workflow-{}", uuid::Uuid::new_v4());
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let task_id = surface::SurfaceTaskId::try_new(prepared.task_id.clone())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let workflow_run_id = surface::SurfaceWorkflowRunId::try_new(prepared.run_id.clone())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let workflow_name = surface::NonEmptyText::try_new(prepared.workflow_name.clone())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let surface_tool_use_id = surface::SurfaceToolCallId::try_new(tool_use_id.clone())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+
+        let operation_id =
+            surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let lease = surface::ReservationLease::new(
+            surface::SurfaceAdmissionLeaseId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            operation_id.clone(),
+            surface::SequenceNumber::new(snapshot.queued_operations.len() as u64 + 1),
+            self.resident_surface
+                .hub
+                .authority()
+                .host_incarnation()
+                .clone(),
+            surface::MonotonicInstant {
+                clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                tick: surface::MonotonicTick::new(0),
+            },
+        );
+        let replayability = surface::Replayability::NonReplayable {
+            reason: surface::NonReplayableReason::Missing,
+            live_capsule: surface::LiveOperationCapsule::Available {
+                incarnation: snapshot.cursor.incarnation.clone(),
+            },
+        };
+        let capability_fingerprint =
+            surface_workflow_launch_fingerprint(&catalog_entry_id, &workflow_args);
+        let operation = surface::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: request_id.clone(),
+            intent: surface::OperationIntent {
+                origin: surface::OperationOrigin::TuiUser,
+                kind: surface::OperationKind::StandaloneWorkflow {
+                    workflow: catalog_entry_id,
+                },
+                initial_replayability: replayability.clone(),
+                busy_disposition: surface::BusyDisposition::Queue,
+                interrupt_settlement: surface::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: capability_fingerprint.clone(),
+                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: surface::OperationPhase::Requested,
+            reservation: lease,
+            ready_for_admission: false,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        };
+        let generation_fence = surface::SurfaceOperationFence {
+            thread_id: snapshot.thread.thread_id.clone(),
+            thread_owner_epoch: snapshot.thread.owner_epoch,
+            operation_id: operation_id.clone(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        };
+        let logical_turn_id = TurnId::new();
+        let generation = surface::GenerationRecord {
+            fence: generation_fence.clone(),
+            logical_turn_id: logical_turn_id.clone(),
+            input: surface::GenerationInputState::NotApplicable,
+            predecessor: None,
+            attempt: surface::GenerationAttempt::Initial,
+            goal_identity: None,
+            replayability: replayability.clone(),
+            required_capabilities: Default::default(),
+            capability_fingerprint: capability_fingerprint.clone(),
+            phase: surface::GenerationPhase::Reserved,
+            started_witness: None,
+            stop_reason: None,
+        };
+        let background_fence = surface::SurfaceBackgroundFence {
+            operation_fence: generation_fence.clone(),
+            background_owner_token: surface::SurfaceBackgroundOwnerToken::new(random_token_bytes()),
+        };
+        let task = surface::SurfaceTask {
+            task_id: task_id.clone(),
+            revision: surface::TaskRevision::try_new(1).expect("one is valid"),
+            task_type: surface::SurfaceTaskType::Workflow,
+            status: surface::SurfaceTaskStatus::Running,
+            backgrounded: true,
+            description: surface::DisplayText::new(prepared.workflow_description.clone()),
+            created_at: surface::UnixMillis::new(prepared.created_at_ms),
+            started_at: Some(surface::UnixMillis::new(prepared.created_at_ms)),
+            completed_at: None,
+            parent_operation: Some(operation_id.clone()),
+            background_fence: Some(background_fence.clone()),
+            workflow_run_id: Some(workflow_run_id.clone()),
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+        };
+        let initial_workflow = surface::SurfaceWorkflow {
+            workflow_run_id: workflow_run_id.clone(),
+            task_id: task_id.clone(),
+            revision: surface::WorkflowRevision::try_new(1).expect("one is valid"),
+            name: workflow_name,
+            status: surface::SurfaceWorkflowStatus::Running,
+            phases: Vec::new(),
+            agents: Vec::new(),
+            result: None,
+            error: None,
+            parent: None,
+        };
+        let final_workflow = surface::SurfaceWorkflow {
+            revision: surface::WorkflowRevision::try_new(2).expect("two is valid"),
+            status: surface::SurfaceWorkflowStatus::AsyncLaunched,
+            ..initial_workflow.clone()
+        };
+        let started_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let events = vec![
+            (
+                surface::SurfaceScope::Operation {
+                    operation_id: operation_id.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Requested { operation }),
+            ),
+            (
+                surface::SurfaceScope::Operation {
+                    operation_id: operation_id.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::Admitted {
+                    operation_id: operation_id.clone(),
+                    logical_turn_id,
+                    input: surface::AdmittedInput::NotApplicable,
+                    first_generation: generation,
+                }),
+            ),
+            (
+                surface::SurfaceScope::Generation {
+                    fence: generation_fence.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStarted {
+                    fence: generation_fence.clone(),
+                    witness: surface::GenerationStartedWitness {
+                        started_commit_id: started_commit_id.clone(),
+                        settings_revision: snapshot.settings.thread_revision,
+                        policy_epoch: snapshot.settings.effective.policy_epoch,
+                        durable_replayability_digest: surface::canonical_replayability_digest(
+                            &replayability,
+                        ),
+                        capability_fingerprint,
+                    },
+                }),
+            ),
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Task(surface::TaskPatch::Upserted {
+                    expected_revision: None,
+                    task,
+                }),
+            ),
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::Started {
+                    workflow: initial_workflow,
+                }),
+            ),
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::AsyncLaunched {
+                    fence: surface::SurfaceWorkflowFence {
+                        workflow_run_id: workflow_run_id.clone(),
+                        workflow_revision: surface::WorkflowRevision::try_new(1)
+                            .expect("one is valid"),
+                        parent: None,
+                    },
+                    next_revision: surface::WorkflowRevision::try_new(2).expect("two is valid"),
+                }),
+            ),
+            (
+                surface::SurfaceScope::Generation {
+                    fence: generation_fence.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationTransferred {
+                    fence: generation_fence,
+                    background_fence: background_fence.clone(),
+                    task_id: Some(task_id.clone()),
+                }),
+            ),
+        ];
+        let batch = self.surface_event_batch_with_commit_id(events, Some(started_commit_id));
+        let mut launch_committed = false;
+        for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            if self
+                .resident_surface
+                .coordinator
+                .commit_actor_batch(&batch)
+                .is_ok()
+            {
+                launch_committed = true;
+                break;
+            }
+        }
+        if !launch_committed {
+            runner.abort_prepared_background(
+                prepared,
+                "typed workflow launch was not durably committed".to_string(),
+            );
+            if self.resident_surface.coordinator.has_incomplete_batch() {
+                self.surface_terminal_blocked =
+                    Some("typed workflow launch commit is retained for cold recovery".to_string());
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        self.resident_surface
+            .operation_origin_attachments
+            .insert(operation_id.clone(), client.attachment_id().clone());
+        let typed_workflow = TypedWorkflowBackground {
+            fence: background_fence,
+            task_id,
+            workflow_run_id: workflow_run_id.clone(),
+            tool_use_id: surface_tool_use_id,
+        };
+        let returned_workflow = final_workflow;
+        match runner.activate_background(prepared.clone()) {
+            Ok(launch) => {
+                let events = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.events.fork())
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                let launched_task_id = launch.task_id.clone();
+                self.spawn_workflow_background_tasks(
+                    task_registry,
+                    &events,
+                    None,
+                    RuntimeBackgroundWorkflows::from_vec(vec![BackgroundWorkflowRun::new(
+                        launch,
+                        Some(tool_use_id),
+                    )]),
+                );
+                self.background_tasks
+                    .get_mut(&launched_task_id)
+                    .expect("activated workflow background task was registered")
+                    .typed_workflow = Some(typed_workflow);
+            }
+            Err(error) => {
+                runner.abort_prepared_background(prepared, error.to_string());
+                self.commit_typed_workflow_completion(typed_workflow, None)
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            }
+        }
+        let event = |index: usize, family| surface::MutationCommitAck::ThreadLocalCursor {
+            cursor: batch.cursor_after.clone(),
+            family,
+            event_id: batch.events.as_slice()[index].event_id.clone(),
+            commit_class: batch.commit_class.clone(),
+        };
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Workflow {
+                    thread_id: snapshot.thread.thread_id,
+                    workflow_run_id,
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    event(4, surface::SurfaceFactFamily::Workflow),
+                    event(3, surface::SurfaceFactFamily::Task),
+                    event(6, surface::SurfaceFactFamily::Operation),
+                ])
+                .expect("workflow launch commits workflow, task, and operation"),
+            },
+            value: surface::WorkflowControlOutput {
+                workflow: returned_workflow,
+                operation_id: Some(operation_id),
+                cursor: batch.cursor_after,
+                waiter: Some(surface::OperationWaiterHandle::new()),
+            },
+        })
+    }
+
+    fn replay_surface_workflow_launch(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        catalog_entry_id: &surface::SurfaceCatalogEntryId,
+        workflow_args: &serde_json::Value,
+    ) -> Result<
+        Option<surface::MutationReply<surface::WorkflowControlOutput>>,
+        surface::SurfaceClientCommandError,
+    > {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let Some(operation) = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| operation.request_id == request_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            &operation.intent.kind,
+            surface::OperationKind::StandaloneWorkflow { workflow }
+                if workflow.as_str() == catalog_entry_id.as_str()
+        ) {
+            return Ok(Some(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid {
+                    request_id,
+                    target: Some(surface::MutationTarget::Operation {
+                        thread_id: snapshot.thread.thread_id,
+                        operation_id: operation.operation_id,
+                    }),
+                    error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::InvalidRequest,
+                        message: surface::DisplayText::new(
+                            "request id is already bound to another operation",
+                        ),
+                        winning_request_id: Some(operation.request_id),
+                        current_revision: Some(surface::SurfaceMutationRevision::Thread {
+                            cursor: snapshot.cursor,
+                        }),
+                    }),
+                },
+            }));
+        }
+        if let Some(bound) = self
+            .resident_surface
+            .operation_origin_attachments
+            .get(&operation.operation_id)
+            && bound != client.attachment_id()
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let current_workflow = snapshot
+            .workflows
+            .iter()
+            .find(|workflow| {
+                snapshot.tasks.iter().any(|task| {
+                    task.task_id == workflow.task_id
+                        && task.parent_operation.as_ref() == Some(&operation.operation_id)
+                })
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let expected_launch_fingerprint =
+            surface_workflow_launch_fingerprint(catalog_entry_id, workflow_args);
+        if operation.intent.capability_fingerprint != expected_launch_fingerprint {
+            return Ok(Some(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid {
+                    request_id,
+                    target: Some(surface::MutationTarget::Workflow {
+                        thread_id: snapshot.thread.thread_id,
+                        workflow_run_id: current_workflow.workflow_run_id,
+                    }),
+                    error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::InvalidRequest,
+                        message: surface::DisplayText::new(
+                            "request id is already bound to different workflow arguments",
+                        ),
+                        winning_request_id: Some(operation.request_id),
+                        current_revision: Some(surface::SurfaceMutationRevision::Thread {
+                            cursor: snapshot.cursor,
+                        }),
+                    }),
+                },
+            }));
+        }
+        let recovered = self
+            .resident_surface
+            .coordinator
+            .ledger()
+            .recover_batches()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let launch_batch = recovered
+            .committed
+            .iter()
+            .find(|batch| {
+                batch.events.as_slice().iter().any(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Requested {
+                            operation: requested,
+                        }) if requested.operation_id == operation.operation_id
+                    )
+                })
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if launch_batch.events.as_slice().len() != 7 {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let launch_workflow = match &launch_batch.events.as_slice()[4].event {
+            surface::SurfaceEvent::Workflow(surface::WorkflowPatch::Started { workflow }) => {
+                surface::SurfaceWorkflow {
+                    revision: surface::WorkflowRevision::try_new(2).expect("two is valid"),
+                    status: surface::SurfaceWorkflowStatus::AsyncLaunched,
+                    ..workflow.clone()
+                }
+            }
+            _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+        };
+        self.resident_surface
+            .operation_origin_attachments
+            .entry(operation.operation_id.clone())
+            .or_insert_with(|| client.attachment_id().clone());
+        let event = |index: usize, family| surface::MutationCommitAck::ThreadLocalCursor {
+            cursor: launch_batch.cursor_after.clone(),
+            family,
+            event_id: launch_batch.events.as_slice()[index].event_id.clone(),
+            commit_class: launch_batch.commit_class.clone(),
+        };
+        Ok(Some(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Workflow {
+                    thread_id: snapshot.thread.thread_id,
+                    workflow_run_id: launch_workflow.workflow_run_id.clone(),
+                },
+                disposition: surface::MutationDisposition::AlreadyApplied,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    event(4, surface::SurfaceFactFamily::Workflow),
+                    event(3, surface::SurfaceFactFamily::Task),
+                    event(6, surface::SurfaceFactFamily::Operation),
+                ])
+                .expect("workflow replay acknowledges workflow, task, and operation"),
+            },
+            value: surface::WorkflowControlOutput {
+                workflow: launch_workflow,
+                operation_id: Some(operation.operation_id),
+                cursor: launch_batch.cursor_after,
+                waiter: Some(surface::OperationWaiterHandle::new()),
+            },
+        }))
     }
 
     fn replay_manual_compaction_request(
@@ -16033,6 +17185,7 @@ impl ThreadActor {
             resident_surface: ResidentSurfaceSlot(resident_surface),
             pending_manual_compaction_completion: None,
             pending_goal_completion_recovery: None,
+            pending_workflow_completions: HashMap::new(),
             surface_terminal_blocked: None,
         }
     }
@@ -16062,12 +17215,20 @@ impl ThreadActor {
                             if self.surface_terminal_blocked.is_some() {
                                 std::future::pending::<()>().await;
                             }
-                            self.shutdown_background_tasks().await;
+                            let _ = self
+                                .shutdown_background_tasks(
+                                    surface::SurfaceShutdownReason::ThreadClose,
+                                )
+                                .await;
                             break;
                         };
                         if let ThreadCommand::ShutdownThread { reply, reason } = command {
                             let bounded_goal_recovery =
                                 self.has_pending_goal_completion_recovery_owner();
+                            let bounded_workflow_recovery =
+                                !self.pending_workflow_completions.is_empty();
+                            let bounded_surface_recovery =
+                                bounded_goal_recovery || bounded_workflow_recovery;
                             let goal_recovery_operation_id =
                                 self.pending_goal_completion_recovery_operation_id();
                             let cold_goal_handoff = bounded_goal_recovery
@@ -16082,7 +17243,7 @@ impl ThreadActor {
                                 self.retry_pending_surface_transition(None);
                                 if self.has_pending_surface_transition_retry() {
                                     retry_attempts = retry_attempts.saturating_add(1);
-                                    if bounded_goal_recovery
+                                    if bounded_surface_recovery
                                         && retry_attempts
                                             >= SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
                                     {
@@ -16091,9 +17252,11 @@ impl ThreadActor {
                                     tokio::time::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL).await;
                                 }
                             }
-                            if bounded_goal_recovery
-                                && self.has_pending_surface_transition_retry()
-                            {
+                            let goal_recovery_still_pending = bounded_goal_recovery
+                                && self.has_pending_goal_completion_recovery_owner();
+                            let workflow_recovery_still_pending =
+                                !self.pending_workflow_completions.is_empty();
+                            if goal_recovery_still_pending || workflow_recovery_still_pending {
                                 if let Some(operation_id) = goal_recovery_operation_id {
                                     for waiter in self
                                         .resident_surface
@@ -16106,9 +17269,28 @@ impl ThreadActor {
                                         ));
                                     }
                                 }
+                                for operation_id in
+                                    self.pending_workflow_completions.keys().cloned()
+                                {
+                                    for waiter in self
+                                        .resident_surface
+                                        .waiters
+                                        .remove(&operation_id)
+                                        .unwrap_or_default()
+                                    {
+                                        let _ = waiter.try_send(Err(
+                                            surface::SurfaceClientCommandError::RuntimeUnavailable,
+                                        ));
+                                    }
+                                }
                                 self.surface_terminal_blocked.get_or_insert_with(|| {
-                                    "typed Goal completion recovery was retained for cold restart"
-                                        .to_string()
+                                    if workflow_recovery_still_pending {
+                                        "typed workflow completion recovery was retained for cold restart"
+                                            .to_string()
+                                    } else {
+                                        "typed Goal completion recovery was retained for cold restart"
+                                            .to_string()
+                                    }
                                 });
                             }
                             if let Some(message) = self.surface_terminal_blocked.as_ref() {
@@ -16116,7 +17298,7 @@ impl ThreadActor {
                                     message: message.clone(),
                                 };
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    self.shutdown_background_tasks().await;
+                                    let _ = self.shutdown_background_tasks(reason).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -16136,7 +17318,7 @@ impl ThreadActor {
                             if let Err(error) = typed_shutdown {
                                 self.surface_terminal_blocked = Some(error.to_string());
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    self.shutdown_background_tasks().await;
+                                    let _ = self.shutdown_background_tasks(reason).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -16147,9 +17329,14 @@ impl ThreadActor {
                                 }
                                 continue;
                             }
-                            self.shutdown_background_tasks().await;
+                            let background_shutdown =
+                                self.shutdown_background_tasks(reason).await;
                             if let Some(reply) = reply {
-                                let _ = reply.send(ThreadShutdownAck::Complete);
+                                let ack = match background_shutdown {
+                                    Ok(()) => ThreadShutdownAck::Complete,
+                                    Err(error) => ThreadShutdownAck::Failed(error),
+                                };
+                                let _ = reply.send(ack);
                             }
                             break;
                         }
@@ -16220,7 +17407,7 @@ impl ThreadActor {
                                     Self::drain_closed_thread_commands(&mut command_rx);
                                     self.resident_surface.0.take();
                                     let _ = (&mut active.generation.join).await;
-                                    self.shutdown_background_tasks().await;
+                                    let _ = self.shutdown_background_tasks(reason).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -16241,8 +17428,18 @@ impl ThreadActor {
                             Self::drain_closed_thread_commands(&mut command_rx);
                             let result = (&mut active.generation.join).await;
                             let finish_result = self.finish_generation(active, result, false);
-                            self.shutdown_background_tasks().await;
+                            let background_shutdown =
+                                self.shutdown_background_tasks(reason).await;
                             if let Err(error) = finish_result {
+                                if let Some(reply) = reply.as_ref() {
+                                    let _ = reply.send(ThreadShutdownAck::Failed(error));
+                                }
+                                if reason == surface::SurfaceShutdownReason::HostShutdown {
+                                    break;
+                                }
+                                std::future::pending::<()>().await;
+                            }
+                            if let Err(error) = background_shutdown {
                                 if let Some(reply) = reply.as_ref() {
                                     let _ = reply.send(ThreadShutdownAck::Failed(error));
                                 }
@@ -16294,7 +17491,11 @@ impl ThreadActor {
                             active.generation.cancel.cancel();
                             let result = (&mut active.generation.join).await;
                             let finish_result = self.finish_generation(active, result, false);
-                            self.shutdown_background_tasks().await;
+                            let _ = self
+                                .shutdown_background_tasks(
+                                    surface::SurfaceShutdownReason::ThreadClose,
+                                )
+                                .await;
                             if let Err(error) = finish_result {
                                 eprintln!("orca: operation finalization failed: {error}");
                                 std::future::pending::<()>().await;
@@ -16369,6 +17570,9 @@ impl ThreadActor {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceGoalMutation { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
+                ThreadCommand::SurfaceWorkflowControl { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
@@ -16817,6 +18021,21 @@ impl ThreadActor {
                 };
                 let _ = reply.send(result);
             }
+            ThreadCommand::SurfaceWorkflowControl {
+                client,
+                request_id,
+                action,
+                reply,
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::ManageWorkflow)
+                {
+                    self.control_surface_workflow(&client, request_id, action)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
             #[cfg(test)]
             ThreadCommand::SurfaceSuspendOperationForTest { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
@@ -16836,6 +18055,9 @@ impl ThreadActor {
                     pending_manual_compaction_completion: self
                         .pending_manual_compaction_completion
                         .is_some(),
+                    pending_workflow_completion: self
+                        .pending_workflow_completions
+                        .contains_key(&operation_id),
                     pending_admission_repair: self
                         .resident_surface
                         .pending_admission_repairs
@@ -17276,6 +18498,9 @@ impl ThreadActor {
             ThreadCommand::SurfaceGoalMutation { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
+            ThreadCommand::SurfaceWorkflowControl { reply, .. } => {
+                let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+            }
             ThreadCommand::SurfaceCommitProviderResponse {
                 fence,
                 response,
@@ -17465,6 +18690,9 @@ impl ThreadActor {
                     pending_manual_compaction_completion: self
                         .pending_manual_compaction_completion
                         .is_some(),
+                    pending_workflow_completion: self
+                        .pending_workflow_completions
+                        .contains_key(&operation_id),
                     pending_admission_repair: self
                         .resident_surface
                         .pending_admission_repairs
@@ -18873,8 +20101,14 @@ impl ThreadActor {
                 }
                 let _ = completion_tx.send(completion_task_id);
             });
-            self.background_tasks
-                .insert(task_id, HostBackgroundTask { cancel, join });
+            self.background_tasks.insert(
+                task_id,
+                HostBackgroundTask {
+                    cancel,
+                    join,
+                    typed_workflow: None,
+                },
+            );
         }
     }
 
@@ -18941,24 +20175,473 @@ impl ThreadActor {
             }
             let _ = completion_tx.send(completion_task_id);
         });
-        self.background_tasks
-            .insert(task_id.clone(), HostBackgroundTask { cancel, join });
+        self.background_tasks.insert(
+            task_id.clone(),
+            HostBackgroundTask {
+                cancel,
+                join,
+                typed_workflow: None,
+            },
+        );
         Ok(task_id)
     }
 
     async fn reap_background_task(&mut self, task_id: &str) {
         if let Some(task) = self.background_tasks.remove(task_id) {
-            let _ = task.join.await;
+            let HostBackgroundTask {
+                join,
+                typed_workflow,
+                ..
+            } = task;
+            let _ = join.await;
+            if let Some(typed_workflow) = typed_workflow
+                && let Err(error) = self.commit_typed_workflow_completion(typed_workflow, None)
+            {
+                self.surface_terminal_blocked = Some(error.to_string());
+            }
         }
     }
 
-    async fn shutdown_background_tasks(&mut self) {
+    fn commit_typed_workflow_completion(
+        &mut self,
+        typed: TypedWorkflowBackground,
+        shutdown_reason: Option<surface::SurfaceShutdownReason>,
+    ) -> Result<(), RuntimeHostError> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == typed.task_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed workflow task disappeared before completion".to_string(),
+            })?;
+        let workflow = snapshot
+            .workflows
+            .iter()
+            .find(|workflow| workflow.workflow_run_id == typed.workflow_run_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "typed workflow disappeared before completion".to_string(),
+            })?;
+        let record = self
+            .state
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .thread
+                    .session()
+                    .task_registry()
+                    .get(typed.task_id.as_str())
+            })
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "workflow task registry record disappeared before completion".to_string(),
+            })?;
+        let workflow_fence = surface::SurfaceWorkflowFence {
+            workflow_run_id: workflow.workflow_run_id.clone(),
+            workflow_revision: workflow.revision,
+            parent: workflow.parent.clone(),
+        };
+        let next_task_revision =
+            surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "workflow task revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "workflow task revision is invalid".to_string(),
+            })?;
+        let next_workflow_revision =
+            surface::WorkflowRevision::try_new(workflow.revision.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "workflow revision exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "workflow revision is invalid".to_string(),
+            })?;
+        let second_workflow_revision = surface::WorkflowRevision::try_new(
+            next_workflow_revision.get().checked_add(1).ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "workflow result revision exhausted".to_string(),
+                }
+            })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "workflow second revision is invalid".to_string(),
+        })?;
+        let usage = surface_usage_totals(record.usage.unwrap_or_default());
+        let diagnostic = surface::SafeDiagnosticText::try_new("background workflow failed")
+            .expect("fixed diagnostic is bounded");
+        let display_reason = surface::DisplayText::new(
+            record
+                .error
+                .clone()
+                .or_else(|| record.result.clone())
+                .unwrap_or_else(|| "Workflow stopped".to_string()),
+        );
+        let (
+            task_status,
+            workflow_patches,
+            terminal_workflow_revision,
+            result_status,
+            result_content,
+            stop_reason,
+            terminal,
+        ) = match record.status {
+            TaskStatus::Completed => (
+                surface::SurfaceTaskStatus::Completed,
+                vec![surface::WorkflowPatch::Completed {
+                    fence: workflow_fence.clone(),
+                    next_revision: next_workflow_revision,
+                }],
+                next_workflow_revision,
+                surface::SurfaceWorkflowResultStatus::Success,
+                surface::DisplayText::new(
+                    record
+                        .result
+                        .clone()
+                        .unwrap_or_else(|| "Workflow completed".to_string()),
+                ),
+                surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::Success,
+                },
+                surface::OperationTerminal::Succeeded {
+                    usage: usage.clone(),
+                },
+            ),
+            TaskStatus::Stopped => (
+                surface::SurfaceTaskStatus::Stopped,
+                vec![
+                    surface::WorkflowPatch::Stopping {
+                        fence: workflow_fence.clone(),
+                        next_revision: next_workflow_revision,
+                        reason: display_reason.clone(),
+                    },
+                    surface::WorkflowPatch::Stopped {
+                        fence: surface::SurfaceWorkflowFence {
+                            workflow_run_id: workflow.workflow_run_id.clone(),
+                            workflow_revision: next_workflow_revision,
+                            parent: workflow.parent.clone(),
+                        },
+                        next_revision: second_workflow_revision,
+                        reason: display_reason.clone(),
+                    },
+                ],
+                second_workflow_revision,
+                surface::SurfaceWorkflowResultStatus::Failed,
+                display_reason.clone(),
+                shutdown_reason.map_or(
+                    surface::GenerationStopReason::Cancelled {
+                        cause: surface::TerminalizationCause::UserCancel,
+                    },
+                    |reason| surface::GenerationStopReason::Cancelled {
+                        cause: match reason {
+                            surface::SurfaceShutdownReason::HostShutdown => {
+                                surface::TerminalizationCause::HostShutdown
+                            }
+                            surface::SurfaceShutdownReason::ThreadClose => {
+                                surface::TerminalizationCause::ThreadClose
+                            }
+                        },
+                    },
+                ),
+                shutdown_reason.map_or(
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
+                    },
+                    |reason| surface::OperationTerminal::Shutdown { reason },
+                ),
+            ),
+            TaskStatus::Cancelled => (
+                surface::SurfaceTaskStatus::Cancelled,
+                vec![surface::WorkflowPatch::Cancelled {
+                    fence: workflow_fence.clone(),
+                    next_revision: next_workflow_revision,
+                    reason: display_reason.clone(),
+                }],
+                next_workflow_revision,
+                surface::SurfaceWorkflowResultStatus::Failed,
+                display_reason.clone(),
+                surface::GenerationStopReason::Cancelled {
+                    cause: surface::TerminalizationCause::UserCancel,
+                },
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User,
+                },
+            ),
+            _ => (
+                surface::SurfaceTaskStatus::Failed,
+                vec![surface::WorkflowPatch::Failed {
+                    fence: workflow_fence.clone(),
+                    next_revision: next_workflow_revision,
+                    error: display_reason.clone(),
+                }],
+                next_workflow_revision,
+                surface::SurfaceWorkflowResultStatus::Failed,
+                display_reason,
+                surface::GenerationStopReason::ExecutionFailed {
+                    class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
+                    message: diagnostic.clone(),
+                },
+                surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message: diagnostic,
+                },
+            ),
+        };
+        let result_workflow_revision = surface::WorkflowRevision::try_new(
+            terminal_workflow_revision
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "workflow result revision exhausted".to_string(),
+                })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "workflow result revision is invalid".to_string(),
+        })?;
+        let result = surface::SurfaceWorkflowResult {
+            result_id: surface::SurfaceWorkflowResultId::try_new(format!(
+                "workflow-result-{}",
+                typed.workflow_run_id.as_str()
+            ))
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "workflow result identity is invalid".to_string(),
+            })?,
+            tool_use_id: Some(typed.tool_use_id.clone()),
+            status: result_status,
+            content: result_content,
+            acknowledged_by_operation: None,
+        };
+        let finalize_intent_id =
+            surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let terminal_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let operation_id = typed.fence.operation_fence.operation_id.clone();
+        let mut completion_events = vec![(
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                task_id: typed.task_id.clone(),
+                expected_revision: task.revision,
+                next_revision: next_task_revision,
+                status: task_status,
+                completed_at: record.completed_at_ms.map(surface::UnixMillis::new),
+                result: record.result.map(surface::DisplayText::new),
+                error: record.error.map(surface::DisplayText::new),
+            }),
+        )];
+        completion_events.extend(workflow_patches.into_iter().map(|patch| {
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(patch),
+            )
+        }));
+        completion_events.extend([
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::ResultReady {
+                    fence: surface::SurfaceWorkflowFence {
+                        workflow_run_id: workflow.workflow_run_id,
+                        workflow_revision: terminal_workflow_revision,
+                        parent: workflow.parent,
+                    },
+                    next_revision: result_workflow_revision,
+                    result,
+                }),
+            ),
+            (
+                surface::SurfaceScope::Background {
+                    fence: typed.fence.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                    fence: typed.fence.operation_fence.clone(),
+                    reason: stop_reason.clone(),
+                    usage_delta: usage.clone(),
+                }),
+            ),
+            (
+                surface::SurfaceScope::Background {
+                    fence: typed.fence.clone(),
+                },
+                surface::SurfaceEvent::Operation(surface::OperationPatch::FinalizationStarted {
+                    operation_id: operation_id.clone(),
+                    finalize_intent_id: finalize_intent_id.clone(),
+                    terminal_commit_id: terminal_commit_id.clone(),
+                    selected_cause: surface::OperationFinalizationCause::GenerationStop(
+                        stop_reason,
+                    ),
+                    suspended_cause: None,
+                    expected_settlements: Vec::new(),
+                }),
+            ),
+        ]);
+        let completion_batch = self.surface_event_batch_with_commit_id(completion_events, None);
+        let mut pending = PendingTypedWorkflowCompletion {
+            typed,
+            operation_id: operation_id.clone(),
+            finalize_intent_id,
+            terminal_commit_id,
+            completion_batch,
+            terminal,
+            usage,
+            terminal_batch: None,
+            terminal_value: None,
+            stage: TypedWorkflowCompletionStage::Completion,
+            retry_at: tokio::time::Instant::now(),
+        };
+        match self.settle_typed_workflow_completion(&mut pending) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                self.pending_workflow_completions
+                    .insert(operation_id, pending);
+                Err(error)
+            }
+        }
+    }
+
+    fn settle_typed_workflow_completion(
+        &mut self,
+        pending: &mut PendingTypedWorkflowCompletion,
+    ) -> Result<(), RuntimeHostError> {
+        if pending.stage == TypedWorkflowCompletionStage::Completion {
+            self.resident_surface
+                .coordinator
+                .commit_workflow_background_stop_batch(
+                    pending.typed.fence.clone(),
+                    pending.operation_id.clone(),
+                    pending.finalize_intent_id.clone(),
+                    &pending.completion_batch,
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to commit typed workflow completion: {error:?}"),
+                })?;
+            pending.stage = TypedWorkflowCompletionStage::Terminal;
+        }
+        if pending.terminal_batch.is_none() {
+            let terminal_batch = self.surface_event_batch_with_commit_id(
+                vec![(
+                    surface::SurfaceScope::Background {
+                        fence: pending.typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                        record: surface::OperationTerminalRecord {
+                            operation_id: pending.operation_id.clone(),
+                            finalize_intent_id: pending.finalize_intent_id.clone(),
+                            terminal: pending.terminal.clone(),
+                            usage: pending.usage.clone(),
+                            source_diagnostic_digest: None,
+                            settlement_receipts: Vec::new(),
+                            committed_at: surface::UnixMillis::new(
+                                chrono::Utc::now().timestamp_millis(),
+                            ),
+                        },
+                    }),
+                )],
+                Some(pending.terminal_commit_id.clone()),
+            );
+            pending.terminal_value = Some(surface::OperationTerminalAtCursor {
+                operation_id: pending.operation_id.clone(),
+                terminal: pending.terminal.clone(),
+                cursor: terminal_batch.cursor_after.clone(),
+                commit_class: terminal_batch.commit_class.clone(),
+                batch_digest: terminal_batch.batch_digest.clone(),
+            });
+            pending.terminal_batch = Some(terminal_batch);
+        }
+        let terminal_batch = pending
+            .terminal_batch
+            .as_ref()
+            .expect("terminal stage owns an exact terminal batch");
+        self.resident_surface
+            .coordinator
+            .commit_finalizer_batch(
+                pending.operation_id.clone(),
+                pending.finalize_intent_id.clone(),
+                terminal_batch,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to commit typed workflow terminal: {error:?}"),
+            })?;
+        self.cache_surface_terminal(
+            pending
+                .terminal_value
+                .clone()
+                .expect("terminal batch owns its public terminal value"),
+        );
+        Ok(())
+    }
+
+    fn retry_typed_workflow_completion(&mut self, operation_id: &surface::SurfaceOperationId) {
+        let Some(mut pending) = self.pending_workflow_completions.remove(operation_id) else {
+            return;
+        };
+        if self.settle_typed_workflow_completion(&mut pending).is_err() {
+            pending.retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            self.pending_workflow_completions
+                .insert(operation_id.clone(), pending);
+        } else if self.pending_workflow_completions.is_empty() {
+            self.surface_terminal_blocked = None;
+        }
+    }
+
+    async fn shutdown_background_tasks(
+        &mut self,
+        reason: surface::SurfaceShutdownReason,
+    ) -> Result<(), RuntimeHostError> {
         for task in self.background_tasks.values() {
             task.cancel.cancel();
         }
-        for (_, task) in self.background_tasks.drain() {
-            let _ = task.join.await;
+        let tasks = self
+            .background_tasks
+            .drain()
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for task in tasks {
+            let HostBackgroundTask {
+                join,
+                typed_workflow,
+                ..
+            } = task;
+            let _ = join.await;
+            if let Some(typed_workflow) = typed_workflow {
+                if let Err(error) =
+                    self.commit_typed_workflow_completion(typed_workflow, Some(reason))
+                {
+                    self.surface_terminal_blocked = Some(error.to_string());
+                    first_error.get_or_insert(error);
+                }
+            }
         }
+        for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            if self.pending_workflow_completions.is_empty() {
+                return Ok(());
+            }
+            let operation_ids = self
+                .pending_workflow_completions
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            for operation_id in operation_ids {
+                self.retry_typed_workflow_completion(&operation_id);
+            }
+            if !self.pending_workflow_completions.is_empty() {
+                tokio::time::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL).await;
+            }
+        }
+        first_error.map_or_else(
+            || {
+                Err(RuntimeHostError::ThreadStartFailed {
+                    message: "typed workflow completion retry did not converge".to_string(),
+                })
+            },
+            Err,
+        )
     }
 }
 
@@ -21237,6 +22920,97 @@ mod tests {
         );
 
         host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn host_shutdown_bounds_persistent_workflow_completion_failure() {
+        if !crate::workflow::host::WorkflowHost::node_available() {
+            return;
+        }
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let cwd = tempfile::tempdir().unwrap();
+        let workflow_dir = cwd.path().join(".orca").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("bounded-shutdown.js"),
+            "export const meta = { name: 'bounded-shutdown', description: 'bounded shutdown', phases: ['main'] };\nexport default 'done';",
+        )
+        .unwrap();
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            cwd.path(),
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().expect("start workflow runtime");
+        let thread = host
+            .start_thread(config, "bounded workflow shutdown")
+            .expect("start workflow thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load workflow transcript")
+            .path;
+        surface::JsonlSurfaceCommitLedger::inject_workflow_completion_append_failures(
+            transcript_path,
+            100,
+        );
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ManageWorkflow,
+            ]),
+        );
+        let output = committed_surface_value(
+            attachment
+                .client
+                .workflow_control(
+                    surface_request_id(),
+                    surface::WorkflowControlAction::Launch {
+                        catalog_entry_id: surface::SurfaceCatalogEntryId::try_new(
+                            "bounded-shutdown",
+                        )
+                        .unwrap(),
+                        observed_catalog_revision: surface::WorkflowCatalogRevision::try_new(1)
+                            .unwrap(),
+                        args: Vec::new(),
+                        parent: None,
+                    },
+                )
+                .expect("launch typed workflow"),
+        );
+        let operation_id = output.operation_id.expect("workflow operation");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while !thread
+            .surface_actor_probe_for_test(operation_id.clone())
+            .expect("probe workflow completion")
+            .pending_workflow_completion
+        {
+            assert!(
+                Instant::now() < deadline,
+                "workflow completion failure was not retained for retry"
+            );
+            std::thread::yield_now();
+        }
+
+        let shutdown_started = Instant::now();
+        assert!(
+            host.shutdown().is_err(),
+            "persistent workflow completion failure must fail shutdown"
+        );
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(3),
+            "workflow completion recovery must not keep HostShutdown pending forever"
+        );
+        match previous_home {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
     }
 
     #[test]

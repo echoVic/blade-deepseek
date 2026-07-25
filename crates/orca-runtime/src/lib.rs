@@ -64,7 +64,7 @@ pub mod surface {
         DetachRequest, DetachResult, DisplayText, DurableRevision, ExpectedGoal, FailureClass,
         FreshAttachRequest, FreshSurfaceAttachment, GoalMutationAction, GoalMutationOutput,
         GoalPatch, GoalRunInput, GoalTokenBudgetUpdate, InteractionPatch, LegacyTurnId,
-        MaintenanceOperationOutput, MutationReply, NonEmptyText, NonEmptyVec,
+        MaintenanceOperationOutput, MutationDisposition, MutationReply, NonEmptyText, NonEmptyVec,
         OperationIngressCorrelation, OperationKind, OperationPatch, OperationRequestIntent,
         OperationSettingsPreparation, OperationTerminal, PermissionGrantScope, PinnedContextAction,
         PinnedContextMutationOutput, PinnedContextPatch, PinnedContextRevision,
@@ -90,9 +90,11 @@ pub mod surface {
         SurfaceReasoningEffort, SurfaceRecoverableOperation, SurfaceRequestId,
         SurfaceResolvedInputFact, SurfaceScope, SurfaceSettingsSnapshot, SurfaceShutdownReason,
         SurfaceSnapshot, SurfaceStreamId, SurfaceSubscriptionHandle, SurfaceSubscriptionItem,
-        SurfaceSubscriptionReceiver, SurfaceThreadId, SurfaceToolResultKind, SurfaceTurnId,
-        SurfaceUserInputDecision, SurfaceUserInputState, ThreadOwnerEpoch, ToolPatch, UnixMillis,
-        WaitOperationTerminalResult,
+        SurfaceSubscriptionReceiver, SurfaceTask, SurfaceTaskStatus, SurfaceThreadId,
+        SurfaceToolResultKind, SurfaceTurnId, SurfaceUserInputDecision, SurfaceUserInputState,
+        SurfaceWorkflow, SurfaceWorkflowStatus, ThreadOwnerEpoch, ToolPatch, UnixMillis,
+        WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction,
+        WorkflowControlOutput,
     };
 }
 mod runtime_tool_actor;
