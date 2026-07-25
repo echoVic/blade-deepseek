@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.53":
+        "Goal Mode now completes its first runtime-owned TUI vertical loop. Set-and-run, resume, pause and cancellation flow through typed commands; Goal state, outer-turn progress, continuation decisions and terminal results are committed durably before TUI projection or waiter wake. Restart recovery preserves the exact owner lease, operation and generation fences, pending mutation receipts, progress barriers and repeated-gap streaks. MaxInnerTurns remains resumable, plan-only work counts as progress, cost-budget exhaustion pauses as UsageLimit, and exact retry digests bind usage, progress, verification, continuation and terminal semantics.",
       "v0.2.52":
         "Goal continuation now distinguishes an advanced turn, a resumable interruption, and a true blocker. Reaching the inner-turn limit preserves a MaxInnerTurns reason, emits soft-landing reminders, and continues with a structured handoff containing the objective, budget state, open gap, current task plan, and bounded assistant checkpoint. Cost-budget exhaustion, cancellation, approval, verification failure, and other blocking outcomes still pause. A separate durable watchdog counts only substantive tool or plan progress, preserves progress barriers across SQLite recovery, pauses after three repeated model-fixable gaps, and caps eight consecutive inner-turn interruptions.",
       "v0.2.51":
@@ -548,6 +550,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.53":
+        "Goal Mode 完成了首个由 runtime 真正拥有的 TUI 纵向闭环。Set-and-run、resume、pause 与取消都通过 typed command；Goal 状态、outer-turn 进展、continuation 决策和 terminal 结果会先持久化，再投影到 TUI 或唤醒 waiter。重启恢复保留精确 owner lease、operation/generation fence、待确认 mutation receipt、进展屏障与重复 gap streak。MaxInnerTurns 仍可续轮，plan-only 工作会计为进展，成本预算耗尽映射为 UsageLimit 暂停，exact retry digest 同时绑定 usage、progress、verification、continuation 和 terminal 语义。",
       "v0.2.52":
         "Goal continuation 现在区分已推进、可恢复中断和真正阻塞。触达 inner-turn 上限会保留 MaxInnerTurns 原因，提前注入软着陆提醒，并通过结构化交接继续下一轮；交接包含目标、预算状态、未解决 gap、当前 task plan 和有界 assistant checkpoint。成本预算耗尽、取消、审批、验证失败等阻塞结果仍会暂停。独立的 durable watchdog 只把实质工具执行或结构化计划变化计为进展，在 SQLite 恢复后保留进展屏障，连续三次重复同一 model-fixable gap 或连续八次 inner-turn 中断时暂停。",
       "v0.2.51":
