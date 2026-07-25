@@ -130,6 +130,23 @@ impl RuntimeSurfaceHostHandle {
         crate::history::load_session(selector)
     }
 
+    pub fn folder_is_trusted(path: &Path) -> bool {
+        orca_core::config::folder_trust::is_trusted(path)
+    }
+
+    pub fn set_folder_trust(path: &Path, trusted: bool) -> Result<(), String> {
+        let level = if trusted {
+            orca_core::config::folder_trust::TrustLevel::Trusted
+        } else {
+            orca_core::config::folder_trust::TrustLevel::Untrusted
+        };
+        orca_core::config::folder_trust::set_trust(path, level)
+    }
+
+    pub fn save_api_key(api_key: &str) -> Result<PathBuf, String> {
+        orca_core::config::file::save_api_key_checked(api_key).map_err(|error| error.to_string())
+    }
+
     pub fn project_saved_goal(session_id: &str) -> Result<Option<ThreadGoal>, RuntimeHostError> {
         with_saved_goal_runtime(|runtime| runtime.project_thread_goal(session_id))
     }

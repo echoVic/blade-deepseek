@@ -25,6 +25,22 @@ pub(crate) struct TuiSurfaceActions {
     thread: RuntimeSurfaceThreadHandle,
 }
 
+pub(crate) struct TuiHostActions;
+
+impl TuiHostActions {
+    pub(crate) fn folder_is_trusted(path: &Path) -> bool {
+        orca_runtime::surface::RuntimeSurfaceHostHandle::folder_is_trusted(path)
+    }
+
+    pub(crate) fn set_folder_trust(path: &Path, trusted: bool) -> Result<(), String> {
+        orca_runtime::surface::RuntimeSurfaceHostHandle::set_folder_trust(path, trusted)
+    }
+
+    pub(crate) fn save_api_key(api_key: &str) -> Result<PathBuf, String> {
+        orca_runtime::surface::RuntimeSurfaceHostHandle::save_api_key(api_key)
+    }
+}
+
 impl TuiSurfaceActions {
     pub(crate) fn new(thread: RuntimeSurfaceThreadHandle) -> Self {
         Self { thread }

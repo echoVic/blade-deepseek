@@ -12,6 +12,7 @@ const BACKGROUND_APPROVAL: &str = include_str!("background_approval.rs");
 const SLASH_COMMAND_ACTIONS: &str = include_str!("slash_command_actions.rs");
 const SLASH_MENU_ACTIONS: &str = include_str!("slash_menu_actions.rs");
 const SESSION_PICKER_ACTIONS: &str = include_str!("session_picker_actions.rs");
+const SETUP_ACTIONS: &str = include_str!("setup_actions.rs");
 
 const CURRENT_ACTIONS: [(&str, &str); 21] = [
     ("Submit", "runtime_mutation"),
@@ -521,5 +522,10 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
     assert!(
         !APP.contains("GoalRuntimeHandle::open_default"),
         "saved Goal actor ownership must remain behind the runtime surface host"
+    );
+    assert!(
+        !SLASH_COMMAND_ACTIONS.contains("folder_trust::")
+            && !SETUP_ACTIONS.contains("orca_core::config::file"),
+        "host-scoped trust and credentials must mutate through the TUI surface facade"
     );
 }

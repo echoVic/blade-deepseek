@@ -6,9 +6,9 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::{Input, TextArea};
 
 use orca_core::config::RunConfig;
-use orca_core::config::file::save_api_key;
 
 use crate::composer_textarea::{make_setup_textarea, make_textarea};
+use crate::surface_actions::TuiHostActions;
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
 use crate::vim::VimState;
@@ -47,12 +47,18 @@ pub(crate) fn handle_setup_key(
                 let lines: Vec<String> = textarea.lines().to_vec();
                 let key_input = lines.join("").trim().to_string();
                 if !key_input.is_empty() {
-                    save_api_key(&key_input);
-                    config.api_key = Some(key_input.clone());
-                    if let Ok(mut cfg) = shared_config.lock() {
-                        cfg.api_key = Some(key_input);
+                    match TuiHostActions::save_api_key(&key_input) {
+                        Ok(_) => {
+                            config.api_key = Some(key_input.clone());
+                            if let Ok(mut cfg) = shared_config.lock() {
+                                cfg.api_key = Some(key_input);
+                            }
+                            state.setup_step = 2;
+                        }
+                        Err(error) => state.push_message(ChatMessage::Error(format!(
+                            "failed to save API key: {error}"
+                        ))),
                     }
-                    state.setup_step = 2;
                 }
             }
             KeyCode::Esc => {
