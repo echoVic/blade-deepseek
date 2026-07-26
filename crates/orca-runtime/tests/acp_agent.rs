@@ -13,11 +13,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent, AgentSideConnection, CancelNotification, Client, ClientSideConnection, ContentBlock,
-    EmbeddedResource, EmbeddedResourceResource, ImageContent, Implementation, InitializeRequest,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextResourceContents,
+    Agent, AgentSideConnection, CancelNotification, Client, ClientCapabilities,
+    ClientSideConnection, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
+    FileSystemCapabilities, ImageContent, Implementation, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionId,
+    SessionNotification, SessionUpdate, StopReason, TextResourceContents,
 };
 use orca_core::cancel::CancelToken;
 use orca_core::config::{
@@ -649,6 +650,16 @@ fn acp_resource_link_fails_closed_before_runtime_capability_route_exists() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let error = local.block_on(&rt, async {
+        agent
+            .initialize(
+                InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                    ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                        .read_text_file(true)
+                        .write_text_file(false)),
+                ),
+            )
+            .await
+            .expect("initialize with read capability");
         let session = agent
             .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
@@ -667,6 +678,108 @@ fn acp_resource_link_fails_closed_before_runtime_capability_route_exists() {
 
     assert_eq!(executor.call_count(), 0);
     assert!(format!("{error:?}").contains("runtime-owned read capability route"));
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_resource_link_rejects_unadvertised_client_read_capability() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let error = local.block_on(&rt, async {
+        agent
+            .initialize(InitializeRequest::new(ProtocolVersion::V1))
+            .await
+            .expect("initialize without read capability");
+        let session = agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::ResourceLink(ResourceLink::new(
+                    "notes",
+                    "file:///workspace/notes.txt",
+                ))],
+            ))
+            .await
+            .expect_err("unadvertised client read capability must fail closed")
+    });
+
+    assert_eq!(executor.call_count(), 0);
+    assert!(format!("{error:?}").contains("did not advertise fs/read_text_file"));
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_initialize_cannot_expand_negotiated_client_capabilities() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let (initialize_error, prompt_error) = local.block_on(&rt, async {
+        agent
+            .initialize(InitializeRequest::new(ProtocolVersion::V1))
+            .await
+            .expect("initial capability negotiation");
+        let initialize_error = agent
+            .initialize(
+                InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                    ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                        .read_text_file(true)
+                        .write_text_file(true)),
+                ),
+            )
+            .await
+            .expect_err("second initialize must not expand client authority");
+        let session = agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        let prompt_error = agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::ResourceLink(ResourceLink::new(
+                    "notes",
+                    "file:///workspace/notes.txt",
+                ))],
+            ))
+            .await
+            .expect_err("failed renegotiation must not grant read capability");
+        (initialize_error, prompt_error)
+    });
+
+    assert!(format!("{initialize_error:?}").contains("already initialized"));
+    assert!(format!("{prompt_error:?}").contains("did not advertise fs/read_text_file"));
+    assert_eq!(executor.call_count(), 0);
     host.shutdown().expect("shutdown");
 }
 

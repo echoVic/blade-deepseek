@@ -13,14 +13,14 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ContentBlock, EmbeddedResourceResource, Error, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ClientCapabilities, ContentBlock, EmbeddedResourceResource, Error, Implementation,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use orca_core::config::{AdditionalWorkingDirectory, HistoryMode, RunConfig};
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
@@ -99,6 +99,24 @@ enum AcpPromptBinding {
 #[derive(Default)]
 struct AgentState {
     sessions: HashMap<SessionId, SessionEntry>,
+    client_capabilities: Option<AcpClientCapabilityProfile>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct AcpClientCapabilityProfile {
+    read_text_file: bool,
+    write_text_file: bool,
+    terminal: bool,
+}
+
+impl From<&ClientCapabilities> for AcpClientCapabilityProfile {
+    fn from(capabilities: &ClientCapabilities) -> Self {
+        Self {
+            read_text_file: capabilities.fs.read_text_file,
+            write_text_file: capabilities.fs.write_text_file,
+            terminal: capabilities.terminal,
+        }
+    }
 }
 
 /// ACP agent backed by the Orca runtime host.
@@ -332,7 +350,7 @@ impl OrcaAcpAgent {
         inbound_seq: Option<u64>,
     ) -> Result<AdmittedAcpPrompt, Error> {
         let ready = Rc::new(Notify::new());
-        let (surface, inbound_seq) = {
+        let (surface, inbound_seq, client_capabilities) = {
             let mut state = self.state.borrow_mut();
             let entry = state
                 .sessions
@@ -355,12 +373,16 @@ impl OrcaAcpAgent {
             entry.prompt_binding = Some(AcpPromptBinding::Decoded {
                 ready: ready.clone(),
             });
-            (entry.surface.clone(), sequence)
+            (
+                entry.surface.clone(),
+                sequence,
+                state.client_capabilities.unwrap_or_default(),
+            )
         };
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.begin_session(&args.session_id);
         }
-        let input = match decode_prompt_content(&args.prompt) {
+        let input = match decode_prompt_content(&args.prompt, client_capabilities) {
             Ok(input) => input,
             Err(message) => {
                 self.clear_prompt_binding(&args.session_id, &ready);
@@ -689,7 +711,10 @@ impl Drop for SurfaceAttachmentGuard<'_> {
 
 /// Decodes ACP prompt content into the closed runtime input algebra without
 /// flattening away block identity or order.
-fn decode_prompt_content(blocks: &[ContentBlock]) -> Result<SurfaceInputRequest, String> {
+fn decode_prompt_content(
+    blocks: &[ContentBlock],
+    client_capabilities: AcpClientCapabilityProfile,
+) -> Result<SurfaceInputRequest, String> {
     let mut decoded = Vec::with_capacity(blocks.len());
     for block in blocks {
         match block {
@@ -699,6 +724,12 @@ fn decode_prompt_content(blocks: &[ContentBlock]) -> Result<SurfaceInputRequest,
                 });
             }
             ContentBlock::ResourceLink(link) => {
+                if !client_capabilities.read_text_file {
+                    return Err(
+                        "ACP client did not advertise fs/read_text_file for resource links"
+                            .to_string(),
+                    );
+                }
                 let uri = CanonicalUri::try_new(link.uri.clone())
                     .map_err(|error| format!("invalid ACP resource link URI: {error}"))?;
                 let name = NonEmptyText::try_new(link.name.clone())
@@ -1541,7 +1572,15 @@ fn cancel_surface_operation(prepared: &PreparedSurfacePrompt) -> Result<(), Stri
 
 #[async_trait::async_trait(?Send)]
 impl Agent for OrcaAcpAgent {
-    async fn initialize(&self, _args: InitializeRequest) -> Result<InitializeResponse, Error> {
+    async fn initialize(&self, args: InitializeRequest) -> Result<InitializeResponse, Error> {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.client_capabilities.is_some() || !state.sessions.is_empty() {
+                return Err(Error::invalid_request().data("ACP session is already initialized"));
+            }
+            state.client_capabilities =
+                Some(AcpClientCapabilityProfile::from(&args.client_capabilities));
+        }
         Ok(
             InitializeResponse::new(ProtocolVersion::V1)
                 .agent_capabilities(
@@ -1777,7 +1816,14 @@ mod tests {
             ContentBlock::from("last".to_string()),
         ];
 
-        let decoded = decode_prompt_content(&blocks).expect("supported ACP prompt content");
+        let decoded = decode_prompt_content(
+            &blocks,
+            AcpClientCapabilityProfile {
+                read_text_file: true,
+                ..AcpClientCapabilityProfile::default()
+            },
+        )
+        .expect("supported ACP prompt content");
         let decoded = decoded.blocks.as_slice();
         assert_eq!(decoded.len(), 4);
         assert!(matches!(
@@ -1817,10 +1863,13 @@ mod tests {
     fn prompt_content_rejects_binary_blocks_before_surface_reservation() {
         use agent_client_protocol::ImageContent;
 
-        let error = decode_prompt_content(&[ContentBlock::Image(ImageContent::new(
-            "base64-payload",
-            "image/png",
-        ))])
+        let error = decode_prompt_content(
+            &[ContentBlock::Image(ImageContent::new(
+                "base64-payload",
+                "image/png",
+            ))],
+            AcpClientCapabilityProfile::default(),
+        )
         .expect_err("image content lacks a frozen runtime mapping");
         assert!(error.contains("unsupported ACP prompt content block: image"));
     }
@@ -2132,8 +2181,11 @@ mod tests {
                 .join()
                 .unwrap();
         let surface = thread.acp_surface().expect("ACP surface");
-        let input = decode_prompt_content(&[ContentBlock::from("complete".to_string())])
-            .expect("decode typed prompt");
+        let input = decode_prompt_content(
+            &[ContentBlock::from("complete".to_string())],
+            AcpClientCapabilityProfile::default(),
+        )
+        .expect("decode typed prompt");
         let mut prepared =
             prepare_surface_prompt(&surface, &SessionId::new("reconcile"), input, 1, None).unwrap();
         let operation_id = prepared.operation_id.clone();
@@ -2202,8 +2254,11 @@ mod tests {
                 .join()
                 .unwrap();
         let surface = thread.acp_surface().expect("ACP surface");
-        let input = decode_prompt_content(&[ContentBlock::from("complete".to_string())])
-            .expect("decode typed prompt");
+        let input = decode_prompt_content(
+            &[ContentBlock::from("complete".to_string())],
+            AcpClientCapabilityProfile::default(),
+        )
+        .expect("decode typed prompt");
         let mut prepared =
             prepare_surface_prompt(&surface, &SessionId::new("sealed"), input, 1, None).unwrap();
         let operation_id = prepared.operation_id.clone();
