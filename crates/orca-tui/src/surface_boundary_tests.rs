@@ -649,6 +649,23 @@ fn typed_surface_facades_do_not_accept_the_legacy_operation_controller() {
 }
 
 #[test]
+fn production_app_inner_loop_owns_only_one_typed_surface_control() {
+    let start = APP
+        .find("fn hosted_tui_controller_loop_with_ordinary_turn_runner(")
+        .expect("production hosted controller inner loop");
+    let end = APP[start..]
+        .find("\npub(crate) fn run_hosted_operation(")
+        .map(|offset| start + offset)
+        .expect("legacy audit owner boundary");
+    let production_loop = &APP[start..end];
+    assert!(
+        !production_loop.contains("TuiOperationController")
+            && !production_loop.contains(".surface_task_control()"),
+        "production app control flow must carry one TuiSurfaceTaskControl directly"
+    );
+}
+
+#[test]
 fn typed_surface_client_does_not_depend_on_the_legacy_operation_controller() {
     assert!(
         SURFACE_CLIENT.contains("TuiSurfaceTaskControl"),
