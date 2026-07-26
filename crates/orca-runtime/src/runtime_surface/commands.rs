@@ -309,6 +309,28 @@ pub enum SurfaceClientCommandError {
 pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
     fn notify_interaction_capability_changed(&self);
 
+    fn claim_acp_read_text_file_write(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn mark_acp_read_text_file_written(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn settle_acp_read_text_file(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpReadTextFileSettlement,
+    ) -> Result<(), SurfaceClientCommandError>;
+
     fn detach(&self, client: RuntimeSurfaceClientHandle, request: DetachRequest) -> DetachResult;
 
     fn reserve_operation(
@@ -441,6 +463,17 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
 
 #[allow(dead_code)]
 impl RuntimeSurfaceClientHandle {
+    pub(crate) fn claim_acp_read_text_file_write(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .claim_acp_read_text_file_write(self.clone(), call_id, capability_revision)
+    }
+
     pub(crate) fn new(
         attachment_id: SurfaceAttachmentId,
         thread_id: SurfaceThreadId,
@@ -467,6 +500,29 @@ impl RuntimeSurfaceClientHandle {
     ) -> Self {
         self.dispatcher = dispatcher;
         self
+    }
+
+    pub(crate) fn mark_acp_read_text_file_written(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .mark_acp_read_text_file_written(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn settle_acp_read_text_file(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpReadTextFileSettlement,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .settle_acp_read_text_file(self.clone(), call_id, capability_revision, settlement)
     }
 
     pub fn reserve_operation(

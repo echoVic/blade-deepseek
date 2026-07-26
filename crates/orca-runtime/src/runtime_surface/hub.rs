@@ -91,6 +91,14 @@ pub(crate) struct AcpReadTextFileDispatch {
     pub(crate) limit: Option<u32>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AcpReadTextFileSettlement {
+    Completed { content: String },
+    RemoteError { code: String, message: String },
+    FailedBeforeWrite { message: String },
+    ObservationUnavailable { message: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AcpCapabilityDispatchError {
     StaleRoute,

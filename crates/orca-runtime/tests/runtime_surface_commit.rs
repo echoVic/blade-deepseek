@@ -507,6 +507,128 @@ fn durable_append_precedes_materialization() {
 }
 
 #[test]
+fn recovery_terminalizes_interrupted_read_capability_calls_without_replay() {
+    let mut recovered_snapshot = snapshot();
+    let mut operation = requested_operation(180);
+    operation.intent.kind = OperationKind::UserTurn;
+    operation.phase = OperationPhase::Admitted;
+    operation.ready_for_admission = true;
+    let turn_id = SurfaceTurnId::new();
+    let fence = SurfaceOperationFence {
+        thread_id: recovered_snapshot.thread.thread_id.clone(),
+        thread_owner_epoch: ThreadOwnerEpoch::new(1),
+        operation_id: operation.operation_id.clone(),
+        generation_id: SurfaceGenerationId::new(0),
+    };
+    operation.generations.push(GenerationRecord {
+        fence: fence.clone(),
+        logical_turn_id: turn_id.clone(),
+        input: GenerationInputState::NotApplicable,
+        predecessor: None,
+        attempt: GenerationAttempt::Initial,
+        goal_identity: None,
+        replayability: operation.intent.initial_replayability.clone(),
+        required_capabilities: Default::default(),
+        capability_fingerprint: operation.intent.capability_fingerprint.clone(),
+        phase: GenerationPhase::Started,
+        started_witness: None,
+        stop_reason: None,
+    });
+    let tool_call_id = SurfaceToolCallId::try_new("read-recovery").unwrap();
+    let call = |seed, state| SurfaceCapabilityCall {
+        call_id: SurfaceCapabilityCallId::try_from_bytes(uuid(seed)).unwrap(),
+        acp_session_id: NonEmptyText::try_new("session-recovery").unwrap(),
+        fence: fence.clone(),
+        capability_revision: CapabilityRevision::try_new(1).unwrap(),
+        policy_epoch: PolicyEpoch::try_new(1).unwrap(),
+        kind: SurfaceCapabilityCallKind::ReadTextFile,
+        arguments_digest: digest(seed),
+        owning_tool_call_id: tool_call_id.clone(),
+        state,
+    };
+    recovered_snapshot.foreground_operation = Some(operation.clone());
+    recovered_snapshot.tools.push(SurfaceToolView {
+        request: SurfaceToolRequest {
+            tool_call_id: tool_call_id.clone(),
+            source_response_id: Some(UuidV7::try_from_bytes(uuid(183)).unwrap()),
+            turn_id,
+            name: NonEmptyText::try_new("read_file").unwrap(),
+            action: SurfaceToolAction::Read,
+            target: Some(DisplayText::new("/tmp/input.txt")),
+            raw_arguments: DisplayText::new(r#"{"path":"/tmp/input.txt"}"#),
+            arguments_digest: digest(184),
+        },
+        state: SurfaceToolViewState::Running,
+        arguments_bytes: ByteCount::new(30),
+        output_bytes: ByteCount::new(0),
+        streamed_output: DisplayText::new(""),
+        streamed_output_truncated: false,
+        result: None,
+        capability_calls: vec![
+            call(185, SurfaceCapabilityCallState::Prepared),
+            call(186, SurfaceCapabilityCallState::WrittenAwaitingResponse),
+        ],
+        terminal_leases: Vec::new(),
+    });
+    let owner_dir = tempfile::tempdir().unwrap();
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let lock_path = owner_dir.path().join("thread.lock");
+    let epoch_path = owner_dir.path().join("thread.epoch");
+    let first_owner = ExclusiveOwnerLease::acquire_thread(
+        &lock_path,
+        &epoch_path,
+        cursor(0).thread_id,
+        &FakeClock {
+            clock_id: HostMonotonicClockId::try_from_bytes(uuid(187)).unwrap(),
+            tick: 1,
+            wall_ms: 1,
+        },
+    )
+    .unwrap();
+    drop(first_owner);
+    let owner = ExclusiveOwnerLease::acquire_thread(
+        &lock_path,
+        &epoch_path,
+        cursor(0).thread_id,
+        &FakeClock {
+            clock_id: HostMonotonicClockId::try_from_bytes(uuid(188)).unwrap(),
+            tick: 2,
+            wall_ms: 2,
+        },
+    )
+    .unwrap();
+    let ledger_path = ledger_dir.path().join("capability-recovery.jsonl");
+    let mut coordinator = RuntimeCommitCoordinator::recover(
+        JsonlSurfaceCommitLedger::new(&ledger_path, cursor(0)),
+        SurfaceReducerState::new(recovered_snapshot),
+        &owner,
+    )
+    .unwrap();
+    let cause = MaterializationCause::ColdOwnerTakeover {
+        new_incarnation: SurfaceIncarnation::try_from_bytes(uuid(189)).unwrap(),
+        new_owner_epoch: ThreadOwnerEpoch::new(2),
+    };
+
+    coordinator
+        .recover_interrupted_capability_calls(&operation.operation_id, &cause)
+        .unwrap();
+
+    let calls = &coordinator.state().snapshot().tools[0].capability_calls;
+    assert!(matches!(
+        calls[0].state,
+        SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+    ));
+    assert!(matches!(
+        calls[1].state,
+        SurfaceCapabilityCallState::ObservationUnavailable { .. }
+    ));
+    assert!(
+        std::fs::metadata(ledger_path).unwrap().len() > 0,
+        "restart recovery must durably settle calls without redispatch"
+    );
+}
+
+#[test]
 fn publisher_permit_is_validated_before_reducer_or_wal() {
     let (_owner_dir, owner) = test_owner_lease();
     let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(

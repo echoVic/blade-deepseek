@@ -1992,6 +1992,68 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         Ok(())
     }
 
+    pub fn recover_interrupted_capability_calls(
+        &mut self,
+        operation_id: &super::SurfaceOperationId,
+        materialization: &super::MaterializationCause,
+    ) -> Result<(), SurfaceCommitError> {
+        if self
+            .recovery_action(operation_id, materialization)
+            .is_none()
+        {
+            return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+        }
+        self.materialize_cold_owner_takeover(materialization)?;
+        let calls = self
+            .state
+            .snapshot()
+            .tools
+            .iter()
+            .flat_map(|tool| tool.capability_calls.iter())
+            .filter(|call| {
+                call.fence.operation_id == *operation_id
+                    && call.kind == super::SurfaceCapabilityCallKind::ReadTextFile
+                    && matches!(
+                        call.state,
+                        super::SurfaceCapabilityCallState::Prepared
+                            | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut call in calls {
+            let message = match call.state {
+                super::SurfaceCapabilityCallState::Prepared => {
+                    call.state = super::SurfaceCapabilityCallState::FailedBeforeWrite {
+                        error: super::SafeDiagnosticText::try_new(
+                            "runtime restarted before ACP capability request write",
+                        )
+                        .expect("fixed recovery diagnostic is bounded"),
+                    };
+                    "prepared"
+                }
+                super::SurfaceCapabilityCallState::WrittenAwaitingResponse => {
+                    call.state = super::SurfaceCapabilityCallState::ObservationUnavailable {
+                        error: super::SafeDiagnosticText::try_new(
+                            "runtime restarted before ACP capability response",
+                        )
+                        .expect("fixed recovery diagnostic is bounded"),
+                    };
+                    "written"
+                }
+                _ => continue,
+            };
+            let fence = call.fence.clone();
+            let batch = self.capability_recovery_batch(call)?;
+            let permit = self.issue_recovery_permit(fence);
+            self.commit_batch(&permit, &batch).map_err(|error| {
+                eprintln!("orca: failed to settle {message} capability call: {error:?}");
+                error
+            })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn recover_interrupted_manual_compaction(
         &mut self,
         operation_id: &super::SurfaceOperationId,
@@ -3612,6 +3674,64 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         Ok(batch)
     }
 
+    fn capability_recovery_batch(
+        &self,
+        call: super::SurfaceCapabilityCall,
+    ) -> Result<SurfaceCommitBatch, SurfaceCommitError> {
+        let cursor_before = self.state.snapshot().cursor.clone();
+        let durable_revision = match cursor_before.source_revision {
+            super::CursorSourceRevision::Recorded { durable_revision } => {
+                super::DurableRevision::try_new(
+                    durable_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                )
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?
+            }
+            super::CursorSourceRevision::Ephemeral { .. } => {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: self.owner_epoch,
+            durable_revision,
+            commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+        };
+        let event = super::SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Generation {
+                fence: call.fence.clone(),
+            },
+            event: super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged { call }),
+        };
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: cursor_before.clone(),
+            cursor_after: super::SurfaceCursor {
+                next_seq: super::SequenceNumber::new(
+                    cursor_before
+                        .next_seq
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                ),
+                source_revision: super::CursorSourceRevision::Recorded { durable_revision },
+                ..cursor_before
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: super::Sha256Digest::new([0; 32]),
+            events: super::NonEmptyVec::try_new(vec![event])
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        };
+        batch.batch_digest = super::canonical_batch_digest(&batch);
+        Ok(batch)
+    }
+
     pub fn commit_batch(
         &mut self,
         permit: &SurfacePublisherPermit,
@@ -4508,6 +4628,20 @@ fn actor_generation_terminalization_authorized(
                     },
                 )
             ),
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call:
+                        super::SurfaceCapabilityCall {
+                            fence: call_fence,
+                            kind: super::SurfaceCapabilityCallKind::ReadTextFile,
+                            state:
+                                super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+                                | super::SurfaceCapabilityCallState::ObservationUnavailable { .. },
+                            ..
+                        },
+                }),
+            ) => scope == fence && call_fence == fence,
             _ => false,
         })
 }
@@ -6724,6 +6858,22 @@ fn recovery_batch_authorized(
                     reason: super::InteractionCancelReason::CapabilityUnavailable,
                     ..
                 }),
+            ) if fence == historical_fence
+        ) || matches!(
+            (&event.scope, &event.event),
+            (
+                SurfaceScope::Generation { fence },
+                super::SurfaceEvent::Tool(
+                    super::ToolPatch::CapabilityCallChanged {
+                        call: super::SurfaceCapabilityCall {
+                            kind: super::SurfaceCapabilityCallKind::ReadTextFile,
+                            state:
+                                super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+                                | super::SurfaceCapabilityCallState::ObservationUnavailable { .. },
+                            ..
+                        },
+                    },
+                ),
             ) if fence == historical_fence
         );
     }

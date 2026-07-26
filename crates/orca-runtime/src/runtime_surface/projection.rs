@@ -434,6 +434,10 @@ macro_rules! bounded_capability_text {
                 }
                 Ok(Self(value))
             }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
         }
 
         impl<'de> Deserialize<'de> for $name {
