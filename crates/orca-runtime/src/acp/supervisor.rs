@@ -2413,10 +2413,12 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
 
+    use agent_client_protocol::RequestPermissionOutcome;
     use agent_client_protocol::{
         CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
         Implementation, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
     };
+    use orca_core::approval_types::{ActionKind, ApprovalDecision, ApprovalRequest};
     use orca_core::cancel::CancelToken;
     use orca_core::config::{
         HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
@@ -2428,14 +2430,20 @@ mod tests {
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+    use orca_mcp::{McpElicitationMode, McpElicitationRequest, McpElicitationResponse};
     use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
     use super::*;
+    use crate::lifecycle::RuntimeUserInputRequest;
     use crate::model_response::RuntimeModelResponse;
+    use crate::protocol::{
+        PermissionResponseDecision, RequestFileSystemPermissions, RequestPermissionProfile,
+    };
     use crate::runtime_host::{
         GenerationContext, HostedTurnRequest, RuntimeHost, ThreadOperationExecutor,
         ThreadOperationOutcome,
     };
+    use crate::runtime_permission::RuntimePermissionRequest;
     use crate::thread::RuntimeThread;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2461,6 +2469,31 @@ mod tests {
     struct TerminalObserveExecutor {
         outcome_tx:
             std::sync::mpsc::SyncSender<Result<(String, bool, Option<u32>, u32), io::ErrorKind>>,
+    }
+
+    struct TerminalWaitBoundaryExecutor {
+        outcome_tx: std::sync::mpsc::SyncSender<Result<usize, io::ErrorKind>>,
+    }
+
+    struct StandardInteractionExecutor {
+        behaviors: Mutex<Vec<StandardInteractionBehavior>>,
+        outcome_tx: std::sync::mpsc::SyncSender<StandardInteractionOutcome>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum StandardInteractionBehavior {
+        ToolApproval,
+        PermissionRequest,
+        UserInput,
+        McpElicitation,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum StandardInteractionOutcome {
+        ToolApproval(ApprovalDecision),
+        PermissionRequest(PermissionResponseDecision),
+        UserInput(Option<String>),
+        McpElicitation(McpElicitationResponse),
     }
 
     struct TerminalOutputCancelExecutor;
@@ -2829,6 +2862,180 @@ mod tests {
         }
     }
 
+    impl ThreadOperationExecutor for TerminalWaitBoundaryExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let tool = ToolRequest {
+                id: "terminal-wait-boundary".to_string(),
+                name: ToolName::Bash,
+                action: orca_core::approval_types::ActionKind::Shell,
+                target: Some("wait".to_string()),
+                raw_arguments: Some(r#"{"command":"wait"}"#.to_string()),
+            };
+            let turn_request = request.thread_turn_request(generation);
+            let ingress = turn_request
+                .provider_response_ingress()
+                .expect("typed ACP operation provides response ingress");
+            ingress.commit_response(&RuntimeModelResponse::new(
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool.clone())],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![RawToolCall {
+                        id: tool.id.clone(),
+                        function_name: tool.name.as_str().to_string(),
+                        arguments: tool.raw_arguments.clone().unwrap(),
+                    }],
+                    usage: None,
+                },
+                request.turn_id().clone(),
+            ))?;
+            let terminal = generation.create_terminal_on_acp_client(
+                &tool,
+                "wait".to_string(),
+                Vec::new(),
+                Vec::new(),
+                Some(PathBuf::from("/workspace")),
+                None,
+            )?;
+            let wait = terminal
+                .wait_for_exit()
+                .map(|status| status.signal().map(str::len).unwrap_or_default());
+            let cleanup = terminal.close();
+            self.outcome_tx
+                .send(wait.as_ref().copied().map_err(io::Error::kind))
+                .unwrap();
+            let signal_len = wait?;
+            cleanup?;
+            ingress.commit_tool_result(&ToolResult::completed(
+                &tool,
+                format!("observed terminal signal with {signal_len} bytes"),
+                false,
+            ))?;
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for StandardInteractionExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let behavior = self.behaviors.lock().unwrap().remove(0);
+            let tool = ToolRequest {
+                id: "standard-interaction-tool".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf".to_string()),
+                raw_arguments: Some(r#"{"command":"printf","args":["hello"]}"#.to_string()),
+            };
+            let turn_request = request.thread_turn_request(generation);
+            let outcome = match behavior {
+                StandardInteractionBehavior::ToolApproval
+                | StandardInteractionBehavior::PermissionRequest => {
+                    turn_request
+                        .provider_response_ingress()
+                        .expect("typed ACP operation provides response ingress")
+                        .commit_response(&RuntimeModelResponse::new(
+                            ProviderResponse {
+                                steps: vec![ProviderStep::ToolCall(tool.clone())],
+                                assistant_content: None,
+                                assistant_reasoning: None,
+                                tool_calls: vec![RawToolCall {
+                                    id: tool.id.clone(),
+                                    function_name: tool.name.as_str().to_string(),
+                                    arguments: tool.raw_arguments.clone().unwrap(),
+                                }],
+                                usage: None,
+                            },
+                            request.turn_id().clone(),
+                        ))?;
+                    match behavior {
+                        StandardInteractionBehavior::ToolApproval => {
+                            let approval = turn_request
+                                .approval_handler()
+                                .expect("typed ACP operation provides approval broker")
+                                .resolve_interactive(
+                                    &ApprovalRequest {
+                                        id: "standard-tool-approval".to_string(),
+                                        action: ActionKind::Shell,
+                                        description: "run exact standard tool".to_string(),
+                                        tool: Some(tool.name.as_str().to_string()),
+                                        target: tool.target.clone(),
+                                        preview: None,
+                                    },
+                                    &tool,
+                                )?;
+                            StandardInteractionOutcome::ToolApproval(approval.decision)
+                        }
+                        StandardInteractionBehavior::PermissionRequest => {
+                            let permission = turn_request
+                                .permission_handler()
+                                .expect("typed ACP operation provides permission broker")
+                                .request_permissions(&RuntimePermissionRequest {
+                                    id: tool.id.clone(),
+                                    reason: Some("write generated output".to_string()),
+                                    permissions: RequestPermissionProfile {
+                                        file_system: Some(RequestFileSystemPermissions {
+                                            read: None,
+                                            write: Some(vec![PathBuf::from("/workspace/output")]),
+                                            entries: None,
+                                        }),
+                                        network: None,
+                                        shell: None,
+                                    },
+                                })?;
+                            StandardInteractionOutcome::PermissionRequest(permission.decision)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                StandardInteractionBehavior::UserInput => StandardInteractionOutcome::UserInput(
+                    generation
+                        .user_input_handler()
+                        .expect("typed ACP operation provides user-input broker")
+                        .request_user_input(&RuntimeUserInputRequest {
+                            id: "standard-user-input".to_string(),
+                            question: "Continue?".to_string(),
+                            choices: vec!["yes".to_string(), "no".to_string()],
+                        })?,
+                ),
+                StandardInteractionBehavior::McpElicitation => {
+                    StandardInteractionOutcome::McpElicitation(
+                        generation
+                            .mcp_elicitation_handler()
+                            .expect("typed ACP operation provides MCP elicitation broker")
+                            .handle_elicitation(McpElicitationRequest {
+                                server_name: "docs".to_string(),
+                                id: "standard-mcp-elicitation".to_string(),
+                                mode: McpElicitationMode::Url,
+                                message: "Open sign-in?".to_string(),
+                                url: Some("https://example.com/sign-in".to_string()),
+                                requested_schema: None,
+                            })
+                            .map_err(io::Error::other)?,
+                    )
+                }
+            };
+            self.outcome_tx.send(outcome).unwrap();
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
     impl ThreadOperationExecutor for TerminalOutputCancelExecutor {
         fn run_turn(
             &self,
@@ -3126,6 +3333,176 @@ mod tests {
             assert_eq!(first["params"]["update"]["content"]["text"], "typed update");
             let prompt = read_response(&mut client_read, 3).await;
             assert_eq!(prompt["result"]["stopReason"], "end_turn");
+
+            client_write.shutdown().await.unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, connection)
+                .await
+                .expect("connection shutdown")
+                .expect("connection task")
+                .expect("clean connection");
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn production_connection_routes_only_standard_tool_approval_and_fails_extensions_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+            let host = RuntimeHost::start_with_executor(Arc::new(StandardInteractionExecutor {
+                behaviors: Mutex::new(vec![
+                    StandardInteractionBehavior::ToolApproval,
+                    StandardInteractionBehavior::PermissionRequest,
+                    StandardInteractionBehavior::UserInput,
+                    StandardInteractionBehavior::McpElicitation,
+                ]),
+                outcome_tx,
+            }))
+            .unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (server_read, server_write) = tokio::io::split(server);
+            let connection = tokio::task::spawn_local(run_connection(
+                host.surface_handle(),
+                test_config(cwd.path().to_path_buf()),
+                server_read,
+                server_write,
+            ));
+            let mut client_read = BufReader::new(client_read);
+
+            write_request(
+                &mut client_write,
+                1,
+                "initialize",
+                InitializeRequest::new(ProtocolVersion::V1)
+                    .client_info(Implementation::new("bounded-test", "0.0.0")),
+            )
+            .await;
+            let _ = read_response(&mut client_read, 1).await;
+            write_request(
+                &mut client_write,
+                2,
+                "session/new",
+                NewSessionRequest::new(cwd.path().to_path_buf()),
+            )
+            .await;
+            let new_session = read_response(&mut client_read, 2).await;
+            let session_id = new_session["result"]["sessionId"]
+                .as_str()
+                .expect("session id")
+                .to_string();
+
+            write_request(
+                &mut client_write,
+                3,
+                "session/prompt",
+                PromptRequest::new(
+                    SessionId::new(session_id.clone()),
+                    vec![ContentBlock::from("standard tool approval".to_string())],
+                ),
+            )
+            .await;
+            let mut permission_requests = 0;
+            let approval_prompt = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "session/request_permission" {
+                    permission_requests += 1;
+                    assert_eq!(
+                        value["params"]["options"]
+                            .as_array()
+                            .expect("permission options")
+                            .len(),
+                        2
+                    );
+                    write_raw_response(
+                        &mut client_write,
+                        value["id"].as_i64().expect("permission request id"),
+                        serde_json::to_value(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ))
+                        .unwrap(),
+                    )
+                    .await;
+                } else if value.get("id").and_then(Value::as_i64) == Some(3) {
+                    break value;
+                }
+            };
+            assert_eq!(approval_prompt["result"]["stopReason"], "end_turn");
+            assert_eq!(
+                outcome_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+                StandardInteractionOutcome::ToolApproval(ApprovalDecision::Deny)
+            );
+
+            for (index, (request_id, prompt, expected)) in [
+                (
+                    4,
+                    "extensionless permission request",
+                    StandardInteractionOutcome::PermissionRequest(PermissionResponseDecision::Deny),
+                ),
+                (
+                    5,
+                    "extensionless user input",
+                    StandardInteractionOutcome::UserInput(None),
+                ),
+                (
+                    6,
+                    "extensionless MCP elicitation",
+                    StandardInteractionOutcome::McpElicitation(McpElicitationResponse::Decline),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let session_request_id = 20 + index as i64;
+                write_request(
+                    &mut client_write,
+                    session_request_id,
+                    "session/new",
+                    NewSessionRequest::new(cwd.path().to_path_buf()),
+                )
+                .await;
+                let new_session = read_response(&mut client_read, session_request_id).await;
+                let interaction_session_id = new_session["result"]["sessionId"]
+                    .as_str()
+                    .expect("interaction session id")
+                    .to_string();
+                write_request(
+                    &mut client_write,
+                    request_id,
+                    "session/prompt",
+                    PromptRequest::new(
+                        SessionId::new(interaction_session_id),
+                        vec![ContentBlock::from(prompt.to_string())],
+                    ),
+                )
+                .await;
+                let response = loop {
+                    let value = read_value(&mut client_read).await;
+                    assert_ne!(
+                        value["method"], "session/request_permission",
+                        "extension-only interaction reached standard ACP wire: {prompt}"
+                    );
+                    if value.get("id").and_then(Value::as_i64) == Some(request_id) {
+                        break value;
+                    }
+                };
+                assert!(
+                    response.get("error").is_some(),
+                    "unexpected prompt: {response}"
+                );
+                assert_eq!(
+                    outcome_rx
+                        .recv_timeout(TEST_TIMEOUT)
+                        .unwrap_or_else(|error| panic!("missing {prompt} outcome: {error:?}")),
+                    expected
+                );
+            }
+            assert_eq!(permission_requests, 1);
 
             client_write.shutdown().await.unwrap();
             tokio::time::timeout(TEST_TIMEOUT, connection)
@@ -3641,6 +4018,170 @@ mod tests {
             host.shutdown().unwrap();
             assert_persisted_terminal_released(&transcript_path, "terminal-observe");
         });
+    }
+
+    #[test]
+    fn production_connection_enforces_terminal_wait_canonical_result_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let at_limit = terminal_wait_signal_for_canonical_len(
+                crate::unstable_surface::ACP_CAPABILITY_RESULT_CANONICAL_BYTE_LIMIT as usize,
+            );
+            let over_limit = format!("{at_limit}x");
+            run_terminal_wait_boundary_case(at_limit, true).await;
+            run_terminal_wait_boundary_case(over_limit, false).await;
+        });
+    }
+
+    async fn run_terminal_wait_boundary_case(signal: String, expect_completed: bool) {
+        let expected_signal_len = signal.len();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+        let host =
+            RuntimeHost::start_with_executor(Arc::new(TerminalWaitBoundaryExecutor { outcome_tx }))
+                .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, server_write) = tokio::io::split(server);
+        let connection = tokio::task::spawn_local(run_connection(
+            host.surface_handle(),
+            test_config(cwd.path().to_path_buf()),
+            server_read,
+            server_write,
+        ));
+        let mut client_read = BufReader::new(client_read);
+
+        write_request(
+            &mut client_write,
+            1,
+            "initialize",
+            InitializeRequest::new(ProtocolVersion::V1)
+                .client_info(Implementation::new("bounded-test", "0.0.0"))
+                .client_capabilities(ClientCapabilities::new().terminal(true)),
+        )
+        .await;
+        let _ = read_response(&mut client_read, 1).await;
+        write_request(
+            &mut client_write,
+            2,
+            "session/new",
+            NewSessionRequest::new(cwd.path().to_path_buf()),
+        )
+        .await;
+        let new_session = read_response(&mut client_read, 2).await;
+        let session_id = new_session["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let transcript_path = crate::thread_store::find_session_path(&session_id, true)
+            .unwrap()
+            .expect("recording ACP session path");
+        write_request(
+            &mut client_write,
+            3,
+            "session/prompt",
+            PromptRequest::new(
+                SessionId::new(session_id),
+                vec![ContentBlock::from("wait for terminal boundary".to_string())],
+            ),
+        )
+        .await;
+
+        let create_request = loop {
+            let value = read_value(&mut client_read).await;
+            if value["method"] == "terminal/create" {
+                break value;
+            }
+        };
+        write_raw_response(
+            &mut client_write,
+            create_request["id"].as_i64().expect("terminal create id"),
+            json!({"terminalId":"terminal-wait-boundary"}),
+        )
+        .await;
+        let wait_request = loop {
+            let value = read_value(&mut client_read).await;
+            if value["method"] == "terminal/wait_for_exit" {
+                break value;
+            }
+        };
+        write_raw_response(
+            &mut client_write,
+            wait_request["id"].as_i64().expect("terminal wait id"),
+            json!({"exitCode":0,"signal":signal}),
+        )
+        .await;
+        let kill_request = loop {
+            let value = read_value(&mut client_read).await;
+            if value["method"] == "terminal/kill" {
+                break value;
+            }
+        };
+        write_raw_response(
+            &mut client_write,
+            kill_request["id"].as_i64().expect("terminal kill id"),
+            json!({}),
+        )
+        .await;
+        let release_request = loop {
+            let value = read_value(&mut client_read).await;
+            if value["method"] == "terminal/release" {
+                break value;
+            }
+        };
+        write_raw_response(
+            &mut client_write,
+            release_request["id"].as_i64().expect("terminal release id"),
+            json!({}),
+        )
+        .await;
+
+        let prompt = read_response(&mut client_read, 3).await;
+        let outcome = outcome_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        if expect_completed {
+            assert_eq!(prompt["result"]["stopReason"], "end_turn");
+            assert_eq!(outcome, Ok(expected_signal_len));
+        } else {
+            assert!(prompt.get("error").is_some(), "unexpected prompt: {prompt}");
+            assert_eq!(outcome, Err(io::ErrorKind::InvalidData));
+        }
+
+        client_write.shutdown().await.unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, connection)
+            .await
+            .expect("connection shutdown")
+            .expect("connection task")
+            .expect("clean connection");
+        host.shutdown().unwrap();
+        assert_persisted_terminal_wait_limit_state(&transcript_path, expect_completed);
+    }
+
+    fn terminal_wait_signal_for_canonical_len(target: usize) -> String {
+        let sample = crate::unstable_surface::CapabilityCallResult::TerminalExitObserved {
+            exit_status: crate::unstable_surface::SurfaceTerminalExitStatus {
+                exit_code: Some(0),
+                signal: Some(crate::unstable_surface::NonEmptyText::try_new("x").unwrap()),
+            },
+        };
+        let sample_len = serde_json::to_vec(&sample).unwrap().len();
+        let signal_len = target
+            .checked_sub(sample_len - 1)
+            .expect("canonical capability target exceeds fixed encoding overhead");
+        let signal = "x".repeat(signal_len);
+        let result = crate::unstable_surface::CapabilityCallResult::TerminalExitObserved {
+            exit_status: crate::unstable_surface::SurfaceTerminalExitStatus {
+                exit_code: Some(0),
+                signal: Some(
+                    crate::unstable_surface::NonEmptyText::try_new(signal.clone()).unwrap(),
+                ),
+            },
+        };
+        assert_eq!(serde_json::to_vec(&result).unwrap().len(), target);
+        signal
     }
 
     #[test]
@@ -4234,7 +4775,7 @@ mod tests {
                 .expect("host shutdown");
             assert_eq!(
                 outcome_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
-                Err(io::ErrorKind::NotConnected)
+                Err(io::ErrorKind::BrokenPipe)
             );
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
@@ -5619,11 +6160,27 @@ mod tests {
     }
 
     fn persisted_surface_events(path: &std::path::Path) -> Vec<crate::surface::SurfaceEvent> {
-        std::fs::read_to_string(path)
+        let records = std::fs::read_to_string(path)
             .unwrap()
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect::<Vec<_>>();
+        let committed_ids = records
+            .iter()
+            .filter(|record| record["type"] == "runtime.surface_commit.committed")
+            .filter_map(|record| record.get("commit_id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        records
+            .into_iter()
             .filter(|record| record["type"] == "runtime.surface_commit.prepared")
+            .filter(|record| {
+                record
+                    .get("commit_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|commit_id| committed_ids.contains(commit_id))
+            })
             .filter_map(|record| record.get("batch").cloned())
             .filter_map(|batch| {
                 serde_json::from_value::<crate::runtime_surface::StoredSurfaceCommitBatchV1>(batch)
@@ -5753,6 +6310,38 @@ mod tests {
                     },
                 ) if kind == &expected_kind
             )
+        }));
+    }
+
+    fn assert_persisted_terminal_wait_limit_state(path: &std::path::Path, expect_completed: bool) {
+        let events = persisted_surface_events(path);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                crate::surface::SurfaceEvent::Tool(
+                    crate::surface::ToolPatch::CapabilityCallChanged {
+                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                            kind: crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+                            state: crate::unstable_surface::SurfaceCapabilityCallState::Completed { .. },
+                            ..
+                        },
+                    },
+                )
+            ) == expect_completed
+                && matches!(
+                    event,
+                    crate::surface::SurfaceEvent::Tool(
+                        crate::surface::ToolPatch::CapabilityCallChanged {
+                            call: crate::unstable_surface::SurfaceCapabilityCall {
+                                kind: crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+                                state:
+                                    crate::unstable_surface::SurfaceCapabilityCallState::Completed { .. }
+                                    | crate::unstable_surface::SurfaceCapabilityCallState::ObservationUnavailable { .. },
+                                ..
+                            },
+                        },
+                    )
+                )
         }));
     }
 
