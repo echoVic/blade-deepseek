@@ -671,6 +671,7 @@ struct PreparedSurfacePrompt {
     client: RuntimeSurfaceClientHandle,
     operation_id: SurfaceOperationId,
     subscription: crate::surface::SurfaceSubscriptionReceiver,
+    _read_text_file_dispatch: Option<crate::runtime_surface::AcpReadTextFileDispatchReceiver>,
     client_bridge: Option<Arc<AcpClientBridge>>,
     tool_outputs: HashMap<String, ToolOutputAccumulator>,
     detached: bool,
@@ -1094,6 +1095,19 @@ fn prepare_surface_prompt(
     let subscription = surface
         .claim_subscription(&attachment.subscription)
         .ok_or_else(|| AcpPromptPrepareError::internal("ACP surface subscription unavailable"))?;
+    let read_text_file_dispatch = if client_capabilities.read_text_file {
+        Some(
+            surface
+                .claim_acp_read_text_file_dispatch(&attachment.client)
+                .ok_or_else(|| {
+                    AcpPromptPrepareError::internal(
+                        "ACP read capability transport lane unavailable",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let session_id = NonEmptyText::try_new(session_id.to_string()).map_err(|error| {
         AcpPromptPrepareError::invalid(format!("invalid ACP session id: {error}"))
     })?;
@@ -1167,6 +1181,7 @@ fn prepare_surface_prompt(
         client: attachment.client,
         operation_id,
         subscription,
+        _read_text_file_dispatch: read_text_file_dispatch,
         client_bridge,
         tool_outputs: HashMap::new(),
         detached: false,

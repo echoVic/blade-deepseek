@@ -3595,6 +3595,13 @@ impl RuntimeSurfaceHandle {
         self.hub.as_ref()?.claim_subscription(handle)
     }
 
+    pub(crate) fn claim_acp_read_text_file_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpReadTextFileDispatchReceiver> {
+        self.hub.as_ref()?.claim_acp_read_text_file_dispatch(client)
+    }
+
     pub fn detach(
         &self,
         client: &RuntimeSurfaceClientHandle,

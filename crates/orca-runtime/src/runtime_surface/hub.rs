@@ -1,6 +1,9 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::mpsc::{
+    Receiver as SyncReceiver, SyncSender, TryRecvError, TrySendError, sync_channel,
+};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +66,8 @@ struct SurfaceSubscriber {
     grant: SurfaceAttachmentGrant,
     interaction_kinds: BTreeSet<SurfaceInteractionKind>,
     acp_capabilities: Option<AcpAttachmentCapabilityProfile>,
+    acp_read_dispatch_tx: Option<SyncSender<AcpReadTextFileDispatch>>,
+    acp_read_dispatch_rx: Option<SyncReceiver<AcpReadTextFileDispatch>>,
     queue: VecDeque<QueuedSubscriptionItem>,
     queued_events: u64,
     queued_bytes: u64,
@@ -74,6 +79,38 @@ struct SurfaceSubscriber {
 pub(crate) struct AcpCapabilityAttachmentRoute {
     pub(crate) attachment_id: SurfaceAttachmentId,
     pub(crate) capability_revision: CapabilityRevision,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AcpReadTextFileDispatch {
+    pub(crate) call_id: SurfaceCapabilityCallId,
+    pub(crate) acp_session_id: NonEmptyText,
+    pub(crate) capability_revision: CapabilityRevision,
+    pub(crate) path: CanonicalPath,
+    pub(crate) line: Option<u32>,
+    pub(crate) limit: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcpCapabilityDispatchError {
+    StaleRoute,
+    Full,
+    Empty,
+    Disconnected,
+}
+
+pub(crate) struct AcpReadTextFileDispatchReceiver {
+    receiver: SyncReceiver<AcpReadTextFileDispatch>,
+}
+
+impl AcpReadTextFileDispatchReceiver {
+    pub(crate) fn try_recv(&self) -> Result<AcpReadTextFileDispatch, AcpCapabilityDispatchError> {
+        match self.receiver.try_recv() {
+            Ok(dispatch) => Ok(dispatch),
+            Err(TryRecvError::Empty) => Err(AcpCapabilityDispatchError::Empty),
+            Err(TryRecvError::Disconnected) => Err(AcpCapabilityDispatchError::Disconnected),
+        }
+    }
 }
 
 struct SharedSurfaceBatch {
@@ -452,6 +489,9 @@ impl SurfaceHub {
         origin: &SurfaceAttachmentId,
     ) -> Option<AcpCapabilityAttachmentRoute> {
         let state = lock(&self.inner);
+        if !state.ready || state.seal_reason.is_some() {
+            return None;
+        }
         state
             .subscriptions
             .iter()
@@ -472,6 +512,70 @@ impl SurfaceHub {
                     })
             })
             .next()
+    }
+
+    pub(crate) fn claim_acp_read_text_file_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpReadTextFileDispatchReceiver> {
+        let mut state = lock(&self.inner);
+        if !state.ready || state.seal_reason.is_some() {
+            return None;
+        }
+        if !client.belongs_to(
+            &self.scope,
+            &state.snapshot.thread.thread_id,
+            self.authority.host_incarnation(),
+        ) || client.detached_receipt().is_some()
+        {
+            return None;
+        }
+        let subscriber = state.subscriptions.get_mut(client.attachment_id())?;
+        if !subscriber.claimed
+            || &subscriber.grant != client.grant()
+            || !subscriber
+                .acp_capabilities
+                .is_some_and(|profile| profile.standard.file_read)
+        {
+            return None;
+        }
+        subscriber
+            .acp_read_dispatch_rx
+            .take()
+            .map(|receiver| AcpReadTextFileDispatchReceiver { receiver })
+    }
+
+    pub(crate) fn dispatch_acp_read_text_file(
+        &self,
+        route: &AcpCapabilityAttachmentRoute,
+        dispatch: AcpReadTextFileDispatch,
+    ) -> Result<(), AcpCapabilityDispatchError> {
+        let state = lock(&self.inner);
+        if !state.ready || state.seal_reason.is_some() {
+            return Err(AcpCapabilityDispatchError::StaleRoute);
+        }
+        let subscriber = state
+            .subscriptions
+            .get(&route.attachment_id)
+            .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
+        if !subscriber.claimed
+            || subscriber.grant.role != SurfaceAttachmentRole::Acp
+            || dispatch.capability_revision != route.capability_revision
+            || !subscriber.acp_capabilities.is_some_and(|profile| {
+                profile.revision == route.capability_revision && profile.standard.file_read
+            })
+        {
+            return Err(AcpCapabilityDispatchError::StaleRoute);
+        }
+        let sender = subscriber
+            .acp_read_dispatch_tx
+            .as_ref()
+            .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
+        match sender.try_send(dispatch) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
+        }
     }
 
     pub(crate) fn apply_committed(
@@ -898,12 +1002,21 @@ impl SurfaceHub {
             SurfaceSubscriptionHandle::new(attachment_id.clone(), move |attachment_id| {
                 reclaim_unclaimed_subscription(&hub, attachment_id);
             });
+        let (acp_read_dispatch_tx, acp_read_dispatch_rx) =
+            if acp_capabilities.is_some_and(|profile| profile.standard.file_read) {
+                let (sender, receiver) = sync_channel(1);
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
         state.subscriptions.insert(
             attachment_id.clone(),
             SurfaceSubscriber {
                 grant: capabilities.grant.clone(),
                 interaction_kinds: capabilities.interaction_kinds.clone(),
                 acp_capabilities,
+                acp_read_dispatch_tx,
+                acp_read_dispatch_rx,
                 queue: VecDeque::new(),
                 queued_events: 0,
                 queued_bytes: 0,
@@ -1292,6 +1405,8 @@ mod tests {
             grant: grant.clone(),
             interaction_kinds: BTreeSet::new(),
             acp_capabilities: None,
+            acp_read_dispatch_tx: None,
+            acp_read_dispatch_rx: None,
             queue: VecDeque::new(),
             queued_events: 0,
             queued_bytes: 0,
@@ -1694,6 +1809,9 @@ mod tests {
         let read_receiver = hub
             .claim_subscription(&read_attachment.subscription)
             .expect("claim read-capable ACP attachment");
+        let read_dispatch_receiver = hub
+            .claim_acp_read_text_file_dispatch(&read_attachment.client)
+            .expect("claim read capability transport lane");
         let route = hub
             .select_acp_capability_attachment(
                 SurfaceCapabilityCallKind::ReadTextFile,
@@ -1704,6 +1822,26 @@ mod tests {
         assert_eq!(
             route.capability_revision,
             CapabilityRevision::try_new(7).unwrap()
+        );
+        let dispatch = || AcpReadTextFileDispatch {
+            call_id: SurfaceCapabilityCallId::try_from_bytes(uuid_v7_bytes(242)).unwrap(),
+            acp_session_id: NonEmptyText::try_new("session-1").unwrap(),
+            capability_revision: route.capability_revision,
+            path: CanonicalPath::try_new(std::env::temp_dir().join("orca-acp-read.txt")).unwrap(),
+            line: Some(3),
+            limit: Some(7),
+        };
+        hub.dispatch_acp_read_text_file(&route, dispatch())
+            .expect("first read dispatch enters the bounded lane");
+        assert_eq!(
+            hub.dispatch_acp_read_text_file(&route, dispatch()),
+            Err(AcpCapabilityDispatchError::Full),
+            "the runtime never creates an unbounded ACP capability queue"
+        );
+        assert_eq!(
+            read_dispatch_receiver.try_recv(),
+            Ok(dispatch()),
+            "the exact revisioned dispatch reaches its origin attachment"
         );
         assert!(
             hub.select_acp_capability_attachment(
@@ -1743,6 +1881,11 @@ mod tests {
             .is_none(),
             "dropping the origin transport must not fall back to another client"
         );
+        assert_eq!(
+            hub.dispatch_acp_read_text_file(&route, dispatch()),
+            Err(AcpCapabilityDispatchError::StaleRoute),
+            "a detached origin cannot retain capability dispatch authority"
+        );
         drop(other_read_receiver);
 
         let terminal_attachment = attach(AcpAttachmentCapabilityProfile {
@@ -1776,6 +1919,43 @@ mod tests {
         assert_eq!(
             terminal_route.capability_revision,
             CapabilityRevision::try_new(9).unwrap()
+        );
+
+        hub.seal_subscriptions(SurfaceSubscriptionSealReason::HostShutdown);
+        assert!(
+            hub.select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::ReadTextFile,
+                &other_read_attachment.attachment_id,
+            )
+            .is_none(),
+            "a sealed hub cannot select a capability route"
+        );
+        assert!(
+            hub.claim_acp_read_text_file_dispatch(&other_read_attachment.client)
+                .is_none(),
+            "a sealed hub cannot transfer a capability transport lane"
+        );
+        let sealed_route = AcpCapabilityAttachmentRoute {
+            attachment_id: other_read_attachment.attachment_id.clone(),
+            capability_revision: CapabilityRevision::try_new(8).unwrap(),
+        };
+        assert_eq!(
+            hub.dispatch_acp_read_text_file(
+                &sealed_route,
+                AcpReadTextFileDispatch {
+                    call_id: SurfaceCapabilityCallId::try_from_bytes(uuid_v7_bytes(243)).unwrap(),
+                    acp_session_id: NonEmptyText::try_new("session-1").unwrap(),
+                    capability_revision: CapabilityRevision::try_new(8).unwrap(),
+                    path: CanonicalPath::try_new(
+                        std::env::temp_dir().join("orca-acp-read-after-seal.txt"),
+                    )
+                    .unwrap(),
+                    line: None,
+                    limit: None,
+                },
+            ),
+            Err(AcpCapabilityDispatchError::StaleRoute),
+            "a sealed hub cannot receive a capability dispatch"
         );
     }
 }
