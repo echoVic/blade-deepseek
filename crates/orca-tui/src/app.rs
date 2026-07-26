@@ -6044,18 +6044,7 @@ fn run_hosted_goal_run(
     }
     let _ = origin;
     let request = hosted_turn_request(&submitted_turn, false);
-    let outcome = match request.operation_kind() {
-        HostedOperationKind::GoalRun => {
-            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
-        }
-        HostedOperationKind::Turn => {
-            ordinary_turn_runner.run(config, thread, request, event_tx, controller)
-        }
-        HostedOperationKind::ManualCompaction
-        | HostedOperationKind::BackgroundContinuation { .. } => {
-            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
-        }
-    };
+    let outcome = ordinary_turn_runner.run(config, thread, request, event_tx, controller);
     let status = match outcome {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
@@ -6087,7 +6076,7 @@ fn run_hosted_ordinary_turn(
     )
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 fn run_legacy_feature_turn_for_test(
     config: &RunConfig,
     thread: &RuntimeThreadHandle,

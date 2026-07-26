@@ -602,8 +602,23 @@ fn production_ordinary_turns_select_only_the_typed_surface_runner() {
     );
     assert!(
         !APP.contains("run_hosted_legacy_ordinary_turn")
-            && APP.contains("#[cfg(test)]\nfn run_legacy_feature_turn_for_test"),
-        "deferred background/workflow compatibility may exist only as an explicit test fixture"
+            && APP.contains("#[allow(dead_code)]\nfn run_legacy_feature_turn_for_test"),
+        "the frozen mutation audit anchor must remain explicitly unreachable production code"
+    );
+}
+
+#[test]
+fn legacy_hosted_operation_owner_is_not_reachable_from_production_goal_routing() {
+    let start = APP
+        .find("fn run_hosted_goal_run(")
+        .expect("hosted goal routing function");
+    let end = APP[start..]
+        .find("\nfn run_hosted_ordinary_turn(")
+        .map(|offset| start + offset)
+        .expect("hosted goal routing boundary");
+    assert!(
+        !APP[start..end].contains("run_hosted_operation("),
+        "Goal routing must use the typed surface rail instead of the raw hosted owner"
     );
 }
 
