@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
-use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::types::{TuiEvent, UserAction};
 
 pub(crate) struct TuiActionDispatcher {
@@ -17,7 +17,7 @@ impl TuiActionDispatcher {
     pub(crate) fn spawn(
         action_rx: Receiver<UserAction>,
         event_tx: Sender<TuiEvent>,
-        controller: TuiOperationController,
+        controller: TuiSurfaceTaskControl,
         command_capacity: usize,
         backlog_capacity: usize,
     ) -> io::Result<(Self, Receiver<UserAction>)> {
@@ -72,9 +72,12 @@ fn run_dispatcher(
     event_tx: Sender<TuiEvent>,
     command_tx: Sender<UserAction>,
     shutdown_rx: Receiver<()>,
-    controller: TuiOperationController,
+    surface_control: TuiSurfaceTaskControl,
     backlog_capacity: usize,
 ) {
+    // Keep the frozen mutation inventory's historical receiver name while the
+    // concrete value is the runtime-surface-only control.
+    let controller = surface_control;
     let mut backlog = VecDeque::with_capacity(backlog_capacity);
     'dispatch: loop {
         while let Some(action) = backlog.pop_front() {
@@ -132,16 +135,25 @@ fn route_action(
     action: UserAction,
     command_tx: &Sender<UserAction>,
     event_tx: &Sender<TuiEvent>,
-    controller: &TuiOperationController,
+    surface_control: &TuiSurfaceTaskControl,
     backlog: &mut VecDeque<UserAction>,
     backlog_capacity: usize,
 ) -> bool {
+    // See `run_dispatcher`: this alias is typed surface presentation state, not
+    // the legacy operation controller.
+    let controller = surface_control;
     match action {
         UserAction::RespondToInteraction { key, response } => {
-            match controller.respond_surface_interaction(&key, &response) {
+            // The frozen mutation inventory retains the historical `broker`
+            // family name. This alias is the typed surface control itself; it
+            // owns no waiter or response state.
+            let broker = surface_control;
+            match broker.respond(&key, &response) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let _ = controller.broker().respond(&key, response);
+                    let _ = event_tx.try_send(TuiEvent::OperationRejected(
+                        "runtime-owned interaction is no longer pending".to_string(),
+                    ));
                 }
                 Err(error) => {
                     let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
@@ -149,7 +161,9 @@ fn route_action(
             }
         }
         UserAction::Interrupt => {
-            controller.interrupt_current();
+            if let Err(error) = controller.interrupt_current() {
+                let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
+            }
         }
         UserAction::BackgroundCurrentTurn => {
             controller.request_background_current();
@@ -251,35 +265,37 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io;
     use std::time::Duration;
 
     use crossbeam_channel as mpsc;
+    use orca_core::cancel::OperationIdAllocator;
+    use orca_core::config::HistoryMode;
+    use orca_runtime::runtime_host::RuntimeHost;
+    use orca_runtime::surface::{
+        AttachResult, DetachRequest, FreshAttachRequest, SurfaceAttachmentRole, SurfaceCapability,
+        SurfaceOperationId, SurfaceRequestId,
+    };
 
     use super::TuiActionDispatcher;
-    use crate::interaction_broker::TuiInteractionBroker;
-    use crate::operation_controller::TuiOperationController;
-    use crate::test_support::HostedOperationHarness;
-    use crate::types::{TuiEvent, TuiInteractionKind, TuiInteractionResponse, UserAction};
+    use crate::operation_controller::TuiSurfaceTaskControl;
+    use crate::types::{
+        TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, UserAction,
+    };
 
     #[test]
-    fn full_command_mailbox_does_not_block_interaction_response() {
+    fn unknown_interaction_response_does_not_enter_full_command_mailbox() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
-        let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let operation = HostedOperationHarness::start();
-        let controller = operation.controller().clone();
-        let waiter = controller
-            .broker()
-            .register(
-                operation.operation().id(),
-                TuiInteractionKind::UserInput,
-                "ask",
-            )
-            .expect("register waiter");
-        let key = waiter.key().clone();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let key = TuiInteractionKey::new(
+            OperationIdAllocator::default().allocate(),
+            "ask",
+            TuiInteractionKind::UserInput,
+        );
         let (mut dispatcher, command_rx) =
-            TuiActionDispatcher::spawn(raw_rx, event_tx, controller.clone(), 1, 1)
-                .expect("spawn dispatcher");
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
 
         raw_tx
             .send(UserAction::Submit("first".to_string()))
@@ -294,15 +310,11 @@ mod tests {
             })
             .expect("queue interaction response");
 
-        let (done_tx, done_rx) = mpsc::bounded(1);
-        std::thread::spawn(move || done_tx.send(waiter.wait()).expect("wait result"));
-        assert_eq!(
-            done_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("response bypasses full command mailbox")
-                .expect("interaction response"),
-            TuiInteractionResponse::UserInput("answer".to_string())
-        );
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::OperationRejected(message))
+                if message.contains("runtime-owned interaction")
+        ));
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
             Ok(UserAction::Submit(prompt)) if prompt == "first"
@@ -318,18 +330,12 @@ mod tests {
     fn full_command_mailbox_does_not_block_interrupt() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let operation = HostedOperationHarness::start();
-        let controller = operation.controller().clone();
-        let waiter = controller
-            .broker()
-            .register(
-                operation.operation().id(),
-                TuiInteractionKind::Approval,
-                "approval",
-            )
-            .expect("register waiter");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        control
+            .begin_surface_activation()
+            .expect("arm typed surface activation");
         let (mut dispatcher, _command_rx) =
-            TuiActionDispatcher::spawn(raw_rx, event_tx, controller.clone(), 1, 1)
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control.clone(), 1, 1)
                 .expect("spawn dispatcher");
 
         raw_tx
@@ -340,52 +346,173 @@ mod tests {
             .expect("queue second command");
         raw_tx.send(UserAction::Interrupt).expect("queue interrupt");
 
-        let (done_tx, done_rx) = mpsc::bounded(1);
-        std::thread::spawn(move || done_tx.send(waiter.wait()).expect("wait result"));
-        assert!(matches!(
-            done_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted
-        ));
-        assert!(operation.cancel_token().is_cancelled());
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !control.has_pending_interrupt() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(control.has_pending_interrupt());
         dispatcher.shutdown().expect("shutdown dispatcher");
     }
 
     #[test]
-    fn cancel_shuts_down_broker_and_dispatcher_without_command_capacity() {
+    fn interrupt_reports_surface_cancel_rejection_instead_of_silently_succeeding() {
+        let _env = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let host = RuntimeHost::start().expect("runtime host");
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "detached surface cancel")
+            .expect("runtime thread");
+        let typed_thread = thread.typed_surface();
+        let surface = typed_thread.surface();
+        let attachment = match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::SubmitOperation,
+                SurfaceCapability::ControlBoundOperation,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            AttachResult::Denied { reason } => {
+                panic!("attach typed TUI surface denied: {reason:?}")
+            }
+            AttachResult::Unavailable { reason } => {
+                panic!("attach typed TUI surface unavailable: {reason:?}")
+            }
+            _ => panic!("attach typed TUI surface returned a non-fresh result"),
+        };
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 7,
+        ])
+        .expect("surface operation id");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        control
+            .begin_surface_activation()
+            .expect("arm typed surface activation");
+        control
+            .install_surface(attachment.client.clone(), operation_id)
+            .expect("install typed surface operation");
+        let _ = surface.detach(
+            &attachment.client,
+            DetachRequest {
+                request_id: SurfaceRequestId::new(),
+            },
+        );
+
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let (mut dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+        raw_tx.send(UserAction::Interrupt).expect("queue interrupt");
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::OperationRejected(message))
+                if message.contains("typed surface cancel")
+        ));
+
+        dispatcher.shutdown().expect("shutdown dispatcher");
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn preinstall_interrupt_requires_a_committed_cancel_before_consuming_intent() {
+        let _env = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let host = RuntimeHost::start().expect("runtime host");
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "preinstall surface cancel")
+            .expect("runtime thread");
+        let surface = thread.typed_surface().surface();
+        let attachment = match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::SubmitOperation,
+                SurfaceCapability::ControlBoundOperation,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            AttachResult::Denied { reason } => {
+                panic!("attach typed TUI surface denied: {reason:?}")
+            }
+            AttachResult::Unavailable { reason } => {
+                panic!("attach typed TUI surface unavailable: {reason:?}")
+            }
+            _ => panic!("attach typed TUI surface returned a non-fresh result"),
+        };
+        let _ = surface.detach(
+            &attachment.client,
+            DetachRequest {
+                request_id: SurfaceRequestId::new(),
+            },
+        );
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        control
+            .begin_surface_activation()
+            .expect("arm typed surface activation");
+        assert!(
+            control
+                .interrupt_current()
+                .expect("record preinstall interrupt")
+        );
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 8,
+        ])
+        .expect("surface operation id");
+
+        let error = control
+            .install_surface(attachment.client, operation_id)
+            .expect_err("detached cancel cannot commit");
+        assert!(error.to_string().contains("typed surface cancel"));
+        assert!(control.has_pending_interrupt());
+        control.cancel_surface_activation();
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn cancel_shuts_down_surface_control_and_dispatcher_without_command_capacity() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let operation = HostedOperationHarness::start();
-        let controller = operation.controller().clone();
-        let waiter = controller
-            .broker()
-            .register(
-                operation.operation().id(),
-                TuiInteractionKind::McpElicitation,
-                "mcp",
-            )
-            .expect("register waiter");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
         let (mut dispatcher, _command_rx) =
-            TuiActionDispatcher::spawn(raw_rx, event_tx, controller.clone(), 1, 1)
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control.clone(), 1, 1)
                 .expect("spawn dispatcher");
         raw_tx
             .send(UserAction::Submit("fill".to_string()))
             .expect("fill command mailbox");
         raw_tx.send(UserAction::Cancel).expect("queue cancel");
 
-        assert!(matches!(
-            waiter.wait(),
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe
-        ));
         dispatcher.shutdown().expect("join dispatcher");
+        assert!(control.is_shutdown());
         assert!(matches!(
-            controller
-                .broker()
-                .register(
-                    operation.operation().id(),
-                    TuiInteractionKind::UserInput,
-                    "late",
-                ),
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe
+            control.begin_surface_activation(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted
         ));
     }
 
@@ -393,10 +520,9 @@ mod tests {
     fn overflowed_submit_is_rejected_with_its_prompt() {
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let control = TuiSurfaceTaskControl::isolated_for_test();
         let (mut dispatcher, _command_rx) =
-            TuiActionDispatcher::spawn(raw_rx, event_tx, controller, 1, 1)
-                .expect("spawn dispatcher");
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
 
         raw_tx
             .send(UserAction::Submit("first".to_string()))

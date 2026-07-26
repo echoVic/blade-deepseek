@@ -21,8 +21,8 @@ use orca_core::conversation::Message;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
 use orca_runtime::runtime_host::{
-    HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, HostedWorkflowRequest,
-    OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
+    HostedGenerationHandlers, HostedOperationKind, HostedTurnRequest, OperationOutcome,
+    RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
@@ -46,7 +46,7 @@ use crate::input_event_actions::{
 use crate::interaction_broker::TuiInteractionBroker;
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
-use crate::operation_controller::{TuiOperationController, TuiTurnControl};
+use crate::operation_controller::{TuiOperationController, TuiSurfaceTaskControl, TuiTurnControl};
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::runtime_interaction_adapter::{
     TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
@@ -542,7 +542,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
         background_capacity,
         controller,
         move |controller, commands, host| {
-            hosted_tui_controller_loop_with_ordinary_turn_runner(
+            hosted_tui_controller_loop(
                 agent_config,
                 agent_preloaded,
                 agent_events,
@@ -551,11 +551,46 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
                 agent_pending,
                 agent_registry,
                 host,
-                run_hosted_legacy_ordinary_turn,
             );
         },
     )
     .expect("hosted TUI test runtime")
+}
+
+#[cfg(test)]
+fn spawn_legacy_feature_test_runtime(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+) -> TuiAgentRuntime {
+    let pending = bridge::PendingWorkflowNotifications::new();
+    let registry = orca_mcp::initialize_registry(&[]);
+    let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+    let agent_config = Arc::clone(&config);
+    let agent_preloaded = Arc::clone(&preloaded);
+    let agent_events = event_tx.clone();
+    let legacy_controller = controller.clone();
+    TuiAgentRuntime::spawn_hosted(
+        action_rx,
+        event_tx,
+        8,
+        controller,
+        move |control, commands, host| {
+            hosted_tui_controller_loop_with_ordinary_turn_runner(
+                agent_config,
+                agent_preloaded,
+                agent_events,
+                commands,
+                control,
+                pending,
+                registry,
+                host,
+                OrdinaryTurnRunner::Legacy(legacy_controller),
+            );
+        },
+    )
+    .expect("legacy feature TUI test runtime")
 }
 
 #[cfg(test)]
@@ -573,6 +608,25 @@ fn run_hosted_tui_controller_for_test(
         std::thread::sleep(Duration::from_millis(5));
     }
     runtime.shutdown().expect("hosted TUI test shutdown");
+}
+
+#[cfg(test)]
+fn run_legacy_feature_tui_controller_for_test(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    _cancel: CancelToken,
+    _pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+) {
+    let mut runtime = spawn_legacy_feature_test_runtime(config, preloaded, event_tx, action_rx);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !runtime.controller().is_shutdown() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    runtime
+        .shutdown()
+        .expect("legacy feature TUI test shutdown");
 }
 
 fn now_timestamp() -> i64 {
@@ -698,7 +752,7 @@ mod tests {
             )
             .expect("trust workflow workspace");
 
-            let mut config = test_config(HistoryMode::Disabled);
+            let mut config = test_config(HistoryMode::Record);
             config.cwd = Some(temp.path().to_path_buf());
             config.output_format = OutputFormat::Jsonl;
             config.approval_mode = ApprovalMode::FullAuto;
@@ -738,22 +792,198 @@ mod tests {
                     events.push(event);
                 }
             }
-            assert!(
-            events
+            while let Ok(event) = event_rx.recv_timeout(Duration::from_millis(100)) {
+                events.push(event);
+            }
+            let action_completed_at = events
                 .iter()
-                .any(|event| matches!(event, TuiEvent::ToolCompleted { name, status, .. } if name == "Workflow" && status == "completed")),
-            "saved workflow should publish a typed tool completion"
-        );
+                .position(|event| {
+                    matches!(
+                        event,
+                        TuiEvent::SessionCompleted { status } if status == "success"
+                    )
+                })
+                .expect("workflow slash action should complete after durable launch");
+            let workflow_completed_at = events
+                .iter()
+                .position(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
+                .expect("workflow should publish a terminal notification");
+            assert!(
+                action_completed_at < workflow_completed_at,
+                "slash action completion must precede background workflow terminal: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    TuiEvent::WorkflowTasksUpdated { tasks }
+                        if tasks.iter().any(|task| task.name.as_deref() == Some("runtime-owned"))
+                )),
+                "saved workflow should publish a typed task projection: {events:?}"
+            );
             assert!(
             events
                 .iter()
                 .any(|event| matches!(event, TuiEvent::WorkflowNotification { status, .. } if status == "completed")),
             "saved workflow should publish a terminal notification"
         );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, TuiEvent::WorkflowNotification { .. }))
+                    .count(),
+                1,
+                "one workflow run must produce exactly one terminal notification: {events:?}"
+            );
             action_tx
                 .send(UserAction::Cancel)
                 .expect("stop TUI test loop");
             handle.join().expect("hosted TUI test loop joined");
+        });
+    }
+
+    #[test]
+    fn typed_workflow_launch_rejects_disabled_history_without_waiting_for_surface_readiness() {
+        let (host, _thread, actions) = test_task_surface();
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let started = Instant::now();
+        let error = actions
+            .launch_workflow("missing", None, &event_tx)
+            .expect_err("durable workflow must require a recorded session");
+        assert!(error.contains("requires recorded conversation history"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn hosted_tui_failed_workflow_launch_rejects_the_foreground_action() {
+        with_orca_home(|home| {
+            let temp = tempdir().expect("workflow workspace");
+            orca_core::config::folder_trust::set_trust_with_config_dir(
+                temp.path(),
+                home,
+                orca_core::config::folder_trust::TrustLevel::Trusted,
+            )
+            .expect("trust workflow workspace");
+
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(temp.path().to_path_buf());
+            let config = Arc::new(Mutex::new(config));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                move || {
+                    run_hosted_tui_controller_for_test(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        CancelToken::new(),
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+
+            action_tx
+                .send(UserAction::RunWorkflow {
+                    name: "missing-workflow".to_string(),
+                    args: None,
+                })
+                .expect("run missing saved workflow action");
+            let rejected = loop {
+                match event_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(TuiEvent::OperationRejected(error)) => break error,
+                    Ok(_) => {}
+                    Err(error) => panic!("workflow launch rejection missing: {error}"),
+                }
+            };
+            assert!(rejected.contains("typed TUI workflow launch failed"));
+
+            action_tx
+                .send(UserAction::Cancel)
+                .expect("stop TUI test loop");
+            handle.join().expect("hosted TUI test loop joined");
+        });
+    }
+
+    #[test]
+    fn resumed_tui_hydrates_durable_workflow_tasks_from_surface_snapshot() {
+        if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+            return;
+        }
+        with_orca_home(|home| {
+            let temp = tempdir().expect("workflow workspace");
+            let workflow_dir = temp.path().join(".orca").join("workflows");
+            std::fs::create_dir_all(&workflow_dir).expect("workflow directory");
+            std::fs::write(
+                workflow_dir.join("restart-visible.js"),
+                "export const meta = { name: 'restart-visible', description: 'Restart visible', phases: ['main'] };\nexport default await phase('main', async () => agent('inspect repo'));",
+            )
+            .expect("saved workflow");
+            orca_core::config::folder_trust::set_trust_with_config_dir(
+                temp.path(),
+                home,
+                orca_core::config::folder_trust::TrustLevel::Trusted,
+            )
+            .expect("trust workflow workspace");
+
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(temp.path().to_path_buf());
+            config.output_format = OutputFormat::Jsonl;
+            config.approval_mode = ApprovalMode::FullAuto;
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "restart workflow projection")
+                .expect("runtime thread");
+            let session_id = thread.session_id().expect("recorded session").to_string();
+            let (workflow_tx, workflow_rx) = mpsc::unbounded();
+            TuiSurfaceActions::new(thread.typed_surface())
+                .launch_workflow("restart-visible", None, &workflow_tx)
+                .expect("typed workflow launch");
+            loop {
+                match workflow_rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(TuiEvent::WorkflowNotification { status, .. }) => {
+                        assert_eq!(status, "completed");
+                        break;
+                    }
+                    Ok(TuiEvent::Error(error)) => panic!("typed workflow failed: {error}"),
+                    Ok(_) => {}
+                    Err(error) => panic!("typed workflow terminal event missing: {error}"),
+                }
+            }
+            host.shutdown().expect("shutdown original runtime");
+
+            let transcript =
+                orca_runtime::history::load_session(&session_id).expect("saved transcript");
+            let mut resumed_config = test_config(HistoryMode::Resume(session_id.clone()));
+            resumed_config.cwd = Some(temp.path().to_path_buf());
+            resumed_config.output_format = OutputFormat::Jsonl;
+            resumed_config.approval_mode = ApprovalMode::FullAuto;
+            let resumed_host =
+                orca_runtime::runtime_host::RuntimeHost::start().expect("resumed runtime host");
+            let resumed = resumed_host
+                .handle()
+                .start_thread_with_request(
+                    RuntimeThreadStartRequest::new(resumed_config, "resume workflow projection")
+                        .with_preloaded(transcript),
+                )
+                .expect("resumed runtime thread");
+            let (event_tx, event_rx) = mpsc::unbounded();
+            emit_typed_history_snapshot(&resumed, &HistoryMode::Resume(session_id), &event_tx)
+                .expect("typed restart snapshot");
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                TuiEvent::WorkflowTasksUpdated { tasks }
+                    if tasks.iter().any(|task| {
+                        task.name.as_deref() == Some("restart-visible")
+                            && task.status == orca_core::task_types::TaskStatus::Completed
+                    })
+            )));
+            resumed_host.shutdown().expect("shutdown resumed runtime");
         });
     }
 
@@ -920,7 +1150,7 @@ mod tests {
     fn manual_compaction_starts_with_a_fresh_cancel_state() {
         let (event_tx, _event_rx) = mpsc::unbounded();
         let previous = crate::test_support::HostedOperationHarness::start();
-        previous.controller().interrupt_current();
+        let _ = previous.controller().interrupt_current();
         assert!(previous.cancel_token().is_cancelled());
         drop(previous);
         let current = crate::test_support::HostedOperationHarness::start();
@@ -1129,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_background_approval_notifies_tui_user() {
+    fn registry_only_background_approval_is_not_presented_as_typed_recoverable() {
         let (host, thread, actions) = test_task_surface();
         let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
@@ -1152,28 +1382,14 @@ mod tests {
 
         assert_eq!(
             notify_recovered_background_approvals_for_tui(&actions, &event_tx),
-            1
+            0
         );
-
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].id == task.id
-                    && tasks[0].status == orca_core::task_types::TaskStatus::ApprovalRequired
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message))
-                if message.contains("Recovered background session")
-                    && message.contains("task_list")
-                    && message.contains("waiting for approval")
-        ));
+        assert!(event_rx.try_recv().is_err());
         host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
-    fn resumed_session_announces_recovered_background_approval_on_first_submit() {
+    fn resumed_registry_only_approval_is_not_advertised_as_actionable() {
         with_orca_home(|home| {
             let session_id = "resume-background-approval-session";
             let registry = orca_runtime::tasks::TaskRegistry::new_persistent(
@@ -1234,29 +1450,26 @@ mod tests {
                 .send(UserAction::Submit("hello".to_string()))
                 .unwrap();
 
-            let mut saw_task_refresh = false;
-            let mut saw_notice = false;
             let mut seen = Vec::new();
             for _ in 0..20 {
-                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        saw_task_refresh |= tasks.into_iter().any(|task| {
-                            task.id == task_id
-                                && task.status
-                                    == orca_core::task_types::TaskStatus::ApprovalRequired
-                                && task.is_backgrounded
-                        });
+                match event_rx.recv_timeout(Duration::from_millis(100)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("hosted TUI event channel disconnected")
                     }
-                    TuiEvent::Notice(message)
+                    Ok(TuiEvent::Notice(message))
                         if message.contains("Recovered background session")
                             && message.contains("task_list") =>
                     {
-                        saw_notice = true;
+                        panic!("registry-only approval was advertised as actionable");
                     }
-                    event => seen.push(format!("{event:?}")),
-                }
-                if saw_task_refresh && saw_notice {
-                    break;
+                    Ok(TuiEvent::WorkflowTasksUpdated { tasks })
+                        if tasks.iter().any(|task| task.id == task_id) =>
+                    {
+                        panic!("registry-only approval leaked into typed task projection");
+                    }
+                    Ok(TuiEvent::TurnStarted { .. }) => break,
+                    Ok(event) => seen.push(format!("{event:?}")),
                 }
             }
 
@@ -1264,155 +1477,107 @@ mod tests {
             handle.join().unwrap();
 
             assert!(
-                saw_task_refresh,
-                "missing recovered task refresh; saw {seen:?}"
-            );
-            assert!(
-                saw_notice,
-                "missing recovered approval notice; saw {seen:?}"
+                seen.iter()
+                    .all(|event| !event.contains("Recovered background session")),
+                "registry-only approval was advertised; saw {seen:?}"
             );
         });
     }
 
     #[test]
     fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Needs approval".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        registry
-            .approval_required_for_pending_tool(
-                &task.id,
-                "approval_required".to_string(),
-                Some(orca_core::task_types::PendingToolCallSummary {
-                    id: "mock-tool-1".to_string(),
-                    name: "task_list".to_string(),
-                    action: orca_core::approval_types::ActionKind::Read,
-                    target: None,
-                    arguments: "{}".to_string(),
-                }),
-            )
-            .unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        let continuation_request = submit_background_approval_response_for_tui(
-            Some(&actions),
-            "mock-tool-1",
-            false,
-            &event_tx,
-        );
-
-        assert!(continuation_request.is_none());
-        let record = registry.get(&task.id).unwrap();
-        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
-        assert_eq!(record.pending_tool_call, None);
-        assert_eq!(record.pending_tool_approval_response, None);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
-                    && tasks[0].pending_tool_call.is_none()
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message))
-                if message.contains("Background approval denied")
-        ));
-        host.shutdown().expect("runtime host shutdown");
-    }
-
-    #[test]
-    fn stop_task_for_tui_requests_stop_and_refreshes_tasks() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Running in background".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
-
-        let record = registry.get(&task.id).unwrap();
-        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopping);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopping
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message))
-                if message.contains("Task stop requested")
-                    && message.contains(&task.id)
-        ));
-        host.shutdown().expect("runtime host shutdown");
-    }
-
-    #[test]
-    fn stop_task_for_tui_stops_approval_required_task_immediately() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Needs approval".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        registry
-            .approval_required_for_pending_tool(
-                &task.id,
-                "approval_required".to_string(),
-                Some(orca_core::task_types::PendingToolCallSummary {
-                    id: "mock-tool-1".to_string(),
-                    name: "task_list".to_string(),
-                    action: orca_core::approval_types::ActionKind::Read,
-                    target: None,
-                    arguments: "{}".to_string(),
-                }),
-            )
-            .unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
-
-        let record = registry.get(&task.id).unwrap();
-        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
-        assert_eq!(record.result.as_deref(), Some("Task stopped"));
-        assert_eq!(record.pending_tool_call, None);
-        assert_eq!(record.pending_tool_approval_response, None);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
-                    && tasks[0].pending_tool_call.is_none()
-        ));
-        host.shutdown().expect("runtime host shutdown");
-    }
-
-    #[test]
-    fn foreground_task_for_tui_marks_backgrounded_task_and_refreshes_tasks() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Long answer".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        assert!(foreground_task_for_tui(Some(&actions), &task.id, &event_tx));
-
-        let record = registry.get(&task.id).unwrap();
-        assert!(!record.is_backgrounded);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1 && !tasks[0].is_backgrounded
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message)) if message.contains("returned to foreground")
-        ));
-        host.shutdown().expect("runtime host shutdown");
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let cancel = CancelToken::new();
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    run_hosted_tui_controller_for_test(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+            action_tx
+                .send(UserAction::Submit(
+                    "mock_stream_tool_delay_ms 250 task_list".to_string(),
+                ))
+                .unwrap();
+            loop {
+                if matches!(
+                    event_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow tool stream started.")
+                ) {
+                    break;
+                }
+            }
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+            let (task_id, approval_id) = loop {
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.is_backgrounded
+                        && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+                }) {
+                    break (
+                        task.id,
+                        task.pending_tool_call.expect("pending background tool").id,
+                    );
+                }
+            };
+            action_tx
+                .send(UserAction::ResolveBackgroundApproval {
+                    id: approval_id,
+                    approved: false,
+                })
+                .unwrap();
+            let mut stopped = false;
+            let mut denied_notice = false;
+            let mut seen = Vec::new();
+            for _ in 0..20 {
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                match event {
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        stopped |= tasks.iter().any(|task| {
+                            task.id == task_id
+                                && matches!(
+                                    task.status,
+                                    orca_core::task_types::TaskStatus::Stopped
+                                        | orca_core::task_types::TaskStatus::Cancelled
+                                )
+                                && task.pending_tool_call.is_none()
+                        });
+                    }
+                    TuiEvent::Notice(message) if message.contains("Background approval denied") => {
+                        denied_notice = true;
+                    }
+                    event => seen.push(format!("{event:?}")),
+                }
+                if stopped && denied_notice {
+                    break;
+                }
+            }
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+            assert!(
+                stopped,
+                "denied background task was not stopped; saw {seen:?}"
+            );
+            assert!(
+                denied_notice,
+                "denied background approval notice was not emitted; saw {seen:?}"
+            );
+        });
     }
 
     fn transcript(session_id: &str) -> history::SessionTranscript {
@@ -1479,45 +1644,6 @@ mod tests {
     impl HostedTuiHarness {
         fn start(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
             Self::start_with_background_capacity(config, preloaded, 8)
-        }
-
-        fn start_typed(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
-            let config = Arc::new(Mutex::new(config));
-            let preloaded = Arc::new(Mutex::new(preloaded));
-            let (event_tx, event_rx) = mpsc::unbounded();
-            let (action_tx, action_rx) = mpsc::unbounded();
-            let pending = test_pending_workflow_notifications();
-            let registry = orca_mcp::initialize_registry(&[]);
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-            let agent_config = Arc::clone(&config);
-            let agent_preloaded = Arc::clone(&preloaded);
-            let agent_events = event_tx.clone();
-            let runtime = TuiAgentRuntime::spawn_hosted(
-                action_rx,
-                event_tx,
-                8,
-                controller,
-                move |controller, commands, host| {
-                    hosted_tui_controller_loop(
-                        agent_config,
-                        agent_preloaded,
-                        agent_events,
-                        commands,
-                        controller,
-                        pending,
-                        registry,
-                        host,
-                    );
-                },
-            )
-            .expect("typed hosted TUI runtime");
-            Self {
-                action_tx,
-                event_rx,
-                runtime,
-                config,
-                preloaded,
-            }
         }
 
         fn start_with_background_capacity(
@@ -1643,6 +1769,7 @@ mod tests {
                 .start_thread(config.clone(), "typed ordinary turn ingress")
                 .expect("runtime thread");
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let control = controller.surface_task_control();
             let (event_tx, event_rx) = mpsc::unbounded();
 
             run_hosted_ordinary_turn(
@@ -1653,7 +1780,7 @@ mod tests {
                     false,
                 ),
                 &event_tx,
-                &controller,
+                &control,
             )
             .expect("typed ordinary turn");
 
@@ -1727,6 +1854,40 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_tui_turn_runs_with_only_typed_surface_task_control() {
+        with_orca_home(|_| {
+            let config = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "typed ordinary turn isolated control")
+                .expect("runtime thread");
+            let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_ordinary_turn(
+                &config,
+                &thread,
+                hosted_turn_request(
+                    &SubmittedTurn::user("typed isolated control".to_string()),
+                    false,
+                ),
+                &event_tx,
+                &control,
+            )
+            .expect("typed ordinary turn without legacy operation owner");
+
+            assert!(event_rx.try_iter().any(
+                |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+            ));
+            assert!(control.current_id().is_none());
+
+            thread.shutdown().expect("thread shutdown");
+            host.shutdown().expect("host shutdown");
+        });
+    }
+
+    #[test]
     fn ordinary_tui_typed_submit_can_manual_compact_the_same_durable_conversation() {
         with_orca_home(|_| {
             let config = test_config(HistoryMode::Record);
@@ -1736,6 +1897,7 @@ mod tests {
                 .start_thread(config.clone(), "typed ordinary turn compaction")
                 .expect("runtime thread");
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let control = controller.surface_task_control();
             let (event_tx, event_rx) = mpsc::unbounded();
 
             run_hosted_ordinary_turn(
@@ -1746,11 +1908,11 @@ mod tests {
                     false,
                 ),
                 &event_tx,
-                &controller,
+                &control,
             )
             .expect("typed ordinary turn");
             let outcome = match TuiSurfaceActions::new(thread.typed_surface())
-                .manual_compact(&controller, &event_tx)
+                .manual_compact(&controller.surface_task_control(), &event_tx)
             {
                 Ok(outcome) => outcome,
                 Err(error) => panic!(
@@ -1866,7 +2028,7 @@ mod tests {
                     .expect("stopped task update");
                 if let Some(task) = matching_task_update(event, |candidate| {
                     candidate.id == task.id
-                        && candidate.status == orca_core::task_types::TaskStatus::Stopped
+                        && candidate.status == orca_core::task_types::TaskStatus::Cancelled
                 }) {
                     break task;
                 }
@@ -1877,7 +2039,7 @@ mod tests {
                 task_id: task.id.clone(),
             });
             let duplicate_stop = harness.recv_until(
-                |event| matches!(event, TuiEvent::Error(message) if message.contains("already stopped")),
+                |event| matches!(event, TuiEvent::Error(message) if message.contains("already cancelled")),
             );
             assert!(matches!(duplicate_stop, TuiEvent::Error(_)));
             harness.shutdown();
@@ -1888,7 +2050,7 @@ mod tests {
     fn hosted_tui_backgrounded_canonical_provider_can_be_foregrounded_once() {
         with_orca_home(|_| {
             let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
-            harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
+            harness.send(UserAction::Submit("mock_stream_delay_ms 3000".to_string()));
             harness.recv_until(|event| {
                 matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
             });
@@ -1920,13 +2082,6 @@ mod tests {
                 .is_some()
             });
 
-            harness.send(UserAction::ForegroundTask {
-                task_id: task.id.clone(),
-            });
-            harness.recv_until(|event| {
-                matches!(event, TuiEvent::Error(message) if message.contains("requires a backgrounded task"))
-            });
-
             let mut saw_completed_delta = false;
             loop {
                 match harness
@@ -1947,6 +2102,18 @@ mod tests {
                 }
             }
             assert!(saw_completed_delta);
+
+            harness.send(UserAction::ForegroundTask {
+                task_id: task.id.clone(),
+            });
+            let duplicate = harness.recv_until(|event| matches!(event, TuiEvent::Error(_)));
+            assert!(
+                matches!(
+                    duplicate,
+                    TuiEvent::Error(ref message) if message.contains("already delivered")
+                ),
+                "unexpected duplicate foreground result: {duplicate:?}"
+            );
             harness.shutdown();
         });
     }
@@ -1954,7 +2121,7 @@ mod tests {
     #[test]
     fn hosted_canonical_approval_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "bash printf canonical-approval".to_string(),
             ));
@@ -1984,7 +2151,7 @@ mod tests {
     #[test]
     fn hosted_canonical_permission_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "request_network_permissions_then_done example.com".to_string(),
             ));
@@ -2014,7 +2181,7 @@ mod tests {
     #[test]
     fn hosted_canonical_user_input_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("ask continue?".to_string()));
 
             let key = match harness
@@ -2099,11 +2266,11 @@ mod tests {
                 &preloaded,
                 &mut thread,
                 &event_tx,
-                &controller,
+                &controller.surface_task_control(),
                 &pending,
                 &registry,
                 &host_handle,
-                run_hosted_ordinary_turn,
+                &OrdinaryTurnRunner::Typed,
             );
 
             assert!(matches!(
@@ -2497,31 +2664,74 @@ mod tests {
     #[test]
     fn resumed_uuid_session_emits_typed_history_before_accepting_initial_turn() {
         with_orca_home(|_| {
-            let mut source = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
-            source.send(UserAction::Submit("restored prompt".to_string()));
+            let mut source = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let secret = "sk-test-typed-history-secret-1234567890";
+            source.send(UserAction::Submit(format!(
+                "restored prompt api_key={secret}"
+            )));
             let source_terminal =
                 source.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
             assert!(matches!(
                 source_terminal,
                 TuiEvent::SessionCompleted { status } if status == "success"
             ));
+            source.send(UserAction::Submit("mock_history_echo".to_string()));
+            let echo_terminal =
+                source.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                echo_terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
             source.shutdown();
             let session_id = history::load_session("latest").unwrap().meta.session_id;
 
             let mut harness =
-                HostedTuiHarness::start_typed(test_config(HistoryMode::Resume(session_id)), None);
+                HostedTuiHarness::start(test_config(HistoryMode::Resume(session_id)), None);
             let event = harness
                 .event_rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("typed history event");
-            assert!(matches!(
-                event,
-                TuiEvent::HistoryLoaded { messages, .. }
-                    if messages.iter().any(|message| matches!(
+            let TuiEvent::HistoryLoaded { messages, .. } = event else {
+                panic!("expected typed history");
+            };
+            assert!(messages.iter().any(|message| matches!(
+                message,
+                ChatMessage::User(prompt)
+                    if prompt == "restored prompt api_key=<redacted>"
+            )));
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| format!("{message:?}").contains(secret)),
+                "typed restart history must not display the replay secret"
+            );
+            let reasoning_index = messages
+                .iter()
+                .position(|message| matches!(
+                    message,
+                    ChatMessage::Reasoning(reasoning)
+                        if reasoning == "Mock runtime is preserving the DeepSeek reasoning channel."
+                ))
+                .expect("typed reasoning history");
+            let assistant_index = messages
+                .iter()
+                .position(|message| {
+                    matches!(
                         message,
-                        ChatMessage::User(prompt) if prompt == "restored prompt"
-                    ))
-            ));
+                        ChatMessage::Assistant(answer)
+                            if answer == "Mock runtime completed the headless harness contract."
+                    )
+                })
+                .expect("typed assistant history");
+            assert!(
+                reasoning_index < assistant_index,
+                "restart history must preserve the live reasoning-before-assistant order"
+            );
+            assert!(messages.iter().any(|message| matches!(
+                message,
+                ChatMessage::Assistant(answer)
+                    if answer == "Mock history users: restored prompt api_key=<redacted> | mock_history_echo"
+            )));
 
             harness.send(UserAction::Submit("mock_history_echo".to_string()));
             let mut saw_restored_history = false;
@@ -3212,7 +3422,7 @@ mod tests {
     #[test]
     fn cancelled_hosted_tui_turn_does_not_cancel_next_submit() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
 
             loop {
@@ -3362,7 +3572,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3435,7 +3645,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3927,6 +4137,7 @@ mod tests {
 
             let mut saw_completion_message = false;
             let mut saw_completed_task = false;
+            let mut saw_output_handoff = false;
             let mut seen = Vec::new();
             for _ in 0..40 {
                 match event_rx.recv_timeout(Duration::from_secs(10)) {
@@ -3948,6 +4159,11 @@ mod tests {
                     {
                         saw_completed_task = true;
                     }
+                    Ok(TuiEvent::BackgroundTaskOutputAttached { task_id: attached })
+                        if attached == task_id =>
+                    {
+                        saw_output_handoff = true;
+                    }
                     Ok(event) => seen.push(format!("{event:?}")),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         seen.push("timeout".to_string());
@@ -3957,7 +4173,7 @@ mod tests {
                         panic!("agent event channel disconnected before background continuation")
                     }
                 }
-                if saw_completion_message && saw_completed_task {
+                if saw_completion_message && saw_completed_task && saw_output_handoff {
                     break;
                 }
             }
@@ -3972,6 +4188,10 @@ mod tests {
             assert!(
                 saw_completed_task,
                 "approved background tool call should complete the background task; saw {seen:?}"
+            );
+            assert!(
+                saw_output_handoff,
+                "approved background tool call should hydrate its durable background output; saw {seen:?}"
             );
         });
     }
@@ -4047,13 +4267,17 @@ mod tests {
                 })
                 .unwrap();
 
-            let mut saw_tool_requested = false;
+            let mut saw_tool_execution = false;
             let mut saw_second_approval = false;
             let mut seen = Vec::new();
             for _ in 0..20 {
                 match event_rx.recv_timeout(Duration::from_secs(10)) {
                     Ok(TuiEvent::ToolRequested { name, .. }) if name == "mcp__broken__tool" => {
-                        saw_tool_requested = true;
+                        saw_tool_execution = true;
+                        break;
+                    }
+                    Ok(TuiEvent::ToolCompleted { name, .. }) if name == "mcp__broken__tool" => {
+                        saw_tool_execution = true;
                         break;
                     }
                     Ok(TuiEvent::ApprovalNeeded { key, tool, .. }) => {
@@ -4082,7 +4306,7 @@ mod tests {
             handle.join().unwrap();
 
             assert!(
-                saw_tool_requested,
+                saw_tool_execution,
                 "approved background tool should execute without a second approval; saw {seen:?}"
             );
             assert!(
@@ -4920,13 +5144,31 @@ fn send_submission_error(
     }
 }
 
-type OrdinaryTurnRunner = fn(
-    &RunConfig,
-    &RuntimeThreadHandle,
-    HostedTurnRequest,
-    &mpsc::Sender<TuiEvent>,
-    &TuiOperationController,
-) -> io::Result<TuiHostedOperationOutcome>;
+#[derive(Clone)]
+enum OrdinaryTurnRunner {
+    Typed,
+    #[cfg(test)]
+    Legacy(TuiOperationController),
+}
+
+impl OrdinaryTurnRunner {
+    fn run(
+        &self,
+        config: &RunConfig,
+        thread: &RuntimeThreadHandle,
+        request: HostedTurnRequest,
+        event_tx: &mpsc::Sender<TuiEvent>,
+        control: &TuiSurfaceTaskControl,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        match self {
+            Self::Typed => run_hosted_ordinary_turn(config, thread, request, event_tx, control),
+            #[cfg(test)]
+            Self::Legacy(controller) => {
+                run_legacy_feature_turn_for_test(config, thread, request, event_tx, controller)
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn hosted_tui_controller_loop(
@@ -4934,7 +5176,7 @@ fn hosted_tui_controller_loop(
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
-    controller: TuiOperationController,
+    control: TuiSurfaceTaskControl,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     mcp_registry: orca_mcp::McpRegistry,
     host: RuntimeHostHandle,
@@ -4944,11 +5186,11 @@ fn hosted_tui_controller_loop(
         preloaded,
         event_tx,
         action_rx,
-        controller,
+        control,
         pending_workflow_notifications,
         mcp_registry,
         host,
-        run_hosted_ordinary_turn,
+        OrdinaryTurnRunner::Typed,
     );
 }
 
@@ -4958,7 +5200,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
-    controller: TuiOperationController,
+    control: TuiSurfaceTaskControl,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     mcp_registry: orca_mcp::McpRegistry,
     host: RuntimeHostHandle,
@@ -5008,7 +5250,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
     }
 
     loop {
-        let action = if controller.is_shutdown() {
+        let action = if control.is_shutdown() {
             Ok(UserAction::Cancel)
         } else if let Some(action) = pending_actions.pop_front() {
             Ok(action)
@@ -5022,11 +5264,11 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 &preloaded,
                 &mut thread,
                 &event_tx,
-                &controller,
+                &control,
                 &pending_workflow_notifications,
                 &mcp_registry,
                 &host,
-                ordinary_turn_runner,
+                &ordinary_turn_runner,
             ),
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
                 handle_hosted_submitted_turn(
@@ -5035,11 +5277,11 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &preloaded,
                     &mut thread,
                     &event_tx,
-                    &controller,
+                    &control,
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &host,
-                    ordinary_turn_runner,
+                    &ordinary_turn_runner,
                 );
             }
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
@@ -5049,11 +5291,11 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     &preloaded,
                     &mut thread,
                     &event_tx,
-                    &controller,
+                    &control,
                     &pending_workflow_notifications,
                     &mcp_registry,
                     &host,
-                    ordinary_turn_runner,
+                    &ordinary_turn_runner,
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
@@ -5076,25 +5318,14 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 }
                 if let Some(runtime_thread) = thread.as_ref() {
                     let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                    let observer = Arc::new(TuiHostedEventObserver::new(event_tx.clone()));
-                    let _ = observer.finish_foreground();
-                    let mut request = HostedWorkflowRequest::new(name).with_config(cfg.clone());
-                    if let Some(args) = args.as_deref() {
-                        request = match request.with_command_args(args) {
-                            Ok(request) => request,
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::Error(error));
-                                continue;
-                            }
-                        };
-                    }
-                    if let Err(error) =
-                        actions.launch_workflow(request.with_event_observer(observer))
-                    {
-                        let _ = event_tx.send(TuiEvent::Error(error));
+                    if let Err(error) = actions.launch_workflow(&name, args.as_deref(), &event_tx) {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
                         continue;
                     }
                 }
+                let _ = event_tx.send(TuiEvent::SessionCompleted {
+                    status: "success".to_string(),
+                });
                 if cfg.desktop_notifications {
                     let _ = orca_runtime::notify::notify("Orca", "Workflow launched");
                 }
@@ -5108,8 +5339,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     continue;
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.resume_operation(&operation_id, &controller, &event_tx)
-                {
+                if let Err(error) = actions.resume_operation(&operation_id, &control, &event_tx) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "failed to resume operation: {error}"
                     )));
@@ -5123,8 +5353,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     continue;
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.cancel_operation(&operation_id, &controller, &event_tx)
-                {
+                if let Err(error) = actions.cancel_operation(&operation_id, &control, &event_tx) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "failed to cancel operation: {error}"
                     )));
@@ -5194,7 +5423,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     continue;
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.manual_compact(&controller, &event_tx) {
+                if let Err(error) = actions.manual_compact(&control, &event_tx) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "manual compaction failed: {error}"
                     )));
@@ -5223,52 +5452,25 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &event_tx);
+                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &control, &event_tx);
             }
             Ok(UserAction::ForegroundTask { task_id }) => {
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &event_tx);
+                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &control, &event_tx);
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let continuation = submit_background_approval_response_for_tui(
+                submit_background_approval_response_for_tui(
                     actions.as_ref(),
                     &id,
                     approved,
+                    &control,
                     &event_tx,
                 );
-                if approved
-                    && let (Some(runtime_thread), Some(continuation)) =
-                        (thread.as_ref(), continuation)
-                {
-                    let cfg = config.lock().unwrap().clone();
-                    let request = HostedTurnRequest::new("")
-                        .with_operation_kind(HostedOperationKind::BackgroundContinuation {
-                            task_id: continuation.task_id().to_string(),
-                        })
-                        .with_goal_usage_tracking(true);
-                    match run_hosted_operation(runtime_thread, request, cfg, &controller, &event_tx)
-                    {
-                        Ok(TuiHostedOperationOutcome::Turn { status }) => {
-                            if status == "success"
-                                && let Some(notification) =
-                                    pending_workflow_notifications.pop_notification()
-                            {
-                                pending_actions.push_front(UserAction::SubmitWorkflowNotification(
-                                    notification,
-                                ));
-                            }
-                        }
-                        Ok(TuiHostedOperationOutcome::ManualCompaction) => {}
-                        Err(error) => {
-                            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                        }
-                    }
-                }
             }
             Ok(UserAction::GoalShow) => {
                 show_hosted_goal(&thread, &preloaded, &config, &event_tx);
@@ -5301,7 +5503,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     "Starting goal. Automatic continuation will keep running while it remains active."
                         .to_string(),
                 ));
-                if let Err(error) = actions.set_goal_and_run(objective, &controller, &event_tx) {
+                if let Err(error) = actions.set_goal_and_run(objective, &control, &event_tx) {
                     emit_hosted_operation_error(&event_tx, error, &HostedOperationKind::GoalRun);
                 }
             }
@@ -5444,9 +5646,8 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &preloaded,
                         &mcp_registry,
                         &event_tx,
-                        &controller,
+                        &control,
                         &pending_workflow_notifications,
-                        ordinary_turn_runner,
                     );
                     continue;
                 }
@@ -5464,7 +5665,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                     if let Err(error) = actions.resume_goal_and_run(
                         goal_continuation_prompt(&goal.objective, 1),
-                        &controller,
+                        &control,
                         &event_tx,
                     ) {
                         emit_hosted_operation_error(
@@ -5545,8 +5746,7 @@ fn emit_typed_history_snapshot(
 ) -> Result<(), String> {
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
-    let history = actions.read_history().map_err(|error| error.to_string())?;
-    let messages = crate::surface_projection::history_messages_from_surface_history(&history);
+    let messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
     let plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
         None
     } else {
@@ -5586,7 +5786,14 @@ fn emit_typed_history_snapshot(
             plan,
             label: label.to_string(),
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let tasks = crate::surface_projection::workflow_task_summaries(&snapshot);
+    if !tasks.is_empty() {
+        event_tx
+            .send(TuiEvent::WorkflowTasksUpdated { tasks })
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn typed_history_startup_eligible(
@@ -5625,11 +5832,11 @@ fn handle_hosted_submitted_turn(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     thread: &mut Option<RuntimeThreadHandle>,
     event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mcp_registry: &orca_mcp::McpRegistry,
     host: &RuntimeHostHandle,
-    ordinary_turn_runner: OrdinaryTurnRunner,
+    ordinary_turn_runner: &OrdinaryTurnRunner,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
     let cfg = config.lock().unwrap().clone();
@@ -5674,7 +5881,7 @@ fn handle_hosted_submitted_turn(
         submitted_turn.with_model_prompt(prompt),
         orca_core::goal_runtime::GoalTurnOrigin::User,
         event_tx,
-        controller,
+        control,
         ordinary_turn_runner,
     );
     if cfg.desktop_notifications {
@@ -5803,8 +6010,8 @@ fn run_hosted_goal_run(
     submitted_turn: SubmittedTurn,
     origin: orca_core::goal_runtime::GoalTurnOrigin,
     event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
-    ordinary_turn_runner: OrdinaryTurnRunner,
+    control: &TuiSurfaceTaskControl,
+    ordinary_turn_runner: &OrdinaryTurnRunner,
 ) {
     let Some(session_id) = thread.session_id().map(str::to_string) else {
         send_goal_history_error(event_tx);
@@ -5821,7 +6028,7 @@ fn run_hosted_goal_run(
     if let Some(goal) = active_goal.as_ref() {
         let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
         if let Err(error) =
-            actions.resume_goal_and_run(submitted_turn.prompt().to_string(), controller, event_tx)
+            actions.resume_goal_and_run(submitted_turn.prompt().to_string(), control, event_tx)
         {
             emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
         }
@@ -5829,18 +6036,7 @@ fn run_hosted_goal_run(
     }
     let _ = origin;
     let request = hosted_turn_request(&submitted_turn, false);
-    let outcome = match request.operation_kind() {
-        HostedOperationKind::GoalRun => {
-            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
-        }
-        HostedOperationKind::Turn => {
-            ordinary_turn_runner(config, thread, request, event_tx, controller)
-        }
-        HostedOperationKind::ManualCompaction
-        | HostedOperationKind::BackgroundContinuation { .. } => {
-            run_hosted_operation(thread, request, config.clone(), controller, event_tx)
-        }
-    };
+    let outcome = ordinary_turn_runner.run(config, thread, request, event_tx, control);
     let status = match outcome {
         Ok(TuiHostedOperationOutcome::Turn { status }) => status,
         Ok(TuiHostedOperationOutcome::ManualCompaction) => {
@@ -5862,18 +6058,18 @@ fn run_hosted_ordinary_turn(
     thread: &RuntimeThreadHandle,
     request: HostedTurnRequest,
     event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
 ) -> io::Result<TuiHostedOperationOutcome> {
     TuiSurfaceActions::new(thread.typed_surface()).run_turn(
         request,
         config.clone(),
-        controller,
+        control,
         event_tx,
     )
 }
 
-#[cfg(test)]
-fn run_hosted_legacy_ordinary_turn(
+#[allow(dead_code)]
+fn run_legacy_feature_turn_for_test(
     config: &RunConfig,
     thread: &RuntimeThreadHandle,
     request: HostedTurnRequest,
@@ -5975,9 +6171,8 @@ fn resume_latest_active_goal_hosted(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    _ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         send_goal_history_error(event_tx);
@@ -6056,7 +6251,7 @@ fn resume_latest_active_goal_hosted(
         let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
         if let Err(error) = actions.resume_goal_and_run(
             goal_continuation_prompt(&active_goal.objective, 1),
-            controller,
+            control,
             event_tx,
         ) {
             emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);

@@ -130,6 +130,10 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.thread_id()
     }
 
+    pub fn session_id(&self) -> Option<&str> {
+        self.runtime.session_id()
+    }
+
     pub fn surface(&self) -> RuntimeSurfaceHandle {
         self.runtime.surface()
     }

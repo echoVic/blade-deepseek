@@ -15,7 +15,7 @@ use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
-use orca_core::task_types::{TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress};
+use orca_core::task_types::{TaskStatus, TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress};
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowEvidenceToolEvent, WorkflowInput,
     WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
@@ -36,7 +36,7 @@ use crate::lifecycle::{
 };
 use crate::memory;
 use crate::schema_validation::validate_json_schema_subset;
-use crate::tasks::TaskRegistry;
+use crate::tasks::{TaskRecord, TaskRegistry};
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost, WorkflowHostIpcPaths};
@@ -139,6 +139,19 @@ struct PreparedWorkflowRun {
     task_id: String,
     run_id: String,
     transcript_dir: PathBuf,
+    state: WorkflowRunState,
+    created_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedWorkflowBackgroundLaunch {
+    pub(crate) task_id: String,
+    pub(crate) run_id: String,
+    pub(crate) workflow_name: String,
+    pub(crate) workflow_description: String,
+    pub(crate) phases: Vec<String>,
+    pub(crate) created_at_ms: i64,
+    prepared: PreparedWorkflowRun,
 }
 
 #[derive(Clone, Debug)]
@@ -308,11 +321,13 @@ impl WorkflowRunner {
 
     pub fn launch(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
         let prepared = self.prepare_launch(request)?;
+        self.activate_prepared_run(&prepared)?;
         self.execute_prepared(prepared)
     }
 
     pub fn resume(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
         let prepared = self.prepare_launch(request)?;
+        self.activate_prepared_run(&prepared)?;
         self.execute_prepared(prepared)
     }
 
@@ -320,11 +335,46 @@ impl WorkflowRunner {
         &self,
         request: WorkflowLaunchRequest,
     ) -> io::Result<WorkflowBackgroundLaunch> {
+        let prepared = self.prepare_background(request)?;
+        self.activate_background(prepared)
+    }
+
+    pub(crate) fn prepare_background(
+        &self,
+        request: WorkflowLaunchRequest,
+    ) -> io::Result<PreparedWorkflowBackgroundLaunch> {
         let prepared = self.prepare_launch(request)?;
         let task_id = prepared.task_id.clone();
         let run_id = prepared.run_id.clone();
         let workflow_name = prepared.resolved.meta.name.clone();
+        let workflow_description = prepared.resolved.meta.description.clone();
         let phases = prepared.resolved.meta.phases.clone();
+        let created_at_ms = prepared.created_at_ms;
+        Ok(PreparedWorkflowBackgroundLaunch {
+            task_id,
+            run_id,
+            workflow_name,
+            workflow_description,
+            phases,
+            created_at_ms,
+            prepared,
+        })
+    }
+
+    pub(crate) fn activate_background(
+        &self,
+        launch: PreparedWorkflowBackgroundLaunch,
+    ) -> io::Result<WorkflowBackgroundLaunch> {
+        let PreparedWorkflowBackgroundLaunch {
+            task_id,
+            run_id,
+            workflow_name,
+            workflow_description: _,
+            phases,
+            created_at_ms: _,
+            prepared,
+        } = launch;
+        self.activate_prepared_run(&prepared)?;
         let output = WorkflowOutput {
             status: "async_launched".to_string(),
             task_id: task_id.clone(),
@@ -358,6 +408,167 @@ impl WorkflowRunner {
         })
     }
 
+    pub(crate) fn abort_prepared_background(
+        &self,
+        launch: PreparedWorkflowBackgroundLaunch,
+        message: String,
+    ) {
+        if let Ok(mut state) = self.state.load_run(&launch.run_id) {
+            state.status = WorkflowRunStatus::Failed;
+            state.error = Some(message.clone());
+            let _ = self.state.write_state(&state);
+        }
+        let _ = self.tasks.fail(&launch.task_id, message);
+    }
+
+    pub(crate) fn reconcile_durable_terminal_outcome(
+        &self,
+        task_id: &str,
+        run_id: &str,
+    ) -> io::Result<Option<TaskRecord>> {
+        let Some(mut task) = self.tasks.get(task_id) else {
+            return Ok(None);
+        };
+        if task.task_type != TaskType::Workflow || task.workflow_run_id.as_deref() != Some(run_id) {
+            return Ok(None);
+        }
+        let interrupted_task = task.status == TaskStatus::Failed
+            && task.error.as_deref().is_some_and(|error| {
+                error.contains(
+                    "interrupted before completion; async task execution is process-local",
+                )
+            });
+        let mut state = match self.state.load_run(run_id) {
+            Ok(state) => state,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if self.state.worker_path(run_id).exists() {
+                    self.state.mark_worker_exited(run_id)?;
+                }
+                return if !interrupted_task
+                    && matches!(
+                        task.status,
+                        TaskStatus::Completed
+                            | TaskStatus::Failed
+                            | TaskStatus::Stopped
+                            | TaskStatus::Cancelled
+                    ) {
+                    Ok(Some(task))
+                } else {
+                    Ok(None)
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        if state.run_id != run_id
+            || state.task_id != task_id
+            || state.session_id != self.tasks.session_id()
+        {
+            return Ok(None);
+        }
+
+        let state_terminal = matches!(
+            state.status,
+            WorkflowRunStatus::Completed
+                | WorkflowRunStatus::Failed
+                | WorkflowRunStatus::Stopped
+                | WorkflowRunStatus::Cancelled
+        );
+        if state_terminal && interrupted_task {
+            match state.status {
+                WorkflowRunStatus::Completed => self
+                    .tasks
+                    .complete(
+                        task_id,
+                        state
+                            .final_summary
+                            .clone()
+                            .unwrap_or_else(|| "Workflow completed".to_string()),
+                    )
+                    .map_err(io::Error::other)?,
+                WorkflowRunStatus::Failed => self
+                    .tasks
+                    .fail(
+                        task_id,
+                        state
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Workflow failed".to_string()),
+                    )
+                    .map_err(io::Error::other)?,
+                WorkflowRunStatus::Stopped | WorkflowRunStatus::Cancelled => self
+                    .tasks
+                    .stop(
+                        task_id,
+                        state
+                            .final_summary
+                            .clone()
+                            .unwrap_or_else(|| STOPPED_SUMMARY.to_string()),
+                    )
+                    .map_err(io::Error::other)?,
+                _ => unreachable!("state terminal was checked"),
+            }
+            task = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| io::Error::other("repaired workflow task disappeared"))?;
+        } else {
+            match task.status {
+                TaskStatus::Completed => {
+                    state.status = WorkflowRunStatus::Completed;
+                    state.final_summary = task.result.clone();
+                    state.error = None;
+                }
+                TaskStatus::Failed if !interrupted_task => {
+                    state.status = WorkflowRunStatus::Failed;
+                    state.final_summary = None;
+                    state.error = task.error.clone();
+                }
+                TaskStatus::Stopped => {
+                    state.status = WorkflowRunStatus::Stopped;
+                    state.final_summary = task.result.clone();
+                    state.error = None;
+                }
+                TaskStatus::Cancelled => {
+                    state.status = WorkflowRunStatus::Cancelled;
+                    state.final_summary = task.result.clone();
+                    state.error = None;
+                }
+                _ => return Ok(None),
+            }
+            self.state.write_state(&state)?;
+        }
+        if self.state.worker_path(run_id).exists() {
+            self.state.mark_worker_exited(run_id)?;
+        }
+        Ok(Some(task))
+    }
+
+    pub(crate) fn settle_runtime_restart_without_durable_outcome(
+        &self,
+        task_id: &str,
+        run_id: &str,
+    ) -> io::Result<()> {
+        let mut state = match self.state.load_run(run_id) {
+            Ok(state) => state,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if state.run_id != run_id
+            || state.task_id != task_id
+            || state.session_id != self.tasks.session_id()
+        {
+            return Ok(());
+        }
+        state.status = WorkflowRunStatus::Failed;
+        state.final_summary = None;
+        state.error = Some("Workflow interrupted by runtime restart".to_string());
+        self.state.write_state(&state)?;
+        if self.state.worker_path(run_id).exists() {
+            self.state.mark_worker_exited(run_id)?;
+        }
+        Ok(())
+    }
+
     fn prepare_launch(&self, request: WorkflowLaunchRequest) -> io::Result<PreparedWorkflowRun> {
         let mut request = request;
         let cwd = self.config.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -371,15 +582,10 @@ impl WorkflowRunner {
         let normalized_args =
             validate_workflow_args(resolved_input.args.clone(), &resolved.args_schema)?;
         request.input.args = Some(normalized_args);
-        let task = self.tasks.create_workflow(
-            run_id.clone(),
-            resolved.meta.name.clone(),
-            resolved.meta.description.clone(),
-            resolved.meta.phases.len(),
-        );
-        let mut state = WorkflowRunState {
+        let task_id = format!("task-{}", uuid::Uuid::new_v4());
+        let state = WorkflowRunState {
             run_id: run_id.clone(),
-            task_id: task.id.clone(),
+            task_id: task_id.clone(),
             session_id: self.tasks.session_id().to_string(),
             cwd: cwd.display().to_string(),
             workflow_name: resolved.meta.name.clone(),
@@ -392,31 +598,47 @@ impl WorkflowRunner {
             final_summary: None,
             error: None,
         };
-        self.state.create_run(&state)?;
-        self.state.write_launch_input(&run_id, &request.input)?;
-        self.tasks
-            .update_workflow_artifacts(
-                &task.id,
-                resolved.persisted_path.display().to_string(),
-                request.input.clone(),
-            )
-            .map_err(io::Error::other)?;
-
-        self.tasks
-            .mark_running(&task.id)
-            .map_err(io::Error::other)?;
-        state.status = WorkflowRunStatus::Running;
-        self.state.write_state(&state)?;
 
         let transcript_dir = self.state.transcript_dir(&run_id);
 
         Ok(PreparedWorkflowRun {
             request,
             resolved,
-            task_id: task.id,
+            task_id,
             run_id,
             transcript_dir,
+            state,
+            created_at_ms: now_ms(),
         })
+    }
+
+    fn activate_prepared_run(&self, prepared: &PreparedWorkflowRun) -> io::Result<()> {
+        self.tasks
+            .activate_prepared_workflow(
+                prepared.task_id.clone(),
+                prepared.run_id.clone(),
+                prepared.resolved.meta.name.clone(),
+                prepared.resolved.meta.description.clone(),
+                prepared.resolved.meta.phases.len(),
+                prepared.created_at_ms,
+            )
+            .map_err(io::Error::other)?;
+        self.state.create_run(&prepared.state)?;
+        self.state
+            .write_launch_input(&prepared.run_id, &prepared.request.input)?;
+        self.tasks
+            .update_workflow_artifacts(
+                &prepared.task_id,
+                prepared.resolved.persisted_path.display().to_string(),
+                prepared.request.input.clone(),
+            )
+            .map_err(io::Error::other)?;
+        self.tasks
+            .mark_running(&prepared.task_id)
+            .map_err(io::Error::other)?;
+        let mut state = prepared.state.clone();
+        state.status = WorkflowRunStatus::Running;
+        self.state.write_state(&state)
     }
 
     fn resolve_launch_input(&self, input: &WorkflowInput) -> io::Result<WorkflowInput> {
@@ -464,6 +686,8 @@ impl WorkflowRunner {
             task_id,
             run_id,
             transcript_dir,
+            state: _,
+            created_at_ms: _,
         } = prepared;
         let mut state = self.state.load_run(&run_id)?;
         let args = request.input.args.clone().unwrap_or(Value::Null);
@@ -1943,6 +2167,180 @@ mod tests {
             !registry.errors().is_empty(),
             "workflow child runtime should initialize MCP registry from configured servers"
         );
+    }
+
+    #[test]
+    fn prepared_background_workflow_has_no_live_worker_before_activation() {
+        let temp = tempdir().unwrap();
+        let workflow_dir = temp.path().join(".orca").join("workflows");
+        fs::create_dir_all(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("prepare-only.js"),
+            "export const meta = { name: 'prepare-only', description: 'prepare only', phases: ['main'] };\nexport default 'done';",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let tasks = TaskRegistry::new("workflow-prepare-only".to_string());
+        let runner =
+            WorkflowRunner::new(config, tasks.clone(), temp.path().join("workflow-session"));
+
+        let prepared = runner
+            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                script_path: Some(workflow_dir.join("prepare-only.js").display().to_string()),
+                ..Default::default()
+            }))
+            .expect("prepare background workflow");
+
+        assert!(!runner.state.worker_path(&prepared.run_id).exists());
+        assert!(tasks.get(&prepared.task_id).is_none());
+        runner.abort_prepared_background(prepared.clone(), "surface commit failed".to_string());
+        assert!(!runner.state.worker_path(&prepared.run_id).exists());
+        assert!(tasks.get(&prepared.task_id).is_none());
+    }
+
+    #[test]
+    fn durable_workflow_state_repairs_interrupted_task_for_every_terminal_outcome() {
+        for (run_status, task_status) in [
+            (WorkflowRunStatus::Completed, TaskStatus::Completed),
+            (WorkflowRunStatus::Failed, TaskStatus::Failed),
+            (WorkflowRunStatus::Stopped, TaskStatus::Stopped),
+        ] {
+            let temp = tempdir().unwrap();
+            let workflow_dir = temp.path().join(".orca").join("workflows");
+            fs::create_dir_all(&workflow_dir).unwrap();
+            let script_path = workflow_dir.join("durable-terminal.js");
+            fs::write(
+                &script_path,
+                "export const meta = { name: 'durable-terminal', description: 'durable terminal', phases: ['main'] };\nexport default 'done';",
+            )
+            .unwrap();
+            let session_id = format!("workflow-terminal-{run_status:?}");
+            let task_root = temp.path().join("task-sessions");
+            let tasks =
+                TaskRegistry::new_persistent(session_id.clone(), task_root.clone()).unwrap();
+            let mut config = test_run_config();
+            config.cwd = Some(temp.path().to_path_buf());
+            let workflow_session = temp.path().join("workflow-session");
+            let runner =
+                WorkflowRunner::new(config.clone(), tasks.clone(), workflow_session.clone());
+            let prepared = runner
+                .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                    script_path: Some(script_path.display().to_string()),
+                    ..Default::default()
+                }))
+                .unwrap();
+            runner
+                .activate_prepared_run(&prepared.prepared)
+                .expect("activate durable workflow fixture");
+            let mut state = runner.state.load_run(&prepared.run_id).unwrap();
+            state.status = run_status;
+            match run_status {
+                WorkflowRunStatus::Completed | WorkflowRunStatus::Stopped => {
+                    state.final_summary = Some(format!("{run_status:?} result"));
+                    state.error = None;
+                }
+                WorkflowRunStatus::Failed => {
+                    state.final_summary = None;
+                    state.error = Some("durable failure".to_string());
+                }
+                _ => unreachable!(),
+            }
+            runner.state.write_state(&state).unwrap();
+            drop(runner);
+            drop(tasks);
+
+            let reopened_tasks =
+                TaskRegistry::new_persistent(session_id, task_root.clone()).unwrap();
+            assert_eq!(
+                reopened_tasks.get(&prepared.task_id).unwrap().status,
+                TaskStatus::Failed,
+                "active TaskRegistry record must first expose the restart interruption window"
+            );
+            let reopened = WorkflowRunner::new(config, reopened_tasks, workflow_session.clone());
+            assert!(
+                reopened
+                    .reconcile_durable_terminal_outcome(
+                        &prepared.task_id,
+                        "workflow-run-mismatched-owner",
+                    )
+                    .unwrap()
+                    .is_none(),
+                "a terminal task cannot authorize a different workflow run"
+            );
+            let repaired = reopened
+                .reconcile_durable_terminal_outcome(&prepared.task_id, &prepared.run_id)
+                .unwrap()
+                .expect("durable workflow state must repair the interrupted task");
+            assert_eq!(repaired.status, task_status);
+            assert_eq!(
+                reopened.state.load_run(&prepared.run_id).unwrap().status,
+                run_status
+            );
+        }
+    }
+
+    #[test]
+    fn missing_workflow_state_preserves_task_terminal_or_defers_restart_settlement() {
+        for task_is_terminal in [false, true] {
+            let temp = tempdir().unwrap();
+            let workflow_dir = temp.path().join(".orca").join("workflows");
+            fs::create_dir_all(&workflow_dir).unwrap();
+            let script_path = workflow_dir.join("missing-state.js");
+            fs::write(
+                &script_path,
+                "export const meta = { name: 'missing-state', description: 'missing state', phases: ['main'] };\nexport default 'done';",
+            )
+            .unwrap();
+            let session_id = format!("workflow-missing-state-{task_is_terminal}");
+            let task_root = temp.path().join("task-sessions");
+            let tasks =
+                TaskRegistry::new_persistent(session_id.clone(), task_root.clone()).unwrap();
+            let mut config = test_run_config();
+            config.cwd = Some(temp.path().to_path_buf());
+            let workflow_session = temp.path().join("workflow-session");
+            let runner =
+                WorkflowRunner::new(config.clone(), tasks.clone(), workflow_session.clone());
+            let prepared = runner
+                .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                    script_path: Some(script_path.display().to_string()),
+                    ..Default::default()
+                }))
+                .unwrap();
+            runner
+                .activate_prepared_run(&prepared.prepared)
+                .expect("persist task before simulating missing workflow state");
+            fs::remove_file(runner.state.state_path(&prepared.run_id)).unwrap();
+            if task_is_terminal {
+                tasks
+                    .complete(&prepared.task_id, "durable task result".to_string())
+                    .unwrap();
+            }
+            drop(runner);
+            drop(tasks);
+
+            let reopened_tasks =
+                TaskRegistry::new_persistent(session_id, task_root.clone()).unwrap();
+            let reopened =
+                WorkflowRunner::new(config, reopened_tasks.clone(), workflow_session.clone());
+            let outcome = reopened
+                .reconcile_durable_terminal_outcome(&prepared.task_id, &prepared.run_id)
+                .expect("missing workflow state is a legal cross-store edge");
+            if task_is_terminal {
+                let outcome = outcome.expect("TaskRegistry terminal outcome remains authoritative");
+                assert_eq!(outcome.status, TaskStatus::Completed);
+                assert_eq!(outcome.result.as_deref(), Some("durable task result"));
+            } else {
+                assert!(
+                    outcome.is_none(),
+                    "interrupted active task must defer to generic restart settlement"
+                );
+                assert_eq!(
+                    reopened_tasks.get(&prepared.task_id).unwrap().status,
+                    TaskStatus::Failed
+                );
+            }
+        }
     }
 
     #[test]

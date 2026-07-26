@@ -6,11 +6,11 @@ use orca_runtime::runtime_host::{RuntimeHost, RuntimeHostHandle};
 
 use crate::action_dispatcher::TuiActionDispatcher;
 use crate::channels::USER_ACTION_CAPACITY;
-use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::{TuiOperationController, TuiSurfaceTaskControl};
 use crate::types::{TuiEvent, UserAction};
 
 pub(crate) struct TuiAgentRuntime {
-    controller: TuiOperationController,
+    controller: TuiSurfaceTaskControl,
     dispatcher: TuiActionDispatcher,
     agent: Option<JoinHandle<()>>,
     host: Option<RuntimeHost>,
@@ -22,18 +22,20 @@ impl TuiAgentRuntime {
         event_tx: Sender<TuiEvent>,
         task_capacity: usize,
         controller: TuiOperationController,
-        run: impl FnOnce(TuiOperationController, Receiver<UserAction>, RuntimeHostHandle)
+        run: impl FnOnce(TuiSurfaceTaskControl, Receiver<UserAction>, RuntimeHostHandle)
         + Send
         + 'static,
     ) -> io::Result<Self> {
         let host = RuntimeHost::start_with_background_capacity(task_capacity)
             .map_err(runtime_host_error)?;
+        let control = controller.surface_task_control();
+        drop(controller);
         Self::spawn_with_dispatch_capacities(
             action_rx,
             event_tx,
             USER_ACTION_CAPACITY,
             USER_ACTION_CAPACITY,
-            controller,
+            control,
             host,
             run,
         )
@@ -44,9 +46,9 @@ impl TuiAgentRuntime {
         event_tx: Sender<TuiEvent>,
         command_capacity: usize,
         backlog_capacity: usize,
-        controller: TuiOperationController,
+        control: TuiSurfaceTaskControl,
         host: RuntimeHost,
-        run: impl FnOnce(TuiOperationController, Receiver<UserAction>, RuntimeHostHandle)
+        run: impl FnOnce(TuiSurfaceTaskControl, Receiver<UserAction>, RuntimeHostHandle)
         + Send
         + 'static,
     ) -> io::Result<Self> {
@@ -54,14 +56,14 @@ impl TuiAgentRuntime {
         let (mut dispatcher, command_rx) = TuiActionDispatcher::spawn(
             action_rx,
             event_tx,
-            controller.clone(),
+            control.clone(),
             command_capacity,
             backlog_capacity,
         )?;
-        let agent_controller = controller.clone();
+        let agent_control = control.clone();
         let agent = thread::Builder::new()
             .name("orca-tui-agent".to_string())
-            .spawn(move || run(agent_controller, command_rx, host_handle));
+            .spawn(move || run(agent_control, command_rx, host_handle));
         let agent = match agent {
             Ok(agent) => agent,
             Err(error) => {
@@ -70,7 +72,7 @@ impl TuiAgentRuntime {
             }
         };
         Ok(Self {
-            controller,
+            controller: control,
             dispatcher,
             agent: Some(agent),
             host: Some(host),
@@ -78,7 +80,7 @@ impl TuiAgentRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn controller(&self) -> &TuiOperationController {
+    pub(crate) fn controller(&self) -> &TuiSurfaceTaskControl {
         &self.controller
     }
 
@@ -119,36 +121,42 @@ impl Drop for TuiAgentRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use orca_runtime::runtime_host::HostedTurnRequest;
 
     use super::*;
     use crate::interaction_broker::TuiInteractionBroker;
+    use crate::surface_actions::TuiSurfaceActions;
 
-    fn run_blocking_hosted_operation(
-        controller: TuiOperationController,
+    fn run_blocking_surface_operation(
+        control: TuiSurfaceTaskControl,
         host: RuntimeHostHandle,
+        event_tx: Sender<TuiEvent>,
         ready_tx: crossbeam_channel::Sender<()>,
     ) {
+        let mut config = crate::test_support::test_run_config();
+        config.history_mode = orca_core::config::HistoryMode::Record;
         let thread = host
-            .start_thread(crate::test_support::test_run_config(), "agent runtime test")
+            .start_thread(config.clone(), "agent runtime test")
             .expect("hosted test thread");
-        let operation = Arc::new(
-            thread
-                .start_turn(
-                    HostedTurnRequest::new("mock_stream_delay_ms 5000"),
-                    io::sink(),
-                )
-                .expect("hosted test operation"),
+        let activation_control = control.clone();
+        let activation_ready = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !activation_control.has_surface_active() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if activation_control.has_surface_active() {
+                ready_tx.send(()).expect("ready signal");
+            }
+        });
+        let _ = TuiSurfaceActions::new(thread.typed_surface()).run_turn(
+            HostedTurnRequest::new("mock_stream_delay_ms 5000"),
+            config,
+            &control,
+            &event_tx,
         );
-        controller
-            .install_hosted(Arc::clone(&operation))
-            .expect("install hosted test operation");
-        ready_tx.send(()).expect("ready signal");
-        operation.wait();
-        controller.complete_hosted(operation.id());
+        activation_ready.join().expect("activation observer");
     }
 
     fn spawn_blocking_runtime(
@@ -157,13 +165,14 @@ mod tests {
         ready_tx: crossbeam_channel::Sender<()>,
     ) -> TuiAgentRuntime {
         let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let operation_events = event_tx.clone();
         TuiAgentRuntime::spawn_hosted(
             action_rx,
             event_tx,
             1,
             controller,
-            move |controller, _commands, host| {
-                run_blocking_hosted_operation(controller, host, ready_tx)
+            move |control, _commands, host| {
+                run_blocking_surface_operation(control, host, operation_events, ready_tx)
             },
         )
         .expect("hosted agent runtime spawned")
@@ -201,11 +210,12 @@ mod tests {
     fn shutdown_does_not_wait_for_capacity_in_full_action_mailbox() {
         let (action_tx, action_rx) = crossbeam_channel::bounded(1);
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let operation_events = event_tx.clone();
         action_tx
             .send(UserAction::Submit("fill command mailbox".to_string()))
             .expect("fill action mailbox");
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let control = TuiSurfaceTaskControl::isolated_for_test();
         let host = RuntimeHost::start().expect("runtime host");
 
         let mut runtime = TuiAgentRuntime::spawn_with_dispatch_capacities(
@@ -213,10 +223,10 @@ mod tests {
             event_tx,
             1,
             1,
-            controller,
+            control,
             host,
-            move |controller, _commands, host| {
-                run_blocking_hosted_operation(controller, host, ready_tx)
+            move |control, _commands, host| {
+                run_blocking_surface_operation(control, host, operation_events, ready_tx)
             },
         )
         .expect("agent runtime spawned");

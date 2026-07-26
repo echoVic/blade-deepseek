@@ -2,15 +2,23 @@
 
 use std::collections::BTreeMap;
 
+use orca_core::approval_types::ActionKind;
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::{PlanItem, PlanStatus};
+use orca_core::task_types::{
+    BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+    WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+};
+use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_runtime::surface::{
-    AssistantChannel, AssistantPatch, OperationPatch, OperationTerminal, SurfaceAssistantStream,
-    SurfaceAssistantStreamState, SurfaceCommitBatch, SurfaceCompletedModelResponse, SurfaceCursor,
-    SurfaceEvent, SurfaceFileChange, SurfaceGoal, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
-    SurfaceGoalState, SurfaceHistoryMessage, SurfaceInputPresentation, SurfaceItem,
-    SurfaceOperationId, SurfaceStreamId, SurfaceToolResultKind, SurfaceUserInputState, ToolPatch,
-    UnixMillis,
+    AssistantChannel, AssistantPatch, ByteOffset, OperationPatch, OperationTerminal,
+    SurfaceAssistantStream, SurfaceAssistantStreamState, SurfaceCommitBatch,
+    SurfaceCompletedModelResponse, SurfaceCursor, SurfaceEvent, SurfaceFileChange, SurfaceGoal,
+    SurfaceGoalPauseReason, SurfaceGoalReceiptState, SurfaceGoalState, SurfaceInputPresentation,
+    SurfaceItem, SurfaceOperationFence, SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult,
+    SurfaceReducerErrorCode, SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus,
+    SurfaceToolResultKind, SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus,
+    SurfaceWorkflowStatus, ToolPatch, UnixMillis,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
@@ -21,78 +29,55 @@ pub(crate) fn history_messages_from_surface_snapshot(
     history_messages_from_surface_items(&snapshot.items)
 }
 
-pub(crate) fn history_messages_from_surface_history(
-    messages: &[SurfaceHistoryMessage],
-) -> Vec<crate::types::ChatMessage> {
+fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
+    let mut messages = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        let Some(turn_id) = assistant_item_turn_id(&items[index]) else {
+            if let Some(message) = history_message_from_surface_item(&items[index]) {
+                messages.push(message);
+            }
+            index += 1;
+            continue;
+        };
+        let start = index;
+        while index < items.len()
+            && assistant_item_turn_id(&items[index]).is_some_and(|candidate| candidate == turn_id)
+        {
+            index += 1;
+        }
+        let assistant_items = &items[start..index];
+        for item in assistant_items
+            .iter()
+            .filter(|item| matches!(item, SurfaceItem::AssistantReasoning { .. }))
+            .chain(
+                assistant_items
+                    .iter()
+                    .filter(|item| matches!(item, SurfaceItem::AssistantMessage { .. })),
+            )
+            .chain(
+                assistant_items
+                    .iter()
+                    .filter(|item| matches!(item, SurfaceItem::AssistantPlan { .. })),
+            )
+        {
+            if let Some(message) = history_message_from_surface_item(item) {
+                messages.push(message);
+            }
+        }
+    }
     messages
-        .iter()
-        .flat_map(|message| match message {
-            SurfaceHistoryMessage::System { .. } => Vec::new(),
-            SurfaceHistoryMessage::User { content, .. } => {
-                vec![crate::types::ChatMessage::User(
-                    content.as_str().to_string(),
-                )]
-            }
-            SurfaceHistoryMessage::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
-                ..
-            } => {
-                let mut projected = Vec::new();
-                if let Some(reasoning) = reasoning_content
-                    .as_ref()
-                    .filter(|text| !text.as_str().trim().is_empty())
-                {
-                    projected.push(crate::types::ChatMessage::Reasoning(
-                        reasoning.as_str().to_string(),
-                    ));
-                }
-                if let Some(content) = content
-                    .as_ref()
-                    .filter(|text| !text.as_str().trim().is_empty())
-                {
-                    projected.push(crate::types::ChatMessage::Assistant(
-                        content.as_str().to_string(),
-                    ));
-                }
-                if content
-                    .as_ref()
-                    .is_none_or(|text| text.as_str().trim().is_empty())
-                    && reasoning_content
-                        .as_ref()
-                        .is_none_or(|text| text.as_str().trim().is_empty())
-                    && !tool_calls.is_empty()
-                {
-                    projected.push(crate::types::ChatMessage::System(
-                        "Previous assistant requested tools".to_string(),
-                    ));
-                }
-                projected
-            }
-            SurfaceHistoryMessage::Tool {
-                tool_call_id,
-                content,
-                ..
-            } => vec![crate::types::ChatMessage::ToolCall {
-                id: tool_call_id.as_str().to_string(),
-                name: format!("tool:{}", tool_call_id.as_str()),
-                target: None,
-                status: "completed".to_string(),
-                output: (!content.as_str().is_empty()).then(|| content.as_str().to_string()),
-                diff: None,
-                kind: None,
-                expanded: false,
-            }],
-        })
-        .collect()
 }
 
-fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
-    items
-        .iter()
-        .filter_map(history_message_from_surface_item)
-        .collect()
+fn assistant_item_turn_id(item: &SurfaceItem) -> Option<&orca_runtime::surface::SurfaceTurnId> {
+    match item {
+        SurfaceItem::AssistantMessage { turn_id, .. }
+        | SurfaceItem::AssistantReasoning { turn_id, .. }
+        | SurfaceItem::AssistantPlan { turn_id, .. } => Some(turn_id),
+        SurfaceItem::UserMessage { .. }
+        | SurfaceItem::SystemMessage { .. }
+        | SurfaceItem::ToolResultMessage { .. } => None,
+    }
 }
 
 fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types::ChatMessage> {
@@ -167,16 +152,28 @@ pub(crate) enum SurfaceProjectionError {
     UnknownAssistantStream {
         stream_id: SurfaceStreamId,
     },
+    ReducerRejected {
+        code: SurfaceReducerErrorCode,
+    },
+    InvalidDeliveryWatermark {
+        stream_id: SurfaceStreamId,
+        offset: ByteOffset,
+    },
 }
+
+pub(crate) type TuiStreamDeliveryWatermark = BTreeMap<SurfaceStreamId, ByteOffset>;
 
 pub(crate) struct TuiSurfaceProjection {
     cursor: SurfaceCursor,
     assistant_streams: BTreeMap<SurfaceStreamId, SurfaceAssistantStream>,
+    completed_items: Vec<SurfaceItem>,
+    operation_turn_ids: BTreeMap<SurfaceOperationId, Vec<orca_runtime::surface::SurfaceTurnId>>,
     focused_operation: Option<SurfaceOperationId>,
     pending_turn_started: Option<TuiTaskLifecycle>,
     goal: Option<SurfaceGoal>,
     thread_created_at: UnixMillis,
     thread_updated_at: UnixMillis,
+    reducer_state: Option<SurfaceReducerState>,
 }
 
 impl TuiSurfaceProjection {
@@ -187,11 +184,14 @@ impl TuiSurfaceProjection {
                 .iter()
                 .map(|stream| (stream.stream_id.clone(), stream.clone()))
                 .collect(),
+            completed_items: Vec::new(),
+            operation_turn_ids: BTreeMap::new(),
             focused_operation: None,
             pending_turn_started: None,
             goal: None,
             thread_created_at: UnixMillis::new(0),
             thread_updated_at: UnixMillis::new(0),
+            reducer_state: None,
         }
     }
 
@@ -216,8 +216,33 @@ impl TuiSurfaceProjection {
                 turn: turn.ordinal,
             });
         projection.goal = snapshot.goal.clone();
+        projection.completed_items = snapshot.items.clone();
+        projection.operation_turn_ids = snapshot
+            .operation_history
+            .iter()
+            .map(|operation| {
+                let mut turn_ids = operation
+                    .generations
+                    .iter()
+                    .map(|generation| generation.logical_turn_id.clone())
+                    .chain(
+                        operation
+                            .agent_loop_turns
+                            .iter()
+                            .map(|turn| turn.turn_id.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                if let Some(turn_id) = operation.initial_logical_turn_id.clone() {
+                    turn_ids.push(turn_id);
+                }
+                turn_ids.sort();
+                turn_ids.dedup();
+                (operation.operation_id.clone(), turn_ids)
+            })
+            .collect();
         projection.thread_created_at = snapshot.thread.created_at;
         projection.thread_updated_at = snapshot.thread.updated_at;
+        projection.reducer_state = Some(SurfaceReducerState::new(snapshot.clone()));
         projection
     }
 
@@ -253,6 +278,159 @@ impl TuiSurfaceProjection {
         projected
     }
 
+    pub(crate) fn delivery_watermark(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> TuiStreamDeliveryWatermark {
+        self.assistant_streams
+            .values()
+            .filter(|stream| {
+                &stream.fence.operation_id == operation_id
+                    && stream.state != SurfaceAssistantStreamState::Discarded
+            })
+            .map(|stream| (stream.stream_id.clone(), stream.next_offset))
+            .collect()
+    }
+
+    pub(crate) fn hydrate_after_delivery_watermark(
+        &self,
+        operation_id: &SurfaceOperationId,
+        watermark: &TuiStreamDeliveryWatermark,
+    ) -> Result<Vec<TuiEvent>, SurfaceProjectionError> {
+        let mut projected = self
+            .assistant_streams
+            .values()
+            .filter(|stream| {
+                &stream.fence.operation_id == operation_id
+                    && stream.state != SurfaceAssistantStreamState::Discarded
+            })
+            .filter_map(|stream| {
+                let offset = watermark
+                    .get(&stream.stream_id)
+                    .copied()
+                    .unwrap_or_else(|| ByteOffset::new(0));
+                let Ok(offset_usize) = usize::try_from(offset.get()) else {
+                    return Some(Err(SurfaceProjectionError::InvalidDeliveryWatermark {
+                        stream_id: stream.stream_id.clone(),
+                        offset,
+                    }));
+                };
+                let text = stream.text.as_str();
+                if offset_usize > text.len() || !text.is_char_boundary(offset_usize) {
+                    return Some(Err(SurfaceProjectionError::InvalidDeliveryWatermark {
+                        stream_id: stream.stream_id.clone(),
+                        offset,
+                    }));
+                }
+                let suffix = &text[offset_usize..];
+                if suffix.is_empty() {
+                    return None;
+                }
+                Some(Ok(match stream.channel {
+                    AssistantChannel::Message => TuiEvent::MessageDelta(suffix.to_string()),
+                    AssistantChannel::Reasoning => TuiEvent::ReasoningDelta(suffix.to_string()),
+                    AssistantChannel::Plan => TuiEvent::Notice(suffix.to_string()),
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(turn_ids) = self.operation_turn_ids.get(operation_id) else {
+            return Ok(projected);
+        };
+        let streamed_item_ids = self
+            .assistant_streams
+            .values()
+            .filter(|stream| &stream.fence.operation_id == operation_id)
+            .map(|stream| &stream.item_id)
+            .collect::<Vec<_>>();
+        projected.extend(self.completed_items.iter().filter_map(|item| match item {
+            SurfaceItem::AssistantMessage {
+                id, turn_id, text, ..
+            } if turn_ids.contains(turn_id)
+                && !streamed_item_ids.iter().any(|streamed| *streamed == id)
+                && !text.as_str().is_empty() =>
+            {
+                Some(TuiEvent::MessageDelta(text.as_str().to_string()))
+            }
+            SurfaceItem::AssistantReasoning {
+                id,
+                turn_id,
+                summary,
+                content,
+                ..
+            } if turn_ids.contains(turn_id)
+                && !streamed_item_ids.iter().any(|streamed| *streamed == id) =>
+            {
+                let text = if content.as_str().is_empty() {
+                    summary.as_str()
+                } else {
+                    content.as_str()
+                };
+                (!text.is_empty()).then(|| TuiEvent::ReasoningDelta(text.to_string()))
+            }
+            SurfaceItem::AssistantPlan {
+                id, turn_id, text, ..
+            } if turn_ids.contains(turn_id)
+                && !streamed_item_ids.iter().any(|streamed| *streamed == id)
+                && !text.as_str().is_empty() =>
+            {
+                Some(TuiEvent::Notice(text.as_str().to_string()))
+            }
+            _ => None,
+        }));
+        for turn_id in turn_ids {
+            let discarded_item_ids = self
+                .assistant_streams
+                .values()
+                .filter(|stream| {
+                    &stream.fence.operation_id == operation_id
+                        && &stream.turn_id == turn_id
+                        && stream.state == SurfaceAssistantStreamState::Discarded
+                })
+                .map(|stream| &stream.item_id)
+                .collect::<Vec<_>>();
+            if discarded_item_ids.is_empty() {
+                continue;
+            }
+            let message = self.completed_items.iter().find_map(|item| match item {
+                SurfaceItem::AssistantMessage { id, text, .. }
+                    if discarded_item_ids.iter().any(|discarded| *discarded == id) =>
+                {
+                    Some(text.as_str().to_string())
+                }
+                _ => None,
+            });
+            let reasoning = self.completed_items.iter().find_map(|item| match item {
+                SurfaceItem::AssistantReasoning {
+                    id,
+                    summary,
+                    content,
+                    ..
+                } if discarded_item_ids.iter().any(|discarded| *discarded == id) => Some(
+                    if content.as_str().is_empty() {
+                        summary.as_str()
+                    } else {
+                        content.as_str()
+                    }
+                    .to_string(),
+                ),
+                _ => None,
+            });
+            if message.is_some() || reasoning.is_some() {
+                projected.push(TuiEvent::AssistantResponseCompleted(message, reasoning));
+            }
+            projected.extend(self.completed_items.iter().filter_map(|item| match item {
+                SurfaceItem::AssistantPlan { id, text, .. }
+                    if discarded_item_ids.iter().any(|discarded| *discarded == id)
+                        && !text.as_str().is_empty() =>
+                {
+                    Some(TuiEvent::Notice(text.as_str().to_string()))
+                }
+                _ => None,
+            }));
+        }
+        Ok(projected)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn focus_operation(&mut self, operation_id: SurfaceOperationId) {
         self.focused_operation = Some(operation_id);
@@ -272,6 +450,18 @@ impl TuiSurfaceProjection {
                 observed: batch.cursor_before.clone(),
             });
         }
+        let next_reducer_state = match self.reducer_state.as_ref() {
+            Some(state) => {
+                match orca_runtime::surface::reduce_batch(SurfaceReduceMode::Live, state, batch) {
+                    SurfaceReduceResult::Applied { state } => Some(state),
+                    SurfaceReduceResult::AlreadyApplied { .. } => Some(state.clone()),
+                    SurfaceReduceResult::Rejected { error } => {
+                        return Err(SurfaceProjectionError::ReducerRejected { code: error.code });
+                    }
+                }
+            }
+            None => None,
+        };
 
         let mut assistant_streams = self.assistant_streams.clone();
         let mut focused_operation = self.focused_operation.clone();
@@ -557,11 +747,440 @@ impl TuiSurfaceProjection {
                 _ => {}
             }
         }
+        if let Some(state) = next_reducer_state.as_ref() {
+            let snapshot = state.snapshot();
+            if batch.events.as_slice().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    SurfaceEvent::Task(_) | SurfaceEvent::Workflow(_)
+                )
+            }) {
+                projected.push(TuiEvent::WorkflowTasksUpdated {
+                    tasks: workflow_task_summaries(snapshot),
+                });
+            }
+        }
         self.assistant_streams = assistant_streams;
         self.focused_operation = focused_operation;
         self.goal = goal;
+        self.reducer_state = next_reducer_state;
         self.cursor = batch.cursor_after.clone();
         Ok(projected)
+    }
+
+    pub(crate) fn terminal_workflow_notification(
+        &self,
+        workflow_run_id: &orca_runtime::surface::SurfaceWorkflowRunId,
+    ) -> Option<TuiEvent> {
+        let workflow = self
+            .reducer_state
+            .as_ref()?
+            .snapshot()
+            .workflows
+            .iter()
+            .find(|workflow| &workflow.workflow_run_id == workflow_run_id)?;
+        workflow_terminal_notification(workflow)
+    }
+
+    pub(crate) fn active_generation_fence(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<SurfaceOperationFence> {
+        let snapshot = self.reducer_state.as_ref()?.snapshot();
+        snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| &operation.operation_id == operation_id)
+            .and_then(|operation| operation.generations.last())
+            .map(|generation| generation.fence.clone())
+            .or_else(|| {
+                snapshot
+                    .background_operations
+                    .iter()
+                    .find(|operation| &operation.operation_id == operation_id)
+                    .map(|operation| operation.fence.operation_fence.clone())
+            })
+    }
+
+    pub(crate) fn operation_is_runtime_backgrounded(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> bool {
+        self.reducer_state.as_ref().is_some_and(|state| {
+            state
+                .snapshot()
+                .background_operations
+                .iter()
+                .any(|operation| &operation.operation_id == operation_id)
+        })
+    }
+
+    pub(crate) fn terminal_status_for_operation(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<&'static str> {
+        let snapshot = self.reducer_state.as_ref()?.snapshot();
+        snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| &operation.operation_id == operation_id)
+            .and_then(|operation| operation.terminal.as_ref())
+            .and_then(|record| operation_terminal_status(&record.terminal))
+    }
+
+    pub(crate) fn background_task_summary_for_operation(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<BackgroundTaskSummary> {
+        background_task_summary_for_operation(self.reducer_state.as_ref()?.snapshot(), operation_id)
+    }
+
+    pub(crate) fn workflow_task_summaries(&self) -> Vec<BackgroundTaskSummary> {
+        self.reducer_state
+            .as_ref()
+            .map(|state| workflow_task_summaries(state.snapshot()))
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) fn workflow_task_summaries(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+) -> Vec<BackgroundTaskSummary> {
+    snapshot
+        .tasks
+        .iter()
+        .map(|task| {
+            let workflow = task.workflow_run_id.as_ref().and_then(|run_id| {
+                snapshot
+                    .workflows
+                    .iter()
+                    .find(|workflow| &workflow.workflow_run_id == run_id)
+            });
+            let pending_tool_call = pending_tool_call_for_task(snapshot, task);
+            BackgroundTaskSummary {
+                id: task.task_id.as_str().to_string(),
+                task_type: task_type(task.task_type),
+                status: task_status(task.status),
+                is_backgrounded: task.backgrounded,
+                description: task.description.as_str().to_string(),
+                created_at_ms: task.created_at.get(),
+                started_at_ms: task.started_at.map(UnixMillis::get),
+                completed_at_ms: task.completed_at.map(UnixMillis::get),
+                command: None,
+                agent_type: None,
+                server: None,
+                tool: pending_tool_call
+                    .as_ref()
+                    .map(|tool| tool.name.clone())
+                    .or_else(|| workflow.map(|_| "workflow".to_string())),
+                pending_tool_call,
+                name: workflow.map(|workflow| workflow.name.as_str().to_string()),
+                workflow_run_id: task
+                    .workflow_run_id
+                    .as_ref()
+                    .map(|run_id| run_id.as_str().to_string()),
+                phase_count: workflow.map(|workflow| workflow.phases.len()),
+                workflow_progress: workflow.map(workflow_progress),
+                workflow_phases: workflow
+                    .map(|workflow| {
+                        workflow
+                            .phases
+                            .iter()
+                            .map(|phase| WorkflowPhaseTaskSummary {
+                                name: phase.name.as_str().to_string(),
+                                status: workflow_status(phase.status),
+                                agent_count: phase.agent_count,
+                                error: phase.error.as_ref().map(|error| error.as_str().to_string()),
+                                fallback: None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                workflow_agents: workflow
+                    .map(|workflow| {
+                        workflow
+                            .agents
+                            .iter()
+                            .map(|agent| WorkflowAgentTaskSummary {
+                                call_id: agent.agent_id.as_str().to_string(),
+                                call_path: agent.agent_id.as_str().to_string(),
+                                team: None,
+                                status: workflow_agent_status(agent.status),
+                                attempt: agent.attempt,
+                                max_attempts: agent.attempt.max(1),
+                                previous_errors: Vec::new(),
+                                error: agent.error.as_ref().map(|error| error.as_str().to_string()),
+                                transcript_path: None,
+                                started_at_ms: None,
+                                completed_at_ms: None,
+                                usage: agent.usage.as_ref().map(core_usage_totals),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                workflow_script_path: None,
+                workflow_launch_input: None,
+                workflow_final_summary: workflow.and_then(|workflow| {
+                    workflow
+                        .result
+                        .as_ref()
+                        .map(|result| result.content.as_str().to_string())
+                }),
+                workflow_failure_count: workflow
+                    .map(|workflow| {
+                        workflow
+                            .agents
+                            .iter()
+                            .filter(|agent| agent.status == SurfaceWorkflowAgentStatus::Failed)
+                            .count() as u32
+                    })
+                    .unwrap_or_default(),
+                usage: task.usage.as_ref().map(core_usage_totals),
+                subagent_current_activity: None,
+                subagent_turn: None,
+                last_activity_at_ms: task.completed_at.or(task.started_at).map(UnixMillis::get),
+                result: task.result.as_ref().map(|value| value.as_str().to_string()),
+                error: task.error.as_ref().map(|value| value.as_str().to_string()),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn background_task_summary_for_operation(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    operation_id: &SurfaceOperationId,
+) -> Option<BackgroundTaskSummary> {
+    let task_id = snapshot
+        .tasks
+        .iter()
+        .find(|task| {
+            task.task_type == orca_runtime::surface::SurfaceTaskType::MainSession
+                && task.parent_operation.as_ref() == Some(operation_id)
+        })?
+        .task_id
+        .as_str();
+    workflow_task_summaries(snapshot)
+        .into_iter()
+        .find(|task| task.id == task_id)
+}
+
+fn workflow_progress(workflow: &SurfaceWorkflow) -> WorkflowTaskProgress {
+    WorkflowTaskProgress {
+        total_agents: workflow.agents.len() as u32,
+        running_agents: workflow
+            .agents
+            .iter()
+            .filter(|agent| agent.status == SurfaceWorkflowAgentStatus::Running)
+            .count() as u32,
+        completed_agents: workflow
+            .agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent.status,
+                    SurfaceWorkflowAgentStatus::Completed | SurfaceWorkflowAgentStatus::Cached
+                )
+            })
+            .count() as u32,
+        failed_agents: workflow
+            .agents
+            .iter()
+            .filter(|agent| agent.status == SurfaceWorkflowAgentStatus::Failed)
+            .count() as u32,
+        completed_phases: workflow
+            .phases
+            .iter()
+            .filter(|phase| phase.status == SurfaceWorkflowStatus::Completed)
+            .count(),
+        running_phases: workflow
+            .phases
+            .iter()
+            .filter(|phase| phase.status == SurfaceWorkflowStatus::Running)
+            .count(),
+        failed_phases: workflow
+            .phases
+            .iter()
+            .filter(|phase| phase.status == SurfaceWorkflowStatus::Failed)
+            .count(),
+    }
+}
+
+fn workflow_terminal_notification(workflow: &SurfaceWorkflow) -> Option<TuiEvent> {
+    let status = match workflow.status {
+        SurfaceWorkflowStatus::Completed => "completed",
+        SurfaceWorkflowStatus::Failed => "failed",
+        SurfaceWorkflowStatus::Stopped => "stopped",
+        SurfaceWorkflowStatus::Cancelled => "cancelled",
+        _ => return None,
+    };
+    let summary = workflow
+        .result
+        .as_ref()
+        .map(|result| result.content.as_str())
+        .or_else(|| workflow.error.as_ref().map(|error| error.as_str()))
+        .unwrap_or(status);
+    let tool_use_id = workflow
+        .result
+        .as_ref()
+        .and_then(|result| result.tool_use_id.as_ref())
+        .map(|tool_use_id| tool_use_id.as_str())
+        .unwrap_or("");
+    let id = format!(
+        "{}:{}:{}",
+        workflow.workflow_run_id.as_str(),
+        workflow.task_id.as_str(),
+        tool_use_id
+    );
+    let prompt = format!(
+        "<task-notification>\n<task-id>{}</task-id>\n<tool-use-id>{}</tool-use-id>\n<run-id>{}</run-id>\n<status>{}</status>\n<summary>{}</summary>\n</task-notification>\n\nA background workflow finished. Use this result to continue the current task.",
+        xml_escape(workflow.task_id.as_str()),
+        xml_escape(tool_use_id),
+        xml_escape(workflow.workflow_run_id.as_str()),
+        status,
+        xml_escape(summary),
+    );
+    Some(TuiEvent::WorkflowNotification {
+        id,
+        prompt,
+        status: status.to_string(),
+        summary: format!("{}: {summary}", workflow.name.as_str()),
+    })
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn task_type(task_type: orca_runtime::surface::SurfaceTaskType) -> TaskType {
+    match task_type {
+        orca_runtime::surface::SurfaceTaskType::MainSession => TaskType::MainSession,
+        orca_runtime::surface::SurfaceTaskType::Workflow => TaskType::Workflow,
+        orca_runtime::surface::SurfaceTaskType::Subagent => TaskType::Subagent,
+        orca_runtime::surface::SurfaceTaskType::Shell => TaskType::Shell,
+        orca_runtime::surface::SurfaceTaskType::Monitor => TaskType::Monitor,
+    }
+}
+
+fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
+    match status {
+        SurfaceTaskStatus::Queued => TaskStatus::Queued,
+        SurfaceTaskStatus::Running => TaskStatus::Running,
+        SurfaceTaskStatus::Paused => TaskStatus::Paused,
+        SurfaceTaskStatus::Stopping => TaskStatus::Stopping,
+        SurfaceTaskStatus::Stopped => TaskStatus::Stopped,
+        SurfaceTaskStatus::Completed => TaskStatus::Completed,
+        SurfaceTaskStatus::Failed => TaskStatus::Failed,
+        SurfaceTaskStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
+        SurfaceTaskStatus::Cancelled => TaskStatus::Cancelled,
+    }
+}
+
+fn tool_action(action: orca_runtime::surface::SurfaceToolAction) -> ActionKind {
+    match action {
+        orca_runtime::surface::SurfaceToolAction::Read => ActionKind::Read,
+        orca_runtime::surface::SurfaceToolAction::Write => ActionKind::Write,
+        orca_runtime::surface::SurfaceToolAction::Network => ActionKind::Network,
+        orca_runtime::surface::SurfaceToolAction::Agent => ActionKind::Agent,
+        orca_runtime::surface::SurfaceToolAction::Shell => ActionKind::Shell,
+    }
+}
+
+fn pending_tool_call_for_task(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    task: &orca_runtime::surface::SurfaceTask,
+) -> Option<PendingToolCallSummary> {
+    if let Some(tool) = task
+        .pending_interaction_id
+        .as_ref()
+        .and_then(|interaction_id| {
+            snapshot
+                .interactions
+                .iter()
+                .find(|interaction| &interaction.interaction_id == interaction_id)
+                .and_then(|interaction| match &interaction.request {
+                    orca_runtime::surface::SurfaceInteractionRequest::BackgroundApproval {
+                        tool,
+                        ..
+                    } => Some(tool),
+                    _ => None,
+                })
+        })
+    {
+        return Some(pending_tool_call(tool));
+    }
+    if task.status != SurfaceTaskStatus::ApprovalRequired {
+        return None;
+    }
+    let operation = task.parent_operation.as_ref().and_then(|operation_id| {
+        snapshot
+            .operation_history
+            .iter()
+            .chain(snapshot.foreground_operation.iter())
+            .chain(snapshot.queued_operations.iter())
+            .find(|operation| &operation.operation_id == operation_id)
+    })?;
+    snapshot
+        .tools
+        .iter()
+        .find(|tool| {
+            tool.result.is_none()
+                && operation
+                    .agent_loop_turns
+                    .iter()
+                    .any(|turn| turn.turn_id == tool.request.turn_id)
+        })
+        .map(|tool| pending_tool_call(&tool.request))
+}
+
+fn pending_tool_call(tool: &orca_runtime::surface::SurfaceToolRequest) -> PendingToolCallSummary {
+    PendingToolCallSummary {
+        id: tool.tool_call_id.as_str().to_string(),
+        name: tool.name.as_str().to_string(),
+        action: tool_action(tool.action),
+        target: tool
+            .target
+            .as_ref()
+            .map(|target| target.as_str().to_string()),
+        arguments: tool.raw_arguments.as_str().to_string(),
+    }
+}
+
+fn workflow_status(status: SurfaceWorkflowStatus) -> WorkflowRunStatus {
+    match status {
+        SurfaceWorkflowStatus::Queued => WorkflowRunStatus::Queued,
+        SurfaceWorkflowStatus::Running => WorkflowRunStatus::Running,
+        SurfaceWorkflowStatus::Paused => WorkflowRunStatus::Paused,
+        SurfaceWorkflowStatus::Stopping => WorkflowRunStatus::Stopping,
+        SurfaceWorkflowStatus::Stopped => WorkflowRunStatus::Stopped,
+        SurfaceWorkflowStatus::Completed => WorkflowRunStatus::Completed,
+        SurfaceWorkflowStatus::Failed => WorkflowRunStatus::Failed,
+        SurfaceWorkflowStatus::Cancelled => WorkflowRunStatus::Cancelled,
+        SurfaceWorkflowStatus::AsyncLaunched => WorkflowRunStatus::AsyncLaunched,
+    }
+}
+
+fn workflow_agent_status(status: SurfaceWorkflowAgentStatus) -> WorkflowAgentStatus {
+    match status {
+        SurfaceWorkflowAgentStatus::Pending => WorkflowAgentStatus::Pending,
+        SurfaceWorkflowAgentStatus::Running => WorkflowAgentStatus::Running,
+        SurfaceWorkflowAgentStatus::Cached => WorkflowAgentStatus::Cached,
+        SurfaceWorkflowAgentStatus::Completed => WorkflowAgentStatus::Completed,
+        SurfaceWorkflowAgentStatus::Failed => WorkflowAgentStatus::Failed,
+        SurfaceWorkflowAgentStatus::Cancelled => WorkflowAgentStatus::Cancelled,
+    }
+}
+
+fn core_usage_totals(usage: &orca_runtime::surface::UsageTotals) -> UsageTotals {
+    UsageTotals {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_tokens: usage.cache_tokens,
+        estimated_cost_usd: usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
     }
 }
 
@@ -674,8 +1293,9 @@ mod tests {
         ByteOffset, CommitClass, CursorSourceRevision, DisplayText, DurableRevision, NonEmptyVec,
         SequenceNumber, Sha256Digest, SurfaceCommitId, SurfaceEventEnvelope, SurfaceEventId,
         SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope,
-        SurfaceThreadId, SurfaceTurnId,
+        SurfaceThreadId, SurfaceTurnId, ThreadOwnerEpoch,
     };
+    use orca_runtime::unstable_surface::SurfaceGenerationId;
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
         let mut bytes = [seed; 16];
@@ -692,6 +1312,15 @@ mod tests {
             source_revision: CursorSourceRevision::Recorded {
                 durable_revision: DurableRevision::try_new(revision).unwrap(),
             },
+        }
+    }
+
+    fn operation_fence(seed: u8) -> SurfaceOperationFence {
+        SurfaceOperationFence {
+            thread_id: SurfaceThreadId::try_from_bytes(uuid_v7_bytes(1)).unwrap(),
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            operation_id: SurfaceOperationId::try_from_bytes(uuid_v7_bytes(seed)).unwrap(),
+            generation_id: SurfaceGenerationId::new(u64::from(seed)),
         }
     }
 
@@ -756,54 +1385,14 @@ mod tests {
             [
                 crate::types::ChatMessage::User(prompt),
                 crate::types::ChatMessage::System(system),
-                crate::types::ChatMessage::Assistant(answer),
                 crate::types::ChatMessage::Reasoning(reasoning),
+                crate::types::ChatMessage::Assistant(answer),
                 crate::types::ChatMessage::ProposedPlan(plan),
             ] if prompt == "visible prompt"
                 && system == "system"
                 && answer == "answer"
                 && reasoning == "reasoning"
                 && plan == "plan"
-        ));
-    }
-
-    #[test]
-    fn runtime_history_projection_preserves_message_order_and_tool_identity() {
-        let tool_id = orca_runtime::surface::SurfaceHistoryId::try_new("call-1").unwrap();
-        let history = vec![
-            SurfaceHistoryMessage::User {
-                role: orca_runtime::surface::SurfaceHistoryUserRole::User,
-                content: DisplayText::new("hello"),
-            },
-            SurfaceHistoryMessage::Assistant {
-                role: orca_runtime::surface::SurfaceHistoryAssistantRole::Assistant,
-                content: Some(DisplayText::new("hi")),
-                reasoning_content: Some(DisplayText::new("reason")),
-                tool_calls: Vec::new(),
-            },
-            SurfaceHistoryMessage::Tool {
-                role: orca_runtime::surface::SurfaceHistoryToolRole::Tool,
-                tool_call_id: tool_id,
-                content: DisplayText::new("done"),
-            },
-        ];
-
-        let messages = history_messages_from_surface_history(&history);
-        assert!(matches!(
-            messages[0],
-            crate::types::ChatMessage::User(ref text) if text == "hello"
-        ));
-        assert!(matches!(
-            messages[1],
-            crate::types::ChatMessage::Reasoning(ref text) if text == "reason"
-        ));
-        assert!(matches!(
-            messages[2],
-            crate::types::ChatMessage::Assistant(ref text) if text == "hi"
-        ));
-        assert!(matches!(
-            messages[3],
-            crate::types::ChatMessage::ToolCall { ref id, .. } if id == "call-1"
         ));
     }
 
@@ -939,6 +1528,8 @@ mod tests {
         let mut projection = TuiSurfaceProjection {
             cursor: cursor(0, 1),
             assistant_streams: BTreeMap::new(),
+            completed_items: Vec::new(),
+            operation_turn_ids: BTreeMap::new(),
             focused_operation: None,
             pending_turn_started: Some(TuiTaskLifecycle {
                 id: "task-1".to_string(),
@@ -949,6 +1540,7 @@ mod tests {
             goal: None,
             thread_created_at: UnixMillis::new(0),
             thread_updated_at: UnixMillis::new(0),
+            reducer_state: None,
         };
 
         assert!(matches!(
@@ -959,5 +1551,130 @@ mod tests {
             }] if id == "task-1" && status == "running"
         ));
         assert!(projection.hydrate_open_streams().is_empty());
+    }
+
+    #[test]
+    fn foreground_hydration_emits_only_undelivered_bytes_for_the_selected_operation() {
+        let fence = operation_fence(10);
+        let other_fence = operation_fence(20);
+        let message_stream_id =
+            SurfaceStreamId::try_from_bytes(uuid_v7_bytes(30)).expect("message stream id");
+        let reasoning_stream_id =
+            SurfaceStreamId::try_from_bytes(uuid_v7_bytes(31)).expect("reasoning stream id");
+        let other_stream_id =
+            SurfaceStreamId::try_from_bytes(uuid_v7_bytes(32)).expect("other stream id");
+        let streams = vec![
+            SurfaceAssistantStream {
+                stream_id: message_stream_id.clone(),
+                fence: fence.clone(),
+                turn_id: SurfaceTurnId::new(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Message,
+                next_offset: ByteOffset::new(12),
+                text: DisplayText::new("hello world!"),
+                state: SurfaceAssistantStreamState::Completed,
+            },
+            SurfaceAssistantStream {
+                stream_id: reasoning_stream_id.clone(),
+                fence: fence.clone(),
+                turn_id: SurfaceTurnId::new(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Reasoning,
+                next_offset: ByteOffset::new(6),
+                text: DisplayText::new("reason"),
+                state: SurfaceAssistantStreamState::Open,
+            },
+            SurfaceAssistantStream {
+                stream_id: other_stream_id,
+                fence: other_fence,
+                turn_id: SurfaceTurnId::new(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Message,
+                next_offset: ByteOffset::new(5),
+                text: DisplayText::new("other"),
+                state: SurfaceAssistantStreamState::Open,
+            },
+        ];
+        let initial_stream = SurfaceAssistantStream {
+            stream_id: message_stream_id.clone(),
+            fence: fence.clone(),
+            turn_id: streams[0].turn_id.clone(),
+            item_id: streams[0].item_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(5),
+            text: DisplayText::new("hello"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let initial = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &[initial_stream]);
+        let watermark = initial.delivery_watermark(&fence.operation_id);
+        let projection = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &streams);
+
+        let hydrated = projection
+            .hydrate_after_delivery_watermark(&fence.operation_id, &watermark)
+            .expect("valid delivery watermark");
+        assert!(matches!(
+            hydrated.as_slice(),
+            [TuiEvent::MessageDelta(message), TuiEvent::ReasoningDelta(reasoning)]
+                if message == " world!" && reasoning == "reason"
+        ));
+        assert_eq!(
+            projection
+                .delivery_watermark(&fence.operation_id)
+                .get(&message_stream_id),
+            Some(&ByteOffset::new(12))
+        );
+        assert_eq!(
+            projection
+                .delivery_watermark(&fence.operation_id)
+                .get(&reasoning_stream_id),
+            Some(&ByteOffset::new(6))
+        );
+    }
+
+    #[test]
+    fn foreground_hydration_reconciles_completed_item_for_discarded_stream() {
+        let fence = operation_fence(40);
+        let turn_id = SurfaceTurnId::new();
+        let item_id = SurfaceItemId::new();
+        let stream = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(41))
+                .expect("discarded stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: item_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(7),
+            text: DisplayText::new("partial"),
+            state: SurfaceAssistantStreamState::Discarded,
+        };
+        let projection = TuiSurfaceProjection {
+            cursor: cursor(0, 1),
+            assistant_streams: BTreeMap::from([(stream.stream_id.clone(), stream)]),
+            completed_items: vec![SurfaceItem::AssistantMessage {
+                id: item_id,
+                turn_id: turn_id.clone(),
+                text: DisplayText::new("corrected full response"),
+                pinned: false,
+            }],
+            operation_turn_ids: BTreeMap::from([(fence.operation_id.clone(), vec![turn_id])]),
+            focused_operation: None,
+            pending_turn_started: None,
+            goal: None,
+            thread_created_at: UnixMillis::new(0),
+            thread_updated_at: UnixMillis::new(0),
+            reducer_state: None,
+        };
+
+        assert!(matches!(
+            projection
+                .hydrate_after_delivery_watermark(
+                    &fence.operation_id,
+                    &TuiStreamDeliveryWatermark::new(),
+                )
+                .expect("discarded stream hydration")
+                .as_slice(),
+            [TuiEvent::AssistantResponseCompleted(Some(message), None)]
+                if message == "corrected full response"
+        ));
     }
 }

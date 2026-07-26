@@ -109,7 +109,7 @@ fn permission_interrupt_wakes_waiter_as_a_denial() {
         event_rx.recv().expect("permission event"),
         TuiEvent::PermissionApprovalNeeded { .. } | TuiEvent::ApprovalNeeded { .. }
     ));
-    controller.interrupt_current();
+    let _ = controller.interrupt_current();
 
     let response = join.join().expect("join permission").expect("response");
     assert_eq!(

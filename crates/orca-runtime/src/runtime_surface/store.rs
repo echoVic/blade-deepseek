@@ -2478,9 +2478,10 @@ static INTERACTION_ROUTE_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = On
 #[cfg(test)]
 static INTERACTION_REQUEST_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
-static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
-static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
 #[cfg(test)]
 static ADMISSION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
@@ -2498,11 +2499,45 @@ static SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = 
 static PENDING_SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static TASK_OWNERSHIP_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static BACKGROUND_TRANSFER_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PENDING_BACKGROUND_TRANSFER_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PROVIDER_COMPLETION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PENDING_PROVIDER_COMPLETION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PENDING_BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES: OnceLock<
+    Mutex<HashMap<PathBuf, usize>>,
+> = OnceLock::new();
+#[cfg(test)]
+static PROVIDER_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PROVIDER_TERMINAL_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
 static MANUAL_COMPACTION_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static WORKFLOW_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 
 pub struct JsonlSurfaceControlLedger {
@@ -2706,11 +2741,31 @@ impl JsonlSurfaceCommitLedger {
 
     #[cfg(test)]
     pub(crate) fn inject_terminal_checkpoint_failure_once(path: impl Into<PathBuf>) {
+        Self::inject_terminal_checkpoint_failures(path, 1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_terminal_checkpoint_failures(path: impl Into<PathBuf>, count: usize) {
         TERMINAL_CHECKPOINT_FAILURES
-            .get_or_init(|| Mutex::new(HashSet::new()))
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(path.into());
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_terminal_checkpoint_failures(path: impl Into<PathBuf>) {
+        let path = path.into();
+        TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+        PENDING_TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
     }
 
     #[cfg(test)]
@@ -2744,12 +2799,96 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_task_ownership_checkpoint_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_task_ownership_checkpoint_failures(path: impl Into<PathBuf>) {
+        let path = path.into();
+        TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+        PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_generation_append_failure_once(path: impl Into<PathBuf>) {
         GENERATION_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(path.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_background_transfer_checkpoint_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        BACKGROUND_TRANSFER_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_provider_completion_checkpoint_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        PROVIDER_COMPLETION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_background_approval_resume_checkpoint_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_provider_completion_append_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        PROVIDER_COMPLETION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_provider_terminal_append_failures(path: impl Into<PathBuf>, count: usize) {
+        PROVIDER_TERMINAL_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
     }
 
     #[cfg(test)]
@@ -2781,6 +2920,18 @@ impl JsonlSurfaceCommitLedger {
         count: usize,
     ) {
         MANUAL_COMPACTION_COMPLETION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_workflow_completion_append_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        WORKFLOW_COMPLETION_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2921,28 +3072,40 @@ impl JsonlSurfaceCommitLedger {
                 })
             )
         });
-        if is_terminal
-            && TERMINAL_CHECKPOINT_FAILURES
-                .get_or_init(|| Mutex::new(HashSet::new()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&self.path)
-        {
+        if !is_terminal {
+            return;
+        }
+        let count = TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path);
+        if let Some(count) = count {
             PENDING_TERMINAL_CHECKPOINT_FAILURES
-                .get_or_init(|| Mutex::new(HashSet::new()))
+                .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(self.path.clone());
+                .entry(self.path.clone())
+                .and_modify(|pending| *pending += count)
+                .or_insert(count);
         }
     }
 
     #[cfg(test)]
     fn take_pending_terminal_checkpoint_failure(&self) -> bool {
-        PENDING_TERMINAL_CHECKPOINT_FAILURES
-            .get_or_init(|| Mutex::new(HashSet::new()))
+        let mut failures = PENDING_TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.path)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
     }
 
     #[cfg(test)]
@@ -2978,8 +3141,234 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    fn take_workflow_completion_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let completes_workflow = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Workflow(
+                    WorkflowPatch::Completed { .. }
+                        | WorkflowPatch::Failed { .. }
+                        | WorkflowPatch::Stopped { .. }
+                        | WorkflowPatch::Cancelled { .. }
+                )
+            )
+        });
+        if !completes_workflow {
+            return false;
+        }
+        let mut failures = WORKFLOW_COMPLETION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
     fn take_admission_checkpoint_failure(&self) -> bool {
         let mut failures = PENDING_ADMISSION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn arm_background_transfer_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        let is_background_transfer = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::GenerationTransferred { .. })
+            )
+        });
+        if !is_background_transfer {
+            return;
+        }
+        let mut failures = BACKGROUND_TRANSFER_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_BACKGROUND_TRANSFER_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone(), count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_background_transfer_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_BACKGROUND_TRANSFER_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn arm_provider_completion_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        let is_provider_completion = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::GenerationStopped {
+                    reason: GenerationStopReason::ProviderSuspended
+                        | GenerationStopReason::ExecutionFailed {
+                            class: GenerationExecutionFailureClass::LegacyApprovalRequired,
+                            ..
+                        },
+                    ..
+                })
+            )
+        });
+        if !is_provider_completion {
+            return;
+        }
+        let mut failures = PROVIDER_COMPLETION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_PROVIDER_COMPLETION_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone(), count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_provider_completion_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_PROVIDER_COMPLETION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn arm_background_approval_resume_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        let is_background_approval_resume = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::ControlIntentCommitted {
+                    intent: PendingControlIntent::ResumeStarting { .. },
+                    ..
+                })
+            )
+        });
+        if !is_background_approval_resume {
+            return;
+        }
+        let mut failures = BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone(), count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_background_approval_resume_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn take_provider_completion_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let is_provider_completion = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                (&event.scope, &event.event),
+                (
+                    SurfaceScope::Background { .. },
+                    SurfaceEvent::Operation(OperationPatch::GenerationStopped { .. })
+                )
+            )
+        }) && !batch
+            .events
+            .as_slice()
+            .iter()
+            .any(|event| matches!(event.event, SurfaceEvent::Workflow(_)));
+        if !is_provider_completion {
+            return false;
+        }
+        let mut failures = PROVIDER_COMPLETION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn take_provider_terminal_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let is_provider_terminal = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                (&event.scope, &event.event),
+                (
+                    SurfaceScope::Background { .. },
+                    SurfaceEvent::Operation(OperationPatch::Terminal { .. })
+                )
+            )
+        });
+        if !is_provider_terminal {
+            return false;
+        }
+        let mut failures = PROVIDER_TERMINAL_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3043,6 +3432,48 @@ impl JsonlSurfaceCommitLedger {
                 .and_modify(|pending| *pending += count)
                 .or_insert(count);
         }
+    }
+
+    #[cfg(test)]
+    fn arm_task_ownership_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        if !batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Task(TaskPatch::OwnershipChanged { .. })
+            )
+        }) {
+            return;
+        }
+        let mut failures = TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(self.path.clone())
+                .and_modify(|pending| *pending += count)
+                .or_insert(count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_task_ownership_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
     }
 
     #[cfg(test)]
@@ -3159,6 +3590,18 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         if self.take_manual_compaction_completion_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
+        #[cfg(test)]
+        if self.take_workflow_completion_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_provider_completion_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_provider_terminal_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
         let (commit_id, durable_revision) = match &batch.commit_class {
             CommitClass::Recorded {
                 commit_id,
@@ -3215,6 +3658,14 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         #[cfg(test)]
         self.arm_settings_checkpoint_failures(batch);
         #[cfg(test)]
+        self.arm_task_ownership_checkpoint_failures(batch);
+        #[cfg(test)]
+        self.arm_background_transfer_checkpoint_failures(batch);
+        #[cfg(test)]
+        self.arm_provider_completion_checkpoint_failures(batch);
+        #[cfg(test)]
+        self.arm_background_approval_resume_checkpoint_failures(batch);
+        #[cfg(test)]
         if batch.events.as_slice().iter().any(|event| {
             matches!(
                 &event.event,
@@ -3253,6 +3704,22 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_settings_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_task_ownership_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_background_transfer_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_provider_completion_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_background_approval_resume_checkpoint_failure() {
             return Err(SurfaceLedgerError::CheckpointFailed);
         }
         self.store

@@ -250,6 +250,9 @@ pub enum TuiEvent {
     WorkflowTaskUpdated {
         task: BackgroundTaskSummary,
     },
+    BackgroundTaskOutputAttached {
+        task_id: String,
+    },
     WorkflowNotification {
         id: String,
         prompt: String,
@@ -1203,7 +1206,6 @@ impl AppState {
         };
         if task.task_type != orca_core::task_types::TaskType::MainSession
             || task.status != orca_core::task_types::TaskStatus::ApprovalRequired
-            || !task.is_backgrounded
         {
             return false;
         }
@@ -1522,6 +1524,10 @@ impl AppState {
                 self.recoverable_operation_id = None;
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
+            }
+            TuiEvent::BackgroundTaskOutputAttached { .. } => {
+                self.suppress_background_main_session_output = false;
+                self.panel_mode = PanelMode::Conversation;
             }
             TuiEvent::ReasoningDelta(text) => {
                 if self.suppress_background_main_session_output {
@@ -4046,6 +4052,32 @@ mod tests {
     }
 
     #[test]
+    fn foreground_claimed_background_approval_can_reopen_dialog() {
+        let mut state = state();
+        let mut task = workflow_task_summary("task-approval", "approval");
+        task.task_type = TaskType::MainSession;
+        task.status = TaskStatus::ApprovalRequired;
+        task.is_backgrounded = false;
+        task.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "mock-tool-1".to_string(),
+            name: "task_list".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: Some("foreground claimed task".to_string()),
+            arguments: "{}".to_string(),
+        });
+        state.workflow_panel.tasks = vec![task];
+
+        assert!(state.open_selected_background_approval_dialog());
+        assert_eq!(
+            state
+                .approval_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.background_task_id.as_deref()),
+            Some("task-approval")
+        );
+    }
+
+    #[test]
     fn show_agents_uses_dedicated_panel_mode() {
         let mut state = state();
         state.workflow_panel.selected = 9;
@@ -4439,6 +4471,27 @@ mod tests {
         state.update(TuiEvent::WorkflowTasksUpdated { tasks: vec![task] });
 
         assert!(!state.suppress_background_main_session_output);
+    }
+
+    #[test]
+    fn background_output_attach_clears_suppression_before_replayed_delta() {
+        let mut state = state();
+        state.panel_mode = PanelMode::Workflows;
+        state.suppress_background_main_session_output = true;
+
+        state.update(TuiEvent::BackgroundTaskOutputAttached {
+            task_id: "task-main".to_string(),
+        });
+        state.update(TuiEvent::MessageDelta(
+            "missing foreground suffix".to_string(),
+        ));
+
+        assert!(!state.suppress_background_main_session_output);
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Assistant(text)) if text == "missing foreground suffix"
+        ));
     }
 
     #[test]

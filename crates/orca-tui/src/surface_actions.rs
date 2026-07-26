@@ -6,14 +6,14 @@ use orca_core::config::RunConfig;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
-use orca_runtime::runtime_host::{HostedTurnRequest, HostedWorkflowRequest};
+use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
-    NonEmptyVec, RuntimeSettingsPatch, RuntimeSurfaceThreadHandle, SurfaceHistoryMessage,
-    SurfaceSettingsSnapshot, SurfaceSnapshot,
+    NonEmptyVec, RuntimeSettingsPatch, RuntimeSurfaceThreadHandle, SurfaceSettingsSnapshot,
+    SurfaceSnapshot,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
-use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::types::{TuiEvent, TuiMemoryScope};
 
 /// The only TUI-facing entry point for thread-scoped runtime commands and
@@ -49,22 +49,22 @@ impl TuiSurfaceActions {
         &self,
         request: HostedTurnRequest,
         config: RunConfig,
-        controller: &TuiOperationController,
+        control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::run(&self.thread, request, config, controller, event_tx)
+        crate::surface_client::run(&self.thread, request, config, control, event_tx)
     }
 
     pub(crate) fn resume_operation(
         &self,
         operation_id: &orca_runtime::surface::SurfaceOperationId,
-        controller: &TuiOperationController,
+        control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
         crate::surface_client::resume_recovered_operation(
             &self.thread,
             operation_id,
-            controller,
+            control,
             event_tx,
         )
     }
@@ -72,23 +72,23 @@ impl TuiSurfaceActions {
     pub(crate) fn cancel_operation(
         &self,
         operation_id: &orca_runtime::surface::SurfaceOperationId,
-        controller: &TuiOperationController,
+        control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
         crate::surface_client::cancel_recovered_operation(
             &self.thread,
             operation_id,
-            controller,
+            control,
             event_tx,
         )
     }
 
     pub(crate) fn manual_compact(
         &self,
-        controller: &TuiOperationController,
+        control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::manual_compact(&self.thread, controller, event_tx)
+        crate::surface_client::manual_compact(&self.thread, control, event_tx)
     }
 
     pub(crate) fn update_settings(
@@ -100,10 +100,6 @@ impl TuiSurfaceActions {
 
     pub(crate) fn read_snapshot(&self) -> io::Result<SurfaceSnapshot> {
         crate::surface_client::read_snapshot(&self.thread)
-    }
-
-    pub(crate) fn read_history(&self) -> io::Result<Vec<SurfaceHistoryMessage>> {
-        crate::surface_client::read_history(&self.thread)
     }
 
     pub(crate) fn add_pinned_context(&self, note: &str) -> io::Result<()> {
@@ -158,48 +154,92 @@ impl TuiSurfaceActions {
     pub(crate) fn set_goal_and_run(
         &self,
         objective: String,
-        controller: &TuiOperationController,
+        control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::set_goal_and_run(&self.thread, objective, controller, event_tx)
+        crate::surface_client::set_goal_and_run(&self.thread, objective, control, event_tx)
     }
 
     pub(crate) fn resume_goal_and_run(
         &self,
         prompt: String,
-        controller: &TuiOperationController,
+        control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::resume_goal_and_run(&self.thread, prompt, controller, event_tx)
+        crate::surface_client::resume_goal_and_run(&self.thread, prompt, control, event_tx)
     }
 
-    pub(crate) fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {
-        self.thread.task_summaries()
+    pub(crate) fn recoverable_background_approval_projection(
+        &self,
+    ) -> Result<(Vec<BackgroundTaskSummary>, Vec<String>), String> {
+        let snapshot = crate::surface_client::read_snapshot(&self.thread)
+            .map_err(|error| error.to_string())?;
+        let tools = snapshot
+            .interactions
+            .iter()
+            .filter_map(|interaction| {
+                let orca_runtime::surface::SurfaceInteractionRequest::BackgroundApproval {
+                    tool,
+                    ..
+                } = &interaction.request
+                else {
+                    return None;
+                };
+                matches!(
+                    interaction.lifecycle,
+                    orca_runtime::surface::SurfaceInteractionLifecycle::Requested
+                )
+                .then(|| tool.name.as_str().to_string())
+            })
+            .collect();
+        Ok((
+            crate::surface_projection::workflow_task_summaries(&snapshot),
+            tools,
+        ))
     }
 
-    pub(crate) fn stop_task(&self, task_id: &str) -> Result<Vec<BackgroundTaskSummary>, String> {
-        self.thread.stop_task(task_id)
+    pub(crate) fn stop_task(
+        &self,
+        task_id: &str,
+        control: &TuiSurfaceTaskControl,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> Result<Vec<BackgroundTaskSummary>, String> {
+        crate::surface_client::stop_task(&self.thread, task_id, control, event_tx)
     }
 
     pub(crate) fn foreground_task(
         &self,
         task_id: &str,
+        control: &TuiSurfaceTaskControl,
+        event_tx: &mpsc::Sender<TuiEvent>,
     ) -> Result<Vec<BackgroundTaskSummary>, String> {
-        self.thread.foreground_task(task_id)
+        crate::surface_client::foreground_task(&self.thread, task_id, control, event_tx)
     }
 
     pub(crate) fn resolve_background_approval(
         &self,
         approval_id: &str,
         approved: bool,
+        control: &TuiSurfaceTaskControl,
+        event_tx: &mpsc::Sender<TuiEvent>,
     ) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
-        self.thread
-            .resolve_background_approval(approval_id, approved)
+        let (task_id, tasks) = crate::surface_client::resolve_background_approval(
+            &self.thread,
+            approval_id,
+            approved,
+            control,
+            event_tx,
+        )?;
+        Ok((task_id, tasks))
     }
 
-    pub(crate) fn launch_workflow(&self, request: HostedWorkflowRequest) -> Result<(), String> {
-        self.thread
-            .launch_workflow(request)
+    pub(crate) fn launch_workflow(
+        &self,
+        name: &str,
+        args: Option<&str>,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> Result<(), String> {
+        crate::surface_client::launch_workflow(&self.thread, name, args, event_tx)
             .map_err(|error| error.to_string())
     }
 

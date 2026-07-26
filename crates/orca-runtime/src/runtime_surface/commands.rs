@@ -325,6 +325,13 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         operation_id: SurfaceOperationId,
     ) -> Result<MutationReply<CancelOperationOutput>, SurfaceClientCommandError>;
 
+    fn transfer_background(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        target: BackgroundTarget,
+    ) -> Result<MutationReply<TransferBackgroundOutput>, SurfaceClientCommandError>;
+
     fn pause_goal_operation(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -376,6 +383,20 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         request_id: SurfaceRequestId,
         action: GoalMutationAction,
     ) -> Result<MutationReply<GoalMutationOutput>, SurfaceClientCommandError>;
+
+    fn workflow_control(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        action: WorkflowControlAction,
+    ) -> Result<MutationReply<WorkflowControlOutput>, SurfaceClientCommandError>;
+
+    fn task_control(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        action: TaskControlAction,
+    ) -> Result<MutationReply<TaskControlOutput>, SurfaceClientCommandError>;
 
     fn respond_interaction_by_id(
         &self,
@@ -487,6 +508,17 @@ impl RuntimeSurfaceClientHandle {
             .cancel_operation(self.clone(), request_id, operation_id)
     }
 
+    pub fn transfer_background(
+        &self,
+        request_id: SurfaceRequestId,
+        target: BackgroundTarget,
+    ) -> Result<MutationReply<TransferBackgroundOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .transfer_background(self.clone(), request_id, target)
+    }
+
     pub fn pause_goal_operation(
         &self,
         request_id: SurfaceRequestId,
@@ -584,6 +616,28 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .goal_mutation(self.clone(), request_id, action)
+    }
+
+    pub fn workflow_control(
+        &self,
+        request_id: SurfaceRequestId,
+        action: WorkflowControlAction,
+    ) -> Result<MutationReply<WorkflowControlOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .workflow_control(self.clone(), request_id, action)
+    }
+
+    pub fn task_control(
+        &self,
+        request_id: SurfaceRequestId,
+        action: TaskControlAction,
+    ) -> Result<MutationReply<TaskControlOutput>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .task_control(self.clone(), request_id, action)
     }
 
     pub fn respond_interaction(
@@ -2039,6 +2093,18 @@ pub enum WorkflowControlAction {
     Stop {
         fence: SurfaceWorkflowFence,
     },
+}
+
+impl WorkflowControlAction {
+    pub fn stop(workflow: &SurfaceWorkflow) -> Self {
+        Self::Stop {
+            fence: SurfaceWorkflowFence {
+                workflow_run_id: workflow.workflow_run_id.clone(),
+                workflow_revision: workflow.revision,
+                parent: workflow.parent.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

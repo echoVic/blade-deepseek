@@ -629,37 +629,43 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/agent_runtime.rs:spawn_with_dispatch_capacities:controller.control", 1],
   ["crates/orca-tui/src/agent_runtime.rs:shutdown:controller.control", 3],
   ["crates/orca-tui/src/agent_runtime.rs:drop:host.shutdown", 1],
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.mutate", 2],
-  ["crates/orca-tui/src/app.rs:ensure_hosted_thread:thread.mutate", 1],
   ["crates/orca-tui/src/app.rs:run_hosted_operation:thread.start_turn_with_config", 1],
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.shutdown", 1],
-  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:thread.shutdown", 5],
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.launch_workflow", 1],
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.backtrack_last_user", 1],
+  [
+    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:thread.shutdown",
+    1,
+  ],
+  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:thread.shutdown", 3],
+  [
+    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:thread.launch_workflow",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:thread.backtrack_last_user",
+    1,
+  ],
   ["crates/orca-tui/src/app.rs:ensure_hosted_thread:host.start_thread_with_request", 1],
   ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:host.start_thread_with_request", 1],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 1],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
   ["crates/orca-tui/src/app.rs:run_hosted_operation:operation.interrupt", 1],
-  ["crates/orca-tui/src/app.rs:update_goal_status_for_session:goal.mutate", 2],
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:goal.mutate", 6],
-  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:goal.mutate", 1],
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:task.mutate", 2],
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:background_approval.respond", 1],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:catalog.mutate", 2],
+  [
+    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:task.mutate",
+    2,
+  ],
+  [
+    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop_with_ordinary_turn_runner:background_approval.respond",
+    1,
+  ],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:catalog.mutate", 1],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval:user_action.route", 2],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 2],
-  ["crates/orca-tui/src/background_approval.rs:submit_background_approval_response_for_tui:background_approval.respond", 2],
-  ["crates/orca-tui/src/background_tasks.rs:stop_task_for_tui:task.mutate", 2],
-  ["crates/orca-tui/src/background_tasks.rs:foreground_task_for_tui:task.mutate", 1],
+  ["crates/orca-tui/src/approval_mode_actions.rs:cycle_approval_mode:user_action.route", 1],
   ["crates/orca-tui/src/global_actions.rs:handle_global_shortcut:user_action.route", 2],
-  ["crates/orca-tui/src/global_actions.rs:handle_global_shortcut:controller.control", 1],
   ["crates/orca-tui/src/idle_navigation_actions.rs:handle_idle_navigation_shortcut:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:user_action.route", 2],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:settings.update", 1],
   ["crates/orca-tui/src/operation_controller.rs:interrupt_current:operation.interrupt", 1],
-  ["crates/orca-tui/src/operation_controller.rs:interrupt_current:controller.control", 1],
   ["crates/orca-tui/src/operation_controller.rs:shutdown:operation.interrupt", 1],
   ["crates/orca-tui/src/operation_controller.rs:install_hosted:operation.interrupt", 1],
   ["crates/orca-tui/src/operation_controller.rs:interrupt_current:interaction_broker.mutate", 1],
@@ -671,7 +677,6 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/interaction_broker.rs:complete:interaction_broker.mutate", 1],
   ["crates/orca-tui/src/operation_controller.rs:shutdown:interaction_broker.mutate", 1],
   ["crates/orca-tui/src/running_actions.rs:handle_running_shortcut:user_action.route", 2],
-  ["crates/orca-tui/src/running_actions.rs:handle_running_shortcut:controller.control", 1],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:user_action.route", 1],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:workflow.continue", 2],
   ["crates/orca-tui/src/runtime_interaction_adapter.rs:resolve_interactive:interaction_projection.mutate", 4],
@@ -680,22 +685,21 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/runtime_interaction_adapter.rs:request_mcp_elicitation:interaction_projection.mutate", 4],
   ["crates/orca-tui/src/runtime_interaction_adapter.rs:project_pending_interaction:interaction_projection.mutate", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:session.resume", 1],
-  ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 1],
+  ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:user_action.route", 1],
-  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:policy.update", 2],
-  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:memory.update", 2],
-  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:user_action.route", 6],
+  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:user_action.route", 8],
   ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:input_history.record", 1],
   ["crates/orca-tui/src/slash_menu_actions.rs:handle_slash_menu_key:user_action.route", 1],
+  ["crates/orca-tui/src/surface_actions.rs:backtrack_last_user:thread.backtrack_last_user", 1],
+  ["crates/orca-tui/src/surface_actions.rs:remember:memory.update", 2],
+  ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
   ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 2],
 ]);
 
-// These direct calls have an approved typed-surface replacement. A migration may
-// only reduce them; all other baseline calls remain exact until separately retired.
-const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([
-  ["crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.mutate", 1],
-]);
+// Direct calls with an approved typed-surface replacement may be added here
+// while they are being retired. The current production baseline has none.
+const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
@@ -704,11 +708,27 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir:seen.insert", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:state.pending_pastes.clear", 2],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:state.mention_bindings.clear", 2],
-  ["crates/orca-tui/src/mention_search_manager.rs:sync_at_cursor:state.mention.candidates.clear", 1],
   ["crates/orca-tui/src/mention_search_manager.rs:drop:self.shutdown", 1],
+  [
+    "crates/orca-tui/src/operation_controller.rs:shutdown:hosted.surface_delivery_watermarks.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/operation_controller.rs:shutdown:hosted.surface_terminal_deliveries.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/operation_controller.rs:remember_surface_delivery_watermark:self.lock_hosted().surface_delivery_watermarks.insert",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/operation_controller.rs:remember_surface_terminal_delivery:self.lock_hosted().surface_terminal_deliveries.insert",
+    1,
+  ],
   ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:state.session_picker_sessions.clear", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:state.session_picker_query.clear", 1],
   ["crates/orca-tui/src/shortcuts.rs:normalize_key_parts:modifiers.insert", 1],
+  ["crates/orca-tui/src/surface_client.rs:parse_workflow_args:args.insert", 2],
   ["crates/orca-tui/src/types.rs:clear_projection:self.candidates.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_message_tracking:self.message_revisions.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_message_tracking:self.transcript_render_cache.clear", 1],
@@ -724,29 +744,50 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/ui.rs:render_table_as_records:lines.insert", 1],
 ]);
 
-const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([]);
+const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([
+  [
+    "crates/orca-tui/src/surface_actions.rs:launch_workflow:crate::surface_client::launch_workflow",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/surface_client.rs:stop_task:WorkflowControlAction::stop",
+    1,
+  ],
+]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_SITES = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256 = new Map([
-  ["crates/orca-tui/src/app.rs:run_tui_inner", "c3565d5d5018acf87c22f0a1745b8c6cc1d4dfbbb6491abb0b4eb6a71a5dda0e"],
+  ["crates/orca-tui/src/app.rs:run_tui_inner", "78b0388cb092eebccc6613093f09592a5e40d015d6d4fc9ae89bb15d4d3f0dde"],
   ["crates/orca-tui/src/app.rs:clear_terminal_scrollback", "bb80acbf783b75a196169182fec5eab27dbf00ce5186a096d0d16a4b788c1336"],
   ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir", "5ff2d53152274d162938b826d93207487a4a70e0c56dfe26967d5fa0e81befe2"],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit", "ce293ae54519035f0310812943fe1b2173026e496ba75bea3019a45548024833"],
-  ["crates/orca-tui/src/mention_search_manager.rs:sync_at_cursor", "dc72b82b37815c37e2ecaaca085584e172d5e65f2ade3f78318662c3d4e67338"],
   ["crates/orca-tui/src/mention_search_manager.rs:drop", "811fcf29ec41cdabc9a1aa66c4ec1ee2f671c8da2b2fd346b05173268c3569ce"],
+  ["crates/orca-tui/src/operation_controller.rs:shutdown", "f5692902b3b5d1acbf62de47ed96db76d5806fc7d46e492c1a262d927059aa16"],
+  ["crates/orca-tui/src/operation_controller.rs:remember_surface_delivery_watermark", "772312ab96bdfe762ed68b356a26a904f7a656709f8b27d47347350884c92602"],
+  ["crates/orca-tui/src/operation_controller.rs:remember_surface_terminal_delivery", "2e5cea80cd4a2b5c616f47340599649a8a67b0759412d9b621a2b72e61fc1344"],
   ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key", "4fd9fd44d409176ef41c576496fdea65b16d38c08c5b2b6a75d1189a1bb8d578"],
   ["crates/orca-tui/src/shortcuts.rs:normalize_key_parts", "73d844ca3283aa368759c2d87008fa123eec3bbf2a7ff0f981931a741a95944c"],
+  ["crates/orca-tui/src/surface_client.rs:parse_workflow_args", "4d21ed0233bca3d7b6cb2e5a3f3fcc2551369b797c0181e9f007d767227e2803"],
   ["crates/orca-tui/src/types.rs:clear_projection", "ed71bb1c512daf63cdf14e2b1810f6bdc4ecaf617b3b131c157ed9fba1801879"],
   ["crates/orca-tui/src/types.rs:reset_message_tracking", "633316c1f2ea3e9e68bf6e7905f66b9a2210bb5961f0af5abb94e143a0b61c09"],
   ["crates/orca-tui/src/types.rs:clear_messages", "5cda88c94e6601f2707b73f0faae255acc19e644e826f02b14b293310f0171e3"],
   ["crates/orca-tui/src/types.rs:load_input_history", "2a3ff85622fead59fa1741adbadcf9bef43e17295c3bbc7fce081640a66553ef"],
   ["crates/orca-tui/src/types.rs:append_input_history", "25aa6ffa36a7cb1ba514d054f715c15821126d97fc519abfbe2a4a62d339174f"],
-  ["crates/orca-tui/src/types.rs:update", "1d30341f083cd6e3f365da0c2559ea7ee7af2fe5746cdc1e5ecf813f9c9627ab"],
+  ["crates/orca-tui/src/types.rs:update", "163c25cf2f8bcedaf8b7a67cabf43c54b647101de9d31f02aff550801851ffc0"],
   ["crates/orca-tui/src/ui.rs:render_markdown", "82a2db5cec2e638d93105e1d8bd19f1accf51e14458c05c0adcc2e07d0ccbbb9"],
   ["crates/orca-tui/src/ui.rs:render_table_as_records", "19c22351863dcfa582b38b37441aada9e28d55a267a5dcfb38d58986167cf593"],
 ]);
 
-const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([]);
+const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
+  [
+    "crates/orca-tui/src/surface_actions.rs:launch_workflow",
+    "580c07fc16f85dd8fcab1fc16c56b3647a6d550a9a5aef0c5889c68041c151dc",
+  ],
+  [
+    "crates/orca-tui/src/surface_client.rs:stop_task",
+    "c78e87931908996735954aa9335937c4c713d67ef672ab51370ed0eaa33024d8",
+  ],
+]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_FUNCTION_SHA256 = new Map([]);
 
 function fail(message) {
@@ -3369,6 +3410,10 @@ export function scanTuiHarmlessAssociatedFunctionItems(options) {
   return scanTuiMutationSurface(options).harmlessAssociatedSites;
 }
 
+export function scanTuiHarmlessAssociatedFunctionHashes(options) {
+  return scanTuiMutationSurface(options).harmlessAssociatedFunctionHashes;
+}
+
 function validateTuiMutationScan(repoRoot, sourceOverrides) {
   const {
     sites: actual,
@@ -3498,7 +3543,10 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     "pub enum UserAction {",
   );
   assertExactArray(
-    manifest.closed_inventory.current_tui_user_actions,
+    [
+      ...manifest.closed_inventory.current_tui_user_actions,
+      ...manifest.closed_inventory.required_tui_user_action_additions,
+    ],
     userActions,
     "current_tui_user_actions current UserAction",
   );
@@ -3514,10 +3562,6 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     manifest.closed_inventory.required_tui_user_action_additions,
     "future tui_actions",
   );
-  for (const future of manifest.closed_inventory.required_tui_user_action_additions) {
-    if (userActions.includes(future)) fail(`${future} must remain a required future UserAction addition`);
-  }
-
   assertExactArray(
     manifest.tui_entrypoints.map((row) => row[0]),
     [...TUI_ENTRYPOINT_ANCHORS.keys()],

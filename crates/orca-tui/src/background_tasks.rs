@@ -1,13 +1,15 @@
 use crossbeam_channel as mpsc;
 
-use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+use orca_core::task_types::TaskStatus;
 
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::types::TuiEvent;
 
 pub(crate) fn stop_task_for_tui(
     actions: Option<&TuiSurfaceActions>,
     task_id: &str,
+    control: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> bool {
     let Some(actions) = actions else {
@@ -16,8 +18,17 @@ pub(crate) fn stop_task_for_tui(
         ));
         return false;
     };
-    match actions.stop_task(task_id) {
-        Ok(tasks) => {
+    match actions.stop_task(task_id, control, event_tx) {
+        Ok(_) => {
+            let tasks = match actions.read_snapshot() {
+                Ok(snapshot) => crate::surface_projection::workflow_task_summaries(&snapshot),
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "failed to refresh runtime-owned tasks after stop: {error}"
+                    )));
+                    return false;
+                }
+            };
             let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Task stop requested for {task_id}."
@@ -34,6 +45,7 @@ pub(crate) fn stop_task_for_tui(
 pub(crate) fn foreground_task_for_tui(
     actions: Option<&TuiSurfaceActions>,
     task_id: &str,
+    control: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> bool {
     let Some(actions) = actions else {
@@ -43,7 +55,7 @@ pub(crate) fn foreground_task_for_tui(
         return false;
     };
 
-    match actions.foreground_task(task_id) {
+    match actions.foreground_task(task_id, control, event_tx) {
         Ok(tasks) => {
             let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
             let _ = event_tx.send(TuiEvent::Notice(format!(
@@ -62,16 +74,9 @@ pub(crate) fn notify_recovered_background_approvals_for_tui(
     actions: &TuiSurfaceActions,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> usize {
-    let tasks = actions.task_summaries();
-    let recovered_tools = tasks
-        .iter()
-        .filter(|task| recovered_background_approval_task(task))
-        .filter_map(|task| {
-            task.pending_tool_call
-                .as_ref()
-                .map(|pending_tool| pending_tool.name.clone())
-        })
-        .collect::<Vec<_>>();
+    let Ok((tasks, recovered_tools)) = actions.recoverable_background_approval_projection() else {
+        return 0;
+    };
 
     if recovered_tools.is_empty() {
         return 0;
@@ -99,11 +104,4 @@ pub(crate) fn is_terminal_task_status(status: TaskStatus) -> bool {
         status,
         TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Stopped
     )
-}
-
-fn recovered_background_approval_task(task: &BackgroundTaskSummary) -> bool {
-    task.task_type == TaskType::MainSession
-        && task.is_backgrounded
-        && task.status == TaskStatus::ApprovalRequired
-        && task.pending_tool_call.is_some()
 }

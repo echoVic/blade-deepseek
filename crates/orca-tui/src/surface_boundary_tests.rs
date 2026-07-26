@@ -5,6 +5,11 @@ const MANIFEST: &str = include_str!(
 );
 const TYPES: &str = include_str!("types.rs");
 const APP: &str = include_str!("app.rs");
+const AGENT_RUNTIME: &str = include_str!("agent_runtime.rs");
+const ACTION_DISPATCHER: &str = include_str!("action_dispatcher.rs");
+const SURFACE_ACTIONS: &str = include_str!("surface_actions.rs");
+const SURFACE_CLIENT: &str = include_str!("surface_client.rs");
+const SURFACE_PROJECTION: &str = include_str!("surface_projection.rs");
 const SUBMITTED_TURN: &str = include_str!("submitted_turn.rs");
 const MENTION_SEARCH_MANAGER: &str = include_str!("mention_search_manager.rs");
 const BACKGROUND_TASKS: &str = include_str!("background_tasks.rs");
@@ -477,7 +482,6 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         "cancel_operation",
         "update_settings",
         "read_snapshot",
-        "read_history",
         "add_pinned_context",
         "expand_mentions",
         "discover_mention_catalog",
@@ -533,8 +537,174 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         "the TUI facade must receive Goal values, not a callable Goal actor handle"
     );
     assert!(
+        action_source.contains("crate::surface_client::launch_workflow")
+            && !action_source.contains("self.thread\n            .launch_workflow"),
+        "saved workflow launch must use the typed runtime surface client"
+    );
+    assert!(
+        action_source.contains("crate::surface_client::stop_task")
+            && !action_source.contains("self.thread.stop_task"),
+        "workflow task stop must cancel its runtime-owned typed operation"
+    );
+    assert!(
+        !APP.contains("HostedWorkflowRequest")
+            && SURFACE_PROJECTION.contains("SurfaceEvent::Task")
+            && SURFACE_PROJECTION.contains("SurfaceEvent::Workflow"),
+        "TUI workflow task and lifecycle updates must come from typed surface batches"
+    );
+    assert!(
         !SLASH_COMMAND_ACTIONS.contains("folder_trust::")
             && !SETUP_ACTIONS.contains("orca_core::config::file"),
         "host-scoped trust and credentials must mutate through the TUI surface facade"
+    );
+}
+
+#[test]
+fn typed_task_stop_returns_only_runtime_surface_projection() {
+    assert!(
+        BACKGROUND_TASKS.contains("actions.read_snapshot()")
+            && BACKGROUND_TASKS.contains("workflow_task_summaries(&snapshot)"),
+        "TUI task stop must refresh its panel from runtime surface truth"
+    );
+    assert!(
+        !BACKGROUND_TASKS.contains("thread.task_summaries()"),
+        "TUI task stop must not merge registry-only tasks back into the panel"
+    );
+}
+
+#[test]
+fn typed_history_resume_projects_only_the_durable_surface_snapshot() {
+    let start = APP
+        .find("fn emit_typed_history_snapshot(")
+        .expect("typed history emitter");
+    let end = APP[start..]
+        .find("\nfn typed_history_startup_eligible(")
+        .map(|offset| start + offset)
+        .expect("typed history emitter boundary");
+    let emitter = &APP[start..end];
+
+    assert!(
+        emitter.contains("history_messages_from_surface_snapshot(&snapshot)"),
+        "resume must rebuild the transcript from the runtime-owned typed snapshot"
+    );
+    assert!(
+        !emitter.contains("read_history"),
+        "resume must not fall back to the legacy conversation history projection"
+    );
+    assert!(
+        !include_str!("surface_actions.rs").contains("fn read_history"),
+        "the TUI facade must not retain a second history truth beside SurfaceSnapshot.items"
+    );
+}
+
+#[test]
+fn production_ordinary_turns_select_only_the_typed_surface_runner() {
+    assert!(
+        APP.contains("host,\n        OrdinaryTurnRunner::Typed,\n    );"),
+        "the production controller entrypoint must select the typed ordinary-turn runner"
+    );
+    assert!(
+        !APP.contains("run_hosted_legacy_ordinary_turn")
+            && APP.contains("#[allow(dead_code)]\nfn run_legacy_feature_turn_for_test"),
+        "the frozen mutation audit anchor must remain explicitly unreachable production code"
+    );
+}
+
+#[test]
+fn legacy_hosted_operation_owner_is_not_reachable_from_production_goal_routing() {
+    let start = APP
+        .find("fn run_hosted_goal_run(")
+        .expect("hosted goal routing function");
+    let end = APP[start..]
+        .find("\nfn run_hosted_ordinary_turn(")
+        .map(|offset| start + offset)
+        .expect("hosted goal routing boundary");
+    assert!(
+        !APP[start..end].contains("run_hosted_operation("),
+        "Goal routing must use the typed surface rail instead of the raw hosted owner"
+    );
+}
+
+#[test]
+fn production_action_dispatcher_uses_only_typed_surface_control() {
+    let production = ACTION_DISPATCHER
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production dispatcher source");
+    assert!(
+        !production.contains("TuiOperationController")
+            && !production.contains(".broker()")
+            && !production.contains("TuiInteractionBroker"),
+        "production dispatch must route interaction and operation control only through TuiSurfaceTaskControl"
+    );
+}
+
+#[test]
+fn typed_surface_facades_do_not_accept_the_legacy_operation_controller() {
+    assert!(
+        !SURFACE_ACTIONS.contains("TuiOperationController")
+            && !BACKGROUND_TASKS.contains("TuiOperationController")
+            && !BACKGROUND_APPROVAL.contains("TuiOperationController"),
+        "typed TUI facades must receive TuiSurfaceTaskControl directly"
+    );
+}
+
+#[test]
+fn production_app_inner_loop_owns_only_one_typed_surface_control() {
+    let start = APP
+        .find("fn hosted_tui_controller_loop_with_ordinary_turn_runner(")
+        .expect("production hosted controller inner loop");
+    let end = APP[start..]
+        .find("\npub(crate) fn run_hosted_operation(")
+        .map(|offset| start + offset)
+        .expect("legacy audit owner boundary");
+    let production_loop = &APP[start..end];
+    assert!(
+        !production_loop.contains("TuiOperationController")
+            && !production_loop.contains(".surface_task_control()"),
+        "production app control flow must carry one TuiSurfaceTaskControl directly"
+    );
+}
+
+#[test]
+fn production_agent_runtime_owns_only_typed_surface_control() {
+    let struct_start = AGENT_RUNTIME
+        .find("pub(crate) struct TuiAgentRuntime")
+        .expect("agent runtime struct");
+    let struct_end = AGENT_RUNTIME[struct_start..]
+        .find("\n}\n\nimpl TuiAgentRuntime")
+        .map(|offset| struct_start + offset)
+        .expect("agent runtime struct end");
+    let runtime_state = &AGENT_RUNTIME[struct_start..struct_end];
+
+    let spawn_start = AGENT_RUNTIME
+        .find("fn spawn_with_dispatch_capacities(")
+        .expect("typed agent runtime spawn");
+    let spawn_end = AGENT_RUNTIME[spawn_start..]
+        .find("\n    #[cfg(test)]")
+        .map(|offset| spawn_start + offset)
+        .expect("typed agent runtime spawn end");
+    let typed_spawn = &AGENT_RUNTIME[spawn_start..spawn_end];
+
+    assert!(
+        runtime_state.contains("controller: TuiSurfaceTaskControl")
+            && !runtime_state.contains("TuiOperationController")
+            && typed_spawn.contains("control: TuiSurfaceTaskControl")
+            && typed_spawn
+                .contains("FnOnce(TuiSurfaceTaskControl, Receiver<UserAction>, RuntimeHostHandle)")
+            && !typed_spawn.contains("TuiOperationController"),
+        "production agent runtime state and worker must own only TuiSurfaceTaskControl"
+    );
+}
+
+#[test]
+fn typed_surface_client_does_not_depend_on_the_legacy_operation_controller() {
+    assert!(
+        SURFACE_CLIENT.contains("TuiSurfaceTaskControl"),
+        "typed TUI operations must use their dedicated surface control"
+    );
+    assert!(
+        !SURFACE_CLIENT.contains("TuiOperationController"),
+        "typed TUI operations must not structurally depend on the legacy operation owner"
     );
 }

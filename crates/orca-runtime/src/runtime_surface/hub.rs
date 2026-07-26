@@ -166,6 +166,8 @@ impl SurfaceHub {
             SurfaceCapability::ReadSnapshot,
             SurfaceCapability::SubmitOperation,
             SurfaceCapability::ControlBoundOperation,
+            SurfaceCapability::ManageTask,
+            SurfaceCapability::ManageWorkflow,
             SurfaceCapability::ManageThreadSettings,
             SurfaceCapability::ManagePinnedContext,
             SurfaceCapability::RespondGrantedInteraction,
@@ -605,6 +607,10 @@ impl SurfaceHub {
 
     pub fn subscriber_count(&self) -> usize {
         lock(&self.inner).subscriptions.len()
+    }
+
+    pub(crate) fn has_live_attachment(&self, attachment_id: &SurfaceAttachmentId) -> bool {
+        lock(&self.inner).subscriptions.contains_key(attachment_id)
     }
 
     #[allow(dead_code)]

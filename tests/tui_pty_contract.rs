@@ -26,17 +26,7 @@ fn tui_submit_renders_and_restores_the_terminal() {
         "TUI did not render the typed assistant terminal",
     );
 
-    std::thread::sleep(Duration::from_millis(250));
-    process.drain_output(&mut output);
-    process.write(&[0x03]).expect("send first idle Ctrl-C");
-    receive_until(
-        &process,
-        &mut output,
-        "Press Ctrl+C again to quit.",
-        Duration::from_secs(2),
-        "TUI did not arm idle exit",
-    );
-    process.write(&[0x03]).expect("send second idle Ctrl-C");
+    arm_idle_exit(&mut process, &mut output);
 
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
@@ -57,6 +47,119 @@ fn tui_submit_renders_and_restores_the_terminal() {
     );
 }
 
+#[test]
+fn tui_permission_round_trips_through_the_runtime_surface() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    const PERMISSION_SENTINEL: &str = "PTY_PERMISSION_RESUMED";
+    let prompt = format!(
+        "request_permissions_then_bash {} :: printf '\\120\\124\\131\\137\\120\\105\\122\\115\\111\\123\\123\\111\\117\\116\\137\\122\\105\\123\\125\\115\\105\\104'",
+        cwd.path().display()
+    );
+    assert!(
+        !prompt.contains(PERMISSION_SENTINEL),
+        "the post-permission sentinel must not be present in the rendered prompt"
+    );
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), &prompt)
+        .expect("spawn permission TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "Filesystem Permission Required",
+        Duration::from_secs(10),
+        "TUI did not render the runtime-owned permission",
+    );
+    process.write(b"1").expect("allow permission once");
+    receive_until(
+        &process,
+        &mut output,
+        "Approval Required",
+        Duration::from_secs(10),
+        "TUI did not advance to the runtime-owned tool approval",
+    );
+    process.write(b"1").expect("approve bash once");
+    receive_until(
+        &process,
+        &mut output,
+        PERMISSION_SENTINEL,
+        Duration::from_secs(10),
+        "TUI did not resume after the typed permission response",
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process =
+        PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "mock_stream_delay_ms 5000")
+            .expect("spawn cancellable TUI in PTY");
+
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "Mock slow stream started.",
+        Duration::from_secs(10),
+        "TUI did not render the first durable stream delta",
+    );
+    process.write(&[0x03]).expect("cancel the running turn");
+    std::thread::sleep(Duration::from_millis(300));
+    arm_idle_exit(&mut process, &mut output);
+
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    process.drain_output(&mut output);
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+    assert!(
+        !String::from_utf8_lossy(&output).contains("Mock slow stream completed."),
+        "cancelled PTY turn must not display a post-terminal completion"
+    );
+}
+
+#[test]
+fn tui_restart_recovers_history_from_the_runtime_snapshot() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut source = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "pty restart seed")
+        .expect("spawn source TUI in PTY");
+    let mut source_output = Vec::new();
+    receive_until(
+        &source,
+        &mut source_output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "source TUI did not complete",
+    );
+    arm_idle_exit(&mut source, &mut source_output);
+    let status = source.wait_for_exit(Duration::from_secs(5));
+    source.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "source TUI exited with {status}");
+
+    let mut resumed =
+        PtyProcess::spawn_resumed(home.path(), cwd.path(), "latest", "mock_history_echo")
+            .expect("spawn resumed TUI in PTY");
+    let mut resumed_output = Vec::new();
+    receive_until(
+        &resumed,
+        &mut resumed_output,
+        "Mock history users: pty restart seed | mock_history_echo",
+        Duration::from_secs(10),
+        "resumed TUI did not hydrate history from the typed snapshot",
+    );
+    arm_idle_exit(&mut resumed, &mut resumed_output);
+    let status = resumed.wait_for_exit(Duration::from_secs(5));
+    resumed.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "resumed TUI exited with {status}");
+}
+
 struct PtyProcess {
     child: Option<Child>,
     writer: Option<File>,
@@ -66,6 +169,32 @@ struct PtyProcess {
 
 impl PtyProcess {
     fn spawn(home: &std::path::Path, cwd: &std::path::Path) -> io::Result<Self> {
+        Self::spawn_with_prompt(home, cwd, PROMPT)
+    }
+
+    fn spawn_with_prompt(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        prompt: &str,
+    ) -> io::Result<Self> {
+        Self::spawn_with_history(home, cwd, None, prompt)
+    }
+
+    fn spawn_resumed(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        selector: &str,
+        prompt: &str,
+    ) -> io::Result<Self> {
+        Self::spawn_with_history(home, cwd, Some(selector), prompt)
+    }
+
+    fn spawn_with_history(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        resume: Option<&str>,
+        prompt: &str,
+    ) -> io::Result<Self> {
         let (master, slave) = open_pty(120, 40)?;
         let stdout = duplicate_fd(&slave)?;
         let stderr = duplicate_fd(&slave)?;
@@ -73,10 +202,13 @@ impl PtyProcess {
         let mut terminal_reader = File::from(master);
         let stdin = File::from(slave);
 
-        let child = Command::new(env!("CARGO_BIN_EXE_orca"))
-            .args(["--provider", "mock", "--cwd"])
-            .arg(cwd)
-            .arg(PROMPT)
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
+        command.args(["--provider", "mock", "--cwd"]).arg(cwd);
+        if let Some(selector) = resume {
+            command.args(["--resume", selector]);
+        }
+        let child = command
+            .arg(prompt)
             .env("ORCA_HOME", home)
             .env("ORCA_API_KEY", "pty-test-key")
             .env("TERM", "xterm-256color")
@@ -172,6 +304,20 @@ impl Drop for PtyProcess {
             let _ = reader.join();
         }
     }
+}
+
+fn arm_idle_exit(process: &mut PtyProcess, output: &mut Vec<u8>) {
+    std::thread::sleep(Duration::from_millis(250));
+    process.drain_output(output);
+    process.write(&[0x03]).expect("send first idle Ctrl-C");
+    receive_until(
+        process,
+        output,
+        "Press Ctrl+C again to quit.",
+        Duration::from_secs(2),
+        "TUI did not arm idle exit",
+    );
+    process.write(&[0x03]).expect("send second idle Ctrl-C");
 }
 
 fn receive_until(
