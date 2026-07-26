@@ -13400,9 +13400,10 @@ impl ThreadActor {
         call_id: surface::SurfaceCapabilityCallId,
         capability_revision: surface::CapabilityRevision,
     ) -> Result<(), surface::SurfaceClientCommandError> {
-        let call =
+        let mut call =
             self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
-        if call.state != surface::SurfaceCapabilityCallState::Prepared
+        if call.kind != surface::SurfaceCapabilityCallKind::ReadTextFile
+            || call.state != surface::SurfaceCapabilityCallState::Prepared
             || self
                 .resident_surface
                 .pending_capability_transitions
@@ -13419,6 +13420,16 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         resident.write_claimed = true;
+        call.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
+        let fence = call.fence.clone();
+        let batch = self.capability_call_batch(call);
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
         Ok(())
     }
 
@@ -13428,8 +13439,11 @@ impl ThreadActor {
         call_id: surface::SurfaceCapabilityCallId,
         capability_revision: surface::CapabilityRevision,
     ) -> Result<(), surface::SurfaceClientCommandError> {
-        let mut call =
+        let call =
             self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if call.kind != surface::SurfaceCapabilityCallKind::ReadTextFile {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         if self
             .resident_surface
             .pending_capability_transitions
@@ -13448,7 +13462,7 @@ impl ThreadActor {
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        if call.state != surface::SurfaceCapabilityCallState::Prepared {
+        if call.state != surface::SurfaceCapabilityCallState::WrittenAwaitingResponse {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
         if !self
@@ -13458,16 +13472,6 @@ impl ThreadActor {
             .is_some_and(|resident| resident.write_claimed)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
-        }
-        call.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
-        let fence = call.fence.clone();
-        let batch = self.capability_call_batch(call);
-        if self
-            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
-            .is_err()
-        {
-            self.retain_surface_capability_transition(call_id, fence, batch, None);
-            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
             resident.write_claimed = false;
@@ -13484,6 +13488,9 @@ impl ThreadActor {
     ) -> Result<(), surface::SurfaceClientCommandError> {
         let mut call =
             self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if call.kind != surface::SurfaceCapabilityCallKind::ReadTextFile {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         if self
             .resident_surface
             .pending_capability_transitions
@@ -32316,6 +32323,10 @@ mod tests {
         result: SyncSender<(bool, io::ErrorKind)>,
     }
 
+    struct WrongKindCapabilityExecutor {
+        result: SyncSender<io::ErrorKind>,
+    }
+
     struct OutputWriterExecutor;
 
     struct SurfaceGoalUpdateExecutor;
@@ -32463,6 +32474,57 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    impl ThreadOperationExecutor for WrongKindCapabilityExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let tool = ToolRequest {
+                id: "wrong-kind-capability".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf".to_string()),
+                raw_arguments: Some(r#"{"command":"printf","args":["hello"]}"#.to_string()),
+            };
+            let turn_request = request.thread_turn_request(generation);
+            let ingress = turn_request
+                .provider_response_ingress()
+                .expect("typed ACP operation provides response ingress");
+            ingress.commit_response(&RuntimeModelResponse::new(
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool.clone())],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![orca_core::conversation::RawToolCall {
+                        id: tool.id.clone(),
+                        function_name: tool.name.as_str().to_string(),
+                        arguments: tool.raw_arguments.clone().unwrap_or_default(),
+                    }],
+                    usage: None,
+                },
+                request.turn_id().clone(),
+            ))?;
+            let error = match generation.create_terminal_on_acp_client(
+                &tool,
+                "printf".to_string(),
+                vec!["hello".to_string()],
+                Vec::new(),
+                None,
+                None,
+            ) {
+                Ok(_) => panic!("terminal create should be failed by the test"),
+                Err(error) => error,
+            };
+            let _ = self.result.send(error.kind());
+            Err(error)
         }
     }
 
@@ -40423,6 +40485,129 @@ mod tests {
     }
 
     #[test]
+    fn read_capability_rail_rejects_wrong_kind_without_consuming_call() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(WrongKindCapabilityExecutor {
+            result: result_tx,
+        }))
+        .expect("start wrong-kind capability host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "reject wrong-kind read capability settlement",
+            )
+            .expect("start recorded runtime thread");
+        let connection_id =
+            surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let surface = thread
+            .acp_surface_for_connection(connection_id)
+            .expect("bind ACP connection surface");
+        let attachment = match surface.attach_acp_fresh(
+            surface::FreshAttachRequest {
+                request_id: surface_request_id(),
+                role: surface::SurfaceAttachmentRole::Acp,
+                requested_capabilities: BTreeSet::from([
+                    surface::SurfaceCapability::ReadSnapshot,
+                    surface::SurfaceCapability::SubmitOperation,
+                    surface::SurfaceCapability::ControlBoundOperation,
+                    surface::SurfaceCapability::RespondGrantedInteraction,
+                ]),
+                interaction_capabilities: BTreeSet::new(),
+            },
+            surface::AcpAttachmentCapabilityProfile {
+                revision: surface::CapabilityRevision::try_new(1).unwrap(),
+                standard: surface::AcpStandardCapabilitySet {
+                    file_read: true,
+                    terminal: true,
+                    ..surface::AcpStandardCapabilitySet::default()
+                },
+            },
+        ) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("attach wrong-kind capability client"),
+        };
+        let _subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim wrong-kind capability subscription");
+        let terminal_dispatches = surface
+            .claim_acp_terminal_create_dispatch(&attachment.client)
+            .expect("claim terminal create dispatch lane");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_acp_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "wrong-kind-capability-session",
+                        "create a terminal",
+                    ),
+                )
+                .expect("reserve wrong-kind capability operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit wrong-kind capability operation"),
+        );
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let dispatch = loop {
+            match terminal_dispatches.try_recv() {
+                Ok(dispatch) => break dispatch,
+                Err(surface::AcpCapabilityDispatchError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                result => panic!("terminal create dispatch failed: {result:?}"),
+            }
+        };
+
+        assert!(matches!(
+            attachment.client.claim_acp_read_text_file_write(
+                dispatch.call_id.clone(),
+                dispatch.capability_revision,
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        ));
+        assert!(matches!(
+            attachment.client.settle_acp_read_text_file(
+                dispatch.call_id.clone(),
+                dispatch.capability_revision,
+                surface::AcpReadTextFileSettlement::Completed {
+                    content: "wrong rail".to_string(),
+                },
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        ));
+        attachment
+            .client
+            .settle_acp_terminal_create(
+                dispatch.call_id,
+                dispatch.capability_revision,
+                surface::AcpTerminalCreateSettlement::FailedBeforeWrite {
+                    message: "test terminal create failed before write".to_string(),
+                },
+            )
+            .expect("proper terminal create rail remains usable");
+        assert_eq!(
+            result_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            io::ErrorKind::NotConnected
+        );
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait wrong-kind capability operation terminal");
+        host.shutdown()
+            .expect("shutdown wrong-kind capability host");
+    }
+
+    #[test]
     fn host_shutdown_bounds_retained_capability_transition_without_resolving_waiter() {
         let cwd = tempfile::tempdir().unwrap();
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -40508,17 +40693,13 @@ mod tests {
                 result => panic!("retained capability dispatch failed: {result:?}"),
             }
         };
-        attachment
-            .client
-            .claim_acp_read_text_file_write(dispatch.call_id.clone(), dispatch.capability_revision)
-            .expect("claim exact physical write");
-
         std::fs::rename(&transcript_path, &backup_path).expect("hide capability ledger");
         std::fs::create_dir(&transcript_path).expect("block capability ledger writes");
         assert!(matches!(
-            attachment
-                .client
-                .mark_acp_read_text_file_written(dispatch.call_id, dispatch.capability_revision,),
+            attachment.client.claim_acp_read_text_file_write(
+                dispatch.call_id.clone(),
+                dispatch.capability_revision,
+            ),
             Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
         ));
         assert!(

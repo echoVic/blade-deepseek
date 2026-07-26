@@ -755,11 +755,20 @@ async fn dispatch_read_text_files(
             let _ = request.client.settle_acp_read_text_file(
                 request.dispatch.call_id,
                 request.dispatch.capability_revision,
-                AcpReadTextFileSettlement::FailedBeforeWrite {
-                    message: "ACP read runtime write claim was unavailable".to_string(),
+                AcpReadTextFileSettlement::ObservationUnavailable {
+                    message: "ACP read durable write claim could not be confirmed".to_string(),
                 },
             );
             continue;
+        }
+        if let Some(route) = routes
+            .pending
+            .lock()
+            .expect("ACP read route mutex is not poisoned")
+            .get_mut(&request_id)
+        {
+            // The durable claim is the conservative delivery-possible barrier.
+            route.physically_written = true;
         }
         let write_receipt =
             match facade.enqueue(TransportFrame::new(FrameDirection::AgentToClient, encoded)) {
@@ -772,25 +781,17 @@ async fn dispatch_read_text_files(
                         .expect("ACP read route mutex is not poisoned")
                         .remove(&request_id);
                     let _ = request.client.settle_acp_read_text_file(
-                        request.dispatch.call_id,
-                        request.dispatch.capability_revision,
-                        AcpReadTextFileSettlement::FailedBeforeWrite {
-                            message: format!("ACP read request was rejected before write: {error}"),
-                        },
-                    );
+                    request.dispatch.call_id,
+                    request.dispatch.capability_revision,
+                    AcpReadTextFileSettlement::ObservationUnavailable {
+                        message: format!(
+                            "ACP read request was rejected after delivery became possible: {error}"
+                        ),
+                    },
+                );
                     break;
                 }
             };
-        if let Some(route) = routes
-            .pending
-            .lock()
-            .expect("ACP read route mutex is not poisoned")
-            .get_mut(&request_id)
-        {
-            // Once admitted to the writer lane, a write/flush failure cannot
-            // prove that zero bytes reached the peer.
-            route.physically_written = true;
-        }
         if let Err(error) = write_receipt.ack().await {
             routes
                 .pending
@@ -1440,6 +1441,15 @@ async fn dispatch_terminal_observations(
             );
             continue;
         }
+        if let Some(route) = routes
+            .pending
+            .lock()
+            .expect("ACP terminal observation route mutex is not poisoned")
+            .get_mut(&request_id)
+        {
+            // The durable claim is the conservative delivery-possible barrier.
+            route.physically_written = true;
+        }
         let write_receipt = match facade
             .enqueue(TransportFrame::new(FrameDirection::AgentToClient, encoded))
         {
@@ -1463,14 +1473,6 @@ async fn dispatch_terminal_observations(
                 break;
             }
         };
-        if let Some(route) = routes
-            .pending
-            .lock()
-            .expect("ACP terminal observation route mutex is not poisoned")
-            .get_mut(&request_id)
-        {
-            route.physically_written = true;
-        }
         if let Err(error) = write_receipt.ack().await {
             routes
                 .pending
@@ -3185,6 +3187,9 @@ mod tests {
                 .as_str()
                 .expect("session id")
                 .to_string();
+            let transcript_path = crate::thread_store::find_session_path(&session_id, true)
+                .unwrap()
+                .expect("recording ACP session path");
 
             write_request(
                 &mut client_write,
@@ -3207,6 +3212,10 @@ mod tests {
             assert_eq!(read_request["params"]["path"], "/workspace/notes.txt");
             assert_eq!(read_request["params"]["line"], 2);
             assert_eq!(read_request["params"]["limit"], 3);
+            let written_before_response = persisted_capability_is_written(
+                &transcript_path,
+                crate::unstable_surface::SurfaceCapabilityCallKind::ReadTextFile,
+            );
             let read_id = read_request["id"].as_i64().expect("reverse request id");
             write_raw_response(
                 &mut client_write,
@@ -3229,6 +3238,10 @@ mod tests {
                 .expect("connection task")
                 .expect("clean connection");
             host.shutdown().unwrap();
+            assert!(
+                written_before_response,
+                "read request reached the client before WrittenAwaitingResponse was durable"
+            );
         });
     }
 
@@ -3539,7 +3552,7 @@ mod tests {
                 }
             };
             assert_eq!(output_request["params"]["terminalId"], "terminal-observe");
-            assert_persisted_terminal_observation_written(
+            assert_persisted_capability_written(
                 &transcript_path,
                 crate::unstable_surface::SurfaceCapabilityCallKind::TerminalOutput,
             );
@@ -3565,7 +3578,7 @@ mod tests {
                 }
             };
             assert_eq!(wait_request["params"]["terminalId"], "terminal-observe");
-            assert_persisted_terminal_observation_written(
+            assert_persisted_capability_written(
                 &transcript_path,
                 crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
             );
@@ -5743,12 +5756,19 @@ mod tests {
         }));
     }
 
-    fn assert_persisted_terminal_observation_written(
+    fn assert_persisted_capability_written(
         path: &std::path::Path,
         expected_kind: crate::unstable_surface::SurfaceCapabilityCallKind,
     ) {
+        assert!(persisted_capability_is_written(path, expected_kind));
+    }
+
+    fn persisted_capability_is_written(
+        path: &std::path::Path,
+        expected_kind: crate::unstable_surface::SurfaceCapabilityCallKind,
+    ) -> bool {
         let events = persisted_surface_events(path);
-        assert!(events.iter().any(|event| {
+        events.iter().any(|event| {
             matches!(
                 event,
                 crate::surface::SurfaceEvent::Tool(
@@ -5762,7 +5782,7 @@ mod tests {
                     },
                 ) if kind == &expected_kind
             )
-        }));
+        })
     }
 
     fn assert_persisted_terminal_released(path: &std::path::Path, expected_terminal_id: &str) {
