@@ -8,8 +8,8 @@ use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
-    NonEmptyVec, RuntimeSettingsPatch, RuntimeSurfaceThreadHandle, SurfaceHistoryMessage,
-    SurfaceSettingsSnapshot, SurfaceSnapshot,
+    NonEmptyVec, RuntimeSettingsPatch, RuntimeSurfaceThreadHandle, SurfaceSettingsSnapshot,
+    SurfaceSnapshot,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -100,10 +100,6 @@ impl TuiSurfaceActions {
 
     pub(crate) fn read_snapshot(&self) -> io::Result<SurfaceSnapshot> {
         crate::surface_client::read_snapshot(&self.thread)
-    }
-
-    pub(crate) fn read_history(&self) -> io::Result<Vec<SurfaceHistoryMessage>> {
-        crate::surface_client::read_history(&self.thread)
     }
 
     pub(crate) fn add_pinned_context(&self, note: &str) -> io::Result<()> {

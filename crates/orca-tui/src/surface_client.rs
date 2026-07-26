@@ -16,12 +16,11 @@ use orca_runtime::surface::{
     PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
     SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId, SurfaceEvent, SurfaceGoal,
-    SurfaceGoalFence, SurfaceHistoryMessage, SurfaceInputRequest, SurfaceInputRequestBlock,
-    SurfaceInteractionKind, SurfaceOperationId, SurfacePinnedContextEntry,
-    SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSnapshot,
-    SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason, SurfaceWorkflowRunId,
-    TaskControlAction, TransferBackgroundOutput, WaitOperationTerminalResult,
-    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SurfaceGoalFence, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
+    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence,
+    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput,
+    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -1194,14 +1193,6 @@ fn parse_workflow_args(raw_args: Option<&str>) -> io::Result<Vec<(NonEmptyText, 
             ))
         })
         .collect()
-}
-
-pub(crate) fn read_history(
-    thread: &RuntimeSurfaceThreadHandle,
-) -> io::Result<Vec<SurfaceHistoryMessage>> {
-    thread
-        .read_history()
-        .map_err(|error| io::Error::other(format!("typed TUI history read failed: {error}")))
 }
 
 pub(crate) fn add_pinned_context(

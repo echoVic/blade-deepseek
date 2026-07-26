@@ -13,11 +13,11 @@ use orca_runtime::surface::{
     AssistantChannel, AssistantPatch, ByteOffset, OperationPatch, OperationTerminal,
     SurfaceAssistantStream, SurfaceAssistantStreamState, SurfaceCommitBatch,
     SurfaceCompletedModelResponse, SurfaceCursor, SurfaceEvent, SurfaceFileChange, SurfaceGoal,
-    SurfaceGoalPauseReason, SurfaceGoalReceiptState, SurfaceGoalState, SurfaceHistoryMessage,
-    SurfaceInputPresentation, SurfaceItem, SurfaceOperationFence, SurfaceOperationId,
-    SurfaceReduceMode, SurfaceReduceResult, SurfaceReducerErrorCode, SurfaceReducerState,
-    SurfaceStreamId, SurfaceTaskStatus, SurfaceToolResultKind, SurfaceUserInputState,
-    SurfaceWorkflow, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, ToolPatch, UnixMillis,
+    SurfaceGoalPauseReason, SurfaceGoalReceiptState, SurfaceGoalState, SurfaceInputPresentation,
+    SurfaceItem, SurfaceOperationFence, SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult,
+    SurfaceReducerErrorCode, SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus,
+    SurfaceToolResultKind, SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus,
+    SurfaceWorkflowStatus, ToolPatch, UnixMillis,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
@@ -28,78 +28,55 @@ pub(crate) fn history_messages_from_surface_snapshot(
     history_messages_from_surface_items(&snapshot.items)
 }
 
-pub(crate) fn history_messages_from_surface_history(
-    messages: &[SurfaceHistoryMessage],
-) -> Vec<crate::types::ChatMessage> {
+fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
+    let mut messages = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        let Some(turn_id) = assistant_item_turn_id(&items[index]) else {
+            if let Some(message) = history_message_from_surface_item(&items[index]) {
+                messages.push(message);
+            }
+            index += 1;
+            continue;
+        };
+        let start = index;
+        while index < items.len()
+            && assistant_item_turn_id(&items[index]).is_some_and(|candidate| candidate == turn_id)
+        {
+            index += 1;
+        }
+        let assistant_items = &items[start..index];
+        for item in assistant_items
+            .iter()
+            .filter(|item| matches!(item, SurfaceItem::AssistantReasoning { .. }))
+            .chain(
+                assistant_items
+                    .iter()
+                    .filter(|item| matches!(item, SurfaceItem::AssistantMessage { .. })),
+            )
+            .chain(
+                assistant_items
+                    .iter()
+                    .filter(|item| matches!(item, SurfaceItem::AssistantPlan { .. })),
+            )
+        {
+            if let Some(message) = history_message_from_surface_item(item) {
+                messages.push(message);
+            }
+        }
+    }
     messages
-        .iter()
-        .flat_map(|message| match message {
-            SurfaceHistoryMessage::System { .. } => Vec::new(),
-            SurfaceHistoryMessage::User { content, .. } => {
-                vec![crate::types::ChatMessage::User(
-                    content.as_str().to_string(),
-                )]
-            }
-            SurfaceHistoryMessage::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
-                ..
-            } => {
-                let mut projected = Vec::new();
-                if let Some(reasoning) = reasoning_content
-                    .as_ref()
-                    .filter(|text| !text.as_str().trim().is_empty())
-                {
-                    projected.push(crate::types::ChatMessage::Reasoning(
-                        reasoning.as_str().to_string(),
-                    ));
-                }
-                if let Some(content) = content
-                    .as_ref()
-                    .filter(|text| !text.as_str().trim().is_empty())
-                {
-                    projected.push(crate::types::ChatMessage::Assistant(
-                        content.as_str().to_string(),
-                    ));
-                }
-                if content
-                    .as_ref()
-                    .is_none_or(|text| text.as_str().trim().is_empty())
-                    && reasoning_content
-                        .as_ref()
-                        .is_none_or(|text| text.as_str().trim().is_empty())
-                    && !tool_calls.is_empty()
-                {
-                    projected.push(crate::types::ChatMessage::System(
-                        "Previous assistant requested tools".to_string(),
-                    ));
-                }
-                projected
-            }
-            SurfaceHistoryMessage::Tool {
-                tool_call_id,
-                content,
-                ..
-            } => vec![crate::types::ChatMessage::ToolCall {
-                id: tool_call_id.as_str().to_string(),
-                name: format!("tool:{}", tool_call_id.as_str()),
-                target: None,
-                status: "completed".to_string(),
-                output: (!content.as_str().is_empty()).then(|| content.as_str().to_string()),
-                diff: None,
-                kind: None,
-                expanded: false,
-            }],
-        })
-        .collect()
 }
 
-fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
-    items
-        .iter()
-        .filter_map(history_message_from_surface_item)
-        .collect()
+fn assistant_item_turn_id(item: &SurfaceItem) -> Option<&orca_runtime::surface::SurfaceTurnId> {
+    match item {
+        SurfaceItem::AssistantMessage { turn_id, .. }
+        | SurfaceItem::AssistantReasoning { turn_id, .. }
+        | SurfaceItem::AssistantPlan { turn_id, .. } => Some(turn_id),
+        SurfaceItem::UserMessage { .. }
+        | SurfaceItem::SystemMessage { .. }
+        | SurfaceItem::ToolResultMessage { .. } => None,
+    }
 }
 
 fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types::ChatMessage> {
@@ -1301,54 +1278,14 @@ mod tests {
             [
                 crate::types::ChatMessage::User(prompt),
                 crate::types::ChatMessage::System(system),
-                crate::types::ChatMessage::Assistant(answer),
                 crate::types::ChatMessage::Reasoning(reasoning),
+                crate::types::ChatMessage::Assistant(answer),
                 crate::types::ChatMessage::ProposedPlan(plan),
             ] if prompt == "visible prompt"
                 && system == "system"
                 && answer == "answer"
                 && reasoning == "reasoning"
                 && plan == "plan"
-        ));
-    }
-
-    #[test]
-    fn runtime_history_projection_preserves_message_order_and_tool_identity() {
-        let tool_id = orca_runtime::surface::SurfaceHistoryId::try_new("call-1").unwrap();
-        let history = vec![
-            SurfaceHistoryMessage::User {
-                role: orca_runtime::surface::SurfaceHistoryUserRole::User,
-                content: DisplayText::new("hello"),
-            },
-            SurfaceHistoryMessage::Assistant {
-                role: orca_runtime::surface::SurfaceHistoryAssistantRole::Assistant,
-                content: Some(DisplayText::new("hi")),
-                reasoning_content: Some(DisplayText::new("reason")),
-                tool_calls: Vec::new(),
-            },
-            SurfaceHistoryMessage::Tool {
-                role: orca_runtime::surface::SurfaceHistoryToolRole::Tool,
-                tool_call_id: tool_id,
-                content: DisplayText::new("done"),
-            },
-        ];
-
-        let messages = history_messages_from_surface_history(&history);
-        assert!(matches!(
-            messages[0],
-            crate::types::ChatMessage::User(ref text) if text == "hello"
-        ));
-        assert!(matches!(
-            messages[1],
-            crate::types::ChatMessage::Reasoning(ref text) if text == "reason"
-        ));
-        assert!(matches!(
-            messages[2],
-            crate::types::ChatMessage::Assistant(ref text) if text == "hi"
-        ));
-        assert!(matches!(
-            messages[3],
-            crate::types::ChatMessage::ToolCall { ref id, .. } if id == "call-1"
         ));
     }
 

@@ -5695,6 +5695,171 @@ fn resolve_surface_input(request: &surface::SurfaceInputRequest) -> Option<surfa
     })
 }
 
+fn surface_input_for_persisted_presentation(
+    input: &surface::SurfaceInput,
+) -> surface::SurfaceInput {
+    let canonical_text = surface_input_presentation_text(input);
+    surface::SurfaceInput {
+        blocks: surface::NonEmptyVec::try_new(vec![surface::SurfaceInputBlock::Text {
+            text: canonical_text.clone(),
+        }])
+        .expect("persisted presentation input remains non-empty"),
+        canonical_text,
+        bindings_digest: input.bindings_digest.clone(),
+    }
+}
+
+fn surface_input_presentation_text(input: &surface::SurfaceInput) -> surface::DisplayText {
+    surface_persisted_display_text(input.canonical_text.as_str())
+}
+
+fn surface_persisted_display_text(text: &str) -> surface::DisplayText {
+    surface::DisplayText::new(crate::thread_store::redact_sensitive_text(text))
+}
+
+fn stable_surface_stream_prefix_len(text: &str) -> usize {
+    if let Some(sensitive_assignment_start) = incomplete_surface_sensitive_assignment_start(text) {
+        return sensitive_assignment_start;
+    }
+
+    let trailing_token_start = text
+        .char_indices()
+        .filter_map(|(index, ch)| {
+            (ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '"' | '\'' | '{' | '}' | '[' | ']' | ',' | ':' | ';' | '(' | ')'
+                ))
+            .then_some(index + ch.len_utf8())
+        })
+        .last()
+        .unwrap_or(0);
+    let trailing_token = &text[trailing_token_start..];
+    let lower = trailing_token.to_ascii_lowercase();
+    let mut retained_start = None;
+    for needle in [
+        "api_key",
+        "apikey",
+        "token",
+        "password",
+        "secret",
+        "authorization",
+    ] {
+        if let Some(index) = lower.find(needle) {
+            retained_start =
+                Some(retained_start.map_or(index, |current: usize| current.min(index)));
+            continue;
+        }
+        for prefix_len in 1..needle.len() {
+            if lower.ends_with(&needle[..prefix_len]) {
+                let index = lower.len() - prefix_len;
+                retained_start =
+                    Some(retained_start.map_or(index, |current: usize| current.min(index)));
+            }
+        }
+    }
+    if matches!(lower.as_str(), "s" | "sk") || lower.starts_with("sk-") {
+        retained_start = Some(0);
+    }
+
+    retained_start
+        .map(|index| trailing_token_start + index)
+        .unwrap_or(text.len())
+}
+
+fn incomplete_surface_sensitive_assignment_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'=' && bytes[index] != b':' {
+            index += 1;
+            continue;
+        }
+
+        let key_start = surface_sensitive_key_start(bytes, index);
+        let key = text[key_start..index].trim_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '[' | ',')
+        });
+        if !is_surface_sensitive_key(key) {
+            index += 1;
+            continue;
+        }
+
+        let mut value_start = index + 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        if value_start == bytes.len() {
+            return Some(key_start);
+        }
+
+        if matches!(bytes[value_start], b'"' | b'\'') {
+            let quote = bytes[value_start];
+            let mut value_index = value_start + 1;
+            let mut escaped = false;
+            let mut closed = false;
+            while value_index < bytes.len() {
+                let byte = bytes[value_index];
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == quote {
+                    closed = true;
+                    value_index += 1;
+                    break;
+                }
+                value_index += 1;
+            }
+            if !closed {
+                return Some(key_start);
+            }
+            index = value_index;
+            continue;
+        }
+
+        let mut value_index = value_start;
+        while value_index < bytes.len()
+            && !bytes[value_index].is_ascii_whitespace()
+            && !matches!(bytes[value_index], b',' | b'}' | b']' | b';')
+        {
+            value_index += 1;
+        }
+        if value_index == bytes.len() {
+            return Some(key_start);
+        }
+        index = value_index + 1;
+    }
+    None
+}
+
+fn surface_sensitive_key_start(bytes: &[u8], delimiter_index: usize) -> usize {
+    let mut start = delimiter_index;
+    while start > 0 {
+        let previous = bytes[start - 1];
+        if previous.is_ascii_whitespace() || matches!(previous, b'{' | b'[' | b',' | b';' | b'(') {
+            break;
+        }
+        start -= 1;
+    }
+    start
+}
+
+fn is_surface_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("authorization")
+}
+
+struct PendingSurfaceStreamRedaction {
+    fence: surface::SurfaceOperationFence,
+    raw_tail: String,
+}
+
 struct ThreadActor {
     state: Option<ThreadActorState>,
     config: RunConfig,
@@ -5717,6 +5882,8 @@ struct ThreadActor {
         HashMap<surface::SurfaceOperationId, PendingTypedProviderPreparation>,
     pending_provider_completions:
         HashMap<surface::SurfaceOperationId, PendingTypedProviderCompletion>,
+    pending_surface_stream_redactions:
+        HashMap<surface::SurfaceItemId, PendingSurfaceStreamRedaction>,
     surface_terminal_blocked: Option<String>,
 }
 
@@ -9757,6 +9924,11 @@ impl ThreadActor {
         if text.is_empty() {
             return Ok(());
         }
+        let Some(text) =
+            self.take_surface_stream_redacted_prefix(&fence, &item_id, text.as_str())?
+        else {
+            return Ok(());
+        };
 
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let active_generation = active.is_some_and(|active| {
@@ -9862,7 +10034,7 @@ impl ThreadActor {
             surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
                 stream_id,
                 offset,
-                text: surface::DisplayText::new(text.clone()),
+                text,
             }),
         ));
         let batch = self.surface_event_batch_with_commit_id(events, None);
@@ -9872,6 +10044,34 @@ impl ThreadActor {
             }
             None => self.commit_surface_generation_batch_with_retry(fence, &batch),
         }
+    }
+
+    fn take_surface_stream_redacted_prefix(
+        &mut self,
+        fence: &surface::SurfaceOperationFence,
+        item_id: &surface::SurfaceItemId,
+        text: &str,
+    ) -> io::Result<Option<surface::DisplayText>> {
+        let pending = self
+            .pending_surface_stream_redactions
+            .entry(item_id.clone())
+            .or_insert_with(|| PendingSurfaceStreamRedaction {
+                fence: fence.clone(),
+                raw_tail: String::new(),
+            });
+        if pending.fence != *fence {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider stream redaction tail belongs to another generation",
+            ));
+        }
+        pending.raw_tail.push_str(text);
+        let stable_len = stable_surface_stream_prefix_len(&pending.raw_tail);
+        if stable_len == 0 {
+            return Ok(None);
+        }
+        let stable = pending.raw_tail.drain(..stable_len).collect::<String>();
+        Ok(Some(surface_persisted_display_text(&stable)))
     }
 
     fn commit_surface_provider_response(
@@ -9924,7 +10124,7 @@ impl ThreadActor {
                     message_item = Some(surface::SurfaceAssistantMessageItem {
                         id,
                         turn_id: completed.identity.turn_id.clone(),
-                        text: surface::DisplayText::new(text),
+                        text: surface_persisted_display_text(&text),
                         pinned: false,
                     });
                 }
@@ -9941,8 +10141,8 @@ impl ThreadActor {
                     reasoning_item = Some(surface::SurfaceAssistantReasoningItem {
                         id,
                         turn_id: completed.identity.turn_id.clone(),
-                        summary: surface::DisplayText::new(summary),
-                        content: surface::DisplayText::new(content),
+                        summary: surface_persisted_display_text(&summary),
+                        content: surface_persisted_display_text(&content),
                         pinned: false,
                     });
                 }
@@ -9950,7 +10150,7 @@ impl ThreadActor {
                     plan_item = Some(surface::SurfaceAssistantPlanItem {
                         id,
                         turn_id: completed.identity.turn_id.clone(),
-                        text: surface::DisplayText::new(text),
+                        text: surface_persisted_display_text(&text),
                         pinned: false,
                     });
                 }
@@ -10026,49 +10226,68 @@ impl ThreadActor {
             plan_item,
             tool_calls: raw_tool_calls,
         };
+        for item_id in [
+            completed_response
+                .message_item
+                .as_ref()
+                .map(|item| &item.id),
+            completed_response
+                .reasoning_item
+                .as_ref()
+                .map(|item| &item.id),
+            completed_response.plan_item.as_ref().map(|item| &item.id),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.pending_surface_stream_redactions.remove(item_id);
+        }
         let scope = surface::SurfaceScope::Generation {
             fence: fence.clone(),
         };
         let snapshot = self.resident_surface.coordinator.state().snapshot();
-        let mut events = snapshot
-            .assistant_streams
-            .iter()
-            .filter(|stream| {
-                if stream.fence != fence
-                    || stream.turn_id != completed_response.turn_id
-                    || stream.state != surface::SurfaceAssistantStreamState::Open
-                {
-                    return false;
-                }
-                let completed_text = match stream.channel {
-                    surface::AssistantChannel::Message => completed_response
-                        .message_item
-                        .as_ref()
-                        .filter(|item| item.id == stream.item_id)
-                        .map(|item| &item.text),
-                    surface::AssistantChannel::Reasoning => completed_response
-                        .reasoning_item
-                        .as_ref()
-                        .filter(|item| item.id == stream.item_id)
-                        .map(|item| &item.content),
-                    surface::AssistantChannel::Plan => completed_response
-                        .plan_item
-                        .as_ref()
-                        .filter(|item| item.id == stream.item_id)
-                        .map(|item| &item.text),
-                };
-                completed_text != Some(&stream.text)
-            })
-            .map(|stream| {
-                (
+        let mut events = Vec::new();
+        for stream in snapshot.assistant_streams.iter().filter(|stream| {
+            stream.fence == fence
+                && stream.turn_id == completed_response.turn_id
+                && stream.state == surface::SurfaceAssistantStreamState::Open
+        }) {
+            let completed_text = match stream.channel {
+                surface::AssistantChannel::Message => completed_response
+                    .message_item
+                    .as_ref()
+                    .filter(|item| item.id == stream.item_id)
+                    .map(|item| item.text.as_str()),
+                surface::AssistantChannel::Reasoning => completed_response
+                    .reasoning_item
+                    .as_ref()
+                    .filter(|item| item.id == stream.item_id)
+                    .map(|item| item.content.as_str()),
+                surface::AssistantChannel::Plan => completed_response
+                    .plan_item
+                    .as_ref()
+                    .filter(|item| item.id == stream.item_id)
+                    .map(|item| item.text.as_str()),
+            };
+            match completed_text.and_then(|text| text.strip_prefix(stream.text.as_str())) {
+                Some(suffix) if !suffix.is_empty() => events.push((
+                    scope.clone(),
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
+                        stream_id: stream.stream_id.clone(),
+                        offset: stream.next_offset,
+                        text: surface::DisplayText::new(suffix),
+                    }),
+                )),
+                Some(_) => {}
+                None => events.push((
                     scope.clone(),
                     surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamDiscarded {
                         stream_id: stream.stream_id.clone(),
                         reason: surface::AssistantDiscardReason::ProviderFailed,
                     }),
-                )
-            })
-            .collect::<Vec<_>>();
+                )),
+            }
+        }
         events.push((
             scope.clone(),
             surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseCompleted {
@@ -10123,7 +10342,7 @@ impl ThreadActor {
                     message_item = Some(surface::SurfaceAssistantMessageItem {
                         id,
                         turn_id: completed.identity.turn_id.clone(),
-                        text: surface::DisplayText::new(text),
+                        text: surface_persisted_display_text(&text),
                         pinned: false,
                     });
                 }
@@ -10140,8 +10359,8 @@ impl ThreadActor {
                     reasoning_item = Some(surface::SurfaceAssistantReasoningItem {
                         id,
                         turn_id: completed.identity.turn_id.clone(),
-                        summary: surface::DisplayText::new(summary),
-                        content: surface::DisplayText::new(content),
+                        summary: surface_persisted_display_text(&summary),
+                        content: surface_persisted_display_text(&content),
                         pinned: false,
                     });
                 }
@@ -10149,7 +10368,7 @@ impl ThreadActor {
                     plan_item = Some(surface::SurfaceAssistantPlanItem {
                         id,
                         turn_id: completed.identity.turn_id.clone(),
-                        text: surface::DisplayText::new(text),
+                        text: surface_persisted_display_text(&text),
                         pinned: false,
                     });
                 }
@@ -10345,8 +10564,8 @@ impl ThreadActor {
                 source,
                 invocation_started,
             };
-            let output = result.output.clone().map(surface::DisplayText::new);
-            let error = result.error.clone().map(surface::DisplayText::new);
+            let output = result.output.as_deref().map(surface_persisted_display_text);
+            let error = result.error.as_deref().map(surface_persisted_display_text);
             let content = output
                 .clone()
                 .or_else(|| error.clone())
@@ -15069,7 +15288,7 @@ impl ThreadActor {
         };
         let input_item_id = surface::SurfaceItemId::new();
         let presentation = surface::SurfaceInputPresentation::Visible {
-            text: resolved_input.canonical_text.clone(),
+            text: surface_input_presentation_text(&resolved_input),
         };
         let correlation_id =
             surface::SurfaceInputCorrelationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -15366,7 +15585,7 @@ impl ThreadActor {
         }
 
         let resolved_fact = surface::SurfaceResolvedInputFact::Replayable {
-            input: resolved_input.clone(),
+            input: surface_input_for_persisted_presentation(&resolved_input),
             request_digest,
         };
         let resolved_batch = self.surface_event_batch_with_commit_id(
@@ -17288,7 +17507,7 @@ impl ThreadActor {
         let logical_turn_id = TurnId::new();
         let input_item_id = surface::SurfaceItemId::new();
         let presentation = surface::SurfaceInputPresentation::Visible {
-            text: continuation_input.canonical_text.clone(),
+            text: surface_input_presentation_text(&continuation_input),
         };
         let correlation_id =
             surface::SurfaceInputCorrelationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -17568,7 +17787,7 @@ impl ThreadActor {
                 message: format!("typed Goal continuation start failed: {error:?}"),
             })?;
         let resolved_fact = surface::SurfaceResolvedInputFact::Replayable {
-            input: continuation_input,
+            input: surface_input_for_persisted_presentation(&continuation_input),
             request_digest: continuation_request_digest,
         };
         let resolved_batch = self.surface_event_batch_with_commit_id(
@@ -18018,7 +18237,7 @@ impl ThreadActor {
 
         if let surface::GenerationInputState::Pending { input_item_id, .. } = &generation.input {
             let resolved_fact = surface::SurfaceResolvedInputFact::Replayable {
-                input: resolved_input.clone(),
+                input: surface_input_for_persisted_presentation(&resolved_input),
                 request_digest: request_digest.clone(),
             };
             let resolved_batch = self.surface_event_batch_with_commit_id(
@@ -19247,6 +19466,7 @@ impl ThreadActor {
             pending_workflow_completions: HashMap::new(),
             pending_provider_preparations: HashMap::new(),
             pending_provider_completions: HashMap::new(),
+            pending_surface_stream_redactions: HashMap::new(),
             surface_terminal_blocked: None,
         }
     }
@@ -22309,6 +22529,12 @@ impl ThreadActor {
                 return Err(error);
             }
         }
+        if !matches!(outcome, OperationOutcome::Backgrounded { .. })
+            && let Some(fence) = active.surface_operation.as_ref()
+        {
+            self.pending_surface_stream_redactions
+                .retain(|_, pending| pending.fence.operation_id != fence.operation_id);
+        }
         let completed = active.completion.complete(OperationTerminal {
             operation_id: active.operation_id,
             outcome,
@@ -22981,7 +23207,7 @@ impl ThreadActor {
     }
 
     fn prepare_typed_provider_completion(
-        &self,
+        &mut self,
         typed: TypedProviderBackground,
         shutdown_reason: Option<surface::SurfaceShutdownReason>,
     ) -> Result<PendingTypedProviderCompletion, RuntimeHostError> {
@@ -23127,6 +23353,11 @@ impl ThreadActor {
             surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
         let operation_id = typed.fence.operation_fence.operation_id.clone();
+        if let Some(response) = outcome.response.as_ref() {
+            for item in response.completed().completed_items() {
+                self.pending_surface_stream_redactions.remove(item.id());
+            }
+        }
         let mut completion_events = outcome
             .response
             .as_ref()
@@ -24917,6 +25148,59 @@ mod tests {
     const RESERVATION_TERMINAL_FAILURE_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn surface_stream_redaction_is_chunk_boundary_safe() {
+        assert_eq!(
+            stable_surface_stream_prefix_len("restart-partial"),
+            "restart-partial".len(),
+            "ordinary partial streams remain durable before completion"
+        );
+        for (chunks, secrets) in [
+            (
+                vec!["prefix sk", "-test-stream-secret-1234567890 suffix"],
+                vec!["sk-test-stream-secret-1234567890"],
+            ),
+            (
+                vec!["sk-", "opaquevalue1234567890 "],
+                vec!["opaquevalue1234567890"],
+            ),
+            (
+                vec!["api_", "key=opaque-value-1234567890 ", "suffix"],
+                vec!["opaque-value-1234567890"],
+            ),
+            (
+                vec![
+                    "authorization: ",
+                    "\"opaque-bearer-value-1234567890\" suffix",
+                ],
+                vec!["opaque-bearer-value-1234567890"],
+            ),
+            (
+                vec!["password=", "opaque-password-value-1234567890", " suffix"],
+                vec!["opaque-password-value-1234567890"],
+            ),
+        ] {
+            let raw = chunks.concat();
+            let expected = crate::thread_store::redact_sensitive_text(&raw);
+            let mut tail = String::new();
+            let mut projected = String::new();
+            for chunk in chunks {
+                tail.push_str(chunk);
+                let stable_len = stable_surface_stream_prefix_len(&tail);
+                if stable_len > 0 {
+                    let stable = tail.drain(..stable_len).collect::<String>();
+                    projected.push_str(&crate::thread_store::redact_sensitive_text(&stable));
+                }
+            }
+            projected.push_str(&crate::thread_store::redact_sensitive_text(&tail));
+
+            assert_eq!(projected, expected);
+            for secret in secrets {
+                assert!(!projected.contains(secret));
+            }
+        }
+    }
 
     struct GatedSuccessExecutor {
         entered: SyncSender<()>,

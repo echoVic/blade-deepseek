@@ -496,14 +496,20 @@ impl ThreadOperationExecutor for BlockingAssistantStreamExecutor {
         _cancel: &CancelToken,
     ) -> io::Result<ThreadOperationOutcome> {
         let identity = ModelResponseIdentity::new(request.turn_id().clone());
-        request
-            .thread_turn_request(generation)
+        let turn_request = request.thread_turn_request(generation);
+        let ingress = turn_request
             .provider_response_ingress()
-            .expect("typed generation installs semantic ingress")
-            .commit_provider_step(
-                &identity,
-                &ProviderStep::MessageDelta("restart-partial".to_string()),
-            )?;
+            .expect("typed generation installs semantic ingress");
+        ingress.commit_provider_step(
+            &identity,
+            &ProviderStep::MessageDelta("restart-partial".to_string()),
+        )?;
+        ingress
+            .commit_provider_step(&identity, &ProviderStep::ReasoningDelta("sk-".to_string()))?;
+        ingress.commit_provider_step(
+            &identity,
+            &ProviderStep::ReasoningDelta("opaquevalue1234567890 ".to_string()),
+        )?;
         std::thread::park();
         unreachable!("restart fixture exits while assistant stream is open")
     }
@@ -1086,14 +1092,23 @@ fn cold_recovery_discards_durable_partial_assistant_stream() {
             )
             .unwrap();
         let snapshot = fresh_snapshot(&thread.surface());
-        assert_eq!(snapshot.assistant_streams.len(), 1);
-        assert_eq!(
-            snapshot.assistant_streams[0].text.as_str(),
-            "restart-partial"
-        );
-        assert_eq!(
-            snapshot.assistant_streams[0].state,
-            SurfaceAssistantStreamState::Discarded
+        assert_eq!(snapshot.assistant_streams.len(), 2);
+        assert!(snapshot.assistant_streams.iter().any(|stream| {
+            stream.channel == AssistantChannel::Message
+                && stream.text.as_str() == "restart-partial"
+                && stream.state == SurfaceAssistantStreamState::Discarded
+        }));
+        assert!(snapshot.assistant_streams.iter().any(|stream| {
+            stream.channel == AssistantChannel::Reasoning
+                && stream.text.as_str() == "<redacted> "
+                && stream.state == SurfaceAssistantStreamState::Discarded
+        }));
+        assert!(
+            snapshot
+                .assistant_streams
+                .iter()
+                .all(|stream| !stream.text.as_str().contains("opaquevalue1234567890")),
+            "restart must not recover a raw partial secret"
         );
         assert!(
             snapshot
@@ -1499,11 +1514,22 @@ fn run_assistant_stream_restart_child() -> ! {
     );
     let deadline = Instant::now() + TEST_TIMEOUT;
     loop {
-        if fresh_snapshot(&surface)
+        let snapshot = fresh_snapshot(&surface);
+        let message_is_durable = snapshot
             .assistant_streams
             .iter()
-            .any(|stream| stream.text.as_str() == "restart-partial")
-        {
+            .any(|stream| stream.text.as_str() == "restart-partial");
+        let secret_is_redacted = snapshot.assistant_streams.iter().any(|stream| {
+            stream.channel == AssistantChannel::Reasoning && stream.text.as_str() == "<redacted> "
+        });
+        if message_is_durable && secret_is_redacted {
+            assert!(
+                snapshot
+                    .assistant_streams
+                    .iter()
+                    .all(|stream| !stream.text.as_str().contains("opaquevalue1234567890")),
+                "partial secret must never enter the durable snapshot"
+            );
             break;
         }
         assert!(

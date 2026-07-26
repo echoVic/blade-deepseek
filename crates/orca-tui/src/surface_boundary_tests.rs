@@ -478,7 +478,6 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         "cancel_operation",
         "update_settings",
         "read_snapshot",
-        "read_history",
         "add_pinned_context",
         "expand_mentions",
         "discover_mention_catalog",
@@ -553,5 +552,30 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
         !SLASH_COMMAND_ACTIONS.contains("folder_trust::")
             && !SETUP_ACTIONS.contains("orca_core::config::file"),
         "host-scoped trust and credentials must mutate through the TUI surface facade"
+    );
+}
+
+#[test]
+fn typed_history_resume_projects_only_the_durable_surface_snapshot() {
+    let start = APP
+        .find("fn emit_typed_history_snapshot(")
+        .expect("typed history emitter");
+    let end = APP[start..]
+        .find("\nfn typed_history_startup_eligible(")
+        .map(|offset| start + offset)
+        .expect("typed history emitter boundary");
+    let emitter = &APP[start..end];
+
+    assert!(
+        emitter.contains("history_messages_from_surface_snapshot(&snapshot)"),
+        "resume must rebuild the transcript from the runtime-owned typed snapshot"
+    );
+    assert!(
+        !emitter.contains("read_history"),
+        "resume must not fall back to the legacy conversation history projection"
+    );
+    assert!(
+        !include_str!("surface_actions.rs").contains("fn read_history"),
+        "the TUI facade must not retain a second history truth beside SurfaceSnapshot.items"
     );
 }

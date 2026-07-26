@@ -2587,11 +2587,21 @@ mod tests {
     fn resumed_uuid_session_emits_typed_history_before_accepting_initial_turn() {
         with_orca_home(|_| {
             let mut source = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
-            source.send(UserAction::Submit("restored prompt".to_string()));
+            let secret = "sk-test-typed-history-secret-1234567890";
+            source.send(UserAction::Submit(format!(
+                "restored prompt api_key={secret}"
+            )));
             let source_terminal =
                 source.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
             assert!(matches!(
                 source_terminal,
+                TuiEvent::SessionCompleted { status } if status == "success"
+            ));
+            source.send(UserAction::Submit("mock_history_echo".to_string()));
+            let echo_terminal =
+                source.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(matches!(
+                echo_terminal,
                 TuiEvent::SessionCompleted { status } if status == "success"
             ));
             source.shutdown();
@@ -2603,14 +2613,47 @@ mod tests {
                 .event_rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("typed history event");
-            assert!(matches!(
-                event,
-                TuiEvent::HistoryLoaded { messages, .. }
-                    if messages.iter().any(|message| matches!(
+            let TuiEvent::HistoryLoaded { messages, .. } = event else {
+                panic!("expected typed history");
+            };
+            assert!(messages.iter().any(|message| matches!(
+                message,
+                ChatMessage::User(prompt)
+                    if prompt == "restored prompt api_key=<redacted>"
+            )));
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| format!("{message:?}").contains(secret)),
+                "typed restart history must not display the replay secret"
+            );
+            let reasoning_index = messages
+                .iter()
+                .position(|message| matches!(
+                    message,
+                    ChatMessage::Reasoning(reasoning)
+                        if reasoning == "Mock runtime is preserving the DeepSeek reasoning channel."
+                ))
+                .expect("typed reasoning history");
+            let assistant_index = messages
+                .iter()
+                .position(|message| {
+                    matches!(
                         message,
-                        ChatMessage::User(prompt) if prompt == "restored prompt"
-                    ))
-            ));
+                        ChatMessage::Assistant(answer)
+                            if answer == "Mock runtime completed the headless harness contract."
+                    )
+                })
+                .expect("typed assistant history");
+            assert!(
+                reasoning_index < assistant_index,
+                "restart history must preserve the live reasoning-before-assistant order"
+            );
+            assert!(messages.iter().any(|message| matches!(
+                message,
+                ChatMessage::Assistant(answer)
+                    if answer == "Mock history users: restored prompt api_key=<redacted> | mock_history_echo"
+            )));
 
             harness.send(UserAction::Submit("mock_history_echo".to_string()));
             let mut saw_restored_history = false;
@@ -5623,8 +5666,7 @@ fn emit_typed_history_snapshot(
 ) -> Result<(), String> {
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
-    let history = actions.read_history().map_err(|error| error.to_string())?;
-    let messages = crate::surface_projection::history_messages_from_surface_history(&history);
+    let messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
     let plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
         None
     } else {
