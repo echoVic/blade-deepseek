@@ -133,6 +133,7 @@ pub struct HostedGenerationHandlers {
     provider_response_ingress: Option<Arc<dyn surface::RuntimeProviderResponseIngress>>,
     acp_read_text_file_handler: Option<Arc<RuntimeSurfaceReadTextFileHandler>>,
     acp_write_text_file_handler: Option<Arc<RuntimeSurfaceWriteTextFileHandler>>,
+    acp_terminal_create_handler: Option<Arc<RuntimeSurfaceTerminalCreateHandler>>,
     manual_compaction_precommit: Option<
         Arc<
             dyn Fn(
@@ -173,6 +174,10 @@ impl fmt::Debug for HostedGenerationHandlers {
                 &self.acp_write_text_file_handler.is_some(),
             )
             .field(
+                "acp_terminal_create_handler",
+                &self.acp_terminal_create_handler.is_some(),
+            )
+            .field(
                 "manual_compaction_precommit",
                 &self.manual_compaction_precommit.is_some(),
             )
@@ -194,6 +199,14 @@ impl HostedGenerationHandlers {
         handler: Arc<RuntimeSurfaceWriteTextFileHandler>,
     ) -> Self {
         self.acp_write_text_file_handler = Some(handler);
+        self
+    }
+
+    fn with_acp_terminal_create_handler(
+        mut self,
+        handler: Arc<RuntimeSurfaceTerminalCreateHandler>,
+    ) -> Self {
+        self.acp_terminal_create_handler = Some(handler);
         self
     }
 
@@ -1047,6 +1060,36 @@ impl GenerationContext {
             .write_text_file(request, path, content)
     }
 
+    pub fn create_terminal_on_acp_client(
+        &self,
+        request: &orca_core::tool_types::ToolRequest,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+    ) -> io::Result<RuntimeAcpTerminalHandle> {
+        let handler = self
+            .handlers
+            .acp_terminal_create_handler
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "runtime-owned ACP terminal create capability is unavailable",
+                )
+            })?
+            .clone();
+        let terminal_id =
+            handler.create_terminal(request, command, args, env, cwd, output_byte_limit)?;
+        Ok(RuntimeAcpTerminalHandle {
+            terminal_id,
+            request: request.clone(),
+            handler,
+            cleanup_started: false,
+        })
+    }
+
     fn prepare_manual_compaction(
         &self,
         outcome: &crate::session::ManualCompactionOutcome,
@@ -1068,6 +1111,43 @@ struct RuntimeSurfaceReadTextFileHandler {
 struct RuntimeSurfaceWriteTextFileHandler {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
+}
+
+struct RuntimeSurfaceTerminalCreateHandler {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+}
+
+pub struct RuntimeAcpTerminalHandle {
+    terminal_id: String,
+    request: orca_core::tool_types::ToolRequest,
+    handler: Arc<RuntimeSurfaceTerminalCreateHandler>,
+    cleanup_started: bool,
+}
+
+impl RuntimeAcpTerminalHandle {
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+
+    pub fn close(mut self) -> io::Result<()> {
+        self.cleanup()
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        if self.cleanup_started {
+            return Ok(());
+        }
+        self.cleanup_started = true;
+        self.handler
+            .cleanup_terminal(&self.request, self.terminal_id.clone())
+    }
+}
+
+impl Drop for RuntimeAcpTerminalHandle {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
 }
 
 impl RuntimeSurfaceReadTextFileHandler {
@@ -1137,6 +1217,82 @@ impl RuntimeSurfaceWriteTextFileHandler {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "runtime capability actor closed before write settlement",
+            )
+        })?
+    }
+}
+
+impl RuntimeSurfaceTerminalCreateHandler {
+    fn create_terminal(
+        &self,
+        request: &orca_core::tool_types::ToolRequest,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+    ) -> io::Result<String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceRequestAcpTerminalCreate {
+                fence: self.fence.clone(),
+                request: request.clone(),
+                command,
+                args,
+                env,
+                cwd,
+                output_byte_limit,
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime capability mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime capability actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime capability actor closed before terminal create settlement",
+            )
+        })?
+    }
+
+    fn cleanup_terminal(
+        &self,
+        request: &orca_core::tool_types::ToolRequest,
+        terminal_id: String,
+    ) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let mut command = ThreadCommand::SurfaceRequestAcpTerminalCleanup {
+            fence: self.fence.clone(),
+            request: request.clone(),
+            terminal_id,
+            reply: reply_tx,
+        };
+        loop {
+            match self.command_tx.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    command = returned;
+                    std::thread::yield_now();
+                }
+                Err(TrySendError::Closed(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "runtime capability actor is unavailable",
+                    ));
+                }
+            }
+        }
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime capability actor closed before terminal cleanup settlement",
             )
         })?
     }
@@ -3001,6 +3157,54 @@ enum ThreadCommand {
         settlement: surface::AcpWriteTextFileSettlement,
         reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
     },
+    SurfaceRequestAcpTerminalCreate {
+        fence: surface::SurfaceOperationFence,
+        request: orca_core::tool_types::ToolRequest,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+        reply: SyncSender<io::Result<String>>,
+    },
+    SurfacePermitAcpTerminalCreateDelivery {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
+    SurfaceAcpTerminalCreateWritten {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
+    SurfaceAcpTerminalCreateSettled {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCreateSettlement,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
+    SurfaceRequestAcpTerminalCleanup {
+        fence: surface::SurfaceOperationFence,
+        request: orca_core::tool_types::ToolRequest,
+        terminal_id: String,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceAcpTerminalCleanupWritten {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
+    SurfaceAcpTerminalCleanupSettled {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCleanupSettlement,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
     #[cfg(test)]
     SurfaceRespondInteraction {
         client: surface::RuntimeSurfaceClientHandle,
@@ -3624,6 +3828,82 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         settlement: surface::AcpWriteTextFileSettlement,
     ) -> Result<(), surface::SurfaceClientCommandError> {
         self.dispatch_required(|reply| ThreadCommand::SurfaceAcpWriteTextFileSettled {
+            client,
+            call_id,
+            capability_revision,
+            settlement,
+            reply,
+        })
+    }
+
+    fn permit_acp_terminal_create_delivery(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(
+            |reply| ThreadCommand::SurfacePermitAcpTerminalCreateDelivery {
+                client,
+                call_id,
+                capability_revision,
+                reply,
+            },
+        )
+    }
+
+    fn mark_acp_terminal_create_written(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(|reply| ThreadCommand::SurfaceAcpTerminalCreateWritten {
+            client,
+            call_id,
+            capability_revision,
+            reply,
+        })
+    }
+
+    fn settle_acp_terminal_create(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCreateSettlement,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(|reply| ThreadCommand::SurfaceAcpTerminalCreateSettled {
+            client,
+            call_id,
+            capability_revision,
+            settlement,
+            reply,
+        })
+    }
+
+    fn mark_acp_terminal_cleanup_written(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(|reply| ThreadCommand::SurfaceAcpTerminalCleanupWritten {
+            client,
+            call_id,
+            capability_revision,
+            reply,
+        })
+    }
+
+    fn settle_acp_terminal_cleanup(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCleanupSettlement,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(|reply| ThreadCommand::SurfaceAcpTerminalCleanupSettled {
             client,
             call_id,
             capability_revision,
@@ -6912,12 +7192,21 @@ struct ResidentSurfaceCapabilityCall {
     attachment_id: surface::SurfaceAttachmentId,
     capability_revision: surface::CapabilityRevision,
     write_claimed: bool,
+    terminal_cleanup_lease: Option<ResidentTerminalCleanupLease>,
     waiter: Option<ResidentSurfaceCapabilityWaiter>,
+}
+
+#[derive(Clone)]
+struct ResidentTerminalCleanupLease {
+    lease_id: surface::UuidV7,
+    terminal_id: surface::SurfaceRemoteTerminalId,
 }
 
 enum ResidentSurfaceCapabilityWaiter {
     ReadTextFile(SyncSender<io::Result<String>>),
     WriteTextFile(SyncSender<io::Result<()>>),
+    TerminalCreate(SyncSender<io::Result<String>>),
+    TerminalCleanup(SyncSender<io::Result<()>>),
 }
 
 struct PendingSurfaceCapabilityTransition {
@@ -6931,6 +7220,8 @@ struct PendingSurfaceCapabilityTransition {
 enum PendingSurfaceCapabilityWaiterOutcome {
     ReadTextFileCompleted(String),
     WriteTextFileCompleted,
+    TerminalCreated(String),
+    TerminalCleanupCompleted,
     Failed {
         kind: io::ErrorKind,
         message: String,
@@ -6947,6 +7238,25 @@ enum PendingSurfaceCapabilitySettlement {
         client: surface::RuntimeSurfaceClientHandle,
         capability_revision: surface::CapabilityRevision,
         settlement: surface::AcpWriteTextFileSettlement,
+    },
+    TerminalCreate {
+        client: surface::RuntimeSurfaceClientHandle,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCreateSettlement,
+    },
+    TerminalCleanup {
+        client: surface::RuntimeSurfaceClientHandle,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCleanupSettlement,
+    },
+    DispatchTerminalCleanup {
+        route: surface::AcpCapabilityAttachmentRoute,
+        dispatch: surface::AcpTerminalCleanupDispatch,
+    },
+    BeginTerminalRelease {
+        kill_call: surface::SurfaceCapabilityCall,
+        lease_id: surface::UuidV7,
+        terminal_id: surface::SurfaceRemoteTerminalId,
     },
 }
 
@@ -12113,17 +12423,15 @@ impl ThreadActor {
         )
     }
 
-    fn ambiguous_write_tool_events(
+    fn ambiguous_capability_tool_events(
         &self,
         call: &surface::SurfaceCapabilityCall,
     ) -> Result<
         Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
         surface::SurfaceClientCommandError,
     > {
-        let surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
-            effect_kind: surface::ExternalEffectKind::FileWrite,
-            error,
-        } = &call.state
+        let surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { error, .. } =
+            &call.state
         else {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         };
@@ -12187,7 +12495,218 @@ impl ThreadActor {
                 call: call.clone(),
             }),
         )];
-        events.extend(self.ambiguous_write_tool_events(&call)?);
+        events.extend(self.ambiguous_capability_tool_events(&call)?);
+        Ok(self.surface_event_batch_with_commit_id(events, None))
+    }
+
+    fn terminal_create_lease_id(call_id: &surface::SurfaceCapabilityCallId) -> surface::UuidV7 {
+        surface::UuidV7::try_from_bytes(*call_id.as_bytes())
+            .expect("capability call id is a UUIDv7")
+    }
+
+    fn terminal_create_completed_batch(
+        &self,
+        call: surface::SurfaceCapabilityCall,
+        terminal_id: surface::SurfaceRemoteTerminalId,
+    ) -> surface::SurfaceCommitBatch {
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        let lease = surface::SurfaceRemoteTerminalLease {
+            lease_id: Self::terminal_create_lease_id(&call.call_id),
+            owning_tool_call_id: call.owning_tool_call_id.clone(),
+            state: surface::SurfaceRemoteTerminalLeaseState::Live {
+                terminal_id,
+                owner_fence: call.fence.clone(),
+            },
+        };
+        self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    scope.clone(),
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+                ),
+                (
+                    scope,
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease,
+                    }),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn ambiguous_terminal_create_capability_batch(
+        &self,
+        call: surface::SurfaceCapabilityCall,
+    ) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        let lease = surface::SurfaceRemoteTerminalLease {
+            lease_id: Self::terminal_create_lease_id(&call.call_id),
+            owning_tool_call_id: call.owning_tool_call_id.clone(),
+            state: surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
+                create_call_id: call.call_id.clone(),
+            },
+        };
+        let mut events = vec![
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                    call: call.clone(),
+                }),
+            ),
+            (
+                scope,
+                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                    lease,
+                }),
+            ),
+        ];
+        events.extend(self.ambiguous_capability_tool_events(&call)?);
+        Ok(self.surface_event_batch_with_commit_id(events, None))
+    }
+
+    fn terminal_cleanup_started_batch(
+        &self,
+        call: surface::SurfaceCapabilityCall,
+        lease: surface::SurfaceRemoteTerminalLease,
+    ) -> surface::SurfaceCommitBatch {
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        let mut delivery_possible = call.clone();
+        delivery_possible.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+        self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    scope.clone(),
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+                ),
+                (
+                    scope.clone(),
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease,
+                    }),
+                ),
+                (
+                    scope,
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                        call: delivery_possible,
+                    }),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn terminal_release_started_batch(
+        &self,
+        call: surface::SurfaceCapabilityCall,
+    ) -> surface::SurfaceCommitBatch {
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        let mut delivery_possible = call.clone();
+        delivery_possible.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+        self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    scope.clone(),
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+                ),
+                (
+                    scope,
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                        call: delivery_possible,
+                    }),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn terminal_cleanup_completed_batch(
+        &self,
+        call: surface::SurfaceCapabilityCall,
+        lease: surface::SurfaceRemoteTerminalLease,
+    ) -> surface::SurfaceCommitBatch {
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    scope.clone(),
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+                ),
+                (
+                    scope,
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease,
+                    }),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn ambiguous_terminal_cleanup_capability_batch(
+        &self,
+        call: surface::SurfaceCapabilityCall,
+        lease_id: surface::UuidV7,
+        terminal_id: surface::SurfaceRemoteTerminalId,
+    ) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        let lease = surface::SurfaceRemoteTerminalLease {
+            lease_id,
+            owning_tool_call_id: call.owning_tool_call_id.clone(),
+            state: surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                terminal_id: Some(terminal_id),
+                owner_fence: call.fence.clone(),
+            },
+        };
+        let mut events = vec![
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                    call: call.clone(),
+                }),
+            ),
+            (
+                scope,
+                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                    lease,
+                }),
+            ),
+        ];
+        let has_other_pending_capability = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+            .is_some_and(|tool| {
+                tool.capability_calls.iter().any(|candidate| {
+                    candidate.call_id != call.call_id
+                        && !matches!(
+                            candidate.state,
+                            surface::SurfaceCapabilityCallState::Completed { .. }
+                                | surface::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+                                | surface::SurfaceCapabilityCallState::ObservationUnavailable { .. }
+                                | surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
+                        )
+                })
+            });
+        if !has_other_pending_capability {
+            events.extend(self.ambiguous_capability_tool_events(&call)?);
+        }
         Ok(self.surface_event_batch_with_commit_id(events, None))
     }
 
@@ -12208,6 +12727,18 @@ impl ThreadActor {
     ) -> PendingSurfaceCapabilityWaiterOutcome {
         match result {
             Ok(()) => PendingSurfaceCapabilityWaiterOutcome::WriteTextFileCompleted,
+            Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
+                kind: error.kind(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn pending_terminal_create_waiter_outcome(
+        result: io::Result<String>,
+    ) -> PendingSurfaceCapabilityWaiterOutcome {
+        match result {
+            Ok(terminal_id) => PendingSurfaceCapabilityWaiterOutcome::TerminalCreated(terminal_id),
             Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
                 kind: error.kind(),
                 message: error.to_string(),
@@ -12243,6 +12774,18 @@ impl ThreadActor {
                     let _ = waiter.send(Ok(()));
                 }
                 (
+                    ResidentSurfaceCapabilityWaiter::TerminalCreate(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::TerminalCreated(terminal_id),
+                ) => {
+                    let _ = waiter.send(Ok(terminal_id));
+                }
+                (
+                    ResidentSurfaceCapabilityWaiter::TerminalCleanup(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted,
+                ) => {
+                    let _ = waiter.send(Ok(()));
+                }
+                (
                     ResidentSurfaceCapabilityWaiter::ReadTextFile(waiter),
                     PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
                 ) => {
@@ -12250,6 +12793,18 @@ impl ThreadActor {
                 }
                 (
                     ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
+                ) => {
+                    let _ = waiter.send(Err(io::Error::new(kind, message)));
+                }
+                (
+                    ResidentSurfaceCapabilityWaiter::TerminalCreate(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
+                ) => {
+                    let _ = waiter.send(Err(io::Error::new(kind, message)));
+                }
+                (
+                    ResidentSurfaceCapabilityWaiter::TerminalCleanup(waiter),
                     PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
                 ) => {
                     let _ = waiter.send(Err(io::Error::new(kind, message)));
@@ -12273,7 +12828,7 @@ impl ThreadActor {
                 batch,
                 waiter_outcome,
                 deferred_settlement: None,
-                retry_at: tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                retry_at: tokio::time::Instant::now(),
             },
         );
     }
@@ -12328,6 +12883,66 @@ impl ThreadActor {
                         capability_revision,
                         settlement,
                     );
+                }
+                PendingSurfaceCapabilitySettlement::TerminalCreate {
+                    client,
+                    capability_revision,
+                    settlement,
+                } => {
+                    let _ = self.settle_surface_acp_terminal_create(
+                        &client,
+                        call_id.clone(),
+                        capability_revision,
+                        settlement,
+                    );
+                }
+                PendingSurfaceCapabilitySettlement::TerminalCleanup {
+                    client,
+                    capability_revision,
+                    settlement,
+                } => {
+                    let _ = self.settle_surface_acp_terminal_cleanup(
+                        &client,
+                        call_id.clone(),
+                        capability_revision,
+                        settlement,
+                    );
+                }
+                PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch } => {
+                    if let Some(resident) = self.resident_surface.capability_calls.get_mut(call_id)
+                    {
+                        resident.write_claimed = true;
+                    }
+                    if let Err(error) = self
+                        .resident_surface
+                        .hub
+                        .dispatch_acp_terminal_cleanup(&route, dispatch)
+                    {
+                        let _ = self.settle_surface_terminal_cleanup_ambiguous(
+                            call_id,
+                            format!(
+                                "ACP terminal cleanup dispatch failed after durable retry: {error:?}"
+                            ),
+                        );
+                    }
+                }
+                PendingSurfaceCapabilitySettlement::BeginTerminalRelease {
+                    kill_call,
+                    lease_id,
+                    terminal_id,
+                } => {
+                    if let Some(mut resident) =
+                        self.resident_surface.capability_calls.remove(call_id)
+                        && let Some(waiter) = resident.waiter.take()
+                    {
+                        let _ = self.begin_surface_terminal_release(
+                            kill_call,
+                            lease_id,
+                            terminal_id,
+                            resident,
+                            waiter,
+                        );
+                    }
                 }
             }
             return !self
@@ -12452,6 +13067,7 @@ impl ThreadActor {
                     attachment_id: route.attachment_id.clone(),
                     capability_revision: route.capability_revision,
                     write_claimed: false,
+                    terminal_cleanup_lease: None,
                     waiter: Some(ResidentSurfaceCapabilityWaiter::ReadTextFile(reply.clone())),
                 },
             );
@@ -12888,6 +13504,7 @@ impl ThreadActor {
                     attachment_id: route.attachment_id.clone(),
                     capability_revision: route.capability_revision,
                     write_claimed: false,
+                    terminal_cleanup_lease: None,
                     waiter: Some(ResidentSurfaceCapabilityWaiter::WriteTextFile(
                         reply.clone(),
                     )),
@@ -13165,6 +13782,1003 @@ impl ThreadActor {
         self.apply_committed_surface_capability_transition(
             &call_id,
             Some(Self::pending_write_capability_waiter_outcome(waiter_result)),
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_surface_acp_terminal_create(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: orca_core::tool_types::ToolRequest,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+        reply: SyncSender<io::Result<String>>,
+    ) {
+        let result = (|| -> io::Result<()> {
+            if active.surface_operation.as_ref() != Some(&fence)
+                || Self::surface_interaction_admission_closed(active)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "runtime capability generation fence is stale",
+                ));
+            }
+            let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+            let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
+            let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "ACP terminal create requires an ACP prompt operation",
+                ));
+            };
+            let origin_attachment = self
+                .resident_surface
+                .operation_origin_attachments
+                .get(&fence.operation_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "ACP operation origin attachment is unavailable",
+                    )
+                })?;
+            let route = self
+                .resident_surface
+                .hub
+                .select_acp_capability_attachment(
+                    surface::SurfaceCapabilityCallKind::TerminalCreate,
+                    origin_attachment,
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "ACP terminal capability route is unavailable",
+                    )
+                })?;
+            if command.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ACP terminal command is empty",
+                ));
+            }
+            let cwd = cwd
+                .map(surface::CanonicalPath::try_new)
+                .transpose()
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid ACP terminal cwd: {error:?}"),
+                    )
+                })?;
+            let arguments = serde_json::to_vec(&(
+                &command,
+                &args,
+                &env,
+                cwd.as_ref().map(|path| path.as_path()),
+                output_byte_limit,
+            ))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let call_id =
+                surface::SurfaceCapabilityCallId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let call = surface::SurfaceCapabilityCall {
+                call_id: call_id.clone(),
+                acp_session_id: session_id.clone(),
+                fence: fence.clone(),
+                capability_revision: route.capability_revision,
+                policy_epoch: operation.intent.policy_epoch,
+                kind: surface::SurfaceCapabilityCallKind::TerminalCreate,
+                arguments_digest: surface_sha256(&arguments),
+                owning_tool_call_id: tool.tool_call_id,
+                state: surface::SurfaceCapabilityCallState::Prepared,
+            };
+            let batch = self.capability_call_batch(call.clone());
+            self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
+            self.resident_surface.capability_calls.insert(
+                call_id.clone(),
+                ResidentSurfaceCapabilityCall {
+                    attachment_id: route.attachment_id.clone(),
+                    capability_revision: route.capability_revision,
+                    write_claimed: false,
+                    terminal_cleanup_lease: None,
+                    waiter: Some(ResidentSurfaceCapabilityWaiter::TerminalCreate(
+                        reply.clone(),
+                    )),
+                },
+            );
+            let dispatch = surface::AcpTerminalCreateDispatch {
+                call_id: call_id.clone(),
+                acp_session_id: session_id.clone(),
+                capability_revision: route.capability_revision,
+                command,
+                args,
+                env,
+                cwd,
+                output_byte_limit,
+            };
+            if let Err(error) = self
+                .resident_surface
+                .hub
+                .dispatch_acp_terminal_create(&route, dispatch)
+            {
+                let diagnostic = surface::SafeDiagnosticText::try_new(format!(
+                    "ACP terminal create dispatch failed: {error:?}"
+                ))
+                .expect("bounded fixed capability diagnostic");
+                let mut failed = call;
+                failed.state =
+                    surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic };
+                let failed_batch = self.capability_call_batch(failed);
+                let waiter_error = io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "ACP terminal create dispatch failed before write",
+                );
+                if self
+                    .commit_surface_generation_batch_with_retry(fence.clone(), &failed_batch)
+                    .is_err()
+                {
+                    self.retain_surface_capability_transition(
+                        call_id,
+                        fence,
+                        failed_batch,
+                        Some(Self::pending_terminal_create_waiter_outcome(Err(
+                            waiter_error,
+                        ))),
+                    );
+                    return Ok(());
+                }
+                self.resident_surface.capability_calls.remove(&call_id);
+                return Err(waiter_error);
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    fn permit_surface_acp_terminal_create_delivery(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if call.kind != surface::SurfaceCapabilityCallKind::TerminalCreate
+            || call.state != surface::SurfaceCapabilityCallState::Prepared
+            || self
+                .resident_surface
+                .pending_capability_transitions
+                .contains_key(&call_id)
+            || self
+                .resident_surface
+                .capability_calls
+                .get(&call_id)
+                .is_some_and(|resident| resident.write_claimed)
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        call.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+        let fence = call.fence.clone();
+        let batch = self.capability_call_batch(call);
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let resident = self
+            .resident_surface
+            .capability_calls
+            .get_mut(&call_id)
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        resident.write_claimed = true;
+        Ok(())
+    }
+
+    fn mark_surface_acp_terminal_create_written(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if self
+            .resident_surface
+            .pending_capability_transitions
+            .contains_key(&call_id)
+        {
+            return self
+                .retry_surface_capability_transition(&call_id)
+                .then_some(())
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if call.kind != surface::SurfaceCapabilityCallKind::TerminalCreate
+            || call.state != surface::SurfaceCapabilityCallState::DeliveryPossible
+            || !self
+                .resident_surface
+                .capability_calls
+                .get(&call_id)
+                .is_some_and(|resident| resident.write_claimed)
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        call.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
+        let fence = call.fence.clone();
+        let batch = self.capability_call_batch(call);
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
+            resident.write_claimed = false;
+        }
+        Ok(())
+    }
+
+    fn settle_surface_acp_terminal_create(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCreateSettlement,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if call.kind != surface::SurfaceCapabilityCallKind::TerminalCreate {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if self
+            .resident_surface
+            .pending_capability_transitions
+            .contains_key(&call_id)
+        {
+            let pending = self
+                .resident_surface
+                .pending_capability_transitions
+                .get_mut(&call_id)
+                .expect("checked pending capability transition");
+            if pending.deferred_settlement.is_some() {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+            pending.deferred_settlement =
+                Some(PendingSurfaceCapabilitySettlement::TerminalCreate {
+                    client: client.clone(),
+                    capability_revision,
+                    settlement,
+                });
+            return self
+                .retry_surface_capability_transition(&call_id)
+                .then_some(())
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let (waiter_result, completed_terminal_id) = match settlement {
+            surface::AcpTerminalCreateSettlement::Completed { terminal_id }
+                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
+            {
+                if let Ok(terminal_id) = surface::SurfaceRemoteTerminalId::try_new(terminal_id) {
+                    let result = surface::CapabilityCallResult::TerminalCreated {
+                        terminal_id: terminal_id.clone(),
+                    };
+                    let canonical =
+                        serde_json::to_vec(&result).expect("terminal result is serializable");
+                    if canonical.len() as u64 <= surface::ACP_CAPABILITY_RESULT_CANONICAL_BYTE_LIMIT
+                    {
+                        call.state = surface::SurfaceCapabilityCallState::Completed {
+                            response_digest: surface_sha256(&canonical),
+                            result,
+                        };
+                        (Ok(terminal_id.as_str().to_string()), Some(terminal_id))
+                    } else {
+                        let diagnostic = surface::SafeDiagnosticText::try_new(
+                            "ACP terminal create response exceeded the canonical result limit",
+                        )
+                        .expect("fixed capability diagnostic is bounded");
+                        call.state = surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                            effect_kind: surface::ExternalEffectKind::TerminalCreate,
+                            error: diagnostic.clone(),
+                        };
+                        (Err(io::Error::other(diagnostic.as_str().to_string())), None)
+                    }
+                } else {
+                    let diagnostic = surface::SafeDiagnosticText::try_new(
+                        "ACP terminal create returned an invalid terminal identity",
+                    )
+                    .expect("fixed capability diagnostic is bounded");
+                    call.state = surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                        effect_kind: surface::ExternalEffectKind::TerminalCreate,
+                        error: diagnostic.clone(),
+                    };
+                    (Err(io::Error::other(diagnostic.as_str().to_string())), None)
+                }
+            }
+            surface::AcpTerminalCreateSettlement::RemoteError { code, message }
+                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
+            {
+                let code = surface::AcpCapabilityIdentifier::try_new(code).unwrap_or_else(|_| {
+                    surface::AcpCapabilityIdentifier::try_new("unknown")
+                        .expect("fixed capability error code is bounded")
+                });
+                let message = surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                    surface::SafeDiagnosticText::try_new(
+                        "ACP terminal create returned an invalid remote diagnostic",
+                    )
+                    .expect("fixed capability diagnostic is bounded")
+                });
+                let waiter_error = format!("ACP terminal create failed: {}", message.as_str());
+                let result = surface::CapabilityCallResult::RemoteError {
+                    code,
+                    message: message.clone(),
+                };
+                let canonical = serde_json::to_vec(&result)
+                    .expect("bounded capability error result is serializable");
+                call.state = surface::SurfaceCapabilityCallState::Completed {
+                    response_digest: surface_sha256(&canonical),
+                    result,
+                };
+                (Err(io::Error::other(waiter_error)), None)
+            }
+            surface::AcpTerminalCreateSettlement::FailedBeforeWrite { message }
+                if call.state == surface::SurfaceCapabilityCallState::Prepared =>
+            {
+                let diagnostic =
+                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                        surface::SafeDiagnosticText::try_new(
+                            "ACP terminal create failed before delivery",
+                        )
+                        .expect("fixed capability diagnostic is bounded")
+                    });
+                let waiter_error = diagnostic.as_str().to_string();
+                call.state =
+                    surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic };
+                (
+                    Err(io::Error::new(io::ErrorKind::NotConnected, waiter_error)),
+                    None,
+                )
+            }
+            surface::AcpTerminalCreateSettlement::ExternalEffectAmbiguous { message }
+                if matches!(
+                    call.state,
+                    surface::SurfaceCapabilityCallState::DeliveryPossible
+                        | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                ) =>
+            {
+                let diagnostic =
+                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                        surface::SafeDiagnosticText::try_new(
+                            "ACP terminal create effect is ambiguous",
+                        )
+                        .expect("fixed capability diagnostic is bounded")
+                    });
+                let waiter_error = diagnostic.as_str().to_string();
+                call.state = surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::TerminalCreate,
+                    error: diagnostic,
+                };
+                (Err(io::Error::other(waiter_error)), None)
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
+        let fence = call.fence.clone();
+        let batch = if let Some(terminal_id) = completed_terminal_id {
+            self.terminal_create_completed_batch(call, terminal_id)
+        } else if matches!(
+            &call.state,
+            surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                effect_kind: surface::ExternalEffectKind::TerminalCreate,
+                ..
+            }
+        ) {
+            self.ambiguous_terminal_create_capability_batch(call)?
+        } else {
+            self.capability_call_batch(call)
+        };
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(
+                call_id,
+                fence,
+                batch,
+                Some(Self::pending_terminal_create_waiter_outcome(waiter_result)),
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        self.apply_committed_surface_capability_transition(
+            &call_id,
+            Some(Self::pending_terminal_create_waiter_outcome(waiter_result)),
+        );
+        Ok(())
+    }
+
+    fn request_surface_acp_terminal_cleanup(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: orca_core::tool_types::ToolRequest,
+        terminal_id: String,
+        reply: SyncSender<io::Result<()>>,
+    ) {
+        let result = (|| -> io::Result<()> {
+            if active.surface_operation.as_ref() != Some(&fence)
+                || Self::surface_interaction_admission_closed(active)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "runtime terminal cleanup generation fence is stale",
+                ));
+            }
+            let terminal_id =
+                surface::SurfaceRemoteTerminalId::try_new(terminal_id).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "runtime terminal cleanup identity is invalid",
+                    )
+                })?;
+            let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+            let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
+            let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "ACP terminal cleanup requires an ACP prompt operation",
+                ));
+            };
+            let lease = snapshot
+                .tools
+                .iter()
+                .find(|candidate| candidate.request.tool_call_id == tool.tool_call_id)
+                .and_then(|candidate| {
+                    candidate.terminal_leases.iter().find(|lease| {
+                        matches!(
+                            &lease.state,
+                            surface::SurfaceRemoteTerminalLeaseState::Live {
+                                terminal_id: live_terminal_id,
+                                owner_fence,
+                            } if live_terminal_id == &terminal_id && owner_fence == &fence
+                        )
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "runtime-owned live terminal lease is unavailable",
+                    )
+                })?;
+            let origin_attachment = self
+                .resident_surface
+                .operation_origin_attachments
+                .get(&fence.operation_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "ACP operation origin attachment is unavailable",
+                    )
+                })?;
+            let route = self
+                .resident_surface
+                .hub
+                .select_acp_capability_attachment(
+                    surface::SurfaceCapabilityCallKind::TerminalKill,
+                    origin_attachment,
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "ACP terminal cleanup route is unavailable",
+                    )
+                })?;
+            let call_id =
+                surface::SurfaceCapabilityCallId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let call = surface::SurfaceCapabilityCall {
+                call_id: call_id.clone(),
+                acp_session_id: session_id.clone(),
+                fence: fence.clone(),
+                capability_revision: route.capability_revision,
+                policy_epoch: operation.intent.policy_epoch,
+                kind: surface::SurfaceCapabilityCallKind::TerminalKill,
+                arguments_digest: surface_sha256(terminal_id.as_str().as_bytes()),
+                owning_tool_call_id: tool.tool_call_id,
+                state: surface::SurfaceCapabilityCallState::Prepared,
+            };
+            let mut kill_pending_lease = lease;
+            kill_pending_lease.state = surface::SurfaceRemoteTerminalLeaseState::KillPending {
+                terminal_id: terminal_id.clone(),
+                owner_fence: fence.clone(),
+            };
+            let cleanup_lease_id = kill_pending_lease.lease_id.clone();
+            let batch = self.terminal_cleanup_started_batch(call.clone(), kill_pending_lease);
+            self.resident_surface.capability_calls.insert(
+                call_id.clone(),
+                ResidentSurfaceCapabilityCall {
+                    attachment_id: route.attachment_id.clone(),
+                    capability_revision: route.capability_revision,
+                    write_claimed: true,
+                    terminal_cleanup_lease: Some(ResidentTerminalCleanupLease {
+                        lease_id: cleanup_lease_id,
+                        terminal_id: terminal_id.clone(),
+                    }),
+                    waiter: Some(ResidentSurfaceCapabilityWaiter::TerminalCleanup(
+                        reply.clone(),
+                    )),
+                },
+            );
+            let dispatch = surface::AcpTerminalCleanupDispatch {
+                call_id: call_id.clone(),
+                acp_session_id: session_id.clone(),
+                capability_revision: route.capability_revision,
+                terminal_id,
+                kind: surface::SurfaceCapabilityCallKind::TerminalKill,
+            };
+            if self
+                .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+                .is_err()
+            {
+                self.retain_surface_capability_transition(call_id.clone(), fence, batch, None);
+                self.resident_surface
+                    .pending_capability_transitions
+                    .get_mut(&call_id)
+                    .expect("retained terminal cleanup admission")
+                    .deferred_settlement = Some(
+                    PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch },
+                );
+                return Ok(());
+            }
+            if let Err(error) = self
+                .resident_surface
+                .hub
+                .dispatch_acp_terminal_cleanup(&route, dispatch)
+            {
+                self.settle_surface_terminal_cleanup_ambiguous(
+                    &call_id,
+                    format!("ACP terminal kill dispatch failed after durable admission: {error:?}"),
+                )
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "failed to persist terminal cleanup ambiguity: {error:?}"
+                    ))
+                })?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    fn mark_surface_acp_terminal_cleanup_written(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if self
+            .resident_surface
+            .pending_capability_transitions
+            .contains_key(&call_id)
+        {
+            return self
+                .retry_surface_capability_transition(&call_id)
+                .then_some(())
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if !matches!(
+            call.kind,
+            surface::SurfaceCapabilityCallKind::TerminalKill
+                | surface::SurfaceCapabilityCallKind::TerminalRelease
+        ) || call.state != surface::SurfaceCapabilityCallState::DeliveryPossible
+            || !self
+                .resident_surface
+                .capability_calls
+                .get(&call_id)
+                .is_some_and(|resident| resident.write_claimed)
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        call.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
+        let fence = call.fence.clone();
+        let batch = self.capability_call_batch(call);
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
+            resident.write_claimed = false;
+        }
+        Ok(())
+    }
+
+    fn settle_surface_acp_terminal_cleanup(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpTerminalCleanupSettlement,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if !matches!(
+            call.kind,
+            surface::SurfaceCapabilityCallKind::TerminalKill
+                | surface::SurfaceCapabilityCallKind::TerminalRelease
+        ) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if self
+            .resident_surface
+            .pending_capability_transitions
+            .contains_key(&call_id)
+        {
+            let pending = self
+                .resident_surface
+                .pending_capability_transitions
+                .get_mut(&call_id)
+                .expect("checked pending capability transition");
+            if pending.deferred_settlement.is_some() {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+            pending.deferred_settlement =
+                Some(PendingSurfaceCapabilitySettlement::TerminalCleanup {
+                    client: client.clone(),
+                    capability_revision,
+                    settlement,
+                });
+            return self
+                .retry_surface_capability_transition(&call_id)
+                .then_some(())
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        match settlement {
+            surface::AcpTerminalCleanupSettlement::Completed
+                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
+            {
+                self.complete_surface_terminal_cleanup(call_id, call)
+            }
+            surface::AcpTerminalCleanupSettlement::RemoteError { code, message }
+                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
+            {
+                self.settle_surface_terminal_cleanup_ambiguous(
+                    &call_id,
+                    format!("ACP terminal cleanup failed remotely ({code}): {message}"),
+                )
+            }
+            surface::AcpTerminalCleanupSettlement::ExternalEffectAmbiguous { message }
+                if matches!(
+                    call.state,
+                    surface::SurfaceCapabilityCallState::DeliveryPossible
+                        | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                ) =>
+            {
+                self.settle_surface_terminal_cleanup_ambiguous(&call_id, message)
+            }
+            _ => Err(surface::SurfaceClientCommandError::Unauthorized),
+        }
+    }
+
+    fn complete_surface_terminal_cleanup(
+        &mut self,
+        call_id: surface::SurfaceCapabilityCallId,
+        mut call: surface::SurfaceCapabilityCall,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let cleanup_lease = self
+            .resident_surface
+            .capability_calls
+            .get(&call_id)
+            .and_then(|resident| resident.terminal_cleanup_lease.clone())
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let lease = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+            .and_then(|tool| {
+                tool.terminal_leases.iter().find(|lease| {
+                    lease.lease_id == cleanup_lease.lease_id
+                        && matches!(
+                                (&call.kind, &lease.state),
+                            (
+                                surface::SurfaceCapabilityCallKind::TerminalKill,
+                                surface::SurfaceRemoteTerminalLeaseState::KillPending {
+                                    terminal_id,
+                                    owner_fence,
+                                }
+                            ) | (
+                                surface::SurfaceCapabilityCallKind::TerminalRelease,
+                                surface::SurfaceRemoteTerminalLeaseState::ReleasePending {
+                                    terminal_id,
+                                    owner_fence,
+                                }
+                            ) if owner_fence == &call.fence
+                                && terminal_id == &cleanup_lease.terminal_id
+                        )
+                })
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let terminal_id = match &lease.state {
+            surface::SurfaceRemoteTerminalLeaseState::KillPending { terminal_id, .. }
+            | surface::SurfaceRemoteTerminalLeaseState::ReleasePending { terminal_id, .. } => {
+                terminal_id.clone()
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
+        let result = match call.kind {
+            surface::SurfaceCapabilityCallKind::TerminalKill => {
+                surface::CapabilityCallResult::TerminalKillAcknowledged
+            }
+            surface::SurfaceCapabilityCallKind::TerminalRelease => {
+                surface::CapabilityCallResult::TerminalReleaseAcknowledged
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
+        let canonical =
+            serde_json::to_vec(&result).expect("terminal cleanup result is serializable");
+        call.state = surface::SurfaceCapabilityCallState::Completed {
+            response_digest: surface_sha256(&canonical),
+            result,
+        };
+        let mut next_lease = lease.clone();
+        next_lease.state = match call.kind {
+            surface::SurfaceCapabilityCallKind::TerminalKill => {
+                surface::SurfaceRemoteTerminalLeaseState::ReleasePending {
+                    terminal_id: terminal_id.clone(),
+                    owner_fence: call.fence.clone(),
+                }
+            }
+            surface::SurfaceCapabilityCallKind::TerminalRelease => {
+                surface::SurfaceRemoteTerminalLeaseState::Released
+            }
+            _ => unreachable!("guarded terminal cleanup kind"),
+        };
+        let fence = call.fence.clone();
+        let kind = call.kind;
+        let batch = self.terminal_cleanup_completed_batch(call.clone(), next_lease);
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            let waiter_outcome = (kind == surface::SurfaceCapabilityCallKind::TerminalRelease)
+                .then_some(PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted);
+            self.retain_surface_capability_transition(
+                call_id.clone(),
+                fence,
+                batch,
+                waiter_outcome,
+            );
+            if kind == surface::SurfaceCapabilityCallKind::TerminalKill {
+                self.resident_surface
+                    .pending_capability_transitions
+                    .get_mut(&call_id)
+                    .expect("retained terminal kill settlement")
+                    .deferred_settlement =
+                    Some(PendingSurfaceCapabilitySettlement::BeginTerminalRelease {
+                        kill_call: call,
+                        lease_id: lease.lease_id,
+                        terminal_id,
+                    });
+            }
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if kind == surface::SurfaceCapabilityCallKind::TerminalRelease {
+            self.apply_committed_surface_capability_transition(
+                &call_id,
+                Some(PendingSurfaceCapabilityWaiterOutcome::TerminalCleanupCompleted),
+            );
+            return Ok(());
+        }
+        let mut resident = self
+            .resident_surface
+            .capability_calls
+            .remove(&call_id)
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let waiter = resident
+            .waiter
+            .take()
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        self.begin_surface_terminal_release(call, lease.lease_id, terminal_id, resident, waiter)
+    }
+
+    fn begin_surface_terminal_release(
+        &mut self,
+        kill_call: surface::SurfaceCapabilityCall,
+        lease_id: surface::UuidV7,
+        terminal_id: surface::SurfaceRemoteTerminalId,
+        resident: ResidentSurfaceCapabilityCall,
+        waiter: ResidentSurfaceCapabilityWaiter,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let call_id =
+            surface::SurfaceCapabilityCallId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7");
+        let release_call = surface::SurfaceCapabilityCall {
+            call_id: call_id.clone(),
+            acp_session_id: kill_call.acp_session_id.clone(),
+            fence: kill_call.fence.clone(),
+            capability_revision: resident.capability_revision,
+            policy_epoch: kill_call.policy_epoch,
+            kind: surface::SurfaceCapabilityCallKind::TerminalRelease,
+            arguments_digest: surface_sha256(terminal_id.as_str().as_bytes()),
+            owning_tool_call_id: kill_call.owning_tool_call_id,
+            state: surface::SurfaceCapabilityCallState::Prepared,
+        };
+        let batch = self.terminal_release_started_batch(release_call.clone());
+        let route = surface::AcpCapabilityAttachmentRoute {
+            attachment_id: resident.attachment_id.clone(),
+            capability_revision: resident.capability_revision,
+        };
+        self.resident_surface.capability_calls.insert(
+            call_id.clone(),
+            ResidentSurfaceCapabilityCall {
+                attachment_id: resident.attachment_id,
+                capability_revision: resident.capability_revision,
+                write_claimed: true,
+                terminal_cleanup_lease: Some(ResidentTerminalCleanupLease {
+                    lease_id,
+                    terminal_id: terminal_id.clone(),
+                }),
+                waiter: Some(waiter),
+            },
+        );
+        let dispatch = surface::AcpTerminalCleanupDispatch {
+            call_id: call_id.clone(),
+            acp_session_id: release_call.acp_session_id,
+            capability_revision: resident.capability_revision,
+            terminal_id,
+            kind: surface::SurfaceCapabilityCallKind::TerminalRelease,
+        };
+        if self
+            .commit_surface_generation_batch_with_retry(release_call.fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(
+                call_id.clone(),
+                release_call.fence,
+                batch,
+                None,
+            );
+            self.resident_surface
+                .pending_capability_transitions
+                .get_mut(&call_id)
+                .expect("retained terminal release admission")
+                .deferred_settlement = Some(
+                PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch },
+            );
+            return Ok(());
+        }
+        if let Err(error) = self
+            .resident_surface
+            .hub
+            .dispatch_acp_terminal_cleanup(&route, dispatch)
+        {
+            self.settle_surface_terminal_cleanup_ambiguous(
+                &call_id,
+                format!("ACP terminal release dispatch failed after durable admission: {error:?}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn settle_surface_terminal_cleanup_ambiguous(
+        &mut self,
+        call_id: &surface::SurfaceCapabilityCallId,
+        message: String,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call = Self::surface_capability_call(
+            self.resident_surface.coordinator.state().snapshot(),
+            call_id,
+        )
+        .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        if !matches!(
+            call.state,
+            surface::SurfaceCapabilityCallState::DeliveryPossible
+                | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
+        ) || !matches!(
+            call.kind,
+            surface::SurfaceCapabilityCallKind::TerminalKill
+                | surface::SurfaceCapabilityCallKind::TerminalRelease
+        ) {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let cleanup_lease = self
+            .resident_surface
+            .capability_calls
+            .get(call_id)
+            .and_then(|resident| resident.terminal_cleanup_lease.clone())
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let lease = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+            .and_then(|tool| {
+                tool.terminal_leases.iter().find(|lease| {
+                    lease.lease_id == cleanup_lease.lease_id
+                        && matches!(
+                            &lease.state,
+                            surface::SurfaceRemoteTerminalLeaseState::KillPending {
+                                terminal_id,
+                                owner_fence,
+                            } | surface::SurfaceRemoteTerminalLeaseState::ReleasePending {
+                                terminal_id,
+                                owner_fence,
+                            } if owner_fence == &call.fence
+                                && terminal_id == &cleanup_lease.terminal_id
+                        )
+                })
+            })
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let terminal_id = match lease.state {
+            surface::SurfaceRemoteTerminalLeaseState::KillPending { terminal_id, .. }
+            | surface::SurfaceRemoteTerminalLeaseState::ReleasePending { terminal_id, .. } => {
+                terminal_id
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
+        let effect_kind = match call.kind {
+            surface::SurfaceCapabilityCallKind::TerminalKill => {
+                surface::ExternalEffectKind::TerminalKill
+            }
+            surface::SurfaceCapabilityCallKind::TerminalRelease => {
+                surface::ExternalEffectKind::TerminalRelease
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
+        let diagnostic = surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+            surface::SafeDiagnosticText::try_new("ACP terminal cleanup effect is ambiguous")
+                .expect("fixed terminal cleanup diagnostic is bounded")
+        });
+        let waiter_error = diagnostic.as_str().to_string();
+        call.state = surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+            effect_kind,
+            error: diagnostic,
+        };
+        let fence = call.fence.clone();
+        let batch =
+            self.ambiguous_terminal_cleanup_capability_batch(call, lease.lease_id, terminal_id)?;
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(
+                call_id.clone(),
+                fence,
+                batch,
+                Some(PendingSurfaceCapabilityWaiterOutcome::Failed {
+                    kind: io::ErrorKind::Other,
+                    message: waiter_error,
+                }),
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        self.apply_committed_surface_capability_transition(
+            call_id,
+            Some(PendingSurfaceCapabilityWaiterOutcome::Failed {
+                kind: io::ErrorKind::Other,
+                message: waiter_error,
+            }),
         );
         Ok(())
     }
@@ -15411,12 +17025,14 @@ impl ThreadActor {
         let mut capability_calls = self
             .resident_surface
             .capability_calls
-            .keys()
-            .filter_map(|call_id| {
-                Self::surface_capability_call(snapshot, call_id).filter(|call| &call.fence == fence)
+            .iter()
+            .filter_map(|(call_id, resident)| {
+                Self::surface_capability_call(snapshot, call_id)
+                    .filter(|call| &call.fence == fence)
+                    .map(|call| (call, resident.terminal_cleanup_lease.clone()))
             })
             .collect::<Vec<_>>();
-        capability_calls.sort_by_key(|call| call.call_id.clone());
+        capability_calls.sort_by_key(|(call, _)| call.call_id.clone());
         let mut events = vec![(
             surface::SurfaceScope::Operation {
                 operation_id: fence.operation_id.clone(),
@@ -15447,7 +17063,13 @@ impl ThreadActor {
             ));
         }
         let mut terminalized_capability_calls = Vec::new();
-        for mut call in capability_calls {
+        let mut terminalized_tool_ids = BTreeSet::new();
+        let mut terminalized_tool_calls = Vec::new();
+        let covered_terminal_leases = capability_calls
+            .iter()
+            .filter_map(|(_, lease)| lease.as_ref().map(|lease| lease.lease_id.clone()))
+            .collect::<BTreeSet<_>>();
+        for (mut call, terminal_cleanup_lease) in capability_calls {
             let diagnostic = surface::SafeDiagnosticText::try_new(match cause {
                 surface::TerminalizationCause::HostShutdown => {
                     "ACP capability cancelled by host shutdown"
@@ -15461,10 +17083,19 @@ impl ThreadActor {
                 }
             })
             .expect("fixed capability cancellation diagnostic is bounded");
+            let terminal_cleanup_was_prepared = matches!(
+                (&call.kind, &call.state),
+                (
+                    surface::SurfaceCapabilityCallKind::TerminalKill
+                        | surface::SurfaceCapabilityCallKind::TerminalRelease,
+                    surface::SurfaceCapabilityCallState::Prepared,
+                )
+            );
             call.state = match (&call.kind, &call.state) {
                 (
                     surface::SurfaceCapabilityCallKind::ReadTextFile
-                    | surface::SurfaceCapabilityCallKind::WriteTextFile,
+                    | surface::SurfaceCapabilityCallKind::WriteTextFile
+                    | surface::SurfaceCapabilityCallKind::TerminalCreate,
                     surface::SurfaceCapabilityCallState::Prepared,
                 ) => surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic },
                 (
@@ -15481,8 +17112,46 @@ impl ThreadActor {
                     effect_kind: surface::ExternalEffectKind::FileWrite,
                     error: diagnostic,
                 },
+                (
+                    surface::SurfaceCapabilityCallKind::TerminalCreate,
+                    surface::SurfaceCapabilityCallState::DeliveryPossible
+                    | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::TerminalCreate,
+                    error: diagnostic,
+                },
+                (
+                    surface::SurfaceCapabilityCallKind::TerminalKill,
+                    surface::SurfaceCapabilityCallState::Prepared
+                    | surface::SurfaceCapabilityCallState::DeliveryPossible
+                    | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::TerminalKill,
+                    error: diagnostic,
+                },
+                (
+                    surface::SurfaceCapabilityCallKind::TerminalRelease,
+                    surface::SurfaceCapabilityCallState::Prepared
+                    | surface::SurfaceCapabilityCallState::DeliveryPossible
+                    | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::TerminalRelease,
+                    error: diagnostic,
+                },
                 _ => continue,
             };
+            if terminal_cleanup_was_prepared {
+                let mut delivery_possible = call.clone();
+                delivery_possible.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+                events.push((
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                        call: delivery_possible,
+                    }),
+                ));
+            }
             events.push((
                 surface::SurfaceScope::Generation {
                     fence: fence.clone(),
@@ -15494,13 +17163,206 @@ impl ThreadActor {
             if matches!(
                 &call.state,
                 surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
-                    effect_kind: surface::ExternalEffectKind::FileWrite,
+                    effect_kind: surface::ExternalEffectKind::TerminalCreate,
                     ..
                 }
             ) {
-                events.extend(self.ambiguous_write_tool_events(&call)?);
+                events.push((
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease: surface::SurfaceRemoteTerminalLease {
+                            lease_id: Self::terminal_create_lease_id(&call.call_id),
+                            owning_tool_call_id: call.owning_tool_call_id.clone(),
+                            state: surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
+                                create_call_id: call.call_id.clone(),
+                            },
+                        },
+                    }),
+                ));
+            } else if matches!(
+                &call.state,
+                surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::TerminalKill
+                        | surface::ExternalEffectKind::TerminalRelease,
+                    ..
+                }
+            ) {
+                let terminal_cleanup_lease = terminal_cleanup_lease
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                let lease = snapshot
+                    .tools
+                    .iter()
+                    .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+                    .and_then(|tool| {
+                        tool.terminal_leases.iter().find(|lease| {
+                            lease.lease_id == terminal_cleanup_lease.lease_id
+                                && matches!(
+                                    &lease.state,
+                                    surface::SurfaceRemoteTerminalLeaseState::KillPending {
+                                        terminal_id,
+                                        owner_fence,
+                                    } | surface::SurfaceRemoteTerminalLeaseState::ReleasePending {
+                                        terminal_id,
+                                        owner_fence,
+                                    } if owner_fence == fence
+                                        && terminal_id == &terminal_cleanup_lease.terminal_id
+                                )
+                        })
+                    })
+                    .cloned()
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                let terminal_id = match lease.state {
+                    surface::SurfaceRemoteTerminalLeaseState::KillPending {
+                        terminal_id, ..
+                    }
+                    | surface::SurfaceRemoteTerminalLeaseState::ReleasePending {
+                        terminal_id,
+                        ..
+                    } => terminal_id,
+                    _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+                };
+                events.push((
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease: surface::SurfaceRemoteTerminalLease {
+                            lease_id: lease.lease_id,
+                            owning_tool_call_id: call.owning_tool_call_id.clone(),
+                            state: surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                terminal_id: Some(terminal_id),
+                                owner_fence: fence.clone(),
+                            },
+                        },
+                    }),
+                ));
+            }
+            if matches!(
+                call.state,
+                surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
+            ) && terminalized_tool_ids.insert(call.owning_tool_call_id.clone())
+            {
+                terminalized_tool_calls.push(call.clone());
             }
             terminalized_capability_calls.push(call);
+        }
+        let mut uncovered_live_leases = snapshot
+            .tools
+            .iter()
+            .flat_map(|tool| {
+                tool.terminal_leases.iter().filter_map(|lease| {
+                    let surface::SurfaceRemoteTerminalLeaseState::Live {
+                        terminal_id,
+                        owner_fence,
+                    } = &lease.state
+                    else {
+                        return None;
+                    };
+                    if owner_fence != fence || covered_terminal_leases.contains(&lease.lease_id) {
+                        return None;
+                    }
+                    Some((
+                        lease.lease_id.clone(),
+                        tool.request.tool_call_id.clone(),
+                        terminal_id.clone(),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        uncovered_live_leases.sort_by_key(|(lease_id, _, _)| lease_id.clone());
+        for (lease_id, tool_call_id, terminal_id) in uncovered_live_leases {
+            let template = snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.request.tool_call_id == tool_call_id)
+                .and_then(|tool| {
+                    tool.capability_calls.iter().rev().find(|call| {
+                        call.fence == *fence
+                            && call.kind == surface::SurfaceCapabilityCallKind::TerminalCreate
+                            && matches!(
+                                &call.state,
+                                surface::SurfaceCapabilityCallState::Completed {
+                                    result:
+                                        surface::CapabilityCallResult::TerminalCreated {
+                                            terminal_id: created_terminal_id,
+                                        },
+                                    ..
+                                } if created_terminal_id == &terminal_id
+                            )
+                    })
+                })
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let call_id =
+                surface::SurfaceCapabilityCallId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let mut call = surface::SurfaceCapabilityCall {
+                call_id: call_id.clone(),
+                acp_session_id: template.acp_session_id.clone(),
+                fence: fence.clone(),
+                capability_revision: template.capability_revision,
+                policy_epoch: template.policy_epoch,
+                kind: surface::SurfaceCapabilityCallKind::TerminalKill,
+                arguments_digest: surface_sha256(terminal_id.as_str().as_bytes()),
+                owning_tool_call_id: tool_call_id,
+                state: surface::SurfaceCapabilityCallState::Prepared,
+            };
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                    call: call.clone(),
+                }),
+            ));
+            call.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                    call: call.clone(),
+                }),
+            ));
+            let diagnostic = surface::SafeDiagnosticText::try_new(
+                "runtime terminalized before remote terminal cleanup was admitted",
+            )
+            .expect("fixed terminal cleanup diagnostic is bounded");
+            call.state = surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                effect_kind: surface::ExternalEffectKind::TerminalKill,
+                error: diagnostic,
+            };
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                    call: call.clone(),
+                }),
+            ));
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                    lease: surface::SurfaceRemoteTerminalLease {
+                        lease_id,
+                        owning_tool_call_id: call.owning_tool_call_id.clone(),
+                        state: surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                            terminal_id: Some(terminal_id),
+                            owner_fence: fence.clone(),
+                        },
+                    },
+                }),
+            ));
+            if terminalized_tool_ids.insert(call.owning_tool_call_id.clone()) {
+                terminalized_tool_calls.push(call.clone());
+            }
+            terminalized_capability_calls.push(call);
+        }
+        for call in terminalized_tool_calls {
+            events.extend(self.ambiguous_capability_tool_events(&call)?);
         }
         Ok(PreparedSurfaceTerminalization {
             fence: fence.clone(),
@@ -15573,6 +17435,12 @@ impl ThreadActor {
                         let _ = waiter.send(Err(error()));
                     }
                     ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter) => {
+                        let _ = waiter.send(Err(error()));
+                    }
+                    ResidentSurfaceCapabilityWaiter::TerminalCreate(waiter) => {
+                        let _ = waiter.send(Err(error()));
+                    }
+                    ResidentSurfaceCapabilityWaiter::TerminalCleanup(waiter) => {
                         let _ = waiter.send(Err(error()));
                     }
                 }
@@ -19285,6 +21153,12 @@ impl ThreadActor {
                             fence: interaction_fence.clone(),
                         },
                     ))
+                    .with_acp_terminal_create_handler(Arc::new(
+                        RuntimeSurfaceTerminalCreateHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        },
+                    ))
                     .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
@@ -20115,6 +21989,14 @@ impl ThreadActor {
             }
         })?;
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let durable_remote_cleanup_ambiguous = snapshot.tools.iter().any(|tool| {
+            tool.terminal_leases.iter().any(|lease| {
+                matches!(
+                    lease.state,
+                    surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous { .. }
+                )
+            })
+        });
         let durable_external_effect_ambiguous = snapshot.tools.iter().any(|tool| {
             tool.capability_calls.iter().any(|call| {
                 call.fence == fence
@@ -20124,8 +22006,12 @@ impl ThreadActor {
                     )
             })
         });
-        let execution_failure = durable_external_effect_ambiguous
-            .then_some(surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous)
+        let execution_failure = durable_remote_cleanup_ambiguous
+            .then_some(surface::GenerationExecutionFailureClass::RemoteResourceCleanupAmbiguous)
+            .or_else(|| {
+                durable_external_effect_ambiguous
+                    .then_some(surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous)
+            })
             .or(active.surface_execution_failure);
         let (stop_reason, terminal) = if let Some(class) = execution_failure {
             let (message, terminal_class) = match class {
@@ -23088,7 +24974,9 @@ impl ThreadActor {
                         self.resident_surface.coordinator.state().snapshot(),
                         call_id,
                     )
-                    .is_some_and(|call| call.fence == *fence)
+                    .is_some_and(|call| {
+                        Self::surface_capability_write_blocks_terminalization(&call, fence)
+                    })
             })
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -23143,6 +25031,22 @@ impl ThreadActor {
                 Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
             }
         }
+    }
+
+    fn surface_capability_write_blocks_terminalization(
+        call: &surface::SurfaceCapabilityCall,
+        fence: &surface::SurfaceOperationFence,
+    ) -> bool {
+        call.fence == *fence
+            && !matches!(
+                (call.kind, &call.state),
+                (
+                    surface::SurfaceCapabilityCallKind::TerminalKill
+                        | surface::SurfaceCapabilityCallKind::TerminalRelease,
+                    surface::SurfaceCapabilityCallState::DeliveryPossible
+                        | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                )
+            )
     }
 
     fn surface_interaction_admission_closed(active: &ActiveOperation) -> bool {
@@ -23586,7 +25490,11 @@ impl ThreadActor {
                                                     .snapshot(),
                                                 call_id,
                                             )
-                                            .is_some_and(|call| call.fence == *fence)
+                                            .is_some_and(|call| {
+                                                Self::surface_capability_write_blocks_terminalization(
+                                                    &call, fence,
+                                                )
+                                            })
                                     },
                                 )
                             }) {
@@ -23839,12 +25747,29 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
+                ThreadCommand::SurfaceRequestAcpTerminalCreate { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
+                ThreadCommand::SurfaceRequestAcpTerminalCleanup { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceClaimAcpReadTextFileWrite { reply, .. }
                 | ThreadCommand::SurfaceAcpReadTextFileWritten { reply, .. }
                 | ThreadCommand::SurfaceAcpReadTextFileSettled { reply, .. }
                 | ThreadCommand::SurfacePermitAcpWriteTextFileDelivery { reply, .. }
                 | ThreadCommand::SurfaceAcpWriteTextFileWritten { reply, .. }
-                | ThreadCommand::SurfaceAcpWriteTextFileSettled { reply, .. } => {
+                | ThreadCommand::SurfaceAcpWriteTextFileSettled { reply, .. }
+                | ThreadCommand::SurfacePermitAcpTerminalCreateDelivery { reply, .. }
+                | ThreadCommand::SurfaceAcpTerminalCreateWritten { reply, .. }
+                | ThreadCommand::SurfaceAcpTerminalCreateSettled { reply, .. }
+                | ThreadCommand::SurfaceAcpTerminalCleanupWritten { reply, .. }
+                | ThreadCommand::SurfaceAcpTerminalCleanupSettled { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 #[cfg(test)]
@@ -24205,12 +26130,29 @@ impl ThreadActor {
                     "runtime generation is not active",
                 )));
             }
+            ThreadCommand::SurfaceRequestAcpTerminalCreate { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceRequestAcpTerminalCleanup { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
             ThreadCommand::SurfaceClaimAcpReadTextFileWrite { reply, .. }
             | ThreadCommand::SurfaceAcpReadTextFileWritten { reply, .. }
             | ThreadCommand::SurfaceAcpReadTextFileSettled { reply, .. }
             | ThreadCommand::SurfacePermitAcpWriteTextFileDelivery { reply, .. }
             | ThreadCommand::SurfaceAcpWriteTextFileWritten { reply, .. }
-            | ThreadCommand::SurfaceAcpWriteTextFileSettled { reply, .. } => {
+            | ThreadCommand::SurfaceAcpWriteTextFileSettled { reply, .. }
+            | ThreadCommand::SurfacePermitAcpTerminalCreateDelivery { reply, .. }
+            | ThreadCommand::SurfaceAcpTerminalCreateWritten { reply, .. }
+            | ThreadCommand::SurfaceAcpTerminalCreateSettled { reply, .. }
+            | ThreadCommand::SurfaceAcpTerminalCleanupWritten { reply, .. }
+            | ThreadCommand::SurfaceAcpTerminalCleanupSettled { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             #[cfg(test)]
@@ -25047,6 +26989,111 @@ impl ThreadActor {
                 reply,
             } => {
                 let result = self.settle_surface_acp_write_text_file(
+                    &client,
+                    call_id,
+                    capability_revision,
+                    settlement,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRequestAcpTerminalCreate {
+                fence,
+                request,
+                command,
+                args,
+                env,
+                cwd,
+                output_byte_limit,
+                reply,
+            } => {
+                self.request_surface_acp_terminal_create(
+                    active,
+                    fence,
+                    request,
+                    command,
+                    args,
+                    env,
+                    cwd,
+                    output_byte_limit,
+                    reply,
+                );
+            }
+            ThreadCommand::SurfacePermitAcpTerminalCreateDelivery {
+                client,
+                call_id,
+                capability_revision,
+                reply,
+            } => {
+                let result = self.permit_surface_acp_terminal_create_delivery(
+                    &client,
+                    call_id,
+                    capability_revision,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceAcpTerminalCreateWritten {
+                client,
+                call_id,
+                capability_revision,
+                reply,
+            } => {
+                let result = self.mark_surface_acp_terminal_create_written(
+                    &client,
+                    call_id,
+                    capability_revision,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceAcpTerminalCreateSettled {
+                client,
+                call_id,
+                capability_revision,
+                settlement,
+                reply,
+            } => {
+                let result = self.settle_surface_acp_terminal_create(
+                    &client,
+                    call_id,
+                    capability_revision,
+                    settlement,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRequestAcpTerminalCleanup {
+                fence,
+                request,
+                terminal_id,
+                reply,
+            } => {
+                self.request_surface_acp_terminal_cleanup(
+                    active,
+                    fence,
+                    request,
+                    terminal_id,
+                    reply,
+                );
+            }
+            ThreadCommand::SurfaceAcpTerminalCleanupWritten {
+                client,
+                call_id,
+                capability_revision,
+                reply,
+            } => {
+                let result = self.mark_surface_acp_terminal_cleanup_written(
+                    &client,
+                    call_id,
+                    capability_revision,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceAcpTerminalCleanupSettled {
+                client,
+                call_id,
+                capability_revision,
+                settlement,
+                reply,
+            } => {
+                let result = self.settle_surface_acp_terminal_cleanup(
                     &client,
                     call_id,
                     capability_revision,

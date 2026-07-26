@@ -6,7 +6,8 @@ use super::{
     SurfaceReducerError, SurfaceReducerState, SurfaceScope, ThreadOwnerEpoch, preflight_batch,
     reduce_batch,
 };
-use std::collections::VecDeque;
+use sha2::Digest;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ManualCompactionItemKey {
@@ -2023,6 +2024,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             super::SurfaceCapabilityCallState::Prepared
                                 | super::SurfaceCapabilityCallState::DeliveryPossible
                                 | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                        ) | (
+                            super::SurfaceCapabilityCallKind::TerminalCreate,
+                            super::SurfaceCapabilityCallState::Prepared
+                                | super::SurfaceCapabilityCallState::DeliveryPossible
+                                | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
                         )
                     )
             })
@@ -2032,7 +2038,8 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             let message = match (call.kind, call.state) {
                 (
                     super::SurfaceCapabilityCallKind::ReadTextFile
-                    | super::SurfaceCapabilityCallKind::WriteTextFile,
+                    | super::SurfaceCapabilityCallKind::WriteTextFile
+                    | super::SurfaceCapabilityCallKind::TerminalCreate,
                     super::SurfaceCapabilityCallState::Prepared,
                 ) => {
                     call.state = super::SurfaceCapabilityCallState::FailedBeforeWrite {
@@ -2069,6 +2076,20 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     };
                     "write-delivery-possible"
                 }
+                (
+                    super::SurfaceCapabilityCallKind::TerminalCreate,
+                    super::SurfaceCapabilityCallState::DeliveryPossible
+                    | super::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => {
+                    call.state = super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                        effect_kind: super::ExternalEffectKind::TerminalCreate,
+                        error: super::SafeDiagnosticText::try_new(
+                            "runtime restarted after ACP terminal create delivery became possible",
+                        )
+                        .expect("fixed recovery diagnostic is bounded"),
+                    };
+                    "terminal-create-delivery-possible"
+                }
                 _ => continue,
             };
             let fence = call.fence.clone();
@@ -2078,6 +2099,185 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 eprintln!("orca: failed to settle {message} capability call: {error:?}");
                 error
             })?;
+        }
+        let cleanup_leases = self
+            .state
+            .snapshot()
+            .tools
+            .iter()
+            .flat_map(|tool| {
+                tool.terminal_leases
+                    .iter()
+                    .filter_map(|lease| match &lease.state {
+                        super::SurfaceRemoteTerminalLeaseState::Live {
+                            terminal_id,
+                            owner_fence,
+                        }
+                        | super::SurfaceRemoteTerminalLeaseState::KillPending {
+                            terminal_id,
+                            owner_fence,
+                        }
+                        | super::SurfaceRemoteTerminalLeaseState::ReleasePending {
+                            terminal_id,
+                            owner_fence,
+                        } if owner_fence.operation_id == *operation_id => Some((
+                            tool.request.tool_call_id.clone(),
+                            lease.clone(),
+                            terminal_id.clone(),
+                            owner_fence.clone(),
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut cleanup_leases_by_tool = BTreeMap::new();
+        for (tool_call_id, lease, terminal_id, fence) in cleanup_leases {
+            cleanup_leases_by_tool
+                .entry(tool_call_id)
+                .or_insert_with(Vec::new)
+                .push((lease, terminal_id, fence));
+        }
+        for (tool_call_id, cleanup_leases) in cleanup_leases_by_tool {
+            let snapshot = self.state.snapshot().clone();
+            let mut patches = Vec::new();
+            let mut recovery_fence = None;
+            for (lease, terminal_id, fence) in cleanup_leases {
+                if recovery_fence
+                    .as_ref()
+                    .is_some_and(|existing| existing != &fence)
+                {
+                    return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+                }
+                recovery_fence.get_or_insert_with(|| fence.clone());
+                let terminal_digest = super::Sha256Digest::new(
+                    sha2::Sha256::digest(terminal_id.as_str().as_bytes()).into(),
+                );
+                let existing = snapshot
+                    .tools
+                    .iter()
+                    .find(|tool| tool.request.tool_call_id == tool_call_id)
+                    .and_then(|tool| {
+                        tool.capability_calls.iter().rev().find(|call| {
+                            matches!(
+                                call.kind,
+                                super::SurfaceCapabilityCallKind::TerminalKill
+                                    | super::SurfaceCapabilityCallKind::TerminalRelease
+                            ) && call.fence == fence
+                                && call.arguments_digest == terminal_digest
+                                && !matches!(
+                                call.state,
+                                super::SurfaceCapabilityCallState::Completed { .. }
+                                    | super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+                                    | super::SurfaceCapabilityCallState::ObservationUnavailable { .. }
+                                    | super::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
+                            )
+                        })
+                    })
+                    .cloned();
+                let existing_was_none = existing.is_none();
+                let mut call = if let Some(call) = existing {
+                    call
+                } else {
+                    let template = snapshot
+                        .tools
+                        .iter()
+                        .find(|tool| tool.request.tool_call_id == tool_call_id)
+                        .and_then(|tool| tool.capability_calls.last())
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+                    let kind = match lease.state {
+                        super::SurfaceRemoteTerminalLeaseState::ReleasePending { .. } => {
+                            super::SurfaceCapabilityCallKind::TerminalRelease
+                        }
+                        _ => super::SurfaceCapabilityCallKind::TerminalKill,
+                    };
+                    super::SurfaceCapabilityCall {
+                        call_id: super::SurfaceCapabilityCallId::try_from_bytes(
+                            *uuid::Uuid::now_v7().as_bytes(),
+                        )
+                        .expect("generated UUID is v7"),
+                        acp_session_id: template.acp_session_id.clone(),
+                        fence: fence.clone(),
+                        capability_revision: template.capability_revision,
+                        policy_epoch: template.policy_epoch,
+                        kind,
+                        arguments_digest: terminal_digest,
+                        owning_tool_call_id: tool_call_id.clone(),
+                        state: super::SurfaceCapabilityCallState::Prepared,
+                    }
+                };
+                if existing_was_none {
+                    patches.push(super::SurfaceEvent::Tool(
+                        super::ToolPatch::CapabilityCallChanged { call: call.clone() },
+                    ));
+                }
+                if call.state == super::SurfaceCapabilityCallState::Prepared {
+                    call.state = super::SurfaceCapabilityCallState::DeliveryPossible;
+                    patches.push(super::SurfaceEvent::Tool(
+                        super::ToolPatch::CapabilityCallChanged { call: call.clone() },
+                    ));
+                }
+                let effect_kind = match call.kind {
+                    super::SurfaceCapabilityCallKind::TerminalKill => {
+                        super::ExternalEffectKind::TerminalKill
+                    }
+                    super::SurfaceCapabilityCallKind::TerminalRelease => {
+                        super::ExternalEffectKind::TerminalRelease
+                    }
+                    _ => return Err(SurfaceCommitError::CursorRangeAlreadyConsumed),
+                };
+                call.state = super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind,
+                    error: super::SafeDiagnosticText::try_new(
+                        "runtime restarted before remote terminal cleanup completed",
+                    )
+                    .expect("fixed recovery diagnostic is bounded"),
+                };
+                patches.push(super::SurfaceEvent::Tool(
+                    super::ToolPatch::CapabilityCallChanged { call: call.clone() },
+                ));
+                patches.push(super::SurfaceEvent::Tool(
+                    super::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease: super::SurfaceRemoteTerminalLease {
+                            lease_id: lease.lease_id,
+                            owning_tool_call_id: tool_call_id.clone(),
+                            state: super::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                terminal_id: Some(terminal_id),
+                                owner_fence: fence,
+                            },
+                        },
+                    },
+                ));
+            }
+            let fence = recovery_fence.ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            let batch = self.terminal_cleanup_recovery_batch(fence.clone(), patches)?;
+            let permit = self.issue_recovery_permit(fence);
+            self.commit_batch(&permit, &batch)?;
+        }
+        let unsettled_ambiguous_tools = self
+            .state
+            .snapshot()
+            .tools
+            .iter()
+            .filter(|tool| tool.result.is_none())
+            .filter_map(|tool| {
+                tool.capability_calls
+                    .iter()
+                    .find(|call| {
+                        call.fence.operation_id == *operation_id
+                            && matches!(
+                                call.state,
+                                super::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
+                            )
+                    })
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        for call in unsettled_ambiguous_tools {
+            let patches = self.ambiguous_capability_tool_recovery_patches(&call)?;
+            let batch = self.terminal_cleanup_recovery_batch(call.fence.clone(), patches)?;
+            let permit = self.issue_recovery_permit(call.fence);
+            self.commit_batch(&permit, &batch)?;
         }
         Ok(())
     }
@@ -2283,7 +2483,27 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                                 )
                         })
                     });
+                let has_remote_cleanup_ambiguity = self.state.snapshot().tools.iter().any(|tool| {
+                    tool.terminal_leases.iter().any(|lease| {
+                        matches!(
+                            lease.state,
+                            super::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous { .. }
+                        )
+                    })
+                });
                 let stop_reason = match action {
+                    RecoveryAction::StopAndFinalizeRuntimeRestart
+                        if has_remote_cleanup_ambiguity =>
+                    {
+                        super::GenerationStopReason::ExecutionFailed {
+                            class:
+                                super::GenerationExecutionFailureClass::RemoteResourceCleanupAmbiguous,
+                            message: super::SafeDiagnosticText::try_new(
+                                "remote terminal cleanup is ambiguous after runtime restart",
+                            )
+                            .expect("static diagnostic is bounded"),
+                        }
+                    }
                     RecoveryAction::StopAndFinalizeRuntimeRestart
                         if has_external_effect_ambiguity =>
                     {
@@ -2631,6 +2851,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         let actor = self.actor_control_permit.clone();
         if permit_authorizes(&self.issued_permits, &actor, batch, self.owner_epoch)
             && finalizer_background_scope_matches_state(&self.state, &actor, batch)
+            && recovery_capability_completion_matches_state(&self.state, &actor, batch)
             && recovery_manual_compaction_matches_state(&self.state, &actor, batch)
         {
             return Ok(RecoveredBatchAuthority::Single(actor));
@@ -3284,6 +3505,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         issued.push(candidate.clone());
         if !permit_authorizes(&issued, &candidate, batch, self.owner_epoch)
             || !finalizer_background_scope_matches_state(&self.state, &candidate, batch)
+            || !recovery_capability_completion_matches_state(&self.state, &candidate, batch)
             || !recovery_manual_compaction_matches_state(&self.state, &candidate, batch)
         {
             return Err(SurfaceCommitError::StalePublisherPermit);
@@ -3757,25 +3979,95 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             super::ToolPatch::CapabilityCallChanged { call: call.clone() },
         )];
         if let super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
-            effect_kind: super::ExternalEffectKind::FileWrite,
-            error,
+            effect_kind:
+                super::ExternalEffectKind::FileWrite | super::ExternalEffectKind::TerminalCreate,
+            ..
         } = &call.state
         {
-            let tool = self
-                .state
-                .snapshot()
-                .tools
-                .iter()
-                .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
-                .filter(|tool| tool.result.is_none())
-                .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
-            let terminal = super::SurfaceToolTerminal {
-                kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
-                source: super::ToolTerminalSource::Observed,
-                invocation_started: super::ToolInvocationStarted::Yes,
-            };
-            let content = super::DisplayText::new(error.as_str());
-            patches.push(super::SurfaceEvent::Tool(super::ToolPatch::Completed {
+            if matches!(
+                call.state,
+                super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: super::ExternalEffectKind::TerminalCreate,
+                    ..
+                }
+            ) {
+                patches.push(super::SurfaceEvent::Tool(
+                    super::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease: super::SurfaceRemoteTerminalLease {
+                            lease_id: super::UuidV7::try_from_bytes(*call.call_id.as_bytes())
+                                .expect("capability call id is a UUIDv7"),
+                            owning_tool_call_id: call.owning_tool_call_id.clone(),
+                            state: super::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
+                                create_call_id: call.call_id.clone(),
+                            },
+                        },
+                    },
+                ));
+            }
+        }
+        let events = patches
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, event)| super::SurfaceEventEnvelope {
+                ordinal: ordinal as u32,
+                event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7"),
+                commit_class: commit_class.clone(),
+                scope: scope.clone(),
+                event,
+            })
+            .collect::<Vec<_>>();
+        let event_count = u32::try_from(events.len())
+            .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: cursor_before.clone(),
+            cursor_after: super::SurfaceCursor {
+                next_seq: super::SequenceNumber::new(
+                    cursor_before
+                        .next_seq
+                        .get()
+                        .checked_add(u64::from(event_count))
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                ),
+                source_revision: super::CursorSourceRevision::Recorded { durable_revision },
+                ..cursor_before
+            },
+            commit_class,
+            event_count,
+            batch_digest: super::Sha256Digest::new([0; 32]),
+            events: super::NonEmptyVec::try_new(events)
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        };
+        batch.batch_digest = super::canonical_batch_digest(&batch);
+        Ok(batch)
+    }
+
+    fn ambiguous_capability_tool_recovery_patches(
+        &self,
+        call: &super::SurfaceCapabilityCall,
+    ) -> Result<Vec<super::SurfaceEvent>, SurfaceCommitError> {
+        let super::SurfaceCapabilityCallState::ExternalEffectAmbiguous { error, .. } = &call.state
+        else {
+            return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+        };
+        let tool = self
+            .state
+            .snapshot()
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+            .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        if tool.result.is_some() {
+            return Ok(Vec::new());
+        }
+        let terminal = super::SurfaceToolTerminal {
+            kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+            source: super::ToolTerminalSource::Observed,
+            invocation_started: super::ToolInvocationStarted::Yes,
+        };
+        let content = super::DisplayText::new(error.as_str());
+        Ok(vec![
+            super::SurfaceEvent::Tool(super::ToolPatch::Completed {
                 result: super::SurfaceToolResult {
                     tool_call_id: call.owning_tool_call_id.clone(),
                     name: tool.request.name.clone(),
@@ -3786,8 +4078,8 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     truncated: false,
                     file_change: None,
                 },
-            }));
-            patches.push(super::SurfaceEvent::Item(super::ItemPatch::Added {
+            }),
+            super::SurfaceEvent::Item(super::ItemPatch::Added {
                 item: super::SurfaceItem::ToolResultMessage {
                     id: super::SurfaceItemId::new(),
                     turn_id: tool.request.turn_id.clone(),
@@ -3796,8 +4088,37 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     terminal,
                     pinned: false,
                 },
-            }));
-        }
+            }),
+        ])
+    }
+
+    fn terminal_cleanup_recovery_batch(
+        &self,
+        fence: super::SurfaceOperationFence,
+        patches: Vec<super::SurfaceEvent>,
+    ) -> Result<SurfaceCommitBatch, SurfaceCommitError> {
+        let cursor_before = self.state.snapshot().cursor.clone();
+        let durable_revision = match cursor_before.source_revision {
+            super::CursorSourceRevision::Recorded { durable_revision } => {
+                super::DurableRevision::try_new(
+                    durable_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                )
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?
+            }
+            super::CursorSourceRevision::Ephemeral { .. } => {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: self.owner_epoch,
+            durable_revision,
+            commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+        };
+        let scope = SurfaceScope::Generation { fence };
         let events = patches
             .into_iter()
             .enumerate()
@@ -3892,6 +4213,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 permit_authorizes(&self.issued_permits, permit, batch, self.owner_epoch)
                     && finalizer_background_scope_matches_state(&self.state, permit, batch)
                     && recovery_stream_dispositions_match_state(&self.state, permit, batch)
+                    && recovery_capability_completion_matches_state(&self.state, permit, batch)
                     && recovery_manual_compaction_matches_state(&self.state, permit, batch)
             }
             BatchCommitAuthority::ActorGoal { actor, goal } => actor_goal_run_start_authorized(
@@ -4704,6 +5026,8 @@ fn actor_generation_terminalization_authorized(
         _ => return false,
     };
     let mut index = 0usize;
+    let mut required_terminal_tool_ids = BTreeSet::new();
+    let mut terminalized_tool_ids = BTreeSet::new();
     while index < settlements.len() {
         let event = &settlements[index];
         let authorized = match (&event.scope, &event.event) {
@@ -4752,7 +5076,60 @@ fn actor_generation_terminalization_authorized(
                     call:
                         super::SurfaceCapabilityCall {
                             fence: call_fence,
-                            kind: super::SurfaceCapabilityCallKind::WriteTextFile,
+                            kind:
+                                super::SurfaceCapabilityCallKind::TerminalKill
+                                | super::SurfaceCapabilityCallKind::TerminalRelease,
+                            state: super::SurfaceCapabilityCallState::DeliveryPossible,
+                            ..
+                        },
+                }),
+            ) if scope == fence && call_fence == fence => {
+                let Some((consumed, owning_tool_call_id)) =
+                    recovery_terminal_cleanup_sequence_authorized(fence, settlements, index)
+                else {
+                    return false;
+                };
+                if !settlements[index..index + consumed].iter().all(
+                    |event| matches!(&event.scope, SurfaceScope::Generation { fence: scope } if scope == fence),
+                ) {
+                    return false;
+                }
+                required_terminal_tool_ids.insert(owning_tool_call_id);
+                index += consumed.saturating_sub(1);
+                true
+            }
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call:
+                        super::SurfaceCapabilityCall {
+                            fence: call_fence,
+                            kind: super::SurfaceCapabilityCallKind::TerminalKill,
+                            state: super::SurfaceCapabilityCallState::Prepared,
+                            ..
+                        },
+                }),
+            ) if scope == fence && call_fence == fence => {
+                let Some(additional_events) = live_terminal_cleanup_terminalization_authorized(
+                    fence,
+                    settlements,
+                    index,
+                    &mut required_terminal_tool_ids,
+                ) else {
+                    return false;
+                };
+                index += additional_events;
+                true
+            }
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call:
+                        super::SurfaceCapabilityCall {
+                            fence: call_fence,
+                            kind:
+                                super::SurfaceCapabilityCallKind::WriteTextFile
+                                | super::SurfaceCapabilityCallKind::TerminalCreate,
                             state: super::SurfaceCapabilityCallState::FailedBeforeWrite { .. },
                             ..
                         },
@@ -4775,52 +5152,123 @@ fn actor_generation_terminalization_authorized(
                         },
                 }),
             ) if scope == fence && call_fence == fence => {
-                let Some(completed) = settlements.get(index + 1) else {
-                    return false;
-                };
-                let Some(item) = settlements.get(index + 2) else {
+                required_terminal_tool_ids.insert(owning_tool_call_id.clone());
+                true
+            }
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call:
+                        super::SurfaceCapabilityCall {
+                            call_id,
+                            fence: call_fence,
+                            kind: super::SurfaceCapabilityCallKind::TerminalCreate,
+                            owning_tool_call_id,
+                            state:
+                                super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                    effect_kind: super::ExternalEffectKind::TerminalCreate,
+                                    ..
+                                },
+                            ..
+                        },
+                }),
+            ) if scope == fence && call_fence == fence => {
+                let Some(lease_event) = settlements.get(index + 1) else {
                     return false;
                 };
                 let (
-                    SurfaceScope::Generation {
-                        fence: completed_fence,
-                    },
-                    super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
-                ) = (&completed.scope, &completed.event)
-                else {
-                    return false;
-                };
-                let (
-                    SurfaceScope::Generation { fence: item_fence },
-                    super::SurfaceEvent::Item(super::ItemPatch::Added {
-                        item:
-                            super::SurfaceItem::ToolResultMessage {
-                                tool_call_id,
-                                terminal,
+                    SurfaceScope::Generation { fence: lease_fence },
+                    super::SurfaceEvent::Tool(super::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease:
+                            super::SurfaceRemoteTerminalLease {
+                                owning_tool_call_id: lease_tool_call_id,
+                                state:
+                                    super::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
+                                        create_call_id,
+                                    },
                                 ..
                             },
                     }),
-                ) = (&item.scope, &item.event)
+                ) = (&lease_event.scope, &lease_event.event)
                 else {
                     return false;
                 };
-                if completed_fence != fence
-                    || item_fence != fence
-                    || &result.tool_call_id != owning_tool_call_id
-                    || tool_call_id != owning_tool_call_id
-                    || result.terminal != *terminal
-                    || !matches!(
-                        result.terminal,
-                        super::SurfaceToolTerminal {
-                            kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
-                            source: super::ToolTerminalSource::Observed,
-                            invocation_started: super::ToolInvocationStarted::Yes,
-                        }
-                    )
+                if lease_fence != fence
+                    || create_call_id != call_id
+                    || lease_tool_call_id != owning_tool_call_id
                 {
                     return false;
                 }
-                index += 2;
+                required_terminal_tool_ids.insert(owning_tool_call_id.clone());
+                index += 1;
+                true
+            }
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call:
+                        super::SurfaceCapabilityCall {
+                            fence: call_fence,
+                            kind:
+                                super::SurfaceCapabilityCallKind::TerminalKill
+                                | super::SurfaceCapabilityCallKind::TerminalRelease,
+                            owning_tool_call_id,
+                            state:
+                                super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                    effect_kind:
+                                        super::ExternalEffectKind::TerminalKill
+                                        | super::ExternalEffectKind::TerminalRelease,
+                                    ..
+                                },
+                            ..
+                        },
+                }),
+            ) if scope == fence && call_fence == fence => {
+                let Some(lease_event) = settlements.get(index + 1) else {
+                    return false;
+                };
+                let (
+                    SurfaceScope::Generation { fence: lease_fence },
+                    super::SurfaceEvent::Tool(super::ToolPatch::RemoteTerminalLeaseChanged {
+                        lease:
+                            super::SurfaceRemoteTerminalLease {
+                                owning_tool_call_id: lease_tool_call_id,
+                                state:
+                                    super::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                        terminal_id: Some(_),
+                                        owner_fence,
+                                    },
+                                ..
+                            },
+                    }),
+                ) = (&lease_event.scope, &lease_event.event)
+                else {
+                    return false;
+                };
+                if lease_fence != fence
+                    || owner_fence != fence
+                    || lease_tool_call_id != owning_tool_call_id
+                {
+                    return false;
+                }
+                required_terminal_tool_ids.insert(owning_tool_call_id.clone());
+                index += 1;
+                true
+            }
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+            ) if scope == fence && required_terminal_tool_ids.contains(&result.tool_call_id) => {
+                let Some(completion_events) = ambiguous_tool_completion_authorized(
+                    fence,
+                    settlements,
+                    index,
+                    &result.tool_call_id,
+                    &mut terminalized_tool_ids,
+                ) else {
+                    return false;
+                };
+                index += completion_events.saturating_sub(1);
                 true
             }
             _ => false,
@@ -4830,7 +5278,164 @@ fn actor_generation_terminalization_authorized(
         }
         index += 1;
     }
-    true
+    required_terminal_tool_ids == terminalized_tool_ids
+}
+
+fn live_terminal_cleanup_terminalization_authorized(
+    fence: &super::SurfaceOperationFence,
+    settlements: &[super::SurfaceEventEnvelope],
+    index: usize,
+    required_terminal_tool_ids: &mut BTreeSet<super::SurfaceToolCallId>,
+) -> Option<usize> {
+    let Some(prepared_event) = settlements.get(index) else {
+        return None;
+    };
+    let Some(delivery_event) = settlements.get(index + 1) else {
+        return None;
+    };
+    let Some(ambiguous_event) = settlements.get(index + 2) else {
+        return None;
+    };
+    let Some(lease_event) = settlements.get(index + 3) else {
+        return None;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: prepared_fence,
+        },
+        super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged { call: prepared }),
+    ) = (&prepared_event.scope, &prepared_event.event)
+    else {
+        return None;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: delivery_fence,
+        },
+        super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged { call: delivery }),
+    ) = (&delivery_event.scope, &delivery_event.event)
+    else {
+        return None;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: ambiguous_fence,
+        },
+        super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged { call: ambiguous }),
+    ) = (&ambiguous_event.scope, &ambiguous_event.event)
+    else {
+        return None;
+    };
+    let (
+        SurfaceScope::Generation { fence: lease_fence },
+        super::SurfaceEvent::Tool(super::ToolPatch::RemoteTerminalLeaseChanged { lease }),
+    ) = (&lease_event.scope, &lease_event.event)
+    else {
+        return None;
+    };
+    let super::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+        terminal_id: Some(terminal_id),
+        owner_fence,
+    } = &lease.state
+    else {
+        return None;
+    };
+    if !(prepared_fence == fence
+        && delivery_fence == fence
+        && ambiguous_fence == fence
+        && lease_fence == fence
+        && prepared.fence == *fence
+        && prepared.kind == super::SurfaceCapabilityCallKind::TerminalKill
+        && prepared.state == super::SurfaceCapabilityCallState::Prepared
+        && same_capability_call_identity(prepared, delivery)
+        && delivery.state == super::SurfaceCapabilityCallState::DeliveryPossible
+        && same_capability_call_identity(prepared, ambiguous)
+        && matches!(
+            ambiguous.state,
+            super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                effect_kind: super::ExternalEffectKind::TerminalKill,
+                ..
+            }
+        )
+        && lease.owning_tool_call_id == prepared.owning_tool_call_id
+        && owner_fence == fence
+        && prepared.arguments_digest
+            == super::Sha256Digest::new(
+                sha2::Sha256::digest(terminal_id.as_str().as_bytes()).into(),
+            ))
+    {
+        return None;
+    }
+    required_terminal_tool_ids.insert(prepared.owning_tool_call_id.clone());
+    Some(3)
+}
+
+fn ambiguous_tool_completion_authorized(
+    fence: &super::SurfaceOperationFence,
+    settlements: &[super::SurfaceEventEnvelope],
+    index: usize,
+    owning_tool_call_id: &super::SurfaceToolCallId,
+    terminalized_tool_ids: &mut BTreeSet<super::SurfaceToolCallId>,
+) -> Option<usize> {
+    if !terminalized_tool_ids.insert(owning_tool_call_id.clone()) {
+        return Some(0);
+    }
+    let completed = settlements.get(index)?;
+    let item = settlements.get(index + 1)?;
+    let (
+        SurfaceScope::Generation {
+            fence: completed_fence,
+        },
+        super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+    ) = (&completed.scope, &completed.event)
+    else {
+        return None;
+    };
+    let (
+        SurfaceScope::Generation { fence: item_fence },
+        super::SurfaceEvent::Item(super::ItemPatch::Added {
+            item:
+                super::SurfaceItem::ToolResultMessage {
+                    tool_call_id,
+                    terminal,
+                    ..
+                },
+        }),
+    ) = (&item.scope, &item.event)
+    else {
+        return None;
+    };
+    if completed_fence != fence
+        || item_fence != fence
+        || &result.tool_call_id != owning_tool_call_id
+        || tool_call_id != owning_tool_call_id
+        || result.terminal != *terminal
+        || !matches!(
+            result.terminal,
+            super::SurfaceToolTerminal {
+                kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+                source: super::ToolTerminalSource::Observed,
+                invocation_started: super::ToolInvocationStarted::Yes,
+            }
+        )
+    {
+        return None;
+    }
+    Some(2)
+}
+
+fn same_capability_call_identity(
+    left: &super::SurfaceCapabilityCall,
+    right: &super::SurfaceCapabilityCall,
+) -> bool {
+    left.call_id == right.call_id
+        && left.acp_session_id == right.acp_session_id
+        && left.fence == right.fence
+        && left.capability_revision == right.capability_revision
+        && left.policy_epoch == right.policy_epoch
+        && left.kind == right.kind
+        && left.arguments_digest == right.arguments_digest
+        && left.owning_tool_call_id == right.owning_tool_call_id
 }
 
 fn live_generation_suspend_authorized(
@@ -7033,7 +7638,139 @@ fn recovery_batch_authorized(
     batch: &SurfaceCommitBatch,
 ) -> bool {
     let events = batch.events.as_slice();
+    if recovery_terminal_cleanup_ambiguity_authorized(historical_fence, events) {
+        return true;
+    }
     if recovery_manual_compaction_completion_authorized(historical_fence, events) {
+        return true;
+    }
+    if let [completed, item] = events
+        && let (
+            SurfaceScope::Generation {
+                fence: completed_fence,
+            },
+            super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+        ) = (&completed.scope, &completed.event)
+        && ambiguous_tool_completion_authorized(
+            historical_fence,
+            events,
+            0,
+            &result.tool_call_id,
+            &mut BTreeSet::new(),
+        ) == Some(2)
+        && completed_fence == historical_fence
+    {
+        let _ = item;
+        return true;
+    }
+    if let [capability, lease_event] = events
+        && let (
+            SurfaceScope::Generation {
+                fence: capability_fence,
+            },
+            super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                call:
+                    super::SurfaceCapabilityCall {
+                        call_id,
+                        fence: call_fence,
+                        kind: super::SurfaceCapabilityCallKind::TerminalCreate,
+                        owning_tool_call_id,
+                        state:
+                            super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                effect_kind: super::ExternalEffectKind::TerminalCreate,
+                                ..
+                            },
+                        ..
+                    },
+            }),
+        ) = (&capability.scope, &capability.event)
+        && let (
+            SurfaceScope::Generation { fence: lease_fence },
+            super::SurfaceEvent::Tool(super::ToolPatch::RemoteTerminalLeaseChanged {
+                lease:
+                    super::SurfaceRemoteTerminalLease {
+                        owning_tool_call_id: lease_tool_call_id,
+                        state:
+                            super::SurfaceRemoteTerminalLeaseState::IdentityUnknown { create_call_id },
+                        ..
+                    },
+            }),
+        ) = (&lease_event.scope, &lease_event.event)
+        && capability_fence == historical_fence
+        && call_fence == historical_fence
+        && lease_fence == historical_fence
+        && create_call_id == call_id
+        && lease_tool_call_id == owning_tool_call_id
+    {
+        return true;
+    }
+    if let [capability, lease_event, completed, item] = events
+        && let (
+            SurfaceScope::Generation {
+                fence: capability_fence,
+            },
+            super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                call:
+                    super::SurfaceCapabilityCall {
+                        call_id,
+                        kind: super::SurfaceCapabilityCallKind::TerminalCreate,
+                        owning_tool_call_id,
+                        state:
+                            super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                effect_kind: super::ExternalEffectKind::TerminalCreate,
+                                ..
+                            },
+                        ..
+                    },
+            }),
+        ) = (&capability.scope, &capability.event)
+        && let (
+            SurfaceScope::Generation { fence: lease_fence },
+            super::SurfaceEvent::Tool(super::ToolPatch::RemoteTerminalLeaseChanged {
+                lease:
+                    super::SurfaceRemoteTerminalLease {
+                        owning_tool_call_id: lease_tool_call_id,
+                        state:
+                            super::SurfaceRemoteTerminalLeaseState::IdentityUnknown { create_call_id },
+                        ..
+                    },
+            }),
+        ) = (&lease_event.scope, &lease_event.event)
+        && let (
+            SurfaceScope::Generation {
+                fence: completed_fence,
+            },
+            super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+        ) = (&completed.scope, &completed.event)
+        && let (
+            SurfaceScope::Generation { fence: item_fence },
+            super::SurfaceEvent::Item(super::ItemPatch::Added {
+                item:
+                    super::SurfaceItem::ToolResultMessage {
+                        tool_call_id,
+                        terminal,
+                        ..
+                    },
+            }),
+        ) = (&item.scope, &item.event)
+        && capability_fence == historical_fence
+        && lease_fence == historical_fence
+        && completed_fence == historical_fence
+        && item_fence == historical_fence
+        && create_call_id == call_id
+        && lease_tool_call_id == owning_tool_call_id
+        && &result.tool_call_id == owning_tool_call_id
+        && tool_call_id == owning_tool_call_id
+        && result.terminal == *terminal
+        && matches!(
+            result.terminal,
+            super::SurfaceToolTerminal {
+                kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+                source: super::ToolTerminalSource::Observed,
+                invocation_started: super::ToolInvocationStarted::Yes,
+            }
+        )
+    {
         return true;
     }
     if let [capability, completed, item] = events
@@ -7121,6 +7858,11 @@ fn recovery_batch_authorized(
                                     ..
                                 },
                             ..
+                        }
+                        | super::SurfaceCapabilityCall {
+                            kind: super::SurfaceCapabilityCallKind::TerminalCreate,
+                            state: super::SurfaceCapabilityCallState::FailedBeforeWrite { .. },
+                            ..
                         },
                     },
                 ),
@@ -7200,6 +7942,157 @@ fn recovery_batch_authorized(
     }) && non_stream_dispositions == 1
 }
 
+fn recovery_terminal_cleanup_ambiguity_authorized(
+    historical_fence: &super::SurfaceOperationFence,
+    events: &[super::SurfaceEventEnvelope],
+) -> bool {
+    if events.len() < 2
+        || events.iter().any(|event| {
+            !matches!(
+                &event.scope,
+                SurfaceScope::Generation { fence } if fence == historical_fence
+            )
+        })
+    {
+        return false;
+    }
+    let mut index = 0usize;
+    let mut owning_tool_call_id = None;
+    while index < events.len()
+        && !matches!(
+            &events[index].event,
+            super::SurfaceEvent::Tool(super::ToolPatch::Completed { .. })
+        )
+    {
+        let Some((consumed, sequence_tool_call_id)) =
+            recovery_terminal_cleanup_sequence_authorized(historical_fence, events, index)
+        else {
+            return false;
+        };
+        if owning_tool_call_id
+            .as_ref()
+            .is_some_and(|existing| existing != &sequence_tool_call_id)
+        {
+            return false;
+        }
+        owning_tool_call_id.get_or_insert(sequence_tool_call_id);
+        index += consumed;
+    }
+    let Some(owning_tool_call_id) = owning_tool_call_id else {
+        return false;
+    };
+    if index == events.len() {
+        return true;
+    }
+    if events.len() - index != 2 {
+        return false;
+    }
+    ambiguous_tool_completion_authorized(
+        historical_fence,
+        events,
+        index,
+        &owning_tool_call_id,
+        &mut BTreeSet::new(),
+    ) == Some(2)
+}
+
+fn recovery_terminal_cleanup_sequence_authorized(
+    historical_fence: &super::SurfaceOperationFence,
+    events: &[super::SurfaceEventEnvelope],
+    index: usize,
+) -> Option<(usize, super::SurfaceToolCallId)> {
+    let first = events.get(index)?;
+    let super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged { call: first_call }) =
+        &first.event
+    else {
+        return None;
+    };
+    let ambiguous_index = match first_call.state {
+        super::SurfaceCapabilityCallState::Prepared => {
+            let delivery = events.get(index + 1)?;
+            let ambiguous = events.get(index + 2)?;
+            let (
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call: delivery_call,
+                }),
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call: ambiguous_call,
+                }),
+            ) = (&delivery.event, &ambiguous.event)
+            else {
+                return None;
+            };
+            if delivery_call.state != super::SurfaceCapabilityCallState::DeliveryPossible
+                || !same_capability_call_identity(first_call, delivery_call)
+                || !same_capability_call_identity(first_call, ambiguous_call)
+            {
+                return None;
+            }
+            index + 2
+        }
+        super::SurfaceCapabilityCallState::DeliveryPossible => {
+            let ambiguous = events.get(index + 1)?;
+            let super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                call: ambiguous_call,
+            }) = &ambiguous.event
+            else {
+                return None;
+            };
+            if !same_capability_call_identity(first_call, ambiguous_call) {
+                return None;
+            }
+            index + 1
+        }
+        super::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. } => index,
+        _ => return None,
+    };
+    let ambiguous_event = events.get(ambiguous_index)?;
+    let lease_event = events.get(ambiguous_index + 1)?;
+    let (
+        super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged { call: ambiguous }),
+        super::SurfaceEvent::Tool(super::ToolPatch::RemoteTerminalLeaseChanged { lease }),
+    ) = (&ambiguous_event.event, &lease_event.event)
+    else {
+        return None;
+    };
+    let super::SurfaceCapabilityCallState::ExternalEffectAmbiguous { effect_kind, .. } =
+        &ambiguous.state
+    else {
+        return None;
+    };
+    let super::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+        terminal_id: Some(terminal_id),
+        owner_fence,
+    } = &lease.state
+    else {
+        return None;
+    };
+    if ambiguous.fence != *historical_fence
+        || owner_fence != historical_fence
+        || ambiguous.owning_tool_call_id != lease.owning_tool_call_id
+        || !matches!(
+            (ambiguous.kind, effect_kind),
+            (
+                super::SurfaceCapabilityCallKind::TerminalKill,
+                super::ExternalEffectKind::TerminalKill
+            ) | (
+                super::SurfaceCapabilityCallKind::TerminalRelease,
+                super::ExternalEffectKind::TerminalRelease
+            )
+        )
+        || ambiguous.arguments_digest
+            != super::Sha256Digest::new(
+                sha2::Sha256::digest(terminal_id.as_str().as_bytes()).into(),
+            )
+    {
+        return None;
+    }
+    Some((
+        ambiguous_index + 2 - index,
+        ambiguous.owning_tool_call_id.clone(),
+    ))
+}
+
 fn recovery_manual_compaction_completion_authorized(
     historical_fence: &super::SurfaceOperationFence,
     events: &[super::SurfaceEventEnvelope],
@@ -7233,6 +8126,99 @@ fn recovery_manual_compaction_completion_authorized(
             _ => false,
         }
     }) && completed == 1
+}
+
+fn recovery_capability_completion_matches_state(
+    state: &SurfaceReducerState,
+    permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+) -> bool {
+    let SurfacePublisherPermit::Recovery {
+        historical_fence, ..
+    } = permit
+    else {
+        return true;
+    };
+    let [completed, item] = batch.events.as_slice() else {
+        return true;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: completed_fence,
+        },
+        super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+        SurfaceScope::Generation { fence: item_fence },
+        super::SurfaceEvent::Item(super::ItemPatch::Added {
+            item:
+                super::SurfaceItem::ToolResultMessage {
+                    turn_id,
+                    tool_call_id,
+                    content,
+                    terminal,
+                    pinned,
+                    ..
+                },
+        }),
+    ) = (&completed.scope, &completed.event, &item.scope, &item.event)
+    else {
+        return true;
+    };
+    if !matches!(
+        result.terminal,
+        super::SurfaceToolTerminal {
+            kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+            source: super::ToolTerminalSource::Observed,
+            invocation_started: super::ToolInvocationStarted::Yes,
+        }
+    ) {
+        return true;
+    }
+    let Some(tool) = state
+        .snapshot()
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == result.tool_call_id)
+    else {
+        return false;
+    };
+    let Some(error) = tool.capability_calls.iter().find_map(|call| {
+        if call.fence != *historical_fence {
+            return None;
+        }
+        let super::SurfaceCapabilityCallState::ExternalEffectAmbiguous { error, .. } = &call.state
+        else {
+            return None;
+        };
+        Some(error)
+    }) else {
+        return false;
+    };
+    let expected_content = super::DisplayText::new(error.as_str());
+    let all_capabilities_terminal = tool.capability_calls.iter().all(|call| {
+        matches!(
+            call.state,
+            super::SurfaceCapabilityCallState::Completed { .. }
+                | super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+                | super::SurfaceCapabilityCallState::ObservationUnavailable { .. }
+                | super::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
+        )
+    });
+    completed_fence == historical_fence
+        && item_fence == historical_fence
+        && tool.result.is_none()
+        && all_capabilities_terminal
+        && result.tool_call_id == tool.request.tool_call_id
+        && result.name == tool.request.name
+        && result.output.is_none()
+        && result.error.as_ref() == Some(&expected_content)
+        && result.exit_code.is_none()
+        && !result.truncated
+        && result.file_change.is_none()
+        && turn_id == &tool.request.turn_id
+        && tool_call_id == &tool.request.tool_call_id
+        && content == &expected_content
+        && terminal == &result.terminal
+        && !pinned
 }
 
 fn recovery_manual_compaction_matches_state(
@@ -7289,12 +8275,12 @@ fn recovery_generation_stop_authorized(
                 reason: super::GenerationStopReason::RuntimeRestart
                     | super::GenerationStopReason::NotStarted {
                         reason: super::NotStartedReason::RuntimeRestart,
-                    }
-                    | super::GenerationStopReason::ExecutionFailed {
-                        class: super::GenerationExecutionFailureClass::ClientCapabilityUnavailable
-                            | super::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
-                        ..
-                    },
+                    } | super::GenerationStopReason::ExecutionFailed {
+                    class: super::GenerationExecutionFailureClass::ClientCapabilityUnavailable
+                        | super::GenerationExecutionFailureClass::ExternalEffectAmbiguous
+                        | super::GenerationExecutionFailureClass::RemoteResourceCleanupAmbiguous,
+                    ..
+                },
                 ..
             })
         )
@@ -9156,6 +10142,108 @@ mod tests {
             &permit,
             &batch,
             ThreadOwnerEpoch::new(1),
+        ));
+    }
+
+    #[test]
+    fn completion_only_recovery_requires_persisted_external_effect_ambiguity() {
+        let fence = test_operation_fence(121);
+        let tool_call_id = super::super::SurfaceToolCallId::try_new("recovery-tool").unwrap();
+        let turn_id = super::super::SurfaceTurnId::new();
+        let mut snapshot = reducer_snapshot();
+        snapshot.tools.push(super::super::SurfaceToolView {
+            request: super::super::SurfaceToolRequest {
+                tool_call_id: tool_call_id.clone(),
+                source_response_id: Some(
+                    super::super::UuidV7::try_from_bytes(uuid_v7_bytes(122)).unwrap(),
+                ),
+                turn_id: turn_id.clone(),
+                name: super::super::NonEmptyText::try_new("read_file").unwrap(),
+                action: super::super::SurfaceToolAction::Read,
+                target: Some(super::super::DisplayText::new("/tmp/input")),
+                raw_arguments: super::super::DisplayText::new(r#"{"path":"/tmp/input"}"#),
+                arguments_digest: digest(123),
+            },
+            state: super::super::SurfaceToolViewState::Running,
+            arguments_bytes: super::super::ByteCount::new(21),
+            output_bytes: super::super::ByteCount::new(0),
+            streamed_output: super::super::DisplayText::new(""),
+            streamed_output_truncated: false,
+            result: None,
+            capability_calls: vec![super::super::SurfaceCapabilityCall {
+                call_id: super::super::SurfaceCapabilityCallId::try_from_bytes(uuid_v7_bytes(124))
+                    .unwrap(),
+                acp_session_id: super::super::NonEmptyText::try_new("session").unwrap(),
+                fence: fence.clone(),
+                capability_revision: super::super::CapabilityRevision::try_new(1).unwrap(),
+                policy_epoch: super::super::PolicyEpoch::try_new(1).unwrap(),
+                kind: super::super::SurfaceCapabilityCallKind::ReadTextFile,
+                arguments_digest: digest(125),
+                owning_tool_call_id: tool_call_id.clone(),
+                state: super::super::SurfaceCapabilityCallState::FailedBeforeWrite {
+                    error: super::super::SafeDiagnosticText::try_new("request was never written")
+                        .unwrap(),
+                },
+            }],
+            terminal_leases: Vec::new(),
+        });
+        let state = SurfaceReducerState::new(snapshot);
+        let terminal = super::super::SurfaceToolTerminal {
+            kind: super::super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+            source: super::super::ToolTerminalSource::Observed,
+            invocation_started: super::super::ToolInvocationStarted::Yes,
+        };
+        let content = super::super::DisplayText::new("forged ambiguity");
+        let scope = SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let batch = test_batch_with_events(
+            &state,
+            vec![
+                (
+                    scope.clone(),
+                    super::super::SurfaceEvent::Tool(super::super::ToolPatch::Completed {
+                        result: super::super::SurfaceToolResult {
+                            tool_call_id: tool_call_id.clone(),
+                            name: super::super::NonEmptyText::try_new("read_file").unwrap(),
+                            terminal: terminal.clone(),
+                            output: None,
+                            error: Some(content.clone()),
+                            exit_code: None,
+                            truncated: false,
+                            file_change: None,
+                        },
+                    }),
+                ),
+                (
+                    scope,
+                    super::super::SurfaceEvent::Item(super::super::ItemPatch::Added {
+                        item: super::super::SurfaceItem::ToolResultMessage {
+                            id: super::super::SurfaceItemId::new(),
+                            turn_id,
+                            tool_call_id,
+                            content,
+                            terminal,
+                            pinned: false,
+                        },
+                    }),
+                ),
+            ],
+        );
+        let permit = SurfacePublisherPermit::Recovery {
+            permit_id: super::super::SurfacePublisherPermitId::new([12; 32]),
+            current_owner_epoch: ThreadOwnerEpoch::new(1),
+            historical_fence: fence,
+        };
+
+        assert!(permit_authorizes(
+            std::slice::from_ref(&permit),
+            &permit,
+            &batch,
+            ThreadOwnerEpoch::new(1),
+        ));
+        assert!(!recovery_capability_completion_matches_state(
+            &state, &permit, &batch,
         ));
     }
 

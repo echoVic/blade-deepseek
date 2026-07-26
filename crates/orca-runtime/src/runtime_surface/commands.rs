@@ -353,6 +353,43 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         settlement: AcpWriteTextFileSettlement,
     ) -> Result<(), SurfaceClientCommandError>;
 
+    fn permit_acp_terminal_create_delivery(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn mark_acp_terminal_create_written(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn settle_acp_terminal_create(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpTerminalCreateSettlement,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn mark_acp_terminal_cleanup_written(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn settle_acp_terminal_cleanup(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpTerminalCleanupSettlement,
+    ) -> Result<(), SurfaceClientCommandError>;
+
     fn detach(&self, client: RuntimeSurfaceClientHandle, request: DetachRequest) -> DetachResult;
 
     fn reserve_operation(
@@ -579,6 +616,63 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .settle_acp_write_text_file(self.clone(), call_id, capability_revision, settlement)
+    }
+
+    pub(crate) fn permit_acp_terminal_create_delivery(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .permit_acp_terminal_create_delivery(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn mark_acp_terminal_create_written(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .mark_acp_terminal_create_written(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn settle_acp_terminal_create(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpTerminalCreateSettlement,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .settle_acp_terminal_create(self.clone(), call_id, capability_revision, settlement)
+    }
+
+    pub(crate) fn mark_acp_terminal_cleanup_written(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .mark_acp_terminal_cleanup_written(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn settle_acp_terminal_cleanup(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpTerminalCleanupSettlement,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .settle_acp_terminal_cleanup(self.clone(), call_id, capability_revision, settlement)
     }
 
     pub fn reserve_operation(
@@ -3721,6 +3815,24 @@ impl RuntimeSurfaceHandle {
         self.hub
             .as_ref()?
             .claim_acp_write_text_file_dispatch(client)
+    }
+
+    pub(crate) fn claim_acp_terminal_create_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpTerminalCreateDispatchReceiver> {
+        self.hub
+            .as_ref()?
+            .claim_acp_terminal_create_dispatch(client)
+    }
+
+    pub(crate) fn claim_acp_terminal_cleanup_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpTerminalCleanupDispatchReceiver> {
+        self.hub
+            .as_ref()?
+            .claim_acp_terminal_cleanup_dispatch(client)
     }
 
     pub fn detach(

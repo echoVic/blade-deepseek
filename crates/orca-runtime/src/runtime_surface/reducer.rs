@@ -1724,13 +1724,19 @@ fn validate_batch_pairings(
                                 lease: SurfaceRemoteTerminalLease {
                                     owning_tool_call_id,
                                     state: SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                                        terminal_id: Some(terminal_id),
                                         owner_fence,
-                                        ..
                                     },
                                     ..
                                 }
                             }) if owning_tool_call_id == &call.owning_tool_call_id
                                 && owner_fence == &call.fence
+                                && call.arguments_digest
+                                    == Sha256Digest::new(
+                                        sha2::Sha256::digest(
+                                            terminal_id.as_str().as_bytes()
+                                        ).into()
+                                    )
                         )
                     }),
                     _ => continue,
@@ -1782,7 +1788,7 @@ fn validate_batch_pairings(
                         owning_tool_call_id,
                         state:
                             SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
-                                terminal_id: Some(_),
+                                terminal_id: Some(terminal_id),
                                 owner_fence,
                             },
                         ..
@@ -1795,6 +1801,7 @@ fn validate_batch_pairings(
                             call: SurfaceCapabilityCall {
                                 owning_tool_call_id: call_tool_id,
                                 fence: call_fence,
+                                arguments_digest,
                                 kind,
                                 state: SurfaceCapabilityCallState::ExternalEffectAmbiguous {
                                     effect_kind,
@@ -1804,6 +1811,12 @@ fn validate_batch_pairings(
                             }
                         }) if call_tool_id == owning_tool_call_id
                             && call_fence == owner_fence
+                            && arguments_digest
+                                == &Sha256Digest::new(
+                                    sha2::Sha256::digest(
+                                        terminal_id.as_str().as_bytes()
+                                    ).into()
+                                )
                             && matches!(
                                 (kind, effect_kind),
                                 (

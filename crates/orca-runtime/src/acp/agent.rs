@@ -159,6 +159,8 @@ pub(crate) struct AcpClientBridge {
     request_tx: mpsc::Sender<AcpPermissionRequest>,
     read_text_file_tx: Mutex<Option<mpsc::Sender<AcpReadTextFileRequest>>>,
     write_text_file_tx: Mutex<Option<mpsc::Sender<AcpWriteTextFileRequest>>>,
+    terminal_create_tx: Mutex<Option<mpsc::Sender<AcpTerminalCreateRequest>>>,
+    terminal_cleanup_tx: Mutex<Option<mpsc::Sender<AcpTerminalCleanupRequest>>>,
     state: Mutex<AcpClientBridgeState>,
     capability_write_notify: tokio::sync::Notify,
     next_key: AtomicU64,
@@ -197,6 +199,16 @@ pub(crate) struct AcpWriteTextFileRequest {
     pub(crate) dispatch: crate::runtime_surface::AcpWriteTextFileDispatch,
 }
 
+pub(crate) struct AcpTerminalCreateRequest {
+    pub(crate) client: RuntimeSurfaceClientHandle,
+    pub(crate) dispatch: crate::runtime_surface::AcpTerminalCreateDispatch,
+}
+
+pub(crate) struct AcpTerminalCleanupRequest {
+    pub(crate) client: RuntimeSurfaceClientHandle,
+    pub(crate) dispatch: crate::runtime_surface::AcpTerminalCleanupDispatch,
+}
+
 impl AcpClientBridge {
     #[cfg(test)]
     pub(crate) fn new() -> (Arc<Self>, mpsc::Receiver<AcpPermissionRequest>) {
@@ -206,6 +218,8 @@ impl AcpClientBridge {
                 request_tx,
                 read_text_file_tx: Mutex::new(None),
                 write_text_file_tx: Mutex::new(None),
+                terminal_create_tx: Mutex::new(None),
+                terminal_cleanup_tx: Mutex::new(None),
                 state: Mutex::new(AcpClientBridgeState {
                     pending: HashMap::new(),
                     cancelled_sessions: HashSet::new(),
@@ -224,15 +238,21 @@ impl AcpClientBridge {
         mpsc::Receiver<AcpPermissionRequest>,
         mpsc::Receiver<AcpReadTextFileRequest>,
         mpsc::Receiver<AcpWriteTextFileRequest>,
+        mpsc::Receiver<AcpTerminalCreateRequest>,
+        mpsc::Receiver<AcpTerminalCleanupRequest>,
     ) {
         let (request_tx, request_rx) = mpsc::channel(ACP_PERMISSION_REQUEST_CAPACITY);
         let (read_text_file_tx, read_text_file_rx) = mpsc::channel(1);
         let (write_text_file_tx, write_text_file_rx) = mpsc::channel(1);
+        let (terminal_create_tx, terminal_create_rx) = mpsc::channel(1);
+        let (terminal_cleanup_tx, terminal_cleanup_rx) = mpsc::channel(1);
         (
             Arc::new(Self {
                 request_tx,
                 read_text_file_tx: Mutex::new(Some(read_text_file_tx)),
                 write_text_file_tx: Mutex::new(Some(write_text_file_tx)),
+                terminal_create_tx: Mutex::new(Some(terminal_create_tx)),
+                terminal_cleanup_tx: Mutex::new(Some(terminal_cleanup_tx)),
                 state: Mutex::new(AcpClientBridgeState {
                     pending: HashMap::new(),
                     cancelled_sessions: HashSet::new(),
@@ -245,6 +265,8 @@ impl AcpClientBridge {
             request_rx,
             read_text_file_rx,
             write_text_file_rx,
+            terminal_create_rx,
+            terminal_cleanup_rx,
         )
     }
 
@@ -283,6 +305,44 @@ impl AcpClientBridge {
         };
         sender
             .try_send(AcpWriteTextFileRequest { client, dispatch })
+            .map_err(|error| error.into_inner().dispatch)
+    }
+
+    fn dispatch_terminal_create(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        dispatch: crate::runtime_surface::AcpTerminalCreateDispatch,
+    ) -> Result<(), crate::runtime_surface::AcpTerminalCreateDispatch> {
+        let Some(sender) = self
+            .terminal_create_tx
+            .lock()
+            .expect("ACP terminal create sender mutex is not poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            return Err(dispatch);
+        };
+        sender
+            .try_send(AcpTerminalCreateRequest { client, dispatch })
+            .map_err(|error| error.into_inner().dispatch)
+    }
+
+    fn dispatch_terminal_cleanup(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        dispatch: crate::runtime_surface::AcpTerminalCleanupDispatch,
+    ) -> Result<(), crate::runtime_surface::AcpTerminalCleanupDispatch> {
+        let Some(sender) = self
+            .terminal_cleanup_tx
+            .lock()
+            .expect("ACP terminal cleanup sender mutex is not poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            return Err(dispatch);
+        };
+        sender
+            .try_send(AcpTerminalCleanupRequest { client, dispatch })
             .map_err(|error| error.into_inner().dispatch)
     }
 
@@ -439,6 +499,14 @@ impl AcpClientBridge {
         self.write_text_file_tx
             .lock()
             .expect("ACP write sender mutex is not poisoned")
+            .take();
+        self.terminal_create_tx
+            .lock()
+            .expect("ACP terminal create sender mutex is not poisoned")
+            .take();
+        self.terminal_cleanup_tx
+            .lock()
+            .expect("ACP terminal cleanup sender mutex is not poisoned")
             .take();
         let pending = {
             let mut state = self
@@ -816,6 +884,8 @@ struct PreparedSurfacePrompt {
     subscription: crate::surface::SurfaceSubscriptionReceiver,
     read_text_file_dispatch: Option<crate::runtime_surface::AcpReadTextFileDispatchReceiver>,
     write_text_file_dispatch: Option<crate::runtime_surface::AcpWriteTextFileDispatchReceiver>,
+    terminal_create_dispatch: Option<crate::runtime_surface::AcpTerminalCreateDispatchReceiver>,
+    terminal_cleanup_dispatch: Option<crate::runtime_surface::AcpTerminalCleanupDispatchReceiver>,
     client_bridge: Option<Arc<AcpClientBridge>>,
     tool_outputs: HashMap<String, ToolOutputAccumulator>,
     detached: bool,
@@ -1265,6 +1335,32 @@ fn prepare_surface_prompt(
     } else {
         None
     };
+    let terminal_create_dispatch = if client_capabilities.terminal {
+        Some(
+            surface
+                .claim_acp_terminal_create_dispatch(&attachment.client)
+                .ok_or_else(|| {
+                    AcpPromptPrepareError::internal(
+                        "ACP terminal create transport lane unavailable",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let terminal_cleanup_dispatch = if client_capabilities.terminal {
+        Some(
+            surface
+                .claim_acp_terminal_cleanup_dispatch(&attachment.client)
+                .ok_or_else(|| {
+                    AcpPromptPrepareError::internal(
+                        "ACP terminal cleanup transport lane unavailable",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let session_id = NonEmptyText::try_new(session_id.to_string()).map_err(|error| {
         AcpPromptPrepareError::invalid(format!("invalid ACP session id: {error}"))
     })?;
@@ -1340,6 +1436,8 @@ fn prepare_surface_prompt(
         subscription,
         read_text_file_dispatch,
         write_text_file_dispatch,
+        terminal_create_dispatch,
+        terminal_cleanup_dispatch,
         client_bridge,
         tool_outputs: HashMap::new(),
         detached: false,
@@ -1460,6 +1558,8 @@ fn drain_surface_prompt(
     let terminal = loop {
         drain_read_text_file_dispatch(&prepared);
         drain_write_text_file_dispatch(&prepared);
+        drain_terminal_create_dispatch(&prepared);
+        drain_terminal_cleanup_dispatch(&prepared);
         let Some(item) = prepared
             .subscription
             .recv_timeout(std::time::Duration::from_millis(100))
@@ -1516,6 +1616,62 @@ fn drain_write_text_file_dispatch(prepared: &PreparedSurfacePrompt) {
                 dispatch.capability_revision,
                 crate::runtime_surface::AcpWriteTextFileSettlement::FailedBeforeWrite {
                     message: "ACP write capability transport lane is unavailable".to_string(),
+                },
+            );
+        }
+    }
+}
+
+fn drain_terminal_create_dispatch(prepared: &PreparedSurfacePrompt) {
+    let Some(receiver) = prepared.terminal_create_dispatch.as_ref() else {
+        return;
+    };
+    loop {
+        let dispatch = match receiver.try_recv() {
+            Ok(dispatch) => dispatch,
+            Err(crate::runtime_surface::AcpCapabilityDispatchError::Empty) => return,
+            Err(crate::runtime_surface::AcpCapabilityDispatchError::Disconnected)
+            | Err(crate::runtime_surface::AcpCapabilityDispatchError::StaleRoute)
+            | Err(crate::runtime_surface::AcpCapabilityDispatchError::Full) => return,
+        };
+        let failed = match prepared.client_bridge.as_ref() {
+            Some(bridge) => bridge.dispatch_terminal_create(prepared.client.clone(), dispatch),
+            None => Err(dispatch),
+        };
+        if let Err(dispatch) = failed {
+            let _ = prepared.client.settle_acp_terminal_create(
+                dispatch.call_id,
+                dispatch.capability_revision,
+                crate::runtime_surface::AcpTerminalCreateSettlement::FailedBeforeWrite {
+                    message: "ACP terminal create transport lane is unavailable".to_string(),
+                },
+            );
+        }
+    }
+}
+
+fn drain_terminal_cleanup_dispatch(prepared: &PreparedSurfacePrompt) {
+    let Some(receiver) = prepared.terminal_cleanup_dispatch.as_ref() else {
+        return;
+    };
+    loop {
+        let dispatch = match receiver.try_recv() {
+            Ok(dispatch) => dispatch,
+            Err(crate::runtime_surface::AcpCapabilityDispatchError::Empty) => return,
+            Err(crate::runtime_surface::AcpCapabilityDispatchError::Disconnected)
+            | Err(crate::runtime_surface::AcpCapabilityDispatchError::StaleRoute)
+            | Err(crate::runtime_surface::AcpCapabilityDispatchError::Full) => return,
+        };
+        let failed = match prepared.client_bridge.as_ref() {
+            Some(bridge) => bridge.dispatch_terminal_cleanup(prepared.client.clone(), dispatch),
+            None => Err(dispatch),
+        };
+        if let Err(dispatch) = failed {
+            let _ = prepared.client.settle_acp_terminal_cleanup(
+                dispatch.call_id,
+                dispatch.capability_revision,
+                crate::runtime_surface::AcpTerminalCleanupSettlement::ExternalEffectAmbiguous {
+                    message: "ACP terminal cleanup transport lane is unavailable".to_string(),
                 },
             );
         }

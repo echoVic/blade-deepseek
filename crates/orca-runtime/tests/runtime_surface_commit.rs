@@ -1,4 +1,5 @@
 use orca_runtime::unstable_surface::*;
+use sha2::Digest;
 use std::path::PathBuf;
 
 const MANIFEST: &str = include_str!(concat!(
@@ -536,6 +537,8 @@ fn recovery_terminalizes_interrupted_capability_calls_without_replay() {
     });
     let tool_call_id = SurfaceToolCallId::try_new("read-recovery").unwrap();
     let second_tool_call_id = SurfaceToolCallId::try_new("write-recovery").unwrap();
+    let terminal_tool_call_id = SurfaceToolCallId::try_new("terminal-create-recovery").unwrap();
+    let live_terminal_tool_call_id = SurfaceToolCallId::try_new("terminal-live-recovery").unwrap();
     let call = |seed, owning_tool_call_id: &SurfaceToolCallId, kind, state| SurfaceCapabilityCall {
         call_id: SurfaceCapabilityCallId::try_from_bytes(uuid(seed)).unwrap(),
         acp_session_id: NonEmptyText::try_new("session-recovery").unwrap(),
@@ -589,6 +592,132 @@ fn recovery_terminalizes_interrupted_capability_calls_without_replay() {
                 &tool_call_id,
                 SurfaceCapabilityCallKind::WriteTextFile,
                 SurfaceCapabilityCallState::DeliveryPossible,
+            ),
+        ],
+        terminal_leases: Vec::new(),
+    });
+    let live_terminal_id = SurfaceRemoteTerminalId::try_new("terminal-live").unwrap();
+    let second_live_terminal_id = SurfaceRemoteTerminalId::try_new("terminal-live-second").unwrap();
+    let live_create_call = call(
+        198,
+        &live_terminal_tool_call_id,
+        SurfaceCapabilityCallKind::TerminalCreate,
+        SurfaceCapabilityCallState::Completed {
+            result: CapabilityCallResult::TerminalCreated {
+                terminal_id: live_terminal_id.clone(),
+            },
+            response_digest: digest(199),
+        },
+    );
+    let second_live_create_call = call(
+        202,
+        &live_terminal_tool_call_id,
+        SurfaceCapabilityCallKind::TerminalCreate,
+        SurfaceCapabilityCallState::Completed {
+            result: CapabilityCallResult::TerminalCreated {
+                terminal_id: second_live_terminal_id.clone(),
+            },
+            response_digest: digest(203),
+        },
+    );
+    let live_kill_call = SurfaceCapabilityCall {
+        call_id: SurfaceCapabilityCallId::try_from_bytes(uuid(204)).unwrap(),
+        acp_session_id: NonEmptyText::try_new("session-recovery").unwrap(),
+        fence: fence.clone(),
+        capability_revision: CapabilityRevision::try_new(1).unwrap(),
+        policy_epoch: PolicyEpoch::try_new(1).unwrap(),
+        kind: SurfaceCapabilityCallKind::TerminalKill,
+        arguments_digest: Sha256Digest::new(
+            sha2::Sha256::digest(live_terminal_id.as_str().as_bytes()).into(),
+        ),
+        owning_tool_call_id: live_terminal_tool_call_id.clone(),
+        state: SurfaceCapabilityCallState::DeliveryPossible,
+    };
+    let second_live_release_call = SurfaceCapabilityCall {
+        call_id: SurfaceCapabilityCallId::try_from_bytes(uuid(205)).unwrap(),
+        acp_session_id: NonEmptyText::try_new("session-recovery").unwrap(),
+        fence: fence.clone(),
+        capability_revision: CapabilityRevision::try_new(1).unwrap(),
+        policy_epoch: PolicyEpoch::try_new(1).unwrap(),
+        kind: SurfaceCapabilityCallKind::TerminalRelease,
+        arguments_digest: Sha256Digest::new(
+            sha2::Sha256::digest(second_live_terminal_id.as_str().as_bytes()).into(),
+        ),
+        owning_tool_call_id: live_terminal_tool_call_id.clone(),
+        state: SurfaceCapabilityCallState::WrittenAwaitingResponse,
+    };
+    recovered_snapshot.tools.push(SurfaceToolView {
+        request: SurfaceToolRequest {
+            tool_call_id: live_terminal_tool_call_id.clone(),
+            source_response_id: Some(UuidV7::try_from_bytes(uuid(200)).unwrap()),
+            turn_id: operation.generations[0].logical_turn_id.clone(),
+            name: NonEmptyText::try_new("bash").unwrap(),
+            action: SurfaceToolAction::Shell,
+            target: Some(DisplayText::new("sleep")),
+            raw_arguments: DisplayText::new(r#"{"command":"sleep","args":["10"]}"#),
+            arguments_digest: digest(201),
+        },
+        state: SurfaceToolViewState::Running,
+        arguments_bytes: ByteCount::new(38),
+        output_bytes: ByteCount::new(0),
+        streamed_output: DisplayText::new(""),
+        streamed_output_truncated: false,
+        result: None,
+        capability_calls: vec![
+            live_create_call.clone(),
+            second_live_create_call.clone(),
+            live_kill_call,
+            second_live_release_call,
+        ],
+        terminal_leases: vec![
+            SurfaceRemoteTerminalLease {
+                lease_id: UuidV7::try_from_bytes(*live_create_call.call_id.as_bytes()).unwrap(),
+                owning_tool_call_id: live_terminal_tool_call_id.clone(),
+                state: SurfaceRemoteTerminalLeaseState::KillPending {
+                    terminal_id: live_terminal_id.clone(),
+                    owner_fence: fence.clone(),
+                },
+            },
+            SurfaceRemoteTerminalLease {
+                lease_id: UuidV7::try_from_bytes(*second_live_create_call.call_id.as_bytes())
+                    .unwrap(),
+                owning_tool_call_id: live_terminal_tool_call_id.clone(),
+                state: SurfaceRemoteTerminalLeaseState::ReleasePending {
+                    terminal_id: second_live_terminal_id.clone(),
+                    owner_fence: fence.clone(),
+                },
+            },
+        ],
+    });
+    recovered_snapshot.tools.push(SurfaceToolView {
+        request: SurfaceToolRequest {
+            tool_call_id: terminal_tool_call_id.clone(),
+            source_response_id: Some(UuidV7::try_from_bytes(uuid(195)).unwrap()),
+            turn_id: operation.generations[0].logical_turn_id.clone(),
+            name: NonEmptyText::try_new("bash").unwrap(),
+            action: SurfaceToolAction::Shell,
+            target: Some(DisplayText::new("printf")),
+            raw_arguments: DisplayText::new(r#"{"command":"printf","args":["hello"]}"#),
+            arguments_digest: digest(196),
+        },
+        state: SurfaceToolViewState::Running,
+        arguments_bytes: ByteCount::new(39),
+        output_bytes: ByteCount::new(0),
+        streamed_output: DisplayText::new(""),
+        streamed_output_truncated: false,
+        result: None,
+        capability_calls: vec![
+            call(
+                197,
+                &terminal_tool_call_id,
+                SurfaceCapabilityCallKind::TerminalCreate,
+                SurfaceCapabilityCallState::DeliveryPossible,
+            ),
+            call(
+                206,
+                &terminal_tool_call_id,
+                SurfaceCapabilityCallKind::TerminalCreate,
+                SurfaceCapabilityCallState::WrittenAwaitingResponse,
             ),
         ],
         terminal_leases: Vec::new(),
@@ -687,13 +816,86 @@ fn recovery_terminalizes_interrupted_capability_calls_without_replay() {
             ..
         }
     ));
+    let recovered_terminal_create = calls
+        .iter()
+        .find(|call| call.call_id == SurfaceCapabilityCallId::try_from_bytes(uuid(197)).unwrap())
+        .expect("recovered terminal create call");
     assert!(matches!(
-        calls[4].state,
+        recovered_terminal_create.state,
+        SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+            effect_kind: ExternalEffectKind::TerminalCreate,
+            ..
+        }
+    ));
+    let recovered_write = calls
+        .iter()
+        .find(|call| call.call_id == SurfaceCapabilityCallId::try_from_bytes(uuid(192)).unwrap())
+        .expect("recovered write call");
+    assert!(matches!(
+        recovered_write.state,
         SurfaceCapabilityCallState::ExternalEffectAmbiguous {
             effect_kind: ExternalEffectKind::FileWrite,
             ..
         }
     ));
+    let live_terminal_tool = coordinator
+        .state()
+        .snapshot()
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == live_terminal_tool_call_id)
+        .expect("live terminal recovery tool");
+    assert!(live_terminal_tool.capability_calls.iter().any(|call| {
+        matches!(
+            call.state,
+            SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                effect_kind: ExternalEffectKind::TerminalKill,
+                ..
+            }
+        )
+    }));
+    assert_eq!(live_terminal_tool.terminal_leases.len(), 2);
+    assert!(live_terminal_tool.terminal_leases.iter().any(|lease| {
+        matches!(
+            &lease.state,
+            SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                terminal_id: Some(terminal_id),
+                ..
+            } if terminal_id == &live_terminal_id
+        )
+    }));
+    assert!(live_terminal_tool.terminal_leases.iter().any(|lease| {
+        matches!(
+            &lease.state,
+            SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+                terminal_id: Some(terminal_id),
+                ..
+            } if terminal_id == &second_live_terminal_id
+        )
+    }));
+    assert!(matches!(
+        live_terminal_tool.state,
+        SurfaceToolViewState::Completed
+    ));
+    assert!(matches!(
+        live_terminal_tool
+            .result
+            .as_ref()
+            .map(|result| result.terminal.kind),
+        Some(SurfaceToolResultKind::ExternalEffectAmbiguous)
+    ));
+    let terminal_tool = coordinator
+        .state()
+        .snapshot()
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == terminal_tool_call_id)
+        .expect("terminal create recovery tool");
+    assert_eq!(terminal_tool.terminal_leases.len(), 2);
+    assert!(terminal_tool.terminal_leases.iter().all(|lease| matches!(
+        lease.state,
+        SurfaceRemoteTerminalLeaseState::IdentityUnknown { .. }
+    )));
     assert!(coordinator.state().snapshot().tools.iter().all(|tool| {
         matches!(
             tool.result.as_ref().map(|result| result.terminal.kind),
@@ -725,7 +927,7 @@ fn recovery_terminalizes_interrupted_capability_calls_without_replay() {
     assert!(matches!(
         &terminal.terminal,
         OperationTerminal::Failed {
-            class: FailureClass::ExternalEffectAmbiguous,
+            class: FailureClass::RemoteResourceCleanupAmbiguous,
             ..
         }
     ));
