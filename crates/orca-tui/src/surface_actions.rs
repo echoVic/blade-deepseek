@@ -13,7 +13,7 @@ use orca_runtime::surface::{
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
-use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::{TuiOperationController, TuiSurfaceTaskControl};
 use crate::types::{TuiEvent, TuiMemoryScope};
 
 /// The only TUI-facing entry point for thread-scoped runtime commands and
@@ -49,16 +49,10 @@ impl TuiSurfaceActions {
         &self,
         request: HostedTurnRequest,
         config: RunConfig,
-        controller: &TuiOperationController,
+        control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::run(
-            &self.thread,
-            request,
-            config,
-            &controller.surface_task_control(),
-            event_tx,
-        )
+        crate::surface_client::run(&self.thread, request, config, control, event_tx)
     }
 
     pub(crate) fn resume_operation(

@@ -149,7 +149,9 @@ fn route_action(
             }
         }
         UserAction::Interrupt => {
-            controller.interrupt_current();
+            if let Err(error) = controller.interrupt_current() {
+                let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
+            }
         }
         UserAction::BackgroundCurrentTurn => {
             controller.request_background_current();
@@ -251,10 +253,17 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io;
     use std::time::Duration;
 
     use crossbeam_channel as mpsc;
+    use orca_core::config::HistoryMode;
+    use orca_runtime::runtime_host::RuntimeHost;
+    use orca_runtime::surface::{
+        AttachResult, DetachRequest, FreshAttachRequest, SurfaceAttachmentRole, SurfaceCapability,
+        SurfaceOperationId, SurfaceRequestId,
+    };
 
     use super::TuiActionDispatcher;
     use crate::interaction_broker::TuiInteractionBroker;
@@ -348,6 +357,81 @@ mod tests {
         ));
         assert!(operation.cancel_token().is_cancelled());
         dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn interrupt_reports_surface_cancel_rejection_instead_of_silently_succeeding() {
+        let _env = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let host = RuntimeHost::start().expect("runtime host");
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "detached surface cancel")
+            .expect("runtime thread");
+        let typed_thread = thread.typed_surface();
+        let surface = typed_thread.surface();
+        let attachment = match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::SubmitOperation,
+                SurfaceCapability::ControlBoundOperation,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            AttachResult::Denied { reason } => {
+                panic!("attach typed TUI surface denied: {reason:?}")
+            }
+            AttachResult::Unavailable { reason } => {
+                panic!("attach typed TUI surface unavailable: {reason:?}")
+            }
+            _ => panic!("attach typed TUI surface returned a non-fresh result"),
+        };
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 7,
+        ])
+        .expect("surface operation id");
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let control = controller.surface_task_control();
+        control
+            .begin_surface_activation()
+            .expect("arm typed surface activation");
+        control
+            .install_surface(attachment.client.clone(), operation_id)
+            .expect("install typed surface operation");
+        let _ = surface.detach(
+            &attachment.client,
+            DetachRequest {
+                request_id: SurfaceRequestId::new(),
+            },
+        );
+
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let (mut dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, controller, 1, 1)
+                .expect("spawn dispatcher");
+        raw_tx.send(UserAction::Interrupt).expect("queue interrupt");
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::OperationRejected(message))
+                if message.contains("typed surface cancel")
+        ));
+
+        dispatcher.shutdown().expect("shutdown dispatcher");
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
     }
 
     #[test]

@@ -597,7 +597,7 @@ fn typed_history_resume_projects_only_the_durable_surface_snapshot() {
 #[test]
 fn production_ordinary_turns_select_only_the_typed_surface_runner() {
     assert!(
-        APP.contains("host,\n        run_hosted_ordinary_turn,\n    );"),
+        APP.contains("host,\n        OrdinaryTurnRunner::Typed,\n    );"),
         "the production controller entrypoint must select the typed ordinary-turn runner"
     );
     assert!(

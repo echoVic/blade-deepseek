@@ -106,17 +106,20 @@ impl TuiOperationController {
             .as_ref()
             .map(|operation| operation.id())
     }
-    pub(crate) fn interrupt_current(&self) -> Option<OperationId> {
+    pub(crate) fn interrupt_current(&self) -> io::Result<Option<OperationId>> {
         let hosted = {
             let mut hosted = self.lock_hosted();
             if let Some(operation) = hosted.active.clone() {
                 operation
             } else {
-                if cancel_surface_or_shutdown(&mut hosted) || !hosted.surface_activation_armed {
-                    return None;
+                if cancel_surface_if_active_checked(&mut hosted)? {
+                    return Ok(None);
+                }
+                if hosted.shutdown || !hosted.surface_activation_armed {
+                    return Ok(None);
                 }
                 hosted.interrupt_requested = true;
-                return None;
+                return Ok(None);
             }
         };
         let operation_id = hosted.id();
@@ -126,14 +129,14 @@ impl TuiOperationController {
                 | InterruptOperationResult::AlreadyRequested { .. },
             ) => {}
             Ok(InterruptOperationResult::Stale { .. } | InterruptOperationResult::Idle { .. })
-            | Err(_) => return None,
+            | Err(_) => return Ok(None),
         };
         self.broker.interrupt(operation_id);
         let mut background = self.lock_background_current();
         if *background == Some(operation_id) {
             *background = None;
         }
-        Some(operation_id)
+        Ok(Some(operation_id))
     }
 
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
@@ -1091,23 +1094,37 @@ impl std::fmt::Debug for SurfaceActiveOperation {
 }
 
 fn cancel_surface_if_active(hosted: &mut HostedOperationInner) -> bool {
+    cancel_surface_if_active_checked(hosted).unwrap_or(false)
+}
+
+fn cancel_surface_if_active_checked(hosted: &mut HostedOperationInner) -> io::Result<bool> {
     let Some(surface) = hosted.surface_active.as_ref() else {
-        return false;
+        return Ok(false);
     };
     if surface.background_handoff_pending {
         hosted.interrupt_requested = true;
-        return true;
+        return Ok(true);
     }
     let surface = surface.clone();
-    let _ = surface.client.cancel_operation(
-        orca_runtime::surface::SurfaceRequestId::new(),
-        surface.operation_id,
-    );
-    true
-}
-
-fn cancel_surface_or_shutdown(hosted: &mut HostedOperationInner) -> bool {
-    cancel_surface_if_active(hosted) || hosted.shutdown
+    match surface
+        .client
+        .cancel_operation(
+            orca_runtime::surface::SurfaceRequestId::new(),
+            surface.operation_id,
+        )
+        .map_err(|error| io::Error::other(format!("typed surface cancel failed: {error:?}")))?
+    {
+        orca_runtime::surface::MutationReply::Committed { .. } => Ok(true),
+        orca_runtime::surface::MutationReply::Deferred { mutation, .. } => {
+            Err(io::Error::other(format!(
+                "typed surface cancel deferred: request={:?} commit={:?}",
+                mutation.request_id, mutation.commit_id
+            )))
+        }
+        orca_runtime::surface::MutationReply::Uncommitted { mutation } => Err(io::Error::other(
+            format!("typed surface cancel did not commit: {mutation:?}"),
+        )),
+    }
 }
 
 fn permission_kind(

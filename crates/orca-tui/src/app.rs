@@ -46,7 +46,7 @@ use crate::input_event_actions::{
 use crate::interaction_broker::TuiInteractionBroker;
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
-use crate::operation_controller::{TuiOperationController, TuiTurnControl};
+use crate::operation_controller::{TuiOperationController, TuiSurfaceTaskControl, TuiTurnControl};
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::runtime_interaction_adapter::{
     TuiApprovalHandler, TuiMcpElicitationHandler, TuiPermissionRequestHandler, TuiUserInputHandler,
@@ -585,7 +585,7 @@ fn spawn_legacy_feature_test_runtime(
                 pending,
                 registry,
                 host,
-                run_legacy_feature_turn_for_test,
+                OrdinaryTurnRunner::Legacy,
             );
         },
     )
@@ -1149,7 +1149,7 @@ mod tests {
     fn manual_compaction_starts_with_a_fresh_cancel_state() {
         let (event_tx, _event_rx) = mpsc::unbounded();
         let previous = crate::test_support::HostedOperationHarness::start();
-        previous.controller().interrupt_current();
+        let _ = previous.controller().interrupt_current();
         assert!(previous.cancel_token().is_cancelled());
         drop(previous);
         let current = crate::test_support::HostedOperationHarness::start();
@@ -1768,6 +1768,7 @@ mod tests {
                 .start_thread(config.clone(), "typed ordinary turn ingress")
                 .expect("runtime thread");
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let control = controller.surface_task_control();
             let (event_tx, event_rx) = mpsc::unbounded();
 
             run_hosted_ordinary_turn(
@@ -1778,7 +1779,7 @@ mod tests {
                     false,
                 ),
                 &event_tx,
-                &controller,
+                &control,
             )
             .expect("typed ordinary turn");
 
@@ -1852,6 +1853,40 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_tui_turn_runs_with_only_typed_surface_task_control() {
+        with_orca_home(|_| {
+            let config = test_config(HistoryMode::Record);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config.clone(), "typed ordinary turn isolated control")
+                .expect("runtime thread");
+            let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            run_hosted_ordinary_turn(
+                &config,
+                &thread,
+                hosted_turn_request(
+                    &SubmittedTurn::user("typed isolated control".to_string()),
+                    false,
+                ),
+                &event_tx,
+                &control,
+            )
+            .expect("typed ordinary turn without legacy operation owner");
+
+            assert!(event_rx.try_iter().any(
+                |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+            ));
+            assert!(control.current_id().is_none());
+
+            thread.shutdown().expect("thread shutdown");
+            host.shutdown().expect("host shutdown");
+        });
+    }
+
+    #[test]
     fn ordinary_tui_typed_submit_can_manual_compact_the_same_durable_conversation() {
         with_orca_home(|_| {
             let config = test_config(HistoryMode::Record);
@@ -1861,6 +1896,7 @@ mod tests {
                 .start_thread(config.clone(), "typed ordinary turn compaction")
                 .expect("runtime thread");
             let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+            let control = controller.surface_task_control();
             let (event_tx, event_rx) = mpsc::unbounded();
 
             run_hosted_ordinary_turn(
@@ -1871,7 +1907,7 @@ mod tests {
                     false,
                 ),
                 &event_tx,
-                &controller,
+                &control,
             )
             .expect("typed ordinary turn");
             let outcome = match TuiSurfaceActions::new(thread.typed_surface())
@@ -2233,7 +2269,7 @@ mod tests {
                 &pending,
                 &registry,
                 &host_handle,
-                run_hosted_ordinary_turn,
+                OrdinaryTurnRunner::Typed,
             );
 
             assert!(matches!(
@@ -5107,13 +5143,37 @@ fn send_submission_error(
     }
 }
 
-type OrdinaryTurnRunner = fn(
-    &RunConfig,
-    &RuntimeThreadHandle,
-    HostedTurnRequest,
-    &mpsc::Sender<TuiEvent>,
-    &TuiOperationController,
-) -> io::Result<TuiHostedOperationOutcome>;
+#[derive(Clone, Copy)]
+enum OrdinaryTurnRunner {
+    Typed,
+    #[cfg(test)]
+    Legacy,
+}
+
+impl OrdinaryTurnRunner {
+    fn run(
+        self,
+        config: &RunConfig,
+        thread: &RuntimeThreadHandle,
+        request: HostedTurnRequest,
+        event_tx: &mpsc::Sender<TuiEvent>,
+        controller: &TuiOperationController,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        match self {
+            Self::Typed => run_hosted_ordinary_turn(
+                config,
+                thread,
+                request,
+                event_tx,
+                &controller.surface_task_control(),
+            ),
+            #[cfg(test)]
+            Self::Legacy => {
+                run_legacy_feature_turn_for_test(config, thread, request, event_tx, controller)
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn hosted_tui_controller_loop(
@@ -5135,7 +5195,7 @@ fn hosted_tui_controller_loop(
         pending_workflow_notifications,
         mcp_registry,
         host,
-        run_hosted_ordinary_turn,
+        OrdinaryTurnRunner::Typed,
     );
 }
 
@@ -5989,7 +6049,7 @@ fn run_hosted_goal_run(
             run_hosted_operation(thread, request, config.clone(), controller, event_tx)
         }
         HostedOperationKind::Turn => {
-            ordinary_turn_runner(config, thread, request, event_tx, controller)
+            ordinary_turn_runner.run(config, thread, request, event_tx, controller)
         }
         HostedOperationKind::ManualCompaction
         | HostedOperationKind::BackgroundContinuation { .. } => {
@@ -6017,12 +6077,12 @@ fn run_hosted_ordinary_turn(
     thread: &RuntimeThreadHandle,
     request: HostedTurnRequest,
     event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
 ) -> io::Result<TuiHostedOperationOutcome> {
     TuiSurfaceActions::new(thread.typed_surface()).run_turn(
         request,
         config.clone(),
-        controller,
+        control,
         event_tx,
     )
 }
