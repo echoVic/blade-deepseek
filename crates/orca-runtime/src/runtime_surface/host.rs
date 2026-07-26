@@ -6,13 +6,18 @@ use crate::runtime_host::{
     HostedWorkflowRequest, RuntimeHost, RuntimeHostError, RuntimeHostHandle, RuntimeThreadHandle,
     RuntimeThreadStartRequest,
 };
-use orca_core::config::RunConfig;
+use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::goal_runtime::{GoalNextAction, GoalPauseReason, GoalRecord, GoalTurnOrigin};
 use orca_core::goal_types::ThreadGoal;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus};
 
 use super::SurfaceConnectionId;
 use super::{RuntimeSurfaceHandle, RuntimeSurfaceHostHandle};
+
+pub(crate) enum RuntimeSurfaceRecordedThreadLoadError {
+    CwdMismatch,
+    Runtime(RuntimeHostError),
+}
 
 /// A thread-scoped typed surface entry point.
 #[derive(Clone)]
@@ -95,6 +100,32 @@ impl RuntimeSurfaceHostHandle {
         title: impl Into<String>,
     ) -> Result<RuntimeSurfaceThreadHandle, RuntimeHostError> {
         self.start_thread_with_request(RuntimeThreadStartRequest::new(config, title))
+    }
+
+    pub(crate) fn load_recorded_thread(
+        &self,
+        mut config: RunConfig,
+        title: impl Into<String>,
+        selector: &str,
+    ) -> Result<RuntimeSurfaceThreadHandle, RuntimeSurfaceRecordedThreadLoadError> {
+        let transcript = crate::history::load_session(selector).map_err(|error| {
+            RuntimeSurfaceRecordedThreadLoadError::Runtime(RuntimeHostError::ThreadStartFailed {
+                message: error.to_string(),
+            })
+        })?;
+        if config
+            .cwd
+            .as_ref()
+            .is_none_or(|cwd| PathBuf::from(&transcript.meta.cwd) != *cwd)
+        {
+            return Err(RuntimeSurfaceRecordedThreadLoadError::CwdMismatch);
+        }
+        config.history_mode = HistoryMode::Resume(selector.to_string());
+        let request = RuntimeThreadStartRequest::new(config, title)
+            .with_preloaded(transcript)
+            .with_resume_scope_replacement();
+        self.start_thread_with_request(request)
+            .map_err(RuntimeSurfaceRecordedThreadLoadError::Runtime)
     }
 
     pub fn start_thread_with_request(

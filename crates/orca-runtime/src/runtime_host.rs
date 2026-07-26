@@ -3059,6 +3059,15 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfaceCancelAcpPromptBinding {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        session_id: surface::NonEmptyText,
+        inbound_seq: surface::SequenceNumber,
+        reply: SyncSender<
+            Result<surface::CancelSessionCurrentResult, surface::SurfaceClientCommandError>,
+        >,
+    },
     SurfaceTransferBackground {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
@@ -4191,6 +4200,22 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             client,
             request_id,
             operation_id,
+            reply,
+        })
+    }
+
+    fn cancel_acp_prompt_binding(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        session_id: surface::NonEmptyText,
+        inbound_seq: surface::SequenceNumber,
+    ) -> Result<surface::CancelSessionCurrentResult, surface::SurfaceClientCommandError> {
+        self.dispatch(|reply| ThreadCommand::SurfaceCancelAcpPromptBinding {
+            client,
+            request_id,
+            session_id,
+            inbound_seq,
             reply,
         })
     }
@@ -25031,6 +25056,68 @@ impl ThreadActor {
         ))
     }
 
+    fn resolve_surface_acp_prompt_operation(
+        &self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        session_id: &surface::NonEmptyText,
+        inbound_seq: surface::SequenceNumber,
+    ) -> Result<Option<surface::SurfaceOperationId>, surface::SurfaceClientCommandError> {
+        let connection_id = client
+            .connection_id()
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let mut matches = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .filter(|operation| {
+                matches!(
+                    &operation.intent.origin,
+                    surface::OperationOrigin::AcpPrompt {
+                        connection_id: origin_connection_id,
+                        session_id: origin_session_id,
+                        inbound_seq: origin_inbound_seq,
+                        ..
+                    } if origin_connection_id == connection_id
+                        && origin_session_id == session_id
+                        && *origin_inbound_seq == inbound_seq
+                )
+            })
+            .map(|operation| operation.operation_id.clone());
+        let operation_id = matches.next();
+        if matches.next().is_some() {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        Ok(operation_id)
+    }
+
+    fn cancel_surface_acp_prompt_idle(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        session_id: surface::NonEmptyText,
+        inbound_seq: surface::SequenceNumber,
+    ) -> Result<surface::CancelSessionCurrentResult, surface::SurfaceClientCommandError> {
+        let Some(operation_id) =
+            self.resolve_surface_acp_prompt_operation(client, &session_id, inbound_seq)?
+        else {
+            return Ok(surface::CancelSessionCurrentResult::NoCurrentOperation {
+                request_id,
+                thread_id: self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .thread
+                    .thread_id
+                    .clone(),
+            });
+        };
+        self.cancel_surface_idle(client, request_id, operation_id)
+            .map(|mutation| surface::CancelSessionCurrentResult::Resolved { mutation })
+    }
+
     fn cancel_surface_background_provider(
         &mut self,
         request_id: surface::SurfaceRequestId,
@@ -26414,6 +26501,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceCancelOperation { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceCancelAcpPromptBinding { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceTransferBackground { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -26718,6 +26808,28 @@ impl ThreadActor {
                     surface::SurfaceCapability::ControlBoundOperation,
                 ) {
                     self.cancel_surface_idle(&client, request_id, operation_id)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCancelAcpPromptBinding {
+                client,
+                request_id,
+                session_id,
+                inbound_seq,
+                reply,
+            } => {
+                let result = if self.admits_surface_client(
+                    &client,
+                    surface::SurfaceCapability::ControlBoundOperation,
+                ) {
+                    self.cancel_surface_acp_prompt_idle(
+                        &client,
+                        request_id,
+                        session_id,
+                        inbound_seq,
+                    )
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -27406,6 +27518,59 @@ impl ThreadActor {
                         self.cancel_surface_idle(&client, request_id, operation_id)
                     } else {
                         self.cancel_surface_running(active, &client, request_id, operation_id)
+                    }
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCancelAcpPromptBinding {
+                client,
+                request_id,
+                session_id,
+                inbound_seq,
+                reply,
+            } => {
+                let result = if self.admits_surface_client(
+                    &client,
+                    surface::SurfaceCapability::ControlBoundOperation,
+                ) {
+                    match self.resolve_surface_acp_prompt_operation(
+                        &client,
+                        &session_id,
+                        inbound_seq,
+                    ) {
+                        Ok(Some(operation_id)) => {
+                            let mutation = if active
+                                .surface_operation
+                                .as_ref()
+                                .is_some_and(|fence| fence.operation_id == operation_id)
+                            {
+                                self.cancel_surface_running(
+                                    active,
+                                    &client,
+                                    request_id,
+                                    operation_id,
+                                )
+                            } else {
+                                self.cancel_surface_idle(&client, request_id, operation_id)
+                            };
+                            mutation.map(|mutation| surface::CancelSessionCurrentResult::Resolved {
+                                mutation,
+                            })
+                        }
+                        Ok(None) => Ok(surface::CancelSessionCurrentResult::NoCurrentOperation {
+                            request_id,
+                            thread_id: self
+                                .resident_surface
+                                .coordinator
+                                .state()
+                                .snapshot()
+                                .thread
+                                .thread_id
+                                .clone(),
+                        }),
+                        Err(error) => Err(error),
                     }
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
@@ -33179,10 +33344,19 @@ mod tests {
         session_id: &str,
         text: &str,
     ) -> surface::OperationRequestIntent {
+        surface_acp_turn_intent_with_seq(snapshot, session_id, 1, text)
+    }
+
+    fn surface_acp_turn_intent_with_seq(
+        snapshot: &surface::SurfaceSnapshot,
+        session_id: &str,
+        inbound_seq: u64,
+        text: &str,
+    ) -> surface::OperationRequestIntent {
         let mut intent = surface_user_turn_intent(snapshot, text);
         intent.correlation = surface::OperationIngressCorrelation::AcpPrompt {
             session_id: surface::NonEmptyText::try_new(session_id).unwrap(),
-            inbound_seq: surface::SequenceNumber::new(1),
+            inbound_seq: surface::SequenceNumber::new(inbound_seq),
             rpc_request_id: surface::AcpRequestId::Integer(1),
         };
         intent
@@ -40507,6 +40681,156 @@ mod tests {
         assert_eq!(control_count, 1);
         assert_eq!(cancelled_count, 1);
         assert!(atomic_batch);
+    }
+
+    #[test]
+    fn acp_prompt_binding_cancel_does_not_cancel_newer_foreground_operation() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(2);
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedSuccessExecutor {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .expect("start ACP prompt binding host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "cancel exact ACP prompt binding",
+            )
+            .expect("start ACP prompt binding thread");
+        let connection_id =
+            surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let surface = thread
+            .acp_surface_for_connection(connection_id)
+            .expect("bind ACP connection surface");
+        let attachment = match surface.attach_acp_fresh(
+            surface::FreshAttachRequest {
+                request_id: surface_request_id(),
+                role: surface::SurfaceAttachmentRole::Acp,
+                requested_capabilities: BTreeSet::from([
+                    surface::SurfaceCapability::ReadSnapshot,
+                    surface::SurfaceCapability::SubmitOperation,
+                    surface::SurfaceCapability::ControlBoundOperation,
+                ]),
+                interaction_capabilities: BTreeSet::new(),
+            },
+            surface::AcpAttachmentCapabilityProfile {
+                revision: surface::CapabilityRevision::try_new(1).unwrap(),
+                standard: surface::AcpStandardCapabilitySet::default(),
+            },
+        ) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("attach ACP prompt binding client"),
+        };
+        let _subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim ACP prompt binding subscription");
+        let session_id = "exact-binding-session";
+
+        let first = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_acp_turn_intent_with_seq(
+                        &attachment.baseline.snapshot,
+                        session_id,
+                        1,
+                        "first prompt",
+                    ),
+                )
+                .expect("reserve first ACP prompt"),
+        );
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    first.operation_id.clone(),
+                    first.lease.lease_id,
+                )
+                .expect("admit first ACP prompt"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("first ACP prompt did not enter executor");
+        release_tx.send(()).expect("release first ACP prompt");
+        assert!(matches!(
+            attachment
+                .client
+                .wait_operation_terminal(surface_request_id(), first.operation_id.clone())
+                .expect("wait first ACP prompt terminal"),
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+
+        let second = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_acp_turn_intent_with_seq(
+                        &attachment.baseline.snapshot,
+                        session_id,
+                        2,
+                        "second prompt",
+                    ),
+                )
+                .expect("reserve second ACP prompt"),
+        );
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    second.operation_id.clone(),
+                    second.lease.lease_id,
+                )
+                .expect("admit second ACP prompt"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("second ACP prompt did not enter executor");
+
+        let cancelled = attachment
+            .client
+            .cancel_acp_prompt_binding(
+                surface_request_id(),
+                surface::NonEmptyText::try_new(session_id).unwrap(),
+                surface::SequenceNumber::new(1),
+            )
+            .expect("resolve exact first ACP prompt binding");
+        assert!(matches!(
+            cancelled,
+            surface::CancelSessionCurrentResult::Resolved {
+                mutation: surface::MutationReply::Committed {
+                    value: surface::CancelOperationOutput::AlreadyTerminal { terminal },
+                    ..
+                }
+            } if terminal.operation_id == first.operation_id
+        ));
+        assert!(
+            thread
+                .surface_actor_probe_for_test(second.operation_id.clone())
+                .expect("probe newer ACP prompt")
+                .legacy_completion
+                .expect("newer ACP prompt retains completion")
+                .try_terminal()
+                .is_none(),
+            "cancelling the old ACP binding cancelled the newer foreground operation"
+        );
+
+        release_tx.send(()).expect("release second ACP prompt");
+        assert!(matches!(
+            attachment
+                .client
+                .wait_operation_terminal(surface_request_id(), second.operation_id)
+                .expect("wait second ACP prompt terminal"),
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        host.shutdown().expect("shutdown ACP prompt binding host");
     }
 
     #[test]

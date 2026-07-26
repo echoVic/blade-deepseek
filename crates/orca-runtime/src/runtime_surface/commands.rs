@@ -445,6 +445,14 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         operation_id: SurfaceOperationId,
     ) -> Result<MutationReply<CancelOperationOutput>, SurfaceClientCommandError>;
 
+    fn cancel_acp_prompt_binding(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        session_id: NonEmptyText,
+        inbound_seq: SequenceNumber,
+    ) -> Result<CancelSessionCurrentResult, SurfaceClientCommandError>;
+
     fn transfer_background(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -785,6 +793,18 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .cancel_operation(self.clone(), request_id, operation_id)
+    }
+
+    pub(crate) fn cancel_acp_prompt_binding(
+        &self,
+        request_id: SurfaceRequestId,
+        session_id: NonEmptyText,
+        inbound_seq: SequenceNumber,
+    ) -> Result<CancelSessionCurrentResult, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .cancel_acp_prompt_binding(self.clone(), request_id, session_id, inbound_seq)
     }
 
     pub fn transfer_background(

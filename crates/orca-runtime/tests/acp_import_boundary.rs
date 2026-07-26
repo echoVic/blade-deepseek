@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 const FORBIDDEN: &[&str] = &[
     "RuntimeHostHandle",
     "RuntimeThreadHandle",
+    "RuntimeThreadStartRequest",
     "OperationHandle",
     "HostedTurnRequest",
     "OperationOutcome",
@@ -17,6 +18,13 @@ const FORBIDDEN: &[&str] = &[
     "AgentSideConnection",
     "tokio_util::compat",
     "event_map",
+    "SessionTranscript",
+    "load_saved_session",
+    "with_preloaded",
+    "start_thread_with_request",
+    "crate::runtime_host::",
+    "crate::history::",
+    "crate::thread_store::",
 ];
 
 #[test]
@@ -47,10 +55,49 @@ fn boundary_scan_ignores_only_the_trailing_test_module() {
     assert!(!production.contains("HostedTurnRequest"));
 }
 
+#[test]
+fn prompt_cancel_keeps_only_transport_binding_in_acp() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/acp/agent.rs");
+    let source = fs::read_to_string(&path).expect("read ACP agent source");
+    let production = production_source(&source);
+    let binding = between(
+        production,
+        "enum AcpPromptBinding {",
+        "\n\n#[derive(Default)]",
+    );
+    assert!(
+        !binding.contains("operation_id"),
+        "ACP prompt transport binding must not own the runtime operation id"
+    );
+    let cancel = between(
+        production,
+        "    async fn cancel(&self, args: CancelNotification)",
+        "\n    }\n}",
+    );
+    assert!(
+        cancel.contains("cancel_acp_prompt_binding"),
+        "ACP cancel must ask runtime to resolve the exact prompt binding"
+    );
+    assert!(
+        !cancel.contains("cancel_operation"),
+        "ACP cancel must not select a runtime operation locally"
+    );
+}
+
 fn production_source(source: &str) -> &str {
     source
         .split_once("\n#[cfg(test)]\nmod tests")
         .map_or(source, |(production, _)| production)
+}
+
+fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .unwrap_or_else(|| panic!("missing boundary start `{start}`"))
+        .1
+        .split_once(end)
+        .unwrap_or_else(|| panic!("missing boundary end `{end}`"))
+        .0
 }
 
 fn scan_rs_files(root: &Path, visit: &mut impl FnMut(&Path, &str)) {

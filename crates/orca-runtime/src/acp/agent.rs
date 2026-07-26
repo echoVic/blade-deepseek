@@ -27,7 +27,6 @@ use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
-use crate::runtime_host::RuntimeThreadStartRequest;
 use crate::surface::{
     AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalPath, CanonicalUri,
     DisplayText, FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
@@ -35,15 +34,17 @@ use crate::surface::{
     OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
     Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
-    SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock,
-    SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionRoute,
-    SurfaceInteractionView, SurfaceOperationId, SurfaceRequestId, SurfaceSubscriptionItem,
-    SurfaceToolResultKind, ToolPatch, TurnRequestBudgetScope, UncommittedMutation,
+    SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceInputRequest,
+    SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceInteractionRequest,
+    SurfaceInteractionRoute, SurfaceInteractionView, SurfaceOperationId, SurfaceRequestId,
+    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch, TurnRequestBudgetScope,
+    UncommittedMutation,
 };
 
 use crate::runtime_surface::{
     AcpAttachmentCapabilityProfile, AcpStandardCapabilitySet, CapabilityRevision, OperationPatch,
-    SurfaceItem, SurfacePlanPriority, SurfacePlanStatus, SurfaceToolAction, SurfaceToolViewState,
+    RuntimeSurfaceRecordedThreadLoadError, SurfaceItem, SurfacePlanPriority, SurfacePlanStatus,
+    SurfaceToolAction, SurfaceToolViewState,
 };
 
 pub(crate) const ACP_NOTIFICATION_CAPACITY: usize = 256;
@@ -92,7 +93,7 @@ enum AcpPromptBinding {
     Bound {
         ready: Rc<Notify>,
         client: RuntimeSurfaceClientHandle,
-        operation_id: SurfaceOperationId,
+        inbound_seq: SequenceNumber,
     },
 }
 
@@ -699,7 +700,7 @@ impl OrcaAcpAgent {
             entry.prompt_binding = Some(AcpPromptBinding::Bound {
                 ready: ready.clone(),
                 client: prepared.client.clone(),
-                operation_id: prepared.operation_id.clone(),
+                inbound_seq: SequenceNumber::new(inbound_seq),
             });
         }
         ready.notify_waiters();
@@ -2150,29 +2151,23 @@ impl Agent for OrcaAcpAgent {
             return Err(Error::invalid_params().data("ACP session is already loaded"));
         }
         let selector = args.session_id.to_string();
-        let transcript = tokio::task::spawn_blocking(move || {
-            RuntimeSurfaceHostHandle::load_saved_session(&selector)
+        let config = self
+            .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
+            .map_err(|message| Error::invalid_params().data(message))?;
+        let surface_host = self.surface_host.clone();
+        let thread = tokio::task::spawn_blocking(move || {
+            surface_host.load_recorded_thread(config, "ACP session", &selector)
         })
         .await
         .map_err(Error::into_internal_error)?
-        .map_err(Error::into_internal_error)?;
-        if PathBuf::from(&transcript.meta.cwd) != args.cwd {
-            return Err(Error::invalid_params().data("ACP load cwd does not match saved session"));
-        }
-
-        let mut config = self
-            .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
-            .map_err(|message| Error::invalid_params().data(message))?;
-        config.history_mode = HistoryMode::Resume(args.session_id.to_string());
-        let request = RuntimeThreadStartRequest::new(config, "ACP session")
-            .with_preloaded(transcript)
-            .with_resume_scope_replacement();
-        let surface_host = self.surface_host.clone();
-        let thread =
-            tokio::task::spawn_blocking(move || surface_host.start_thread_with_request(request))
-                .await
-                .map_err(Error::into_internal_error)?
-                .map_err(Error::into_internal_error)?;
+        .map_err(|error| match error {
+            RuntimeSurfaceRecordedThreadLoadError::CwdMismatch => {
+                Error::invalid_params().data("ACP load cwd does not match saved session")
+            }
+            RuntimeSurfaceRecordedThreadLoadError::Runtime(error) => {
+                Error::into_internal_error(error)
+            }
+        })?;
         let surface = thread
             .acp_surface()
             .ok_or_else(|| Error::internal_error().data("ACP surface unavailable"))?;
@@ -2207,6 +2202,9 @@ impl Agent for OrcaAcpAgent {
             bridge.cancel_session(&args.session_id);
             bridge.wait_for_capability_writes(&args.session_id).await;
         }
+        let session_id = NonEmptyText::try_new(args.session_id.to_string()).map_err(|error| {
+            Error::invalid_params().data(format!("invalid ACP session id: {error}"))
+        })?;
         loop {
             let binding = {
                 let state = self.state.borrow();
@@ -2215,11 +2213,11 @@ impl Agent for OrcaAcpAgent {
                         prompt_binding:
                             Some(AcpPromptBinding::Bound {
                                 client,
-                                operation_id,
+                                inbound_seq,
                                 ..
                             }),
                         ..
-                    }) => Some(Ok((client.clone(), operation_id.clone()))),
+                    }) => Some(Ok((client.clone(), *inbound_seq))),
                     Some(SessionEntry {
                         prompt_binding: Some(AcpPromptBinding::Decoded { ready }),
                         ..
@@ -2228,12 +2226,23 @@ impl Agent for OrcaAcpAgent {
                 }
             };
             match binding {
-                Some(Ok((client, operation_id))) => {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        client.cancel_operation(SurfaceRequestId::new(), operation_id)
+                Some(Ok((client, inbound_seq))) => {
+                    let session_id = session_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        client.cancel_acp_prompt_binding(
+                            SurfaceRequestId::new(),
+                            session_id,
+                            inbound_seq,
+                        )
                     })
                     .await
-                    .map_err(Error::into_internal_error)?;
+                    .map_err(Error::into_internal_error)?
+                    .map_err(|error| match error {
+                        SurfaceClientCommandError::RuntimeUnavailable => Error::internal_error()
+                            .data("ACP cancel could not commit runtime state"),
+                        SurfaceClientCommandError::Unauthorized => Error::internal_error()
+                            .data("ACP cancel was rejected by runtime ownership"),
+                    })?;
                     break;
                 }
                 Some(Err(ready)) => ready.notified().await,

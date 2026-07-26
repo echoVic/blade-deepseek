@@ -1121,6 +1121,72 @@ fn acp_cancel_stops_in_flight_prompt() {
 }
 
 #[test]
+fn acp_cancel_reports_runtime_commit_failure_before_retry_succeeds() {
+    let _home = OrcaHomeGuard::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![TestBehavior::WaitForCancel]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        initialize_agent(&agent).await;
+        let session = Agent::new_session(&agent, NewSessionRequest::new(cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        let transcript =
+            RuntimeSurfaceHostHandle::load_saved_session(&session.session_id.to_string())
+                .expect("load active ACP transcript");
+        let transcript_path = transcript.path;
+        let backup_path = transcript_path.with_extension("cancel-error-backup");
+
+        let prompt_fut = Agent::prompt(
+            &agent,
+            PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from("long running".to_string())],
+            ),
+        );
+        let cancel_fut = async {
+            while executor.call_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+            std::fs::rename(&transcript_path, &backup_path).expect("hide ACP transcript");
+            std::fs::create_dir(&transcript_path).expect("block ACP transcript writes");
+            assert!(
+                Agent::cancel(&agent, CancelNotification::new(session.session_id.clone()),)
+                    .await
+                    .is_err(),
+                "ACP cancel must report a runtime commit failure"
+            );
+            std::fs::remove_dir(&transcript_path).expect("remove blocking transcript directory");
+            std::fs::rename(&backup_path, &transcript_path).expect("restore ACP transcript");
+            Agent::cancel(&agent, CancelNotification::new(session.session_id))
+                .await
+                .expect("retry ACP cancel after restoring persistence");
+        };
+
+        let (prompt_result, ()) = tokio::join!(prompt_fut, cancel_fut);
+        assert_eq!(
+            prompt_result.expect("cancelled prompt").stop_reason,
+            StopReason::Cancelled
+        );
+    });
+
+    assert_eq!(executor.call_count(), 1);
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
 fn acp_prompt_on_unknown_session_returns_error() {
     let _home = OrcaHomeGuard::new();
     let cwd = tempfile::tempdir().unwrap();
