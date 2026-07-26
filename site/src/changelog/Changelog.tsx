@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.54":
+        "The production TUI now completes its runtime-owned typed surface migration. The app loop, agent runtime and action dispatcher hold one typed surface control while RuntimeHost owns prompt admission, durable batches, operation and generation fences, interactions, cancellation, terminal finalization, workflow task state and restart recovery. Assistant and tool output is projected only after durable commit, interaction answers are persisted before waiters wake, manual compaction cannot report success before its terminal receipt, and restart restores the exact snapshot and pending ownership without redefining turn semantics in the renderer. ACP convergence follows this TUI release; JSONL compatibility remains later work.",
       "v0.2.53":
         "Goal Mode now completes its first runtime-owned TUI vertical loop. Set-and-run, resume, pause and cancellation flow through typed commands; Goal state, outer-turn progress, continuation decisions and terminal results are committed durably before TUI projection or waiter wake. Restart recovery preserves the exact owner lease, operation and generation fences, pending mutation receipts, progress barriers and repeated-gap streaks. MaxInnerTurns remains resumable, plan-only work counts as progress, cost-budget exhaustion pauses as UsageLimit, and exact retry digests bind usage, progress, verification, continuation and terminal semantics.",
       "v0.2.52":
@@ -550,6 +552,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.2.54":
+        "生产 TUI 已完成 runtime-owned typed surface 迁移收口。App loop、agent runtime 与 action dispatcher 只持有一份 typed surface control；prompt 准入、durable batch、operation/generation fence、交互、取消、terminal finalization、workflow task 状态和重启恢复都由 RuntimeHost 统一拥有。Assistant 与 tool 输出只在持久化提交后投影，交互响应会先落盘再唤醒 waiter，manual compaction 不会在拿到 terminal receipt 前误报成功，重启则从精确 snapshot 恢复原有 owner，而不再由 renderer 重新定义 turn 语义。ACP convergence 将在本次 TUI 发布后继续，JSONL compatibility 更后置。",
       "v0.2.53":
         "Goal Mode 完成了首个由 runtime 真正拥有的 TUI 纵向闭环。Set-and-run、resume、pause 与取消都通过 typed command；Goal 状态、outer-turn 进展、continuation 决策和 terminal 结果会先持久化，再投影到 TUI 或唤醒 waiter。重启恢复保留精确 owner lease、operation/generation fence、待确认 mutation receipt、进展屏障与重复 gap streak。MaxInnerTurns 仍可续轮，plan-only 工作会计为进展，成本预算耗尽映射为 UsageLimit 暂停，exact retry digest 同时绑定 usage、progress、verification、continuation 和 terminal 语义。",
       "v0.2.52":
