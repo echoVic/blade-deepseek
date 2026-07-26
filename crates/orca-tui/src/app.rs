@@ -1911,7 +1911,7 @@ mod tests {
             )
             .expect("typed ordinary turn");
             let outcome = match TuiSurfaceActions::new(thread.typed_surface())
-                .manual_compact(&controller, &event_tx)
+                .manual_compact(&controller.surface_task_control(), &event_tx)
             {
                 Ok(outcome) => outcome,
                 Err(error) => panic!(
@@ -5344,8 +5344,11 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     continue;
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.resume_operation(&operation_id, &controller, &event_tx)
-                {
+                if let Err(error) = actions.resume_operation(
+                    &operation_id,
+                    &controller.surface_task_control(),
+                    &event_tx,
+                ) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "failed to resume operation: {error}"
                     )));
@@ -5359,8 +5362,11 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     continue;
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.cancel_operation(&operation_id, &controller, &event_tx)
-                {
+                if let Err(error) = actions.cancel_operation(
+                    &operation_id,
+                    &controller.surface_task_control(),
+                    &event_tx,
+                ) {
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "failed to cancel operation: {error}"
                     )));
@@ -5430,7 +5436,9 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     continue;
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.manual_compact(&controller, &event_tx) {
+                if let Err(error) =
+                    actions.manual_compact(&controller.surface_task_control(), &event_tx)
+                {
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "manual compaction failed: {error}"
                     )));
@@ -5459,13 +5467,23 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &controller, &event_tx);
+                let _ = stop_task_for_tui(
+                    actions.as_ref(),
+                    &task_id,
+                    &controller.surface_task_control(),
+                    &event_tx,
+                );
             }
             Ok(UserAction::ForegroundTask { task_id }) => {
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &controller, &event_tx);
+                let _ = foreground_task_for_tui(
+                    actions.as_ref(),
+                    &task_id,
+                    &controller.surface_task_control(),
+                    &event_tx,
+                );
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
                 let actions = thread
@@ -5475,7 +5493,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     actions.as_ref(),
                     &id,
                     approved,
-                    &controller,
+                    &controller.surface_task_control(),
                     &event_tx,
                 );
             }
@@ -5510,7 +5528,11 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     "Starting goal. Automatic continuation will keep running while it remains active."
                         .to_string(),
                 ));
-                if let Err(error) = actions.set_goal_and_run(objective, &controller, &event_tx) {
+                if let Err(error) = actions.set_goal_and_run(
+                    objective,
+                    &controller.surface_task_control(),
+                    &event_tx,
+                ) {
                     emit_hosted_operation_error(&event_tx, error, &HostedOperationKind::GoalRun);
                 }
             }
@@ -5653,7 +5675,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                         &preloaded,
                         &mcp_registry,
                         &event_tx,
-                        &controller,
+                        &controller.surface_task_control(),
                         &pending_workflow_notifications,
                         ordinary_turn_runner,
                     );
@@ -5673,7 +5695,7 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                     let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                     if let Err(error) = actions.resume_goal_and_run(
                         goal_continuation_prompt(&goal.objective, 1),
-                        &controller,
+                        &controller.surface_task_control(),
                         &event_tx,
                     ) {
                         emit_hosted_operation_error(
@@ -6035,9 +6057,11 @@ fn run_hosted_goal_run(
     };
     if let Some(goal) = active_goal.as_ref() {
         let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
-        if let Err(error) =
-            actions.resume_goal_and_run(submitted_turn.prompt().to_string(), controller, event_tx)
-        {
+        if let Err(error) = actions.resume_goal_and_run(
+            submitted_turn.prompt().to_string(),
+            &controller.surface_task_control(),
+            event_tx,
+        ) {
             emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
         }
         return;
@@ -6179,7 +6203,7 @@ fn resume_latest_active_goal_hosted(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     mcp_registry: &orca_mcp::McpRegistry,
     event_tx: &mpsc::Sender<TuiEvent>,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
     _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     _ordinary_turn_runner: OrdinaryTurnRunner,
 ) {
@@ -6260,7 +6284,7 @@ fn resume_latest_active_goal_hosted(
         let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
         if let Err(error) = actions.resume_goal_and_run(
             goal_continuation_prompt(&active_goal.objective, 1),
-            controller,
+            control,
             event_tx,
         ) {
             emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);

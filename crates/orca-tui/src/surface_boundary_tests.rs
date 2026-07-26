@@ -6,6 +6,7 @@ const MANIFEST: &str = include_str!(
 const TYPES: &str = include_str!("types.rs");
 const APP: &str = include_str!("app.rs");
 const ACTION_DISPATCHER: &str = include_str!("action_dispatcher.rs");
+const SURFACE_ACTIONS: &str = include_str!("surface_actions.rs");
 const SURFACE_CLIENT: &str = include_str!("surface_client.rs");
 const SURFACE_PROJECTION: &str = include_str!("surface_projection.rs");
 const SUBMITTED_TURN: &str = include_str!("submitted_turn.rs");
@@ -634,6 +635,16 @@ fn production_action_dispatcher_uses_only_typed_surface_control() {
             && !production.contains(".broker()")
             && !production.contains("TuiInteractionBroker"),
         "production dispatch must route interaction and operation control only through TuiSurfaceTaskControl"
+    );
+}
+
+#[test]
+fn typed_surface_facades_do_not_accept_the_legacy_operation_controller() {
+    assert!(
+        !SURFACE_ACTIONS.contains("TuiOperationController")
+            && !BACKGROUND_TASKS.contains("TuiOperationController")
+            && !BACKGROUND_APPROVAL.contains("TuiOperationController"),
+        "typed TUI facades must receive TuiSurfaceTaskControl directly"
     );
 }
 

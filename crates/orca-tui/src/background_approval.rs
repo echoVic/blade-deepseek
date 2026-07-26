@@ -1,6 +1,6 @@
 use crossbeam_channel as mpsc;
 
-use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::types::TuiEvent;
 
@@ -8,7 +8,7 @@ pub(crate) fn submit_background_approval_response_for_tui(
     actions: Option<&TuiSurfaceActions>,
     approval_id: &str,
     approved: bool,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) {
     let Some(actions) = actions else {
@@ -18,7 +18,7 @@ pub(crate) fn submit_background_approval_response_for_tui(
         return;
     };
 
-    match actions.resolve_background_approval(approval_id, approved, controller, event_tx) {
+    match actions.resolve_background_approval(approval_id, approved, control, event_tx) {
         Ok((task_id, tasks)) => {
             let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
             let decision = if approved { "approved" } else { "denied" };

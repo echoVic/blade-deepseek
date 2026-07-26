@@ -2,14 +2,14 @@ use crossbeam_channel as mpsc;
 
 use orca_core::task_types::TaskStatus;
 
-use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::types::TuiEvent;
 
 pub(crate) fn stop_task_for_tui(
     actions: Option<&TuiSurfaceActions>,
     task_id: &str,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> bool {
     let Some(actions) = actions else {
@@ -18,7 +18,7 @@ pub(crate) fn stop_task_for_tui(
         ));
         return false;
     };
-    match actions.stop_task(task_id, controller, event_tx) {
+    match actions.stop_task(task_id, control, event_tx) {
         Ok(_) => {
             let tasks = match actions.read_snapshot() {
                 Ok(snapshot) => crate::surface_projection::workflow_task_summaries(&snapshot),
@@ -45,7 +45,7 @@ pub(crate) fn stop_task_for_tui(
 pub(crate) fn foreground_task_for_tui(
     actions: Option<&TuiSurfaceActions>,
     task_id: &str,
-    controller: &TuiOperationController,
+    control: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> bool {
     let Some(actions) = actions else {
@@ -55,7 +55,7 @@ pub(crate) fn foreground_task_for_tui(
         return false;
     };
 
-    match actions.foreground_task(task_id, controller, event_tx) {
+    match actions.foreground_task(task_id, control, event_tx) {
         Ok(tasks) => {
             let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
             let _ = event_tx.send(TuiEvent::Notice(format!(
