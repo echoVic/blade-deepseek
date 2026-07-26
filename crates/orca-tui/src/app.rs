@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_background_approval_notifies_tui_user() {
+    fn registry_only_background_approval_is_not_presented_as_typed_recoverable() {
         let (host, thread, actions) = test_task_surface();
         let registry = thread.task_registry();
         let task = registry.create_main_session("Needs approval".to_string());
@@ -1381,28 +1381,14 @@ mod tests {
 
         assert_eq!(
             notify_recovered_background_approvals_for_tui(&actions, &event_tx),
-            1
+            0
         );
-
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].id == task.id
-                    && tasks[0].status == orca_core::task_types::TaskStatus::ApprovalRequired
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message))
-                if message.contains("Recovered background session")
-                    && message.contains("task_list")
-                    && message.contains("waiting for approval")
-        ));
+        assert!(event_rx.try_recv().is_err());
         host.shutdown().expect("runtime host shutdown");
     }
 
     #[test]
-    fn resumed_session_announces_recovered_background_approval_on_first_submit() {
+    fn resumed_registry_only_approval_is_not_advertised_as_actionable() {
         with_orca_home(|home| {
             let session_id = "resume-background-approval-session";
             let registry = orca_runtime::tasks::TaskRegistry::new_persistent(
@@ -1463,29 +1449,26 @@ mod tests {
                 .send(UserAction::Submit("hello".to_string()))
                 .unwrap();
 
-            let mut saw_task_refresh = false;
-            let mut saw_notice = false;
             let mut seen = Vec::new();
             for _ in 0..20 {
-                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        saw_task_refresh |= tasks.into_iter().any(|task| {
-                            task.id == task_id
-                                && task.status
-                                    == orca_core::task_types::TaskStatus::ApprovalRequired
-                                && task.is_backgrounded
-                        });
+                match event_rx.recv_timeout(Duration::from_millis(100)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("hosted TUI event channel disconnected")
                     }
-                    TuiEvent::Notice(message)
+                    Ok(TuiEvent::Notice(message))
                         if message.contains("Recovered background session")
                             && message.contains("task_list") =>
                     {
-                        saw_notice = true;
+                        panic!("registry-only approval was advertised as actionable");
                     }
-                    event => seen.push(format!("{event:?}")),
-                }
-                if saw_task_refresh && saw_notice {
-                    break;
+                    Ok(TuiEvent::WorkflowTasksUpdated { tasks })
+                        if tasks.iter().any(|task| task.id == task_id) =>
+                    {
+                        panic!("registry-only approval leaked into typed task projection");
+                    }
+                    Ok(TuiEvent::TurnStarted { .. }) => break,
+                    Ok(event) => seen.push(format!("{event:?}")),
                 }
             }
 
@@ -1493,63 +1476,107 @@ mod tests {
             handle.join().unwrap();
 
             assert!(
-                saw_task_refresh,
-                "missing recovered task refresh; saw {seen:?}"
-            );
-            assert!(
-                saw_notice,
-                "missing recovered approval notice; saw {seen:?}"
+                seen.iter()
+                    .all(|event| !event.contains("Recovered background session")),
+                "registry-only approval was advertised; saw {seen:?}"
             );
         });
     }
 
     #[test]
     fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Needs approval".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        registry
-            .approval_required_for_pending_tool(
-                &task.id,
-                "approval_required".to_string(),
-                Some(orca_core::task_types::PendingToolCallSummary {
-                    id: "mock-tool-1".to_string(),
-                    name: "task_list".to_string(),
-                    action: orca_core::approval_types::ActionKind::Read,
-                    target: None,
-                    arguments: "{}".to_string(),
-                }),
-            )
-            .unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        let continuation_request = submit_background_approval_response_for_tui(
-            Some(&actions),
-            "mock-tool-1",
-            false,
-            &event_tx,
-        );
-
-        assert!(continuation_request.is_none());
-        let record = registry.get(&task.id).unwrap();
-        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
-        assert_eq!(record.pending_tool_call, None);
-        assert_eq!(record.pending_tool_approval_response, None);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
-                    && tasks[0].pending_tool_call.is_none()
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message))
-                if message.contains("Background approval denied")
-        ));
-        host.shutdown().expect("runtime host shutdown");
+        with_orca_home(|_| {
+            let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let cancel = CancelToken::new();
+            let handle = std::thread::spawn({
+                let config = Arc::clone(&config);
+                let preloaded = Arc::clone(&preloaded);
+                let cancel = cancel.clone();
+                move || {
+                    run_hosted_tui_controller_for_test(
+                        config,
+                        preloaded,
+                        event_tx,
+                        action_rx,
+                        cancel,
+                        test_pending_workflow_notifications(),
+                    )
+                }
+            });
+            action_tx
+                .send(UserAction::Submit(
+                    "mock_stream_tool_delay_ms 250 task_list".to_string(),
+                ))
+                .unwrap();
+            loop {
+                if matches!(
+                    event_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                    TuiEvent::MessageDelta(text)
+                        if text.contains("Mock slow tool stream started.")
+                ) {
+                    break;
+                }
+            }
+            action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+            let (task_id, approval_id) = loop {
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                if let Some(task) = matching_task_update(event, |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.is_backgrounded
+                        && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
+                }) {
+                    break (
+                        task.id,
+                        task.pending_tool_call.expect("pending background tool").id,
+                    );
+                }
+            };
+            action_tx
+                .send(UserAction::ResolveBackgroundApproval {
+                    id: approval_id,
+                    approved: false,
+                })
+                .unwrap();
+            let mut stopped = false;
+            let mut denied_notice = false;
+            let mut seen = Vec::new();
+            for _ in 0..20 {
+                let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                match event {
+                    TuiEvent::WorkflowTasksUpdated { tasks } => {
+                        stopped |= tasks.iter().any(|task| {
+                            task.id == task_id
+                                && matches!(
+                                    task.status,
+                                    orca_core::task_types::TaskStatus::Stopped
+                                        | orca_core::task_types::TaskStatus::Cancelled
+                                )
+                                && task.pending_tool_call.is_none()
+                        });
+                    }
+                    TuiEvent::Notice(message) if message.contains("Background approval denied") => {
+                        denied_notice = true;
+                    }
+                    event => seen.push(format!("{event:?}")),
+                }
+                if stopped && denied_notice {
+                    break;
+                }
+            }
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
+            assert!(
+                stopped,
+                "denied background task was not stopped; saw {seen:?}"
+            );
+            assert!(
+                denied_notice,
+                "denied background approval notice was not emitted; saw {seen:?}"
+            );
+        });
     }
 
     fn transcript(session_id: &str) -> history::SessionTranscript {
@@ -4017,7 +4044,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -4073,6 +4100,7 @@ mod tests {
 
             let mut saw_completion_message = false;
             let mut saw_completed_task = false;
+            let mut saw_output_handoff = false;
             let mut seen = Vec::new();
             for _ in 0..40 {
                 match event_rx.recv_timeout(Duration::from_secs(10)) {
@@ -4094,6 +4122,11 @@ mod tests {
                     {
                         saw_completed_task = true;
                     }
+                    Ok(TuiEvent::BackgroundTaskOutputAttached { task_id: attached })
+                        if attached == task_id =>
+                    {
+                        saw_output_handoff = true;
+                    }
                     Ok(event) => seen.push(format!("{event:?}")),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         seen.push("timeout".to_string());
@@ -4103,7 +4136,7 @@ mod tests {
                         panic!("agent event channel disconnected before background continuation")
                     }
                 }
-                if saw_completion_message && saw_completed_task {
+                if saw_completion_message && saw_completed_task && saw_output_handoff {
                     break;
                 }
             }
@@ -4118,6 +4151,10 @@ mod tests {
             assert!(
                 saw_completed_task,
                 "approved background tool call should complete the background task; saw {seen:?}"
+            );
+            assert!(
+                saw_output_handoff,
+                "approved background tool call should hydrate its durable background output; saw {seen:?}"
             );
         });
     }
@@ -4136,7 +4173,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -4193,13 +4230,17 @@ mod tests {
                 })
                 .unwrap();
 
-            let mut saw_tool_requested = false;
+            let mut saw_tool_execution = false;
             let mut saw_second_approval = false;
             let mut seen = Vec::new();
             for _ in 0..20 {
                 match event_rx.recv_timeout(Duration::from_secs(10)) {
                     Ok(TuiEvent::ToolRequested { name, .. }) if name == "mcp__broken__tool" => {
-                        saw_tool_requested = true;
+                        saw_tool_execution = true;
+                        break;
+                    }
+                    Ok(TuiEvent::ToolCompleted { name, .. }) if name == "mcp__broken__tool" => {
+                        saw_tool_execution = true;
                         break;
                     }
                     Ok(TuiEvent::ApprovalNeeded { key, tool, .. }) => {
@@ -4228,7 +4269,7 @@ mod tests {
             handle.join().unwrap();
 
             assert!(
-                saw_tool_requested,
+                saw_tool_execution,
                 "approved background tool should execute without a second approval; saw {seen:?}"
             );
             assert!(
@@ -5370,40 +5411,13 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let continuation = submit_background_approval_response_for_tui(
+                submit_background_approval_response_for_tui(
                     actions.as_ref(),
                     &id,
                     approved,
+                    &controller,
                     &event_tx,
                 );
-                if approved
-                    && let (Some(runtime_thread), Some(continuation)) =
-                        (thread.as_ref(), continuation)
-                {
-                    let cfg = config.lock().unwrap().clone();
-                    let request = HostedTurnRequest::new("")
-                        .with_operation_kind(HostedOperationKind::BackgroundContinuation {
-                            task_id: continuation.task_id().to_string(),
-                        })
-                        .with_goal_usage_tracking(true);
-                    match run_hosted_operation(runtime_thread, request, cfg, &controller, &event_tx)
-                    {
-                        Ok(TuiHostedOperationOutcome::Turn { status }) => {
-                            if status == "success"
-                                && let Some(notification) =
-                                    pending_workflow_notifications.pop_notification()
-                            {
-                                pending_actions.push_front(UserAction::SubmitWorkflowNotification(
-                                    notification,
-                                ));
-                            }
-                        }
-                        Ok(TuiHostedOperationOutcome::ManualCompaction) => {}
-                        Err(error) => {
-                            let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                        }
-                    }
-                }
             }
             Ok(UserAction::GoalShow) => {
                 show_hosted_goal(&thread, &preloaded, &config, &event_tx);

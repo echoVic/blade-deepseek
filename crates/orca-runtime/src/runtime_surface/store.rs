@@ -2517,6 +2517,13 @@ static PROVIDER_COMPLETION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, 
 static PENDING_PROVIDER_COMPLETION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PENDING_BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES: OnceLock<
+    Mutex<HashMap<PathBuf, usize>>,
+> = OnceLock::new();
+#[cfg(test)]
 static PROVIDER_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
@@ -2845,6 +2852,18 @@ impl JsonlSurfaceCommitLedger {
         count: usize,
     ) {
         PROVIDER_COMPLETION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_background_approval_resume_checkpoint_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3216,10 +3235,11 @@ impl JsonlSurfaceCommitLedger {
             matches!(
                 &event.event,
                 SurfaceEvent::Operation(OperationPatch::GenerationStopped {
-                    reason: GenerationStopReason::ExecutionFailed {
-                        class: GenerationExecutionFailureClass::LegacyApprovalRequired,
-                        ..
-                    },
+                    reason: GenerationStopReason::ProviderSuspended
+                        | GenerationStopReason::ExecutionFailed {
+                            class: GenerationExecutionFailureClass::LegacyApprovalRequired,
+                            ..
+                        },
                     ..
                 })
             )
@@ -3243,6 +3263,50 @@ impl JsonlSurfaceCommitLedger {
     #[cfg(test)]
     fn take_provider_completion_checkpoint_failure(&self) -> bool {
         let mut failures = PENDING_PROVIDER_COMPLETION_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn arm_background_approval_resume_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        let is_background_approval_resume = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Operation(OperationPatch::ControlIntentCommitted {
+                    intent: PendingControlIntent::ResumeStarting { .. },
+                    ..
+                })
+            )
+        });
+        if !is_background_approval_resume {
+            return;
+        }
+        let mut failures = BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone(), count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_background_approval_resume_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3600,6 +3664,8 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         #[cfg(test)]
         self.arm_provider_completion_checkpoint_failures(batch);
         #[cfg(test)]
+        self.arm_background_approval_resume_checkpoint_failures(batch);
+        #[cfg(test)]
         if batch.events.as_slice().iter().any(|event| {
             matches!(
                 &event.event,
@@ -3650,6 +3716,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_provider_completion_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_background_approval_resume_checkpoint_failure() {
             return Err(SurfaceLedgerError::CheckpointFailed);
         }
         self.store

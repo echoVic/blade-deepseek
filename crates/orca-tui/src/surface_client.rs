@@ -15,12 +15,13 @@ use orca_runtime::surface::{
     OperationRequestIntent, OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
     PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, Sha256Digest,
-    SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId, SurfaceEvent, SurfaceGoal,
-    SurfaceGoalFence, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
-    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence,
-    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput,
-    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
+    SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal, SurfaceGoalFence,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
+    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
+    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason,
+    SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput, WaitOperationTerminalResult,
+    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -656,6 +657,12 @@ pub(crate) fn foreground_task(
     } else if terminal_status.is_none()
         && !task.backgrounded
         && !projection.operation_is_runtime_backgrounded(&operation_id)
+        && attachment
+            .baseline
+            .snapshot
+            .foreground_operation
+            .as_ref()
+            .is_none_or(|operation| operation.operation_id != operation_id)
     {
         return Err(format!(
             "surface task '{task_id}' is neither backgrounded nor attached to a runtime background owner"
@@ -707,6 +714,214 @@ pub(crate) fn foreground_task(
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
     Ok(crate::surface_projection::workflow_task_summaries(
         &snapshot,
+    ))
+}
+
+pub(crate) fn resolve_background_approval(
+    thread: &RuntimeSurfaceThreadHandle,
+    approval_id: &str,
+    approved: bool,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
+    let surface = thread.surface();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (attachment, interaction) = loop {
+        let attachment = match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::ManageTask,
+                SurfaceCapability::ControlBoundOperation,
+                SurfaceCapability::RespondGrantedInteraction,
+            ]),
+            interaction_capabilities: BTreeSet::from([
+                SurfaceInteractionKind::ToolApproval,
+                SurfaceInteractionKind::PermissionRequest,
+                SurfaceInteractionKind::UserInput,
+                SurfaceInteractionKind::McpElicitation,
+                SurfaceInteractionKind::BackgroundApproval,
+            ]),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            _ => return Err("background approval responder attachment unavailable".to_string()),
+        };
+        let interaction = attachment
+            .baseline
+            .snapshot
+            .interactions
+            .iter()
+            .find(|interaction| {
+                matches!(
+                    &interaction.request,
+                    orca_runtime::surface::SurfaceInteractionRequest::BackgroundApproval {
+                        tool,
+                        ..
+                    } if tool.tool_call_id.as_str() == approval_id
+                )
+            })
+            .cloned();
+        if let Some(interaction) = interaction {
+            break (attachment, interaction);
+        }
+        let last_observed = format!(
+            "tasks={} interactions={} background={} history={}",
+            attachment.baseline.snapshot.tasks.len(),
+            attachment.baseline.snapshot.interactions.len(),
+            attachment.baseline.snapshot.background_operations.len(),
+            attachment.baseline.snapshot.operation_history.len(),
+        );
+        detach(&surface, &attachment.client);
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "pending background approval '{approval_id}' did not become durable; {}",
+                last_observed
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .ok_or_else(|| "background approval subscription unavailable".to_string())?;
+    let task_fence = match &interaction.request {
+        orca_runtime::surface::SurfaceInteractionRequest::BackgroundApproval { task, .. } => {
+            task.clone()
+        }
+        _ => return Err("background approval request kind is invalid".to_string()),
+    };
+    let task_id = task_fence.task_id.as_str().to_string();
+    let task = attachment
+        .baseline
+        .snapshot
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_fence.task_id)
+        .cloned()
+        .ok_or_else(|| "background approval task disappeared".to_string())?;
+    let operation_id = task
+        .parent_operation
+        .clone()
+        .ok_or_else(|| "background approval task has no owning operation".to_string())?;
+    let mut foreground_run = if approved {
+        let mut activation =
+            SurfaceActivationGuard::begin(controller).map_err(|error| error.to_string())?;
+        controller.retire_surface_presentation(&operation_id);
+        let mut guard = SurfaceRunGuard::new(&surface, attachment.client.clone(), controller);
+        guard.bind_operation(operation_id.clone());
+        guard.preserve_operation();
+        if task.backgrounded {
+            match attachment.client.task_control(
+                SurfaceRequestId::new(),
+                TaskControlAction::Foreground {
+                    fence: SurfaceTaskFence {
+                        task_id: task.task_id.clone(),
+                        task_revision: task.revision,
+                        background_owner: task.background_fence.clone(),
+                    },
+                },
+            ) {
+                Ok(MutationReply::Committed { .. }) => {}
+                Ok(MutationReply::Deferred { mutation, .. }) => {
+                    return Err(format!(
+                        "background approval task foreground deferred: request={:?} commit={:?}",
+                        mutation.request_id, mutation.commit_id
+                    ));
+                }
+                Ok(MutationReply::Uncommitted { mutation }) => {
+                    return Err(format!(
+                        "background approval task foreground did not commit: {mutation:?}"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "background approval task foreground failed: {error:?}"
+                    ));
+                }
+            }
+        }
+        let mut projection =
+            TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
+        projection.focus_operation(operation_id.clone());
+        let delivery_watermark = controller.surface_delivery_watermark(&operation_id);
+        let _ = event_tx.send(TuiEvent::BackgroundTaskOutputAttached {
+            task_id: task_id.clone(),
+        });
+        for event in projection
+            .hydrate_after_delivery_watermark(&operation_id, &delivery_watermark)
+            .map_err(|error| format!("typed TUI approval hydration failed: {error:?}"))?
+        {
+            let _ = event_tx.send(event);
+        }
+        controller
+            .install_surface(attachment.client.clone(), operation_id.clone())
+            .map_err(|error| error.to_string())?;
+        activation.disarm();
+        guard.controller_installed();
+        Some((guard, projection))
+    } else {
+        None
+    };
+    let decision = if approved {
+        SurfaceAllowDeny::Allow
+    } else {
+        SurfaceAllowDeny::Deny
+    };
+    let result = loop {
+        match attachment.client.respond_interaction_by_id(
+            SurfaceRequestId::new(),
+            interaction.interaction_id.clone(),
+            SurfaceClientInteractionAnswer::BackgroundApproval { decision },
+        ) {
+            Err(orca_runtime::surface::SurfaceClientCommandError::RuntimeUnavailable)
+                if Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => break result,
+        }
+    }
+    .map_err(|error| format!("background approval response failed: {error:?}"));
+    match result? {
+        MutationReply::Committed { .. } => {}
+        MutationReply::Deferred { .. } => {
+            return Err("background approval response was deferred".to_string());
+        }
+        MutationReply::Uncommitted { mutation } => {
+            return Err(format!(
+                "background approval response was not committed: {mutation:?}"
+            ));
+        }
+    }
+    if let Some((mut guard, mut projection)) = foreground_run.take() {
+        projection.focus_operation(operation_id.clone());
+        let outcome = drain_operation(
+            &surface,
+            &attachment.client,
+            &operation_id,
+            &mut subscription,
+            &mut projection,
+            controller,
+            event_tx,
+        )
+        .map_err(|error| error.to_string())?;
+        if !matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { ref status } if status == "backgrounded"
+        ) {
+            guard.terminal_observed();
+        }
+    } else {
+        detach(&surface, &attachment.client);
+    }
+    let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
+    Ok((
+        task_id,
+        crate::surface_projection::workflow_task_summaries(&snapshot),
     ))
 }
 
@@ -2926,7 +3141,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_background_approval_terminalizes_original_operation_and_keeps_task_actionable() {
+    fn typed_background_approval_suspends_original_operation_and_requests_bound_interaction() {
         let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
@@ -2994,21 +3209,15 @@ mod tests {
                     .parent_operation
                     .as_ref()
                     .expect("approval task keeps its operation identity");
-                let operation = snapshot
-                    .operation_history
+                let background = snapshot
+                    .background_operations
                     .iter()
                     .find(|operation| &operation.operation_id == operation_id)
-                    .expect("approval operation remains in durable history");
+                    .expect("approval operation remains durably suspended in background");
                 let pending_tool = snapshot
                     .tools
                     .iter()
-                    .find(|tool| {
-                        tool.request.tool_call_id.as_str() == "mock-tool-1"
-                            && operation
-                                .agent_loop_turns
-                                .iter()
-                                .any(|turn| turn.turn_id == tool.request.turn_id)
-                    })
+                    .find(|tool| tool.request.tool_call_id.as_str() == "mock-tool-1")
                     .expect("approval task keeps its typed provider tool request");
                 assert_eq!(pending_tool.request.name.as_str(), "task_list");
                 assert_eq!(
@@ -3017,26 +3226,39 @@ mod tests {
                 );
                 assert_eq!(pending_tool.request.raw_arguments.as_str(), "{}");
                 assert!(pending_tool.result.is_none());
-                match operation.terminal.as_ref().map(|record| &record.terminal) {
-                    Some(OperationTerminal::Failed {
-                        class: orca_runtime::surface::FailureClass::LegacyApprovalRequired,
-                        ..
-                    }) => {
-                        assert!(
-                            snapshot
-                                .background_operations
-                                .iter()
-                                .all(|background| &background.operation_id != operation_id)
-                        );
-                        break;
-                    }
-                    Some(terminal) => panic!("unexpected approval terminal: {terminal:?}"),
-                    None => {}
-                }
+                let operation = snapshot
+                    .operation_history
+                    .iter()
+                    .find(|operation| &operation.operation_id == operation_id)
+                    .expect("background operation keeps its durable operation record");
+                assert!(operation.finalization.is_none());
+                assert!(operation.terminal.is_none());
+                let interaction = snapshot
+                    .interactions
+                    .iter()
+                    .find(|interaction| {
+                        interaction.fence.operation_id == *operation_id
+                            && interaction.kind
+                                == orca_runtime::surface::SurfaceInteractionKind::BackgroundApproval
+                    })
+                    .expect("approval task exposes a typed background approval");
+                let orca_runtime::surface::SurfaceInteractionRequest::BackgroundApproval {
+                    task: task_fence,
+                    tool,
+                    ..
+                } = &interaction.request
+                else {
+                    panic!("background approval uses the exact typed request");
+                };
+                assert_eq!(task_fence.task_id, task.task_id);
+                assert!(task_fence.background_owner.as_ref() == Some(&background.fence));
+                assert_eq!(background.fence.operation_fence, interaction.fence);
+                assert_eq!(tool, &pending_tool.request);
+                break;
             }
             assert!(
                 Instant::now() < deadline,
-                "approval-required task and original terminal must converge; observed {observed:?}"
+                "approval-required task and suspended interaction must converge; observed {observed:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }

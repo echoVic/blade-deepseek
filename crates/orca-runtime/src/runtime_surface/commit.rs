@@ -630,7 +630,28 @@ enum BatchCommitAuthority<'permit> {
         actor: &'permit SurfacePublisherPermit,
         generation: &'permit SurfacePublisherPermit,
     },
+    ActorFinalizerTaskTerminal {
+        actor: &'permit SurfacePublisherPermit,
+        finalizer: &'permit SurfacePublisherPermit,
+    },
     ActorBackgroundControl {
+        actor: &'permit SurfacePublisherPermit,
+        background: &'permit SurfacePublisherPermit,
+    },
+    ProviderBackgroundSuspend {
+        actor: &'permit SurfacePublisherPermit,
+        background: &'permit SurfacePublisherPermit,
+    },
+    ProviderBackgroundInteractionRoute {
+        actor: &'permit SurfacePublisherPermit,
+        background: &'permit SurfacePublisherPermit,
+    },
+    ProviderBackgroundInteractionResolution {
+        actor: &'permit SurfacePublisherPermit,
+        background: &'permit SurfacePublisherPermit,
+        expected_safe_projection: Option<&'permit super::SurfaceInteractionSafeProjection>,
+    },
+    ProviderBackgroundResume {
         actor: &'permit SurfacePublisherPermit,
         background: &'permit SurfacePublisherPermit,
     },
@@ -679,7 +700,27 @@ enum RecoveredBatchAuthority {
         actor: SurfacePublisherPermit,
         generation: SurfacePublisherPermit,
     },
+    ActorFinalizerTaskTerminal {
+        actor: SurfacePublisherPermit,
+        finalizer: SurfacePublisherPermit,
+    },
     ActorBackgroundControl {
+        actor: SurfacePublisherPermit,
+        background: SurfacePublisherPermit,
+    },
+    ProviderBackgroundSuspend {
+        actor: SurfacePublisherPermit,
+        background: SurfacePublisherPermit,
+    },
+    ProviderBackgroundInteractionRoute {
+        actor: SurfacePublisherPermit,
+        background: SurfacePublisherPermit,
+    },
+    ProviderBackgroundInteractionResolution {
+        actor: SurfacePublisherPermit,
+        background: SurfacePublisherPermit,
+    },
+    ProviderBackgroundResume {
         actor: SurfacePublisherPermit,
         background: SurfacePublisherPermit,
     },
@@ -971,9 +1012,66 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                         None,
                     )?;
                 }
+                RecoveredBatchAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ActorFinalizerTaskTerminal {
+                            actor: &actor,
+                            finalizer: &finalizer,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
                 RecoveredBatchAuthority::ActorBackgroundControl { actor, background } => {
                     coordinator.commit_batch_with_authority(
                         BatchCommitAuthority::ActorBackgroundControl {
+                            actor: &actor,
+                            background: &background,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::ProviderBackgroundSuspend { actor, background } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ProviderBackgroundSuspend {
+                            actor: &actor,
+                            background: &background,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::ProviderBackgroundInteractionRoute {
+                    actor,
+                    background,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ProviderBackgroundInteractionRoute {
+                            actor: &actor,
+                            background: &background,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::ProviderBackgroundInteractionResolution {
+                    actor,
+                    background,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ProviderBackgroundInteractionResolution {
+                            actor: &actor,
+                            background: &background,
+                            expected_safe_projection: None,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::ProviderBackgroundResume { actor, background } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ProviderBackgroundResume {
                             actor: &actor,
                             background: &background,
                         },
@@ -1104,6 +1202,55 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             RecoveredBatchAuthority::ActorBackgroundControl { actor, background } => self
                 .commit_batch_with_authority(
                     BatchCommitAuthority::ActorBackgroundControl {
+                        actor: &actor,
+                        background: &background,
+                    },
+                    &batch,
+                    None,
+                )?,
+            RecoveredBatchAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => self
+                .commit_batch_with_authority(
+                    BatchCommitAuthority::ActorFinalizerTaskTerminal {
+                        actor: &actor,
+                        finalizer: &finalizer,
+                    },
+                    &batch,
+                    None,
+                )?,
+            RecoveredBatchAuthority::ProviderBackgroundSuspend { actor, background } => self
+                .commit_batch_with_authority(
+                    BatchCommitAuthority::ProviderBackgroundSuspend {
+                        actor: &actor,
+                        background: &background,
+                    },
+                    &batch,
+                    None,
+                )?,
+            RecoveredBatchAuthority::ProviderBackgroundInteractionRoute { actor, background } => {
+                self.commit_batch_with_authority(
+                    BatchCommitAuthority::ProviderBackgroundInteractionRoute {
+                        actor: &actor,
+                        background: &background,
+                    },
+                    &batch,
+                    None,
+                )?
+            }
+            RecoveredBatchAuthority::ProviderBackgroundInteractionResolution {
+                actor,
+                background,
+            } => self.commit_batch_with_authority(
+                BatchCommitAuthority::ProviderBackgroundInteractionResolution {
+                    actor: &actor,
+                    background: &background,
+                    expected_safe_projection: None,
+                },
+                &batch,
+                None,
+            )?,
+            RecoveredBatchAuthority::ProviderBackgroundResume { actor, background } => self
+                .commit_batch_with_authority(
+                    BatchCommitAuthority::ProviderBackgroundResume {
                         actor: &actor,
                         background: &background,
                     },
@@ -1356,6 +1503,88 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         )
     }
 
+    pub(crate) fn commit_provider_background_suspend_batch(
+        &mut self,
+        fence: super::SurfaceBackgroundFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let background = self.register_permit(SurfacePublisherPermit::Background {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ProviderBackgroundSuspend {
+                actor: &actor,
+                background: &background,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_provider_background_interaction_route_batch(
+        &mut self,
+        fence: super::SurfaceBackgroundFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let background = self.register_permit(SurfacePublisherPermit::Background {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ProviderBackgroundInteractionRoute {
+                actor: &actor,
+                background: &background,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_provider_background_interaction_resolution_batch(
+        &mut self,
+        fence: super::SurfaceBackgroundFence,
+        expected_safe_projection: &super::SurfaceInteractionSafeProjection,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let background = self.register_permit(SurfacePublisherPermit::Background {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ProviderBackgroundInteractionResolution {
+                actor: &actor,
+                background: &background,
+                expected_safe_projection: Some(expected_safe_projection),
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_provider_background_resume_batch(
+        &mut self,
+        fence: super::SurfaceBackgroundFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let background = self.register_permit(SurfacePublisherPermit::Background {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ProviderBackgroundResume {
+                actor: &actor,
+                background: &background,
+            },
+            batch,
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_goal_generation_stop_batch(
         &mut self,
@@ -1507,6 +1736,24 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
     ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
         let permit = self.issue_finalizer_permit(operation_id, finalize_intent_id);
         self.commit_batch(&permit, batch)
+    }
+
+    pub(crate) fn commit_actor_finalizer_task_terminal_batch(
+        &mut self,
+        operation_id: super::SurfaceOperationId,
+        finalize_intent_id: super::SurfaceFinalizeIntentId,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let finalizer = self.issue_finalizer_permit(operation_id, finalize_intent_id);
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActorFinalizerTaskTerminal {
+                actor: &actor,
+                finalizer: &finalizer,
+            },
+            batch,
+            None,
+        )
     }
 
     pub fn ledger(&self) -> &L {
@@ -2277,6 +2524,39 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         }
 
         let events = batch.events.as_slice();
+        if let [task_event, terminal_event] = events
+            && matches!(
+                (&task_event.scope, &task_event.event),
+                (
+                    SurfaceScope::Thread,
+                    super::SurfaceEvent::Task(super::TaskPatch::StatusChanged { .. })
+                )
+            )
+            && let super::SurfaceEvent::Operation(super::OperationPatch::Terminal { record }) =
+                &terminal_event.event
+        {
+            let finalizer = SurfacePublisherPermit::Finalizer {
+                permit_id: next_permit_id(),
+                operation_id: record.operation_id.clone(),
+                finalize_intent_id: record.finalize_intent_id.clone(),
+                owner_epoch: self.owner_epoch,
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(finalizer.clone());
+            if actor_finalizer_task_terminal_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &finalizer,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(RecoveredBatchAuthority::ActorFinalizerTaskTerminal {
+                    actor,
+                    finalizer: self.register_permit(finalizer),
+                });
+            }
+        }
         if let [control, ..] = events
             && let (
                 SurfaceScope::Background { fence },
@@ -2300,6 +2580,125 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 self.owner_epoch,
             ) {
                 return Ok(RecoveredBatchAuthority::ActorBackgroundControl {
+                    actor,
+                    background: self.register_permit(background),
+                });
+            }
+        }
+        if events.len() >= 4
+            && let [.., stop, _, suspended] = events
+            && let (
+                SurfaceScope::Background { fence },
+                super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+                    reason: super::GenerationStopReason::ProviderSuspended,
+                    ..
+                }),
+            ) = (&stop.scope, &stop.event)
+            && matches!(
+                &suspended.event,
+                super::SurfaceEvent::Operation(super::OperationPatch::Suspended { .. })
+            )
+        {
+            let background = SurfacePublisherPermit::Background {
+                permit_id: next_permit_id(),
+                fence: fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(background.clone());
+            if provider_background_suspend_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &background,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(RecoveredBatchAuthority::ProviderBackgroundSuspend {
+                    actor,
+                    background: self.register_permit(background),
+                });
+            }
+        }
+        if let [route_event] = events
+            && let (
+                SurfaceScope::Background { fence },
+                super::SurfaceEvent::Interaction(super::InteractionPatch::RouteChanged { .. }),
+            ) = (&route_event.scope, &route_event.event)
+        {
+            let background = SurfacePublisherPermit::Background {
+                permit_id: next_permit_id(),
+                fence: fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(background.clone());
+            if provider_background_interaction_route_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &background,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(
+                    RecoveredBatchAuthority::ProviderBackgroundInteractionRoute {
+                        actor,
+                        background: self.register_permit(background),
+                    },
+                );
+            }
+        }
+        if let [resolution_event] = events
+            && let (
+                SurfaceScope::Background { fence },
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. }),
+            ) = (&resolution_event.scope, &resolution_event.event)
+        {
+            let background = SurfacePublisherPermit::Background {
+                permit_id: next_permit_id(),
+                fence: fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(background.clone());
+            if provider_background_interaction_resolution_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &background,
+                batch,
+                self.owner_epoch,
+                None,
+            ) {
+                return Ok(
+                    RecoveredBatchAuthority::ProviderBackgroundInteractionResolution {
+                        actor,
+                        background: self.register_permit(background),
+                    },
+                );
+            }
+        }
+        if let [reservation, _, _] = events
+            && let (
+                SurfaceScope::Background { fence },
+                super::SurfaceEvent::Operation(super::OperationPatch::GenerationReserved {
+                    ..
+                }),
+            ) = (&reservation.scope, &reservation.event)
+        {
+            let background = SurfacePublisherPermit::Background {
+                permit_id: next_permit_id(),
+                fence: fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(background.clone());
+            if provider_background_resume_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &background,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(RecoveredBatchAuthority::ProviderBackgroundResume {
                     actor,
                     background: self.register_permit(background),
                 });
@@ -3300,8 +3699,61 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     self.owner_epoch,
                 )
             }
+            BatchCommitAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => {
+                actor_finalizer_task_terminal_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    finalizer,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
             BatchCommitAuthority::ActorBackgroundControl { actor, background } => {
                 actor_background_control_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    background,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
+            BatchCommitAuthority::ProviderBackgroundSuspend { actor, background } => {
+                provider_background_suspend_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    background,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
+            BatchCommitAuthority::ProviderBackgroundInteractionRoute { actor, background } => {
+                provider_background_interaction_route_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    background,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
+            BatchCommitAuthority::ProviderBackgroundInteractionResolution {
+                actor,
+                background,
+                expected_safe_projection,
+            } => provider_background_interaction_resolution_authorized(
+                &self.state,
+                &self.issued_permits,
+                actor,
+                background,
+                batch,
+                self.owner_epoch,
+                expected_safe_projection,
+            ),
+            BatchCommitAuthority::ProviderBackgroundResume { actor, background } => {
+                provider_background_resume_authorized(
                     &self.state,
                     &self.issued_permits,
                     actor,
@@ -4622,6 +5074,444 @@ fn provider_background_stop_authorized(
         && selected_reason == reason
 }
 
+fn provider_background_suspend_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    background_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(background_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Background {
+            fence: background_fence,
+            ..
+        },
+    ) = (actor_permit, background_permit)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let events = batch.events.as_slice();
+    if events.len() < 4 {
+        return false;
+    }
+    let (response_events, tail) = events.split_at(events.len() - 4);
+    let [task_event, stop_event, interaction_event, suspended_event] = tail else {
+        return false;
+    };
+    let mut completed_response = None;
+    let mut tool_requests = Vec::new();
+    for event in response_events {
+        let SurfaceScope::Background {
+            fence: response_scope,
+        } = &event.scope
+        else {
+            return false;
+        };
+        if response_scope != background_fence {
+            return false;
+        }
+        match &event.event {
+            super::SurfaceEvent::Assistant(
+                super::AssistantPatch::Delta { .. } | super::AssistantPatch::StreamDiscarded { .. },
+            ) if completed_response.is_none() => {}
+            super::SurfaceEvent::Assistant(super::AssistantPatch::ResponseCompleted {
+                response,
+            }) if completed_response.is_none() => {
+                completed_response = Some(response);
+            }
+            super::SurfaceEvent::Tool(super::ToolPatch::Requested { request })
+                if completed_response.is_some() =>
+            {
+                tool_requests.push(request);
+            }
+            _ => return false,
+        }
+    }
+    let Some(response) = completed_response else {
+        return false;
+    };
+    if response.tool_calls.len() != tool_requests.len()
+        || response
+            .tool_calls
+            .iter()
+            .zip(tool_requests.iter())
+            .any(|(raw, request)| {
+                raw.id != request.tool_call_id
+                    || raw.name != request.name
+                    || raw.raw_arguments != request.raw_arguments
+                    || raw.arguments_digest != request.arguments_digest
+                    || request.source_response_id.as_ref() != Some(&response.response_id)
+                    || request.turn_id != response.turn_id
+            })
+    {
+        return false;
+    }
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status: super::SurfaceTaskStatus::ApprovalRequired,
+            ..
+        }),
+    ) = (&task_event.scope, &task_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background { fence: stop_scope },
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationStopped {
+            fence: stop_fence,
+            reason: super::GenerationStopReason::ProviderSuspended,
+            ..
+        }),
+    ) = (&stop_event.scope, &stop_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background {
+            fence: interaction_scope,
+        },
+        super::SurfaceEvent::Interaction(super::InteractionPatch::Requested { interaction }),
+    ) = (&interaction_event.scope, &interaction_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background {
+            fence: suspended_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::Suspended {
+            operation_id: suspended_operation,
+            cause: super::SuspensionCause::ProviderSuspended { generation_id },
+        }),
+    ) = (&suspended_event.scope, &suspended_event.event)
+    else {
+        return false;
+    };
+    let snapshot = state.snapshot();
+    let Some(background) = snapshot
+        .background_operations
+        .iter()
+        .find(|background| background.fence == *background_fence)
+    else {
+        return false;
+    };
+    let Some(task) = snapshot.tasks.iter().find(|task| &task.task_id == task_id) else {
+        return false;
+    };
+    let super::SurfaceInteractionRequest::BackgroundApproval {
+        task: task_fence,
+        tool,
+        ..
+    } = &interaction.request
+    else {
+        return false;
+    };
+    background.task_id.as_ref() == Some(task_id)
+        && background.operation_id == background_fence.operation_fence.operation_id
+        && task.task_type == super::SurfaceTaskType::MainSession
+        && task.revision == *expected_revision
+        && expected_revision.get().checked_add(1) == Some(next_revision.get())
+        && task.background_fence.as_ref() == Some(background_fence)
+        && task_fence.task_id == *task_id
+        && task_fence.task_revision == *next_revision
+        && task_fence.background_owner.as_ref() == Some(background_fence)
+        && interaction.kind == super::SurfaceInteractionKind::BackgroundApproval
+        && interaction.fence == background_fence.operation_fence
+        && matches!(
+            interaction.route,
+            super::SurfaceInteractionRoute::Unassigned { .. }
+        )
+        && matches!(
+            interaction.recovery_disposition,
+            super::InteractionUnavailableDisposition::AwaitCapableAttachment { .. }
+        )
+        && interaction_scope == background_fence
+        && tool_requests.len() == 1
+        && tool_requests[0] == tool
+        && stop_scope == background_fence
+        && stop_fence == &background_fence.operation_fence
+        && suspended_scope == background_fence
+        && suspended_operation == &background_fence.operation_fence.operation_id
+        && generation_id == &background_fence.operation_fence.generation_id
+}
+
+fn provider_background_interaction_route_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    background_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(background_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Background {
+            fence: background_fence,
+            ..
+        },
+    ) = (actor_permit, background_permit)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let [event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background { fence: scope },
+        super::SurfaceEvent::Interaction(super::InteractionPatch::RouteChanged {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            route,
+        }),
+    ) = (&event.scope, &event.event)
+    else {
+        return false;
+    };
+    let Some(interaction) = state
+        .snapshot()
+        .interactions
+        .iter()
+        .find(|interaction| &interaction.interaction_id == interaction_id)
+    else {
+        return false;
+    };
+    scope == background_fence
+        && interaction.fence == background_fence.operation_fence
+        && interaction.kind == super::SurfaceInteractionKind::BackgroundApproval
+        && interaction.revision == *expected_revision
+        && expected_revision.get().checked_add(1) == Some(next_revision.get())
+        && match (&interaction.route, route) {
+            (
+                super::SurfaceInteractionRoute::Unassigned { epoch: current },
+                super::SurfaceInteractionRoute::Exclusive { epoch: next, .. }
+                | super::SurfaceInteractionRoute::SharedFirstCommitWins { epoch: next, .. },
+            ) => current.get().checked_add(1) == Some(next.get()),
+            (
+                super::SurfaceInteractionRoute::Exclusive { epoch: current, .. }
+                | super::SurfaceInteractionRoute::SharedFirstCommitWins { epoch: current, .. },
+                super::SurfaceInteractionRoute::Unassigned { epoch: next },
+            ) => current.get().checked_add(1) == Some(next.get()),
+            _ => false,
+        }
+}
+
+fn provider_background_interaction_resolution_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    background_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+    expected_safe_projection: Option<&super::SurfaceInteractionSafeProjection>,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(background_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Background {
+            fence: background_fence,
+            ..
+        },
+    ) = (actor_permit, background_permit)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let [event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background { fence: scope },
+        super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            receipt,
+        }),
+    ) = (&event.scope, &event.event)
+    else {
+        return false;
+    };
+    let Some(interaction) = state
+        .snapshot()
+        .interactions
+        .iter()
+        .find(|interaction| &interaction.interaction_id == interaction_id)
+    else {
+        return false;
+    };
+    scope == background_fence
+        && interaction.fence == background_fence.operation_fence
+        && interaction.kind == super::SurfaceInteractionKind::BackgroundApproval
+        && receipt.kind == super::SurfaceInteractionKind::BackgroundApproval
+        && expected_safe_projection.is_none_or(|expected| &receipt.safe_projection == expected)
+        && interaction.revision == *expected_revision
+        && expected_revision.get().checked_add(1) == Some(next_revision.get())
+        && matches!(
+            interaction.lifecycle,
+            super::SurfaceInteractionLifecycle::Requested
+        )
+}
+
+fn provider_background_resume_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    background_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(background_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Background {
+            fence: background_fence,
+            ..
+        },
+    ) = (actor_permit, background_permit)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let [reservation, control, status_event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Background {
+            fence: reservation_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::GenerationReserved { generation }),
+    ) = (&reservation.scope, &reservation.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Operation {
+            operation_id: control_scope,
+        },
+        super::SurfaceEvent::Operation(super::OperationPatch::ControlIntentCommitted {
+            operation_id,
+            request_id,
+            intent: super::PendingControlIntent::ResumeStarting { generation_fence },
+        }),
+    ) = (&control.scope, &control.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status: super::SurfaceTaskStatus::Running,
+            completed_at: None,
+            result: None,
+            error: None,
+        }),
+    ) = (&status_event.scope, &status_event.event)
+    else {
+        return false;
+    };
+    let snapshot = state.snapshot();
+    let Some(operation) = snapshot
+        .operation_history
+        .iter()
+        .find(|operation| operation.operation_id == background_fence.operation_fence.operation_id)
+    else {
+        return false;
+    };
+    let Some(background) = snapshot
+        .background_operations
+        .iter()
+        .find(|background| background.fence == *background_fence)
+    else {
+        return false;
+    };
+    let Some(task) = snapshot.tasks.iter().find(|task| &task.task_id == task_id) else {
+        return false;
+    };
+    reservation_scope == background_fence
+        && generation.predecessor.as_ref() == Some(&background_fence.operation_fence)
+        && generation.fence.operation_id == background_fence.operation_fence.operation_id
+        && generation.fence.generation_id.get()
+            == background_fence
+                .operation_fence
+                .generation_id
+                .get()
+                .saturating_add(1)
+        && generation.phase == super::GenerationPhase::Reserved
+        && control_scope == &operation.operation_id
+        && operation_id == &operation.operation_id
+        && request_id == &operation.request_id
+        && generation_fence == &generation.fence
+        && matches!(
+            operation.phase,
+            super::OperationPhase::Suspended {
+                cause: super::SuspensionCause::ProviderSuspended { .. }
+            }
+        )
+        && background.task_id.as_ref() == Some(task_id)
+        && task.revision == *expected_revision
+        && expected_revision.get().checked_add(1) == Some(next_revision.get())
+        && !task.backgrounded
+        && task.background_fence.is_none()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn goal_generation_stop_authorized(
     state: &SurfaceReducerState,
@@ -5293,6 +6183,36 @@ fn actor_provider_background_control_authorized(
     let Some(task) = snapshot.tasks.iter().find(|task| task.task_id == *task_id) else {
         return false;
     };
+    let foreground_claimed_denial = !task.backgrounded
+        && task.background_fence.is_none()
+        && snapshot.interactions.iter().any(|interaction| {
+            interaction.fence.operation_id == *operation_id
+                && matches!(
+                    (
+                        &interaction.request,
+                        &interaction.lifecycle,
+                    ),
+                    (
+                        super::SurfaceInteractionRequest::BackgroundApproval {
+                            task: requested_task,
+                            ..
+                        },
+                        super::SurfaceInteractionLifecycle::Resolved { receipt },
+                    ) if requested_task.task_id == *task_id
+                        && requested_task.background_owner.as_ref() == Some(background_fence)
+                        && requested_task
+                            .task_revision
+                            .get()
+                            .checked_add(1)
+                            == Some(task.revision.get())
+                        && matches!(
+                            &receipt.safe_projection,
+                            super::SurfaceInteractionSafeProjection::BackgroundApproval {
+                                allowed: false,
+                            }
+                        )
+                )
+        });
     control_scope == background_fence
         && &background.fence == background_fence
         && intent_operation == operation_id
@@ -5301,13 +6221,15 @@ fn actor_provider_background_control_authorized(
         && background.task_id.as_ref() == Some(task_id)
         && task.task_type == super::SurfaceTaskType::MainSession
         && task.parent_operation.as_ref() == Some(operation_id)
-        && task.background_fence.as_ref() == Some(background_fence)
+        && (task.background_fence.as_ref() == Some(background_fence) || foreground_claimed_denial)
         && task.workflow_run_id.is_none()
         && task.revision == *expected_revision
         && expected_revision.get().checked_add(1) == Some(next_revision.get())
         && matches!(
             task.status,
-            super::SurfaceTaskStatus::Running | super::SurfaceTaskStatus::Paused
+            super::SurfaceTaskStatus::Running
+                | super::SurfaceTaskStatus::Paused
+                | super::SurfaceTaskStatus::ApprovalRequired
         )
 }
 
@@ -5589,6 +6511,90 @@ fn finalizer_event_authorized(
                     }
             ) if patch_operation == operation_id && patch_intent == finalize_intent_id
         )
+}
+
+fn actor_finalizer_task_terminal_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    finalizer_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(finalizer_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Finalizer {
+            operation_id,
+            finalize_intent_id,
+            owner_epoch: finalizer_epoch,
+            ..
+        },
+    ) = (actor_permit, finalizer_permit)
+    else {
+        return false;
+    };
+    if *actor_epoch != owner_epoch
+        || *finalizer_epoch != owner_epoch
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let [task_event, terminal_event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
+            task_id,
+            status,
+            completed_at: Some(_),
+            ..
+        }),
+    ) = (&task_event.scope, &task_event.event)
+    else {
+        return false;
+    };
+    let super::SurfaceEvent::Operation(super::OperationPatch::Terminal { record }) =
+        &terminal_event.event
+    else {
+        return false;
+    };
+    let Some(task) = state
+        .snapshot()
+        .tasks
+        .iter()
+        .find(|task| &task.task_id == task_id)
+    else {
+        return false;
+    };
+    let expected_status = match record.terminal {
+        super::OperationTerminal::Succeeded { .. } => super::SurfaceTaskStatus::Completed,
+        super::OperationTerminal::Cancelled { .. }
+        | super::OperationTerminal::NotAdmitted { .. } => super::SurfaceTaskStatus::Cancelled,
+        super::OperationTerminal::Shutdown { .. }
+        | super::OperationTerminal::AbortedByRuntimeRestart { .. } => {
+            super::SurfaceTaskStatus::Stopped
+        }
+        super::OperationTerminal::Failed { .. }
+        | super::OperationTerminal::Panicked { .. }
+        | super::OperationTerminal::JoinFailed { .. }
+        | super::OperationTerminal::BudgetExhausted { .. } => super::SurfaceTaskStatus::Failed,
+    };
+    task.task_type == super::SurfaceTaskType::MainSession
+        && task.parent_operation.as_ref() == Some(operation_id)
+        && record.operation_id == *operation_id
+        && record.finalize_intent_id == *finalize_intent_id
+        && *status == expected_status
+        && finalizer_event_authorized(operation_id, finalize_intent_id, terminal_event)
+        && finalizer_background_scope_matches_state(state, finalizer_permit, batch)
 }
 
 fn finalizer_background_scope_matches_state(

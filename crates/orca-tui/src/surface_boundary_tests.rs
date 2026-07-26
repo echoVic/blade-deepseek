@@ -557,6 +557,19 @@ fn typed_thread_actions_enter_through_the_tui_surface_action_facade() {
 }
 
 #[test]
+fn typed_task_stop_returns_only_runtime_surface_projection() {
+    assert!(
+        BACKGROUND_TASKS.contains("actions.read_snapshot()")
+            && BACKGROUND_TASKS.contains("workflow_task_summaries(&snapshot)"),
+        "TUI task stop must refresh its panel from runtime surface truth"
+    );
+    assert!(
+        !BACKGROUND_TASKS.contains("thread.task_summaries()"),
+        "TUI task stop must not merge registry-only tasks back into the panel"
+    );
+}
+
+#[test]
 fn typed_history_resume_projects_only_the_durable_surface_snapshot() {
     let start = APP
         .find("fn emit_typed_history_snapshot(")

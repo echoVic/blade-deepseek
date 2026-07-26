@@ -2909,6 +2909,7 @@ struct SurfaceActorTestProbe {
     pending_workflow_completion: bool,
     pending_admission_repair: bool,
     exact_interaction_selector: Option<surface::InteractionSelector>,
+    resident_interaction_count: usize,
     secret_bearing_interaction_count: usize,
     pending_capability_loss: Option<PendingCapabilityLossTestProbe>,
     pending_terminalization: Option<PendingTerminalizationTestProbe>,
@@ -4517,7 +4518,7 @@ fn reconcile_durable_workflow_outcomes_on_start(
                     },
                 }),
             )],
-            Some(terminal_commit_id),
+            Some(terminal_commit_id.clone()),
         );
         coordinator
             .commit_finalizer_batch(operation_id, finalize_intent_id, &terminal_batch)
@@ -4532,6 +4533,7 @@ fn reconcile_durable_workflow_outcomes_on_start(
 fn reconcile_durable_provider_outcomes_on_start(
     thread: &RuntimeThread,
     coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+    host_incarnation: &surface::HostIncarnation,
 ) -> Result<(), RuntimeHostError> {
     let task_registry = thread.session().task_registry();
     loop {
@@ -4586,6 +4588,182 @@ fn reconcile_durable_provider_outcomes_on_start(
             return Ok(());
         };
         let operation_id = operation.operation_id.clone();
+        if outcome.status == TaskStatus::ApprovalRequired {
+            if matches!(
+                operation.phase,
+                surface::OperationPhase::Suspended {
+                    cause: surface::SuspensionCause::ProviderSuspended { .. }
+                }
+            ) {
+                mirror_recovered_typed_provider_outcome(
+                    &task_registry,
+                    task.task_id.as_str(),
+                    &outcome,
+                    false,
+                );
+                task_registry
+                    .clear_typed_provider_outcome(task.task_id.as_str())
+                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                        message: format!(
+                            "failed to clear recovered background approval outcome for {}: {error}",
+                            task.task_id.as_str()
+                        ),
+                    })?;
+                continue;
+            }
+            let response =
+                outcome
+                    .response
+                    .as_ref()
+                    .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                        message: "recovered background approval lost its provider response"
+                            .to_string(),
+                    })?;
+            let next_task_revision =
+                surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                    || RuntimeHostError::ThreadStartFailed {
+                        message:
+                            "recovered background approval task revision exhausted".to_string(),
+                    },
+                )?)
+                .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                    message: "recovered background approval task revision is invalid".to_string(),
+                })?;
+            let mut suspension_events = ThreadActor::background_provider_response_events(
+                &snapshot,
+                &background_fence,
+                response,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to rebuild recovered background approval response: {error}"
+                ),
+            })?;
+            let tool = suspension_events
+                .iter()
+                .find_map(|(_, event)| match event {
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }) => {
+                        Some(request.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "recovered background approval has no tool request".to_string(),
+                })?;
+            let authority = ThreadActor::surface_authority_for_tool(
+                &snapshot,
+                &background_fence.operation_fence,
+                &tool,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("recovered background approval authority is invalid: {error}"),
+            })?;
+            let interaction_id =
+                surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let revision = surface::InteractionRevision::try_new(1).expect("one is valid");
+            let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is valid");
+            let request = surface::SurfaceInteractionRequest::BackgroundApproval {
+                task: surface::SurfaceTaskFence {
+                    task_id: task.task_id.clone(),
+                    task_revision: next_task_revision,
+                    background_owner: Some(background_fence.clone()),
+                },
+                tool,
+                authority,
+            };
+            let recovery_disposition =
+                surface::InteractionUnavailableDisposition::AwaitCapableAttachment {
+                    deadline: surface::InteractionExpiryDeadline {
+                        issuing_host_incarnation: host_incarnation.clone(),
+                        expires_at: surface::MonotonicInstant {
+                            clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                                *uuid::Uuid::now_v7().as_bytes(),
+                            )
+                            .expect("generated UUID is v7"),
+                            tick: surface::MonotonicTick::new(u64::MAX),
+                        },
+                        observed_expires_at: None,
+                    },
+                };
+            suspension_events.extend([
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        task_id: task.task_id.clone(),
+                        expected_revision: task.revision,
+                        next_revision: next_task_revision,
+                        status: surface::SurfaceTaskStatus::ApprovalRequired,
+                        completed_at: None,
+                        result: None,
+                        error: None,
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: background_fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
+                        fence: background_fence.operation_fence.clone(),
+                        reason: surface::GenerationStopReason::ProviderSuspended,
+                        usage_delta: surface_usage_totals(outcome.usage.unwrap_or_default()),
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: background_fence.clone(),
+                    },
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                        interaction: surface::SurfaceInteractionView {
+                            interaction_id,
+                            revision,
+                            fence: background_fence.operation_fence.clone(),
+                            kind: surface::SurfaceInteractionKind::BackgroundApproval,
+                            request,
+                            route: surface::SurfaceInteractionRoute::Unassigned {
+                                epoch: route_epoch,
+                            },
+                            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
+                            recovery_disposition,
+                        },
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: background_fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Suspended {
+                        operation_id: operation_id.clone(),
+                        cause: surface::SuspensionCause::ProviderSuspended {
+                            generation_id: background_fence.operation_fence.generation_id,
+                        },
+                    }),
+                ),
+            ]);
+            let suspension_batch = recorded_surface_event_batch(&snapshot, suspension_events, None);
+            coordinator
+                .commit_provider_background_suspend_batch(background_fence, &suspension_batch)
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!(
+                        "failed to recover durable background approval suspension: {error:?}"
+                    ),
+                })?;
+            mirror_recovered_typed_provider_outcome(
+                &task_registry,
+                task.task_id.as_str(),
+                &outcome,
+                false,
+            );
+            task_registry
+                .clear_typed_provider_outcome(task.task_id.as_str())
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!(
+                        "failed to clear recovered background approval outcome for {}: {error}",
+                        task.task_id.as_str()
+                    ),
+                })?;
+            continue;
+        }
         let committed_user_cancel = matches!(
             &operation.pending_control,
             Some(surface::PendingControlIntent::Terminalize {
@@ -4854,8 +5032,8 @@ fn mirror_recovered_typed_provider_outcome(
     }
 }
 
-fn reconcile_terminal_main_session_tasks_on_start(
-    thread: &RuntimeThread,
+fn reconcile_terminal_main_session_tasks(
+    task_registry: &TaskRegistry,
     coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
 ) -> Result<(), RuntimeHostError> {
     loop {
@@ -4967,15 +5145,42 @@ fn reconcile_terminal_main_session_tasks_on_start(
             )],
             None,
         );
-        coordinator.commit_actor_batch(&batch).map_err(|error| {
-            RuntimeHostError::ThreadStartFailed {
-                message: format!(
-                    "failed to reconcile terminal main-session task during recovery: {error:?}"
-                ),
+        let mut committed = None;
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            match coordinator.commit_actor_batch(&batch) {
+                Ok(_) => {
+                    committed = Some(Ok(()));
+                    break;
+                }
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) => {}
+                Err(error) => {
+                    committed = Some(Err(error));
+                    break;
+                }
             }
-        })?;
+        }
+        match committed {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to reconcile terminal main-session task: {error:?}"),
+                });
+            }
+            None => {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: "terminal main-session task reconciliation exhausted bounded retries"
+                        .to_string(),
+                });
+            }
+        }
 
-        let task_registry = thread.session().task_registry();
         let legacy_usage = UsageTotals {
             input_tokens: terminal.usage.input_tokens,
             output_tokens: terminal.usage.output_tokens,
@@ -5018,6 +5223,156 @@ fn reconcile_terminal_main_session_tasks_on_start(
             }
             _ => unreachable!("recovery maps only terminal main-session task states"),
         }
+    }
+}
+
+#[derive(Clone)]
+struct PreparedMainSessionTaskTerminalProjection {
+    event: (surface::SurfaceScope, surface::SurfaceEvent),
+    task_id: surface::SurfaceTaskId,
+    status: surface::SurfaceTaskStatus,
+    result: Option<surface::DisplayText>,
+    error: Option<surface::DisplayText>,
+}
+
+fn prepare_main_session_task_terminal_projection(
+    snapshot: &surface::SurfaceSnapshot,
+    operation_id: &surface::SurfaceOperationId,
+    terminal: &surface::OperationTerminalRecord,
+) -> Result<Option<PreparedMainSessionTaskTerminalProjection>, RuntimeHostError> {
+    let Some(task) = snapshot
+        .tasks
+        .iter()
+        .find(|task| {
+            task.task_type == surface::SurfaceTaskType::MainSession
+                && task.parent_operation.as_ref() == Some(operation_id)
+                && matches!(
+                    task.status,
+                    surface::SurfaceTaskStatus::Queued
+                        | surface::SurfaceTaskStatus::Running
+                        | surface::SurfaceTaskStatus::Paused
+                        | surface::SurfaceTaskStatus::Stopping
+                        | surface::SurfaceTaskStatus::ApprovalRequired
+                )
+        })
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let next_revision =
+        surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "main-session task terminal revision exhausted".to_string(),
+            }
+        })?)
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "main-session task terminal revision is invalid".to_string(),
+        })?;
+    let (status, result, error) = match &terminal.terminal {
+        surface::OperationTerminal::Succeeded { .. } => (
+            surface::SurfaceTaskStatus::Completed,
+            Some(surface::DisplayText::new("Background turn completed")),
+            None,
+        ),
+        surface::OperationTerminal::Cancelled { .. }
+        | surface::OperationTerminal::NotAdmitted { .. } => (
+            surface::SurfaceTaskStatus::Cancelled,
+            Some(surface::DisplayText::new("Background turn cancelled")),
+            None,
+        ),
+        surface::OperationTerminal::Shutdown { .. }
+        | surface::OperationTerminal::AbortedByRuntimeRestart { .. } => (
+            surface::SurfaceTaskStatus::Stopped,
+            Some(surface::DisplayText::new("Background turn stopped")),
+            None,
+        ),
+        surface::OperationTerminal::Failed { message, .. }
+        | surface::OperationTerminal::Panicked { message }
+        | surface::OperationTerminal::JoinFailed { message } => (
+            surface::SurfaceTaskStatus::Failed,
+            None,
+            Some(surface::DisplayText::new(message.as_str())),
+        ),
+        surface::OperationTerminal::BudgetExhausted { .. } => (
+            surface::SurfaceTaskStatus::Failed,
+            None,
+            Some(surface::DisplayText::new(
+                "Background turn exhausted its runtime budget",
+            )),
+        ),
+    };
+    let event = (
+        surface::SurfaceScope::Thread,
+        surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            next_revision,
+            status,
+            completed_at: Some(surface::UnixMillis::new(
+                chrono::Utc::now().timestamp_millis(),
+            )),
+            result: result.clone(),
+            error: error.clone(),
+        }),
+    );
+    Ok(Some(PreparedMainSessionTaskTerminalProjection {
+        event,
+        task_id: task.task_id,
+        status,
+        result,
+        error,
+    }))
+}
+
+fn mirror_main_session_task_terminal_projection(
+    task_registry: &TaskRegistry,
+    terminal: &surface::OperationTerminalRecord,
+    projection: &PreparedMainSessionTaskTerminalProjection,
+) {
+    let legacy_usage = UsageTotals {
+        input_tokens: terminal.usage.input_tokens,
+        output_tokens: terminal.usage.output_tokens,
+        cache_tokens: terminal.usage.cache_tokens,
+        estimated_cost_usd: terminal.usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
+    };
+    match projection.status {
+        surface::SurfaceTaskStatus::Completed => {
+            let _ = task_registry.apply_main_session_terminal_update(
+                projection.task_id.as_str(),
+                MainSessionTerminalUpdate::Completed {
+                    result: projection
+                        .result
+                        .as_ref()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_default(),
+                },
+                Some(legacy_usage),
+            );
+        }
+        surface::SurfaceTaskStatus::Failed => {
+            let _ = task_registry.apply_main_session_terminal_update(
+                projection.task_id.as_str(),
+                MainSessionTerminalUpdate::Failed {
+                    error: projection
+                        .error
+                        .as_ref()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| "Background turn failed".to_string()),
+                },
+                Some(legacy_usage),
+            );
+        }
+        surface::SurfaceTaskStatus::Stopped | surface::SurfaceTaskStatus::Cancelled => {
+            let _ = task_registry.stop(
+                projection.task_id.as_str(),
+                projection
+                    .result
+                    .as_ref()
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "Background turn stopped".to_string()),
+            );
+        }
+        _ => unreachable!("terminal projection maps only terminal task states"),
     }
 }
 
@@ -5124,6 +5479,212 @@ fn reconcile_main_session_task_mirrors_on_start(
     }
 }
 
+fn recover_background_approval_routes_on_start(
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<(), RuntimeHostError> {
+    loop {
+        let snapshot = coordinator.state().snapshot().clone();
+        let Some((interaction, background_fence, current_epoch)) =
+            snapshot.interactions.iter().find_map(|interaction| {
+                if interaction.kind != surface::SurfaceInteractionKind::BackgroundApproval
+                    || !matches!(
+                        interaction.lifecycle,
+                        surface::SurfaceInteractionLifecycle::Requested
+                    )
+                {
+                    return None;
+                }
+                let current_epoch = match &interaction.route {
+                    surface::SurfaceInteractionRoute::Unassigned { .. } => return None,
+                    surface::SurfaceInteractionRoute::Exclusive { epoch, .. }
+                    | surface::SurfaceInteractionRoute::SharedFirstCommitWins { epoch, .. } => {
+                        *epoch
+                    }
+                };
+                let background_fence = snapshot
+                    .background_operations
+                    .iter()
+                    .find(|background| {
+                        background.operation_id == interaction.fence.operation_id
+                            && background.fence.operation_fence == interaction.fence
+                    })?
+                    .fence
+                    .clone();
+                Some((interaction.clone(), background_fence, current_epoch))
+            })
+        else {
+            return Ok(());
+        };
+        let next_revision =
+            surface::InteractionRevision::try_new(interaction.revision.get().saturating_add(1))
+                .expect("interaction revision did not exhaust");
+        let next_epoch =
+            surface::ResponseRouteEpoch::try_new(current_epoch.get().saturating_add(1))
+                .expect("interaction route epoch did not exhaust");
+        let batch = recorded_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Background {
+                    fence: background_fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                    interaction_id: interaction.interaction_id,
+                    expected_revision: interaction.revision,
+                    next_revision,
+                    route: surface::SurfaceInteractionRoute::Unassigned { epoch: next_epoch },
+                }),
+            )],
+            None,
+        );
+        coordinator
+            .commit_provider_background_interaction_route_batch(background_fence, &batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to recover background approval response route: {error:?}"),
+            })?;
+    }
+}
+
+fn recovered_background_approval_interactions(
+    coordinator: &surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction> {
+    let snapshot = coordinator.state().snapshot();
+    let mut committed_resolutions = HashMap::new();
+    if let Ok(recovered) = coordinator.ledger().recover_batches() {
+        for batch in recovered.committed {
+            for envelope in batch.events.as_slice() {
+                let surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
+                    interaction_id,
+                    ..
+                }) = &envelope.event
+                else {
+                    continue;
+                };
+                committed_resolutions.insert(
+                    interaction_id.clone(),
+                    (
+                        surface::MutationCommitAck::ThreadLocalCursor {
+                            cursor: batch.cursor_after.clone(),
+                            family: surface::SurfaceFactFamily::Interaction,
+                            event_id: envelope.event_id.clone(),
+                            commit_class: batch.commit_class.clone(),
+                        },
+                        batch.cursor_after.clone(),
+                    ),
+                );
+            }
+        }
+    }
+    snapshot
+        .interactions
+        .iter()
+        .filter_map(|interaction| {
+            if interaction.kind != surface::SurfaceInteractionKind::BackgroundApproval {
+                return None;
+            }
+            let (winning_receipt, resolution_ack, projected_cursor) = match &interaction.lifecycle {
+                surface::SurfaceInteractionLifecycle::Requested => (None, None, None),
+                surface::SurfaceInteractionLifecycle::Resolved { receipt } => {
+                    let (ack, cursor) = committed_resolutions
+                        .get(&interaction.interaction_id)?
+                        .clone();
+                    (Some(receipt.clone()), Some(ack), Some(cursor))
+                }
+                surface::SurfaceInteractionLifecycle::Cancelled { .. }
+                | surface::SurfaceInteractionLifecycle::Expired { .. }
+                | surface::SurfaceInteractionLifecycle::Transferred { .. } => return None,
+            };
+            let epoch = match &interaction.route {
+                surface::SurfaceInteractionRoute::Unassigned { epoch }
+                | surface::SurfaceInteractionRoute::Exclusive { epoch, .. }
+                | surface::SurfaceInteractionRoute::SharedFirstCommitWins { epoch, .. } => *epoch,
+            };
+            let record = surface::BrokerInteractionRequestRecord {
+                thread_id: interaction.fence.thread_id.clone(),
+                interaction_id: interaction.interaction_id.clone(),
+                fence: interaction.fence.clone(),
+                kind: interaction.kind,
+                request: interaction.request.clone(),
+                response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+                answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+                recovery_disposition: interaction.recovery_disposition.clone(),
+            };
+            Some((
+                interaction.interaction_id.clone(),
+                ResidentSurfaceInteraction {
+                    record,
+                    route: surface::BrokerInteractionResponseRoute::Unassigned { epoch },
+                    revision: interaction.revision,
+                    waiter: None,
+                    private_response: None,
+                    pending_background_route: None,
+                    winning_receipt,
+                    resolution_ack,
+                    projected_cursor,
+                    cancelled: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn recovered_background_approval_resolutions(
+    snapshot: &surface::SurfaceSnapshot,
+) -> HashMap<surface::SurfaceOperationId, PendingBackgroundApprovalResolution> {
+    snapshot
+        .interactions
+        .iter()
+        .filter_map(|interaction| {
+            let surface::SurfaceInteractionRequest::BackgroundApproval { task, tool, .. } =
+                &interaction.request
+            else {
+                return None;
+            };
+            let surface::SurfaceInteractionLifecycle::Resolved { receipt } = &interaction.lifecycle
+            else {
+                return None;
+            };
+            let surface::SurfaceInteractionSafeProjection::BackgroundApproval { allowed } =
+                receipt.safe_projection
+            else {
+                return None;
+            };
+            let suspended_background = snapshot.background_operations.iter().any(|background| {
+                background.operation_id == interaction.fence.operation_id
+                    && background.fence.operation_fence == interaction.fence
+            });
+            let committed_successor = snapshot
+                .foreground_operation
+                .iter()
+                .chain(snapshot.queued_operations.iter())
+                .chain(snapshot.operation_history.iter())
+                .any(|operation| {
+                    operation.operation_id == interaction.fence.operation_id
+                        && operation.terminal.is_none()
+                        && operation.generations.iter().any(|generation| {
+                            generation.fence.generation_id > interaction.fence.generation_id
+                        })
+                });
+            (suspended_background || committed_successor).then(|| {
+                (
+                    interaction.fence.operation_id.clone(),
+                    PendingBackgroundApprovalResolution {
+                        fence: interaction.fence.clone(),
+                        task: task.clone(),
+                        tool: tool.clone(),
+                        decision: if allowed {
+                            surface::SurfaceAllowDeny::Allow
+                        } else {
+                            surface::SurfaceAllowDeny::Deny
+                        },
+                        pending_commit: None,
+                        retry_at: tokio::time::Instant::now(),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 fn bootstrap_recorded_surface(
     thread: &mut RuntimeThread,
     config: &RunConfig,
@@ -5188,7 +5749,7 @@ fn bootstrap_recorded_surface(
             })?;
         reconcile_main_session_task_mirrors_on_start(thread, coordinator.state().snapshot());
         reconcile_durable_workflow_outcomes_on_start(thread, config, &mut coordinator)?;
-        reconcile_durable_provider_outcomes_on_start(thread, &mut coordinator)?;
+        reconcile_durable_provider_outcomes_on_start(thread, &mut coordinator, &host_incarnation)?;
         let operation_ids = coordinator
             .state()
             .snapshot()
@@ -5256,9 +5817,10 @@ fn bootstrap_recorded_surface(
                 }
             }
         }
-        reconcile_terminal_main_session_tasks_on_start(thread, &mut coordinator)?;
+        reconcile_terminal_main_session_tasks(thread.session().task_registry(), &mut coordinator)?;
         reconcile_interrupted_workflow_surfaces_on_start(&mut coordinator)?;
     }
+    recover_background_approval_routes_on_start(&mut coordinator)?;
     reconcile_goal_surface_outbox_on_start(thread, &mut coordinator)?;
     reconcile_main_session_task_mirrors_on_start(thread, coordinator.state().snapshot());
     hydrate_session_pinned_context_from_surface(
@@ -5294,6 +5856,7 @@ fn bootstrap_recorded_surface(
             surface::SurfaceInteractionKind::PermissionRequest,
             surface::SurfaceInteractionKind::UserInput,
             surface::SurfaceInteractionKind::McpElicitation,
+            surface::SurfaceInteractionKind::BackgroundApproval,
         ]),
     );
     let hub = surface::SurfaceHub::from_authority(
@@ -5314,6 +5877,7 @@ fn bootstrap_recorded_surface(
         }
     })?;
     let terminals = recovered_surface_terminals(&coordinator);
+    let interactions = recovered_background_approval_interactions(&coordinator);
     Ok((
         surface::RuntimeSurfaceHandle::from_hub(hub.clone()),
         ResidentSurfaceState {
@@ -5322,7 +5886,7 @@ fn bootstrap_recorded_surface(
             terminals,
             pending_terminal_commits: HashMap::new(),
             waiters: HashMap::new(),
-            interactions: HashMap::new(),
+            interactions,
             operation_origin_attachments: HashMap::new(),
             pending_task_ownership: None,
             pending_detaches: HashMap::new(),
@@ -5882,6 +6446,8 @@ struct ThreadActor {
         HashMap<surface::SurfaceOperationId, PendingTypedProviderPreparation>,
     pending_provider_completions:
         HashMap<surface::SurfaceOperationId, PendingTypedProviderCompletion>,
+    pending_background_approval_resolutions:
+        HashMap<surface::SurfaceOperationId, PendingBackgroundApprovalResolution>,
     pending_surface_stream_redactions:
         HashMap<surface::SurfaceItemId, PendingSurfaceStreamRedaction>,
     surface_terminal_blocked: Option<String>,
@@ -5941,10 +6507,20 @@ struct ResidentSurfaceInteraction {
     revision: surface::InteractionRevision,
     waiter: Option<ResidentInteractionWaiter>,
     private_response: Option<ResidentPrivateInteractionResponse>,
+    pending_background_route: Option<PendingBackgroundInteractionRoute>,
     winning_receipt: Option<surface::SurfaceInteractionResolutionReceipt>,
     resolution_ack: Option<surface::MutationCommitAck>,
     projected_cursor: Option<surface::SurfaceCursor>,
     cancelled: Option<surface::InteractionCancelReason>,
+}
+
+#[derive(Clone)]
+struct PendingBackgroundInteractionRoute {
+    fence: surface::SurfaceBackgroundFence,
+    batch: surface::SurfaceCommitBatch,
+    next_revision: surface::InteractionRevision,
+    private_route: surface::BrokerInteractionResponseRoute,
+    retry_at: tokio::time::Instant,
 }
 
 struct ResidentPrivateInteractionResponse {
@@ -5993,6 +6569,8 @@ enum PendingSurfaceTransitionRetry {
     WorkflowCompletion(surface::SurfaceOperationId),
     ProviderPreparation(surface::SurfaceOperationId),
     ProviderCompletion(surface::SurfaceOperationId),
+    BackgroundApprovalResolution(surface::SurfaceOperationId),
+    BackgroundInteractionRoute(surface::SurfaceInteractionId),
     TaskOwnership(surface::SurfaceOperationId),
     BackgroundControl(surface::SurfaceOperationId),
     AdmissionCommit(surface::SurfaceOperationId),
@@ -6012,6 +6590,46 @@ struct PendingSurfaceTaskOwnership {
     backgrounded: bool,
     batch: surface::SurfaceCommitBatch,
     retry_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct PendingBackgroundApprovalResolution {
+    fence: surface::SurfaceOperationFence,
+    task: surface::SurfaceTaskFence,
+    tool: surface::SurfaceToolRequest,
+    decision: surface::SurfaceAllowDeny,
+    pending_commit: Option<PendingBackgroundApprovalCommit>,
+    retry_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+enum PendingBackgroundApprovalCommit {
+    ProviderResume {
+        fence: surface::SurfaceBackgroundFence,
+        batch: surface::SurfaceCommitBatch,
+    },
+    Generation {
+        fence: surface::SurfaceOperationFence,
+        batch: surface::SurfaceCommitBatch,
+    },
+    ActorControl {
+        fence: surface::SurfaceBackgroundFence,
+        batch: surface::SurfaceCommitBatch,
+    },
+    Actor {
+        batch: surface::SurfaceCommitBatch,
+    },
+    Finalizer {
+        operation_id: surface::SurfaceOperationId,
+        finalize_intent_id: surface::SurfaceFinalizeIntentId,
+        terminal_commit_id: surface::SurfaceCommitId,
+        batch: surface::SurfaceCommitBatch,
+    },
+    ActorFinalizerTaskTerminal {
+        operation_id: surface::SurfaceOperationId,
+        finalize_intent_id: surface::SurfaceFinalizeIntentId,
+        batch: surface::SurfaceCommitBatch,
+    },
 }
 
 #[derive(Clone)]
@@ -7940,6 +8558,14 @@ struct TypedProviderBackgroundOutcome {
     completed_at_ms: i64,
 }
 
+#[derive(Clone)]
+struct PreparedBackgroundApprovalInteraction {
+    interaction_id: surface::SurfaceInteractionId,
+    record: surface::BrokerInteractionRequestRecord,
+    route: surface::BrokerInteractionResponseRoute,
+    revision: surface::InteractionRevision,
+}
+
 fn durable_typed_provider_outcome(
     outcome: &TypedProviderBackgroundOutcome,
 ) -> DurableTypedProviderOutcome {
@@ -7984,6 +8610,7 @@ struct PendingTypedProviderCompletion {
     usage: surface::UsageTotals,
     terminal_batch: Option<surface::SurfaceCommitBatch>,
     terminal_value: Option<surface::OperationTerminalAtCursor>,
+    background_approval: Option<PreparedBackgroundApprovalInteraction>,
     stage: TypedProviderCompletionStage,
     rebuild_after_foreign_incomplete: bool,
     retry_at: tokio::time::Instant,
@@ -10246,6 +10873,81 @@ impl ThreadActor {
             fence: fence.clone(),
         };
         let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let response_items_match = [
+            completed_response.message_item.as_ref().map(|expected| {
+                snapshot.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        surface::SurfaceItem::AssistantMessage {
+                            id,
+                            turn_id,
+                            text,
+                            pinned,
+                        } if id == &expected.id
+                            && turn_id == &expected.turn_id
+                            && text == &expected.text
+                            && pinned == &expected.pinned
+                    )
+                })
+            }),
+            completed_response.reasoning_item.as_ref().map(|expected| {
+                snapshot.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        surface::SurfaceItem::AssistantReasoning {
+                            id,
+                            turn_id,
+                            summary,
+                            content,
+                            pinned,
+                        } if id == &expected.id
+                            && turn_id == &expected.turn_id
+                            && summary == &expected.summary
+                            && content == &expected.content
+                            && pinned == &expected.pinned
+                    )
+                })
+            }),
+            completed_response.plan_item.as_ref().map(|expected| {
+                snapshot.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        surface::SurfaceItem::AssistantPlan {
+                            id,
+                            turn_id,
+                            text,
+                            pinned,
+                        } if id == &expected.id
+                            && turn_id == &expected.turn_id
+                            && text == &expected.text
+                            && pinned == &expected.pinned
+                    )
+                })
+            }),
+        ];
+        let has_response_identity =
+            response_items_match.iter().any(Option::is_some) || !tool_requests.is_empty();
+        let tools_match = snapshot
+            .tools
+            .iter()
+            .filter(|tool| {
+                tool.request.source_response_id.as_ref() == Some(&completed_response.response_id)
+                    && tool.request.turn_id == completed_response.turn_id
+            })
+            .count()
+            == tool_requests.len()
+            && tool_requests
+                .iter()
+                .all(|expected| snapshot.tools.iter().any(|tool| tool.request == *expected));
+        if has_response_identity
+            && response_items_match
+                .into_iter()
+                .flatten()
+                .all(|matched| matched)
+            && tools_match
+        {
+            return Ok(());
+        }
         let mut events = Vec::new();
         for stream in snapshot.assistant_streams.iter().filter(|stream| {
             stream.fence == fence
@@ -11128,6 +11830,7 @@ impl ThreadActor {
                         waiter: reply.clone(),
                     }),
                     private_response: None,
+                    pending_background_route: None,
                     winning_receipt: None,
                     resolution_ack: None,
                     projected_cursor: None,
@@ -11212,6 +11915,7 @@ impl ThreadActor {
                     revision,
                     waiter: Some(ResidentInteractionWaiter::Permission(reply.clone())),
                     private_response: None,
+                    pending_background_route: None,
                     winning_receipt: None,
                     resolution_ack: None,
                     projected_cursor: None,
@@ -11365,6 +12069,7 @@ impl ThreadActor {
                 revision,
                 waiter: Some(ResidentInteractionWaiter::UserInput(reply)),
                 private_response: None,
+                pending_background_route: None,
                 winning_receipt: None,
                 resolution_ack: None,
                 projected_cursor: None,
@@ -11517,6 +12222,7 @@ impl ThreadActor {
                 revision,
                 waiter: Some(ResidentInteractionWaiter::McpElicitation(reply)),
                 private_response: None,
+                pending_background_route: None,
                 winning_receipt: None,
                 resolution_ack: None,
                 projected_cursor: None,
@@ -11556,6 +12262,42 @@ impl ThreadActor {
         surface::MutationReply<surface::RespondInteractionOutput>,
         surface::SurfaceClientCommandError,
     > {
+        if let Some(interaction) = self.resident_surface.interactions.get(&interaction_id)
+            && let Some(winning_receipt) = interaction.winning_receipt.clone()
+        {
+            if !self
+                .resident_surface
+                .hub
+                .admits_interaction_client(client, interaction.record.kind)
+            {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+            let acknowledgement = interaction
+                .resolution_ack
+                .clone()
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            return Ok(surface::MutationReply::Committed {
+                mutation: surface::CommittedMutation {
+                    request_id,
+                    target: surface::MutationTarget::Interaction {
+                        thread_id: interaction.record.thread_id.clone(),
+                        interaction_id: interaction_id.clone(),
+                    },
+                    disposition: surface::MutationDisposition::AlreadyApplied,
+                    acknowledgements: surface::NonEmptyVec::try_new(vec![acknowledgement])
+                        .expect("interaction replay has one acknowledgement"),
+                },
+                value: surface::RespondInteractionOutput {
+                    interaction_id,
+                    attempted_response_id: winning_receipt.response_id.clone(),
+                    disposition: surface::RespondInteractionDisposition::AlreadyResolved {
+                        winning_receipt,
+                    },
+                    projected_cursor: interaction.projected_cursor.clone(),
+                },
+            });
+        }
+        self.assign_unassigned_background_interaction(client, &interaction_id)?;
         let interaction = self
             .resident_surface
             .interactions
@@ -11590,6 +12332,156 @@ impl ThreadActor {
         let response =
             surface::BoundInteractionResponse::new(response_id, answer, policy, authority);
         self.respond_surface_interaction(client, request_id, selector, response)
+    }
+
+    fn assign_unassigned_background_interaction(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        interaction_id: &surface::SurfaceInteractionId,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        if self
+            .resident_surface
+            .interactions
+            .get(interaction_id)
+            .is_some_and(|interaction| interaction.pending_background_route.is_some())
+        {
+            self.retry_background_interaction_route(interaction_id);
+            if self
+                .resident_surface
+                .interactions
+                .get(interaction_id)
+                .is_some_and(|interaction| interaction.pending_background_route.is_some())
+            {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+        }
+        let Some(interaction) = self.resident_surface.interactions.get(interaction_id) else {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        };
+        if !matches!(
+            interaction.route,
+            surface::BrokerInteractionResponseRoute::Unassigned { .. }
+        ) {
+            return Ok(());
+        }
+        if interaction.record.kind != surface::SurfaceInteractionKind::BackgroundApproval
+            || !self.resident_surface.hub.admits_interaction_client(
+                client,
+                surface::SurfaceInteractionKind::BackgroundApproval,
+            )
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let background_fence = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .background_operations
+            .iter()
+            .find(|background| {
+                background.operation_id == interaction.record.fence.operation_id
+                    && background.fence.operation_fence == interaction.record.fence
+            })
+            .map(|background| background.fence.clone())
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let expected_revision = interaction.revision;
+        let next_revision =
+            surface::InteractionRevision::try_new(expected_revision.get().saturating_add(1))
+                .expect("interaction revision did not exhaust");
+        let current_epoch = interaction_route_epoch(&interaction.route);
+        let next_epoch =
+            surface::ResponseRouteEpoch::try_new(current_epoch.get().saturating_add(1))
+                .expect("interaction route epoch did not exhaust");
+        let grant_token = surface::SurfaceResponseGrantToken::new(random_token_bytes());
+        let public_route = surface::SurfaceInteractionRoute::Exclusive {
+            epoch: next_epoch,
+            attachment_id: client.attachment_id().clone(),
+        };
+        let private_route = surface::BrokerInteractionResponseRoute::Exclusive {
+            epoch: next_epoch,
+            attachment_id: client.attachment_id().clone(),
+            grant_token,
+        };
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Background {
+                    fence: background_fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision,
+                    next_revision,
+                    route: public_route,
+                }),
+            )],
+            None,
+        );
+        let interaction = self
+            .resident_surface
+            .interactions
+            .get_mut(interaction_id)
+            .expect("background interaction remains resident");
+        interaction.pending_background_route = Some(PendingBackgroundInteractionRoute {
+            fence: background_fence,
+            batch,
+            next_revision,
+            private_route,
+            retry_at: tokio::time::Instant::now(),
+        });
+        self.retry_background_interaction_route(interaction_id);
+        if self
+            .resident_surface
+            .interactions
+            .get(interaction_id)
+            .is_some_and(|interaction| interaction.pending_background_route.is_some())
+        {
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn retry_background_interaction_route(
+        &mut self,
+        interaction_id: &surface::SurfaceInteractionId,
+    ) {
+        let Some(pending) = self
+            .resident_surface
+            .interactions
+            .get(interaction_id)
+            .and_then(|interaction| interaction.pending_background_route.clone())
+        else {
+            return;
+        };
+        if self
+            .resident_surface
+            .coordinator
+            .commit_provider_background_interaction_route_batch(
+                pending.fence.clone(),
+                &pending.batch,
+            )
+            .is_err()
+        {
+            if let Some(route) = self
+                .resident_surface
+                .interactions
+                .get_mut(interaction_id)
+                .and_then(|interaction| interaction.pending_background_route.as_mut())
+            {
+                route.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+            }
+            return;
+        }
+        let interaction = self
+            .resident_surface
+            .interactions
+            .get_mut(interaction_id)
+            .expect("committed background interaction remains resident");
+        interaction.revision = pending.next_revision;
+        interaction.route = pending.private_route;
+        interaction.pending_background_route = None;
     }
 
     fn respond_surface_interaction(
@@ -11802,6 +12694,27 @@ impl ThreadActor {
         let next_revision = surface::InteractionRevision::try_new(expected_revision.get() + 1)
             .expect("interaction revision did not exhaust");
         let fence = interaction.record.fence.clone();
+        let background_fence = (interaction.record.kind
+            == surface::SurfaceInteractionKind::BackgroundApproval)
+            .then(|| {
+                self.resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .background_operations
+                    .iter()
+                    .find(|background| {
+                        background.operation_id == fence.operation_id
+                            && background.fence.operation_fence == fence
+                    })
+                    .map(|background| background.fence.clone())
+            })
+            .flatten();
+        if interaction.record.kind == surface::SurfaceInteractionKind::BackgroundApproval
+            && background_fence.is_none()
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
         let attempted_digest = keyed_interaction_response_digest(
             &interaction.record.response_token,
             response.answer(),
@@ -11860,11 +12773,17 @@ impl ThreadActor {
         {
             batch
         } else {
+            let scope = background_fence
+                .as_ref()
+                .map(|fence| surface::SurfaceScope::Background {
+                    fence: fence.clone(),
+                })
+                .unwrap_or_else(|| surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                });
             let batch = self.surface_event_batch_with_commit_id(
                 vec![(
-                    surface::SurfaceScope::Generation {
-                        fence: fence.clone(),
-                    },
+                    scope,
                     surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
                         interaction_id: interaction_id.clone(),
                         expected_revision,
@@ -11882,11 +12801,23 @@ impl ThreadActor {
                 .pending_batch = Some(batch.clone());
             batch
         };
-        if let Err(error) = self
-            .resident_surface
-            .coordinator
-            .commit_generation_batch(fence, &batch)
-        {
+        let resolution = match background_fence {
+            Some(background_fence) => {
+                let safe_projection = interaction_safe_projection(&winner_answer);
+                self.resident_surface
+                    .coordinator
+                    .commit_provider_background_interaction_resolution_batch(
+                        background_fence,
+                        &safe_projection,
+                        &batch,
+                    )
+            }
+            None => self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(fence, &batch),
+        };
+        if let Err(error) = resolution {
             eprintln!("orca: typed interaction resolution commit failed: {error:?}");
             self.resident_surface
                 .interactions
@@ -11923,12 +12854,53 @@ impl ThreadActor {
         interaction_id: &surface::SurfaceInteractionId,
         winner_answer: &surface::SurfaceClientInteractionAnswer,
     ) {
-        let waiter = self
-            .resident_surface
-            .interactions
-            .remove(interaction_id)
-            .expect("committed interaction remains resident")
-            .waiter;
+        let (record, waiter) = {
+            let interaction = self
+                .resident_surface
+                .interactions
+                .get_mut(interaction_id)
+                .expect("committed interaction remains resident");
+            let private = interaction
+                .private_response
+                .take()
+                .expect("committed interaction retains its private winner");
+            let batch = private
+                .pending_batch
+                .expect("committed interaction retains its exact public batch");
+            let envelope = &batch.events.as_slice()[0];
+            interaction.revision =
+                surface::InteractionRevision::try_new(interaction.revision.get().saturating_add(1))
+                    .expect("interaction revision did not exhaust");
+            interaction.winning_receipt = Some(private.record.receipt);
+            interaction.resolution_ack = Some(surface::MutationCommitAck::ThreadLocalCursor {
+                cursor: batch.cursor_after.clone(),
+                family: surface::SurfaceFactFamily::Interaction,
+                event_id: envelope.event_id.clone(),
+                commit_class: batch.commit_class.clone(),
+            });
+            interaction.projected_cursor = Some(batch.cursor_after);
+            (interaction.record.clone(), interaction.waiter.take())
+        };
+        if let (
+            surface::SurfaceInteractionRequest::BackgroundApproval { task, tool, .. },
+            surface::SurfaceClientInteractionAnswer::BackgroundApproval { decision },
+        ) = (&record.request, winner_answer)
+        {
+            let mut pending = PendingBackgroundApprovalResolution {
+                fence: record.fence.clone(),
+                task: task.clone(),
+                tool: tool.clone(),
+                decision: *decision,
+                pending_commit: None,
+                retry_at: tokio::time::Instant::now(),
+            };
+            let operation_id = pending.fence.operation_id.clone();
+            if let Err(error) = self.settle_background_approval_resolution(&mut pending) {
+                eprintln!("orca: background approval settlement deferred: {error}");
+                self.pending_background_approval_resolutions
+                    .insert(operation_id, pending);
+            }
+        }
         if let Some(waiter) = waiter {
             match (waiter, winner_answer) {
                 (
@@ -12026,6 +12998,762 @@ impl ThreadActor {
                 _ => unreachable!("waiter and answer kind were validated before commit"),
             }
         }
+    }
+
+    fn settle_background_approval_resolution(
+        &mut self,
+        pending: &mut PendingBackgroundApprovalResolution,
+    ) -> Result<(), RuntimeHostError> {
+        let task_id = pending.task.task_id.as_str();
+        let registry = self.handle.task_registry.clone();
+        if Self::surface_operation_record(
+            self.resident_surface.coordinator.state().snapshot(),
+            &pending.fence.operation_id,
+        )
+        .is_some_and(|operation| operation.terminal.is_some())
+        {
+            return Ok(());
+        }
+        if pending.decision == surface::SurfaceAllowDeny::Deny && pending.pending_commit.is_some() {
+            return self.settle_denied_background_approval(pending, &registry);
+        }
+        if pending.decision == surface::SurfaceAllowDeny::Deny {
+            let snapshot = self.resident_surface.coordinator.state().snapshot();
+            let denial_is_durably_underway =
+                Self::surface_operation_record(snapshot, &pending.fence.operation_id)
+                    .is_some_and(|operation| operation.finalization.is_some())
+                    || snapshot.tasks.iter().any(|task| {
+                        task.task_id == pending.task.task_id
+                            && matches!(
+                                task.status,
+                                surface::SurfaceTaskStatus::Stopping
+                                    | surface::SurfaceTaskStatus::Stopped
+                                    | surface::SurfaceTaskStatus::Cancelled
+                            )
+                    });
+            if denial_is_durably_underway {
+                return self.settle_denied_background_approval(pending, &registry);
+            }
+        }
+        let record = registry
+            .get(task_id)
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "background approval task disappeared".to_string(),
+            })?;
+        if record
+            .pending_tool_call
+            .as_ref()
+            .is_none_or(|tool| tool.id != pending.tool.tool_call_id.as_str())
+            || record.pending_provider_response.is_none()
+        {
+            if self.active.as_ref().is_some_and(|active| {
+                active.surface_operation.as_ref().is_some_and(|fence| {
+                    fence.operation_id == pending.fence.operation_id
+                        && fence.generation_id > pending.fence.generation_id
+                })
+            }) {
+                return Ok(());
+            }
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "background approval lost its exact pending provider response".to_string(),
+            });
+        }
+        let approved = pending.decision == surface::SurfaceAllowDeny::Allow;
+        match record.pending_tool_approval_response {
+            Some(existing) if existing != approved => {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: "background approval decision conflicts with durable task state"
+                        .to_string(),
+                });
+            }
+            Some(_) => {}
+            None => registry
+                .submit_pending_tool_approval_response(task_id, approved)
+                .map_err(|message| RuntimeHostError::ThreadStartFailed { message })?,
+        }
+        if !approved {
+            return self.settle_denied_background_approval(pending, &registry);
+        }
+        self.resume_approved_background_operation(pending, &registry)
+    }
+
+    fn commit_background_approval_stage(
+        &mut self,
+        pending: &mut PendingBackgroundApprovalResolution,
+        prepared: PendingBackgroundApprovalCommit,
+        context: &'static str,
+    ) -> Result<(), RuntimeHostError> {
+        if pending.pending_commit.is_none() {
+            pending.pending_commit = Some(prepared);
+        }
+        let result = match pending
+            .pending_commit
+            .as_ref()
+            .expect("background approval stage is retained before commit")
+        {
+            PendingBackgroundApprovalCommit::ProviderResume { fence, batch } => self
+                .resident_surface
+                .coordinator
+                .commit_provider_background_resume_batch(fence.clone(), batch),
+            PendingBackgroundApprovalCommit::Generation { fence, batch } => self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(fence.clone(), batch),
+            PendingBackgroundApprovalCommit::ActorControl { fence, batch } => self
+                .resident_surface
+                .coordinator
+                .commit_actor_background_control_batch(fence.clone(), batch),
+            PendingBackgroundApprovalCommit::Actor { batch } => {
+                self.resident_surface.coordinator.commit_actor_batch(batch)
+            }
+            PendingBackgroundApprovalCommit::Finalizer {
+                operation_id,
+                finalize_intent_id,
+                terminal_commit_id: _,
+                batch,
+            } => self.resident_surface.coordinator.commit_finalizer_batch(
+                operation_id.clone(),
+                finalize_intent_id.clone(),
+                batch,
+            ),
+            PendingBackgroundApprovalCommit::ActorFinalizerTaskTerminal {
+                operation_id,
+                finalize_intent_id,
+                batch,
+            } => self
+                .resident_surface
+                .coordinator
+                .commit_actor_finalizer_task_terminal_batch(
+                    operation_id.clone(),
+                    finalize_intent_id.clone(),
+                    batch,
+                ),
+        };
+        result.map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("{context}: {error:?}"),
+        })?;
+        pending.pending_commit = None;
+        Ok(())
+    }
+
+    fn resume_approved_background_operation(
+        &mut self,
+        pending: &mut PendingBackgroundApprovalResolution,
+        registry: &TaskRegistry,
+    ) -> Result<(), RuntimeHostError> {
+        if self.active.as_ref().is_some_and(|active| {
+            active.surface_operation.as_ref().is_some_and(|fence| {
+                fence.operation_id == pending.fence.operation_id
+                    && fence.generation_id > pending.fence.generation_id
+            })
+        }) {
+            return Ok(());
+        }
+        let mut snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = Self::surface_operation_record(&snapshot, &pending.fence.operation_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "background approval operation disappeared".to_string(),
+            })?;
+        let previous = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == pending.fence)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "background approval predecessor generation disappeared".to_string(),
+            })?;
+        if snapshot
+            .background_operations
+            .iter()
+            .any(|background| background.fence.operation_fence == pending.fence)
+        {
+            let task = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id == pending.task.task_id)
+                .cloned()
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "background approval projected task disappeared".to_string(),
+                })?;
+            if task.revision.get() != pending.task.task_revision.get().saturating_add(1)
+                || task.backgrounded
+                || task.background_fence.is_some()
+                || task.status != surface::SurfaceTaskStatus::ApprovalRequired
+            {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message:
+                        "background approval requires an explicit foreground task ownership commit"
+                            .to_string(),
+                });
+            }
+            let response_turn_id = registry
+                .get(pending.task.task_id.as_str())
+                .and_then(|task| task.pending_provider_response)
+                .map(|response| response.completed().identity.turn_id.clone())
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "background approval response turn identity disappeared".to_string(),
+                })?;
+            let generation_id = surface::SurfaceGenerationId::new(
+                previous
+                    .fence
+                    .generation_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                        message: "background approval generation id exhausted".to_string(),
+                    })?,
+            );
+            let successor_fence = surface::SurfaceOperationFence {
+                thread_id: snapshot.thread.thread_id.clone(),
+                thread_owner_epoch: snapshot.thread.owner_epoch,
+                operation_id: pending.fence.operation_id.clone(),
+                generation_id,
+            };
+            let successor = surface::GenerationRecord {
+                fence: successor_fence.clone(),
+                logical_turn_id: response_turn_id,
+                input: previous.input.clone(),
+                predecessor: Some(previous.fence.clone()),
+                attempt: surface::GenerationAttempt::RecoveryReplacement,
+                goal_identity: None,
+                replayability: previous.replayability.clone(),
+                required_capabilities: previous.required_capabilities.clone(),
+                capability_fingerprint: previous.capability_fingerprint.clone(),
+                phase: surface::GenerationPhase::Reserved,
+                started_witness: None,
+                stop_reason: None,
+            };
+            let running_revision =
+                surface::TaskRevision::try_new(task.revision.get().saturating_add(1))
+                    .expect("task revision did not exhaust");
+            let background_fence = pending.task.background_owner.clone().ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "background approval task lost its background owner".to_string(),
+                }
+            })?;
+            let resume_batch = self.surface_event_batch_with_commit_id(
+                vec![
+                    (
+                        surface::SurfaceScope::Background {
+                            fence: background_fence.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::GenerationReserved {
+                                generation: successor,
+                            },
+                        ),
+                    ),
+                    (
+                        surface::SurfaceScope::Operation {
+                            operation_id: pending.fence.operation_id.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::ControlIntentCommitted {
+                                operation_id: pending.fence.operation_id.clone(),
+                                request_id: operation.request_id.clone(),
+                                intent: surface::PendingControlIntent::ResumeStarting {
+                                    generation_fence: successor_fence,
+                                },
+                            },
+                        ),
+                    ),
+                    (
+                        surface::SurfaceScope::Thread,
+                        surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                            task_id: task.task_id.clone(),
+                            expected_revision: task.revision,
+                            next_revision: running_revision,
+                            status: surface::SurfaceTaskStatus::Running,
+                            completed_at: None,
+                            result: None,
+                            error: None,
+                        }),
+                    ),
+                ],
+                None,
+            );
+            self.commit_background_approval_stage(
+                pending,
+                PendingBackgroundApprovalCommit::ProviderResume {
+                    fence: background_fence,
+                    batch: resume_batch,
+                },
+                "failed to durably reserve background approval continuation",
+            )?;
+            snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        }
+        let recovery_rebased = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| {
+                operation.operation_id == pending.fence.operation_id
+                    && matches!(
+                        operation.phase,
+                        surface::OperationPhase::Suspended {
+                            cause: surface::SuspensionCause::RecoveryRequired { .. }
+                        }
+                    )
+                    && operation.generations.last().is_some_and(|generation| {
+                        generation.phase == surface::GenerationPhase::Stopped
+                            && generation.fence.generation_id > pending.fence.generation_id
+                    })
+            })
+            .cloned();
+        if let Some(operation) = recovery_rebased {
+            let previous = operation
+                .generations
+                .last()
+                .cloned()
+                .expect("recovery-rebased operation has a generation");
+            let response_turn_id = registry
+                .get(pending.task.task_id.as_str())
+                .and_then(|task| task.pending_provider_response)
+                .map(|response| response.completed().identity.turn_id.clone())
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "recovered background approval response identity disappeared"
+                        .to_string(),
+                })?;
+            let generation_id = surface::SurfaceGenerationId::new(
+                previous
+                    .fence
+                    .generation_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                        message: "recovered background approval generation id exhausted"
+                            .to_string(),
+                    })?,
+            );
+            let successor_fence = surface::SurfaceOperationFence {
+                thread_id: snapshot.thread.thread_id.clone(),
+                thread_owner_epoch: snapshot.thread.owner_epoch,
+                operation_id: pending.fence.operation_id.clone(),
+                generation_id,
+            };
+            let successor = surface::GenerationRecord {
+                fence: successor_fence.clone(),
+                logical_turn_id: response_turn_id,
+                input: previous.input.clone(),
+                predecessor: Some(previous.fence.clone()),
+                attempt: surface::GenerationAttempt::RecoveryReplacement,
+                goal_identity: None,
+                replayability: previous.replayability.clone(),
+                required_capabilities: previous.required_capabilities.clone(),
+                capability_fingerprint: previous.capability_fingerprint.clone(),
+                phase: surface::GenerationPhase::Reserved,
+                started_witness: None,
+                stop_reason: None,
+            };
+            let resume_batch = self.surface_operation_batch(
+                &operation.operation_id,
+                vec![
+                    surface::OperationPatch::GenerationReserved {
+                        generation: successor,
+                    },
+                    surface::OperationPatch::ControlIntentCommitted {
+                        operation_id: operation.operation_id.clone(),
+                        request_id: operation.request_id.clone(),
+                        intent: surface::PendingControlIntent::ResumeStarting {
+                            generation_fence: successor_fence,
+                        },
+                    },
+                ],
+            );
+            self.commit_background_approval_stage(
+                pending,
+                PendingBackgroundApprovalCommit::Actor {
+                    batch: resume_batch,
+                },
+                "failed to reserve recovered background approval continuation",
+            )?;
+            snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        }
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == pending.fence.operation_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "background approval continuation was not foregrounded".to_string(),
+            })?;
+        let successor = operation
+            .generations
+            .last()
+            .cloned()
+            .filter(|generation| generation.fence.generation_id > pending.fence.generation_id)
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "background approval successor generation disappeared".to_string(),
+            })?;
+        if successor.phase == surface::GenerationPhase::Reserved {
+            let started_commit_id =
+                surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let started_batch = self.surface_operation_batch_with_commit_id(
+                &operation.operation_id,
+                vec![surface::OperationPatch::GenerationStarted {
+                    fence: successor.fence.clone(),
+                    witness: surface::GenerationStartedWitness {
+                        started_commit_id: started_commit_id.clone(),
+                        settings_revision: operation.intent.settings_revision,
+                        policy_epoch: operation.intent.policy_epoch,
+                        durable_replayability_digest: surface::canonical_replayability_digest(
+                            &successor.replayability,
+                        ),
+                        capability_fingerprint: successor.capability_fingerprint.clone(),
+                    },
+                }],
+                Some(started_commit_id),
+            );
+            self.commit_background_approval_stage(
+                pending,
+                PendingBackgroundApprovalCommit::Generation {
+                    fence: successor.fence.clone(),
+                    batch: started_batch,
+                },
+                "failed to start background approval continuation",
+            )?;
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = snapshot
+            .foreground_operation
+            .as_ref()
+            .filter(|operation| operation.operation_id == pending.fence.operation_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "background approval continuation operation disappeared".to_string(),
+            })?;
+        let successor = operation.generations.last().cloned().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "background approval continuation generation disappeared".to_string(),
+            }
+        })?;
+        if !operation
+            .agent_loop_turns
+            .iter()
+            .any(|turn| turn.fence == successor.fence)
+        {
+            let loop_batch = self.surface_operation_batch(
+                &operation.operation_id,
+                vec![surface::OperationPatch::AgentLoopTurnStarted {
+                    turn: surface::SurfaceAgentLoopTurn {
+                        turn_id: successor.logical_turn_id.clone(),
+                        fence: successor.fence.clone(),
+                        ordinal: 0,
+                        task_id: pending.task.task_id.clone(),
+                        task_status: surface::SurfaceTaskRunningStatus::Running,
+                    },
+                }],
+            );
+            self.commit_background_approval_stage(
+                pending,
+                PendingBackgroundApprovalCommit::Generation {
+                    fence: successor.fence.clone(),
+                    batch: loop_batch,
+                },
+                "failed to start background approval agent loop",
+            )?;
+        }
+        if self.active.is_none() {
+            let interaction_command_tx = self.handle.command_tx.clone();
+            let interaction_fence = successor.fence.clone();
+            let request = HostedTurnRequest::new("")
+                .with_operation_kind(HostedOperationKind::BackgroundContinuation {
+                    task_id: pending.task.task_id.as_str().to_string(),
+                })
+                .with_goal_usage_tracking(true)
+                .with_generation_handlers(move |_, _| {
+                    HostedGenerationHandlers::default()
+                        .with_provider_response_ingress(Arc::new(
+                            RuntimeSurfaceProviderResponseIngress {
+                                command_tx: interaction_command_tx.clone(),
+                                fence: interaction_fence.clone(),
+                            },
+                        ))
+                        .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        }))
+                        .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        }))
+                        .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        }))
+                        .with_mcp_elicitation_handler(Arc::new(
+                            RuntimeSurfaceMcpElicitationHandler {
+                                command_tx: interaction_command_tx.clone(),
+                                fence: interaction_fence.clone(),
+                            },
+                        ))
+                });
+            let (start_tx, start_rx) = mpsc::sync_channel(1);
+            self.handle_idle_command(ThreadCommand::StartTurn {
+                request: Box::new(request),
+                writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+                config: None,
+                reply: start_tx,
+            });
+            start_rx
+                .recv()
+                .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                    message: "background approval continuation start channel closed".to_string(),
+                })??;
+            let active =
+                self.active
+                    .as_mut()
+                    .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                        message: "background approval continuation did not become active"
+                            .to_string(),
+                    })?;
+            active.surface_operation = Some(successor.fence);
+        }
+        Ok(())
+    }
+
+    fn settle_denied_background_approval(
+        &mut self,
+        pending: &mut PendingBackgroundApprovalResolution,
+        registry: &TaskRegistry,
+    ) -> Result<(), RuntimeHostError> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        if let Some(operation) =
+            Self::surface_operation_record(&snapshot, &pending.fence.operation_id)
+            && operation.terminal.is_some()
+        {
+            let _ = registry.finish_denied_pending_tool_approval(pending.task.task_id.as_str());
+            return Ok(());
+        }
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| {
+                operation.operation_id == pending.fence.operation_id && operation.terminal.is_none()
+            })
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "denied background approval operation disappeared".to_string(),
+            })?;
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == pending.task.task_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "denied background approval task disappeared".to_string(),
+            })?;
+        let background_fence = pending.task.background_owner.clone().ok_or_else(|| {
+            RuntimeHostError::ThreadStartFailed {
+                message: "denied background approval lost its background owner".to_string(),
+            }
+        })?;
+        let foreground_revision = surface::TaskRevision::try_new(
+            pending
+                .task
+                .task_revision
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "denied background approval task revision exhausted".to_string(),
+                })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "denied background approval task revision exhausted".to_string(),
+        })?;
+        let owns_original_background = task.backgrounded
+            && task.background_fence.as_ref() == Some(&background_fence)
+            && task.revision == pending.task.task_revision;
+        let owns_explicit_foreground = !task.backgrounded
+            && task.background_fence.is_none()
+            && task.revision == foreground_revision;
+        match task.status {
+            surface::SurfaceTaskStatus::ApprovalRequired => {
+                if !owns_original_background && !owns_explicit_foreground {
+                    return Err(RuntimeHostError::ThreadStartFailed {
+                        message:
+                            "denied background approval task is not owned by its exact background or foreground claim"
+                                .to_string(),
+                    });
+                }
+                let stopping_revision =
+                    surface::TaskRevision::try_new(task.revision.get().saturating_add(1))
+                        .expect("task revision did not exhaust");
+                let control_batch = self.surface_event_batch_with_commit_id(
+                    vec![
+                        (
+                            surface::SurfaceScope::Background {
+                                fence: background_fence.clone(),
+                            },
+                            surface::SurfaceEvent::Operation(
+                                surface::OperationPatch::ControlIntentCommitted {
+                                    operation_id: operation.operation_id.clone(),
+                                    request_id: operation.request_id.clone(),
+                                    intent: surface::PendingControlIntent::Terminalize {
+                                        operation_id: operation.operation_id.clone(),
+                                        cause: surface::TerminalizationCause::UserCancel,
+                                    },
+                                },
+                            ),
+                        ),
+                        (
+                            surface::SurfaceScope::Thread,
+                            surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                                task_id: task.task_id.clone(),
+                                expected_revision: task.revision,
+                                next_revision: stopping_revision,
+                                status: surface::SurfaceTaskStatus::Stopping,
+                                completed_at: None,
+                                result: None,
+                                error: None,
+                            }),
+                        ),
+                    ],
+                    None,
+                );
+                self.commit_background_approval_stage(
+                    pending,
+                    PendingBackgroundApprovalCommit::ActorControl {
+                        fence: background_fence.clone(),
+                        batch: control_batch,
+                    },
+                    "failed to commit denied background approval control",
+                )?;
+            }
+            surface::SurfaceTaskStatus::Stopping
+            | surface::SurfaceTaskStatus::Cancelled
+            | surface::SurfaceTaskStatus::Stopped => {}
+            _ => {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: "denied background approval task left its terminalization path"
+                        .to_string(),
+                });
+            }
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| {
+                operation.operation_id == pending.fence.operation_id && operation.terminal.is_none()
+            })
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                message: "denied background approval operation disappeared after control"
+                    .to_string(),
+            })?;
+        let (finalize_intent_id, terminal_commit_id) =
+            if let Some(PendingBackgroundApprovalCommit::Finalizer {
+                finalize_intent_id,
+                terminal_commit_id,
+                ..
+            }) = pending.pending_commit.as_ref()
+            {
+                (finalize_intent_id.clone(), terminal_commit_id.clone())
+            } else if let Some(finalization) = operation.finalization.as_ref() {
+                (
+                    finalization.finalize_intent_id.clone(),
+                    finalization.terminal_commit_id.clone(),
+                )
+            } else {
+                let finalize_intent_id = surface::SurfaceFinalizeIntentId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7");
+                let terminal_commit_id =
+                    surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                        .expect("generated UUID is v7");
+                let suspended_cause = surface::SuspendedFinalizationCause::Terminalization(
+                    surface::TerminalizationCause::UserCancel,
+                );
+                let finalization_batch = self.surface_event_batch_with_commit_id(
+                    vec![(
+                        surface::SurfaceScope::Background {
+                            fence: background_fence.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::FinalizationStarted {
+                                operation_id: operation.operation_id.clone(),
+                                finalize_intent_id: finalize_intent_id.clone(),
+                                terminal_commit_id: terminal_commit_id.clone(),
+                                selected_cause: surface::OperationFinalizationCause::Suspended(
+                                    suspended_cause.clone(),
+                                ),
+                                suspended_cause: Some(suspended_cause),
+                                expected_settlements: Vec::new(),
+                            },
+                        ),
+                    )],
+                    None,
+                );
+                self.commit_background_approval_stage(
+                    pending,
+                    PendingBackgroundApprovalCommit::Finalizer {
+                        operation_id: operation.operation_id.clone(),
+                        finalize_intent_id: finalize_intent_id.clone(),
+                        terminal_commit_id: terminal_commit_id.clone(),
+                        batch: finalization_batch,
+                    },
+                    "failed to begin denied background approval finalization",
+                )?;
+                (finalize_intent_id, terminal_commit_id)
+            };
+        let terminal = surface::OperationTerminal::Cancelled {
+            reason: surface::CancelReason::User,
+        };
+        let terminal_record = surface::OperationTerminalRecord {
+            operation_id: operation.operation_id.clone(),
+            finalize_intent_id: finalize_intent_id.clone(),
+            terminal: terminal.clone(),
+            usage: surface::UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                estimated_cost_usd_micros: 0,
+            },
+            source_diagnostic_digest: None,
+            settlement_receipts: Vec::new(),
+            committed_at: surface::UnixMillis::new(0),
+        };
+        let projection = prepare_main_session_task_terminal_projection(
+            self.resident_surface.coordinator.state().snapshot(),
+            &operation.operation_id,
+            &terminal_record,
+        )?
+        .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+            message: "denied background approval lost its main-session task projection".to_string(),
+        })?;
+        let mut terminal_events = vec![projection.event.clone()];
+        terminal_events.push((
+            surface::SurfaceScope::Background {
+                fence: background_fence,
+            },
+            surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                record: terminal_record.clone(),
+            }),
+        ));
+        let terminal_batch = self
+            .surface_event_batch_with_commit_id(terminal_events, Some(terminal_commit_id.clone()));
+        self.commit_background_approval_stage(
+            pending,
+            PendingBackgroundApprovalCommit::ActorFinalizerTaskTerminal {
+                operation_id: operation.operation_id.clone(),
+                finalize_intent_id,
+                batch: terminal_batch.clone(),
+            },
+            "failed to commit denied background approval terminal",
+        )?;
+        mirror_main_session_task_terminal_projection(registry, &terminal_record, &projection);
+        self.cache_surface_terminal(surface::OperationTerminalAtCursor {
+            operation_id: operation.operation_id,
+            terminal,
+            cursor: terminal_batch.cursor_after.clone(),
+            commit_class: terminal_batch.commit_class.clone(),
+            batch_digest: terminal_batch.batch_digest.clone(),
+        });
+        let _ = registry.finish_denied_pending_tool_approval(pending.task.task_id.as_str());
+        Ok(())
     }
 
     fn uncommitted_interaction_response(
@@ -12529,6 +14257,11 @@ impl ThreadActor {
                     .values()
                     .map(|pending| pending.retry_at),
             )
+            .chain(
+                self.pending_background_approval_resolutions
+                    .values()
+                    .map(|pending| pending.retry_at),
+            )
             .min()
     }
 
@@ -12611,12 +14344,25 @@ impl ThreadActor {
                 private.answer.clone(),
             )
         };
-        if self
-            .resident_surface
-            .coordinator
-            .commit_generation_batch(fence, &batch)
-            .is_err()
-        {
+        let commit_result = match batch.events.as_slice().first().map(|event| &event.scope) {
+            Some(surface::SurfaceScope::Background {
+                fence: background_fence,
+            }) => {
+                let safe_projection = interaction_safe_projection(&winner_answer);
+                self.resident_surface
+                    .coordinator
+                    .commit_provider_background_interaction_resolution_batch(
+                        background_fence.clone(),
+                        &safe_projection,
+                        &batch,
+                    )
+            }
+            _ => self
+                .resident_surface
+                .coordinator
+                .commit_generation_batch(fence, &batch),
+        };
+        if commit_result.is_err() {
             if let Some(private) = self
                 .resident_surface
                 .interactions
@@ -12884,6 +14630,9 @@ impl ThreadActor {
             (true, false) => pending
                 .task_registry
                 .mark_backgrounded(pending.task_id.as_str()),
+            (false, true) if task.status == TaskStatus::ApprovalRequired => pending
+                .task_registry
+                .reconcile_main_session_backgrounded(pending.task_id.as_str(), false),
             (false, true) => pending
                 .task_registry
                 .mark_foregrounded(pending.task_id.as_str()),
@@ -12964,6 +14713,32 @@ impl ThreadActor {
                         PendingSurfaceTransitionRetry::ProviderPreparation(operation_id.clone()),
                     )
                 });
+        let background_approval_resolutions = self
+            .pending_background_approval_resolutions
+            .iter()
+            .map(|(operation_id, pending)| {
+                (
+                    pending.retry_at,
+                    PendingSurfaceTransitionRetry::BackgroundApprovalResolution(
+                        operation_id.clone(),
+                    ),
+                )
+            });
+        let background_interaction_routes = self.resident_surface.interactions.iter().filter_map(
+            |(interaction_id, interaction)| {
+                interaction
+                    .pending_background_route
+                    .as_ref()
+                    .map(|pending| {
+                        (
+                            pending.retry_at,
+                            PendingSurfaceTransitionRetry::BackgroundInteractionRoute(
+                                interaction_id.clone(),
+                            ),
+                        )
+                    })
+            },
+        );
         let task_ownership = self
             .resident_surface
             .pending_task_ownership
@@ -12980,6 +14755,8 @@ impl ThreadActor {
             .chain(workflow_completions)
             .chain(provider_preparations)
             .chain(provider_completions)
+            .chain(background_approval_resolutions)
+            .chain(background_interaction_routes)
             .chain(task_ownership)
             .chain(
                 self.resident_surface
@@ -13137,6 +14914,28 @@ impl ThreadActor {
         }
         if let PendingSurfaceTransitionRetry::ProviderCompletion(operation_id) = retry {
             self.retry_typed_provider_completion(&operation_id);
+            return;
+        }
+        if let PendingSurfaceTransitionRetry::BackgroundApprovalResolution(operation_id) = retry {
+            let Some(mut pending) = self
+                .pending_background_approval_resolutions
+                .remove(&operation_id)
+            else {
+                return;
+            };
+            if self
+                .settle_background_approval_resolution(&mut pending)
+                .is_err()
+            {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                self.pending_background_approval_resolutions
+                    .insert(operation_id, pending);
+            }
+            return;
+        }
+        if let PendingSurfaceTransitionRetry::BackgroundInteractionRoute(interaction_id) = retry {
+            self.retry_background_interaction_route(&interaction_id);
             return;
         }
         if let PendingSurfaceTransitionRetry::TaskOwnership(operation_id) = retry {
@@ -14238,7 +16037,24 @@ impl ThreadActor {
                         || Some(&typed.fence) == task.background_fence.as_ref())
             })
         });
-        if !owns_background_provider {
+        let owns_suspended_background_approval = foreground
+            && task.status == surface::SurfaceTaskStatus::ApprovalRequired
+            && task.background_fence.as_ref().is_some_and(|fence| {
+                snapshot.background_operations.iter().any(|background| {
+                    &background.fence == fence
+                        && background.operation_id == *parent_operation
+                        && snapshot.operation_history.iter().any(|operation| {
+                            operation.operation_id == *parent_operation
+                                && matches!(
+                                    operation.phase,
+                                    surface::OperationPhase::Suspended {
+                                        cause: surface::SuspensionCause::ProviderSuspended { .. }
+                                    }
+                                )
+                        })
+                })
+            });
+        if !owns_background_provider && !owns_suspended_background_approval {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         if !foreground {
@@ -17247,26 +19063,66 @@ impl ThreadActor {
             }
         }
         let usage = surface_usage;
-        let terminal_batch = self.surface_operation_batch_with_commit_id(
-            &operation_id,
-            vec![surface::OperationPatch::Terminal {
-                record: surface::OperationTerminalRecord {
-                    operation_id: operation_id.clone(),
-                    finalize_intent_id: finalize_intent_id.clone(),
-                    terminal: terminal.clone(),
-                    usage,
-                    source_diagnostic_digest: None,
-                    settlement_receipts: Vec::new(),
-                    committed_at: surface::UnixMillis::new(0),
-                },
-            }],
-            Some(terminal_commit_id.clone()),
-        );
-        let terminal_result = self.resident_surface.coordinator.commit_finalizer_batch(
-            operation_id.clone(),
-            finalize_intent_id.clone(),
-            &terminal_batch,
-        );
+        let terminal_record = surface::OperationTerminalRecord {
+            operation_id: operation_id.clone(),
+            finalize_intent_id: finalize_intent_id.clone(),
+            terminal: terminal.clone(),
+            usage,
+            source_diagnostic_digest: None,
+            settlement_receipts: Vec::new(),
+            committed_at: surface::UnixMillis::new(0),
+        };
+        let task_terminal_projection = if matches!(
+            active.request.operation_kind(),
+            HostedOperationKind::BackgroundContinuation { .. }
+        ) {
+            prepare_main_session_task_terminal_projection(
+                self.resident_surface.coordinator.state().snapshot(),
+                &operation_id,
+                &terminal_record,
+            )?
+        } else {
+            None
+        };
+        let terminal_batch = if let Some(projection) = task_terminal_projection.as_ref() {
+            self.surface_event_batch_with_commit_id(
+                vec![
+                    projection.event.clone(),
+                    (
+                        surface::SurfaceScope::Operation {
+                            operation_id: operation_id.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                            record: terminal_record.clone(),
+                        }),
+                    ),
+                ],
+                Some(terminal_commit_id.clone()),
+            )
+        } else {
+            self.surface_operation_batch_with_commit_id(
+                &operation_id,
+                vec![surface::OperationPatch::Terminal {
+                    record: terminal_record.clone(),
+                }],
+                Some(terminal_commit_id.clone()),
+            )
+        };
+        let terminal_result = if task_terminal_projection.is_some() {
+            self.resident_surface
+                .coordinator
+                .commit_actor_finalizer_task_terminal_batch(
+                    operation_id.clone(),
+                    finalize_intent_id.clone(),
+                    &terminal_batch,
+                )
+        } else {
+            self.resident_surface.coordinator.commit_finalizer_batch(
+                operation_id.clone(),
+                finalize_intent_id.clone(),
+                &terminal_batch,
+            )
+        };
         let value = surface::OperationTerminalAtCursor {
             operation_id: operation_id.clone(),
             terminal,
@@ -17303,6 +19159,13 @@ impl ThreadActor {
             return Err(RuntimeHostError::ThreadStartFailed {
                 message: format!("typed surface terminal commit failed: {error:?}"),
             });
+        }
+        if let Some(projection) = task_terminal_projection.as_ref() {
+            mirror_main_session_task_terminal_projection(
+                &self.handle.task_registry,
+                &terminal_record,
+                projection,
+            );
         }
         self.cache_surface_terminal(value.clone());
         Ok(value)
@@ -19509,6 +21372,12 @@ impl ThreadActor {
         let usage_ledger = RuntimeUsageLedger::new(thread.session().aggregate_usage_totals());
         let events = thread.event_factory();
         let (background_completion_tx, background_completion_rx) = tokio_mpsc::unbounded_channel();
+        let pending_background_approval_resolutions = resident_surface
+            .as_ref()
+            .map(|resident| {
+                recovered_background_approval_resolutions(resident.coordinator.state().snapshot())
+            })
+            .unwrap_or_default();
         Self {
             state: Some(ThreadActorState { thread, events }),
             config,
@@ -19528,6 +21397,7 @@ impl ThreadActor {
             pending_workflow_completions: HashMap::new(),
             pending_provider_preparations: HashMap::new(),
             pending_provider_completions: HashMap::new(),
+            pending_background_approval_resolutions,
             pending_surface_stream_redactions: HashMap::new(),
             surface_terminal_blocked: None,
         }
@@ -20575,7 +22445,13 @@ impl ThreadActor {
                         &self.resident_surface,
                         &operation_id,
                     ),
-                    secret_bearing_interaction_count: self.resident_surface.interactions.len(),
+                    resident_interaction_count: self.resident_surface.interactions.len(),
+                    secret_bearing_interaction_count: self
+                        .resident_surface
+                        .interactions
+                        .values()
+                        .filter(|interaction| interaction.private_response.is_some())
+                        .count(),
                     pending_capability_loss: pending_capability_loss_for_test(
                         &self.resident_surface,
                     ),
@@ -21297,7 +23173,13 @@ impl ThreadActor {
                         &self.resident_surface,
                         &operation_id,
                     ),
-                    secret_bearing_interaction_count: self.resident_surface.interactions.len(),
+                    resident_interaction_count: self.resident_surface.interactions.len(),
+                    secret_bearing_interaction_count: self
+                        .resident_surface
+                        .interactions
+                        .values()
+                        .filter(|interaction| interaction.private_response.is_some())
+                        .count(),
                     pending_capability_loss: pending_capability_loss_for_test(
                         &self.resident_surface,
                     ),
@@ -23239,26 +25121,33 @@ impl ThreadActor {
         shutdown_reason: Option<surface::SurfaceShutdownReason>,
     ) -> Result<(), RuntimeHostError> {
         let operation_id = typed.fence.operation_fence.operation_id.clone();
-        let mut pending =
-            match self.prepare_typed_provider_completion(typed.clone(), shutdown_reason.clone()) {
-                Ok(pending) => pending,
-                Err(error) => {
-                    self.pending_provider_preparations.insert(
-                        operation_id,
-                        PendingTypedProviderPreparation {
-                            typed,
-                            shutdown_reason,
-                            retry_at: tokio::time::Instant::now()
-                                + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
-                        },
-                    );
-                    return Err(error);
-                }
-            };
+        let mut pending = match self
+            .prepare_typed_provider_completion(typed.clone(), shutdown_reason.clone())
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!(
+                    "orca: typed provider completion preparation deferred for {operation_id:?}: {error}"
+                );
+                self.pending_provider_preparations.insert(
+                    operation_id,
+                    PendingTypedProviderPreparation {
+                        typed,
+                        shutdown_reason,
+                        retry_at: tokio::time::Instant::now()
+                            + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                    },
+                );
+                return Err(error);
+            }
+        };
         let operation_id = pending.operation_id.clone();
         match self.settle_typed_provider_completion(&mut pending) {
             Ok(()) => Ok(()),
             Err(error) => {
+                eprintln!(
+                    "orca: typed provider completion settlement deferred for {operation_id:?}: {error}"
+                );
                 pending.retry_at =
                     tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
                 self.pending_provider_completions
@@ -23340,6 +25229,9 @@ impl ThreadActor {
         let approval_message =
             surface::SafeDiagnosticText::try_new("background provider requires approval")
                 .expect("fixed diagnostic is bounded");
+        let approval_required = shutdown_reason.is_none()
+            && !committed_user_cancel
+            && outcome.status == RunStatus::ApprovalRequired;
         let (task_status, stop_reason, terminal) = match (shutdown_reason.clone(), outcome.status) {
             (Some(reason), _) => (
                 surface::SurfaceTaskStatus::Stopped,
@@ -23384,10 +25276,7 @@ impl ThreadActor {
             ),
             (None, RunStatus::ApprovalRequired) => (
                 surface::SurfaceTaskStatus::ApprovalRequired,
-                surface::GenerationStopReason::ExecutionFailed {
-                    class: surface::GenerationExecutionFailureClass::LegacyApprovalRequired,
-                    message: approval_message.clone(),
-                },
+                surface::GenerationStopReason::ProviderSuspended,
                 surface::OperationTerminal::Failed {
                     class: surface::FailureClass::LegacyApprovalRequired,
                     message: approval_message,
@@ -23443,7 +25332,8 @@ impl ThreadActor {
                     expected_revision: task.revision,
                     next_revision: next_task_revision,
                     status: task_status,
-                    completed_at: Some(surface::UnixMillis::new(outcome.completed_at_ms)),
+                    completed_at: (!approval_required)
+                        .then_some(surface::UnixMillis::new(outcome.completed_at_ms)),
                     result: if committed_user_cancel {
                         Some(surface::DisplayText::new("Background turn cancelled"))
                     } else if outcome.status == RunStatus::Success {
@@ -23468,7 +25358,110 @@ impl ThreadActor {
                     usage_delta: usage.clone(),
                 }),
             ),
-            (
+        ]);
+        let background_approval = if approval_required {
+            let tool = completion_events
+                .iter()
+                .find_map(|(_, event)| match event {
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }) => {
+                        Some(request.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "background approval lacks its committed tool request".to_string(),
+                })?;
+            let authority = Self::surface_authority_for_tool(
+                self.resident_surface.coordinator.state().snapshot(),
+                &typed.fence.operation_fence,
+                &tool,
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("background approval authority is invalid: {error}"),
+            })?;
+            let interaction_id =
+                surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let revision = surface::InteractionRevision::try_new(1).expect("one is valid");
+            let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is valid");
+            let request = surface::SurfaceInteractionRequest::BackgroundApproval {
+                task: surface::SurfaceTaskFence {
+                    task_id: typed.task_id.clone(),
+                    task_revision: next_task_revision,
+                    background_owner: Some(typed.fence.clone()),
+                },
+                tool,
+                authority,
+            };
+            let recovery_disposition =
+                surface::InteractionUnavailableDisposition::AwaitCapableAttachment {
+                    deadline: surface::InteractionExpiryDeadline {
+                        issuing_host_incarnation: self
+                            .resident_surface
+                            .hub
+                            .authority()
+                            .host_incarnation()
+                            .clone(),
+                        expires_at: surface::MonotonicInstant {
+                            clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                                *uuid::Uuid::now_v7().as_bytes(),
+                            )
+                            .expect("generated UUID is v7"),
+                            tick: surface::MonotonicTick::new(u64::MAX),
+                        },
+                        observed_expires_at: None,
+                    },
+                };
+            let record = surface::BrokerInteractionRequestRecord {
+                thread_id: typed.fence.operation_fence.thread_id.clone(),
+                interaction_id: interaction_id.clone(),
+                fence: typed.fence.operation_fence.clone(),
+                kind: surface::SurfaceInteractionKind::BackgroundApproval,
+                request: request.clone(),
+                response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+                answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+                recovery_disposition: recovery_disposition.clone(),
+            };
+            let route = surface::BrokerInteractionResponseRoute::Unassigned { epoch: route_epoch };
+            let public_route = surface::SurfaceInteractionRoute::Unassigned { epoch: route_epoch };
+            completion_events.extend([
+                (
+                    surface::SurfaceScope::Background {
+                        fence: typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
+                        interaction: surface::SurfaceInteractionView {
+                            interaction_id: interaction_id.clone(),
+                            revision,
+                            fence: typed.fence.operation_fence.clone(),
+                            kind: surface::SurfaceInteractionKind::BackgroundApproval,
+                            request,
+                            route: public_route,
+                            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
+                            recovery_disposition,
+                        },
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Background {
+                        fence: typed.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Suspended {
+                        operation_id: operation_id.clone(),
+                        cause: surface::SuspensionCause::ProviderSuspended {
+                            generation_id: typed.fence.operation_fence.generation_id,
+                        },
+                    }),
+                ),
+            ]);
+            Some(PreparedBackgroundApprovalInteraction {
+                interaction_id,
+                record,
+                route,
+                revision,
+            })
+        } else {
+            completion_events.push((
                 surface::SurfaceScope::Background {
                     fence: typed.fence.clone(),
                 },
@@ -23482,8 +25475,9 @@ impl ThreadActor {
                     suspended_cause: None,
                     expected_settlements: Vec::new(),
                 }),
-            ),
-        ]);
+            ));
+            None
+        };
         let completion_batch = self.surface_event_batch_with_commit_id(completion_events, None);
         Ok(PendingTypedProviderCompletion {
             typed,
@@ -23496,6 +25490,7 @@ impl ThreadActor {
             usage,
             terminal_batch: None,
             terminal_value: None,
+            background_approval,
             stage: TypedProviderCompletionStage::Completion,
             rebuild_after_foreign_incomplete: false,
             retry_at: tokio::time::Instant::now(),
@@ -23536,18 +25531,49 @@ impl ThreadActor {
                     pending.shutdown_reason.clone(),
                 )?;
             }
-            self.resident_surface
-                .coordinator
-                .commit_provider_background_stop_batch(
-                    pending.typed.fence.clone(),
-                    pending.operation_id.clone(),
-                    pending.finalize_intent_id.clone(),
-                    &pending.completion_batch,
-                )
-                .map_err(|error| RuntimeHostError::ThreadStartFailed {
-                    message: format!("failed to commit typed provider completion: {error:?}"),
-                })?;
+            let completion = if pending.background_approval.is_some() {
+                self.resident_surface
+                    .coordinator
+                    .commit_provider_background_suspend_batch(
+                        pending.typed.fence.clone(),
+                        &pending.completion_batch,
+                    )
+            } else {
+                self.resident_surface
+                    .coordinator
+                    .commit_provider_background_stop_batch(
+                        pending.typed.fence.clone(),
+                        pending.operation_id.clone(),
+                        pending.finalize_intent_id.clone(),
+                        &pending.completion_batch,
+                    )
+            };
+            completion.map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to commit typed provider completion: {error:?}"),
+            })?;
             pending.stage = TypedProviderCompletionStage::Terminal;
+        }
+        if let Some(prepared) = pending.background_approval.take() {
+            self.resident_surface.interactions.insert(
+                prepared.interaction_id.clone(),
+                ResidentSurfaceInteraction {
+                    record: prepared.record,
+                    route: prepared.route,
+                    revision: prepared.revision,
+                    waiter: None,
+                    private_response: None,
+                    pending_background_route: None,
+                    winning_receipt: None,
+                    resolution_ack: None,
+                    projected_cursor: None,
+                    cancelled: None,
+                },
+            );
+            self.mirror_typed_provider_outcome_after_terminal(
+                &pending.typed,
+                pending.shutdown_reason.as_ref(),
+            );
+            return Ok(());
         }
         if self.resident_surface.coordinator.has_incomplete_batch()
             && !pending
@@ -26100,6 +28126,82 @@ mod tests {
         }
     }
 
+    fn fresh_background_approval_attachment(
+        handle: &surface::RuntimeSurfaceHandle,
+    ) -> surface::FreshSurfaceAttachment {
+        match handle.attach_fresh(surface::FreshAttachRequest {
+            request_id: surface_request_id(),
+            role: surface::SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ManageTask,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::RespondGrantedInteraction,
+            ]),
+            interaction_capabilities: BTreeSet::from([
+                surface::SurfaceInteractionKind::BackgroundApproval,
+            ]),
+        }) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("fresh background approval attachment failed"),
+        }
+    }
+
+    fn foreground_background_approval_task(
+        attachment: &surface::FreshSurfaceAttachment,
+        interaction_id: &surface::SurfaceInteractionId,
+    ) {
+        let interaction = attachment
+            .baseline
+            .snapshot
+            .interactions
+            .iter()
+            .find(|interaction| &interaction.interaction_id == interaction_id)
+            .expect("background approval interaction is visible");
+        let surface::SurfaceInteractionRequest::BackgroundApproval { task, .. } =
+            &interaction.request
+        else {
+            panic!("background approval interaction has the expected request kind");
+        };
+        let projected = attachment
+            .baseline
+            .snapshot
+            .tasks
+            .iter()
+            .find(|candidate| candidate.task_id == task.task_id)
+            .expect("background approval task is visible");
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .task_control(
+                    surface_request_id(),
+                    surface::TaskControlAction::Foreground {
+                        fence: surface::SurfaceTaskFence {
+                            task_id: projected.task_id.clone(),
+                            task_revision: projected.revision,
+                            background_owner: projected.background_fence.clone(),
+                        },
+                    },
+                )
+                .expect("explicitly foreground background approval task"),
+        );
+    }
+
+    fn detach_surface_attachment(
+        handle: &surface::RuntimeSurfaceHandle,
+        attachment: &surface::FreshSurfaceAttachment,
+    ) {
+        assert!(matches!(
+            handle.detach(
+                &attachment.client,
+                surface::DetachRequest {
+                    request_id: surface_request_id(),
+                },
+            ),
+            surface::DetachResult::Detached { .. } | surface::DetachResult::AlreadyDetached { .. }
+        ));
+    }
+
     struct WorkflowCancelShutdownFixture {
         host: RuntimeHost,
         thread: RuntimeThreadHandle,
@@ -27218,8 +29320,10 @@ mod tests {
         .baseline
         .snapshot;
         let operation = snapshot
-            .operation_history
+            .foreground_operation
             .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
             .find(|operation| operation.operation_id == operation_id)
             .expect("cold recovery must retain the workflow operation");
         assert!(matches!(
@@ -27476,8 +29580,10 @@ mod tests {
                     && matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
         ));
         let operation = snapshot
-            .operation_history
+            .foreground_operation
             .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
             .find(|operation| operation.operation_id == operation_id)
             .expect("resumed operation reached history");
         assert_eq!(operation.generations.len(), 3);
@@ -28034,7 +30140,6 @@ mod tests {
         )
         .baseline
         .snapshot;
-        assert!(snapshot.background_operations.is_empty());
         let operation = snapshot
             .operation_history
             .iter()
@@ -28119,6 +30224,8 @@ mod tests {
                 "mock_stream_tool_delay_ms 100 task_list test_provider_completion_notify_delay_ms=30000"
             }
             "approval-finalizing" => "mock_stream_tool_delay_ms 500 task_list",
+            "approval-resolved" => "mock_stream_tool_delay_ms 100 task_list",
+            "approval-denied" => "mock_stream_tool_delay_ms 100 task_list",
             _ => panic!("unknown durable provider outcome mode: {mode}"),
         };
         let reserved = committed_surface_value(
@@ -28162,7 +30269,10 @@ mod tests {
                 .load_session(thread.thread_id())
                 .expect("load durable provider outcome transcript")
                 .path;
-            surface::JsonlSurfaceCommitLedger::inject_terminal_append_failure_once(transcript_path);
+            surface::JsonlSurfaceCommitLedger::inject_provider_completion_checkpoint_failures(
+                transcript_path,
+                1_000,
+            );
         }
         let snapshot = fresh_surface_attachment_with_capabilities(
             &surface,
@@ -28197,35 +30307,130 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         if mode == "approval-finalizing" {
-            loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let operation = snapshot
+                .operation_history
+                .iter()
+                .find(|operation| operation.operation_id == reserved.operation_id)
+                .expect("approval provider operation remains in history");
+            assert!(
+                !matches!(
+                    operation.phase,
+                    surface::OperationPhase::Suspended {
+                        cause: surface::SuspensionCause::ProviderSuspended { .. }
+                    }
+                ),
+                "injected checkpoint failures must leave suspension prepared for restart"
+            );
+        }
+        if mode == "approval-resolved" {
+            let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+            let interaction_id = loop {
                 let snapshot = fresh_surface_attachment_with_capabilities(
                     &surface,
                     BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
                 )
                 .baseline
                 .snapshot;
-                let operation = snapshot
-                    .operation_history
-                    .iter()
-                    .find(|operation| operation.operation_id == reserved.operation_id)
-                    .expect("approval provider operation remains in history");
-                let task = snapshot
-                    .tasks
-                    .iter()
-                    .find(|task| task.task_id == task_id)
-                    .expect("approval provider task remains projected");
-                if task.status == surface::SurfaceTaskStatus::ApprovalRequired
-                    && operation.finalization.is_some()
-                    && operation.terminal.is_none()
-                {
-                    break;
+                if let Some(interaction) = snapshot.interactions.iter().find(|interaction| {
+                    interaction.fence.operation_id == reserved.operation_id
+                        && interaction.kind == surface::SurfaceInteractionKind::BackgroundApproval
+                        && matches!(
+                            interaction.lifecycle,
+                            surface::SurfaceInteractionLifecycle::Requested
+                        )
+                }) {
+                    break interaction.interaction_id.clone();
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "approval provider completion did not stop before terminal append"
+                    "resolved approval fixture did not request interaction"
                 );
-                std::thread::sleep(Duration::from_millis(10));
-            }
+                std::thread::yield_now();
+            };
+            let transcript_path = SessionStore::new()
+                .load_session(thread.thread_id())
+                .expect("reload resolved approval fixture transcript")
+                .path;
+            surface::JsonlSurfaceCommitLedger::inject_background_approval_resume_checkpoint_failures(
+                transcript_path,
+                1_000,
+            );
+            detach_surface_attachment(&surface, &attachment);
+            let responder = fresh_background_approval_attachment(&surface);
+            foreground_background_approval_task(&responder, &interaction_id);
+            let response = committed_surface_value(
+                responder
+                    .client
+                    .respond_interaction_by_id(
+                        surface_request_id(),
+                        interaction_id,
+                        surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                            decision: surface::SurfaceAllowDeny::Allow,
+                        },
+                    )
+                    .expect("resolve approval before crash"),
+            );
+            assert!(matches!(
+                response.disposition,
+                surface::RespondInteractionDisposition::Resolved { .. }
+            ));
+        }
+        if mode == "approval-denied" {
+            let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+            let interaction_id = loop {
+                let snapshot = fresh_surface_attachment_with_capabilities(
+                    &surface,
+                    BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+                )
+                .baseline
+                .snapshot;
+                if let Some(interaction) = snapshot.interactions.iter().find(|interaction| {
+                    interaction.fence.operation_id == reserved.operation_id
+                        && interaction.kind == surface::SurfaceInteractionKind::BackgroundApproval
+                        && matches!(
+                            interaction.lifecycle,
+                            surface::SurfaceInteractionLifecycle::Requested
+                        )
+                }) {
+                    break interaction.interaction_id.clone();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "denied approval fixture did not request interaction"
+                );
+                std::thread::yield_now();
+            };
+            let transcript_path = SessionStore::new()
+                .load_session(thread.thread_id())
+                .expect("reload denied approval fixture transcript")
+                .path;
+            surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failures(
+                transcript_path,
+                1_000,
+            );
+            let responder = fresh_background_approval_attachment(&surface);
+            let response = committed_surface_value(
+                responder
+                    .client
+                    .respond_interaction_by_id(
+                        surface_request_id(),
+                        interaction_id,
+                        surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                            decision: surface::SurfaceAllowDeny::Deny,
+                        },
+                    )
+                    .expect("deny approval before crash"),
+            );
+            assert!(matches!(
+                response.disposition,
+                surface::RespondInteractionDisposition::Resolved { .. }
+            ));
         }
         let fixture: DurableProviderOutcomeRecoveryFixture = (
             thread.thread_id().to_string(),
@@ -28264,12 +30469,13 @@ mod tests {
         )
         .baseline
         .snapshot;
-        assert!(snapshot.background_operations.is_empty());
         let operation = snapshot
-            .operation_history
+            .foreground_operation
             .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
             .find(|operation| operation.operation_id == operation_id)
-            .expect("durable provider outcome operation remains in history");
+            .expect("durable provider outcome operation remains visible");
         let task = snapshot
             .tasks
             .iter()
@@ -28277,6 +30483,7 @@ mod tests {
             .expect("durable provider outcome task remains projected");
         match mode {
             "completed" => {
+                assert!(snapshot.background_operations.is_empty());
                 assert!(matches!(
                     operation.terminal.as_ref().map(|record| &record.terminal),
                     Some(surface::OperationTerminal::Succeeded { .. })
@@ -28291,12 +30498,18 @@ mod tests {
                 }));
             }
             "approval" | "approval-finalizing" => {
+                assert!(
+                    snapshot
+                        .background_operations
+                        .iter()
+                        .any(|background| background.operation_id == operation_id)
+                );
+                assert!(operation.terminal.is_none());
                 assert!(matches!(
-                    operation.terminal.as_ref().map(|record| &record.terminal),
-                    Some(surface::OperationTerminal::Failed {
-                        class: surface::FailureClass::LegacyApprovalRequired,
-                        ..
-                    })
+                    operation.phase,
+                    surface::OperationPhase::Suspended {
+                        cause: surface::SuspensionCause::ProviderSuspended { .. }
+                    }
                 ));
                 assert_eq!(task.status, surface::SurfaceTaskStatus::ApprovalRequired);
                 let pending_tool = snapshot
@@ -28317,6 +30530,172 @@ mod tests {
                 );
                 assert_eq!(pending_tool.request.raw_arguments.as_str(), "{}");
                 assert!(pending_tool.result.is_none());
+                let interaction = snapshot
+                    .interactions
+                    .iter()
+                    .find(|interaction| {
+                        interaction.fence.operation_id == operation_id
+                            && interaction.kind
+                                == surface::SurfaceInteractionKind::BackgroundApproval
+                    })
+                    .expect("approval recovery keeps its typed background interaction");
+                assert!(matches!(
+                    interaction.lifecycle,
+                    surface::SurfaceInteractionLifecycle::Requested
+                ));
+                assert!(matches!(
+                    interaction.route,
+                    surface::SurfaceInteractionRoute::Unassigned { .. }
+                ));
+            }
+            "approval-resolved" => {
+                let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+                let snapshot = loop {
+                    let snapshot = fresh_surface_attachment_with_capabilities(
+                        &thread.surface(),
+                        BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+                    )
+                    .baseline
+                    .snapshot;
+                    if snapshot.operation_history.iter().any(|operation| {
+                        operation.operation_id == operation_id
+                            && matches!(
+                                operation.terminal.as_ref().map(|record| &record.terminal),
+                                Some(surface::OperationTerminal::Succeeded { .. })
+                            )
+                    }) {
+                        break snapshot;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "resolved approval did not resume after restart: foreground={:?} background={:?} history={:?} interactions={:?}",
+                        snapshot.foreground_operation.as_ref().map(|operation| {
+                            (
+                                &operation.phase,
+                                operation
+                                    .generations
+                                    .iter()
+                                    .map(|generation| {
+                                        (
+                                            generation.fence.generation_id,
+                                            &generation.phase,
+                                            generation
+                                                .predecessor
+                                                .as_ref()
+                                                .map(|fence| fence.generation_id),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        }),
+                        snapshot
+                            .background_operations
+                            .iter()
+                            .map(|background| &background.operation_id)
+                            .collect::<Vec<_>>(),
+                        snapshot
+                            .operation_history
+                            .iter()
+                            .map(|operation| (&operation.operation_id, &operation.phase))
+                            .collect::<Vec<_>>(),
+                        snapshot
+                            .interactions
+                            .iter()
+                            .map(|interaction| {
+                                (
+                                    &interaction.interaction_id,
+                                    match interaction.lifecycle {
+                                        surface::SurfaceInteractionLifecycle::Requested => {
+                                            "requested"
+                                        }
+                                        surface::SurfaceInteractionLifecycle::Resolved {
+                                            ..
+                                        } => "resolved",
+                                        surface::SurfaceInteractionLifecycle::Cancelled {
+                                            ..
+                                        } => "cancelled",
+                                        surface::SurfaceInteractionLifecycle::Expired {
+                                            ..
+                                        } => "expired",
+                                        surface::SurfaceInteractionLifecycle::Transferred {
+                                            ..
+                                        } => "transferred",
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    std::thread::yield_now();
+                };
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == task_id)
+                    .expect("resolved approval recovery task remains projected");
+                assert_eq!(task.status, surface::SurfaceTaskStatus::Completed);
+                let interaction_id = snapshot
+                    .interactions
+                    .iter()
+                    .find(|interaction| {
+                        interaction.fence.operation_id == operation_id
+                            && matches!(
+                                interaction.lifecycle,
+                                surface::SurfaceInteractionLifecycle::Resolved { .. }
+                            )
+                    })
+                    .expect("resolved approval remains replayable after recovery")
+                    .interaction_id
+                    .clone();
+                let responder = fresh_background_approval_attachment(&thread.surface());
+                let replay = committed_surface_value(
+                    responder
+                        .client
+                        .respond_interaction_by_id(
+                            surface_request_id(),
+                            interaction_id,
+                            surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                                decision: surface::SurfaceAllowDeny::Allow,
+                            },
+                        )
+                        .expect("replay resolved approval after restart"),
+                );
+                assert!(matches!(
+                    replay.disposition,
+                    surface::RespondInteractionDisposition::AlreadyResolved { .. }
+                ));
+            }
+            "approval-denied" => {
+                let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+                let snapshot = loop {
+                    let snapshot = fresh_surface_attachment_with_capabilities(
+                        &thread.surface(),
+                        BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+                    )
+                    .baseline
+                    .snapshot;
+                    if snapshot.operation_history.iter().any(|operation| {
+                        operation.operation_id == operation_id
+                            && matches!(
+                                operation.terminal.as_ref().map(|record| &record.terminal),
+                                Some(surface::OperationTerminal::Cancelled {
+                                    reason: surface::CancelReason::User,
+                                })
+                            )
+                    }) {
+                        break snapshot;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "denied approval did not terminalize after restart"
+                    );
+                    std::thread::yield_now();
+                };
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == task_id)
+                    .expect("denied approval recovery task remains projected");
+                assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
             }
             _ => panic!("unknown durable provider outcome mode: {mode}"),
         }
@@ -28338,7 +30717,13 @@ mod tests {
             panic!("unknown durable provider outcome recovery phase: {phase}");
         }
         let home = tempfile::tempdir().unwrap();
-        for mode in ["completed", "approval", "approval-finalizing"] {
+        for mode in [
+            "completed",
+            "approval",
+            "approval-finalizing",
+            "approval-resolved",
+            "approval-denied",
+        ] {
             for phase in ["seed", "recover"] {
                 let phase = format!("{phase}-{mode}");
                 let status = Command::new(std::env::current_exe().unwrap())
@@ -28361,7 +30746,7 @@ mod tests {
     }
 
     #[test]
-    fn background_approval_checkpoint_failure_retries_exact_terminalization() {
+    fn background_approval_resolution_failure_retries_with_background_authority() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start approval retry host");
         let thread = host
@@ -28419,18 +30804,277 @@ mod tests {
             transcript_path,
             1,
         );
-        let terminal = attachment
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let snapshot = loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let suspended = snapshot.operation_history.iter().any(|operation| {
+                operation.operation_id == reserved.operation_id
+                    && operation.terminal.is_none()
+                    && matches!(
+                        operation.phase,
+                        surface::OperationPhase::Suspended {
+                            cause: surface::SuspensionCause::ProviderSuspended { .. }
+                        }
+                    )
+            });
+            let requested = snapshot.interactions.iter().any(|interaction| {
+                interaction.fence.operation_id == reserved.operation_id
+                    && interaction.kind == surface::SurfaceInteractionKind::BackgroundApproval
+                    && matches!(
+                        interaction.lifecycle,
+                        surface::SurfaceInteractionLifecycle::Requested
+                    )
+            });
+            if suspended && requested {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background approval did not reach exact durable suspension"
+            );
+            std::thread::yield_now();
+        };
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.parent_operation.as_ref() == Some(&reserved.operation_id))
+            .expect("approval retry keeps its main-session task");
+        assert_eq!(task.status, surface::SurfaceTaskStatus::ApprovalRequired);
+        assert!(
+            snapshot
+                .background_operations
+                .iter()
+                .any(|background| background.operation_id == reserved.operation_id)
+        );
+        let interaction_id = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| {
+                interaction.fence.operation_id == reserved.operation_id
+                    && interaction.kind == surface::SurfaceInteractionKind::BackgroundApproval
+            })
+            .expect("approval retry keeps its background interaction")
+            .interaction_id
+            .clone();
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("reload approval retry transcript")
+            .path;
+        surface::JsonlSurfaceCommitLedger::inject_background_approval_resume_checkpoint_failures(
+            transcript_path.clone(),
+            1,
+        );
+        detach_surface_attachment(&surface, &attachment);
+        let responder = fresh_background_approval_attachment(&surface);
+        let route_only = responder
+            .client
+            .respond_interaction_by_id(
+                surface_request_id(),
+                interaction_id.clone(),
+                surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: surface::SurfaceUserInputDecision::Cancel,
+                },
+            )
+            .expect("assign background approval route before validating answer kind");
+        assert!(
+            matches!(route_only, surface::MutationReply::Uncommitted { .. }),
+            "wrong-kind response must only commit the route"
+        );
+        foreground_background_approval_task(&responder, &interaction_id);
+        let backup_path = transcript_path.with_extension("jsonl.background-resolution-backup");
+        std::fs::rename(&transcript_path, &backup_path).expect("hide surface ledger");
+        std::fs::create_dir(&transcript_path).expect("replace surface ledger with directory");
+        assert_eq!(
+            responder
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction_id.clone(),
+                    surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    },
+                )
+                .err(),
+            Some(surface::SurfaceClientCommandError::RuntimeUnavailable),
+            "resolution append failure must retain the exact private winner and batch"
+        );
+        assert_eq!(
+            thread
+                .surface_actor_probe_for_test(reserved.operation_id.clone())
+                .expect("probe retained background approval winner")
+                .secret_bearing_interaction_count,
+            1,
+            "failed background resolution did not retain its private winner"
+        );
+        std::fs::remove_dir(&transcript_path).expect("remove blocking ledger directory");
+        std::fs::rename(&backup_path, &transcript_path).expect("restore surface ledger");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            if thread
+                .surface_actor_probe_for_test(reserved.operation_id.clone())
+                .expect("probe background approval retry")
+                .secret_bearing_interaction_count
+                == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background approval resolution did not retry automatically"
+            );
+            std::thread::yield_now();
+        }
+        let terminal = responder
             .client
             .wait_operation_terminal(surface_request_id(), reserved.operation_id.clone())
-            .expect("wait approval retry terminal");
+            .expect("wait automatically retried background continuation");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        let replay = committed_surface_value(
+            responder
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction_id,
+                    surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    },
+                )
+                .expect("replay committed background interaction"),
+        );
+        assert!(matches!(
+            replay.disposition,
+            surface::RespondInteractionDisposition::AlreadyResolved { .. }
+        ));
+        host.shutdown().expect("shutdown approval retry host");
+    }
+
+    #[test]
+    fn denied_background_approval_retries_exact_terminal_batch() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start denied approval retry host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "retry denied background approval",
+            )
+            .expect("start denied approval retry thread");
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load denied approval retry transcript")
+            .path;
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "mock_stream_tool_delay_ms 250 task_list",
+                    ),
+                )
+                .expect("reserve denied approval operation"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit denied approval operation"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("denied approval operation was queued");
+        };
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .transfer_background(
+                    surface_request_id(),
+                    surface::BackgroundTarget::ActiveGeneration {
+                        fence: first_generation,
+                    },
+                )
+                .expect("transfer denied approval operation"),
+        );
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let (interaction_id, task_id) = loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            if let Some(interaction) = snapshot.interactions.iter().find(|interaction| {
+                interaction.fence.operation_id == reserved.operation_id
+                    && interaction.kind == surface::SurfaceInteractionKind::BackgroundApproval
+                    && matches!(
+                        interaction.lifecycle,
+                        surface::SurfaceInteractionLifecycle::Requested
+                    )
+            }) {
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| {
+                        task.parent_operation.as_ref() == Some(&reserved.operation_id)
+                            && task.status == surface::SurfaceTaskStatus::ApprovalRequired
+                    })
+                    .expect("denied approval task is projected");
+                break (interaction.interaction_id.clone(), task.task_id.clone());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "denied background approval did not become durable"
+            );
+            std::thread::yield_now();
+        };
+        surface::JsonlSurfaceCommitLedger::inject_terminal_append_failure_once(transcript_path);
+        detach_surface_attachment(&surface, &attachment);
+        let responder = fresh_background_approval_attachment(&surface);
+        foreground_background_approval_task(&responder, &interaction_id);
+        let response = committed_surface_value(
+            responder
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    interaction_id,
+                    surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                        decision: surface::SurfaceAllowDeny::Deny,
+                    },
+                )
+                .expect("commit denied background interaction"),
+        );
+        assert!(matches!(
+            response.disposition,
+            surface::RespondInteractionDisposition::Resolved { .. }
+        ));
+        let terminal = responder
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id.clone())
+            .expect("wait checkpoint-retried denial terminal");
         assert!(matches!(
             terminal,
             surface::WaitOperationTerminalResult::Terminal { value }
                 if matches!(
                     value.terminal,
-                    surface::OperationTerminal::Failed {
-                        class: surface::FailureClass::LegacyApprovalRequired,
-                        ..
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
                     }
                 )
         ));
@@ -28443,16 +31087,11 @@ mod tests {
         let task = snapshot
             .tasks
             .iter()
-            .find(|task| task.parent_operation.as_ref() == Some(&reserved.operation_id))
-            .expect("approval retry keeps its main-session task");
-        assert_eq!(task.status, surface::SurfaceTaskStatus::ApprovalRequired);
-        assert!(
-            snapshot
-                .background_operations
-                .iter()
-                .all(|background| background.operation_id != reserved.operation_id)
-        );
-        host.shutdown().expect("shutdown approval retry host");
+            .find(|task| task.task_id == task_id)
+            .expect("denied approval task remains projected");
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        host.shutdown()
+            .expect("shutdown denied approval retry host");
     }
 
     #[test]
@@ -28566,13 +31205,56 @@ mod tests {
             surface::TransferBackgroundOutput::HandedOff { .. }
         ));
 
-        let first_terminal = attachment
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let first_interaction = loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            if let Some(interaction) = snapshot.interactions.iter().find(|interaction| {
+                interaction.fence.operation_id == first.operation_id
+                    && interaction.kind == surface::SurfaceInteractionKind::BackgroundApproval
+                    && matches!(
+                        interaction.lifecycle,
+                        surface::SurfaceInteractionLifecycle::Requested
+                    )
+            }) {
+                break interaction.interaction_id.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "older incomplete approval did not settle before the newer transfer"
+            );
+            std::thread::yield_now();
+        };
+        let responder = fresh_background_approval_attachment(&surface);
+        let _ = committed_surface_value(
+            responder
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    first_interaction,
+                    surface::SurfaceClientInteractionAnswer::BackgroundApproval {
+                        decision: surface::SurfaceAllowDeny::Deny,
+                    },
+                )
+                .expect("deny older approval after newer transfer"),
+        );
+        let first_terminal = responder
             .client
             .wait_operation_terminal(surface_request_id(), first.operation_id)
             .expect("wait first provider terminal");
         assert!(matches!(
             first_terminal,
-            surface::WaitOperationTerminalResult::Terminal { .. }
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(
+                    value.terminal,
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
+                    }
+                )
         ));
         let second_terminal = attachment
             .client
@@ -31719,7 +34401,7 @@ mod tests {
             thread
                 .surface_actor_probe_for_test(operation_id.clone())
                 .expect("probe retained interaction")
-                .secret_bearing_interaction_count,
+                .resident_interaction_count,
             1
         );
         assert!(subscription.try_recv().is_none());
@@ -31851,7 +34533,7 @@ mod tests {
             .surface_actor_probe_for_test(operation_id.clone())
             .expect("probe retained terminalization");
         assert!(retained.interaction_admission_closed);
-        assert_eq!(retained.secret_bearing_interaction_count, 1);
+        assert_eq!(retained.resident_interaction_count, 1);
         let retained = retained
             .pending_terminalization
             .expect("checkpoint failure discarded prepared terminalization");
@@ -32548,7 +35230,7 @@ mod tests {
             thread
                 .surface_actor_probe_for_test(operation_id.clone())
                 .expect("probe restored active operation")
-                .secret_bearing_interaction_count,
+                .resident_interaction_count,
             1
         );
         assert!(subscription.try_recv().is_none());

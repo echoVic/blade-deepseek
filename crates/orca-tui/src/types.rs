@@ -1206,7 +1206,6 @@ impl AppState {
         };
         if task.task_type != orca_core::task_types::TaskType::MainSession
             || task.status != orca_core::task_types::TaskStatus::ApprovalRequired
-            || !task.is_backgrounded
         {
             return false;
         }
@@ -4050,6 +4049,32 @@ mod tests {
         assert_eq!(dialog.target.as_deref(), Some("background task"));
         assert_eq!(dialog.background_task_id.as_deref(), Some("task-approval"));
         assert_eq!(dialog.diff.as_deref(), Some("{\"limit\":1}"));
+    }
+
+    #[test]
+    fn foreground_claimed_background_approval_can_reopen_dialog() {
+        let mut state = state();
+        let mut task = workflow_task_summary("task-approval", "approval");
+        task.task_type = TaskType::MainSession;
+        task.status = TaskStatus::ApprovalRequired;
+        task.is_backgrounded = false;
+        task.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+            id: "mock-tool-1".to_string(),
+            name: "task_list".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: Some("foreground claimed task".to_string()),
+            arguments: "{}".to_string(),
+        });
+        state.workflow_panel.tasks = vec![task];
+
+        assert!(state.open_selected_background_approval_dialog());
+        assert_eq!(
+            state
+                .approval_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.background_task_id.as_deref()),
+            Some("task-approval")
+        );
     }
 
     #[test]

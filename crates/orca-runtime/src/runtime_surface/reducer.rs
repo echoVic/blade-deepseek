@@ -1023,7 +1023,6 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
                 OperationPatch::ReservationQueueChanged { operation_id, .. }
                 | OperationPatch::Admitted { operation_id, .. }
                 | OperationPatch::ControlIntentCommitted { operation_id, .. }
-                | OperationPatch::Suspended { operation_id, .. }
                 | OperationPatch::SuspensionRebasedAfterUnstartedResume { operation_id, .. }
                 | OperationPatch::RecoveryRequired { operation_id, .. }
                 | OperationPatch::FinalizationStarted { operation_id, .. }
@@ -1034,12 +1033,29 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
                 SurfaceScope::Operation {
                     operation_id: scoped,
                 },
+                OperationPatch::Suspended { operation_id, .. },
+            ) => scoped == operation_id,
+            (
+                SurfaceScope::Background { fence: scoped },
+                OperationPatch::Suspended { operation_id, .. },
+            ) => &scoped.operation_fence.operation_id == operation_id,
+            (
+                SurfaceScope::Operation {
+                    operation_id: scoped,
+                },
                 OperationPatch::Terminal { record },
             ) => scoped == &record.operation_id,
             (
                 SurfaceScope::Generation { fence: scoped },
                 OperationPatch::GenerationReserved { generation },
             ) => scoped == &generation.fence,
+            (
+                SurfaceScope::Background { fence: scoped },
+                OperationPatch::GenerationReserved { generation },
+            ) => {
+                scoped.operation_fence.operation_id == generation.fence.operation_id
+                    && generation.predecessor.as_ref() == Some(&scoped.operation_fence)
+            }
             (
                 SurfaceScope::Generation { fence: scoped },
                 OperationPatch::GenerationStarted { fence, .. }
@@ -1089,10 +1105,15 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
             scope,
             SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
         ),
-        SurfaceEvent::Interaction(InteractionPatch::Requested { interaction }) => matches!(
-            scope,
-            SurfaceScope::Generation { fence } if fence == &interaction.fence
-        ),
+        SurfaceEvent::Interaction(InteractionPatch::Requested { interaction }) => {
+            matches!(
+                scope,
+                SurfaceScope::Generation { fence } if fence == &interaction.fence
+            ) || matches!(
+                scope,
+                SurfaceScope::Background { fence } if fence.operation_fence == interaction.fence
+            )
+        }
         SurfaceEvent::Interaction(InteractionPatch::Transferred {
             background_fence, ..
         }) => matches!(
@@ -5242,6 +5263,10 @@ fn apply_operation_patch(
         }
         OperationPatch::GenerationReserved { generation } => {
             ensure_background_owner(snapshot, envelope, &generation.fence.operation_id)?;
+            let resumed_background_fence = match &envelope.scope {
+                SurfaceScope::Background { fence } => Some(fence.clone()),
+                _ => None,
+            };
             let thread_id = snapshot.thread.thread_id.clone();
             let owner_epoch = snapshot.thread.owner_epoch;
             let goal = snapshot.goal.clone();
@@ -5273,6 +5298,40 @@ fn apply_operation_patch(
                 ));
             }
             operation.generations.push(generation.clone());
+            if let Some(background_fence) = resumed_background_fence {
+                if snapshot.foreground_operation.is_some() {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::IllegalTransition,
+                        "background resume cannot replace an active foreground operation",
+                    ));
+                }
+                let background_position = snapshot
+                    .background_operations
+                    .iter()
+                    .position(|background| background.fence == background_fence)
+                    .ok_or_else(|| {
+                        event_error(
+                            envelope,
+                            SurfaceReducerErrorCode::MissingIdentity,
+                            "background resume owner disappeared",
+                        )
+                    })?;
+                let operation_position = snapshot
+                    .operation_history
+                    .iter()
+                    .position(|operation| operation.operation_id == generation.fence.operation_id)
+                    .ok_or_else(|| {
+                        event_error(
+                            envelope,
+                            SurfaceReducerErrorCode::MissingIdentity,
+                            "background resume operation disappeared",
+                        )
+                    })?;
+                snapshot.background_operations.remove(background_position);
+                snapshot.foreground_operation =
+                    Some(snapshot.operation_history.remove(operation_position));
+            }
             Ok(())
         }
         OperationPatch::GenerationStarted { fence, witness } => {

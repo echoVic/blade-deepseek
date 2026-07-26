@@ -189,8 +189,33 @@ impl TuiSurfaceActions {
         )
     }
 
-    pub(crate) fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {
-        self.thread.task_summaries()
+    pub(crate) fn recoverable_background_approval_projection(
+        &self,
+    ) -> Result<(Vec<BackgroundTaskSummary>, Vec<String>), String> {
+        let snapshot = crate::surface_client::read_snapshot(&self.thread)
+            .map_err(|error| error.to_string())?;
+        let tools = snapshot
+            .interactions
+            .iter()
+            .filter_map(|interaction| {
+                let orca_runtime::surface::SurfaceInteractionRequest::BackgroundApproval {
+                    tool,
+                    ..
+                } = &interaction.request
+                else {
+                    return None;
+                };
+                matches!(
+                    interaction.lifecycle,
+                    orca_runtime::surface::SurfaceInteractionLifecycle::Requested
+                )
+                .then(|| tool.name.as_str().to_string())
+            })
+            .collect();
+        Ok((
+            crate::surface_projection::workflow_task_summaries(&snapshot),
+            tools,
+        ))
     }
 
     pub(crate) fn stop_task(
@@ -225,9 +250,17 @@ impl TuiSurfaceActions {
         &self,
         approval_id: &str,
         approved: bool,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
     ) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
-        self.thread
-            .resolve_background_approval(approval_id, approved)
+        let (task_id, tasks) = crate::surface_client::resolve_background_approval(
+            &self.thread,
+            approval_id,
+            approved,
+            &controller.surface_task_control(),
+            event_tx,
+        )?;
+        Ok((task_id, tasks))
     }
 
     pub(crate) fn launch_workflow(

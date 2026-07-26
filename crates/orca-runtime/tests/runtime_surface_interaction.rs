@@ -2812,16 +2812,21 @@ fn foreground_user_input_is_durable_before_typed_response_wakes_generation() {
         answer_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
         Some("ship".to_string())
     );
-    let late_response = attachment.client.respond_interaction_by_id(
-        request_id(),
-        interaction.interaction_id.clone(),
-        SurfaceClientInteractionAnswer::UserInput {
-            decision: SurfaceUserInputDecision::Answer(DisplayText::new("replace")),
-        },
+    let late_response = committed_value(
+        attachment
+            .client
+            .respond_interaction_by_id(
+                request_id(),
+                interaction.interaction_id.clone(),
+                SurfaceClientInteractionAnswer::UserInput {
+                    decision: SurfaceUserInputDecision::Answer(DisplayText::new("replace")),
+                },
+            )
+            .expect("replay resolved user input"),
     );
     assert!(matches!(
-        late_response,
-        Err(SurfaceClientCommandError::Unauthorized)
+        late_response.disposition,
+        RespondInteractionDisposition::AlreadyResolved { .. }
     ));
     let terminal = thread.surface().attach_fresh(FreshAttachRequest {
         request_id: request_id(),
@@ -3085,12 +3090,17 @@ fn sequential_operations_can_reuse_the_same_kind_adapter_opaque_id() {
             .unwrap(),
     );
     let second = collect_requested_interaction(&mut subscription);
-    let late_old_response = attachment.client.respond_interaction_by_id(
-        request_id(),
-        first.interaction_id.clone(),
-        SurfaceClientInteractionAnswer::UserInput {
-            decision: SurfaceUserInputDecision::Answer(DisplayText::new("late-old")),
-        },
+    let late_old_response = committed_value(
+        attachment
+            .client
+            .respond_interaction_by_id(
+                request_id(),
+                first.interaction_id.clone(),
+                SurfaceClientInteractionAnswer::UserInput {
+                    decision: SurfaceUserInputDecision::Answer(DisplayText::new("late-old")),
+                },
+            )
+            .expect("replay first resolved interaction"),
     );
     let answer_after_late = answer_rx.recv_timeout(Duration::from_millis(100)).ok();
     let interaction_after_late = snapshot_interaction(&surface, &second.interaction_id);
@@ -3105,8 +3115,8 @@ fn sequential_operations_can_reuse_the_same_kind_adapter_opaque_id() {
     assert_ne!(first.interaction_id, second.interaction_id);
     assert_eq!(second.kind, SurfaceInteractionKind::UserInput);
     assert!(matches!(
-        late_old_response,
-        Err(SurfaceClientCommandError::Unauthorized)
+        late_old_response.disposition,
+        RespondInteractionDisposition::AlreadyResolved { .. }
     ));
     assert_eq!(answer_after_late, None);
     assert!(matches!(
@@ -3729,16 +3739,21 @@ fn append_failure_retains_private_first_winner_until_exact_batch_retry() {
             retried.disposition,
             RespondInteractionDisposition::AlreadyResolved { .. }
         ));
-        let late_response = attachment.client.respond_interaction_by_id(
-            request_id(),
-            interaction.interaction_id.clone(),
-            SurfaceClientInteractionAnswer::UserInput {
-                decision: SurfaceUserInputDecision::Answer(DisplayText::new("late")),
-            },
+        let late_response = committed_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    request_id(),
+                    interaction.interaction_id.clone(),
+                    SurfaceClientInteractionAnswer::UserInput {
+                        decision: SurfaceUserInputDecision::Answer(DisplayText::new("late")),
+                    },
+                )
+                .expect("replay retained private winner"),
         );
         assert!(matches!(
-            late_response,
-            Err(SurfaceClientCommandError::Unauthorized)
+            late_response.disposition,
+            RespondInteractionDisposition::AlreadyResolved { .. }
         ));
         assert_eq!(
             answer_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
@@ -3832,15 +3847,21 @@ fn tool_approval_allow_wakes_only_after_exact_resolution_batch_commits() {
             ApprovalDecision::Allow
         );
         assert!(resolution_rx.try_recv().is_err());
+        let replay = committed_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    request_id(),
+                    interaction.interaction_id,
+                    SurfaceClientInteractionAnswer::ToolApproval {
+                        decision: SurfaceAllowDeny::Deny,
+                    },
+                )
+                .expect("replay resolved tool approval"),
+        );
         assert!(matches!(
-            attachment.client.respond_interaction_by_id(
-                request_id(),
-                interaction.interaction_id,
-                SurfaceClientInteractionAnswer::ToolApproval {
-                    decision: SurfaceAllowDeny::Deny,
-                },
-            ),
-            Err(SurfaceClientCommandError::Unauthorized)
+            replay.disposition,
+            RespondInteractionDisposition::AlreadyResolved { .. }
         ));
         assert!(matches!(
             attachment
@@ -3947,19 +3968,25 @@ fn permission_allow_wakes_only_after_exact_resolution_batch_commits() {
             PermissionResponseDecision::Allow
         );
         assert!(response_rx.try_recv().is_err());
-        assert!(matches!(
-            attachment.client.respond_interaction_by_id(
-                request_id(),
-                interaction.interaction_id,
-                SurfaceClientInteractionAnswer::PermissionRequest {
-                    decision: SurfacePermissionClientDecision::Deny {
-                        scope: PermissionGrantScope::Turn,
-                        permissions: requested,
-                        strict_auto_review: false,
+        let replay = committed_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    request_id(),
+                    interaction.interaction_id,
+                    SurfaceClientInteractionAnswer::PermissionRequest {
+                        decision: SurfacePermissionClientDecision::Deny {
+                            scope: PermissionGrantScope::Turn,
+                            permissions: requested,
+                            strict_auto_review: false,
+                        },
                     },
-                },
-            ),
-            Err(SurfaceClientCommandError::Unauthorized)
+                )
+                .expect("replay resolved permission response"),
+        );
+        assert!(matches!(
+            replay.disposition,
+            RespondInteractionDisposition::AlreadyResolved { .. }
         ));
         assert!(matches!(
             attachment
