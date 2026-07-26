@@ -2012,18 +2012,29 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             .flat_map(|tool| tool.capability_calls.iter())
             .filter(|call| {
                 call.fence.operation_id == *operation_id
-                    && call.kind == super::SurfaceCapabilityCallKind::ReadTextFile
                     && matches!(
-                        call.state,
-                        super::SurfaceCapabilityCallState::Prepared
-                            | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                        (call.kind, &call.state),
+                        (
+                            super::SurfaceCapabilityCallKind::ReadTextFile,
+                            super::SurfaceCapabilityCallState::Prepared
+                                | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                        ) | (
+                            super::SurfaceCapabilityCallKind::WriteTextFile,
+                            super::SurfaceCapabilityCallState::Prepared
+                                | super::SurfaceCapabilityCallState::DeliveryPossible
+                                | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                        )
                     )
             })
             .cloned()
             .collect::<Vec<_>>();
         for mut call in calls {
-            let message = match call.state {
-                super::SurfaceCapabilityCallState::Prepared => {
+            let message = match (call.kind, call.state) {
+                (
+                    super::SurfaceCapabilityCallKind::ReadTextFile
+                    | super::SurfaceCapabilityCallKind::WriteTextFile,
+                    super::SurfaceCapabilityCallState::Prepared,
+                ) => {
                     call.state = super::SurfaceCapabilityCallState::FailedBeforeWrite {
                         error: super::SafeDiagnosticText::try_new(
                             "runtime restarted before ACP capability request write",
@@ -2032,7 +2043,10 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     };
                     "prepared"
                 }
-                super::SurfaceCapabilityCallState::WrittenAwaitingResponse => {
+                (
+                    super::SurfaceCapabilityCallKind::ReadTextFile,
+                    super::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => {
                     call.state = super::SurfaceCapabilityCallState::ObservationUnavailable {
                         error: super::SafeDiagnosticText::try_new(
                             "runtime restarted before ACP capability response",
@@ -2040,6 +2054,20 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                         .expect("fixed recovery diagnostic is bounded"),
                     };
                     "written"
+                }
+                (
+                    super::SurfaceCapabilityCallKind::WriteTextFile,
+                    super::SurfaceCapabilityCallState::DeliveryPossible
+                    | super::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => {
+                    call.state = super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                        effect_kind: super::ExternalEffectKind::FileWrite,
+                        error: super::SafeDiagnosticText::try_new(
+                            "runtime restarted after ACP file write delivery became possible",
+                        )
+                        .expect("fixed recovery diagnostic is bounded"),
+                    };
+                    "write-delivery-possible"
                 }
                 _ => continue,
             };
@@ -2243,7 +2271,30 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     .recovery_generation(&operation)
                     .cloned()
                     .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+                let has_external_effect_ambiguity =
+                    self.state.snapshot().tools.iter().any(|tool| {
+                        tool.capability_calls.iter().any(|call| {
+                            call.fence == generation.fence
+                                && matches!(
+                                    &call.state,
+                                    super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                        ..
+                                    }
+                                )
+                        })
+                    });
                 let stop_reason = match action {
+                    RecoveryAction::StopAndFinalizeRuntimeRestart
+                        if has_external_effect_ambiguity =>
+                    {
+                        super::GenerationStopReason::ExecutionFailed {
+                            class: super::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
+                            message: super::SafeDiagnosticText::try_new(
+                                "external file write effect is ambiguous after runtime restart",
+                            )
+                            .expect("static diagnostic is bounded"),
+                        }
+                    }
                     RecoveryAction::StopAndFinalizeRuntimeRestart => {
                         super::GenerationStopReason::RuntimeRestart
                     }
@@ -3699,16 +3750,68 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7"),
         };
-        let event = super::SurfaceEventEnvelope {
-            ordinal: 0,
-            event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-                .expect("generated UUID is v7"),
-            commit_class: commit_class.clone(),
-            scope: SurfaceScope::Generation {
-                fence: call.fence.clone(),
-            },
-            event: super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged { call }),
+        let scope = SurfaceScope::Generation {
+            fence: call.fence.clone(),
         };
+        let mut patches = vec![super::SurfaceEvent::Tool(
+            super::ToolPatch::CapabilityCallChanged { call: call.clone() },
+        )];
+        if let super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+            effect_kind: super::ExternalEffectKind::FileWrite,
+            error,
+        } = &call.state
+        {
+            let tool = self
+                .state
+                .snapshot()
+                .tools
+                .iter()
+                .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+                .filter(|tool| tool.result.is_none())
+                .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            let terminal = super::SurfaceToolTerminal {
+                kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+                source: super::ToolTerminalSource::Observed,
+                invocation_started: super::ToolInvocationStarted::Yes,
+            };
+            let content = super::DisplayText::new(error.as_str());
+            patches.push(super::SurfaceEvent::Tool(super::ToolPatch::Completed {
+                result: super::SurfaceToolResult {
+                    tool_call_id: call.owning_tool_call_id.clone(),
+                    name: tool.request.name.clone(),
+                    terminal: terminal.clone(),
+                    output: None,
+                    error: Some(content.clone()),
+                    exit_code: None,
+                    truncated: false,
+                    file_change: None,
+                },
+            }));
+            patches.push(super::SurfaceEvent::Item(super::ItemPatch::Added {
+                item: super::SurfaceItem::ToolResultMessage {
+                    id: super::SurfaceItemId::new(),
+                    turn_id: tool.request.turn_id.clone(),
+                    tool_call_id: tool.request.tool_call_id.clone(),
+                    content,
+                    terminal,
+                    pinned: false,
+                },
+            }));
+        }
+        let events = patches
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, event)| super::SurfaceEventEnvelope {
+                ordinal: ordinal as u32,
+                event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7"),
+                commit_class: commit_class.clone(),
+                scope: scope.clone(),
+                event,
+            })
+            .collect::<Vec<_>>();
+        let event_count = u32::try_from(events.len())
+            .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
         let mut batch = SurfaceCommitBatch {
             cursor_before: cursor_before.clone(),
             cursor_after: super::SurfaceCursor {
@@ -3716,16 +3819,16 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     cursor_before
                         .next_seq
                         .get()
-                        .checked_add(1)
+                        .checked_add(u64::from(event_count))
                         .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
                 ),
                 source_revision: super::CursorSourceRevision::Recorded { durable_revision },
                 ..cursor_before
             },
             commit_class,
-            event_count: 1,
+            event_count,
             batch_digest: super::Sha256Digest::new([0; 32]),
-            events: super::NonEmptyVec::try_new(vec![event])
+            events: super::NonEmptyVec::try_new(events)
                 .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
         };
         batch.batch_digest = super::canonical_batch_digest(&batch);
@@ -4600,9 +4703,10 @@ fn actor_generation_terminalization_authorized(
         }
         _ => return false,
     };
-    settlements
-        .iter()
-        .all(|event| match (&event.scope, &event.event) {
+    let mut index = 0usize;
+    while index < settlements.len() {
+        let event = &settlements[index];
+        let authorized = match (&event.scope, &event.event) {
             (
                 SurfaceScope::Generation { fence: scope },
                 super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
@@ -4642,8 +4746,91 @@ fn actor_generation_terminalization_authorized(
                         },
                 }),
             ) => scope == fence && call_fence == fence,
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call:
+                        super::SurfaceCapabilityCall {
+                            fence: call_fence,
+                            kind: super::SurfaceCapabilityCallKind::WriteTextFile,
+                            state: super::SurfaceCapabilityCallState::FailedBeforeWrite { .. },
+                            ..
+                        },
+                }),
+            ) => scope == fence && call_fence == fence,
+            (
+                SurfaceScope::Generation { fence: scope },
+                super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                    call:
+                        super::SurfaceCapabilityCall {
+                            fence: call_fence,
+                            kind: super::SurfaceCapabilityCallKind::WriteTextFile,
+                            owning_tool_call_id,
+                            state:
+                                super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                    effect_kind: super::ExternalEffectKind::FileWrite,
+                                    ..
+                                },
+                            ..
+                        },
+                }),
+            ) if scope == fence && call_fence == fence => {
+                let Some(completed) = settlements.get(index + 1) else {
+                    return false;
+                };
+                let Some(item) = settlements.get(index + 2) else {
+                    return false;
+                };
+                let (
+                    SurfaceScope::Generation {
+                        fence: completed_fence,
+                    },
+                    super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+                ) = (&completed.scope, &completed.event)
+                else {
+                    return false;
+                };
+                let (
+                    SurfaceScope::Generation { fence: item_fence },
+                    super::SurfaceEvent::Item(super::ItemPatch::Added {
+                        item:
+                            super::SurfaceItem::ToolResultMessage {
+                                tool_call_id,
+                                terminal,
+                                ..
+                            },
+                    }),
+                ) = (&item.scope, &item.event)
+                else {
+                    return false;
+                };
+                if completed_fence != fence
+                    || item_fence != fence
+                    || &result.tool_call_id != owning_tool_call_id
+                    || tool_call_id != owning_tool_call_id
+                    || result.terminal != *terminal
+                    || !matches!(
+                        result.terminal,
+                        super::SurfaceToolTerminal {
+                            kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+                            source: super::ToolTerminalSource::Observed,
+                            invocation_started: super::ToolInvocationStarted::Yes,
+                        }
+                    )
+                {
+                    return false;
+                }
+                index += 2;
+                true
+            }
             _ => false,
-        })
+        };
+        if !authorized {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 fn live_generation_suspend_authorized(
@@ -6849,6 +7036,59 @@ fn recovery_batch_authorized(
     if recovery_manual_compaction_completion_authorized(historical_fence, events) {
         return true;
     }
+    if let [capability, completed, item] = events
+        && let (
+            SurfaceScope::Generation {
+                fence: capability_fence,
+            },
+            super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
+                call:
+                    super::SurfaceCapabilityCall {
+                        kind: super::SurfaceCapabilityCallKind::WriteTextFile,
+                        owning_tool_call_id,
+                        state:
+                            super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                effect_kind: super::ExternalEffectKind::FileWrite,
+                                ..
+                            },
+                        ..
+                    },
+            }),
+        ) = (&capability.scope, &capability.event)
+        && let (
+            SurfaceScope::Generation {
+                fence: completed_fence,
+            },
+            super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+        ) = (&completed.scope, &completed.event)
+        && let (
+            SurfaceScope::Generation { fence: item_fence },
+            super::SurfaceEvent::Item(super::ItemPatch::Added {
+                item:
+                    super::SurfaceItem::ToolResultMessage {
+                        tool_call_id,
+                        terminal,
+                        ..
+                    },
+            }),
+        ) = (&item.scope, &item.event)
+        && capability_fence == historical_fence
+        && completed_fence == historical_fence
+        && item_fence == historical_fence
+        && &result.tool_call_id == owning_tool_call_id
+        && tool_call_id == owning_tool_call_id
+        && result.terminal == *terminal
+        && matches!(
+            result.terminal,
+            super::SurfaceToolTerminal {
+                kind: super::SurfaceToolResultKind::ExternalEffectAmbiguous,
+                source: super::ToolTerminalSource::Observed,
+                invocation_started: super::ToolInvocationStarted::Yes,
+            }
+        )
+    {
+        return true;
+    }
     if let [event] = events {
         return matches!(
             (&event.scope, &event.event),
@@ -6870,6 +7110,16 @@ fn recovery_batch_authorized(
                             state:
                                 super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
                                 | super::SurfaceCapabilityCallState::ObservationUnavailable { .. },
+                            ..
+                        }
+                        | super::SurfaceCapabilityCall {
+                            kind: super::SurfaceCapabilityCallKind::WriteTextFile,
+                            state:
+                                super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+                                | super::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                                    effect_kind: super::ExternalEffectKind::FileWrite,
+                                    ..
+                                },
                             ..
                         },
                     },
@@ -7041,7 +7291,8 @@ fn recovery_generation_stop_authorized(
                         reason: super::NotStartedReason::RuntimeRestart,
                     }
                     | super::GenerationStopReason::ExecutionFailed {
-                        class: super::GenerationExecutionFailureClass::ClientCapabilityUnavailable,
+                        class: super::GenerationExecutionFailureClass::ClientCapabilityUnavailable
+                            | super::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
                         ..
                     },
                 ..

@@ -158,8 +158,9 @@ pub struct OrcaAcpAgent {
 pub(crate) struct AcpClientBridge {
     request_tx: mpsc::Sender<AcpPermissionRequest>,
     read_text_file_tx: Mutex<Option<mpsc::Sender<AcpReadTextFileRequest>>>,
+    write_text_file_tx: Mutex<Option<mpsc::Sender<AcpWriteTextFileRequest>>>,
     state: Mutex<AcpClientBridgeState>,
-    read_text_file_write_notify: tokio::sync::Notify,
+    capability_write_notify: tokio::sync::Notify,
     next_key: AtomicU64,
 }
 
@@ -169,8 +170,8 @@ struct AcpClientBridgeState {
         std_mpsc::SyncSender<Result<RequestPermissionResponse, AcpPermissionWaitError>>,
     >,
     cancelled_sessions: HashSet<String>,
-    read_text_file_writes: HashMap<String, usize>,
-    read_text_file_closed: bool,
+    capability_writes: HashMap<String, usize>,
+    capability_lanes_closed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +192,11 @@ pub(crate) struct AcpReadTextFileRequest {
     pub(crate) dispatch: crate::runtime_surface::AcpReadTextFileDispatch,
 }
 
+pub(crate) struct AcpWriteTextFileRequest {
+    pub(crate) client: RuntimeSurfaceClientHandle,
+    pub(crate) dispatch: crate::runtime_surface::AcpWriteTextFileDispatch,
+}
+
 impl AcpClientBridge {
     #[cfg(test)]
     pub(crate) fn new() -> (Arc<Self>, mpsc::Receiver<AcpPermissionRequest>) {
@@ -199,41 +205,46 @@ impl AcpClientBridge {
             Arc::new(Self {
                 request_tx,
                 read_text_file_tx: Mutex::new(None),
+                write_text_file_tx: Mutex::new(None),
                 state: Mutex::new(AcpClientBridgeState {
                     pending: HashMap::new(),
                     cancelled_sessions: HashSet::new(),
-                    read_text_file_writes: HashMap::new(),
-                    read_text_file_closed: false,
+                    capability_writes: HashMap::new(),
+                    capability_lanes_closed: false,
                 }),
-                read_text_file_write_notify: tokio::sync::Notify::new(),
+                capability_write_notify: tokio::sync::Notify::new(),
                 next_key: AtomicU64::new(1),
             }),
             request_rx,
         )
     }
 
-    pub(crate) fn new_with_read_text_file_lane() -> (
+    pub(crate) fn new_with_capability_lanes() -> (
         Arc<Self>,
         mpsc::Receiver<AcpPermissionRequest>,
         mpsc::Receiver<AcpReadTextFileRequest>,
+        mpsc::Receiver<AcpWriteTextFileRequest>,
     ) {
         let (request_tx, request_rx) = mpsc::channel(ACP_PERMISSION_REQUEST_CAPACITY);
         let (read_text_file_tx, read_text_file_rx) = mpsc::channel(1);
+        let (write_text_file_tx, write_text_file_rx) = mpsc::channel(1);
         (
             Arc::new(Self {
                 request_tx,
                 read_text_file_tx: Mutex::new(Some(read_text_file_tx)),
+                write_text_file_tx: Mutex::new(Some(write_text_file_tx)),
                 state: Mutex::new(AcpClientBridgeState {
                     pending: HashMap::new(),
                     cancelled_sessions: HashSet::new(),
-                    read_text_file_writes: HashMap::new(),
-                    read_text_file_closed: false,
+                    capability_writes: HashMap::new(),
+                    capability_lanes_closed: false,
                 }),
-                read_text_file_write_notify: tokio::sync::Notify::new(),
+                capability_write_notify: tokio::sync::Notify::new(),
                 next_key: AtomicU64::new(1),
             }),
             request_rx,
             read_text_file_rx,
+            write_text_file_rx,
         )
     }
 
@@ -256,44 +267,63 @@ impl AcpClientBridge {
             .map_err(|error| error.into_inner().dispatch)
     }
 
-    pub(crate) fn begin_read_text_file_write(&self, session_id: &SessionId) -> bool {
+    fn dispatch_write_text_file(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        dispatch: crate::runtime_surface::AcpWriteTextFileDispatch,
+    ) -> Result<(), crate::runtime_surface::AcpWriteTextFileDispatch> {
+        let Some(sender) = self
+            .write_text_file_tx
+            .lock()
+            .expect("ACP write sender mutex is not poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            return Err(dispatch);
+        };
+        sender
+            .try_send(AcpWriteTextFileRequest { client, dispatch })
+            .map_err(|error| error.into_inner().dispatch)
+    }
+
+    pub(crate) fn begin_capability_write(&self, session_id: &SessionId) -> bool {
         let session_id = session_id.to_string();
         let mut state = self
             .state
             .lock()
             .expect("ACP client bridge mutex is not poisoned");
-        if state.read_text_file_closed || state.cancelled_sessions.contains(&session_id) {
+        if state.capability_lanes_closed || state.cancelled_sessions.contains(&session_id) {
             return false;
         }
-        *state.read_text_file_writes.entry(session_id).or_default() += 1;
+        *state.capability_writes.entry(session_id).or_default() += 1;
         true
     }
 
-    pub(crate) fn finish_read_text_file_write(&self, session_id: &SessionId) {
+    pub(crate) fn finish_capability_write(&self, session_id: &SessionId) {
         let session_id = session_id.to_string();
         let mut state = self
             .state
             .lock()
             .expect("ACP client bridge mutex is not poisoned");
-        if let Some(count) = state.read_text_file_writes.get_mut(&session_id) {
+        if let Some(count) = state.capability_writes.get_mut(&session_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                state.read_text_file_writes.remove(&session_id);
+                state.capability_writes.remove(&session_id);
             }
         }
         drop(state);
-        self.read_text_file_write_notify.notify_waiters();
+        self.capability_write_notify.notify_waiters();
     }
 
-    async fn wait_for_read_text_file_writes(&self, session_id: &SessionId) {
+    async fn wait_for_capability_writes(&self, session_id: &SessionId) {
         let session_id = session_id.to_string();
         loop {
-            let notified = self.read_text_file_write_notify.notified();
+            let notified = self.capability_write_notify.notified();
             if !self
                 .state
                 .lock()
                 .expect("ACP client bridge mutex is not poisoned")
-                .read_text_file_writes
+                .capability_writes
                 .contains_key(&session_id)
             {
                 return;
@@ -406,12 +436,16 @@ impl AcpClientBridge {
             .lock()
             .expect("ACP read sender mutex is not poisoned")
             .take();
+        self.write_text_file_tx
+            .lock()
+            .expect("ACP write sender mutex is not poisoned")
+            .take();
         let pending = {
             let mut state = self
                 .state
                 .lock()
                 .expect("ACP permission bridge mutex is not poisoned");
-            state.read_text_file_closed = true;
+            state.capability_lanes_closed = true;
             state
                 .pending
                 .drain()
@@ -781,6 +815,7 @@ struct PreparedSurfacePrompt {
     operation_id: SurfaceOperationId,
     subscription: crate::surface::SurfaceSubscriptionReceiver,
     read_text_file_dispatch: Option<crate::runtime_surface::AcpReadTextFileDispatchReceiver>,
+    write_text_file_dispatch: Option<crate::runtime_surface::AcpWriteTextFileDispatchReceiver>,
     client_bridge: Option<Arc<AcpClientBridge>>,
     tool_outputs: HashMap<String, ToolOutputAccumulator>,
     detached: bool,
@@ -1217,6 +1252,19 @@ fn prepare_surface_prompt(
     } else {
         None
     };
+    let write_text_file_dispatch = if client_capabilities.write_text_file {
+        Some(
+            surface
+                .claim_acp_write_text_file_dispatch(&attachment.client)
+                .ok_or_else(|| {
+                    AcpPromptPrepareError::internal(
+                        "ACP write capability transport lane unavailable",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let session_id = NonEmptyText::try_new(session_id.to_string()).map_err(|error| {
         AcpPromptPrepareError::invalid(format!("invalid ACP session id: {error}"))
     })?;
@@ -1291,6 +1339,7 @@ fn prepare_surface_prompt(
         operation_id,
         subscription,
         read_text_file_dispatch,
+        write_text_file_dispatch,
         client_bridge,
         tool_outputs: HashMap::new(),
         detached: false,
@@ -1410,6 +1459,7 @@ fn drain_surface_prompt(
 ) -> Result<StopReason, String> {
     let terminal = loop {
         drain_read_text_file_dispatch(&prepared);
+        drain_write_text_file_dispatch(&prepared);
         let Some(item) = prepared
             .subscription
             .recv_timeout(std::time::Duration::from_millis(100))
@@ -1442,6 +1492,34 @@ fn drain_surface_prompt(
     };
     prepared.detach_once();
     terminal_to_stop_reason(&terminal)
+}
+
+fn drain_write_text_file_dispatch(prepared: &PreparedSurfacePrompt) {
+    let Some(receiver) = prepared.write_text_file_dispatch.as_ref() else {
+        return;
+    };
+    loop {
+        let dispatch = match receiver.try_recv() {
+            Ok(dispatch) => dispatch,
+            Err(crate::runtime_surface::AcpCapabilityDispatchError::Empty) => return,
+            Err(crate::runtime_surface::AcpCapabilityDispatchError::Disconnected)
+            | Err(crate::runtime_surface::AcpCapabilityDispatchError::StaleRoute)
+            | Err(crate::runtime_surface::AcpCapabilityDispatchError::Full) => return,
+        };
+        let failed = match prepared.client_bridge.as_ref() {
+            Some(bridge) => bridge.dispatch_write_text_file(prepared.client.clone(), dispatch),
+            None => Err(dispatch),
+        };
+        if let Err(dispatch) = failed {
+            let _ = prepared.client.settle_acp_write_text_file(
+                dispatch.call_id,
+                dispatch.capability_revision,
+                crate::runtime_surface::AcpWriteTextFileSettlement::FailedBeforeWrite {
+                    message: "ACP write capability transport lane is unavailable".to_string(),
+                },
+            );
+        }
+    }
 }
 
 fn drain_read_text_file_dispatch(prepared: &PreparedSurfacePrompt) {
@@ -1892,9 +1970,7 @@ impl Agent for OrcaAcpAgent {
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.cancel_session(&args.session_id);
-            bridge
-                .wait_for_read_text_file_writes(&args.session_id)
-                .await;
+            bridge.wait_for_capability_writes(&args.session_id).await;
         }
         loop {
             let binding = {

@@ -132,6 +132,7 @@ pub struct HostedGenerationHandlers {
     provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
     provider_response_ingress: Option<Arc<dyn surface::RuntimeProviderResponseIngress>>,
     acp_read_text_file_handler: Option<Arc<RuntimeSurfaceReadTextFileHandler>>,
+    acp_write_text_file_handler: Option<Arc<RuntimeSurfaceWriteTextFileHandler>>,
     manual_compaction_precommit: Option<
         Arc<
             dyn Fn(
@@ -168,6 +169,10 @@ impl fmt::Debug for HostedGenerationHandlers {
                 &self.acp_read_text_file_handler.is_some(),
             )
             .field(
+                "acp_write_text_file_handler",
+                &self.acp_write_text_file_handler.is_some(),
+            )
+            .field(
                 "manual_compaction_precommit",
                 &self.manual_compaction_precommit.is_some(),
             )
@@ -181,6 +186,14 @@ impl HostedGenerationHandlers {
         handler: Arc<RuntimeSurfaceReadTextFileHandler>,
     ) -> Self {
         self.acp_read_text_file_handler = Some(handler);
+        self
+    }
+
+    fn with_acp_write_text_file_handler(
+        mut self,
+        handler: Arc<RuntimeSurfaceWriteTextFileHandler>,
+    ) -> Self {
+        self.acp_write_text_file_handler = Some(handler);
         self
     }
 
@@ -1016,6 +1029,24 @@ impl GenerationContext {
             .read_text_file(request, path, line, limit)
     }
 
+    pub fn write_text_file_to_acp_client(
+        &self,
+        request: &orca_core::tool_types::ToolRequest,
+        path: PathBuf,
+        content: String,
+    ) -> io::Result<()> {
+        self.handlers
+            .acp_write_text_file_handler
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "runtime-owned ACP write capability is unavailable",
+                )
+            })?
+            .write_text_file(request, path, content)
+    }
+
     fn prepare_manual_compaction(
         &self,
         outcome: &crate::session::ManualCompactionOutcome,
@@ -1030,6 +1061,11 @@ impl GenerationContext {
 }
 
 struct RuntimeSurfaceReadTextFileHandler {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+}
+
+struct RuntimeSurfaceWriteTextFileHandler {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
 }
@@ -1066,6 +1102,41 @@ impl RuntimeSurfaceReadTextFileHandler {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "runtime capability actor closed before read settlement",
+            )
+        })?
+    }
+}
+
+impl RuntimeSurfaceWriteTextFileHandler {
+    fn write_text_file(
+        &self,
+        request: &orca_core::tool_types::ToolRequest,
+        path: PathBuf,
+        content: String,
+    ) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceRequestAcpWriteTextFile {
+                fence: self.fence.clone(),
+                request: request.clone(),
+                path,
+                content,
+                reply: reply_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime capability mailbox is full",
+                ),
+                TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runtime capability actor is unavailable",
+                ),
+            })?;
+        reply_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime capability actor closed before write settlement",
             )
         })?
     }
@@ -2904,6 +2975,32 @@ enum ThreadCommand {
         settlement: surface::AcpReadTextFileSettlement,
         reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
     },
+    SurfaceRequestAcpWriteTextFile {
+        fence: surface::SurfaceOperationFence,
+        request: orca_core::tool_types::ToolRequest,
+        path: PathBuf,
+        content: String,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfacePermitAcpWriteTextFileDelivery {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
+    SurfaceAcpWriteTextFileWritten {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
+    SurfaceAcpWriteTextFileSettled {
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpWriteTextFileSettlement,
+        reply: SyncSender<Result<(), surface::SurfaceClientCommandError>>,
+    },
     #[cfg(test)]
     SurfaceRespondInteraction {
         client: surface::RuntimeSurfaceClientHandle,
@@ -3481,6 +3578,52 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         settlement: surface::AcpReadTextFileSettlement,
     ) -> Result<(), surface::SurfaceClientCommandError> {
         self.dispatch_required(|reply| ThreadCommand::SurfaceAcpReadTextFileSettled {
+            client,
+            call_id,
+            capability_revision,
+            settlement,
+            reply,
+        })
+    }
+
+    fn permit_acp_write_text_file_delivery(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(
+            |reply| ThreadCommand::SurfacePermitAcpWriteTextFileDelivery {
+                client,
+                call_id,
+                capability_revision,
+                reply,
+            },
+        )
+    }
+
+    fn mark_acp_write_text_file_written(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(|reply| ThreadCommand::SurfaceAcpWriteTextFileWritten {
+            client,
+            call_id,
+            capability_revision,
+            reply,
+        })
+    }
+
+    fn settle_acp_write_text_file(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpWriteTextFileSettlement,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        self.dispatch_required(|reply| ThreadCommand::SurfaceAcpWriteTextFileSettled {
             client,
             call_id,
             capability_revision,
@@ -6769,26 +6912,41 @@ struct ResidentSurfaceCapabilityCall {
     attachment_id: surface::SurfaceAttachmentId,
     capability_revision: surface::CapabilityRevision,
     write_claimed: bool,
-    waiter: Option<SyncSender<io::Result<String>>>,
+    waiter: Option<ResidentSurfaceCapabilityWaiter>,
+}
+
+enum ResidentSurfaceCapabilityWaiter {
+    ReadTextFile(SyncSender<io::Result<String>>),
+    WriteTextFile(SyncSender<io::Result<()>>),
 }
 
 struct PendingSurfaceCapabilityTransition {
     fence: surface::SurfaceOperationFence,
     batch: surface::SurfaceCommitBatch,
     waiter_outcome: Option<PendingSurfaceCapabilityWaiterOutcome>,
-    deferred_settlement: Option<(
-        surface::RuntimeSurfaceClientHandle,
-        surface::CapabilityRevision,
-        surface::AcpReadTextFileSettlement,
-    )>,
+    deferred_settlement: Option<PendingSurfaceCapabilitySettlement>,
     retry_at: tokio::time::Instant,
 }
 
 enum PendingSurfaceCapabilityWaiterOutcome {
-    Completed(String),
+    ReadTextFileCompleted(String),
+    WriteTextFileCompleted,
     Failed {
         kind: io::ErrorKind,
         message: String,
+    },
+}
+
+enum PendingSurfaceCapabilitySettlement {
+    ReadTextFile {
+        client: surface::RuntimeSurfaceClientHandle,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpReadTextFileSettlement,
+    },
+    WriteTextFile {
+        client: surface::RuntimeSurfaceClientHandle,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpWriteTextFileSettlement,
     },
 }
 
@@ -11955,11 +12113,101 @@ impl ThreadActor {
         )
     }
 
-    fn pending_capability_waiter_outcome(
+    fn ambiguous_write_tool_events(
+        &self,
+        call: &surface::SurfaceCapabilityCall,
+    ) -> Result<
+        Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
+        surface::SurfaceClientCommandError,
+    > {
+        let surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+            effect_kind: surface::ExternalEffectKind::FileWrite,
+            error,
+        } = &call.state
+        else {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        };
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+            .filter(|tool| tool.result.is_none())
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let terminal = surface::SurfaceToolTerminal {
+            kind: surface::SurfaceToolResultKind::ExternalEffectAmbiguous,
+            source: surface::ToolTerminalSource::Observed,
+            invocation_started: surface::ToolInvocationStarted::Yes,
+        };
+        let content = surface_persisted_display_text(error.as_str());
+        let result = surface::SurfaceToolResult {
+            tool_call_id: call.owning_tool_call_id.clone(),
+            name: tool.request.name.clone(),
+            terminal: terminal.clone(),
+            output: None,
+            error: Some(content.clone()),
+            exit_code: None,
+            truncated: false,
+            file_change: None,
+        };
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        Ok(vec![
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::Completed { result }),
+            ),
+            (
+                scope,
+                surface::SurfaceEvent::Item(surface::ItemPatch::Added {
+                    item: surface::SurfaceItem::ToolResultMessage {
+                        id: surface::SurfaceItemId::new(),
+                        turn_id: tool.request.turn_id.clone(),
+                        tool_call_id: tool.request.tool_call_id.clone(),
+                        content,
+                        terminal,
+                        pinned: false,
+                    },
+                }),
+            ),
+        ])
+    }
+
+    fn ambiguous_write_capability_batch(
+        &self,
+        call: surface::SurfaceCapabilityCall,
+    ) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
+        let scope = surface::SurfaceScope::Generation {
+            fence: call.fence.clone(),
+        };
+        let mut events = vec![(
+            scope,
+            surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                call: call.clone(),
+            }),
+        )];
+        events.extend(self.ambiguous_write_tool_events(&call)?);
+        Ok(self.surface_event_batch_with_commit_id(events, None))
+    }
+
+    fn pending_read_capability_waiter_outcome(
         result: io::Result<String>,
     ) -> PendingSurfaceCapabilityWaiterOutcome {
         match result {
-            Ok(content) => PendingSurfaceCapabilityWaiterOutcome::Completed(content),
+            Ok(content) => PendingSurfaceCapabilityWaiterOutcome::ReadTextFileCompleted(content),
+            Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
+                kind: error.kind(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn pending_write_capability_waiter_outcome(
+        result: io::Result<()>,
+    ) -> PendingSurfaceCapabilityWaiterOutcome {
+        match result {
+            Ok(()) => PendingSurfaceCapabilityWaiterOutcome::WriteTextFileCompleted,
             Err(error) => PendingSurfaceCapabilityWaiterOutcome::Failed {
                 kind: error.kind(),
                 message: error.to_string(),
@@ -11981,13 +12229,33 @@ impl ThreadActor {
         if let Some(mut resident) = self.resident_surface.capability_calls.remove(call_id)
             && let Some(waiter) = resident.waiter.take()
         {
-            let result = match waiter_outcome {
-                PendingSurfaceCapabilityWaiterOutcome::Completed(content) => Ok(content),
-                PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message } => {
-                    Err(io::Error::new(kind, message))
+            match (waiter, waiter_outcome) {
+                (
+                    ResidentSurfaceCapabilityWaiter::ReadTextFile(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::ReadTextFileCompleted(content),
+                ) => {
+                    let _ = waiter.send(Ok(content));
                 }
-            };
-            let _ = waiter.send(result);
+                (
+                    ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::WriteTextFileCompleted,
+                ) => {
+                    let _ = waiter.send(Ok(()));
+                }
+                (
+                    ResidentSurfaceCapabilityWaiter::ReadTextFile(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
+                ) => {
+                    let _ = waiter.send(Err(io::Error::new(kind, message)));
+                }
+                (
+                    ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter),
+                    PendingSurfaceCapabilityWaiterOutcome::Failed { kind, message },
+                ) => {
+                    let _ = waiter.send(Err(io::Error::new(kind, message)));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -12035,13 +12303,33 @@ impl ThreadActor {
         }
         let deferred_settlement = pending.deferred_settlement.take();
         self.apply_committed_surface_capability_transition(call_id, pending.waiter_outcome);
-        if let Some((client, capability_revision, settlement)) = deferred_settlement {
-            let _ = self.settle_surface_acp_read_text_file(
-                &client,
-                call_id.clone(),
-                capability_revision,
-                settlement,
-            );
+        if let Some(deferred_settlement) = deferred_settlement {
+            match deferred_settlement {
+                PendingSurfaceCapabilitySettlement::ReadTextFile {
+                    client,
+                    capability_revision,
+                    settlement,
+                } => {
+                    let _ = self.settle_surface_acp_read_text_file(
+                        &client,
+                        call_id.clone(),
+                        capability_revision,
+                        settlement,
+                    );
+                }
+                PendingSurfaceCapabilitySettlement::WriteTextFile {
+                    client,
+                    capability_revision,
+                    settlement,
+                } => {
+                    let _ = self.settle_surface_acp_write_text_file(
+                        &client,
+                        call_id.clone(),
+                        capability_revision,
+                        settlement,
+                    );
+                }
+            }
             return !self
                 .resident_surface
                 .pending_capability_transitions
@@ -12164,7 +12452,7 @@ impl ThreadActor {
                     attachment_id: route.attachment_id.clone(),
                     capability_revision: route.capability_revision,
                     write_claimed: false,
-                    waiter: Some(reply.clone()),
+                    waiter: Some(ResidentSurfaceCapabilityWaiter::ReadTextFile(reply.clone())),
                 },
             );
             let dispatch = surface::AcpReadTextFileDispatch {
@@ -12200,7 +12488,9 @@ impl ThreadActor {
                         call_id,
                         fence,
                         failed_batch,
-                        Some(Self::pending_capability_waiter_outcome(Err(waiter_error))),
+                        Some(Self::pending_read_capability_waiter_outcome(Err(
+                            waiter_error,
+                        ))),
                     );
                     return Ok(());
                 }
@@ -12351,7 +12641,11 @@ impl ThreadActor {
                     return Err(surface::SurfaceClientCommandError::Unauthorized);
                 }
                 pending.deferred_settlement =
-                    Some((client.clone(), capability_revision, settlement));
+                    Some(PendingSurfaceCapabilitySettlement::ReadTextFile {
+                        client: client.clone(),
+                        capability_revision,
+                        settlement,
+                    });
             }
             return self
                 .retry_surface_capability_transition(&call_id)
@@ -12495,13 +12789,382 @@ impl ThreadActor {
                 call_id,
                 fence,
                 batch,
-                Some(Self::pending_capability_waiter_outcome(waiter_result)),
+                Some(Self::pending_read_capability_waiter_outcome(waiter_result)),
             );
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         self.apply_committed_surface_capability_transition(
             &call_id,
-            Some(Self::pending_capability_waiter_outcome(waiter_result)),
+            Some(Self::pending_read_capability_waiter_outcome(waiter_result)),
+        );
+        Ok(())
+    }
+
+    fn request_surface_acp_write_text_file(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        request: orca_core::tool_types::ToolRequest,
+        path: PathBuf,
+        content: String,
+        reply: SyncSender<io::Result<()>>,
+    ) {
+        let result = (|| -> io::Result<()> {
+            if active.surface_operation.as_ref() != Some(&fence)
+                || Self::surface_interaction_admission_closed(active)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "runtime capability generation fence is stale",
+                ));
+            }
+            let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+            let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
+            let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
+            let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "ACP client write requires an ACP prompt operation",
+                ));
+            };
+            let origin_attachment = self
+                .resident_surface
+                .operation_origin_attachments
+                .get(&fence.operation_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "ACP operation origin attachment is unavailable",
+                    )
+                })?;
+            let route = self
+                .resident_surface
+                .hub
+                .select_acp_capability_attachment(
+                    surface::SurfaceCapabilityCallKind::WriteTextFile,
+                    origin_attachment,
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "ACP write capability route is unavailable",
+                    )
+                })?;
+            let path = surface::CanonicalPath::try_new(path).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid ACP write path: {error:?}"),
+                )
+            })?;
+            let content_digest = surface_sha256(content.as_bytes());
+            let arguments = serde_json::to_vec(&(
+                path.as_path()
+                    .to_str()
+                    .expect("canonical ACP path is valid UTF-8"),
+                content_digest,
+            ))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let call_id =
+                surface::SurfaceCapabilityCallId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let call = surface::SurfaceCapabilityCall {
+                call_id: call_id.clone(),
+                acp_session_id: session_id.clone(),
+                fence: fence.clone(),
+                capability_revision: route.capability_revision,
+                policy_epoch: operation.intent.policy_epoch,
+                kind: surface::SurfaceCapabilityCallKind::WriteTextFile,
+                arguments_digest: surface_sha256(&arguments),
+                owning_tool_call_id: tool.tool_call_id,
+                state: surface::SurfaceCapabilityCallState::Prepared,
+            };
+            let batch = self.capability_call_batch(call.clone());
+            self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
+            self.resident_surface.capability_calls.insert(
+                call_id.clone(),
+                ResidentSurfaceCapabilityCall {
+                    attachment_id: route.attachment_id.clone(),
+                    capability_revision: route.capability_revision,
+                    write_claimed: false,
+                    waiter: Some(ResidentSurfaceCapabilityWaiter::WriteTextFile(
+                        reply.clone(),
+                    )),
+                },
+            );
+            let dispatch = surface::AcpWriteTextFileDispatch {
+                call_id: call_id.clone(),
+                acp_session_id: session_id.clone(),
+                capability_revision: route.capability_revision,
+                path,
+                content,
+            };
+            if let Err(error) = self
+                .resident_surface
+                .hub
+                .dispatch_acp_write_text_file(&route, dispatch)
+            {
+                let diagnostic = surface::SafeDiagnosticText::try_new(format!(
+                    "ACP write dispatch failed: {error:?}"
+                ))
+                .expect("bounded fixed capability diagnostic");
+                let mut failed = call;
+                failed.state =
+                    surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic };
+                let failed_batch = self.capability_call_batch(failed);
+                let waiter_error = io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "ACP write dispatch failed before write",
+                );
+                if self
+                    .commit_surface_generation_batch_with_retry(fence.clone(), &failed_batch)
+                    .is_err()
+                {
+                    self.retain_surface_capability_transition(
+                        call_id,
+                        fence,
+                        failed_batch,
+                        Some(Self::pending_write_capability_waiter_outcome(Err(
+                            waiter_error,
+                        ))),
+                    );
+                    return Ok(());
+                }
+                self.resident_surface.capability_calls.remove(&call_id);
+                return Err(waiter_error);
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
+        }
+    }
+
+    fn permit_surface_acp_write_text_file_delivery(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if call.kind != surface::SurfaceCapabilityCallKind::WriteTextFile
+            || call.state != surface::SurfaceCapabilityCallState::Prepared
+            || self
+                .resident_surface
+                .pending_capability_transitions
+                .contains_key(&call_id)
+            || self
+                .resident_surface
+                .capability_calls
+                .get(&call_id)
+                .is_some_and(|resident| resident.write_claimed)
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        call.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+        let fence = call.fence.clone();
+        let batch = self.capability_call_batch(call);
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let resident = self
+            .resident_surface
+            .capability_calls
+            .get_mut(&call_id)
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        resident.write_claimed = true;
+        Ok(())
+    }
+
+    fn mark_surface_acp_write_text_file_written(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if self
+            .resident_surface
+            .pending_capability_transitions
+            .contains_key(&call_id)
+        {
+            return self
+                .retry_surface_capability_transition(&call_id)
+                .then_some(())
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if call.kind != surface::SurfaceCapabilityCallKind::WriteTextFile
+            || call.state != surface::SurfaceCapabilityCallState::DeliveryPossible
+            || !self
+                .resident_surface
+                .capability_calls
+                .get(&call_id)
+                .is_some_and(|resident| resident.write_claimed)
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        call.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
+        let fence = call.fence.clone();
+        let batch = self.capability_call_batch(call);
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(call_id, fence, batch, None);
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if let Some(resident) = self.resident_surface.capability_calls.get_mut(&call_id) {
+            resident.write_claimed = false;
+        }
+        Ok(())
+    }
+
+    fn settle_surface_acp_write_text_file(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        call_id: surface::SurfaceCapabilityCallId,
+        capability_revision: surface::CapabilityRevision,
+        settlement: surface::AcpWriteTextFileSettlement,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
+        let mut call =
+            self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
+        if call.kind != surface::SurfaceCapabilityCallKind::WriteTextFile {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if self
+            .resident_surface
+            .pending_capability_transitions
+            .contains_key(&call_id)
+        {
+            let pending = self
+                .resident_surface
+                .pending_capability_transitions
+                .get_mut(&call_id)
+                .expect("checked pending capability transition");
+            if pending.deferred_settlement.is_some() {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+            pending.deferred_settlement = Some(PendingSurfaceCapabilitySettlement::WriteTextFile {
+                client: client.clone(),
+                capability_revision,
+                settlement,
+            });
+            return self
+                .retry_surface_capability_transition(&call_id)
+                .then_some(())
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let waiter_result = match settlement {
+            surface::AcpWriteTextFileSettlement::Completed
+                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
+            {
+                let result = surface::CapabilityCallResult::WriteTextFileAcknowledged;
+                let canonical =
+                    serde_json::to_vec(&result).expect("write capability result is serializable");
+                call.state = surface::SurfaceCapabilityCallState::Completed {
+                    response_digest: surface_sha256(&canonical),
+                    result,
+                };
+                Ok(())
+            }
+            surface::AcpWriteTextFileSettlement::RemoteError { code, message }
+                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
+            {
+                let code = surface::AcpCapabilityIdentifier::try_new(code).unwrap_or_else(|_| {
+                    surface::AcpCapabilityIdentifier::try_new("unknown")
+                        .expect("fixed capability error code is bounded")
+                });
+                let message = surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                    surface::SafeDiagnosticText::try_new(
+                        "ACP write request returned an invalid remote diagnostic",
+                    )
+                    .expect("fixed capability diagnostic is bounded")
+                });
+                let waiter_error = format!("ACP write request failed: {}", message.as_str());
+                let result = surface::CapabilityCallResult::RemoteError {
+                    code,
+                    message: message.clone(),
+                };
+                let canonical = serde_json::to_vec(&result)
+                    .expect("bounded capability error result is serializable");
+                call.state = surface::SurfaceCapabilityCallState::Completed {
+                    response_digest: surface_sha256(&canonical),
+                    result,
+                };
+                Err(io::Error::other(waiter_error))
+            }
+            surface::AcpWriteTextFileSettlement::FailedBeforeWrite { message }
+                if call.state == surface::SurfaceCapabilityCallState::Prepared =>
+            {
+                let diagnostic =
+                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                        surface::SafeDiagnosticText::try_new(
+                            "ACP write failed before delivery with an invalid diagnostic",
+                        )
+                        .expect("fixed capability diagnostic is bounded")
+                    });
+                let waiter_error = diagnostic.as_str().to_string();
+                call.state =
+                    surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic };
+                Err(io::Error::new(io::ErrorKind::NotConnected, waiter_error))
+            }
+            surface::AcpWriteTextFileSettlement::ExternalEffectAmbiguous { message }
+                if matches!(
+                    call.state,
+                    surface::SurfaceCapabilityCallState::DeliveryPossible
+                        | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                ) =>
+            {
+                let diagnostic =
+                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                        surface::SafeDiagnosticText::try_new(
+                            "ACP file write effect was ambiguous with an invalid diagnostic",
+                        )
+                        .expect("fixed capability diagnostic is bounded")
+                    });
+                let waiter_error = diagnostic.as_str().to_string();
+                call.state = surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::FileWrite,
+                    error: diagnostic,
+                };
+                Err(io::Error::other(waiter_error))
+            }
+            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
+        };
+        let fence = call.fence.clone();
+        let batch = if matches!(
+            &call.state,
+            surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                effect_kind: surface::ExternalEffectKind::FileWrite,
+                ..
+            }
+        ) {
+            self.ambiguous_write_capability_batch(call)?
+        } else {
+            self.capability_call_batch(call)
+        };
+        if self
+            .commit_surface_generation_batch_with_retry(fence.clone(), &batch)
+            .is_err()
+        {
+            self.retain_surface_capability_transition(
+                call_id,
+                fence,
+                batch,
+                Some(Self::pending_write_capability_waiter_outcome(waiter_result)),
+            );
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        self.apply_committed_surface_capability_transition(
+            &call_id,
+            Some(Self::pending_write_capability_waiter_outcome(waiter_result)),
         );
         Ok(())
     }
@@ -14783,31 +15446,41 @@ impl ThreadActor {
                 }),
             ));
         }
-        for call in &mut capability_calls {
+        let mut terminalized_capability_calls = Vec::new();
+        for mut call in capability_calls {
             let diagnostic = surface::SafeDiagnosticText::try_new(match cause {
                 surface::TerminalizationCause::HostShutdown => {
-                    "ACP read capability cancelled by host shutdown"
+                    "ACP capability cancelled by host shutdown"
                 }
                 surface::TerminalizationCause::ThreadClose => {
-                    "ACP read capability cancelled by thread close"
+                    "ACP capability cancelled by thread close"
                 }
-                surface::TerminalizationCause::UserCancel => {
-                    "ACP read capability cancelled by user"
-                }
+                surface::TerminalizationCause::UserCancel => "ACP capability cancelled by user",
                 surface::TerminalizationCause::GoalPause => {
-                    "ACP read capability cancelled by Goal pause"
+                    "ACP capability cancelled by Goal pause"
                 }
             })
             .expect("fixed capability cancellation diagnostic is bounded");
-            call.state = match call.state {
-                surface::SurfaceCapabilityCallState::Prepared => {
-                    surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic }
-                }
-                surface::SurfaceCapabilityCallState::WrittenAwaitingResponse => {
-                    surface::SurfaceCapabilityCallState::ObservationUnavailable {
-                        error: diagnostic,
-                    }
-                }
+            call.state = match (&call.kind, &call.state) {
+                (
+                    surface::SurfaceCapabilityCallKind::ReadTextFile
+                    | surface::SurfaceCapabilityCallKind::WriteTextFile,
+                    surface::SurfaceCapabilityCallState::Prepared,
+                ) => surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic },
+                (
+                    surface::SurfaceCapabilityCallKind::ReadTextFile,
+                    surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => surface::SurfaceCapabilityCallState::ObservationUnavailable {
+                    error: diagnostic,
+                },
+                (
+                    surface::SurfaceCapabilityCallKind::WriteTextFile,
+                    surface::SurfaceCapabilityCallState::DeliveryPossible
+                    | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                ) => surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::FileWrite,
+                    error: diagnostic,
+                },
                 _ => continue,
             };
             events.push((
@@ -14818,6 +15491,16 @@ impl ThreadActor {
                     call: call.clone(),
                 }),
             ));
+            if matches!(
+                &call.state,
+                surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+                    effect_kind: surface::ExternalEffectKind::FileWrite,
+                    ..
+                }
+            ) {
+                events.extend(self.ambiguous_write_tool_events(&call)?);
+            }
+            terminalized_capability_calls.push(call);
         }
         Ok(PreparedSurfaceTerminalization {
             fence: fence.clone(),
@@ -14827,7 +15510,7 @@ impl ThreadActor {
                 .into_iter()
                 .map(|(interaction_id, _)| interaction_id)
                 .collect(),
-            capability_call_ids: capability_calls
+            capability_call_ids: terminalized_capability_calls
                 .into_iter()
                 .map(|call| call.call_id)
                 .collect(),
@@ -14879,10 +15562,20 @@ impl ThreadActor {
             if let Some(mut call) = self.resident_surface.capability_calls.remove(call_id)
                 && let Some(waiter) = call.waiter.take()
             {
-                let _ = waiter.send(Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "ACP read capability was cancelled before settlement",
-                )));
+                let error = || {
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "ACP capability was cancelled before settlement",
+                    )
+                };
+                match waiter {
+                    ResidentSurfaceCapabilityWaiter::ReadTextFile(waiter) => {
+                        let _ = waiter.send(Err(error()));
+                    }
+                    ResidentSurfaceCapabilityWaiter::WriteTextFile(waiter) => {
+                        let _ = waiter.send(Err(error()));
+                    }
+                }
             }
         }
     }
@@ -18586,6 +19279,12 @@ impl ThreadActor {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
                     }))
+                    .with_acp_write_text_file_handler(Arc::new(
+                        RuntimeSurfaceWriteTextFileHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        },
+                    ))
                     .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
@@ -19415,18 +20114,67 @@ impl ThreadActor {
                 message: "typed surface operation fence is missing during finalization".to_string(),
             }
         })?;
-        let (stop_reason, terminal) = if let Some(class) = active.surface_execution_failure {
-            let message = surface::SafeDiagnosticText::try_new(
-                "required client capability became unavailable",
-            )
-            .expect("fixed diagnostic is bounded");
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let durable_external_effect_ambiguous = snapshot.tools.iter().any(|tool| {
+            tool.capability_calls.iter().any(|call| {
+                call.fence == fence
+                    && matches!(
+                        &call.state,
+                        surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
+                    )
+            })
+        });
+        let execution_failure = durable_external_effect_ambiguous
+            .then_some(surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous)
+            .or(active.surface_execution_failure);
+        let (stop_reason, terminal) = if let Some(class) = execution_failure {
+            let (message, terminal_class) = match class {
+                surface::GenerationExecutionFailureClass::Provider => {
+                    ("provider execution failed", surface::FailureClass::Provider)
+                }
+                surface::GenerationExecutionFailureClass::Tool => {
+                    ("tool execution failed", surface::FailureClass::Tool)
+                }
+                surface::GenerationExecutionFailureClass::Hook => {
+                    ("hook execution failed", surface::FailureClass::Hook)
+                }
+                surface::GenerationExecutionFailureClass::Workflow => {
+                    ("workflow execution failed", surface::FailureClass::Workflow)
+                }
+                surface::GenerationExecutionFailureClass::InputResolution => (
+                    "input resolution failed",
+                    surface::FailureClass::InputResolution,
+                ),
+                surface::GenerationExecutionFailureClass::ClientCapabilityUnavailable => (
+                    "required client capability became unavailable",
+                    surface::FailureClass::ClientCapabilityUnavailable,
+                ),
+                surface::GenerationExecutionFailureClass::LegacyApprovalRequired => (
+                    "legacy approval is required",
+                    surface::FailureClass::LegacyApprovalRequired,
+                ),
+                surface::GenerationExecutionFailureClass::RuntimeInvariant => (
+                    "runtime invariant failed",
+                    surface::FailureClass::RuntimeInvariant,
+                ),
+                surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous => (
+                    "external file write effect is ambiguous",
+                    surface::FailureClass::ExternalEffectAmbiguous,
+                ),
+                surface::GenerationExecutionFailureClass::RemoteResourceCleanupAmbiguous => (
+                    "remote resource cleanup is ambiguous",
+                    surface::FailureClass::RemoteResourceCleanupAmbiguous,
+                ),
+            };
+            let message =
+                surface::SafeDiagnosticText::try_new(message).expect("fixed diagnostic is bounded");
             (
                 surface::GenerationStopReason::ExecutionFailed {
                     class,
                     message: message.clone(),
                 },
                 surface::OperationTerminal::Failed {
-                    class: surface::FailureClass::ClientCapabilityUnavailable,
+                    class: terminal_class,
                     message,
                 },
             )
@@ -19584,7 +20332,6 @@ impl ThreadActor {
             self.reconcile_goal_surface_outbox(&control.runtime, &control.session_id)?;
         }
         let operation_id = fence.operation_id.clone();
-        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let operation = snapshot
             .foreground_operation
             .iter()
@@ -21314,6 +22061,12 @@ impl ThreadActor {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
                     }))
+                    .with_acp_write_text_file_handler(Arc::new(
+                        RuntimeSurfaceWriteTextFileHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                        },
+                    ))
                     .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
                         command_tx: interaction_command_tx.clone(),
                         fence: interaction_fence.clone(),
@@ -23080,9 +23833,18 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
+                ThreadCommand::SurfaceRequestAcpWriteTextFile { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceClaimAcpReadTextFileWrite { reply, .. }
                 | ThreadCommand::SurfaceAcpReadTextFileWritten { reply, .. }
-                | ThreadCommand::SurfaceAcpReadTextFileSettled { reply, .. } => {
+                | ThreadCommand::SurfaceAcpReadTextFileSettled { reply, .. }
+                | ThreadCommand::SurfacePermitAcpWriteTextFileDelivery { reply, .. }
+                | ThreadCommand::SurfaceAcpWriteTextFileWritten { reply, .. }
+                | ThreadCommand::SurfaceAcpWriteTextFileSettled { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
                 #[cfg(test)]
@@ -23437,9 +24199,18 @@ impl ThreadActor {
                     "runtime generation is not active",
                 )));
             }
+            ThreadCommand::SurfaceRequestAcpWriteTextFile { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
             ThreadCommand::SurfaceClaimAcpReadTextFileWrite { reply, .. }
             | ThreadCommand::SurfaceAcpReadTextFileWritten { reply, .. }
-            | ThreadCommand::SurfaceAcpReadTextFileSettled { reply, .. } => {
+            | ThreadCommand::SurfaceAcpReadTextFileSettled { reply, .. }
+            | ThreadCommand::SurfacePermitAcpWriteTextFileDelivery { reply, .. }
+            | ThreadCommand::SurfaceAcpWriteTextFileWritten { reply, .. }
+            | ThreadCommand::SurfaceAcpWriteTextFileSettled { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
             }
             #[cfg(test)]
@@ -24224,6 +24995,58 @@ impl ThreadActor {
                 reply,
             } => {
                 let result = self.settle_surface_acp_read_text_file(
+                    &client,
+                    call_id,
+                    capability_revision,
+                    settlement,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceRequestAcpWriteTextFile {
+                fence,
+                request,
+                path,
+                content,
+                reply,
+            } => {
+                self.request_surface_acp_write_text_file(
+                    active, fence, request, path, content, reply,
+                );
+            }
+            ThreadCommand::SurfacePermitAcpWriteTextFileDelivery {
+                client,
+                call_id,
+                capability_revision,
+                reply,
+            } => {
+                let result = self.permit_surface_acp_write_text_file_delivery(
+                    &client,
+                    call_id,
+                    capability_revision,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceAcpWriteTextFileWritten {
+                client,
+                call_id,
+                capability_revision,
+                reply,
+            } => {
+                let result = self.mark_surface_acp_write_text_file_written(
+                    &client,
+                    call_id,
+                    capability_revision,
+                );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceAcpWriteTextFileSettled {
+                client,
+                call_id,
+                capability_revision,
+                settlement,
+                reply,
+            } => {
+                let result = self.settle_surface_acp_write_text_file(
                     &client,
                     call_id,
                     capability_revision,

@@ -2524,6 +2524,12 @@ static PENDING_BACKGROUND_APPROVAL_RESUME_CHECKPOINT_FAILURES: OnceLock<
     Mutex<HashMap<PathBuf, usize>>,
 > = OnceLock::new();
 #[cfg(test)]
+static CAPABILITY_DELIVERY_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PENDING_CAPABILITY_DELIVERY_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static PROVIDER_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
@@ -2783,6 +2789,18 @@ impl JsonlSurfaceCommitLedger {
         count: usize,
     ) {
         PROVIDER_RESPONSE_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_capability_delivery_checkpoint_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        CAPABILITY_DELIVERY_CHECKPOINT_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3410,6 +3428,53 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    fn arm_capability_delivery_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        let permits_delivery = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Tool(ToolPatch::CapabilityCallChanged {
+                    call: SurfaceCapabilityCall {
+                        kind: SurfaceCapabilityCallKind::WriteTextFile,
+                        state: SurfaceCapabilityCallState::DeliveryPossible,
+                        ..
+                    },
+                })
+            )
+        });
+        if !permits_delivery {
+            return;
+        }
+        let mut failures = CAPABILITY_DELIVERY_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_CAPABILITY_DELIVERY_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone(), count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_capability_delivery_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_CAPABILITY_DELIVERY_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
     fn arm_settings_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
         if !batch
             .events
@@ -3656,6 +3721,8 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         #[cfg(test)]
         self.arm_provider_response_checkpoint_failures(batch);
         #[cfg(test)]
+        self.arm_capability_delivery_checkpoint_failures(batch);
+        #[cfg(test)]
         self.arm_settings_checkpoint_failures(batch);
         #[cfg(test)]
         self.arm_task_ownership_checkpoint_failures(batch);
@@ -3700,6 +3767,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_provider_response_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_capability_delivery_checkpoint_failure() {
             return Err(SurfaceLedgerError::CheckpointFailed);
         }
         #[cfg(test)]

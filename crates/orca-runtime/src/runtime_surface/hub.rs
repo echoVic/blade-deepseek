@@ -68,6 +68,8 @@ struct SurfaceSubscriber {
     acp_capabilities: Option<AcpAttachmentCapabilityProfile>,
     acp_read_dispatch_tx: Option<SyncSender<AcpReadTextFileDispatch>>,
     acp_read_dispatch_rx: Option<SyncReceiver<AcpReadTextFileDispatch>>,
+    acp_write_dispatch_tx: Option<SyncSender<AcpWriteTextFileDispatch>>,
+    acp_write_dispatch_rx: Option<SyncReceiver<AcpWriteTextFileDispatch>>,
     queue: VecDeque<QueuedSubscriptionItem>,
     queued_events: u64,
     queued_bytes: u64,
@@ -99,6 +101,23 @@ pub(crate) enum AcpReadTextFileSettlement {
     ObservationUnavailable { message: String },
 }
 
+#[derive(Eq, PartialEq)]
+pub(crate) struct AcpWriteTextFileDispatch {
+    pub(crate) call_id: SurfaceCapabilityCallId,
+    pub(crate) acp_session_id: NonEmptyText,
+    pub(crate) capability_revision: CapabilityRevision,
+    pub(crate) path: CanonicalPath,
+    pub(crate) content: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AcpWriteTextFileSettlement {
+    Completed,
+    RemoteError { code: String, message: String },
+    FailedBeforeWrite { message: String },
+    ExternalEffectAmbiguous { message: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AcpCapabilityDispatchError {
     StaleRoute,
@@ -109,6 +128,20 @@ pub(crate) enum AcpCapabilityDispatchError {
 
 pub(crate) struct AcpReadTextFileDispatchReceiver {
     receiver: SyncReceiver<AcpReadTextFileDispatch>,
+}
+
+pub(crate) struct AcpWriteTextFileDispatchReceiver {
+    receiver: SyncReceiver<AcpWriteTextFileDispatch>,
+}
+
+impl AcpWriteTextFileDispatchReceiver {
+    pub(crate) fn try_recv(&self) -> Result<AcpWriteTextFileDispatch, AcpCapabilityDispatchError> {
+        match self.receiver.try_recv() {
+            Ok(dispatch) => Ok(dispatch),
+            Err(TryRecvError::Empty) => Err(AcpCapabilityDispatchError::Empty),
+            Err(TryRecvError::Disconnected) => Err(AcpCapabilityDispatchError::Disconnected),
+        }
+    }
 }
 
 impl AcpReadTextFileDispatchReceiver {
@@ -586,6 +619,70 @@ impl SurfaceHub {
         }
     }
 
+    pub(crate) fn claim_acp_write_text_file_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpWriteTextFileDispatchReceiver> {
+        let mut state = lock(&self.inner);
+        if !state.ready || state.seal_reason.is_some() {
+            return None;
+        }
+        if !client.belongs_to(
+            &self.scope,
+            &state.snapshot.thread.thread_id,
+            self.authority.host_incarnation(),
+        ) || client.detached_receipt().is_some()
+        {
+            return None;
+        }
+        let subscriber = state.subscriptions.get_mut(client.attachment_id())?;
+        if !subscriber.claimed
+            || &subscriber.grant != client.grant()
+            || !subscriber
+                .acp_capabilities
+                .is_some_and(|profile| profile.standard.file_write)
+        {
+            return None;
+        }
+        subscriber
+            .acp_write_dispatch_rx
+            .take()
+            .map(|receiver| AcpWriteTextFileDispatchReceiver { receiver })
+    }
+
+    pub(crate) fn dispatch_acp_write_text_file(
+        &self,
+        route: &AcpCapabilityAttachmentRoute,
+        dispatch: AcpWriteTextFileDispatch,
+    ) -> Result<(), AcpCapabilityDispatchError> {
+        let state = lock(&self.inner);
+        if !state.ready || state.seal_reason.is_some() {
+            return Err(AcpCapabilityDispatchError::StaleRoute);
+        }
+        let subscriber = state
+            .subscriptions
+            .get(&route.attachment_id)
+            .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
+        if !subscriber.claimed
+            || subscriber.grant.role != SurfaceAttachmentRole::Acp
+            || dispatch.capability_revision != route.capability_revision
+            || !subscriber.acp_capabilities.is_some_and(|profile| {
+                profile.revision == route.capability_revision && profile.standard.file_write
+            })
+        {
+            return Err(AcpCapabilityDispatchError::StaleRoute);
+        }
+        let sender = subscriber
+            .acp_write_dispatch_tx
+            .as_ref()
+            .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
+        match sender.try_send(dispatch) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
+        }
+    }
+
     pub(crate) fn apply_committed(
         &self,
         snapshot: Arc<SurfaceSnapshot>,
@@ -1017,6 +1114,13 @@ impl SurfaceHub {
             } else {
                 (None, None)
             };
+        let (acp_write_dispatch_tx, acp_write_dispatch_rx) =
+            if acp_capabilities.is_some_and(|profile| profile.standard.file_write) {
+                let (sender, receiver) = sync_channel(1);
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
         state.subscriptions.insert(
             attachment_id.clone(),
             SurfaceSubscriber {
@@ -1025,6 +1129,8 @@ impl SurfaceHub {
                 acp_capabilities,
                 acp_read_dispatch_tx,
                 acp_read_dispatch_rx,
+                acp_write_dispatch_tx,
+                acp_write_dispatch_rx,
                 queue: VecDeque::new(),
                 queued_events: 0,
                 queued_bytes: 0,
@@ -1415,6 +1521,8 @@ mod tests {
             acp_capabilities: None,
             acp_read_dispatch_tx: None,
             acp_read_dispatch_rx: None,
+            acp_write_dispatch_tx: None,
+            acp_write_dispatch_rx: None,
             queue: VecDeque::new(),
             queued_events: 0,
             queued_bytes: 0,

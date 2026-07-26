@@ -10,6 +10,8 @@ pub(crate) const ORCA_HOME_ENV: &str = "ORCA_HOME";
 use orca_core::conversation::Conversation;
 
 pub use live_thread::LiveThread;
+#[cfg(test)]
+pub(crate) use local::find_session_path;
 pub(crate) use local::sessions_dir;
 pub use local::{
     JsonlThreadStore, SearchHit, SessionStore, archive_session, compress_session, delete_session,

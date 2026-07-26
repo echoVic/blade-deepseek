@@ -331,6 +331,28 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         settlement: AcpReadTextFileSettlement,
     ) -> Result<(), SurfaceClientCommandError>;
 
+    fn permit_acp_write_text_file_delivery(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn mark_acp_write_text_file_written(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn settle_acp_write_text_file(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpWriteTextFileSettlement,
+    ) -> Result<(), SurfaceClientCommandError>;
+
     fn detach(&self, client: RuntimeSurfaceClientHandle, request: DetachRequest) -> DetachResult;
 
     fn reserve_operation(
@@ -523,6 +545,40 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .settle_acp_read_text_file(self.clone(), call_id, capability_revision, settlement)
+    }
+
+    pub(crate) fn permit_acp_write_text_file_delivery(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .permit_acp_write_text_file_delivery(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn mark_acp_write_text_file_written(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .mark_acp_write_text_file_written(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn settle_acp_write_text_file(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpWriteTextFileSettlement,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .settle_acp_write_text_file(self.clone(), call_id, capability_revision, settlement)
     }
 
     pub fn reserve_operation(
@@ -3656,6 +3712,15 @@ impl RuntimeSurfaceHandle {
         client: &RuntimeSurfaceClientHandle,
     ) -> Option<AcpReadTextFileDispatchReceiver> {
         self.hub.as_ref()?.claim_acp_read_text_file_dispatch(client)
+    }
+
+    pub(crate) fn claim_acp_write_text_file_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpWriteTextFileDispatchReceiver> {
+        self.hub
+            .as_ref()?
+            .claim_acp_write_text_file_dispatch(client)
     }
 
     pub fn detach(

@@ -507,7 +507,7 @@ fn durable_append_precedes_materialization() {
 }
 
 #[test]
-fn recovery_terminalizes_interrupted_read_capability_calls_without_replay() {
+fn recovery_terminalizes_interrupted_capability_calls_without_replay() {
     let mut recovered_snapshot = snapshot();
     let mut operation = requested_operation(180);
     operation.intent.kind = OperationKind::UserTurn;
@@ -535,15 +535,16 @@ fn recovery_terminalizes_interrupted_read_capability_calls_without_replay() {
         stop_reason: None,
     });
     let tool_call_id = SurfaceToolCallId::try_new("read-recovery").unwrap();
-    let call = |seed, state| SurfaceCapabilityCall {
+    let second_tool_call_id = SurfaceToolCallId::try_new("write-recovery").unwrap();
+    let call = |seed, owning_tool_call_id: &SurfaceToolCallId, kind, state| SurfaceCapabilityCall {
         call_id: SurfaceCapabilityCallId::try_from_bytes(uuid(seed)).unwrap(),
         acp_session_id: NonEmptyText::try_new("session-recovery").unwrap(),
         fence: fence.clone(),
         capability_revision: CapabilityRevision::try_new(1).unwrap(),
         policy_epoch: PolicyEpoch::try_new(1).unwrap(),
-        kind: SurfaceCapabilityCallKind::ReadTextFile,
+        kind,
         arguments_digest: digest(seed),
-        owning_tool_call_id: tool_call_id.clone(),
+        owning_tool_call_id: owning_tool_call_id.clone(),
         state,
     };
     recovered_snapshot.foreground_operation = Some(operation.clone());
@@ -565,9 +566,56 @@ fn recovery_terminalizes_interrupted_read_capability_calls_without_replay() {
         streamed_output_truncated: false,
         result: None,
         capability_calls: vec![
-            call(185, SurfaceCapabilityCallState::Prepared),
-            call(186, SurfaceCapabilityCallState::WrittenAwaitingResponse),
+            call(
+                185,
+                &tool_call_id,
+                SurfaceCapabilityCallKind::ReadTextFile,
+                SurfaceCapabilityCallState::Prepared,
+            ),
+            call(
+                186,
+                &tool_call_id,
+                SurfaceCapabilityCallKind::ReadTextFile,
+                SurfaceCapabilityCallState::WrittenAwaitingResponse,
+            ),
+            call(
+                190,
+                &tool_call_id,
+                SurfaceCapabilityCallKind::WriteTextFile,
+                SurfaceCapabilityCallState::Prepared,
+            ),
+            call(
+                191,
+                &tool_call_id,
+                SurfaceCapabilityCallKind::WriteTextFile,
+                SurfaceCapabilityCallState::DeliveryPossible,
+            ),
         ],
+        terminal_leases: Vec::new(),
+    });
+    recovered_snapshot.tools.push(SurfaceToolView {
+        request: SurfaceToolRequest {
+            tool_call_id: second_tool_call_id.clone(),
+            source_response_id: Some(UuidV7::try_from_bytes(uuid(193)).unwrap()),
+            turn_id: operation.generations[0].logical_turn_id.clone(),
+            name: NonEmptyText::try_new("write_file").unwrap(),
+            action: SurfaceToolAction::Write,
+            target: Some(DisplayText::new("/tmp/output.txt")),
+            raw_arguments: DisplayText::new(r#"{"path":"/tmp/output.txt","content":"recovered"}"#),
+            arguments_digest: digest(194),
+        },
+        state: SurfaceToolViewState::Running,
+        arguments_bytes: ByteCount::new(52),
+        output_bytes: ByteCount::new(0),
+        streamed_output: DisplayText::new(""),
+        streamed_output_truncated: false,
+        result: None,
+        capability_calls: vec![call(
+            192,
+            &second_tool_call_id,
+            SurfaceCapabilityCallKind::WriteTextFile,
+            SurfaceCapabilityCallState::WrittenAwaitingResponse,
+        )],
         terminal_leases: Vec::new(),
     });
     let owner_dir = tempfile::tempdir().unwrap();
@@ -613,7 +661,13 @@ fn recovery_terminalizes_interrupted_read_capability_calls_without_replay() {
         .recover_interrupted_capability_calls(&operation.operation_id, &cause)
         .unwrap();
 
-    let calls = &coordinator.state().snapshot().tools[0].capability_calls;
+    let calls = coordinator
+        .state()
+        .snapshot()
+        .tools
+        .iter()
+        .flat_map(|tool| tool.capability_calls.iter())
+        .collect::<Vec<_>>();
     assert!(matches!(
         calls[0].state,
         SurfaceCapabilityCallState::FailedBeforeWrite { .. }
@@ -621,6 +675,59 @@ fn recovery_terminalizes_interrupted_read_capability_calls_without_replay() {
     assert!(matches!(
         calls[1].state,
         SurfaceCapabilityCallState::ObservationUnavailable { .. }
+    ));
+    assert!(matches!(
+        calls[2].state,
+        SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+    ));
+    assert!(matches!(
+        calls[3].state,
+        SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+            effect_kind: ExternalEffectKind::FileWrite,
+            ..
+        }
+    ));
+    assert!(matches!(
+        calls[4].state,
+        SurfaceCapabilityCallState::ExternalEffectAmbiguous {
+            effect_kind: ExternalEffectKind::FileWrite,
+            ..
+        }
+    ));
+    assert!(coordinator.state().snapshot().tools.iter().all(|tool| {
+        matches!(
+            tool.result.as_ref().map(|result| result.terminal.kind),
+            Some(SurfaceToolResultKind::ExternalEffectAmbiguous)
+        )
+    }));
+    loop {
+        let before = coordinator.state().snapshot().cursor.clone();
+        let action = coordinator
+            .recover_operation(&operation.operation_id, &cause)
+            .unwrap();
+        if action == RecoveryAction::NoOp {
+            break;
+        }
+        assert_ne!(
+            coordinator.state().snapshot().cursor,
+            before,
+            "recovery action must advance durable state"
+        );
+    }
+    let terminal = coordinator
+        .state()
+        .snapshot()
+        .operation_history
+        .iter()
+        .find(|record| record.operation_id == operation.operation_id)
+        .and_then(|record| record.terminal.as_ref())
+        .expect("recovered operation terminal");
+    assert!(matches!(
+        &terminal.terminal,
+        OperationTerminal::Failed {
+            class: FailureClass::ExternalEffectAmbiguous,
+            ..
+        }
     ));
     assert!(
         std::fs::metadata(ledger_path).unwrap().len() > 0,
