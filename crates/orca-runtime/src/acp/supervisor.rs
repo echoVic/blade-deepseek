@@ -10,7 +10,8 @@ use agent_client_protocol::{
     EnvVariable, InitializeRequest, KillTerminalRequest, KillTerminalResponse, LoadSessionRequest,
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionResponse, SessionId,
-    WriteTextFileRequest, WriteTextFileResponse,
+    TerminalOutputRequest, TerminalOutputResponse, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use orca_core::config::RunConfig;
 use serde::Serialize;
@@ -30,8 +31,8 @@ use super::rpc_facade::{
 };
 use crate::runtime_surface::{
     AcpReadTextFileSettlement, AcpTerminalCleanupSettlement, AcpTerminalCreateSettlement,
-    AcpWriteTextFileSettlement, CapabilityRevision, SurfaceCapabilityCallId,
-    SurfaceCapabilityCallKind,
+    AcpTerminalObservationSettlement, AcpWriteTextFileSettlement, CapabilityRevision, NonEmptyText,
+    SurfaceCapabilityCallId, SurfaceCapabilityCallKind, SurfaceTerminalExitStatus,
 };
 use crate::surface::{RuntimeSurfaceClientHandle, RuntimeSurfaceHostHandle};
 
@@ -100,6 +101,21 @@ struct PendingTerminalCreateRoute {
     client: RuntimeSurfaceClientHandle,
     delivery_possible: bool,
     completed: oneshot::Sender<AcpTerminalCreateSettlement>,
+}
+
+#[derive(Default)]
+struct TerminalObservationRoutes {
+    pending: Arc<Mutex<HashMap<i64, PendingTerminalObservationRoute>>>,
+}
+
+struct PendingTerminalObservationRoute {
+    session_id: SessionId,
+    call_id: SurfaceCapabilityCallId,
+    capability_revision: CapabilityRevision,
+    client: RuntimeSurfaceClientHandle,
+    kind: SurfaceCapabilityCallKind,
+    physically_written: bool,
+    completed: oneshot::Sender<AcpTerminalObservationSettlement>,
 }
 
 struct TerminalCleanupRoutes {
@@ -177,6 +193,7 @@ where
         read_text_file_rx,
         write_text_file_rx,
         terminal_create_rx,
+        terminal_observation_rx,
         terminal_cleanup_rx,
     ) = AcpClientBridge::new_with_capability_lanes();
     let agent = Rc::new(
@@ -192,6 +209,7 @@ where
         ..WriteTextFileRoutes::default()
     });
     let terminal_create_routes = Rc::new(TerminalCreateRoutes::default());
+    let terminal_observation_routes = Rc::new(TerminalObservationRoutes::default());
     let terminal_cleanup_routes = Rc::new(TerminalCleanupRoutes {
         response_observer: write_response_observer,
         ..TerminalCleanupRoutes::default()
@@ -205,6 +223,7 @@ where
         let read_text_file_routes = Rc::clone(&read_text_file_routes);
         let write_text_file_routes = Rc::clone(&write_text_file_routes);
         let terminal_create_routes = Rc::clone(&terminal_create_routes);
+        let terminal_observation_routes = Rc::clone(&terminal_observation_routes);
         let terminal_cleanup_routes = Rc::clone(&terminal_cleanup_routes);
         Rc::new(move |frame: InboundFrame| {
             handle_inbound(
@@ -215,6 +234,7 @@ where
                 Rc::clone(&read_text_file_routes),
                 Rc::clone(&write_text_file_routes),
                 Rc::clone(&terminal_create_routes),
+                Rc::clone(&terminal_observation_routes),
                 Rc::clone(&terminal_cleanup_routes),
                 frame,
             )
@@ -224,6 +244,7 @@ where
     let read_response_routes = Arc::clone(&read_text_file_routes.pending);
     let write_response_routes = Arc::clone(&write_text_file_routes.pending);
     let terminal_create_response_routes = Arc::clone(&terminal_create_routes.pending);
+    let terminal_observation_response_routes = Arc::clone(&terminal_observation_routes.pending);
     let terminal_cleanup_response_routes = Arc::clone(&terminal_cleanup_routes.pending);
     let response_session_resolver: ResponseSessionResolver = Arc::new(move |request_id| {
         response_routes
@@ -249,6 +270,13 @@ where
                 terminal_create_response_routes
                     .lock()
                     .expect("ACP terminal create route mutex is not poisoned")
+                    .get(&request_id)
+                    .map(|route| route.session_id.to_string())
+            })
+            .or_else(|| {
+                terminal_observation_response_routes
+                    .lock()
+                    .expect("ACP terminal observation route mutex is not poisoned")
                     .get(&request_id)
                     .map(|route| route.session_id.to_string())
             })
@@ -298,6 +326,13 @@ where
         Rc::clone(&capability_request_ids),
         terminal_create_rx,
     ));
+    let mut terminal_observation_task = tokio::task::spawn_local(dispatch_terminal_observations(
+        facade.clone(),
+        Arc::clone(&client_bridge),
+        Rc::clone(&terminal_observation_routes),
+        Rc::clone(&capability_request_ids),
+        terminal_observation_rx,
+    ));
     let mut terminal_cleanup_task = tokio::task::spawn_local(dispatch_terminal_cleanups(
         facade,
         Arc::clone(&client_bridge),
@@ -312,6 +347,7 @@ where
     retire_all_read_text_file_routes(&read_text_file_routes);
     retire_all_write_text_file_routes(&write_text_file_routes);
     retire_all_terminal_create_routes(&terminal_create_routes);
+    retire_all_terminal_observation_routes(&terminal_observation_routes);
     retire_all_terminal_cleanup_routes(&terminal_cleanup_routes);
     notification_task.abort();
     permission_task.abort();
@@ -338,6 +374,13 @@ where
         terminal_create_task.abort();
         let _ = terminal_create_task.await;
     }
+    if tokio::time::timeout(Duration::from_secs(5), &mut terminal_observation_task)
+        .await
+        .is_err()
+    {
+        terminal_observation_task.abort();
+        let _ = terminal_observation_task.await;
+    }
     if tokio::time::timeout(Duration::from_secs(5), &mut terminal_cleanup_task)
         .await
         .is_err()
@@ -356,6 +399,7 @@ fn handle_inbound(
     read_text_file_routes: Rc<ReadTextFileRoutes>,
     write_text_file_routes: Rc<WriteTextFileRoutes>,
     terminal_create_routes: Rc<TerminalCreateRoutes>,
+    terminal_observation_routes: Rc<TerminalObservationRoutes>,
     terminal_cleanup_routes: Rc<TerminalCleanupRoutes>,
     frame: InboundFrame,
 ) -> LocalHandlerFuture {
@@ -365,6 +409,7 @@ fn handle_inbound(
             if !handle_read_text_file_response(&read_text_file_routes, &value)
                 && !handle_write_text_file_response(&write_text_file_routes, &value)
                 && !handle_terminal_create_response(&terminal_create_routes, &value)
+                && !handle_terminal_observation_response(&terminal_observation_routes, &value)
                 && !handle_terminal_cleanup_response(&terminal_cleanup_routes, &value)
             {
                 handle_permission_response(&client_bridge, &permission_routes, &value);
@@ -457,6 +502,10 @@ fn handle_inbound(
                 retire_session_read_text_file_routes(&read_text_file_routes, &session_id);
                 retire_session_write_text_file_routes(&write_text_file_routes, &session_id);
                 retire_session_terminal_create_routes(&terminal_create_routes, &session_id);
+                retire_session_terminal_observation_routes(
+                    &terminal_observation_routes,
+                    &session_id,
+                );
                 retire_session_terminal_cleanup_routes(&terminal_cleanup_routes, &session_id);
                 Ok(empty_completion())
             }
@@ -1254,6 +1303,245 @@ async fn dispatch_terminal_creates(
     }
 }
 
+async fn dispatch_terminal_observations(
+    facade: RpcFacadeHandle,
+    client_bridge: Arc<AcpClientBridge>,
+    routes: Rc<TerminalObservationRoutes>,
+    request_ids: Rc<CapabilityRequestIds>,
+    mut requests: tokio::sync::mpsc::Receiver<super::agent::AcpTerminalObservationRequest>,
+) {
+    while let Some(request) = requests.recv().await {
+        let Some(request_id) = request_ids.reserve() else {
+            let _ = request.client.settle_acp_terminal_observation(
+                request.dispatch.call_id,
+                request.dispatch.capability_revision,
+                AcpTerminalObservationSettlement::FailedBeforeWrite {
+                    message: "ACP terminal observation reverse request id exhausted".to_string(),
+                },
+            );
+            break;
+        };
+        let session_id = SessionId::new(request.dispatch.acp_session_id.as_str().to_string());
+        let terminal_id = request.dispatch.terminal_id.as_str().to_string();
+        let (method, params) = match request.dispatch.kind {
+            SurfaceCapabilityCallKind::TerminalOutput => (
+                "terminal/output",
+                serde_json::to_value(TerminalOutputRequest::new(session_id.clone(), terminal_id)),
+            ),
+            SurfaceCapabilityCallKind::TerminalWaitForExit => (
+                "terminal/wait_for_exit",
+                serde_json::to_value(WaitForTerminalExitRequest::new(
+                    session_id.clone(),
+                    terminal_id,
+                )),
+            ),
+            _ => {
+                let _ = request.client.settle_acp_terminal_observation(
+                    request.dispatch.call_id,
+                    request.dispatch.capability_revision,
+                    AcpTerminalObservationSettlement::FailedBeforeWrite {
+                        message: "runtime dispatched an invalid terminal observation method"
+                            .to_string(),
+                    },
+                );
+                continue;
+            }
+        };
+        let params = match params {
+            Ok(params) => params,
+            Err(error) => {
+                let _ = request.client.settle_acp_terminal_observation(
+                    request.dispatch.call_id,
+                    request.dispatch.capability_revision,
+                    AcpTerminalObservationSettlement::FailedBeforeWrite {
+                        message: format!(
+                            "ACP terminal observation request could not be encoded: {error}"
+                        ),
+                    },
+                );
+                continue;
+            }
+        };
+        let value = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        });
+        let mut encoded = match serde_json::to_vec(&value) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                let _ = request.client.settle_acp_terminal_observation(
+                    request.dispatch.call_id,
+                    request.dispatch.capability_revision,
+                    AcpTerminalObservationSettlement::FailedBeforeWrite {
+                        message: format!(
+                            "ACP terminal observation request could not be encoded: {error}"
+                        ),
+                    },
+                );
+                continue;
+            }
+        };
+        encoded.push(b'\n');
+        let (completed, mut completion) = oneshot::channel();
+        routes
+            .pending
+            .lock()
+            .expect("ACP terminal observation route mutex is not poisoned")
+            .insert(
+                request_id,
+                PendingTerminalObservationRoute {
+                    session_id: session_id.clone(),
+                    call_id: request.dispatch.call_id.clone(),
+                    capability_revision: request.dispatch.capability_revision,
+                    client: request.client.clone(),
+                    kind: request.dispatch.kind,
+                    physically_written: false,
+                    completed,
+                },
+            );
+        if !client_bridge.begin_capability_write(&session_id) {
+            routes
+                .pending
+                .lock()
+                .expect("ACP terminal observation route mutex is not poisoned")
+                .remove(&request_id);
+            let _ = request.client.settle_acp_terminal_observation(
+                request.dispatch.call_id,
+                request.dispatch.capability_revision,
+                AcpTerminalObservationSettlement::FailedBeforeWrite {
+                    message: "ACP terminal observation was cancelled before write".to_string(),
+                },
+            );
+            continue;
+        }
+        if request
+            .client
+            .claim_acp_terminal_observation_write(
+                request.dispatch.call_id.clone(),
+                request.dispatch.capability_revision,
+            )
+            .is_err()
+        {
+            client_bridge.finish_capability_write(&session_id);
+            routes
+                .pending
+                .lock()
+                .expect("ACP terminal observation route mutex is not poisoned")
+                .remove(&request_id);
+            let _ = request.client.settle_acp_terminal_observation(
+                request.dispatch.call_id,
+                request.dispatch.capability_revision,
+                AcpTerminalObservationSettlement::ObservationUnavailable {
+                    message: "ACP terminal observation durable write claim could not be confirmed"
+                        .to_string(),
+                },
+            );
+            continue;
+        }
+        let write_receipt = match facade
+            .enqueue(TransportFrame::new(FrameDirection::AgentToClient, encoded))
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                client_bridge.finish_capability_write(&session_id);
+                routes
+                    .pending
+                    .lock()
+                    .expect("ACP terminal observation route mutex is not poisoned")
+                    .remove(&request_id);
+                let _ = request.client.settle_acp_terminal_observation(
+                        request.dispatch.call_id,
+                        request.dispatch.capability_revision,
+                        AcpTerminalObservationSettlement::ObservationUnavailable {
+                            message: format!(
+                                "ACP terminal observation was rejected after delivery became possible: {error}"
+                            ),
+                        },
+                    );
+                break;
+            }
+        };
+        if let Some(route) = routes
+            .pending
+            .lock()
+            .expect("ACP terminal observation route mutex is not poisoned")
+            .get_mut(&request_id)
+        {
+            route.physically_written = true;
+        }
+        if let Err(error) = write_receipt.ack().await {
+            routes
+                .pending
+                .lock()
+                .expect("ACP terminal observation route mutex is not poisoned")
+                .remove(&request_id);
+            let settlement = completion.try_recv().unwrap_or_else(|_| {
+                AcpTerminalObservationSettlement::ObservationUnavailable {
+                    message: format!(
+                        "ACP terminal observation may have been written but acknowledgement failed: {error}"
+                    ),
+                }
+            });
+            let _ = request.client.settle_acp_terminal_observation(
+                request.dispatch.call_id,
+                request.dispatch.capability_revision,
+                settlement,
+            );
+            client_bridge.finish_capability_write(&session_id);
+            break;
+        }
+        if request
+            .client
+            .mark_acp_terminal_observation_written(
+                request.dispatch.call_id.clone(),
+                request.dispatch.capability_revision,
+            )
+            .is_err()
+        {
+            routes
+                .pending
+                .lock()
+                .expect("ACP terminal observation route mutex is not poisoned")
+                .remove(&request_id);
+            let _ = request.client.settle_acp_terminal_observation(
+                request.dispatch.call_id,
+                request.dispatch.capability_revision,
+                AcpTerminalObservationSettlement::ObservationUnavailable {
+                    message: "ACP terminal observation was written but its durable acknowledgement failed"
+                        .to_string(),
+                },
+            );
+            client_bridge.finish_capability_write(&session_id);
+            break;
+        }
+        client_bridge.finish_capability_write(&session_id);
+        let settlement = match tokio::time::timeout(ACP_REVERSE_REQUEST_DEADLINE, completion).await
+        {
+            Ok(Ok(settlement)) => settlement,
+            Ok(Err(_)) => AcpTerminalObservationSettlement::ObservationUnavailable {
+                message: "ACP terminal observation response route was dropped".to_string(),
+            },
+            Err(_) => {
+                routes
+                    .pending
+                    .lock()
+                    .expect("ACP terminal observation route mutex is not poisoned")
+                    .remove(&request_id);
+                AcpTerminalObservationSettlement::ObservationUnavailable {
+                    message: "ACP terminal observation response timed out".to_string(),
+                }
+            }
+        };
+        let _ = request.client.settle_acp_terminal_observation(
+            request.dispatch.call_id,
+            request.dispatch.capability_revision,
+            settlement,
+        );
+    }
+}
+
 async fn dispatch_terminal_cleanups(
     facade: RpcFacadeHandle,
     client_bridge: Arc<AcpClientBridge>,
@@ -1601,6 +1889,89 @@ fn handle_terminal_create_response(routes: &TerminalCreateRoutes, value: &Value)
     true
 }
 
+fn handle_terminal_observation_response(routes: &TerminalObservationRoutes, value: &Value) -> bool {
+    let Some(request_id) = value.get("id").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(route) = routes
+        .pending
+        .lock()
+        .expect("ACP terminal observation route mutex is not poisoned")
+        .remove(&request_id)
+    else {
+        return false;
+    };
+    let settlement = if let Some(result) = value.get("result") {
+        match route.kind {
+            SurfaceCapabilityCallKind::TerminalOutput => {
+                match serde_json::from_value::<TerminalOutputResponse>(result.clone())
+                    .map_err(|error| error.to_string())
+                    .and_then(|response| {
+                        let exit_status = response
+                            .exit_status
+                            .map(surface_terminal_exit_status)
+                            .transpose()?;
+                        Ok((response.output, response.truncated, exit_status))
+                    }) {
+                    Ok((output, truncated, exit_status)) => {
+                        AcpTerminalObservationSettlement::Output {
+                            output,
+                            truncated,
+                            exit_status,
+                        }
+                    }
+                    Err(error) => AcpTerminalObservationSettlement::ObservationUnavailable {
+                        message: format!("invalid ACP terminal output response: {error}"),
+                    },
+                }
+            }
+            SurfaceCapabilityCallKind::TerminalWaitForExit => {
+                match serde_json::from_value::<WaitForTerminalExitResponse>(result.clone())
+                    .map_err(|error| error.to_string())
+                    .and_then(|response| surface_terminal_exit_status(response.exit_status))
+                {
+                    Ok(exit_status) => AcpTerminalObservationSettlement::Exit { exit_status },
+                    Err(error) => AcpTerminalObservationSettlement::ObservationUnavailable {
+                        message: format!("invalid ACP terminal wait response: {error}"),
+                    },
+                }
+            }
+            _ => AcpTerminalObservationSettlement::ObservationUnavailable {
+                message: "runtime routed an invalid terminal observation response".to_string(),
+            },
+        }
+    } else {
+        let code = value
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .map(Value::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = value
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("ACP terminal observation request failed")
+            .to_string();
+        AcpTerminalObservationSettlement::RemoteError { code, message }
+    };
+    let _ = route.completed.send(settlement);
+    true
+}
+
+fn surface_terminal_exit_status(
+    status: agent_client_protocol::TerminalExitStatus,
+) -> Result<SurfaceTerminalExitStatus, String> {
+    let signal = status
+        .signal
+        .map(NonEmptyText::try_new)
+        .transpose()
+        .map_err(|error| format!("invalid terminal exit signal: {error}"))?;
+    Ok(SurfaceTerminalExitStatus {
+        exit_code: status.exit_code,
+        signal,
+    })
+}
+
 fn handle_terminal_cleanup_response(routes: &TerminalCleanupRoutes, value: &Value) -> bool {
     let Some(request_id) = value.get("id").and_then(Value::as_i64) else {
         return false;
@@ -1794,6 +2165,42 @@ fn retire_session_terminal_create_routes(routes: &TerminalCreateRoutes, session_
     }
 }
 
+fn retire_session_terminal_observation_routes(
+    routes: &TerminalObservationRoutes,
+    session_id: &SessionId,
+) {
+    let retired = {
+        let mut pending = routes
+            .pending
+            .lock()
+            .expect("ACP terminal observation route mutex is not poisoned");
+        let ids = pending
+            .iter()
+            .filter(|(_, route)| &route.session_id == session_id)
+            .map(|(request_id, _)| *request_id)
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|request_id| pending.remove(&request_id))
+            .collect::<Vec<_>>()
+    };
+    for route in retired {
+        let settlement = if route.physically_written {
+            AcpTerminalObservationSettlement::ObservationUnavailable {
+                message: "ACP terminal observation was cancelled after write".to_string(),
+            }
+        } else {
+            AcpTerminalObservationSettlement::FailedBeforeWrite {
+                message: "ACP terminal observation was cancelled before write".to_string(),
+            }
+        };
+        let _ = route.client.settle_acp_terminal_observation(
+            route.call_id,
+            route.capability_revision,
+            settlement,
+        );
+    }
+}
+
 fn retire_session_terminal_cleanup_routes(routes: &TerminalCleanupRoutes, session_id: &SessionId) {
     let retired = {
         let mut pending = routes
@@ -1936,6 +2343,32 @@ fn retire_all_terminal_create_routes(routes: &TerminalCreateRoutes) {
     }
 }
 
+fn retire_all_terminal_observation_routes(routes: &TerminalObservationRoutes) {
+    let retired = routes
+        .pending
+        .lock()
+        .expect("ACP terminal observation route mutex is not poisoned")
+        .drain()
+        .map(|(_, route)| route)
+        .collect::<Vec<_>>();
+    for route in retired {
+        let settlement = if route.physically_written {
+            AcpTerminalObservationSettlement::ObservationUnavailable {
+                message: "ACP terminal observation connection closed after write".to_string(),
+            }
+        } else {
+            AcpTerminalObservationSettlement::FailedBeforeWrite {
+                message: "ACP terminal observation connection closed before write".to_string(),
+            }
+        };
+        let _ = route.client.settle_acp_terminal_observation(
+            route.call_id,
+            route.capability_revision,
+            settlement,
+        );
+    }
+}
+
 fn retire_all_terminal_cleanup_routes(routes: &TerminalCleanupRoutes) {
     let retired = routes
         .pending
@@ -2022,6 +2455,13 @@ mod tests {
         created_tx: Option<std::sync::mpsc::SyncSender<()>>,
         continue_rx: Option<Mutex<std::sync::mpsc::Receiver<()>>>,
     }
+
+    struct TerminalObserveExecutor {
+        outcome_tx:
+            std::sync::mpsc::SyncSender<Result<(String, bool, Option<u32>, u32), io::ErrorKind>>,
+    }
+
+    struct TerminalOutputCancelExecutor;
 
     struct MultiTerminalCreateExecutor {
         outcome_tx: std::sync::mpsc::SyncSender<Result<Vec<String>, io::ErrorKind>>,
@@ -2321,6 +2761,122 @@ mod tests {
             ))?;
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for TerminalObserveExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let tool = ToolRequest {
+                id: "terminal-observe-1".to_string(),
+                name: ToolName::Bash,
+                action: orca_core::approval_types::ActionKind::Shell,
+                target: Some("printf".to_string()),
+                raw_arguments: Some(r#"{"command":"printf","args":["hello"]}"#.to_string()),
+            };
+            let turn_request = request.thread_turn_request(generation);
+            let ingress = turn_request
+                .provider_response_ingress()
+                .expect("typed ACP operation provides response ingress");
+            ingress.commit_response(&RuntimeModelResponse::new(
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool.clone())],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![RawToolCall {
+                        id: tool.id.clone(),
+                        function_name: tool.name.as_str().to_string(),
+                        arguments: tool.raw_arguments.clone().unwrap(),
+                    }],
+                    usage: None,
+                },
+                request.turn_id().clone(),
+            ))?;
+            let terminal = generation.create_terminal_on_acp_client(
+                &tool,
+                "printf".to_string(),
+                vec!["hello".to_string()],
+                Vec::new(),
+                Some(PathBuf::from("/workspace")),
+                Some(4096),
+            )?;
+            let output = terminal.output()?;
+            let exit = terminal.wait_for_exit()?;
+            let observed = (
+                output.output().to_string(),
+                output.truncated(),
+                output.exit_status().and_then(|status| status.exit_code()),
+                exit.exit_code().expect("test terminal exits with a code"),
+            );
+            terminal.close()?;
+            self.outcome_tx.send(Ok(observed)).unwrap();
+            ingress.commit_tool_result(&ToolResult::completed(
+                &tool,
+                "observed terminal through ACP client".to_string(),
+                false,
+            ))?;
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for TerminalOutputCancelExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let tool = ToolRequest {
+                id: "terminal-output-cancel".to_string(),
+                name: ToolName::Bash,
+                action: orca_core::approval_types::ActionKind::Shell,
+                target: Some("sleep".to_string()),
+                raw_arguments: Some(r#"{"command":"sleep","args":["30"]}"#.to_string()),
+            };
+            let turn_request = request.thread_turn_request(generation);
+            let ingress = turn_request
+                .provider_response_ingress()
+                .expect("typed ACP operation provides response ingress");
+            ingress.commit_response(&RuntimeModelResponse::new(
+                ProviderResponse {
+                    steps: vec![ProviderStep::ToolCall(tool.clone())],
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![RawToolCall {
+                        id: tool.id.clone(),
+                        function_name: tool.name.as_str().to_string(),
+                        arguments: tool.raw_arguments.clone().unwrap(),
+                    }],
+                    usage: None,
+                },
+                request.turn_id().clone(),
+            ))?;
+            let terminal = generation.create_terminal_on_acp_client(
+                &tool,
+                "sleep".to_string(),
+                vec!["30".to_string()],
+                Vec::new(),
+                Some(PathBuf::from("/workspace")),
+                Some(4096),
+            )?;
+            match terminal.output() {
+                Err(_) if cancel.is_cancelled() => Ok(RunStatus::Cancelled.into()),
+                Err(error) => Err(error),
+                Ok(_) => Err(io::Error::other(
+                    "terminal output unexpectedly completed before cancellation",
+                )),
+            }
         }
     }
 
@@ -2900,6 +3456,177 @@ mod tests {
                 .expect("clean connection");
             host.shutdown().unwrap();
             assert_persisted_terminal_released(&transcript_path, "terminal-1");
+        });
+    }
+
+    #[test]
+    fn production_connection_observes_terminal_output_and_exit_before_release() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+            let host =
+                RuntimeHost::start_with_executor(Arc::new(TerminalObserveExecutor { outcome_tx }))
+                    .unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (server_read, server_write) = tokio::io::split(server);
+            let connection = tokio::task::spawn_local(run_connection(
+                host.surface_handle(),
+                test_config(cwd.path().to_path_buf()),
+                server_read,
+                server_write,
+            ));
+            let mut client_read = BufReader::new(client_read);
+
+            write_request(
+                &mut client_write,
+                1,
+                "initialize",
+                InitializeRequest::new(ProtocolVersion::V1)
+                    .client_info(Implementation::new("bounded-test", "0.0.0"))
+                    .client_capabilities(ClientCapabilities::new().terminal(true)),
+            )
+            .await;
+            let _ = read_response(&mut client_read, 1).await;
+            write_request(
+                &mut client_write,
+                2,
+                "session/new",
+                NewSessionRequest::new(cwd.path().to_path_buf()),
+            )
+            .await;
+            let new_session = read_response(&mut client_read, 2).await;
+            let session_id = new_session["result"]["sessionId"]
+                .as_str()
+                .expect("session id")
+                .to_string();
+            let transcript_path = crate::thread_store::find_session_path(&session_id, true)
+                .unwrap()
+                .expect("recording ACP session path");
+            write_request(
+                &mut client_write,
+                3,
+                "session/prompt",
+                PromptRequest::new(
+                    SessionId::new(session_id),
+                    vec![ContentBlock::from("observe terminal".to_string())],
+                ),
+            )
+            .await;
+
+            let create_request = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "terminal/create" {
+                    break value;
+                }
+            };
+            write_raw_response(
+                &mut client_write,
+                create_request["id"].as_i64().expect("terminal create id"),
+                json!({"terminalId":"terminal-observe"}),
+            )
+            .await;
+
+            let output_request = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "terminal/output" {
+                    break value;
+                }
+            };
+            assert_eq!(output_request["params"]["terminalId"], "terminal-observe");
+            assert_persisted_terminal_observation_written(
+                &transcript_path,
+                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalOutput,
+            );
+            assert!(
+                outcome_rx.try_recv().is_err(),
+                "tool resumed before terminal output settled"
+            );
+            write_raw_response(
+                &mut client_write,
+                output_request["id"].as_i64().expect("terminal output id"),
+                json!({
+                    "output":"hello",
+                    "truncated":false,
+                    "exitStatus":{"exitCode":0,"signal":null}
+                }),
+            )
+            .await;
+
+            let wait_request = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "terminal/wait_for_exit" {
+                    break value;
+                }
+            };
+            assert_eq!(wait_request["params"]["terminalId"], "terminal-observe");
+            assert_persisted_terminal_observation_written(
+                &transcript_path,
+                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+            );
+            assert_persisted_terminal_observation(
+                &transcript_path,
+                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalOutput,
+            );
+            assert!(
+                outcome_rx.try_recv().is_err(),
+                "tool resumed before terminal exit settled"
+            );
+            write_raw_response(
+                &mut client_write,
+                wait_request["id"].as_i64().expect("terminal wait id"),
+                json!({"exitCode":0,"signal":null}),
+            )
+            .await;
+
+            let kill_request = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "terminal/kill" {
+                    break value;
+                }
+            };
+            assert_persisted_terminal_observation(
+                &transcript_path,
+                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalWaitForExit,
+            );
+            write_raw_response(
+                &mut client_write,
+                kill_request["id"].as_i64().expect("terminal kill id"),
+                json!({}),
+            )
+            .await;
+            let release_request = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "terminal/release" {
+                    break value;
+                }
+            };
+            write_raw_response(
+                &mut client_write,
+                release_request["id"].as_i64().expect("terminal release id"),
+                json!({}),
+            )
+            .await;
+
+            let prompt = read_response(&mut client_read, 3).await;
+            assert_eq!(prompt["result"]["stopReason"], "end_turn");
+            assert_eq!(
+                outcome_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+                Ok(("hello".to_string(), false, Some(0), 0))
+            );
+            client_write.shutdown().await.unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, connection)
+                .await
+                .expect("connection shutdown")
+                .expect("connection task")
+                .expect("clean connection");
+            host.shutdown().unwrap();
+            assert_persisted_terminal_released(&transcript_path, "terminal-observe");
         });
     }
 
@@ -4703,6 +5430,109 @@ mod tests {
         });
     }
 
+    #[test]
+    fn cancelling_prompt_terminalizes_outstanding_terminal_output_call() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let host =
+                RuntimeHost::start_with_executor(Arc::new(TerminalOutputCancelExecutor)).unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (server_read, server_write) = tokio::io::split(server);
+            let connection = tokio::task::spawn_local(run_connection(
+                host.surface_handle(),
+                test_config(cwd.path().to_path_buf()),
+                server_read,
+                server_write,
+            ));
+            let mut client_read = BufReader::new(client_read);
+
+            write_request(
+                &mut client_write,
+                1,
+                "initialize",
+                InitializeRequest::new(ProtocolVersion::V1)
+                    .client_info(Implementation::new("bounded-test", "0.0.0"))
+                    .client_capabilities(ClientCapabilities::new().terminal(true)),
+            )
+            .await;
+            let _ = read_response(&mut client_read, 1).await;
+            write_request(
+                &mut client_write,
+                2,
+                "session/new",
+                NewSessionRequest::new(cwd.path().to_path_buf()),
+            )
+            .await;
+            let new_session = read_response(&mut client_read, 2).await;
+            let session_id = new_session["result"]["sessionId"]
+                .as_str()
+                .expect("session id")
+                .to_string();
+            let transcript_path = crate::thread_store::find_session_path(&session_id, true)
+                .unwrap()
+                .expect("recording ACP session path");
+            write_request(
+                &mut client_write,
+                3,
+                "session/prompt",
+                PromptRequest::new(
+                    SessionId::new(session_id.clone()),
+                    vec![ContentBlock::from("observe until cancelled".to_string())],
+                ),
+            )
+            .await;
+            let create = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "terminal/create" {
+                    break value;
+                }
+            };
+            write_raw_response(
+                &mut client_write,
+                create["id"].as_i64().expect("terminal create id"),
+                json!({"terminalId":"terminal-cancel-output"}),
+            )
+            .await;
+            loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "terminal/output" {
+                    break;
+                }
+            }
+            write_notification(
+                &mut client_write,
+                "session/cancel",
+                CancelNotification::new(SessionId::new(session_id)),
+            )
+            .await;
+            let prompt = read_response(&mut client_read, 3).await;
+            assert!(
+                prompt["error"]["data"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("ambiguous")),
+                "terminal cleanup ambiguity must remain visible after cancel: {prompt}"
+            );
+            assert_persisted_terminal_observation(
+                &transcript_path,
+                crate::unstable_surface::SurfaceCapabilityCallKind::TerminalOutput,
+            );
+
+            client_write.shutdown().await.unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, connection)
+                .await
+                .expect("connection shutdown")
+                .expect("connection task")
+                .expect("clean connection");
+            host.shutdown().unwrap();
+        });
+    }
+
     async fn write_request(
         writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
         id: i64,
@@ -4884,6 +5714,55 @@ mod tests {
             )
         }));
         assert_persisted_external_effect_ambiguity(path);
+    }
+
+    fn assert_persisted_terminal_observation(
+        path: &std::path::Path,
+        expected_kind: crate::unstable_surface::SurfaceCapabilityCallKind,
+    ) {
+        let events = persisted_surface_events(path);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                crate::surface::SurfaceEvent::Tool(
+                    crate::surface::ToolPatch::CapabilityCallChanged {
+                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                            kind,
+                            state:
+                                crate::unstable_surface::SurfaceCapabilityCallState::Completed {
+                                    ..
+                                }
+                                | crate::unstable_surface::SurfaceCapabilityCallState::ObservationUnavailable {
+                                    ..
+                                },
+                            ..
+                        },
+                    },
+                ) if kind == &expected_kind
+            )
+        }));
+    }
+
+    fn assert_persisted_terminal_observation_written(
+        path: &std::path::Path,
+        expected_kind: crate::unstable_surface::SurfaceCapabilityCallKind,
+    ) {
+        let events = persisted_surface_events(path);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                crate::surface::SurfaceEvent::Tool(
+                    crate::surface::ToolPatch::CapabilityCallChanged {
+                        call: crate::unstable_surface::SurfaceCapabilityCall {
+                            kind,
+                            state:
+                                crate::unstable_surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
+                            ..
+                        },
+                    },
+                ) if kind == &expected_kind
+            )
+        }));
     }
 
     fn assert_persisted_terminal_released(path: &std::path::Path, expected_terminal_id: &str) {

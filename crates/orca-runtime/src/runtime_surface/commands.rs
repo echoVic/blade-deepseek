@@ -375,6 +375,28 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         settlement: AcpTerminalCreateSettlement,
     ) -> Result<(), SurfaceClientCommandError>;
 
+    fn claim_acp_terminal_observation_write(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn mark_acp_terminal_observation_written(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError>;
+
+    fn settle_acp_terminal_observation(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpTerminalObservationSettlement,
+    ) -> Result<(), SurfaceClientCommandError>;
+
     fn mark_acp_terminal_cleanup_written(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -650,6 +672,40 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .settle_acp_terminal_create(self.clone(), call_id, capability_revision, settlement)
+    }
+
+    pub(crate) fn claim_acp_terminal_observation_write(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .claim_acp_terminal_observation_write(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn mark_acp_terminal_observation_written(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .mark_acp_terminal_observation_written(self.clone(), call_id, capability_revision)
+    }
+
+    pub(crate) fn settle_acp_terminal_observation(
+        &self,
+        call_id: SurfaceCapabilityCallId,
+        capability_revision: CapabilityRevision,
+        settlement: AcpTerminalObservationSettlement,
+    ) -> Result<(), SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .settle_acp_terminal_observation(self.clone(), call_id, capability_revision, settlement)
     }
 
     pub(crate) fn mark_acp_terminal_cleanup_written(
@@ -3824,6 +3880,15 @@ impl RuntimeSurfaceHandle {
         self.hub
             .as_ref()?
             .claim_acp_terminal_create_dispatch(client)
+    }
+
+    pub(crate) fn claim_acp_terminal_observation_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpTerminalObservationDispatchReceiver> {
+        self.hub
+            .as_ref()?
+            .claim_acp_terminal_observation_dispatch(client)
     }
 
     pub(crate) fn claim_acp_terminal_cleanup_dispatch(

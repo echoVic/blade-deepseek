@@ -72,6 +72,8 @@ struct SurfaceSubscriber {
     acp_write_dispatch_rx: Option<SyncReceiver<AcpWriteTextFileDispatch>>,
     acp_terminal_create_dispatch_tx: Option<SyncSender<AcpTerminalCreateDispatch>>,
     acp_terminal_create_dispatch_rx: Option<SyncReceiver<AcpTerminalCreateDispatch>>,
+    acp_terminal_observation_dispatch_tx: Option<SyncSender<AcpTerminalObservationDispatch>>,
+    acp_terminal_observation_dispatch_rx: Option<SyncReceiver<AcpTerminalObservationDispatch>>,
     acp_terminal_cleanup_dispatch_tx: Option<SyncSender<AcpTerminalCleanupDispatch>>,
     acp_terminal_cleanup_dispatch_rx: Option<SyncReceiver<AcpTerminalCleanupDispatch>>,
     queue: VecDeque<QueuedSubscriptionItem>,
@@ -143,6 +145,37 @@ pub(crate) enum AcpTerminalCreateSettlement {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcpTerminalObservationDispatch {
+    pub(crate) call_id: SurfaceCapabilityCallId,
+    pub(crate) acp_session_id: NonEmptyText,
+    pub(crate) capability_revision: CapabilityRevision,
+    pub(crate) terminal_id: SurfaceRemoteTerminalId,
+    pub(crate) kind: SurfaceCapabilityCallKind,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AcpTerminalObservationSettlement {
+    Output {
+        output: String,
+        truncated: bool,
+        exit_status: Option<SurfaceTerminalExitStatus>,
+    },
+    Exit {
+        exit_status: SurfaceTerminalExitStatus,
+    },
+    RemoteError {
+        code: String,
+        message: String,
+    },
+    FailedBeforeWrite {
+        message: String,
+    },
+    ObservationUnavailable {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AcpTerminalCleanupDispatch {
     pub(crate) call_id: SurfaceCapabilityCallId,
     pub(crate) acp_session_id: NonEmptyText,
@@ -178,6 +211,10 @@ pub(crate) struct AcpTerminalCreateDispatchReceiver {
     receiver: SyncReceiver<AcpTerminalCreateDispatch>,
 }
 
+pub(crate) struct AcpTerminalObservationDispatchReceiver {
+    receiver: SyncReceiver<AcpTerminalObservationDispatch>,
+}
+
 pub(crate) struct AcpTerminalCleanupDispatchReceiver {
     receiver: SyncReceiver<AcpTerminalCleanupDispatch>,
 }
@@ -196,6 +233,18 @@ impl AcpTerminalCleanupDispatchReceiver {
 
 impl AcpTerminalCreateDispatchReceiver {
     pub(crate) fn try_recv(&self) -> Result<AcpTerminalCreateDispatch, AcpCapabilityDispatchError> {
+        match self.receiver.try_recv() {
+            Ok(dispatch) => Ok(dispatch),
+            Err(TryRecvError::Empty) => Err(AcpCapabilityDispatchError::Empty),
+            Err(TryRecvError::Disconnected) => Err(AcpCapabilityDispatchError::Disconnected),
+        }
+    }
+}
+
+impl AcpTerminalObservationDispatchReceiver {
+    pub(crate) fn try_recv(
+        &self,
+    ) -> Result<AcpTerminalObservationDispatch, AcpCapabilityDispatchError> {
         match self.receiver.try_recv() {
             Ok(dispatch) => Ok(dispatch),
             Err(TryRecvError::Empty) => Err(AcpCapabilityDispatchError::Empty),
@@ -817,6 +866,75 @@ impl SurfaceHub {
         }
     }
 
+    pub(crate) fn claim_acp_terminal_observation_dispatch(
+        &self,
+        client: &RuntimeSurfaceClientHandle,
+    ) -> Option<AcpTerminalObservationDispatchReceiver> {
+        let mut state = lock(&self.inner);
+        if !state.ready || state.seal_reason.is_some() {
+            return None;
+        }
+        if !client.belongs_to(
+            &self.scope,
+            &state.snapshot.thread.thread_id,
+            self.authority.host_incarnation(),
+        ) || client.detached_receipt().is_some()
+        {
+            return None;
+        }
+        let subscriber = state.subscriptions.get_mut(client.attachment_id())?;
+        if !subscriber.claimed
+            || &subscriber.grant != client.grant()
+            || !subscriber
+                .acp_capabilities
+                .is_some_and(|profile| profile.standard.terminal)
+        {
+            return None;
+        }
+        subscriber
+            .acp_terminal_observation_dispatch_rx
+            .take()
+            .map(|receiver| AcpTerminalObservationDispatchReceiver { receiver })
+    }
+
+    pub(crate) fn dispatch_acp_terminal_observation(
+        &self,
+        route: &AcpCapabilityAttachmentRoute,
+        dispatch: AcpTerminalObservationDispatch,
+    ) -> Result<(), AcpCapabilityDispatchError> {
+        let state = lock(&self.inner);
+        if !state.ready || state.seal_reason.is_some() {
+            return Err(AcpCapabilityDispatchError::StaleRoute);
+        }
+        let subscriber = state
+            .subscriptions
+            .get(&route.attachment_id)
+            .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
+        if !subscriber.claimed
+            || subscriber.grant.role != SurfaceAttachmentRole::Acp
+            || dispatch.capability_revision != route.capability_revision
+            || !subscriber.acp_capabilities.is_some_and(|profile| {
+                profile.revision == route.capability_revision && profile.standard.terminal
+            })
+            || !matches!(
+                dispatch.kind,
+                SurfaceCapabilityCallKind::TerminalOutput
+                    | SurfaceCapabilityCallKind::TerminalWaitForExit
+            )
+        {
+            return Err(AcpCapabilityDispatchError::StaleRoute);
+        }
+        let sender = subscriber
+            .acp_terminal_observation_dispatch_tx
+            .as_ref()
+            .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
+        match sender.try_send(dispatch) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
+        }
+    }
+
     pub(crate) fn claim_acp_terminal_cleanup_dispatch(
         &self,
         client: &RuntimeSurfaceClientHandle,
@@ -1331,6 +1449,13 @@ impl SurfaceHub {
             } else {
                 (None, None)
             };
+        let (acp_terminal_observation_dispatch_tx, acp_terminal_observation_dispatch_rx) =
+            if acp_capabilities.is_some_and(|profile| profile.standard.terminal) {
+                let (sender, receiver) = sync_channel(1);
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
         let (acp_terminal_cleanup_dispatch_tx, acp_terminal_cleanup_dispatch_rx) =
             if acp_capabilities.is_some_and(|profile| profile.standard.terminal) {
                 let (sender, receiver) = sync_channel(1);
@@ -1350,6 +1475,8 @@ impl SurfaceHub {
                 acp_write_dispatch_rx,
                 acp_terminal_create_dispatch_tx,
                 acp_terminal_create_dispatch_rx,
+                acp_terminal_observation_dispatch_tx,
+                acp_terminal_observation_dispatch_rx,
                 acp_terminal_cleanup_dispatch_tx,
                 acp_terminal_cleanup_dispatch_rx,
                 queue: VecDeque::new(),
@@ -1746,6 +1873,8 @@ mod tests {
             acp_write_dispatch_rx: None,
             acp_terminal_create_dispatch_tx: None,
             acp_terminal_create_dispatch_rx: None,
+            acp_terminal_observation_dispatch_tx: None,
+            acp_terminal_observation_dispatch_rx: None,
             acp_terminal_cleanup_dispatch_tx: None,
             acp_terminal_cleanup_dispatch_rx: None,
             queue: VecDeque::new(),

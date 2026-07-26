@@ -2020,6 +2020,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             super::SurfaceCapabilityCallState::Prepared
                                 | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
                         ) | (
+                            super::SurfaceCapabilityCallKind::TerminalOutput
+                                | super::SurfaceCapabilityCallKind::TerminalWaitForExit,
+                            super::SurfaceCapabilityCallState::Prepared
+                                | super::SurfaceCapabilityCallState::WrittenAwaitingResponse
+                        ) | (
                             super::SurfaceCapabilityCallKind::WriteTextFile,
                             super::SurfaceCapabilityCallState::Prepared
                                 | super::SurfaceCapabilityCallState::DeliveryPossible
@@ -2038,6 +2043,8 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             let message = match (call.kind, call.state) {
                 (
                     super::SurfaceCapabilityCallKind::ReadTextFile
+                    | super::SurfaceCapabilityCallKind::TerminalOutput
+                    | super::SurfaceCapabilityCallKind::TerminalWaitForExit
                     | super::SurfaceCapabilityCallKind::WriteTextFile
                     | super::SurfaceCapabilityCallKind::TerminalCreate,
                     super::SurfaceCapabilityCallState::Prepared,
@@ -2051,7 +2058,9 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     "prepared"
                 }
                 (
-                    super::SurfaceCapabilityCallKind::ReadTextFile,
+                    super::SurfaceCapabilityCallKind::ReadTextFile
+                    | super::SurfaceCapabilityCallKind::TerminalOutput
+                    | super::SurfaceCapabilityCallKind::TerminalWaitForExit,
                     super::SurfaceCapabilityCallState::WrittenAwaitingResponse,
                 ) => {
                     call.state = super::SurfaceCapabilityCallState::ObservationUnavailable {
@@ -5062,7 +5071,10 @@ fn actor_generation_terminalization_authorized(
                     call:
                         super::SurfaceCapabilityCall {
                             fence: call_fence,
-                            kind: super::SurfaceCapabilityCallKind::ReadTextFile,
+                            kind:
+                                super::SurfaceCapabilityCallKind::ReadTextFile
+                                | super::SurfaceCapabilityCallKind::TerminalOutput
+                                | super::SurfaceCapabilityCallKind::TerminalWaitForExit,
                             state:
                                 super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
                                 | super::SurfaceCapabilityCallState::ObservationUnavailable { .. },
@@ -7843,7 +7855,10 @@ fn recovery_batch_authorized(
                 super::SurfaceEvent::Tool(
                     super::ToolPatch::CapabilityCallChanged {
                         call: super::SurfaceCapabilityCall {
-                            kind: super::SurfaceCapabilityCallKind::ReadTextFile,
+                            kind:
+                                super::SurfaceCapabilityCallKind::ReadTextFile
+                                | super::SurfaceCapabilityCallKind::TerminalOutput
+                                | super::SurfaceCapabilityCallKind::TerminalWaitForExit,
                             state:
                                 super::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
                                 | super::SurfaceCapabilityCallState::ObservationUnavailable { .. },

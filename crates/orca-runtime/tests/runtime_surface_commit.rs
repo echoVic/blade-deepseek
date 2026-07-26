@@ -593,6 +593,18 @@ fn recovery_terminalizes_interrupted_capability_calls_without_replay() {
                 SurfaceCapabilityCallKind::WriteTextFile,
                 SurfaceCapabilityCallState::DeliveryPossible,
             ),
+            call(
+                207,
+                &tool_call_id,
+                SurfaceCapabilityCallKind::TerminalOutput,
+                SurfaceCapabilityCallState::Prepared,
+            ),
+            call(
+                208,
+                &tool_call_id,
+                SurfaceCapabilityCallKind::TerminalWaitForExit,
+                SurfaceCapabilityCallState::WrittenAwaitingResponse,
+            ),
         ],
         terminal_leases: Vec::new(),
     });
@@ -815,6 +827,22 @@ fn recovery_terminalizes_interrupted_capability_calls_without_replay() {
             effect_kind: ExternalEffectKind::FileWrite,
             ..
         }
+    ));
+    let recovered_terminal_output = calls
+        .iter()
+        .find(|call| call.call_id == SurfaceCapabilityCallId::try_from_bytes(uuid(207)).unwrap())
+        .expect("recovered terminal output call");
+    assert!(matches!(
+        recovered_terminal_output.state,
+        SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+    ));
+    let recovered_terminal_wait = calls
+        .iter()
+        .find(|call| call.call_id == SurfaceCapabilityCallId::try_from_bytes(uuid(208)).unwrap())
+        .expect("recovered terminal wait call");
+    assert!(matches!(
+        recovered_terminal_wait.state,
+        SurfaceCapabilityCallState::ObservationUnavailable { .. }
     ));
     let recovered_terminal_create = calls
         .iter()
