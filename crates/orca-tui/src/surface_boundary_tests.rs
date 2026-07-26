@@ -579,3 +579,16 @@ fn typed_history_resume_projects_only_the_durable_surface_snapshot() {
         "the TUI facade must not retain a second history truth beside SurfaceSnapshot.items"
     );
 }
+
+#[test]
+fn production_ordinary_turns_select_only_the_typed_surface_runner() {
+    assert!(
+        APP.contains("host,\n        run_hosted_ordinary_turn,\n    );"),
+        "the production controller entrypoint must select the typed ordinary-turn runner"
+    );
+    assert!(
+        !APP.contains("run_hosted_legacy_ordinary_turn")
+            && APP.contains("#[cfg(test)]\nfn run_legacy_feature_turn_for_test"),
+        "deferred background/workflow compatibility may exist only as an explicit test fixture"
+    );
+}

@@ -542,7 +542,7 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
         background_capacity,
         controller,
         move |controller, commands, host| {
-            hosted_tui_controller_loop_with_ordinary_turn_runner(
+            hosted_tui_controller_loop(
                 agent_config,
                 agent_preloaded,
                 agent_events,
@@ -551,11 +551,45 @@ fn spawn_hosted_tui_test_runtime_with_background_capacity(
                 agent_pending,
                 agent_registry,
                 host,
-                run_hosted_legacy_ordinary_turn,
             );
         },
     )
     .expect("hosted TUI test runtime")
+}
+
+#[cfg(test)]
+fn spawn_legacy_feature_test_runtime(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+) -> TuiAgentRuntime {
+    let pending = bridge::PendingWorkflowNotifications::new();
+    let registry = orca_mcp::initialize_registry(&[]);
+    let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+    let agent_config = Arc::clone(&config);
+    let agent_preloaded = Arc::clone(&preloaded);
+    let agent_events = event_tx.clone();
+    TuiAgentRuntime::spawn_hosted(
+        action_rx,
+        event_tx,
+        8,
+        controller,
+        move |controller, commands, host| {
+            hosted_tui_controller_loop_with_ordinary_turn_runner(
+                agent_config,
+                agent_preloaded,
+                agent_events,
+                commands,
+                controller,
+                pending,
+                registry,
+                host,
+                run_legacy_feature_turn_for_test,
+            );
+        },
+    )
+    .expect("legacy feature TUI test runtime")
 }
 
 #[cfg(test)]
@@ -573,6 +607,25 @@ fn run_hosted_tui_controller_for_test(
         std::thread::sleep(Duration::from_millis(5));
     }
     runtime.shutdown().expect("hosted TUI test shutdown");
+}
+
+#[cfg(test)]
+fn run_legacy_feature_tui_controller_for_test(
+    config: Arc<Mutex<RunConfig>>,
+    preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    action_rx: mpsc::Receiver<UserAction>,
+    _cancel: CancelToken,
+    _pending_workflow_notifications: bridge::PendingWorkflowNotifications,
+) {
+    let mut runtime = spawn_legacy_feature_test_runtime(config, preloaded, event_tx, action_rx);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !runtime.controller().is_shutdown() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    runtime
+        .shutdown()
+        .expect("legacy feature TUI test shutdown");
 }
 
 fn now_timestamp() -> i64 {
@@ -1565,45 +1618,6 @@ mod tests {
             Self::start_with_background_capacity(config, preloaded, 8)
         }
 
-        fn start_typed(config: RunConfig, preloaded: Option<history::SessionTranscript>) -> Self {
-            let config = Arc::new(Mutex::new(config));
-            let preloaded = Arc::new(Mutex::new(preloaded));
-            let (event_tx, event_rx) = mpsc::unbounded();
-            let (action_tx, action_rx) = mpsc::unbounded();
-            let pending = test_pending_workflow_notifications();
-            let registry = orca_mcp::initialize_registry(&[]);
-            let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
-            let agent_config = Arc::clone(&config);
-            let agent_preloaded = Arc::clone(&preloaded);
-            let agent_events = event_tx.clone();
-            let runtime = TuiAgentRuntime::spawn_hosted(
-                action_rx,
-                event_tx,
-                8,
-                controller,
-                move |controller, commands, host| {
-                    hosted_tui_controller_loop(
-                        agent_config,
-                        agent_preloaded,
-                        agent_events,
-                        commands,
-                        controller,
-                        pending,
-                        registry,
-                        host,
-                    );
-                },
-            )
-            .expect("typed hosted TUI runtime");
-            Self {
-                action_tx,
-                event_rx,
-                runtime,
-                config,
-                preloaded,
-            }
-        }
-
         fn start_with_background_capacity(
             config: RunConfig,
             preloaded: Option<history::SessionTranscript>,
@@ -1919,7 +1933,7 @@ mod tests {
     #[test]
     fn hosted_tui_backgrounded_canonical_provider_can_be_stopped_once() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
             harness.recv_until(|event| {
                 matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
@@ -1971,7 +1985,7 @@ mod tests {
     #[test]
     fn hosted_tui_backgrounded_canonical_provider_can_be_foregrounded_once() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("mock_stream_delay_ms 3000".to_string()));
             harness.recv_until(|event| {
                 matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
@@ -2043,7 +2057,7 @@ mod tests {
     #[test]
     fn hosted_canonical_approval_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "bash printf canonical-approval".to_string(),
             ));
@@ -2073,7 +2087,7 @@ mod tests {
     #[test]
     fn hosted_canonical_permission_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit(
                 "request_network_permissions_then_done example.com".to_string(),
             ));
@@ -2103,7 +2117,7 @@ mod tests {
     #[test]
     fn hosted_canonical_user_input_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("ask continue?".to_string()));
 
             let key = match harness
@@ -2586,7 +2600,7 @@ mod tests {
     #[test]
     fn resumed_uuid_session_emits_typed_history_before_accepting_initial_turn() {
         with_orca_home(|_| {
-            let mut source = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut source = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             let secret = "sk-test-typed-history-secret-1234567890";
             source.send(UserAction::Submit(format!(
                 "restored prompt api_key={secret}"
@@ -2608,7 +2622,7 @@ mod tests {
             let session_id = history::load_session("latest").unwrap().meta.session_id;
 
             let mut harness =
-                HostedTuiHarness::start_typed(test_config(HistoryMode::Resume(session_id)), None);
+                HostedTuiHarness::start(test_config(HistoryMode::Resume(session_id)), None);
             let event = harness
                 .event_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -3344,7 +3358,7 @@ mod tests {
     #[test]
     fn cancelled_hosted_tui_turn_does_not_cancel_next_submit() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
 
             loop {
@@ -3494,7 +3508,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3567,7 +3581,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3716,7 +3730,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3782,7 +3796,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3848,7 +3862,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3919,7 +3933,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -4003,7 +4017,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -4122,7 +4136,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_hosted_tui_controller_for_test(
+                    run_legacy_feature_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -6000,7 +6014,7 @@ fn run_hosted_ordinary_turn(
 }
 
 #[cfg(test)]
-fn run_hosted_legacy_ordinary_turn(
+fn run_legacy_feature_turn_for_test(
     config: &RunConfig,
     thread: &RuntimeThreadHandle,
     request: HostedTurnRequest,
