@@ -30,14 +30,13 @@ use crate::surface::{
     AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalUri, DisplayText,
     FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
     OperationBudget, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
-    OperationSettingsPreparation, OperationTerminal, PermissionGrantScope, ReplayabilityRequest,
+    OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
-    Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability,
+    Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
     SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock,
-    SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionView, SurfaceOperationId,
-    SurfacePermissionClientDecision, SurfacePermissionProfile, SurfaceRequestId,
-    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch, TurnRequestBudgetScope,
-    UncommittedMutation,
+    SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionRoute,
+    SurfaceInteractionView, SurfaceOperationId, SurfaceRequestId, SurfaceSubscriptionItem,
+    SurfaceToolResultKind, ToolPatch, TurnRequestBudgetScope, UncommittedMutation,
 };
 
 use crate::runtime_surface::{
@@ -830,10 +829,7 @@ fn prepare_surface_prompt(
             SurfaceCapability::ControlBoundOperation,
             SurfaceCapability::RespondGrantedInteraction,
         ]),
-        interaction_capabilities: std::collections::BTreeSet::from([
-            SurfaceInteractionKind::ToolApproval,
-            SurfaceInteractionKind::PermissionRequest,
-        ]),
+        interaction_capabilities: standard_interaction_capabilities(),
     }) {
         AttachResult::FreshAttached { attachment } => attachment,
         AttachResult::Denied { .. } => {
@@ -934,6 +930,30 @@ fn prepare_surface_prompt(
     })
 }
 
+fn standard_interaction_capabilities() -> std::collections::BTreeSet<SurfaceInteractionKind> {
+    std::collections::BTreeSet::from([SurfaceInteractionKind::ToolApproval])
+}
+
+fn standard_acp_routes_interaction(
+    attachment_id: &SurfaceAttachmentId,
+    kind: SurfaceInteractionKind,
+    route: &SurfaceInteractionRoute,
+) -> bool {
+    if kind != SurfaceInteractionKind::ToolApproval {
+        return false;
+    }
+    match route {
+        SurfaceInteractionRoute::Unassigned { .. } => false,
+        SurfaceInteractionRoute::Exclusive {
+            attachment_id: routed,
+            ..
+        } => routed == attachment_id,
+        SurfaceInteractionRoute::SharedFirstCommitWins { attachments, .. } => {
+            attachments.as_set().contains(attachment_id)
+        }
+    }
+}
+
 fn uncommitted_mutation_message(mutation: &UncommittedMutation) -> &str {
     match mutation {
         UncommittedMutation::Invalid { error, .. } => error.error().message.as_str(),
@@ -946,9 +966,6 @@ fn uncommitted_mutation_message(mutation: &UncommittedMutation) -> &str {
 #[derive(Clone)]
 enum AcpPermissionTarget {
     ToolApproval,
-    PermissionRequest {
-        permissions: SurfacePermissionProfile,
-    },
 }
 
 fn build_permission_request(
@@ -963,18 +980,8 @@ fn build_permission_request(
             description.as_str().to_string(),
             AcpPermissionTarget::ToolApproval,
         ),
-        SurfaceInteractionRequest::PermissionRequest {
-            tool_call_id,
-            permissions,
-            ..
-        } => (
-            tool_call_id.as_str().to_string(),
-            "Permission requested".to_string(),
-            AcpPermissionTarget::PermissionRequest {
-                permissions: permissions.clone(),
-            },
-        ),
-        SurfaceInteractionRequest::UserInput { .. }
+        SurfaceInteractionRequest::PermissionRequest { .. }
+        | SurfaceInteractionRequest::UserInput { .. }
         | SurfaceInteractionRequest::McpElicitation { .. }
         | SurfaceInteractionRequest::BackgroundApproval { .. } => {
             return Err("ACP client bridge does not support this interaction kind".to_string());
@@ -982,42 +989,37 @@ fn build_permission_request(
     };
     let fields = ToolCallUpdateFields::new().title(title);
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id), fields);
-    let options = vec![
-        PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
-        PermissionOption::new(
-            "allow_always",
-            "Allow for session",
-            PermissionOptionKind::AllowAlways,
+    Ok((
+        RequestPermissionRequest::new(
+            session_id.clone(),
+            tool_call,
+            standard_tool_approval_options(),
         ),
+        target,
+    ))
+}
+
+fn standard_tool_approval_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
         PermissionOption::new(
             "reject_once",
             "Reject once",
             PermissionOptionKind::RejectOnce,
         ),
-        PermissionOption::new(
-            "reject_always",
-            "Reject for session",
-            PermissionOptionKind::RejectAlways,
-        ),
-    ];
-    Ok((
-        RequestPermissionRequest::new(session_id.clone(), tool_call, options),
-        target,
-    ))
+    ]
 }
 
 fn permission_answer(
     response: RequestPermissionResponse,
     target: AcpPermissionTarget,
 ) -> Result<SurfaceClientInteractionAnswer, String> {
-    let (allow, scope) = match response.outcome {
-        RequestPermissionOutcome::Cancelled => (false, PermissionGrantScope::Turn),
+    let allow = match response.outcome {
+        RequestPermissionOutcome::Cancelled => false,
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
             match option_id.to_string().as_str() {
-                "allow_once" => (true, PermissionGrantScope::Turn),
-                "allow_always" => (true, PermissionGrantScope::Session),
-                "reject_once" => (false, PermissionGrantScope::Turn),
-                "reject_always" => (false, PermissionGrantScope::Session),
+                "allow_once" => true,
+                "reject_once" => false,
                 other => return Err(format!("unknown ACP permission option '{other}'")),
             }
         }
@@ -1031,23 +1033,6 @@ fn permission_answer(
                 SurfaceAllowDeny::Deny
             },
         },
-        AcpPermissionTarget::PermissionRequest { permissions } => {
-            SurfaceClientInteractionAnswer::PermissionRequest {
-                decision: if allow {
-                    SurfacePermissionClientDecision::Allow {
-                        scope,
-                        permissions,
-                        strict_auto_review: false,
-                    }
-                } else {
-                    SurfacePermissionClientDecision::Deny {
-                        scope,
-                        permissions,
-                        strict_auto_review: false,
-                    }
-                },
-            }
-        }
     })
 }
 
@@ -1294,6 +1279,11 @@ fn project_surface_event(
 ) -> Result<(), String> {
     if let SurfaceEvent::Interaction(crate::surface::InteractionPatch::Requested { interaction }) =
         event
+        && standard_acp_routes_interaction(
+            prepared.client.attachment_id(),
+            interaction.kind,
+            &interaction.route,
+        )
     {
         let Some(bridge) = prepared.client_bridge.as_ref() else {
             cancel_surface_operation(prepared)?;
@@ -1568,6 +1558,13 @@ mod tests {
         )
     }
 
+    fn attachment_id(seed: u8) -> SurfaceAttachmentId {
+        let mut bytes = [seed; 16];
+        bytes[6] = 0x70 | (seed & 0x0f);
+        bytes[8] = 0x80 | (seed & 0x3f);
+        SurfaceAttachmentId::try_from_bytes(bytes).expect("valid UUIDv7 attachment id")
+    }
+
     #[test]
     fn prompt_content_decodes_supported_blocks_in_original_order() {
         use agent_client_protocol::{
@@ -1686,6 +1683,66 @@ mod tests {
             }),
             Ok(StopReason::Cancelled)
         );
+    }
+
+    #[test]
+    fn standard_tool_approval_options_never_fabricate_persistent_scope() {
+        let options = standard_tool_approval_options();
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.option_id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["allow_once".to_string(), "reject_once".to_string()]
+        );
+        let error = permission_answer(
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new("allow_always"),
+            )),
+            AcpPermissionTarget::ToolApproval,
+        )
+        .expect_err("unadvertised persistent grant must be rejected");
+        assert!(error.contains("unknown ACP permission option"));
+    }
+
+    #[test]
+    fn standard_interaction_capabilities_only_advertise_exact_tool_approval() {
+        assert_eq!(
+            standard_interaction_capabilities(),
+            std::collections::BTreeSet::from([SurfaceInteractionKind::ToolApproval])
+        );
+    }
+
+    #[test]
+    fn standard_acp_ignores_ungranted_and_extension_only_interactions() {
+        let acp = attachment_id(1);
+        let other = attachment_id(2);
+        let acp_route = SurfaceInteractionRoute::Exclusive {
+            epoch: crate::unstable_surface::ResponseRouteEpoch::try_new(1)
+                .expect("valid route epoch"),
+            attachment_id: acp.clone(),
+        };
+        let other_route = SurfaceInteractionRoute::Exclusive {
+            epoch: crate::unstable_surface::ResponseRouteEpoch::try_new(1)
+                .expect("valid route epoch"),
+            attachment_id: other,
+        };
+
+        assert!(standard_acp_routes_interaction(
+            &acp,
+            SurfaceInteractionKind::ToolApproval,
+            &acp_route,
+        ));
+        assert!(!standard_acp_routes_interaction(
+            &acp,
+            SurfaceInteractionKind::ToolApproval,
+            &other_route,
+        ));
+        assert!(!standard_acp_routes_interaction(
+            &acp,
+            SurfaceInteractionKind::PermissionRequest,
+            &acp_route,
+        ));
     }
 
     #[test]
