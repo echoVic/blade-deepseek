@@ -1,8 +1,8 @@
 use orca_core::approval_types::ActionKind;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
-    HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig,
-    WorkflowConfig,
+    AdditionalWorkingDirectory, HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind,
+    RunConfig, ThemeName, ToolConfig, WorkflowConfig,
 };
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::SubagentConfig;
@@ -53,6 +53,67 @@ fn closed_host_facade_starts_a_typed_thread_surface() {
     .expect("surface thread id");
     assert_eq!(attachment.baseline.snapshot.thread.thread_id, thread_id);
 
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn typed_thread_snapshot_preserves_configured_additional_directories() {
+    let cwd = tempdir().expect("temp cwd");
+    let extra = tempdir().expect("additional cwd");
+    let host = RuntimeHost::start().expect("runtime host");
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.runtime_workspace_roots =
+        Some(vec![cwd.path().to_path_buf(), extra.path().to_path_buf()]);
+    config.additional_working_directories = vec![AdditionalWorkingDirectory::new(
+        extra.path().to_path_buf(),
+        "acp",
+    )];
+    let thread = host
+        .surface_handle()
+        .start_thread(config, "additional roots")
+        .expect("typed thread");
+    let attachment = match thread.surface().attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        _ => panic!("unexpected attachment result"),
+    };
+
+    assert_eq!(
+        attachment
+            .baseline
+            .snapshot
+            .settings
+            .effective
+            .workspace_roots[1]
+            .as_path(),
+        extra.path()
+    );
+    assert_eq!(
+        attachment
+            .baseline
+            .snapshot
+            .settings
+            .effective
+            .additional_working_directories[0]
+            .path
+            .as_path(),
+        extra.path()
+    );
+    assert_eq!(
+        attachment
+            .baseline
+            .snapshot
+            .settings
+            .effective
+            .additional_working_directories[0]
+            .source
+            .as_str(),
+        "acp"
+    );
     host.shutdown().expect("shutdown runtime host");
 }
 

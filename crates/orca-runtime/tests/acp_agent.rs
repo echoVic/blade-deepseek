@@ -36,6 +36,7 @@ use orca_runtime::runtime_host::{
     GenerationContext, HostedTurnRequest, RuntimeHost, ThreadOperationExecutor,
     ThreadOperationOutcome,
 };
+use orca_runtime::surface::RuntimeSurfaceHostHandle;
 use orca_runtime::thread::RuntimeThread;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -350,7 +351,7 @@ fn drain_notifications(rx: &mut mpsc::Receiver<SessionNotification>) -> Vec<Sess
 // --- Tests ---
 
 #[test]
-fn acp_initialize_returns_v1_with_load_session_capability() {
+fn acp_initialize_returns_exact_session_and_mcp_capabilities() {
     let _home = OrcaHomeGuard::new();
     let cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![]));
@@ -377,6 +378,15 @@ fn acp_initialize_returns_v1_with_load_session_capability() {
 
     assert_eq!(response.protocol_version, ProtocolVersion::V1);
     assert!(response.agent_capabilities.load_session);
+    assert!(response.agent_capabilities.mcp_capabilities.sse);
+    assert!(!response.agent_capabilities.mcp_capabilities.http);
+    assert!(
+        response
+            .agent_capabilities
+            .session_capabilities
+            .additional_directories
+            .is_some()
+    );
     assert_eq!(
         response.agent_info.as_ref().map(|i| i.name.as_str()),
         Some("orca")
@@ -387,6 +397,118 @@ fn acp_initialize_returns_v1_with_load_session_capability() {
     );
 
     host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_new_session_persists_declared_additional_directories() {
+    let _home = OrcaHomeGuard::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![]));
+    let host = RuntimeHost::start_with_executor(executor).expect("start host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(cwd.path().to_path_buf()),
+        note_tx,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let response = local.block_on(&rt, async {
+        agent
+            .new_session(
+                NewSessionRequest::new(cwd.path().to_path_buf())
+                    .additional_directories(vec![extra.path().to_path_buf()]),
+            )
+            .await
+            .expect("new session")
+    });
+    let transcript = RuntimeSurfaceHostHandle::load_saved_session(&response.session_id.to_string())
+        .expect("saved ACP session");
+    assert_eq!(transcript.meta.additional_working_directories.len(), 1);
+    assert_eq!(
+        transcript.meta.additional_working_directories[0].path,
+        extra.path()
+    );
+    assert_eq!(
+        transcript.meta.additional_working_directories[0].source,
+        "acp"
+    );
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_load_session_replaces_persisted_additional_directories() {
+    let _home = OrcaHomeGuard::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let original = tempfile::tempdir().unwrap();
+    let replacement = tempfile::tempdir().unwrap();
+
+    let first_host =
+        RuntimeHost::start_with_executor(Arc::new(AcpTestExecutor::new(vec![]))).expect("host");
+    let (first_tx, _first_rx) = mpsc::channel::<SessionNotification>(256);
+    let first_agent = OrcaAcpAgent::new(
+        first_host.surface_handle(),
+        test_config(cwd.path().to_path_buf()),
+        first_tx,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let session = local.block_on(&rt, async {
+        first_agent
+            .new_session(
+                NewSessionRequest::new(cwd.path().to_path_buf())
+                    .additional_directories(vec![original.path().to_path_buf()]),
+            )
+            .await
+            .expect("new session")
+    });
+    first_host.shutdown().expect("shutdown first host");
+
+    let second_host =
+        RuntimeHost::start_with_executor(Arc::new(AcpTestExecutor::new(vec![]))).expect("host");
+    let (second_tx, _second_rx) = mpsc::channel::<SessionNotification>(256);
+    let second_agent = OrcaAcpAgent::new(
+        second_host.surface_handle(),
+        test_config(cwd.path().to_path_buf()),
+        second_tx,
+    );
+    let wrong_cwd = tempfile::tempdir().unwrap();
+    local.block_on(&rt, async {
+        assert!(
+            second_agent
+                .load_session(LoadSessionRequest::new(
+                    session.session_id.clone(),
+                    wrong_cwd.path().to_path_buf(),
+                ))
+                .await
+                .is_err(),
+            "load must reject a cwd that differs from the saved session"
+        );
+        second_agent
+            .load_session(
+                LoadSessionRequest::new(session.session_id.clone(), cwd.path().to_path_buf())
+                    .additional_directories(vec![replacement.path().to_path_buf()]),
+            )
+            .await
+            .expect("load session")
+    });
+    let transcript = RuntimeSurfaceHostHandle::load_saved_session(&session.session_id.to_string())
+        .expect("loaded ACP session");
+    assert_eq!(
+        transcript.meta.additional_working_directories,
+        vec![orca_core::config::AdditionalWorkingDirectory::new(
+            replacement.path().to_path_buf(),
+            "acp",
+        )]
+    );
+    second_host.shutdown().expect("shutdown second host");
 }
 
 #[test]

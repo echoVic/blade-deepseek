@@ -58,7 +58,9 @@ use crate::runtime_pending_interaction::RuntimePendingInteractionStore;
 use crate::runtime_surface as surface;
 use crate::tasks::{DurableTypedProviderOutcome, MainSessionTerminalUpdate, TaskRegistry};
 use crate::thread::RuntimeThread;
-use crate::thread_store::{SessionMeta, SessionStore, SessionTranscript};
+use crate::thread_store::{
+    SessionMeta, SessionStore, SessionTranscript, ThreadMetadataPatch, ThreadStore,
+};
 use crate::workflow::runner::{WorkflowLaunchRequest, WorkflowRunner};
 use crate::workflow_execution::BackgroundWorkflowRun;
 
@@ -1471,6 +1473,7 @@ pub struct RuntimeThreadStartRequest {
     preloaded: Option<SessionTranscript>,
     mcp_registry: Option<McpRegistry>,
     prepared_record_meta: Option<SessionMeta>,
+    replace_resume_scope: bool,
 }
 
 impl RuntimeThreadStartRequest {
@@ -1481,6 +1484,7 @@ impl RuntimeThreadStartRequest {
             preloaded: None,
             mcp_registry: None,
             prepared_record_meta: None,
+            replace_resume_scope: false,
         }
     }
 
@@ -1491,6 +1495,11 @@ impl RuntimeThreadStartRequest {
 
     pub fn with_mcp_registry(mut self, mcp_registry: McpRegistry) -> Self {
         self.mcp_registry = Some(mcp_registry);
+        self
+    }
+
+    pub(crate) fn with_resume_scope_replacement(mut self) -> Self {
+        self.replace_resume_scope = true;
         self
     }
 
@@ -1547,6 +1556,7 @@ impl RuntimeThreadStartRequest {
                 return Ok(PreparedRuntimeThreadStart {
                     request: self,
                     surface_owner: None,
+                    resume_scope_replacement: None,
                 });
             }
         };
@@ -1554,6 +1564,7 @@ impl RuntimeThreadStartRequest {
             return Ok(PreparedRuntimeThreadStart {
                 request: self,
                 surface_owner: None,
+                resume_scope_replacement: None,
             });
         };
         let surface_thread_id = surface::SurfaceThreadId::try_from_bytes(*raw_thread_id.as_bytes())
@@ -1569,6 +1580,16 @@ impl RuntimeThreadStartRequest {
         .map_err(|error| RuntimeHostError::ThreadStartFailed {
             message: format!("failed to acquire typed surface owner lease: {error:?}"),
         })?;
+        let resume_scope_replacement = (self.replace_resume_scope
+            && matches!(self.config.history_mode, HistoryMode::Resume(_)))
+        .then(|| ResumeScopeReplacement {
+            runtime_workspace_roots: self
+                .config
+                .runtime_workspace_roots
+                .clone()
+                .unwrap_or_else(|| self.config.cwd.clone().into_iter().collect::<Vec<_>>()),
+            additional_working_directories: self.config.additional_working_directories.clone(),
+        });
         Ok(PreparedRuntimeThreadStart {
             request: self,
             surface_owner: Some(PreparedSurfaceOwner {
@@ -1577,6 +1598,7 @@ impl RuntimeThreadStartRequest {
                 path,
                 owner_lease,
             }),
+            resume_scope_replacement,
         })
     }
 }
@@ -1584,6 +1606,12 @@ impl RuntimeThreadStartRequest {
 struct PreparedRuntimeThreadStart {
     request: RuntimeThreadStartRequest,
     surface_owner: Option<PreparedSurfaceOwner>,
+    resume_scope_replacement: Option<ResumeScopeReplacement>,
+}
+
+struct ResumeScopeReplacement {
+    runtime_workspace_roots: Vec<std::path::PathBuf>,
+    additional_working_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
 }
 
 struct PreparedSurfaceOwner {
@@ -2989,6 +3017,7 @@ async fn run_host_supervisor(
                 let PreparedRuntimeThreadStart {
                     request,
                     surface_owner,
+                    resume_scope_replacement,
                 } = prepared;
                 let started = tokio::task::spawn_blocking(move || request.start()).await;
                 let mut thread = match started {
@@ -3006,6 +3035,32 @@ async fn run_host_supervisor(
                         continue;
                     }
                 };
+                if let Some(replacement) = resume_scope_replacement {
+                    let Some(owner) = surface_owner.as_ref() else {
+                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                            message: "replacement runtime scope requires a durable surface owner"
+                                .to_string(),
+                        }));
+                        continue;
+                    };
+                    if let Err(error) = SessionStore::new().update_thread_metadata(
+                        &owner.thread_id,
+                        ThreadMetadataPatch {
+                            runtime_workspace_roots: Some(replacement.runtime_workspace_roots),
+                            additional_working_directories: Some(
+                                replacement.additional_working_directories,
+                            ),
+                            ..ThreadMetadataPatch::default()
+                        },
+                    ) {
+                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                            message: format!(
+                                "failed to persist replacement runtime scope: {error}"
+                            ),
+                        }));
+                        continue;
+                    }
+                }
                 let thread_id = thread.thread_id().to_string();
                 let session_id = thread.session().session_id().map(str::to_string);
                 let task_registry = thread.session().task_registry().clone();
@@ -5956,6 +6011,26 @@ fn initial_surface_snapshot(
         .map_err(|error| RuntimeHostError::ThreadStartFailed {
             message: format!("invalid surface workspace root: {error:?}"),
         })?;
+    let additional_working_directories = config
+        .additional_working_directories
+        .iter()
+        .map(|directory| {
+            Ok(surface::SurfaceAdditionalWorkingDirectory {
+                path: surface::CanonicalPath::try_new(directory.path.clone()).map_err(|error| {
+                    RuntimeHostError::ThreadStartFailed {
+                        message: format!("invalid surface additional working directory: {error:?}"),
+                    }
+                })?,
+                source: surface::NonEmptyText::try_new(directory.source.clone()).map_err(
+                    |error| RuntimeHostError::ThreadStartFailed {
+                        message: format!(
+                            "invalid surface additional working directory source: {error:?}"
+                        ),
+                    },
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeHostError>>()?;
     let now = surface::UnixMillis::new(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5990,7 +6065,7 @@ fn initial_surface_snapshot(
             ordered_rules: Vec::new(),
             digest: surface::Sha256Digest::new([0; 32]),
         },
-        additional_working_directories: Vec::new(),
+        additional_working_directories,
         network_permissions: surface::SurfaceNetworkPermissions {
             enabled: None,
             domains: Vec::new(),

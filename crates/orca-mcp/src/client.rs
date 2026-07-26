@@ -1092,6 +1092,10 @@ fn sanitize_name(name: &str) -> String {
     sanitized.trim_matches('_').to_string()
 }
 
+pub fn canonical_server_name(name: &str) -> String {
+    sanitize_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

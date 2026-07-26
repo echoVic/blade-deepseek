@@ -14,21 +14,23 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, EmbeddedResourceResource, Error, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
-use orca_core::config::{HistoryMode, RunConfig};
+use orca_core::config::{AdditionalWorkingDirectory, HistoryMode, RunConfig};
+use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
 use crate::runtime_host::RuntimeThreadStartRequest;
 use crate::surface::{
-    AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalUri, DisplayText,
-    FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
+    AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalPath, CanonicalUri,
+    DisplayText, FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
     OperationBudget, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
     OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
@@ -305,14 +307,23 @@ impl OrcaAcpAgent {
     /// Builds a per-session config from the base config with the session cwd
     /// applied. Events flow through the observer, not the writer, so the
     /// output format is irrelevant.
-    fn build_session_config(&self, cwd: PathBuf) -> RunConfig {
-        let mut config = self.base_config.clone();
+    fn build_session_config(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        additional_directories: Vec<PathBuf>,
+    ) -> Result<RunConfig, String> {
+        let mut config = build_acp_session_config(
+            self.base_config.clone(),
+            cwd,
+            mcp_servers,
+            additional_directories,
+        )?;
         config.prompt = String::new();
-        config.cwd = Some(cwd);
         config.show_session_picker = false;
         config.desktop_notifications = false;
         config.history_mode = HistoryMode::Record;
-        config
+        Ok(config)
     }
 
     pub(crate) async fn admit_prompt(
@@ -427,6 +438,165 @@ impl OrcaAcpAgent {
             }
         }
         ready.notify_waiters();
+    }
+}
+
+fn build_acp_session_config(
+    mut config: RunConfig,
+    cwd: PathBuf,
+    mcp_servers: Vec<McpServer>,
+    additional_directories: Vec<PathBuf>,
+) -> Result<RunConfig, String> {
+    CanonicalPath::try_new(cwd.clone())
+        .map_err(|error| format!("invalid ACP session cwd: {error:?}"))?;
+    config.cwd = Some(cwd.clone());
+
+    let mut roots = vec![cwd.clone()];
+    let mut root_set = BTreeSet::from([cwd]);
+    for root in config.runtime_workspace_roots.take().unwrap_or_default() {
+        CanonicalPath::try_new(root.clone())
+            .map_err(|error| format!("invalid ACP base workspace root: {error:?}"))?;
+        if root_set.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    for directory in &config.additional_working_directories {
+        CanonicalPath::try_new(directory.path.clone())
+            .map_err(|error| format!("invalid ACP base additional directory: {error:?}"))?;
+        if root_set.insert(directory.path.clone()) {
+            roots.push(directory.path.clone());
+        }
+    }
+    for directory in additional_directories {
+        CanonicalPath::try_new(directory.clone())
+            .map_err(|error| format!("invalid ACP additional directory: {error:?}"))?;
+        if !root_set.insert(directory.clone()) {
+            return Err("duplicate ACP additional directory".to_string());
+        }
+        roots.push(directory.clone());
+        config
+            .additional_working_directories
+            .push(AdditionalWorkingDirectory::new(directory, "acp"));
+    }
+    config.runtime_workspace_roots = Some(roots);
+
+    let mut server_names = config
+        .mcp_servers
+        .iter()
+        .map(|server| orca_mcp::canonical_server_name(&server.name))
+        .collect::<HashSet<_>>();
+    for server in mcp_servers {
+        let mapped = map_acp_mcp_server(server)?;
+        let canonical_name = orca_mcp::canonical_server_name(&mapped.name);
+        if canonical_name.is_empty() || !server_names.insert(canonical_name) {
+            return Err(format!("duplicate ACP MCP server '{}'", mapped.name));
+        }
+        config.mcp_servers.push(mapped);
+    }
+    Ok(config)
+}
+
+fn map_acp_mcp_server(server: McpServer) -> Result<McpServerConfig, String> {
+    match server {
+        McpServer::Stdio(server) => {
+            validate_mcp_name(&server.name)?;
+            CanonicalPath::try_new(server.command.clone()).map_err(|error| {
+                format!(
+                    "ACP MCP server '{}' has invalid absolute command: {error:?}",
+                    server.name
+                )
+            })?;
+            let command = server
+                .command
+                .to_str()
+                .filter(|command| !command.is_empty())
+                .ok_or_else(|| format!("ACP MCP server '{}' has invalid command", server.name))?
+                .to_string();
+            let mut env = HashMap::new();
+            for variable in server.env {
+                if variable.name.is_empty()
+                    || env.insert(variable.name.clone(), variable.value).is_some()
+                {
+                    return Err(format!(
+                        "ACP MCP server '{}' has invalid or duplicate environment name",
+                        server.name
+                    ));
+                }
+            }
+            Ok(McpServerConfig {
+                name: server.name,
+                transport: McpTransportKind::Stdio,
+                command: Some(command),
+                args: server.args,
+                url: None,
+                env,
+                headers: HashMap::new(),
+                disabled: false,
+                startup_timeout_ms: None,
+                tool_timeout_ms: None,
+            })
+        }
+        McpServer::Sse(server) => {
+            validate_mcp_name(&server.name)?;
+            CanonicalUri::try_new(server.url.clone()).map_err(|error| {
+                format!(
+                    "ACP MCP server '{}' has invalid SSE URL: {error:?}",
+                    server.name
+                )
+            })?;
+            if !matches!(
+                server.url.split_once(':').map(|(scheme, _)| scheme),
+                Some("http" | "https")
+            ) {
+                return Err(format!(
+                    "ACP MCP server '{}' SSE URL must use http or https",
+                    server.name
+                ));
+            }
+            let mut headers = HashMap::new();
+            for header in server.headers {
+                let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+                    .map_err(|_| {
+                        format!("ACP MCP server '{}' has invalid header name", server.name)
+                    })?
+                    .as_str()
+                    .to_string();
+                reqwest::header::HeaderValue::from_bytes(header.value.as_bytes()).map_err(
+                    |_| format!("ACP MCP server '{}' has invalid header value", server.name),
+                )?;
+                if headers.insert(name, header.value).is_some() {
+                    return Err(format!(
+                        "ACP MCP server '{}' has duplicate header name",
+                        server.name
+                    ));
+                }
+            }
+            Ok(McpServerConfig {
+                name: server.name,
+                transport: McpTransportKind::Sse,
+                command: None,
+                args: Vec::new(),
+                url: Some(server.url),
+                env: HashMap::new(),
+                headers,
+                disabled: false,
+                startup_timeout_ms: None,
+                tool_timeout_ms: None,
+            })
+        }
+        McpServer::Http(server) => Err(format!(
+            "HTTP MCP transport is not supported for ACP server '{}'",
+            server.name
+        )),
+        _ => Err("unsupported ACP MCP transport".to_string()),
+    }
+}
+
+fn validate_mcp_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        Err("ACP MCP server name cannot be empty".to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -1372,12 +1542,21 @@ fn cancel_surface_operation(prepared: &PreparedSurfacePrompt) -> Result<(), Stri
 #[async_trait::async_trait(?Send)]
 impl Agent for OrcaAcpAgent {
     async fn initialize(&self, _args: InitializeRequest) -> Result<InitializeResponse, Error> {
-        Ok(InitializeResponse::new(ProtocolVersion::V1)
-            .agent_capabilities(AgentCapabilities::new().load_session(true))
-            .agent_info(
-                Implementation::new("orca", self.base_config.app_version.clone())
-                    .title("Orca".to_string()),
-            ))
+        Ok(
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(
+                    AgentCapabilities::new()
+                        .load_session(true)
+                        .mcp_capabilities(McpCapabilities::new().sse(true))
+                        .session_capabilities(SessionCapabilities::new().additional_directories(
+                            SessionAdditionalDirectoriesCapabilities::new(),
+                        )),
+                )
+                .agent_info(
+                    Implementation::new("orca", self.base_config.app_version.clone())
+                        .title("Orca".to_string()),
+                ),
+        )
     }
 
     async fn authenticate(
@@ -1388,7 +1567,9 @@ impl Agent for OrcaAcpAgent {
     }
 
     async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        let config = self.build_session_config(args.cwd);
+        let config = self
+            .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
+            .map_err(|message| Error::invalid_params().data(message))?;
         let surface_host = self.surface_host.clone();
         let thread =
             tokio::task::spawn_blocking(move || surface_host.start_thread(config, "ACP session"))
@@ -1426,11 +1607,17 @@ impl Agent for OrcaAcpAgent {
         .await
         .map_err(Error::into_internal_error)?
         .map_err(Error::into_internal_error)?;
+        if PathBuf::from(&transcript.meta.cwd) != args.cwd {
+            return Err(Error::invalid_params().data("ACP load cwd does not match saved session"));
+        }
 
-        let mut config = self.build_session_config(args.cwd);
+        let mut config = self
+            .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
+            .map_err(|message| Error::invalid_params().data(message))?;
         config.history_mode = HistoryMode::Resume(args.session_id.to_string());
-        let request =
-            RuntimeThreadStartRequest::new(config, "ACP session").with_preloaded(transcript);
+        let request = RuntimeThreadStartRequest::new(config, "ACP session")
+            .with_preloaded(transcript)
+            .with_resume_scope_replacement();
         let surface_host = self.surface_host.clone();
         let thread =
             tokio::task::spawn_blocking(move || surface_host.start_thread_with_request(request))
@@ -1523,6 +1710,9 @@ mod tests {
         ToolInvocationStarted, ToolTerminalSource,
     };
     use crate::thread::RuntimeThread;
+    use agent_client_protocol::{
+        EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
+    };
     use orca_core::approval_types::ApprovalMode;
     use orca_core::cancel::CancelToken;
     use orca_core::config::{
@@ -1633,6 +1823,135 @@ mod tests {
         ))])
         .expect_err("image content lacks a frozen runtime mapping");
         assert!(error.contains("unsupported ACP prompt content block: image"));
+    }
+
+    #[test]
+    fn acp_session_declarations_map_supported_mcp_and_canonical_roots() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let extra = tempfile::tempdir().expect("additional directory");
+        let mut base = test_run_config(cwd.path().to_path_buf());
+        base.mcp_servers.clear();
+        base.additional_working_directories.clear();
+        base.runtime_workspace_roots = None;
+
+        let config = build_acp_session_config(
+            base,
+            cwd.path().to_path_buf(),
+            vec![
+                McpServer::Stdio(
+                    McpServerStdio::new("stdio", "/usr/bin/example")
+                        .args(vec!["--stdio".to_string()])
+                        .env(vec![EnvVariable::new("TOKEN", "secret")]),
+                ),
+                McpServer::Sse(
+                    McpServerSse::new("sse", "https://example.test/mcp")
+                        .headers(vec![HttpHeader::new("Authorization", "Bearer secret")]),
+                ),
+            ],
+            vec![extra.path().to_path_buf()],
+        )
+        .expect("supported session declarations");
+
+        assert_eq!(
+            config.runtime_workspace_roots,
+            Some(vec![cwd.path().to_path_buf(), extra.path().to_path_buf()])
+        );
+        assert_eq!(config.additional_working_directories.len(), 1);
+        assert_eq!(config.additional_working_directories[0].path, extra.path());
+        assert_eq!(config.additional_working_directories[0].source, "acp");
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert_eq!(config.mcp_servers[0].name, "stdio");
+        assert_eq!(
+            config.mcp_servers[0].command.as_deref(),
+            Some("/usr/bin/example")
+        );
+        assert_eq!(
+            config.mcp_servers[0].env.get("TOKEN").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(config.mcp_servers[1].name, "sse");
+        assert_eq!(
+            config.mcp_servers[1].url.as_deref(),
+            Some("https://example.test/mcp")
+        );
+        assert_eq!(
+            config.mcp_servers[1]
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer secret")
+        );
+    }
+
+    #[test]
+    fn acp_session_declarations_reject_unsupported_or_ambiguous_scope() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let relative = PathBuf::from("relative-root");
+        let base = test_run_config(cwd.path().to_path_buf());
+        assert!(
+            build_acp_session_config(
+                base.clone(),
+                cwd.path().to_path_buf(),
+                Vec::new(),
+                vec![relative],
+            )
+            .expect_err("relative additional directory must fail")
+            .contains("additional directory")
+        );
+        assert!(
+            build_acp_session_config(
+                base.clone(),
+                cwd.path().to_path_buf(),
+                vec![McpServer::Http(McpServerHttp::new(
+                    "http",
+                    "https://example.test/mcp",
+                ))],
+                Vec::new(),
+            )
+            .expect_err("HTTP MCP transport is not supported")
+            .contains("HTTP MCP transport")
+        );
+        assert!(
+            build_acp_session_config(
+                base.clone(),
+                cwd.path().to_path_buf(),
+                vec![McpServer::Stdio(McpServerStdio::new(
+                    "relative-command",
+                    "mcp-server",
+                ))],
+                Vec::new(),
+            )
+            .expect_err("relative executable must fail")
+            .contains("absolute command")
+        );
+        assert!(
+            build_acp_session_config(
+                base.clone(),
+                cwd.path().to_path_buf(),
+                vec![
+                    McpServer::Stdio(McpServerStdio::new("a-b", "/usr/bin/true")),
+                    McpServer::Stdio(McpServerStdio::new("a_b", "/usr/bin/true")),
+                ],
+                Vec::new(),
+            )
+            .expect_err("canonical MCP names must be unique")
+            .contains("duplicate ACP MCP server")
+        );
+        assert!(
+            build_acp_session_config(
+                base,
+                cwd.path().to_path_buf(),
+                vec![McpServer::Sse(
+                    McpServerSse::new("headers", "https://example.test/mcp").headers(vec![
+                        HttpHeader::new("Authorization", "first"),
+                        HttpHeader::new("authorization", "second"),
+                    ]),
+                )],
+                Vec::new(),
+            )
+            .expect_err("header names are case-insensitive")
+            .contains("duplicate header name")
+        );
     }
 
     #[test]
