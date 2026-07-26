@@ -15244,6 +15244,30 @@ impl ThreadActor {
             }
             _ => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
         };
+        if matches!(
+            intent.correlation,
+            surface::OperationIngressCorrelation::AcpPrompt { .. }
+        ) && input_request.blocks.as_slice().iter().any(|block| {
+            matches!(
+                block,
+                surface::SurfaceInputRequestBlock::ResourceLink { .. }
+            )
+        }) {
+            return Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid {
+                    request_id,
+                    target: None,
+                    error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                        code: surface::SurfaceMutationErrorCode::UnsupportedContent,
+                        message: surface::DisplayText::new(
+                            "ACP resource links require a runtime-owned read capability route",
+                        ),
+                        winning_request_id: None,
+                        current_revision: None,
+                    }),
+                },
+            });
+        }
         let snapshot = self.resident_surface.coordinator.state().snapshot();
         let settings = &snapshot.settings;
         let (expected_settings_revision, expected_policy_epoch) = match &intent.settings_preparation

@@ -59,13 +59,14 @@ mod runtime_surface;
 pub mod surface {
     pub use crate::runtime_surface::{
         AcpRequestId, AdmissionOutput, AssistantChannel, AssistantPatch, AttachResult,
-        BackgroundTarget, ByteCount, ByteOffset, CancelOperationOutput, CanonicalPath, CommitClass,
-        CompactionReason, CompactionState, ContextRevision, CursorSourceRevision,
-        DeferredCommandValue, DetachRequest, DetachResult, DisplayText, DurableRevision,
-        ExpectedGoal, FailureClass, FreshAttachRequest, FreshSurfaceAttachment, GoalMutationAction,
-        GoalMutationOutput, GoalPatch, GoalRunInput, GoalTokenBudgetUpdate, InteractionPatch,
-        LegacyTurnId, MaintenanceOperationOutput, MutationDisposition, MutationReply, NonEmptyText,
-        NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
+        BackgroundTarget, ByteCount, ByteOffset, CancelOperationOutput, CanonicalMime,
+        CanonicalPath, CanonicalUri, CommitClass, CompactionReason, CompactionState,
+        ContextRevision, CursorSourceRevision, DeferredCommandValue, DetachRequest, DetachResult,
+        DisplayText, DurableRevision, ExpectedGoal, FailureClass, FreshAttachRequest,
+        FreshSurfaceAttachment, GoalMutationAction, GoalMutationOutput, GoalPatch, GoalRunInput,
+        GoalTokenBudgetUpdate, InteractionPatch, LegacyTurnId, MaintenanceOperationOutput,
+        MutationDisposition, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
+        OperationBudget, OperationIngressCorrelation, OperationKind, OperationPatch,
         OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
         PermissionGrantScope, PinnedContextAction, PinnedContextMutationOutput, PinnedContextPatch,
         PinnedContextRevision, PinnedContextSourceRevision, PinnedUserRevision,
@@ -97,9 +98,9 @@ pub mod surface {
         SurfaceToolResultKind, SurfaceTurnId, SurfaceUnavailableReason, SurfaceUserInputDecision,
         SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus, SurfaceWorkflowRunId,
         SurfaceWorkflowStatus, TaskControlAction, TaskControlOutput, TaskPatch, ThreadOwnerEpoch,
-        ToolPatch, TransferBackgroundOutput, UnixMillis, UsageTotals, WaitOperationTerminalResult,
-        WorkflowCatalogRevision, WorkflowControlAction, WorkflowControlOutput, WorkflowPatch,
-        reduce_batch,
+        ToolPatch, TransferBackgroundOutput, TurnRequestBudgetScope, UncommittedMutation,
+        UnixMillis, UsageTotals, WaitOperationTerminalResult, WorkflowCatalogRevision,
+        WorkflowControlAction, WorkflowControlOutput, WorkflowPatch, reduce_batch,
     };
 }
 mod runtime_tool_actor;

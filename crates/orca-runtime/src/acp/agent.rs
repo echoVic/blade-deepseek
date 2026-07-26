@@ -13,28 +13,31 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ContentBlock, Error, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ContentBlock, EmbeddedResourceResource, Error, Implementation, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
+    SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use orca_core::config::{HistoryMode, RunConfig};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
 use crate::runtime_host::RuntimeThreadStartRequest;
 use crate::surface::{
-    AcpRequestId, AssistantPatch, AttachResult, DisplayText, FreshAttachRequest, MutationReply,
-    NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
+    AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalUri, DisplayText,
+    FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
+    OperationBudget, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
     OperationSettingsPreparation, OperationTerminal, PermissionGrantScope, ReplayabilityRequest,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
-    SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceClientInteractionAnswer,
-    SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceInteractionRequest, SurfaceInteractionView, SurfaceOperationId,
+    Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability,
+    SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock,
+    SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionView, SurfaceOperationId,
     SurfacePermissionClientDecision, SurfacePermissionProfile, SurfaceRequestId,
-    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch,
+    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch, TurnRequestBudgetScope,
+    UncommittedMutation,
 };
 
 use crate::runtime_surface::{
@@ -347,8 +350,8 @@ impl OrcaAcpAgent {
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.begin_session(&args.session_id);
         }
-        let prompt = match flatten_prompt(&args.prompt) {
-            Ok(prompt) => prompt,
+        let input = match decode_prompt_content(&args.prompt) {
+            Ok(input) => input,
             Err(message) => {
                 self.clear_prompt_binding(&args.session_id, &ready);
                 return Err(Error::invalid_params().data(message));
@@ -357,14 +360,14 @@ impl OrcaAcpAgent {
         let session_id = args.session_id.clone();
         let client_bridge = self.client_bridge.clone();
         let prepared = match tokio::task::spawn_blocking(move || {
-            prepare_surface_prompt(&surface, &session_id, &prompt, inbound_seq, client_bridge)
+            prepare_surface_prompt(&surface, &session_id, input, inbound_seq, client_bridge)
         })
         .await
         {
             Ok(Ok(prepared)) => prepared,
-            Ok(Err(message)) => {
+            Ok(Err(error)) => {
                 self.clear_prompt_binding(&args.session_id, &ready);
-                return Err(Error::internal_error().data(message));
+                return Err(error.into_protocol_error());
             }
             Err(error) => {
                 self.clear_prompt_binding(&args.session_id, &ready);
@@ -515,21 +518,64 @@ impl Drop for SurfaceAttachmentGuard<'_> {
     }
 }
 
-/// Flattens ACP content blocks into a single prompt string.
-///
-/// This adapter currently supports text prompts only. Unsupported blocks must
-/// be rejected explicitly so a client-provided resource or media block is
-/// never silently lost before the runtime operation is reserved.
-fn flatten_prompt(blocks: &[ContentBlock]) -> Result<String, String> {
-    let mut out = String::new();
+/// Decodes ACP prompt content into the closed runtime input algebra without
+/// flattening away block identity or order.
+fn decode_prompt_content(blocks: &[ContentBlock]) -> Result<SurfaceInputRequest, String> {
+    let mut decoded = Vec::with_capacity(blocks.len());
     for block in blocks {
         match block {
             ContentBlock::Text(text) => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(&text.text);
+                decoded.push(SurfaceInputRequestBlock::Text {
+                    text: DisplayText::new(text.text.clone()),
+                });
             }
+            ContentBlock::ResourceLink(link) => {
+                let uri = CanonicalUri::try_new(link.uri.clone())
+                    .map_err(|error| format!("invalid ACP resource link URI: {error}"))?;
+                let name = NonEmptyText::try_new(link.name.clone())
+                    .map_err(|error| format!("invalid ACP resource link name: {error}"))?;
+                let mime = link
+                    .mime_type
+                    .as_ref()
+                    .map(|mime| {
+                        CanonicalMime::try_new(mime.clone())
+                            .map_err(|error| format!("invalid ACP resource link MIME: {error}"))
+                    })
+                    .transpose()?;
+                decoded.push(SurfaceInputRequestBlock::ResourceLink {
+                    uri,
+                    name,
+                    description: link.description.clone().map(DisplayText::new),
+                    mime,
+                });
+            }
+            ContentBlock::Resource(resource) => match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(resource) => {
+                    let mime = resource.mime_type.as_deref().unwrap_or("text/plain");
+                    if !mime.starts_with("text/") {
+                        return Err(format!("unsupported ACP embedded text MIME: {mime}"));
+                    }
+                    let uri = CanonicalUri::try_new(resource.uri.clone())
+                        .map_err(|error| format!("invalid ACP embedded resource URI: {error}"))?;
+                    let mime = CanonicalMime::try_new(mime.to_string())
+                        .map_err(|error| format!("invalid ACP embedded resource MIME: {error}"))?;
+                    let digest = Sha256Digest::new(Sha256::digest(resource.text.as_bytes()).into());
+                    decoded.push(SurfaceInputRequestBlock::EmbeddedText {
+                        uri,
+                        mime,
+                        text: DisplayText::new(resource.text.clone()),
+                        digest,
+                    });
+                }
+                EmbeddedResourceResource::BlobResourceContents(_) => {
+                    return Err("unsupported ACP prompt content block: embedded_blob".to_string());
+                }
+                _ => {
+                    return Err(
+                        "unsupported ACP prompt content block: embedded_resource".to_string()
+                    );
+                }
+            },
             _ => {
                 return Err(format!(
                     "unsupported ACP prompt content block: {}",
@@ -538,7 +584,9 @@ fn flatten_prompt(blocks: &[ContentBlock]) -> Result<String, String> {
             }
         }
     }
-    Ok(out)
+    let blocks = NonEmptyVec::try_new(decoded)
+        .map_err(|error| format!("invalid ACP prompt content: {error}"))?;
+    Ok(SurfaceInputRequest { blocks })
 }
 
 fn content_block_name(block: &ContentBlock) -> &'static str {
@@ -743,13 +791,36 @@ fn tool_status(kind: SurfaceToolResultKind) -> ToolCallStatus {
     }
 }
 
+#[derive(Debug)]
+enum AcpPromptPrepareError {
+    InvalidInput(String),
+    Internal(String),
+}
+
+impl AcpPromptPrepareError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::InvalidInput(message.into())
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
+    fn into_protocol_error(self) -> Error {
+        match self {
+            Self::InvalidInput(message) => Error::invalid_params().data(message),
+            Self::Internal(message) => Error::internal_error().data(message),
+        }
+    }
+}
+
 fn prepare_surface_prompt(
     surface: &RuntimeSurfaceHandle,
     session_id: &SessionId,
-    prompt: &str,
+    input: SurfaceInputRequest,
     inbound_seq: u64,
     client_bridge: Option<Arc<AcpClientBridge>>,
-) -> Result<PreparedSurfacePrompt, String> {
+) -> Result<PreparedSurfacePrompt, AcpPromptPrepareError> {
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
         role: SurfaceAttachmentRole::Acp,
@@ -765,36 +836,42 @@ fn prepare_surface_prompt(
         ]),
     }) {
         AttachResult::FreshAttached { attachment } => attachment,
-        AttachResult::Denied { .. } => return Err("ACP surface attachment denied".to_string()),
+        AttachResult::Denied { .. } => {
+            return Err(AcpPromptPrepareError::internal(
+                "ACP surface attachment denied",
+            ));
+        }
         AttachResult::CursorAttached { .. }
         | AttachResult::SnapshotRequired { .. }
         | AttachResult::InvalidCursor { .. }
         | AttachResult::ThreadClosed { .. }
         | AttachResult::Unavailable { .. } => {
-            return Err("ACP surface attachment unavailable".to_string());
+            return Err(AcpPromptPrepareError::internal(
+                "ACP surface attachment unavailable",
+            ));
         }
     };
     let mut cleanup = SurfaceAttachmentGuard::new(surface, attachment.client.clone());
     let subscription = surface
         .claim_subscription(&attachment.subscription)
-        .ok_or_else(|| "ACP surface subscription unavailable".to_string())?;
-    let session_id = NonEmptyText::try_new(session_id.to_string())
-        .map_err(|error| format!("invalid ACP session id: {error}"))?;
-    let input = NonEmptyVec::try_new(vec![SurfaceInputRequestBlock::Text {
-        text: DisplayText::new(prompt),
-    }])
-    .map_err(|error| format!("invalid ACP prompt: {error}"))?;
+        .ok_or_else(|| AcpPromptPrepareError::internal("ACP surface subscription unavailable"))?;
+    let session_id = NonEmptyText::try_new(session_id.to_string()).map_err(|error| {
+        AcpPromptPrepareError::invalid(format!("invalid ACP session id: {error}"))
+    })?;
     let intent = OperationRequestIntent {
         correlation: OperationIngressCorrelation::AcpPrompt {
             session_id,
             inbound_seq: SequenceNumber::new(inbound_seq),
             rpc_request_id: AcpRequestId::String(
-                NonEmptyText::try_new(format!("prompt-{}", uuid::Uuid::new_v4()))
-                    .map_err(|error| format!("invalid ACP request id: {error}"))?,
+                NonEmptyText::try_new(format!("prompt-{}", uuid::Uuid::new_v4())).map_err(
+                    |error| {
+                        AcpPromptPrepareError::invalid(format!("invalid ACP request id: {error}"))
+                    },
+                )?,
             ),
         },
         kind: OperationKind::UserTurn,
-        input: Some(SurfaceInputRequest { blocks: input }),
+        input: Some(input),
         replayability: ReplayabilityRequest::CaptureReplayableCapsule,
         settings_preparation: OperationSettingsPreparation::UseCurrent {
             expected_settings_revision: attachment.baseline.snapshot.settings.thread_revision,
@@ -804,11 +881,26 @@ fn prepare_surface_prompt(
     let reserved = match attachment
         .client
         .reserve_operation(SurfaceRequestId::new(), intent)
-        .map_err(|error| format!("ACP surface reserve failed: {error:?}"))?
-    {
+        .map_err(|error| {
+            AcpPromptPrepareError::internal(format!("ACP surface reserve failed: {error:?}"))
+        })? {
         MutationReply::Committed { value, .. } => value,
-        MutationReply::Deferred { .. } | MutationReply::Uncommitted { .. } => {
-            return Err("ACP surface reserve did not commit".to_string());
+        MutationReply::Deferred { .. } => {
+            return Err(AcpPromptPrepareError::internal(
+                "ACP surface reserve did not commit",
+            ));
+        }
+        MutationReply::Uncommitted { mutation } => {
+            let message = uncommitted_mutation_message(&mutation).to_string();
+            return Err(match mutation {
+                UncommittedMutation::Invalid { .. } | UncommittedMutation::Stale { .. } => {
+                    AcpPromptPrepareError::invalid(message)
+                }
+                UncommittedMutation::Unavailable { .. }
+                | UncommittedMutation::CommitFailed { .. } => {
+                    AcpPromptPrepareError::internal(message)
+                }
+            });
         }
     };
     let operation_id = reserved.operation_id.clone();
@@ -820,11 +912,14 @@ fn prepare_surface_prompt(
             operation_id.clone(),
             reserved.lease.lease_id,
         )
-        .map_err(|error| format!("ACP surface admission failed: {error:?}"))?
-    {
+        .map_err(|error| {
+            AcpPromptPrepareError::internal(format!("ACP surface admission failed: {error:?}"))
+        })? {
         MutationReply::Committed { .. } => {}
         MutationReply::Deferred { .. } | MutationReply::Uncommitted { .. } => {
-            return Err("ACP surface admission did not commit".to_string());
+            return Err(AcpPromptPrepareError::internal(
+                "ACP surface admission did not commit",
+            ));
         }
     }
     cleanup.disarm();
@@ -837,6 +932,15 @@ fn prepare_surface_prompt(
         tool_outputs: HashMap::new(),
         detached: false,
     })
+}
+
+fn uncommitted_mutation_message(mutation: &UncommittedMutation) -> &str {
+    match mutation {
+        UncommittedMutation::Invalid { error, .. } => error.error().message.as_str(),
+        UncommittedMutation::Stale { error, .. } => error.error().message.as_str(),
+        UncommittedMutation::Unavailable { error, .. } => error.error().message.as_str(),
+        UncommittedMutation::CommitFailed { error, .. } => error.error().message.as_str(),
+    }
 }
 
 #[derive(Clone)]
@@ -1062,7 +1166,22 @@ fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, S
     match terminal {
         OperationTerminal::Succeeded { .. } => Ok(StopReason::EndTurn),
         OperationTerminal::Cancelled { .. } => Ok(StopReason::Cancelled),
-        OperationTerminal::BudgetExhausted { .. } => Ok(StopReason::MaxTokens),
+        OperationTerminal::BudgetExhausted {
+            budget: OperationBudget::ModelTokens { .. },
+        } => Ok(StopReason::MaxTokens),
+        OperationTerminal::BudgetExhausted {
+            budget:
+                OperationBudget::TurnRequests {
+                    scope: TurnRequestBudgetScope::AgentLoop,
+                    ..
+                },
+        } => Ok(StopReason::MaxTurnRequests),
+        OperationTerminal::BudgetExhausted { budget } => {
+            Err(format!("ACP budget exhausted: {budget:?}"))
+        }
+        OperationTerminal::NotAdmitted {
+            reason: NotAdmittedReason::CancelledBeforeAdmission,
+        } => Ok(StopReason::Cancelled),
         OperationTerminal::NotAdmitted { reason } => {
             Err(format!("ACP operation was not admitted: {reason:?}"))
         }
@@ -1072,9 +1191,7 @@ fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, S
         OperationTerminal::AbortedByRuntimeRestart { .. } => {
             Err("ACP operation aborted by runtime restart".to_string())
         }
-        OperationTerminal::Shutdown { reason } => {
-            Err(format!("ACP operation shut down: {reason:?}"))
-        }
+        OperationTerminal::Shutdown { .. } => Ok(StopReason::Cancelled),
     }
 }
 
@@ -1452,6 +1569,126 @@ mod tests {
     }
 
     #[test]
+    fn prompt_content_decodes_supported_blocks_in_original_order() {
+        use agent_client_protocol::{
+            EmbeddedResource, EmbeddedResourceResource, ResourceLink, TextResourceContents,
+        };
+
+        let blocks = vec![
+            ContentBlock::from("first".to_string()),
+            ContentBlock::ResourceLink(
+                ResourceLink::new("notes", "file:///workspace/notes.txt")
+                    .description("notes description")
+                    .mime_type("text/plain"),
+            ),
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(
+                    TextResourceContents::new("embedded", "file:///workspace/context.txt")
+                        .mime_type("text/markdown"),
+                ),
+            )),
+            ContentBlock::from("last".to_string()),
+        ];
+
+        let decoded = decode_prompt_content(&blocks).expect("supported ACP prompt content");
+        let decoded = decoded.blocks.as_slice();
+        assert_eq!(decoded.len(), 4);
+        assert!(matches!(
+            &decoded[0],
+            SurfaceInputRequestBlock::Text { text } if text.as_str() == "first"
+        ));
+        assert!(matches!(
+            &decoded[1],
+            SurfaceInputRequestBlock::ResourceLink {
+                uri,
+                name,
+                description: Some(description),
+                mime: Some(mime),
+            } if uri.as_str() == "file:///workspace/notes.txt"
+                && name.as_str() == "notes"
+                && description.as_str() == "notes description"
+                && mime.as_str() == "text/plain"
+        ));
+        assert!(matches!(
+            &decoded[2],
+            SurfaceInputRequestBlock::EmbeddedText {
+                uri,
+                mime,
+                text,
+                ..
+            } if uri.as_str() == "file:///workspace/context.txt"
+                && mime.as_str() == "text/markdown"
+                && text.as_str() == "embedded"
+        ));
+        assert!(matches!(
+            &decoded[3],
+            SurfaceInputRequestBlock::Text { text } if text.as_str() == "last"
+        ));
+    }
+
+    #[test]
+    fn prompt_content_rejects_binary_blocks_before_surface_reservation() {
+        use agent_client_protocol::ImageContent;
+
+        let error = decode_prompt_content(&[ContentBlock::Image(ImageContent::new(
+            "base64-payload",
+            "image/png",
+        ))])
+        .expect_err("image content lacks a frozen runtime mapping");
+        assert!(error.contains("unsupported ACP prompt content block: image"));
+    }
+
+    #[test]
+    fn terminal_mapping_preserves_only_exact_standard_stop_reasons() {
+        use crate::runtime_surface::{
+            NotAdmittedReason, OperationBudget, SurfaceShutdownReason, TurnRequestBudgetScope,
+        };
+
+        assert_eq!(
+            terminal_to_stop_reason(&OperationTerminal::BudgetExhausted {
+                budget: OperationBudget::ModelTokens {
+                    limit: Some(100),
+                    observed: Some(100),
+                },
+            }),
+            Ok(StopReason::MaxTokens)
+        );
+        assert_eq!(
+            terminal_to_stop_reason(&OperationTerminal::BudgetExhausted {
+                budget: OperationBudget::TurnRequests {
+                    scope: TurnRequestBudgetScope::AgentLoop,
+                    limit: 8,
+                    observed: 8,
+                },
+            }),
+            Ok(StopReason::MaxTurnRequests)
+        );
+        assert!(
+            terminal_to_stop_reason(&OperationTerminal::BudgetExhausted {
+                budget: OperationBudget::TurnRequests {
+                    scope: TurnRequestBudgetScope::Subagent,
+                    limit: 4,
+                    observed: 4,
+                },
+            })
+            .expect_err("subagent budget is not the ACP agent-loop turn limit")
+            .contains("Subagent")
+        );
+        assert_eq!(
+            terminal_to_stop_reason(&OperationTerminal::NotAdmitted {
+                reason: NotAdmittedReason::CancelledBeforeAdmission,
+            }),
+            Ok(StopReason::Cancelled)
+        );
+        assert_eq!(
+            terminal_to_stop_reason(&OperationTerminal::Shutdown {
+                reason: SurfaceShutdownReason::HostShutdown,
+            }),
+            Ok(StopReason::Cancelled)
+        );
+    }
+
+    #[test]
     fn permission_cancel_before_registration_is_not_lost() {
         let (bridge, _requests) = AcpClientBridge::new();
         let session_id = SessionId::new("cancel-before-register");
@@ -1519,9 +1756,10 @@ mod tests {
                 .join()
                 .unwrap();
         let surface = thread.acp_surface().expect("ACP surface");
+        let input = decode_prompt_content(&[ContentBlock::from("complete".to_string())])
+            .expect("decode typed prompt");
         let mut prepared =
-            prepare_surface_prompt(&surface, &SessionId::new("reconcile"), "complete", 1, None)
-                .unwrap();
+            prepare_surface_prompt(&surface, &SessionId::new("reconcile"), input, 1, None).unwrap();
         let operation_id = prepared.operation_id.clone();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1588,9 +1826,10 @@ mod tests {
                 .join()
                 .unwrap();
         let surface = thread.acp_surface().expect("ACP surface");
+        let input = decode_prompt_content(&[ContentBlock::from("complete".to_string())])
+            .expect("decode typed prompt");
         let mut prepared =
-            prepare_surface_prompt(&surface, &SessionId::new("sealed"), "complete", 1, None)
-                .unwrap();
+            prepare_surface_prompt(&surface, &SessionId::new("sealed"), input, 1, None).unwrap();
         let operation_id = prepared.operation_id.clone();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use agent_client_protocol::{
     Agent, AgentSideConnection, CancelNotification, Client, ClientSideConnection, ContentBlock,
-    Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResourceLink, SessionId, SessionNotification, SessionUpdate, StopReason,
+    EmbeddedResource, EmbeddedResourceResource, ImageContent, Implementation, InitializeRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+    SessionId, SessionNotification, SessionUpdate, StopReason, TextResourceContents,
 };
 use orca_core::cancel::CancelToken;
 use orca_core::config::{
@@ -250,6 +251,7 @@ struct AcpTestExecutor {
     behaviors: Mutex<Vec<TestBehavior>>,
     calls: AtomicUsize,
     working_directories: Mutex<Vec<Option<PathBuf>>>,
+    prompts: Mutex<Vec<String>>,
 }
 
 impl AcpTestExecutor {
@@ -258,6 +260,7 @@ impl AcpTestExecutor {
             behaviors: Mutex::new(behaviors),
             calls: AtomicUsize::new(0),
             working_directories: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
         }
     }
 
@@ -267,6 +270,10 @@ impl AcpTestExecutor {
 
     fn working_directories(&self) -> Vec<Option<PathBuf>> {
         self.working_directories.lock().unwrap().clone()
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
     }
 }
 
@@ -285,6 +292,10 @@ impl ThreadOperationExecutor for AcpTestExecutor {
             .lock()
             .unwrap()
             .push(generation.config().cwd.clone());
+        self.prompts
+            .lock()
+            .unwrap()
+            .push(request.prompt().to_string());
         let behavior = self.behaviors.lock().unwrap().remove(0);
         match behavior {
             TestBehavior::EmitMessageAndComplete { message } => {
@@ -445,7 +456,59 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
 }
 
 #[test]
-fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
+fn acp_typed_prompt_preserves_supported_content_for_runtime_ingress() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![
+        TestBehavior::EmitMessageAndComplete {
+            message: "content accepted".to_string(),
+        },
+    ]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let response = local.block_on(&rt, async {
+        let session = agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![
+                    ContentBlock::from("first".to_string()),
+                    ContentBlock::Resource(EmbeddedResource::new(
+                        EmbeddedResourceResource::TextResourceContents(
+                            TextResourceContents::new("embedded", "file:///workspace/context.txt")
+                                .mime_type("text/plain"),
+                        ),
+                    )),
+                    ContentBlock::from("last".to_string()),
+                ],
+            ))
+            .await
+            .expect("supported content prompt")
+    });
+
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert_eq!(executor.call_count(), 1);
+    assert_eq!(executor.prompts(), vec!["first\nembedded\nlast"]);
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_resource_link_fails_closed_before_runtime_capability_route_exists() {
     let _home = OrcaHomeGuard::new();
     let base_cwd = tempfile::tempdir().unwrap();
     let session_cwd = tempfile::tempdir().unwrap();
@@ -473,11 +536,52 @@ fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
                 session.session_id,
                 vec![ContentBlock::ResourceLink(ResourceLink::new(
                     "notes",
-                    "file:///tmp/notes.txt",
+                    "file:///workspace/notes.txt",
                 ))],
             ))
             .await
-            .expect_err("unsupported resource prompt must fail")
+            .expect_err("resource link must fail closed without runtime capability route")
+    });
+
+    assert_eq!(executor.call_count(), 0);
+    assert!(format!("{error:?}").contains("runtime-owned read capability route"));
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
+fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
+    let _home = OrcaHomeGuard::new();
+    let base_cwd = tempfile::tempdir().unwrap();
+    let session_cwd = tempfile::tempdir().unwrap();
+    let executor = Arc::new(AcpTestExecutor::new(vec![]));
+    let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(base_cwd.path().to_path_buf()),
+        note_tx,
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let error = local.block_on(&rt, async {
+        let session = agent
+            .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
+            .await
+            .expect("new_session");
+        agent
+            .prompt(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::Image(ImageContent::new(
+                    "base64-payload",
+                    "image/png",
+                ))],
+            ))
+            .await
+            .expect_err("unsupported image prompt must fail")
     });
 
     assert_eq!(executor.call_count(), 0);
