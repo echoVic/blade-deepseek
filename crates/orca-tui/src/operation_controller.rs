@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{
@@ -46,6 +47,7 @@ impl TuiSurfaceTaskControl {
 #[derive(Debug, Default)]
 struct HostedOperationState {
     inner: Mutex<HostedOperationInner>,
+    surface_presentation_transition: Mutex<()>,
     changed: Condvar,
 }
 
@@ -53,6 +55,7 @@ struct HostedOperationState {
 struct HostedOperationInner {
     active: Option<Arc<OperationHandle>>,
     surface_active: Option<SurfaceActiveOperation>,
+    surface_presentation_tasks: Vec<SurfacePresentationTask>,
     surface_activation_armed: bool,
     interrupt_requested: bool,
     background_requested: bool,
@@ -60,6 +63,24 @@ struct HostedOperationInner {
         HashMap<orca_runtime::surface::SurfaceOperationId, TuiStreamDeliveryWatermark>,
     surface_terminal_deliveries: HashSet<orca_runtime::surface::SurfaceOperationId>,
     shutdown: bool,
+}
+
+#[derive(Debug)]
+struct SurfacePresentationTask {
+    operation_id: orca_runtime::surface::SurfaceOperationId,
+    cancelled: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SurfacePresentationCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SurfacePresentationCancellation {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 impl TuiOperationController {
@@ -188,12 +209,23 @@ impl TuiOperationController {
     }
 
     pub(crate) fn shutdown(&self) {
-        let hosted = {
+        let _presentation_transition = self
+            .hosted
+            .surface_presentation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (hosted, surface_presentation_tasks) = {
             let mut hosted = self.lock_hosted();
             hosted.shutdown = true;
             hosted.surface_delivery_watermarks.clear();
             hosted.surface_terminal_deliveries.clear();
-            hosted.active.clone()
+            for task in &hosted.surface_presentation_tasks {
+                task.cancelled.store(true, Ordering::Release);
+            }
+            (
+                hosted.active.clone(),
+                std::mem::take(&mut hosted.surface_presentation_tasks),
+            )
         };
         if let Some(operation) = hosted {
             let _ = operation.interrupt();
@@ -201,6 +233,9 @@ impl TuiOperationController {
         self.surface_task_control().cancel_surface_and_notify();
         self.broker.shutdown();
         *self.lock_background_current() = None;
+        for task in surface_presentation_tasks {
+            let _ = task.handle.join();
+        }
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
@@ -478,7 +513,95 @@ impl TuiSurfaceTaskControl {
         self.lock_hosted().shutdown
     }
 
-    pub(crate) fn take_surface_background_current(
+    pub(crate) fn spawn_surface_presentation(
+        &self,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+        name: &str,
+        task: impl FnOnce(SurfacePresentationCancellation) + Send + 'static,
+    ) -> io::Result<()> {
+        let _transition = self
+            .hosted
+            .surface_presentation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let completed = {
+            let mut hosted = self.lock_hosted();
+            if hosted.shutdown {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "TUI surface task control is shutting down",
+                ));
+            }
+            let mut completed = Vec::new();
+            let mut running = Vec::with_capacity(hosted.surface_presentation_tasks.len());
+            for presentation in hosted.surface_presentation_tasks.drain(..) {
+                if presentation.operation_id == operation_id || presentation.handle.is_finished() {
+                    presentation.cancelled.store(true, Ordering::Release);
+                    completed.push(presentation.handle);
+                } else {
+                    running.push(presentation);
+                }
+            }
+            hosted.surface_presentation_tasks = running;
+            completed
+        };
+        for task in completed {
+            let _ = task.join();
+        }
+        let mut hosted = self.lock_hosted();
+        if hosted.shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "TUI surface task control is shutting down",
+            ));
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = SurfacePresentationCancellation {
+            cancelled: Arc::clone(&cancelled),
+        };
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || task(cancellation))?;
+        hosted
+            .surface_presentation_tasks
+            .push(SurfacePresentationTask {
+                operation_id,
+                cancelled,
+                handle,
+            });
+        Ok(())
+    }
+
+    pub(crate) fn retire_surface_presentation(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        let _transition = self
+            .hosted
+            .surface_presentation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retired = {
+            let mut hosted = self.lock_hosted();
+            let mut retired = Vec::new();
+            let mut running = Vec::with_capacity(hosted.surface_presentation_tasks.len());
+            for presentation in hosted.surface_presentation_tasks.drain(..) {
+                if &presentation.operation_id == operation_id {
+                    presentation.cancelled.store(true, Ordering::Release);
+                    retired.push(presentation.handle);
+                } else {
+                    running.push(presentation);
+                }
+            }
+            hosted.surface_presentation_tasks = running;
+            retired
+        };
+        for task in retired {
+            let _ = task.join();
+        }
+    }
+
+    pub(crate) fn begin_surface_background_handoff(
         &self,
         operation_id: &orca_runtime::surface::SurfaceOperationId,
     ) -> bool {
@@ -490,7 +613,56 @@ impl TuiSurfaceTaskControl {
         else {
             return false;
         };
-        std::mem::take(&mut surface.background_requested)
+        if surface.background_handoff_pending || !std::mem::take(&mut surface.background_requested)
+        {
+            return false;
+        }
+        surface.background_handoff_pending = true;
+        true
+    }
+
+    pub(crate) fn commit_surface_background_handoff(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) -> bool {
+        let mut hosted = self.lock_hosted();
+        let committed = hosted.surface_active.as_ref().is_some_and(|surface| {
+            &surface.operation_id == operation_id && surface.background_handoff_pending
+        });
+        if committed {
+            hosted.surface_active = None;
+            hosted.surface_activation_armed = false;
+            hosted.interrupt_requested = false;
+        }
+        drop(hosted);
+        self.hosted.changed.notify_all();
+        committed
+    }
+
+    pub(crate) fn rollback_surface_background_handoff(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        let cancel = {
+            let mut hosted = self.lock_hosted();
+            let should_cancel = hosted.shutdown || hosted.interrupt_requested;
+            let Some(surface) = hosted
+                .surface_active
+                .as_mut()
+                .filter(|surface| &surface.operation_id == operation_id)
+            else {
+                return;
+            };
+            if !surface.background_handoff_pending {
+                return;
+            }
+            surface.background_handoff_pending = false;
+            should_cancel.then(|| (surface.client.clone(), surface.operation_id.clone()))
+        };
+        if let Some((client, operation_id)) = cancel {
+            let _ = client
+                .cancel_operation(orca_runtime::surface::SurfaceRequestId::new(), operation_id);
+        }
     }
 
     fn cancel_surface_and_notify(&self) {
@@ -521,6 +693,7 @@ impl TuiSurfaceTaskControl {
         operation_id: orca_runtime::surface::SurfaceOperationId,
         goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
     ) -> io::Result<()> {
+        self.retire_surface_presentation(&operation_id);
         let (interrupt_requested, background_requested) = {
             let mut hosted = self.lock_hosted();
             if hosted.shutdown {
@@ -541,6 +714,7 @@ impl TuiSurfaceTaskControl {
                 ui_operation_id: self.surface_ids.allocate(),
                 interactions: HashMap::new(),
                 background_requested,
+                background_handoff_pending: false,
             });
             let requested = hosted.interrupt_requested;
             hosted.surface_activation_armed = false;
@@ -896,6 +1070,7 @@ struct SurfaceActiveOperation {
     ui_operation_id: OperationId,
     interactions: HashMap<TuiInteractionKey, SurfaceInteractionBinding>,
     background_requested: bool,
+    background_handoff_pending: bool,
 }
 
 #[derive(Clone)]
@@ -916,9 +1091,14 @@ impl std::fmt::Debug for SurfaceActiveOperation {
 }
 
 fn cancel_surface_if_active(hosted: &mut HostedOperationInner) -> bool {
-    let Some(surface) = hosted.surface_active.clone() else {
+    let Some(surface) = hosted.surface_active.as_ref() else {
         return false;
     };
+    if surface.background_handoff_pending {
+        hosted.interrupt_requested = true;
+        return true;
+    }
+    let surface = surface.clone();
     let _ = surface.client.cancel_operation(
         orca_runtime::surface::SurfaceRequestId::new(),
         surface.operation_id,
@@ -961,6 +1141,9 @@ fn permission_kind(
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use super::TuiSurfaceTaskControl;
     use crate::test_support::HostedOperationHarness;
@@ -968,6 +1151,13 @@ mod tests {
     use orca_runtime::surface::{ByteOffset, SurfaceOperationId, SurfaceStreamId};
 
     use crate::surface_projection::TuiStreamDeliveryWatermark;
+
+    fn test_surface_operation_id(seed: u8) -> SurfaceOperationId {
+        let mut bytes = [seed; 16];
+        bytes[6] = 0x70 | (seed & 0x0f);
+        bytes[8] = 0x80 | (seed & 0x3f);
+        SurfaceOperationId::try_from_bytes(bytes).expect("surface operation id")
+    }
 
     #[test]
     fn completing_hosted_operation_clears_current_and_wakes_waiter() {
@@ -1013,6 +1203,178 @@ mod tests {
         assert!(controller.request_background_current());
         assert!(controller.take_background_current(operation.operation().id()));
         assert!(!controller.take_background_current(operation.operation().id()));
+    }
+
+    #[test]
+    fn shutdown_signals_and_joins_surface_presentation_tasks() {
+        let operation = HostedOperationHarness::start();
+        let controller = operation.controller().clone();
+        let surface_control = controller.surface_task_control();
+        let monitor_control = surface_control.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let monitor_exited = Arc::clone(&exited);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let operation_id = test_surface_operation_id(7);
+        surface_control
+            .spawn_surface_presentation(
+                operation_id.clone(),
+                "test-surface-presentation",
+                move |cancellation| {
+                    started_tx.send(()).expect("signal monitor start");
+                    while !cancellation.is_cancelled() && !monitor_control.is_shutdown() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    monitor_exited.store(true, Ordering::Release);
+                },
+            )
+            .expect("spawn supervised presentation");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("presentation monitor started");
+
+        controller.shutdown();
+
+        assert!(exited.load(Ordering::Acquire));
+        assert!(
+            surface_control
+                .spawn_surface_presentation(operation_id, "late-surface-presentation", |_| {},)
+                .is_err(),
+            "shutdown must reject unowned presentation tasks"
+        );
+    }
+
+    #[test]
+    fn replacement_surface_presentation_retires_the_same_operation_observer() {
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let operation_id = test_surface_operation_id(9);
+        let first_exited = Arc::new(AtomicBool::new(false));
+        let first_exited_task = Arc::clone(&first_exited);
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (first_cancelled_tx, first_cancelled_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .spawn_surface_presentation(
+                operation_id.clone(),
+                "first-surface-presentation",
+                move |cancellation| {
+                    first_started_tx.send(()).expect("first task started");
+                    while !cancellation.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    first_cancelled_tx
+                        .send(())
+                        .expect("first task observed cancellation");
+                    release_first_rx.recv().expect("release first presentation");
+                    first_exited_task.store(true, Ordering::Release);
+                },
+            )
+            .expect("first presentation");
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first presentation started");
+
+        let (replacement_started_tx, replacement_started_rx) = std::sync::mpsc::sync_channel(1);
+        let replacement_controller = controller.clone();
+        let replacement_operation_id = operation_id.clone();
+        let (replacement_result_tx, replacement_result_rx) = std::sync::mpsc::sync_channel(1);
+        let replacement = std::thread::spawn(move || {
+            let result = replacement_controller.spawn_surface_presentation(
+                replacement_operation_id,
+                "replacement-surface-presentation",
+                move |cancellation| {
+                    replacement_started_tx
+                        .send(())
+                        .expect("replacement task started");
+                    while !cancellation.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                },
+            );
+            replacement_result_tx
+                .send(result)
+                .expect("replacement result");
+        });
+
+        first_cancelled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first observer cancellation");
+        assert!(
+            replacement_started_rx.try_recv().is_err(),
+            "replacement must not start before the prior observer settles"
+        );
+        release_first_tx
+            .send(())
+            .expect("allow first observer to settle");
+        replacement_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement result")
+            .expect("replacement presentation");
+        replacement.join().expect("replacement spawner");
+
+        replacement_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement presentation started");
+        assert!(
+            first_exited.load(Ordering::Acquire),
+            "replacement must join the previous observer before returning"
+        );
+        controller.retire_surface_presentation(&operation_id);
+    }
+
+    #[test]
+    fn shutdown_waits_for_an_observer_already_being_retired() {
+        let operation = HostedOperationHarness::start();
+        let owner = operation.controller().clone();
+        let controller = owner.surface_task_control();
+        let operation_id = test_surface_operation_id(11);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .spawn_surface_presentation(
+                operation_id.clone(),
+                "retiring-surface-presentation",
+                move |cancellation| {
+                    started_tx.send(()).expect("observer started");
+                    while !cancellation.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    cancelled_tx.send(()).expect("observer saw cancellation");
+                    release_rx.recv().expect("release retiring observer");
+                },
+            )
+            .expect("spawn observer");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observer started");
+
+        let retiring_controller = controller.clone();
+        let retiring_operation_id = operation_id.clone();
+        let retire = std::thread::spawn(move || {
+            retiring_controller.retire_surface_presentation(&retiring_operation_id);
+        });
+        cancelled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observer entered retirement");
+
+        let (shutdown_done_tx, shutdown_done_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            owner.shutdown();
+            shutdown_done_tx.send(()).expect("shutdown result");
+        });
+        assert!(
+            shutdown_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "shutdown must wait for the transition owner to join the retiring observer"
+        );
+
+        release_tx.send(()).expect("settle retiring observer");
+        retire.join().expect("retire observer");
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown completed after retirement");
+        shutdown.join().expect("shutdown thread");
     }
 
     #[test]

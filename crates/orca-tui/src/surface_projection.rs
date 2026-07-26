@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 
+use orca_core::approval_types::ActionKind;
 use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::task_types::{
-    BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+    BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
@@ -828,6 +829,20 @@ impl TuiSurfaceProjection {
             .and_then(|operation| operation.terminal.as_ref())
             .and_then(|record| operation_terminal_status(&record.terminal))
     }
+
+    pub(crate) fn background_task_summary_for_operation(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<BackgroundTaskSummary> {
+        background_task_summary_for_operation(self.reducer_state.as_ref()?.snapshot(), operation_id)
+    }
+
+    pub(crate) fn workflow_task_summaries(&self) -> Vec<BackgroundTaskSummary> {
+        self.reducer_state
+            .as_ref()
+            .map(|state| workflow_task_summaries(state.snapshot()))
+            .unwrap_or_default()
+    }
 }
 
 pub(crate) fn workflow_task_summaries(
@@ -843,6 +858,7 @@ pub(crate) fn workflow_task_summaries(
                     .iter()
                     .find(|workflow| &workflow.workflow_run_id == run_id)
             });
+            let pending_tool_call = pending_tool_call_for_task(snapshot, task);
             BackgroundTaskSummary {
                 id: task.task_id.as_str().to_string(),
                 task_type: task_type(task.task_type),
@@ -855,8 +871,11 @@ pub(crate) fn workflow_task_summaries(
                 command: None,
                 agent_type: None,
                 server: None,
-                tool: workflow.map(|_| "workflow".to_string()),
-                pending_tool_call: None,
+                tool: pending_tool_call
+                    .as_ref()
+                    .map(|tool| tool.name.clone())
+                    .or_else(|| workflow.map(|_| "workflow".to_string())),
+                pending_tool_call,
                 name: workflow.map(|workflow| workflow.name.as_str().to_string()),
                 workflow_run_id: task
                     .workflow_run_id
@@ -927,6 +946,24 @@ pub(crate) fn workflow_task_summaries(
             }
         })
         .collect()
+}
+
+pub(crate) fn background_task_summary_for_operation(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    operation_id: &SurfaceOperationId,
+) -> Option<BackgroundTaskSummary> {
+    let task_id = snapshot
+        .tasks
+        .iter()
+        .find(|task| {
+            task.task_type == orca_runtime::surface::SurfaceTaskType::MainSession
+                && task.parent_operation.as_ref() == Some(operation_id)
+        })?
+        .task_id
+        .as_str();
+    workflow_task_summaries(snapshot)
+        .into_iter()
+        .find(|task| task.id == task_id)
 }
 
 fn workflow_progress(workflow: &SurfaceWorkflow) -> WorkflowTaskProgress {
@@ -1040,6 +1077,76 @@ fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
         SurfaceTaskStatus::Failed => TaskStatus::Failed,
         SurfaceTaskStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
         SurfaceTaskStatus::Cancelled => TaskStatus::Cancelled,
+    }
+}
+
+fn tool_action(action: orca_runtime::surface::SurfaceToolAction) -> ActionKind {
+    match action {
+        orca_runtime::surface::SurfaceToolAction::Read => ActionKind::Read,
+        orca_runtime::surface::SurfaceToolAction::Write => ActionKind::Write,
+        orca_runtime::surface::SurfaceToolAction::Network => ActionKind::Network,
+        orca_runtime::surface::SurfaceToolAction::Agent => ActionKind::Agent,
+        orca_runtime::surface::SurfaceToolAction::Shell => ActionKind::Shell,
+    }
+}
+
+fn pending_tool_call_for_task(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    task: &orca_runtime::surface::SurfaceTask,
+) -> Option<PendingToolCallSummary> {
+    if let Some(tool) = task
+        .pending_interaction_id
+        .as_ref()
+        .and_then(|interaction_id| {
+            snapshot
+                .interactions
+                .iter()
+                .find(|interaction| &interaction.interaction_id == interaction_id)
+                .and_then(|interaction| match &interaction.request {
+                    orca_runtime::surface::SurfaceInteractionRequest::BackgroundApproval {
+                        tool,
+                        ..
+                    } => Some(tool),
+                    _ => None,
+                })
+        })
+    {
+        return Some(pending_tool_call(tool));
+    }
+    if task.status != SurfaceTaskStatus::ApprovalRequired {
+        return None;
+    }
+    let operation = task.parent_operation.as_ref().and_then(|operation_id| {
+        snapshot
+            .operation_history
+            .iter()
+            .chain(snapshot.foreground_operation.iter())
+            .chain(snapshot.queued_operations.iter())
+            .find(|operation| &operation.operation_id == operation_id)
+    })?;
+    snapshot
+        .tools
+        .iter()
+        .find(|tool| {
+            tool.result.is_none()
+                && operation
+                    .agent_loop_turns
+                    .iter()
+                    .any(|turn| turn.turn_id == tool.request.turn_id)
+        })
+        .map(|tool| pending_tool_call(&tool.request))
+}
+
+fn pending_tool_call(tool: &orca_runtime::surface::SurfaceToolRequest) -> PendingToolCallSummary {
+    PendingToolCallSummary {
+        id: tool.tool_call_id.as_str().to_string(),
+        name: tool.name.as_str().to_string(),
+        action: tool_action(tool.action),
+        target: tool
+            .target
+            .as_ref()
+            .map(|target| target.as_str().to_string()),
+        arguments: tool.raw_arguments.as_str().to_string(),
     }
 }
 

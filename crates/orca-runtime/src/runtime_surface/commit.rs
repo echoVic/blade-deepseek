@@ -4492,30 +4492,53 @@ fn provider_background_stop_authorized(
     let [task_event, stop_event, finalization_event] = terminalization_events else {
         return false;
     };
-    let mut response_completed = 0usize;
+    let mut completed_response = None;
+    let mut tool_requests = Vec::new();
     for event in response_events {
-        let (
-            SurfaceScope::Background {
-                fence: response_scope,
-            },
-            super::SurfaceEvent::Assistant(patch),
-        ) = (&event.scope, &event.event)
+        let SurfaceScope::Background {
+            fence: response_scope,
+        } = &event.scope
         else {
             return false;
         };
         if response_scope != background_fence {
             return false;
         }
-        match patch {
-            super::AssistantPatch::Delta { .. } | super::AssistantPatch::StreamDiscarded { .. } => {
+        match &event.event {
+            super::SurfaceEvent::Assistant(
+                super::AssistantPatch::Delta { .. } | super::AssistantPatch::StreamDiscarded { .. },
+            ) if completed_response.is_none() => {}
+            super::SurfaceEvent::Assistant(super::AssistantPatch::ResponseCompleted {
+                response,
+            }) if completed_response.is_none() => {
+                completed_response = Some(response);
             }
-            super::AssistantPatch::ResponseCompleted { .. } => {
-                response_completed = response_completed.saturating_add(1);
+            super::SurfaceEvent::Tool(super::ToolPatch::Requested { request })
+                if completed_response.is_some() =>
+            {
+                tool_requests.push(request);
             }
             _ => return false,
         }
     }
-    if !response_events.is_empty() && response_completed != 1 {
+    if !response_events.is_empty() && completed_response.is_none() {
+        return false;
+    }
+    if let Some(response) = completed_response
+        && (response.tool_calls.len() != tool_requests.len()
+            || response
+                .tool_calls
+                .iter()
+                .zip(tool_requests.iter())
+                .any(|(raw, request)| {
+                    raw.id != request.tool_call_id
+                        || raw.name != request.name
+                        || raw.raw_arguments != request.raw_arguments
+                        || raw.arguments_digest != request.arguments_digest
+                        || request.source_response_id.as_ref() != Some(&response.response_id)
+                        || request.turn_id != response.turn_id
+                }))
+    {
         return false;
     }
     let (

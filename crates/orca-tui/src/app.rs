@@ -3730,7 +3730,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3796,7 +3796,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3862,7 +3862,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,
@@ -3933,7 +3933,7 @@ mod tests {
                 let preloaded = Arc::clone(&preloaded);
                 let cancel = cancel.clone();
                 move || {
-                    run_legacy_feature_tui_controller_for_test(
+                    run_hosted_tui_controller_for_test(
                         config,
                         preloaded,
                         event_tx,

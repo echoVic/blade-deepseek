@@ -10309,9 +10309,6 @@ impl ThreadActor {
         fence: &surface::SurfaceBackgroundFence,
         response: &crate::model_response::RuntimeModelResponse,
     ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
-        if !response.response.tool_calls.is_empty() {
-            return Ok(Vec::new());
-        }
         let completed = response.completed();
         let response_uuid = completed
             .identity
@@ -10395,13 +10392,72 @@ impl ThreadActor {
         }) {
             return Ok(Vec::new());
         }
+        let mut requests_by_id = HashMap::new();
+        for step in &response.response.steps {
+            if let ProviderStep::ToolCall(request) = step
+                && requests_by_id
+                    .insert(request.id.clone(), request.clone())
+                    .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "background provider response repeats a tool call id",
+                ));
+            }
+        }
+        if requests_by_id.len() != completed.tool_calls.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background provider response tool metadata is incomplete",
+            ));
+        }
+        let mut raw_tool_calls = Vec::with_capacity(completed.tool_calls.len());
+        let mut tool_requests = Vec::with_capacity(completed.tool_calls.len());
+        for raw_call in &completed.tool_calls {
+            let request = requests_by_id.get(&raw_call.id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "background provider response lacks the executable tool request",
+                )
+            })?;
+            let raw_arguments = request.raw_arguments.clone().unwrap_or_default();
+            if request.name.as_str() != raw_call.function_name
+                || raw_arguments != raw_call.arguments
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "background provider tool identity differs from executable request",
+                ));
+            }
+            let tool_call_id = surface::SurfaceToolCallId::try_new(raw_call.id.clone())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
+            let name = surface::NonEmptyText::try_new(raw_call.function_name.clone())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool name"))?;
+            let arguments_digest = surface_sha256(raw_call.arguments.as_bytes());
+            raw_tool_calls.push(surface::SurfaceRawToolCall {
+                id: tool_call_id.clone(),
+                name: name.clone(),
+                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
+                arguments_digest: arguments_digest.clone(),
+            });
+            tool_requests.push(surface::SurfaceToolRequest {
+                tool_call_id,
+                source_response_id: Some(response_id.clone()),
+                turn_id: completed.identity.turn_id.clone(),
+                name,
+                action: surface_tool_action(request.action),
+                target: request.target.clone().map(surface::DisplayText::new),
+                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
+                arguments_digest,
+            });
+        }
         let completed_response = surface::SurfaceCompletedModelResponse {
             response_id,
             turn_id: completed.identity.turn_id.clone(),
             message_item,
             reasoning_item,
             plan_item,
-            tool_calls: Vec::new(),
+            tool_calls: raw_tool_calls,
         };
         let scope = surface::SurfaceScope::Background {
             fence: fence.clone(),
@@ -10449,11 +10505,17 @@ impl ThreadActor {
             }
         }
         events.push((
-            scope,
+            scope.clone(),
             surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseCompleted {
                 response: completed_response,
             }),
         ));
+        events.extend(tool_requests.into_iter().map(|request| {
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }),
+            )
+        }));
         Ok(events)
     }
 
@@ -28237,6 +28299,24 @@ mod tests {
                     })
                 ));
                 assert_eq!(task.status, surface::SurfaceTaskStatus::ApprovalRequired);
+                let pending_tool = snapshot
+                    .tools
+                    .iter()
+                    .find(|tool| {
+                        tool.request.tool_call_id.as_str() == "mock-tool-1"
+                            && operation
+                                .agent_loop_turns
+                                .iter()
+                                .any(|turn| turn.turn_id == tool.request.turn_id)
+                    })
+                    .expect("approval recovery keeps its typed provider tool request");
+                assert_eq!(pending_tool.request.name.as_str(), "task_list");
+                assert_eq!(
+                    pending_tool.request.action,
+                    surface::SurfaceToolAction::Read
+                );
+                assert_eq!(pending_tool.request.raw_arguments.as_str(), "{}");
+                assert!(pending_tool.result.is_none());
             }
             _ => panic!("unknown durable provider outcome mode: {mode}"),
         }
