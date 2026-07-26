@@ -11,12 +11,14 @@ use orca_core::goal_runtime::{GoalNextAction, GoalPauseReason, GoalRecord, GoalT
 use orca_core::goal_types::ThreadGoal;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus};
 
+use super::SurfaceConnectionId;
 use super::{RuntimeSurfaceHandle, RuntimeSurfaceHostHandle};
 
 /// A thread-scoped typed surface entry point.
 #[derive(Clone)]
 pub struct RuntimeSurfaceThreadHandle {
     runtime: RuntimeThreadHandle,
+    connection_id: Option<SurfaceConnectionId>,
 }
 
 impl fmt::Debug for RuntimeSurfaceThreadHandle {
@@ -103,7 +105,9 @@ impl RuntimeSurfaceHostHandle {
             .as_ref()
             .ok_or(RuntimeHostError::HostUnavailable)?
             .start_thread_with_request(request)
-            .map(RuntimeSurfaceThreadHandle::from_runtime)
+            .map(|runtime| {
+                RuntimeSurfaceThreadHandle::from_runtime(runtime, self.connection_id().cloned())
+            })
     }
 }
 
@@ -122,8 +126,14 @@ fn with_saved_goal_runtime<T>(
 }
 
 impl RuntimeSurfaceThreadHandle {
-    fn from_runtime(runtime: RuntimeThreadHandle) -> Self {
-        Self { runtime }
+    fn from_runtime(
+        runtime: RuntimeThreadHandle,
+        connection_id: Option<SurfaceConnectionId>,
+    ) -> Self {
+        Self {
+            runtime,
+            connection_id,
+        }
     }
 
     pub fn thread_id(&self) -> &str {
@@ -139,7 +149,9 @@ impl RuntimeSurfaceThreadHandle {
     }
 
     pub fn acp_surface(&self) -> Option<RuntimeSurfaceHandle> {
-        self.runtime.acp_surface()
+        self.connection_id
+            .clone()
+            .and_then(|connection_id| self.runtime.acp_surface_for_connection(connection_id))
     }
 
     pub fn read_history(&self) -> Result<Vec<super::SurfaceHistoryMessage>, RuntimeHostError> {
@@ -301,7 +313,7 @@ impl RuntimeSurfaceThreadHandle {
 
 impl RuntimeThreadHandle {
     pub fn typed_surface(&self) -> RuntimeSurfaceThreadHandle {
-        RuntimeSurfaceThreadHandle::from_runtime(self.clone())
+        RuntimeSurfaceThreadHandle::from_runtime(self.clone(), None)
     }
 }
 

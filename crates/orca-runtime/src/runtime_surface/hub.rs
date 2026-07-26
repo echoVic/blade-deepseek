@@ -62,11 +62,18 @@ struct SurfaceHubState {
 struct SurfaceSubscriber {
     grant: SurfaceAttachmentGrant,
     interaction_kinds: BTreeSet<SurfaceInteractionKind>,
+    acp_capabilities: Option<AcpAttachmentCapabilityProfile>,
     queue: VecDeque<QueuedSubscriptionItem>,
     queued_events: u64,
     queued_bytes: u64,
     claimed: bool,
     gapped: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcpCapabilityAttachmentRoute {
+    pub(crate) attachment_id: SurfaceAttachmentId,
+    pub(crate) capability_revision: CapabilityRevision,
 }
 
 struct SharedSurfaceBatch {
@@ -291,13 +298,39 @@ impl SurfaceHub {
     }
 
     pub fn attach_fresh(&self, request: FreshAttachRequest) -> AttachResult {
+        self.attach_fresh_with_acp_capabilities(request, None)
+    }
+
+    pub(crate) fn attach_acp_fresh(
+        &self,
+        request: FreshAttachRequest,
+        capability_profile: AcpAttachmentCapabilityProfile,
+    ) -> AttachResult {
+        if self.authority.connection_id().is_none() {
+            return AttachResult::Unavailable {
+                reason: SurfaceUnavailableReason::RuntimeUnavailable,
+            };
+        }
+        if request.role != SurfaceAttachmentRole::Acp {
+            return AttachResult::Denied {
+                reason: AttachDeniedReason::RoleMismatch,
+            };
+        }
+        self.attach_fresh_with_acp_capabilities(request, Some(capability_profile))
+    }
+
+    fn attach_fresh_with_acp_capabilities(
+        &self,
+        request: FreshAttachRequest,
+        capability_profile: Option<AcpAttachmentCapabilityProfile>,
+    ) -> AttachResult {
         let mut state = lock(&self.inner);
         if !state.ready {
             return AttachResult::Unavailable {
                 reason: SurfaceUnavailableReason::RuntimeUnavailable,
             };
         }
-        let capabilities = match self.authorize(
+        let mut capabilities = match self.authorize(
             request.role,
             &request.requested_capabilities,
             &request.interaction_capabilities,
@@ -306,6 +339,8 @@ impl SurfaceHub {
             Ok(capabilities) => capabilities,
             Err(reason) => return AttachResult::Denied { reason },
         };
+        capabilities.acp_capability_revision =
+            capability_profile.map(|capabilities| capabilities.revision);
         if state.snapshot.thread.closed {
             return AttachResult::ThreadClosed {
                 thread_id: state.snapshot.thread.thread_id.clone(),
@@ -321,7 +356,7 @@ impl SurfaceHub {
             cursor: state.snapshot.cursor.clone(),
         };
         let (attachment_id, client, subscription, capabilities) =
-            self.register(&mut state, capabilities);
+            self.register(&mut state, capabilities, capability_profile);
         AttachResult::FreshAttached {
             attachment: FreshSurfaceAttachment {
                 attachment_id,
@@ -367,7 +402,7 @@ impl SurfaceHub {
             };
             let from = request.cursor;
             let (attachment_id, client, subscription, capabilities) =
-                self.register(&mut state, capabilities);
+                self.register(&mut state, capabilities, None);
             (
                 attachment_id,
                 client,
@@ -409,6 +444,34 @@ impl SurfaceHub {
             dispatcher: self.dispatcher.clone(),
             notify: self.notify.clone(),
         })
+    }
+
+    pub(crate) fn select_acp_capability_attachment(
+        &self,
+        kind: SurfaceCapabilityCallKind,
+        origin: &SurfaceAttachmentId,
+    ) -> Option<AcpCapabilityAttachmentRoute> {
+        let state = lock(&self.inner);
+        state
+            .subscriptions
+            .iter()
+            .filter(|(attachment_id, subscriber)| {
+                origin == *attachment_id
+                    && subscriber.claimed
+                    && subscriber.grant.role == SurfaceAttachmentRole::Acp
+                    && subscriber.acp_capabilities.is_some_and(|capabilities| {
+                        acp_standard_capability_supports(capabilities.standard, kind)
+                    })
+            })
+            .filter_map(|(attachment_id, subscriber)| {
+                subscriber
+                    .acp_capabilities
+                    .map(|capabilities| AcpCapabilityAttachmentRoute {
+                        attachment_id: attachment_id.clone(),
+                        capability_revision: capabilities.revision,
+                    })
+            })
+            .next()
     }
 
     pub(crate) fn apply_committed(
@@ -813,6 +876,7 @@ impl SurfaceHub {
         &self,
         state: &mut SurfaceHubState,
         capabilities: SurfaceAttachmentCapabilities,
+        acp_capabilities: Option<AcpAttachmentCapabilityProfile>,
     ) -> (
         SurfaceAttachmentId,
         RuntimeSurfaceClientHandle,
@@ -839,6 +903,7 @@ impl SurfaceHub {
             SurfaceSubscriber {
                 grant: capabilities.grant.clone(),
                 interaction_kinds: capabilities.interaction_kinds.clone(),
+                acp_capabilities,
                 queue: VecDeque::new(),
                 queued_events: 0,
                 queued_bytes: 0,
@@ -856,6 +921,21 @@ fn interaction_role_priority(role: SurfaceAttachmentRole) -> u8 {
         SurfaceAttachmentRole::Acp => 1,
         SurfaceAttachmentRole::Jsonl => 2,
         SurfaceAttachmentRole::InternalCompatibility => 3,
+    }
+}
+
+fn acp_standard_capability_supports(
+    capabilities: AcpStandardCapabilitySet,
+    kind: SurfaceCapabilityCallKind,
+) -> bool {
+    match kind {
+        SurfaceCapabilityCallKind::ReadTextFile => capabilities.file_read,
+        SurfaceCapabilityCallKind::WriteTextFile => capabilities.file_write,
+        SurfaceCapabilityCallKind::TerminalCreate
+        | SurfaceCapabilityCallKind::TerminalOutput
+        | SurfaceCapabilityCallKind::TerminalWaitForExit
+        | SurfaceCapabilityCallKind::TerminalKill
+        | SurfaceCapabilityCallKind::TerminalRelease => capabilities.terminal,
     }
 }
 
@@ -1211,6 +1291,7 @@ mod tests {
         SurfaceSubscriber {
             grant: grant.clone(),
             interaction_kinds: BTreeSet::new(),
+            acp_capabilities: None,
             queue: VecDeque::new(),
             queued_events: 0,
             queued_bytes: 0,
@@ -1558,6 +1639,143 @@ mod tests {
             hub.select_interaction_attachment_for(SurfaceInteractionKind::UserInput, None),
             Some(higher_id),
             "earlier grant order wins even when its attachment id sorts later"
+        );
+    }
+
+    #[test]
+    fn acp_capability_routes_require_claimed_live_revisioned_attachment() {
+        let snapshot = reducer_snapshot();
+        let capabilities =
+            NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot])).unwrap();
+        let authority = SurfaceAttachAuthority::new(
+            HostIncarnation::try_from_bytes(uuid_v7_bytes(240)).unwrap(),
+            snapshot.thread.thread_id.clone(),
+            SurfaceAttachmentRole::Acp,
+            capabilities.clone(),
+            capabilities.clone(),
+            BTreeSet::new(),
+        )
+        .with_connection_id(SurfaceConnectionId::try_from_bytes(uuid_v7_bytes(241)).unwrap());
+        let hub =
+            SurfaceHub::from_authority(snapshot.clone(), authority, Default::default()).unwrap();
+        hub.repair_committed(Arc::new(snapshot.clone()), &[]);
+        let attach = |capability_profile| match hub.attach_acp_fresh(
+            FreshAttachRequest {
+                request_id: SurfaceRequestId::new(),
+                role: SurfaceAttachmentRole::Acp,
+                requested_capabilities: capabilities.as_set().clone(),
+                interaction_capabilities: BTreeSet::new(),
+            },
+            capability_profile,
+        ) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("fresh ACP capability attachment failed"),
+        };
+
+        let read_attachment = attach(AcpAttachmentCapabilityProfile {
+            revision: CapabilityRevision::try_new(7).unwrap(),
+            standard: AcpStandardCapabilitySet {
+                file_read: true,
+                ..AcpStandardCapabilitySet::default()
+            },
+        });
+        assert_eq!(
+            read_attachment.capabilities.acp_capability_revision,
+            Some(CapabilityRevision::try_new(7).unwrap())
+        );
+        assert!(
+            hub.select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::ReadTextFile,
+                &read_attachment.attachment_id,
+            )
+            .is_none(),
+            "an unclaimed transport cannot receive runtime calls"
+        );
+        let read_receiver = hub
+            .claim_subscription(&read_attachment.subscription)
+            .expect("claim read-capable ACP attachment");
+        let route = hub
+            .select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::ReadTextFile,
+                &read_attachment.attachment_id,
+            )
+            .expect("claimed read capability route");
+        assert_eq!(route.attachment_id, read_attachment.attachment_id);
+        assert_eq!(
+            route.capability_revision,
+            CapabilityRevision::try_new(7).unwrap()
+        );
+        assert!(
+            hub.select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::WriteTextFile,
+                &read_attachment.attachment_id,
+            )
+            .is_none()
+        );
+
+        let other_read_attachment = attach(AcpAttachmentCapabilityProfile {
+            revision: CapabilityRevision::try_new(8).unwrap(),
+            standard: AcpStandardCapabilitySet {
+                file_read: true,
+                ..AcpStandardCapabilitySet::default()
+            },
+        });
+        let other_read_receiver = hub
+            .claim_subscription(&other_read_attachment.subscription)
+            .expect("claim newer read-capable ACP attachment");
+        assert_eq!(
+            hub.select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::ReadTextFile,
+                &read_attachment.attachment_id,
+            )
+            .unwrap()
+            .attachment_id,
+            read_attachment.attachment_id,
+            "operation-bound routing preserves its origin attachment"
+        );
+
+        drop(read_receiver);
+        assert!(
+            hub.select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::ReadTextFile,
+                &read_attachment.attachment_id,
+            )
+            .is_none(),
+            "dropping the origin transport must not fall back to another client"
+        );
+        drop(other_read_receiver);
+
+        let terminal_attachment = attach(AcpAttachmentCapabilityProfile {
+            revision: CapabilityRevision::try_new(9).unwrap(),
+            standard: AcpStandardCapabilitySet {
+                terminal: true,
+                ..AcpStandardCapabilitySet::default()
+            },
+        });
+        assert_eq!(
+            terminal_attachment.capabilities.acp_capability_revision,
+            Some(CapabilityRevision::try_new(9).unwrap())
+        );
+        let _terminal_receiver = hub
+            .claim_subscription(&terminal_attachment.subscription)
+            .expect("claim terminal-capable ACP attachment");
+        assert!(
+            hub.select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::ReadTextFile,
+                &terminal_attachment.attachment_id,
+            )
+            .is_none(),
+            "reconnect must not retain the previous capability profile"
+        );
+        let terminal_route = hub
+            .select_acp_capability_attachment(
+                SurfaceCapabilityCallKind::TerminalCreate,
+                &terminal_attachment.attachment_id,
+            )
+            .expect("claimed terminal route");
+        assert_eq!(
+            terminal_route.capability_revision,
+            CapabilityRevision::try_new(9).unwrap()
         );
     }
 }

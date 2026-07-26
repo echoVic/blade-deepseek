@@ -349,6 +349,13 @@ fn drain_notifications(rx: &mut mpsc::Receiver<SessionNotification>) -> Vec<Sess
     updates
 }
 
+async fn initialize_agent(agent: &OrcaAcpAgent) {
+    agent
+        .initialize(InitializeRequest::new(ProtocolVersion::V1))
+        .await
+        .expect("initialize ACP connection");
+}
+
 // --- Tests ---
 
 #[test]
@@ -401,6 +408,52 @@ fn acp_initialize_returns_exact_session_and_mcp_capabilities() {
 }
 
 #[test]
+fn acp_session_commands_fail_closed_before_initialize() {
+    let _home = OrcaHomeGuard::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let host =
+        RuntimeHost::start_with_executor(Arc::new(AcpTestExecutor::new(vec![]))).expect("host");
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
+        host.surface_handle(),
+        test_config(cwd.path().to_path_buf()),
+        note_tx,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    let errors = local.block_on(&rt, async {
+        let new_error = agent
+            .new_session(NewSessionRequest::new(cwd.path().to_path_buf()))
+            .await
+            .expect_err("new_session requires initialize");
+        let load_error = agent
+            .load_session(LoadSessionRequest::new(
+                SessionId::new("not-loaded"),
+                cwd.path().to_path_buf(),
+            ))
+            .await
+            .expect_err("load_session requires initialize");
+        let prompt_error = agent
+            .prompt(PromptRequest::new(
+                SessionId::new("not-loaded"),
+                vec![ContentBlock::from("hello".to_string())],
+            ))
+            .await
+            .expect_err("prompt requires initialize");
+        [new_error, load_error, prompt_error]
+    });
+
+    for error in errors {
+        assert!(format!("{error:?}").contains("not initialized"));
+    }
+    host.shutdown().expect("shutdown");
+}
+
+#[test]
 fn acp_new_session_persists_declared_additional_directories() {
     let _home = OrcaHomeGuard::new();
     let cwd = tempfile::tempdir().unwrap();
@@ -419,6 +472,7 @@ fn acp_new_session_persists_declared_additional_directories() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let response = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         agent
             .new_session(
                 NewSessionRequest::new(cwd.path().to_path_buf())
@@ -462,6 +516,7 @@ fn acp_load_session_replaces_persisted_additional_directories() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let session = local.block_on(&rt, async {
+        initialize_agent(&first_agent).await;
         first_agent
             .new_session(
                 NewSessionRequest::new(cwd.path().to_path_buf())
@@ -482,6 +537,7 @@ fn acp_load_session_replaces_persisted_additional_directories() {
     );
     let wrong_cwd = tempfile::tempdir().unwrap();
     local.block_on(&rt, async {
+        initialize_agent(&second_agent).await;
         assert!(
             second_agent
                 .load_session(LoadSessionRequest::new(
@@ -537,6 +593,7 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
     let local = tokio::task::LocalSet::new();
 
     let (session_id, stop_reason) = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         let session = agent
             .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
@@ -602,6 +659,7 @@ fn acp_typed_prompt_preserves_supported_content_for_runtime_ingress() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let response = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         let session = agent
             .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
@@ -803,6 +861,7 @@ fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let error = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         let session = agent
             .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
@@ -847,6 +906,7 @@ fn acp_typed_load_replays_surface_history_after_restart() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let session_id = local.block_on(&rt, async {
+        initialize_agent(&first_agent).await;
         let session = first_agent
             .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
@@ -872,6 +932,7 @@ fn acp_typed_load_replays_surface_history_after_restart() {
         second_note_tx,
     );
     local.block_on(&rt, async {
+        initialize_agent(&second_agent).await;
         second_agent
             .load_session(LoadSessionRequest::new(
                 session_id,
@@ -923,6 +984,7 @@ fn acp_typed_surface_prompt_projects_runtime_batch_and_terminal() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let stop_reason = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         let session = agent
             .new_session(NewSessionRequest::new(session_cwd.path().to_path_buf()))
             .await
@@ -973,6 +1035,7 @@ fn acp_typed_surface_prompt_releases_session_after_terminal_error() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         let session = agent
             .new_session(NewSessionRequest::new(cwd.path().to_path_buf()))
             .await
@@ -1020,6 +1083,7 @@ fn acp_cancel_stops_in_flight_prompt() {
     let local = tokio::task::LocalSet::new();
 
     let stop_reason = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         let session = Agent::new_session(&agent, NewSessionRequest::new(cwd.path().to_path_buf()))
             .await
             .expect("new_session");
@@ -1076,6 +1140,7 @@ fn acp_prompt_on_unknown_session_returns_error() {
     let local = tokio::task::LocalSet::new();
 
     let result = local.block_on(&rt, async {
+        initialize_agent(&agent).await;
         agent
             .prompt(PromptRequest::new(
                 SessionId::new("nonexistent-session"),

@@ -42,8 +42,8 @@ use crate::surface::{
 };
 
 use crate::runtime_surface::{
-    OperationPatch, SurfaceItem, SurfacePlanPriority, SurfacePlanStatus, SurfaceToolAction,
-    SurfaceToolViewState,
+    AcpAttachmentCapabilityProfile, AcpStandardCapabilitySet, CapabilityRevision, OperationPatch,
+    SurfaceItem, SurfacePlanPriority, SurfacePlanStatus, SurfaceToolAction, SurfaceToolViewState,
 };
 
 pub(crate) const ACP_NOTIFICATION_CAPACITY: usize = 256;
@@ -102,16 +102,43 @@ struct AgentState {
     client_capabilities: Option<AcpClientCapabilityProfile>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct AcpClientCapabilityProfile {
+    revision: CapabilityRevision,
     read_text_file: bool,
     write_text_file: bool,
     terminal: bool,
 }
 
+impl AcpClientCapabilityProfile {
+    #[cfg(test)]
+    fn negotiated_for_test() -> Self {
+        Self {
+            revision: CapabilityRevision::try_new(1).expect("one is a valid capability revision"),
+            read_text_file: false,
+            write_text_file: false,
+            terminal: false,
+        }
+    }
+
+    fn attachment_profile(self) -> AcpAttachmentCapabilityProfile {
+        AcpAttachmentCapabilityProfile {
+            revision: self.revision,
+            standard: AcpStandardCapabilitySet {
+                file_read: self.read_text_file,
+                file_write: self.write_text_file,
+                terminal: self.terminal,
+                ..AcpStandardCapabilitySet::default()
+            },
+        }
+    }
+}
+
 impl From<&ClientCapabilities> for AcpClientCapabilityProfile {
     fn from(capabilities: &ClientCapabilities) -> Self {
         Self {
+            revision: CapabilityRevision::try_new(1)
+                .expect("initial ACP capability revision is valid"),
             read_text_file: capabilities.fs.read_text_file,
             write_text_file: capabilities.fs.write_text_file,
             terminal: capabilities.terminal,
@@ -289,13 +316,20 @@ impl AcpClientBridge {
 }
 
 impl OrcaAcpAgent {
+    fn negotiated_client_capabilities(&self) -> Result<AcpClientCapabilityProfile, Error> {
+        self.state
+            .borrow()
+            .client_capabilities
+            .ok_or_else(|| Error::invalid_request().data("ACP connection is not initialized"))
+    }
+
     pub fn new(
         host: RuntimeSurfaceHostHandle,
         base_config: RunConfig,
         note_tx: mpsc::Sender<SessionNotification>,
     ) -> Self {
         Self {
-            surface_host: host,
+            surface_host: host.bind_new_connection(),
             base_config,
             note_tx: AcpNotificationSender::Buffered(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
@@ -309,7 +343,7 @@ impl OrcaAcpAgent {
         note_tx: mpsc::Sender<AcpNotificationDelivery>,
     ) -> Self {
         Self {
-            surface_host: host,
+            surface_host: host.bind_new_connection(),
             base_config,
             note_tx: AcpNotificationSender::Acknowledged(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
@@ -349,8 +383,9 @@ impl OrcaAcpAgent {
         args: PromptRequest,
         inbound_seq: Option<u64>,
     ) -> Result<AdmittedAcpPrompt, Error> {
+        let client_capabilities = self.negotiated_client_capabilities()?;
         let ready = Rc::new(Notify::new());
-        let (surface, inbound_seq, client_capabilities) = {
+        let (surface, inbound_seq) = {
             let mut state = self.state.borrow_mut();
             let entry = state
                 .sessions
@@ -373,11 +408,7 @@ impl OrcaAcpAgent {
             entry.prompt_binding = Some(AcpPromptBinding::Decoded {
                 ready: ready.clone(),
             });
-            (
-                entry.surface.clone(),
-                sequence,
-                state.client_capabilities.unwrap_or_default(),
-            )
+            (entry.surface.clone(), sequence)
         };
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.begin_session(&args.session_id);
@@ -392,7 +423,14 @@ impl OrcaAcpAgent {
         let session_id = args.session_id.clone();
         let client_bridge = self.client_bridge.clone();
         let prepared = match tokio::task::spawn_blocking(move || {
-            prepare_surface_prompt(&surface, &session_id, input, inbound_seq, client_bridge)
+            prepare_surface_prompt(
+                &surface,
+                &session_id,
+                input,
+                inbound_seq,
+                client_capabilities,
+                client_bridge,
+            )
         })
         .await
         {
@@ -1019,19 +1057,23 @@ fn prepare_surface_prompt(
     session_id: &SessionId,
     input: SurfaceInputRequest,
     inbound_seq: u64,
+    client_capabilities: AcpClientCapabilityProfile,
     client_bridge: Option<Arc<AcpClientBridge>>,
 ) -> Result<PreparedSurfacePrompt, AcpPromptPrepareError> {
-    let attachment = match surface.attach_fresh(FreshAttachRequest {
-        request_id: SurfaceRequestId::new(),
-        role: SurfaceAttachmentRole::Acp,
-        requested_capabilities: std::collections::BTreeSet::from([
-            SurfaceCapability::ReadSnapshot,
-            SurfaceCapability::SubmitOperation,
-            SurfaceCapability::ControlBoundOperation,
-            SurfaceCapability::RespondGrantedInteraction,
-        ]),
-        interaction_capabilities: standard_interaction_capabilities(),
-    }) {
+    let attachment = match surface.attach_acp_fresh(
+        FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Acp,
+            requested_capabilities: std::collections::BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::SubmitOperation,
+                SurfaceCapability::ControlBoundOperation,
+                SurfaceCapability::RespondGrantedInteraction,
+            ]),
+            interaction_capabilities: standard_interaction_capabilities(),
+        },
+        client_capabilities.attachment_profile(),
+    ) {
         AttachResult::FreshAttached { attachment } => attachment,
         AttachResult::Denied { .. } => {
             return Err(AcpPromptPrepareError::internal(
@@ -1606,6 +1648,7 @@ impl Agent for OrcaAcpAgent {
     }
 
     async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+        self.negotiated_client_capabilities()?;
         let config = self
             .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
             .map_err(|message| Error::invalid_params().data(message))?;
@@ -1636,6 +1679,7 @@ impl Agent for OrcaAcpAgent {
     }
 
     async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+        self.negotiated_client_capabilities()?;
         if self.state.borrow().sessions.contains_key(&args.session_id) {
             return Err(Error::invalid_params().data("ACP session is already loaded"));
         }
@@ -1820,7 +1864,7 @@ mod tests {
             &blocks,
             AcpClientCapabilityProfile {
                 read_text_file: true,
-                ..AcpClientCapabilityProfile::default()
+                ..AcpClientCapabilityProfile::negotiated_for_test()
             },
         )
         .expect("supported ACP prompt content");
@@ -1868,7 +1912,7 @@ mod tests {
                 "base64-payload",
                 "image/png",
             ))],
-            AcpClientCapabilityProfile::default(),
+            AcpClientCapabilityProfile::negotiated_for_test(),
         )
         .expect_err("image content lacks a frozen runtime mapping");
         assert!(error.contains("unsupported ACP prompt content block: image"));
@@ -2174,7 +2218,7 @@ mod tests {
     fn lost_subscription_reconciles_durable_terminal_without_cancelling_operation() {
         let host = RuntimeHost::start_with_executor(Arc::new(CompleteImmediatelyExecutor)).unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let surface_host = host.surface_handle();
+        let surface_host = host.surface_handle().bind_new_connection();
         let config = test_run_config(cwd.path().to_path_buf());
         let thread =
             std::thread::spawn(move || surface_host.start_thread(config, "ACP reconcile").unwrap())
@@ -2183,11 +2227,18 @@ mod tests {
         let surface = thread.acp_surface().expect("ACP surface");
         let input = decode_prompt_content(
             &[ContentBlock::from("complete".to_string())],
-            AcpClientCapabilityProfile::default(),
+            AcpClientCapabilityProfile::negotiated_for_test(),
         )
         .expect("decode typed prompt");
-        let mut prepared =
-            prepare_surface_prompt(&surface, &SessionId::new("reconcile"), input, 1, None).unwrap();
+        let mut prepared = prepare_surface_prompt(
+            &surface,
+            &SessionId::new("reconcile"),
+            input,
+            1,
+            AcpClientCapabilityProfile::negotiated_for_test(),
+            None,
+        )
+        .unwrap();
         let operation_id = prepared.operation_id.clone();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2247,7 +2298,7 @@ mod tests {
     fn sealed_subscription_reconciles_terminal_from_retained_runtime_snapshot() {
         let host = RuntimeHost::start_with_executor(Arc::new(CompleteImmediatelyExecutor)).unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let surface_host = host.surface_handle();
+        let surface_host = host.surface_handle().bind_new_connection();
         let config = test_run_config(cwd.path().to_path_buf());
         let thread =
             std::thread::spawn(move || surface_host.start_thread(config, "ACP sealed").unwrap())
@@ -2256,11 +2307,18 @@ mod tests {
         let surface = thread.acp_surface().expect("ACP surface");
         let input = decode_prompt_content(
             &[ContentBlock::from("complete".to_string())],
-            AcpClientCapabilityProfile::default(),
+            AcpClientCapabilityProfile::negotiated_for_test(),
         )
         .expect("decode typed prompt");
-        let mut prepared =
-            prepare_surface_prompt(&surface, &SessionId::new("sealed"), input, 1, None).unwrap();
+        let mut prepared = prepare_surface_prompt(
+            &surface,
+            &SessionId::new("sealed"),
+            input,
+            1,
+            AcpClientCapabilityProfile::negotiated_for_test(),
+            None,
+        )
+        .unwrap();
         let operation_id = prepared.operation_id.clone();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

@@ -118,31 +118,14 @@ fn typed_thread_snapshot_preserves_configured_additional_directories() {
 }
 
 #[test]
-fn thread_facade_issues_a_distinct_acp_surface_authority() {
+fn unbound_thread_facade_does_not_issue_acp_surface_authority() {
     let cwd = tempdir().expect("temp cwd");
     let host = RuntimeHost::start().expect("runtime host");
     let thread = host
         .surface_handle()
         .start_thread(test_config(cwd.path().to_path_buf()), "ACP facade")
         .expect("typed thread");
-    let surface = thread.acp_surface().expect("ACP surface");
-    let attachment = match surface.attach_fresh(FreshAttachRequest {
-        request_id: SurfaceRequestId::new(),
-        role: SurfaceAttachmentRole::Acp,
-        requested_capabilities: BTreeSet::from([
-            SurfaceCapability::ReadSnapshot,
-            SurfaceCapability::SubmitOperation,
-            SurfaceCapability::ControlBoundOperation,
-        ]),
-        interaction_capabilities: BTreeSet::new(),
-    }) {
-        AttachResult::FreshAttached { attachment } => attachment,
-        _ => panic!("unexpected ACP attachment result"),
-    };
-    assert_eq!(
-        attachment.capabilities.grant.role,
-        SurfaceAttachmentRole::Acp
-    );
+    assert!(thread.acp_surface().is_none());
     host.shutdown().expect("shutdown runtime host");
 }
 

@@ -35,6 +35,23 @@ pub const JSONL_REPAIR_AUTHORITY_LIMIT: u64 = 1_024;
 pub const JSONL_COMMITTED_REPAIR_DRAIN_DEADLINE_MS: u64 = 5_000;
 pub const JSONL_SUPERVISOR_JOIN_DEADLINE_MS: u64 = 5_000;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcpStandardCapabilitySet {
+    pub session_usage: bool,
+    pub session_model: bool,
+    pub session_modes: bool,
+    pub session_info: bool,
+    pub file_read: bool,
+    pub file_write: bool,
+    pub terminal: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AcpAttachmentCapabilityProfile {
+    pub(crate) revision: CapabilityRevision,
+    pub(crate) standard: AcpStandardCapabilitySet,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum SurfaceEvent {
     Operation(OperationPatch),
@@ -3498,6 +3515,19 @@ impl RuntimeSurfaceHostHandle {
             runtime: Some(runtime),
         }
     }
+
+    pub(crate) fn bind_new_connection(&self) -> Self {
+        let mut bound = self.clone();
+        bound.connection_id = Some(
+            SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated ACP connection id is valid"),
+        );
+        bound
+    }
+
+    pub(crate) fn connection_id(&self) -> Option<&SurfaceConnectionId> {
+        self.connection_id.as_ref()
+    }
 }
 
 #[allow(dead_code)]
@@ -3542,6 +3572,19 @@ impl RuntimeSurfaceHandle {
                 reason: SurfaceUnavailableReason::RuntimeUnavailable,
             },
             |hub| hub.attach_fresh(request),
+        )
+    }
+
+    pub(crate) fn attach_acp_fresh(
+        &self,
+        request: FreshAttachRequest,
+        capability_profile: AcpAttachmentCapabilityProfile,
+    ) -> AttachResult {
+        self.hub.as_ref().map_or(
+            AttachResult::Unavailable {
+                reason: SurfaceUnavailableReason::RuntimeUnavailable,
+            },
+            |hub| hub.attach_acp_fresh(request, capability_profile),
         )
     }
 
@@ -3989,6 +4032,20 @@ mod closed_command_domain_tests {
         );
         let bound = authority.with_connection_id(connection.clone());
         assert_eq!(bound.connection_id(), Some(&connection));
+    }
+
+    #[test]
+    fn surface_host_connection_binding_is_immutable_per_adapter_instance() {
+        let grant =
+            NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot])).unwrap();
+        let host = RuntimeSurfaceHostHandle::new(host_incarnation(44), grant, None);
+        let first = host.bind_new_connection();
+        let first_clone = first.clone();
+        let second = host.bind_new_connection();
+
+        assert!(host.connection_id().is_none());
+        assert_eq!(first.connection_id(), first_clone.connection_id());
+        assert_ne!(first.connection_id(), second.connection_id());
     }
 
     fn thread_snapshot(seed: u8) -> SurfaceThreadSnapshot {

@@ -2022,7 +2022,11 @@ impl RuntimeThreadHandle {
         self.surface.clone()
     }
 
-    pub(crate) fn acp_surface(&self) -> Option<surface::RuntimeSurfaceHandle> {
+    pub(crate) fn acp_surface_for_connection(
+        &self,
+        connection_id: surface::SurfaceConnectionId,
+    ) -> Option<surface::RuntimeSurfaceHandle> {
+        let connection_id = Some(connection_id);
         let authority = surface::SurfaceAttachAuthority::new(
             self.surface.host_incarnation().clone(),
             self.surface.thread_id().clone(),
@@ -2046,6 +2050,8 @@ impl RuntimeThreadHandle {
                 surface::SurfaceInteractionKind::McpElicitation,
             ]),
         );
+        let authority = authority
+            .with_connection_id(connection_id.expect("ACP connection identity is required"));
         self.surface.with_authority(authority)
     }
 
@@ -15454,7 +15460,14 @@ impl ThreadActor {
                 tick: surface::MonotonicTick::new(0),
             },
         );
-        let jsonl_connection_id = origin_connection.or_else(|| {
+        if matches!(
+            intent.correlation,
+            surface::OperationIngressCorrelation::AcpPrompt { .. }
+        ) && origin_connection.is_none()
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let jsonl_connection_id = origin_connection.clone().or_else(|| {
             surface::SurfaceConnectionId::try_from_bytes(*origin_attachment.as_bytes()).ok()
         });
         let origin = match &intent.correlation {
@@ -15464,10 +15477,7 @@ impl ThreadActor {
                 inbound_seq,
                 rpc_request_id,
             } => surface::OperationOrigin::AcpPrompt {
-                connection_id: surface::SurfaceConnectionId::try_from_bytes(
-                    *uuid::Uuid::now_v7().as_bytes(),
-                )
-                .expect("generated ACP connection id is valid"),
+                connection_id: origin_connection.expect("ACP connection identity is bound"),
                 session_id: session_id.clone(),
                 inbound_seq: *inbound_seq,
                 rpc_request_id: rpc_request_id.clone(),
