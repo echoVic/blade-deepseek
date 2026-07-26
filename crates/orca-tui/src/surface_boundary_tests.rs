@@ -5,6 +5,7 @@ const MANIFEST: &str = include_str!(
 );
 const TYPES: &str = include_str!("types.rs");
 const APP: &str = include_str!("app.rs");
+const ACTION_DISPATCHER: &str = include_str!("action_dispatcher.rs");
 const SURFACE_CLIENT: &str = include_str!("surface_client.rs");
 const SURFACE_PROJECTION: &str = include_str!("surface_projection.rs");
 const SUBMITTED_TURN: &str = include_str!("submitted_turn.rs");
@@ -619,6 +620,20 @@ fn legacy_hosted_operation_owner_is_not_reachable_from_production_goal_routing()
     assert!(
         !APP[start..end].contains("run_hosted_operation("),
         "Goal routing must use the typed surface rail instead of the raw hosted owner"
+    );
+}
+
+#[test]
+fn production_action_dispatcher_uses_only_typed_surface_control() {
+    let production = ACTION_DISPATCHER
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production dispatcher source");
+    assert!(
+        !production.contains("TuiOperationController")
+            && !production.contains(".broker()")
+            && !production.contains("TuiInteractionBroker"),
+        "production dispatch must route interaction and operation control only through TuiSurfaceTaskControl"
     );
 }
 

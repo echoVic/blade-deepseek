@@ -2631,7 +2631,7 @@ mod tests {
         }
         assert!(controller.has_surface_active());
 
-        controller.interrupt_current();
+        let _ = controller.interrupt_current();
         let outcome = result_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("typed cancellation terminal")
@@ -3106,7 +3106,7 @@ mod tests {
         let summaries = match foreground_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(result) => result.expect("second background handoff"),
             Err(error) => {
-                controller.interrupt_current();
+                let _ = controller.interrupt_current();
                 let _ = foreground_rx.recv_timeout(Duration::from_secs(3));
                 foreground_worker
                     .join()
@@ -3413,7 +3413,7 @@ mod tests {
             TuiHostedOperationOutcome::Turn { status } if status == "success"
         ));
 
-        controller.interrupt_current();
+        let _ = controller.interrupt_current();
 
         let (second_event_tx, second_event_rx) = mpsc::unbounded();
         let second = run_through_dispatch(
@@ -3472,7 +3472,7 @@ mod tests {
         };
         assert!(error.to_string().contains("config differs"));
 
-        controller.interrupt_current();
+        let _ = controller.interrupt_current();
 
         let (event_tx, event_rx) = mpsc::unbounded();
         let typed_thread = thread.typed_surface();
@@ -3897,7 +3897,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(controller.has_surface_active());
-        controller.interrupt_current();
+        let _ = controller.interrupt_current();
 
         let cancelled = result_rx
             .recv_timeout(Duration::from_secs(2))

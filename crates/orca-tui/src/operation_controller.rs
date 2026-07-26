@@ -139,6 +139,7 @@ impl TuiOperationController {
         Ok(Some(operation_id))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
         let (surface, hosted) = {
             let state = self.lock_hosted();
@@ -245,6 +246,7 @@ impl TuiOperationController {
         self.lock_hosted().shutdown
     }
 
+    #[allow(dead_code)]
     pub(crate) fn respond_surface_interaction(
         &self,
         key: &TuiInteractionKey,
@@ -455,19 +457,22 @@ impl TuiSurfaceTaskControl {
     }
 
     #[cfg(test)]
-    pub(crate) fn interrupt_current(&self) -> bool {
-        let mut hosted = self.lock_hosted();
-        if cancel_surface_if_active(&mut hosted) {
-            return true;
-        }
-        if hosted.shutdown || !hosted.surface_activation_armed {
-            return false;
-        }
-        hosted.interrupt_requested = true;
-        true
+    pub(crate) fn has_pending_interrupt(&self) -> bool {
+        self.lock_hosted().interrupt_requested
     }
 
-    #[cfg(test)]
+    pub(crate) fn interrupt_current(&self) -> io::Result<bool> {
+        let mut hosted = self.lock_hosted();
+        if cancel_surface_if_active_checked(&mut hosted)? {
+            return Ok(true);
+        }
+        if hosted.shutdown || !hosted.surface_activation_armed {
+            return Ok(false);
+        }
+        hosted.interrupt_requested = true;
+        Ok(true)
+    }
+
     pub(crate) fn request_background_current(&self) -> bool {
         let mut hosted = self.lock_hosted();
         if hosted.shutdown {
@@ -481,6 +486,54 @@ impl TuiSurfaceTaskControl {
         drop(hosted);
         self.hosted.changed.notify_all();
         true
+    }
+
+    pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
+        let surface = self.lock_hosted().surface_active.clone();
+        let Some(surface) = surface else {
+            return Ok(false);
+        };
+        let Some(goal_fence) = surface.goal_fence else {
+            return Ok(false);
+        };
+        match surface
+            .client
+            .pause_goal_operation(orca_runtime::surface::SurfaceRequestId::new(), goal_fence)
+            .map_err(|error| io::Error::other(format!("typed Goal pause failed: {error:?}")))?
+        {
+            orca_runtime::surface::MutationReply::Committed { .. } => Ok(true),
+            orca_runtime::surface::MutationReply::Deferred { mutation, .. } => {
+                Err(io::Error::other(format!(
+                    "typed Goal pause deferred: request={:?} commit={:?}",
+                    mutation.request_id, mutation.commit_id
+                )))
+            }
+            orca_runtime::surface::MutationReply::Uncommitted { mutation } => Err(
+                io::Error::other(format!("typed Goal pause did not commit: {mutation:?}")),
+            ),
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _transition = self
+            .hosted
+            .surface_presentation_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let surface_presentation_tasks = {
+            let mut hosted = self.lock_hosted();
+            hosted.shutdown = true;
+            hosted.surface_delivery_watermarks = HashMap::new();
+            hosted.surface_terminal_deliveries = HashSet::new();
+            for task in &hosted.surface_presentation_tasks {
+                task.cancelled.store(true, Ordering::Release);
+            }
+            std::mem::take(&mut hosted.surface_presentation_tasks)
+        };
+        self.cancel_surface_and_notify();
+        for task in surface_presentation_tasks {
+            let _ = task.handle.join();
+        }
     }
 
     pub(crate) fn begin_surface_activation(&self) -> io::Result<bool> {
@@ -697,7 +750,8 @@ impl TuiSurfaceTaskControl {
         goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
     ) -> io::Result<()> {
         self.retire_surface_presentation(&operation_id);
-        let (interrupt_requested, background_requested) = {
+        let mut cancel_committed = false;
+        let background_requested = loop {
             let mut hosted = self.lock_hosted();
             if hosted.shutdown {
                 return Err(io::Error::new(
@@ -707,6 +761,12 @@ impl TuiSurfaceTaskControl {
             }
             if hosted.active.is_some() || hosted.surface_active.is_some() {
                 return Err(io::Error::other("TUI operation is still active"));
+            }
+            if hosted.interrupt_requested && !cancel_committed {
+                drop(hosted);
+                cancel_surface_operation_checked(&client, operation_id.clone())?;
+                cancel_committed = true;
+                continue;
             }
             let background_requested = hosted.background_requested;
             hosted.background_requested = false;
@@ -719,16 +779,11 @@ impl TuiSurfaceTaskControl {
                 background_requested,
                 background_handoff_pending: false,
             });
-            let requested = hosted.interrupt_requested;
             hosted.surface_activation_armed = false;
             hosted.interrupt_requested = false;
-            (requested, background_requested)
+            break background_requested;
         };
         self.hosted.changed.notify_all();
-        if interrupt_requested {
-            let _ = client
-                .cancel_operation(orca_runtime::surface::SurfaceRequestId::new(), operation_id);
-        }
         if background_requested {
             self.hosted.changed.notify_all();
         }
@@ -1052,6 +1107,14 @@ impl TuiSurfaceTaskControl {
         }
     }
 
+    pub(crate) fn respond(
+        &self,
+        key: &TuiInteractionKey,
+        response: &TuiInteractionResponse,
+    ) -> io::Result<bool> {
+        self.respond_surface_interaction(key, response)
+    }
+
     #[cfg(test)]
     pub(crate) fn has_surface_active(&self) -> bool {
         self.lock_hosted().surface_active.is_some()
@@ -1106,15 +1169,19 @@ fn cancel_surface_if_active_checked(hosted: &mut HostedOperationInner) -> io::Re
         return Ok(true);
     }
     let surface = surface.clone();
-    match surface
-        .client
-        .cancel_operation(
-            orca_runtime::surface::SurfaceRequestId::new(),
-            surface.operation_id,
-        )
+    cancel_surface_operation_checked(&surface.client, surface.operation_id)?;
+    Ok(true)
+}
+
+fn cancel_surface_operation_checked(
+    client: &orca_runtime::surface::RuntimeSurfaceClientHandle,
+    operation_id: orca_runtime::surface::SurfaceOperationId,
+) -> io::Result<()> {
+    match client
+        .cancel_operation(orca_runtime::surface::SurfaceRequestId::new(), operation_id)
         .map_err(|error| io::Error::other(format!("typed surface cancel failed: {error:?}")))?
     {
-        orca_runtime::surface::MutationReply::Committed { .. } => Ok(true),
+        orca_runtime::surface::MutationReply::Committed { .. } => Ok(()),
         orca_runtime::surface::MutationReply::Deferred { mutation, .. } => {
             Err(io::Error::other(format!(
                 "typed surface cancel deferred: request={:?} commit={:?}",

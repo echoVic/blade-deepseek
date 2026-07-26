@@ -54,7 +54,7 @@ impl TuiAgentRuntime {
         let (mut dispatcher, command_rx) = TuiActionDispatcher::spawn(
             action_rx,
             event_tx,
-            controller.clone(),
+            controller.surface_task_control(),
             command_capacity,
             backlog_capacity,
         )?;
