@@ -5,6 +5,7 @@ const MANIFEST: &str = include_str!(
 );
 const TYPES: &str = include_str!("types.rs");
 const APP: &str = include_str!("app.rs");
+const SURFACE_CLIENT: &str = include_str!("surface_client.rs");
 const SURFACE_PROJECTION: &str = include_str!("surface_projection.rs");
 const SUBMITTED_TURN: &str = include_str!("submitted_turn.rs");
 const MENTION_SEARCH_MANAGER: &str = include_str!("mention_search_manager.rs");
@@ -590,5 +591,17 @@ fn production_ordinary_turns_select_only_the_typed_surface_runner() {
         !APP.contains("run_hosted_legacy_ordinary_turn")
             && APP.contains("#[cfg(test)]\nfn run_legacy_feature_turn_for_test"),
         "deferred background/workflow compatibility may exist only as an explicit test fixture"
+    );
+}
+
+#[test]
+fn typed_surface_client_does_not_depend_on_the_legacy_operation_controller() {
+    assert!(
+        SURFACE_CLIENT.contains("TuiSurfaceTaskControl"),
+        "typed TUI operations must use their dedicated surface control"
+    );
+    assert!(
+        !SURFACE_CLIENT.contains("TuiOperationController"),
+        "typed TUI operations must not structurally depend on the legacy operation owner"
     );
 }

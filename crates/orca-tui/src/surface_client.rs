@@ -24,7 +24,7 @@ use orca_runtime::surface::{
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
-use crate::operation_controller::TuiOperationController;
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::surface_projection::TuiSurfaceProjection;
 use crate::types::TuiEvent;
 
@@ -54,19 +54,19 @@ pub(crate) fn is_terminal_recovery_error(error: &io::Error) -> bool {
 struct SurfaceRunGuard<'a> {
     surface: &'a RuntimeSurfaceHandle,
     client: RuntimeSurfaceClientHandle,
-    controller: &'a TuiOperationController,
+    controller: &'a TuiSurfaceTaskControl,
     operation_id: Option<SurfaceOperationId>,
     controller_installed: bool,
     cancel_on_drop: bool,
 }
 
 struct SurfaceActivationGuard<'a> {
-    controller: &'a TuiOperationController,
+    controller: &'a TuiSurfaceTaskControl,
     pending: bool,
 }
 
 impl<'a> SurfaceActivationGuard<'a> {
-    fn begin(controller: &'a TuiOperationController) -> io::Result<Self> {
+    fn begin(controller: &'a TuiSurfaceTaskControl) -> io::Result<Self> {
         controller.begin_surface_activation()?;
         Ok(Self {
             controller,
@@ -91,7 +91,7 @@ impl<'a> SurfaceRunGuard<'a> {
     fn new(
         surface: &'a RuntimeSurfaceHandle,
         client: RuntimeSurfaceClientHandle,
-        controller: &'a TuiOperationController,
+        controller: &'a TuiSurfaceTaskControl,
     ) -> Self {
         Self {
             surface,
@@ -146,7 +146,7 @@ pub(crate) fn run(
     thread: &RuntimeSurfaceThreadHandle,
     request: HostedTurnRequest,
     config: RunConfig,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     run_typed_thread(thread, request, config, controller, event_tx)
@@ -155,7 +155,7 @@ pub(crate) fn run(
 pub(crate) fn resume_recovered_operation(
     thread: &RuntimeSurfaceThreadHandle,
     operation_id: &SurfaceOperationId,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     control_recovered_operation(
@@ -170,7 +170,7 @@ pub(crate) fn resume_recovered_operation(
 pub(crate) fn cancel_recovered_operation(
     thread: &RuntimeSurfaceThreadHandle,
     operation_id: &SurfaceOperationId,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     control_recovered_operation(
@@ -184,7 +184,7 @@ pub(crate) fn cancel_recovered_operation(
 
 pub(crate) fn manual_compact(
     thread: &RuntimeSurfaceThreadHandle,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let mut activation = SurfaceActivationGuard::begin(controller)?;
@@ -362,7 +362,7 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
 pub(crate) fn stop_task(
     thread: &RuntimeSurfaceThreadHandle,
     task_id: &str,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<Vec<BackgroundTaskSummary>, String> {
     if thread.session_id().is_none() {
@@ -538,7 +538,7 @@ pub(crate) fn stop_task(
 pub(crate) fn foreground_task(
     thread: &RuntimeSurfaceThreadHandle,
     task_id: &str,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<Vec<BackgroundTaskSummary>, String> {
     if thread.session_id().is_none() {
@@ -809,7 +809,7 @@ fn mutate_idle_goal(
 pub(crate) fn set_goal_and_run(
     thread: &RuntimeSurfaceThreadHandle,
     objective: String,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     run_goal_mutation(thread, controller, event_tx, move |snapshot| {
@@ -831,7 +831,7 @@ pub(crate) fn set_goal_and_run(
 pub(crate) fn resume_goal_and_run(
     thread: &RuntimeSurfaceThreadHandle,
     prompt: String,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     run_goal_mutation(thread, controller, event_tx, move |snapshot| {
@@ -848,7 +848,7 @@ pub(crate) fn resume_goal_and_run(
 
 fn run_goal_mutation(
     thread: &RuntimeSurfaceThreadHandle,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
     action: impl FnOnce(&SurfaceSnapshot) -> io::Result<GoalMutationAction>,
 ) -> io::Result<TuiHostedOperationOutcome> {
@@ -1261,7 +1261,7 @@ fn run_typed_thread(
     thread: &RuntimeSurfaceThreadHandle,
     request: HostedTurnRequest,
     config: RunConfig,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let surface = thread.surface();
@@ -1272,7 +1272,7 @@ fn run_typed_surface(
     surface: &RuntimeSurfaceHandle,
     request: HostedTurnRequest,
     config: RunConfig,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let mut activation = SurfaceActivationGuard::begin(controller)?;
@@ -1417,7 +1417,7 @@ enum RecoveryControl {
 fn control_recovered_operation(
     thread: &RuntimeSurfaceThreadHandle,
     expected_operation_id: &SurfaceOperationId,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
     control: RecoveryControl,
 ) -> io::Result<TuiHostedOperationOutcome> {
@@ -1591,7 +1591,7 @@ fn drain_operation(
     operation_id: &SurfaceOperationId,
     subscription: &mut orca_runtime::surface::SurfaceSubscriptionReceiver,
     projection: &mut TuiSurfaceProjection,
-    controller: &TuiOperationController,
+    controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let (wait_tx, wait_rx) = mpsc::bounded(1);
@@ -1946,7 +1946,6 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Instant;
 
-    use crate::interaction_broker::TuiInteractionBroker;
     use crate::types::TuiTaskLifecycle;
 
     static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1955,7 +1954,7 @@ mod tests {
         thread: &RuntimeThreadHandle,
         request: HostedTurnRequest,
         config: RunConfig,
-        controller: &TuiOperationController,
+        controller: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
         let typed_thread = thread.typed_surface();
@@ -1975,7 +1974,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed TUI turn")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
 
         let outcome = run_through_dispatch(
@@ -2030,7 +2029,7 @@ mod tests {
         let thread = host
             .start_thread(config, "typed TUI manual compaction")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
 
         let outcome = manual_compact(&thread.typed_surface(), &controller, &event_tx)
@@ -2081,7 +2080,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed TUI cancellation")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
         let run_thread = thread.clone();
@@ -2137,7 +2136,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed TUI background handoff")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
         let run_thread = thread.clone();
@@ -2283,7 +2282,7 @@ mod tests {
         registry
             .mark_backgrounded(&task.id)
             .expect("task backgrounded");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, _event_rx) = mpsc::unbounded();
 
         let summaries = foreground_task(&thread.typed_surface(), &task.id, &controller, &event_tx)
@@ -2312,7 +2311,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "foreground completed background output")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
         let run_thread = thread.clone();
@@ -2405,7 +2404,7 @@ mod tests {
                 .surface_delivery_watermark(&operation_id)
                 .is_empty()
         );
-        let restarted_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let restarted_controller = TuiSurfaceTaskControl::isolated_for_test();
         let (restart_tx, restart_rx) = mpsc::unbounded();
         foreground_task(
             &thread.typed_surface(),
@@ -2458,7 +2457,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "foreground and re-background")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
         let run_thread = thread.clone();
@@ -2616,7 +2615,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed background approval")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
         let run_thread = thread.clone();
@@ -2772,11 +2771,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
 
-        let controller = TuiOperationController::hosted(
-            crate::interaction_broker::TuiInteractionBroker::default(),
-        );
-        let summaries = actions
-            .stop_task(&task_id, &controller, &event_tx)
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let summaries = stop_task(&thread.typed_surface(), &task_id, &controller, &event_tx)
             .expect("typed workflow stop");
         assert!(
             summaries.iter().any(|task| {
@@ -2839,7 +2835,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed late interrupt")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (first_event_tx, _first_event_rx) = mpsc::unbounded();
         let first = run_through_dispatch(
             &thread,
@@ -2894,7 +2890,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed prearmed activation failure")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         assert!(controller.begin_surface_activation().expect("prearm"));
 
         let mut mismatched = config.clone();
@@ -2954,7 +2950,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed TUI approval")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
         let worker_controller = controller.clone();
         let worker_thread = thread.clone();
@@ -3019,7 +3015,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed TUI permission")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
         let worker_controller = controller.clone();
         let worker_thread = thread.clone();
@@ -3084,7 +3080,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed TUI user input")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
         let worker_controller = controller.clone();
         let worker_thread = thread.clone();
@@ -3150,7 +3146,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed restart source")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = mpsc::unbounded();
         let first = run_through_dispatch(
             &thread,
@@ -3177,7 +3173,7 @@ mod tests {
         let resumed_thread = resumed_host
             .start_thread(resumed_config.clone(), "typed restart resumed")
             .expect("resumed runtime thread");
-        let resumed_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let resumed_controller = TuiSurfaceTaskControl::isolated_for_test();
         let (resumed_event_tx, resumed_event_rx) = mpsc::unbounded();
         let second = run_through_dispatch(
             &resumed_thread,
@@ -3223,7 +3219,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed background restart source")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
         let run_thread = thread.clone();
@@ -3280,7 +3276,7 @@ mod tests {
             Some(OperationTerminal::Shutdown { .. })
         ));
 
-        let resumed_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let resumed_controller = TuiSurfaceTaskControl::isolated_for_test();
         let (resumed_event_tx, _resumed_event_rx) = mpsc::unbounded();
         let next = run_through_dispatch(
             &resumed_thread,
@@ -3317,7 +3313,7 @@ mod tests {
         let thread = host
             .start_thread(config.clone(), "typed cancellation restart source")
             .expect("runtime thread");
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
         let run_thread = thread.clone();
@@ -3359,7 +3355,7 @@ mod tests {
         let resumed_thread = resumed_host
             .start_thread(resumed_config.clone(), "typed cancellation restart resumed")
             .expect("resumed runtime thread");
-        let resumed_controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let resumed_controller = TuiSurfaceTaskControl::isolated_for_test();
         let (resumed_event_tx, resumed_event_rx) = mpsc::unbounded();
         let resumed = run_through_dispatch(
             &resumed_thread,

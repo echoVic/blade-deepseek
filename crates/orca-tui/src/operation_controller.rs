@@ -23,6 +23,26 @@ pub(crate) struct TuiOperationController {
     surface_ids: Arc<OperationIdAllocator>,
 }
 
+/// Presentation-side correlation for a typed runtime surface operation.
+///
+/// This handle intentionally exposes no legacy operation handle, interaction
+/// broker, or generation control to the typed surface client.
+#[derive(Clone, Debug)]
+pub(crate) struct TuiSurfaceTaskControl {
+    hosted: Arc<HostedOperationState>,
+    surface_ids: Arc<OperationIdAllocator>,
+}
+
+impl TuiSurfaceTaskControl {
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test() -> Self {
+        Self {
+            hosted: Arc::new(HostedOperationState::default()),
+            surface_ids: Arc::new(OperationIdAllocator::default()),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct HostedOperationState {
     inner: Mutex<HostedOperationInner>,
@@ -49,6 +69,13 @@ impl TuiOperationController {
             broker,
             background_current: Arc::new(Mutex::new(None)),
             surface_ids: Arc::new(OperationIdAllocator::default()),
+        }
+    }
+
+    pub(crate) fn surface_task_control(&self) -> TuiSurfaceTaskControl {
+        TuiSurfaceTaskControl {
+            hosted: Arc::clone(&self.hosted),
+            surface_ids: Arc::clone(&self.surface_ids),
         }
     }
     #[cfg(test)]
@@ -150,21 +177,6 @@ impl TuiOperationController {
         true
     }
 
-    pub(crate) fn take_surface_background_current(
-        &self,
-        operation_id: &orca_runtime::surface::SurfaceOperationId,
-    ) -> bool {
-        let mut hosted = self.lock_hosted();
-        let Some(surface) = hosted
-            .surface_active
-            .as_mut()
-            .filter(|surface| &surface.operation_id == operation_id)
-        else {
-            return false;
-        };
-        std::mem::take(&mut surface.background_requested)
-    }
-
     pub(crate) fn take_background_current(&self, operation_id: OperationId) -> bool {
         let mut background = self.lock_background_current();
         if *background == Some(operation_id) {
@@ -186,13 +198,27 @@ impl TuiOperationController {
         if let Some(operation) = hosted {
             let _ = operation.interrupt();
         }
-        self.cancel_surface_and_notify();
+        self.surface_task_control().cancel_surface_and_notify();
         self.broker.shutdown();
         *self.lock_background_current() = None;
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
         self.lock_hosted().shutdown
+    }
+
+    pub(crate) fn respond_surface_interaction(
+        &self,
+        key: &TuiInteractionKey,
+        response: &TuiInteractionResponse,
+    ) -> io::Result<bool> {
+        self.surface_task_control()
+            .respond_surface_interaction(key, response)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_surface_active(&self) -> bool {
+        self.surface_task_control().has_surface_active()
     }
 
     pub(crate) fn begin_surface_activation(&self) -> io::Result<bool> {
@@ -381,7 +407,92 @@ impl RuntimeProviderSuspensionControl for TuiTurnControl {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-impl TuiOperationController {
+impl TuiSurfaceTaskControl {
+    #[cfg(test)]
+    pub(crate) fn current_id(&self) -> Option<OperationId> {
+        self.lock_hosted()
+            .surface_active
+            .as_ref()
+            .map(|operation| operation.ui_operation_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_current(&self) -> bool {
+        let mut hosted = self.lock_hosted();
+        if cancel_surface_if_active(&mut hosted) {
+            return true;
+        }
+        if hosted.shutdown || !hosted.surface_activation_armed {
+            return false;
+        }
+        hosted.interrupt_requested = true;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_background_current(&self) -> bool {
+        let mut hosted = self.lock_hosted();
+        if hosted.shutdown {
+            return false;
+        }
+        if let Some(surface) = hosted.surface_active.as_mut() {
+            surface.background_requested = true;
+        } else {
+            hosted.background_requested = true;
+        }
+        drop(hosted);
+        self.hosted.changed.notify_all();
+        true
+    }
+
+    pub(crate) fn begin_surface_activation(&self) -> io::Result<bool> {
+        let mut hosted = self.lock_hosted();
+        if hosted.shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "TUI surface task control is shutting down",
+            ));
+        }
+        if hosted.surface_activation_armed {
+            return Ok(false);
+        }
+        if hosted.active.is_some() || hosted.surface_active.is_some() {
+            return Err(io::Error::other("TUI operation is still active"));
+        }
+        hosted.surface_activation_armed = true;
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
+        Ok(true)
+    }
+
+    pub(crate) fn cancel_surface_activation(&self) {
+        let mut hosted = self.lock_hosted();
+        hosted.surface_activation_armed = false;
+        hosted.interrupt_requested = false;
+        drop(hosted);
+        self.hosted.changed.notify_all();
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.lock_hosted().shutdown
+    }
+
+    pub(crate) fn take_surface_background_current(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) -> bool {
+        let mut hosted = self.lock_hosted();
+        let Some(surface) = hosted
+            .surface_active
+            .as_mut()
+            .filter(|surface| &surface.operation_id == operation_id)
+        else {
+            return false;
+        };
+        std::mem::take(&mut surface.background_requested)
+    }
+
     fn cancel_surface_and_notify(&self) {
         let _ = cancel_surface_if_active(&mut self.lock_hosted());
         self.hosted.changed.notify_all();
@@ -768,6 +879,13 @@ impl TuiOperationController {
     pub(crate) fn has_surface_active(&self) -> bool {
         self.lock_hosted().surface_active.is_some()
     }
+
+    fn lock_hosted(&self) -> MutexGuard<'_, HostedOperationInner> {
+        self.hosted
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[derive(Clone)]
@@ -844,8 +962,7 @@ fn permission_kind(
 mod tests {
     use std::io;
 
-    use super::TuiOperationController;
-    use crate::interaction_broker::TuiInteractionBroker;
+    use super::TuiSurfaceTaskControl;
     use crate::test_support::HostedOperationHarness;
     use crate::types::TuiInteractionKind;
     use orca_runtime::surface::{ByteOffset, SurfaceOperationId, SurfaceStreamId};
@@ -900,7 +1017,7 @@ mod tests {
 
     #[test]
     fn surface_delivery_watermark_survives_background_detach_until_terminal_clear() {
-        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
         let mut operation_bytes = [7; 16];
         operation_bytes[6] = 0x77;
         operation_bytes[8] = 0x87;

@@ -762,7 +762,7 @@ const BASELINE_HARMLESS_SAME_NAME_FUNCTION_SHA256 = new Map([
   ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir", "5ff2d53152274d162938b826d93207487a4a70e0c56dfe26967d5fa0e81befe2"],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit", "ce293ae54519035f0310812943fe1b2173026e496ba75bea3019a45548024833"],
   ["crates/orca-tui/src/mention_search_manager.rs:drop", "811fcf29ec41cdabc9a1aa66c4ec1ee2f671c8da2b2fd346b05173268c3569ce"],
-  ["crates/orca-tui/src/operation_controller.rs:shutdown", "2710286ea9bb4dcaff490ed4534b65fbc961ab6811f399ae2ff3cd39195fbd27"],
+  ["crates/orca-tui/src/operation_controller.rs:shutdown", "1c9a5b7926290c568adcee761ceb15068bbee9dcb8bd7909d79b928ebb1352b7"],
   ["crates/orca-tui/src/operation_controller.rs:remember_surface_delivery_watermark", "772312ab96bdfe762ed68b356a26a904f7a656709f8b27d47347350884c92602"],
   ["crates/orca-tui/src/operation_controller.rs:remember_surface_terminal_delivery", "2e5cea80cd4a2b5c616f47340599649a8a67b0759412d9b621a2b72e61fc1344"],
   ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key", "4fd9fd44d409176ef41c576496fdea65b16d38c08c5b2b6a75d1189a1bb8d578"],
@@ -785,7 +785,7 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
   ],
   [
     "crates/orca-tui/src/surface_client.rs:stop_task",
-    "0e911898ea3d74094304063412055c9e1533f3eea1a88c59e5250d27773fd091",
+    "04c697a86bdd69052adf9f9ef7c5c8a8387d1c88cd1dfcc28b73bb8006e036d6",
   ],
 ]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_FUNCTION_SHA256 = new Map([]);

@@ -52,7 +52,13 @@ impl TuiSurfaceActions {
         controller: &TuiOperationController,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::run(&self.thread, request, config, controller, event_tx)
+        crate::surface_client::run(
+            &self.thread,
+            request,
+            config,
+            &controller.surface_task_control(),
+            event_tx,
+        )
     }
 
     pub(crate) fn resume_operation(
@@ -64,7 +70,7 @@ impl TuiSurfaceActions {
         crate::surface_client::resume_recovered_operation(
             &self.thread,
             operation_id,
-            controller,
+            &controller.surface_task_control(),
             event_tx,
         )
     }
@@ -78,7 +84,7 @@ impl TuiSurfaceActions {
         crate::surface_client::cancel_recovered_operation(
             &self.thread,
             operation_id,
-            controller,
+            &controller.surface_task_control(),
             event_tx,
         )
     }
@@ -88,7 +94,11 @@ impl TuiSurfaceActions {
         controller: &TuiOperationController,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::manual_compact(&self.thread, controller, event_tx)
+        crate::surface_client::manual_compact(
+            &self.thread,
+            &controller.surface_task_control(),
+            event_tx,
+        )
     }
 
     pub(crate) fn update_settings(
@@ -157,7 +167,12 @@ impl TuiSurfaceActions {
         controller: &TuiOperationController,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::set_goal_and_run(&self.thread, objective, controller, event_tx)
+        crate::surface_client::set_goal_and_run(
+            &self.thread,
+            objective,
+            &controller.surface_task_control(),
+            event_tx,
+        )
     }
 
     pub(crate) fn resume_goal_and_run(
@@ -166,7 +181,12 @@ impl TuiSurfaceActions {
         controller: &TuiOperationController,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::resume_goal_and_run(&self.thread, prompt, controller, event_tx)
+        crate::surface_client::resume_goal_and_run(
+            &self.thread,
+            prompt,
+            &controller.surface_task_control(),
+            event_tx,
+        )
     }
 
     pub(crate) fn task_summaries(&self) -> Vec<BackgroundTaskSummary> {
@@ -179,7 +199,12 @@ impl TuiSurfaceActions {
         controller: &TuiOperationController,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> Result<Vec<BackgroundTaskSummary>, String> {
-        crate::surface_client::stop_task(&self.thread, task_id, controller, event_tx)
+        crate::surface_client::stop_task(
+            &self.thread,
+            task_id,
+            &controller.surface_task_control(),
+            event_tx,
+        )
     }
 
     pub(crate) fn foreground_task(
@@ -188,7 +213,12 @@ impl TuiSurfaceActions {
         controller: &TuiOperationController,
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> Result<Vec<BackgroundTaskSummary>, String> {
-        crate::surface_client::foreground_task(&self.thread, task_id, controller, event_tx)
+        crate::surface_client::foreground_task(
+            &self.thread,
+            task_id,
+            &controller.surface_task_control(),
+            event_tx,
+        )
     }
 
     pub(crate) fn resolve_background_approval(
