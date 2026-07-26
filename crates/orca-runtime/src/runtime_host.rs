@@ -17916,6 +17916,27 @@ impl ThreadActor {
                 surface_usage = result.usage_delta;
                 self.usage_ledger.add(result.usage_delta);
                 self.publish_pending_goal_pause_event(&mut result.state, &mut active);
+                // Terminal owner for a lost generation. The in-task settlement
+                // is skipped when the task unwinds, so settle here — outside the
+                // supervised task and before the continuation gate — to keep a
+                // panicked turn from leaving the Goal active with an in-flight
+                // outer turn.
+                //
+                // Surface-owned turns are excluded: their settlement runs
+                // through the surface mutation outbox, and the legacy store path
+                // rejects them after the actor has already dropped its active
+                // turn, which would lose the recorded surface result.
+                if !active.request.surface_goal_owned
+                    && let GenerationTaskOutcome::Panicked { message }
+                    | GenerationTaskOutcome::ExecutionFailed { message, .. } = &result.outcome
+                {
+                    let diagnostic = format!("goal outer turn lost its generation: {message}");
+                    if let Err(error) =
+                        self.settle_unsettled_goal_turn(&mut result.state, &diagnostic)
+                    {
+                        eprintln!("orca: failed to settle a lost Goal outer turn: {error}");
+                    }
+                }
                 let background_error = match &mut result.outcome {
                     GenerationTaskOutcome::Executed(outcome) => {
                         let required = outcome
@@ -18408,6 +18429,80 @@ impl ThreadActor {
             outcome,
         });
         debug_assert!(completed, "operation terminal must complete exactly once");
+        Ok(())
+    }
+
+    /// Settles a Goal outer turn that its generation task left in flight.
+    ///
+    /// The normal settlement happens inside the generation task, next to the
+    /// executor that produced the outcome. That call is skipped whenever the
+    /// task unwinds, so this supervisor-side settler owns the terminal state of
+    /// last resort: it runs outside the supervised task, after the join, and
+    /// fails the turn closed to a paused Goal.
+    ///
+    /// Idempotent by construction. It probes the durable store for a still
+    /// in-flight turn matching the binding and returns without writing when the
+    /// generation already settled, so it is safe to call on every outcome.
+    fn settle_unsettled_goal_turn(
+        &self,
+        state: &mut ThreadActorState,
+        message: &str,
+    ) -> Result<(), RuntimeHostError> {
+        let Some(binding) = state
+            .thread
+            .thread_extensions()
+            .get::<crate::goal_actor::GoalRuntimeBinding>()
+        else {
+            return Ok(());
+        };
+        let Some(turn) = binding.turn.as_ref() else {
+            state.thread.clear_goal_turn_binding();
+            return Ok(());
+        };
+        let still_in_flight = binding
+            .handle
+            .read(&turn.session_id)
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: error.to_string(),
+            })?
+            .and_then(|record| record.current_run)
+            .is_some_and(|run| {
+                run.in_flight
+                    && run
+                        .outer_turn_id
+                        .is_some_and(|outer| outer.as_str() == turn.outer_turn_id.as_str())
+            });
+        if !still_in_flight {
+            state.thread.clear_goal_turn_binding();
+            return Ok(());
+        }
+        // A lost generation produced no trustworthy progress evidence, so the
+        // turn settles as failed. The tracker maps that onto an infrastructure
+        // pause, which keeps the Goal from self-driving on unknown state.
+        binding
+            .handle
+            .finish_outer_turn_with_progress(
+                &turn.session_id,
+                orca_core::goal_runtime::GoalTurnStatus::Failed,
+                crate::lifecycle::TurnEndReason::Unclassified,
+                orca_core::goal_runtime::GoalUsage::default(),
+                0,
+                0,
+                false,
+                Some(crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string()),
+                chrono::Utc::now().timestamp(),
+            )
+            .map_err(|error| RuntimeHostError::GoalControlFailed {
+                message: format!("lost Goal generation could not be settled: {error}"),
+            })?;
+        let _ = binding.handle.pause(
+            &turn.session_id,
+            orca_core::goal_runtime::GoalPauseReason::Infrastructure,
+            message.to_string(),
+            chrono::Utc::now().timestamp(),
+        );
+        state.thread.clear_goal_turn_binding();
+        state.thread.session_mut().replace_goal_context(None);
         Ok(())
     }
 
@@ -19204,6 +19299,8 @@ fn run_hosted_operation(
                 &progress_baseline,
             );
             if !request.surface_goal_owned {
+                // A settlement failure keeps the binding in place so the
+                // supervisor-side settler can finish the turn after the join.
                 thread.finish_goal_turn(
                     binding.as_ref(),
                     status,
@@ -19214,7 +19311,7 @@ fn run_hosted_operation(
                     evidence,
                     generation.config(),
                     cancel.clone(),
-                );
+                )?;
             } else {
                 let binding = binding.as_ref().ok_or_else(|| {
                     io::Error::other("surface Goal turn lost its runtime binding")

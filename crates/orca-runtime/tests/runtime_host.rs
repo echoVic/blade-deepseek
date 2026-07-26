@@ -3601,6 +3601,131 @@ fn interrupting_active_goal_run_persists_user_pause_before_cancellation() {
 }
 
 #[test]
+fn panicking_goal_run_settles_outer_turn_and_fails_closed_to_paused() {
+    with_orca_home(|home| {
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::Panic]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host.start_thread(config, "panicking goal run").unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        let goal = runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "survive a panic".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("start goal")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true),
+                io::sink(),
+            )
+            .unwrap();
+        let terminal = operation.wait_timeout(TEST_TIMEOUT).unwrap();
+        assert!(matches!(
+            terminal.outcome(),
+            OperationOutcome::Panicked { message } if message.contains("scripted operation panic")
+        ));
+
+        let record = runtime.read(&session_id).unwrap().unwrap();
+        assert!(
+            record.current_run.is_none(),
+            "panicked Goal turn left its run open: {:?}",
+            record.current_run
+        );
+        assert!(
+            matches!(
+                record.state,
+                orca_core::goal_runtime::GoalState::Paused {
+                    reason: orca_core::goal_runtime::GoalPauseReason::Infrastructure,
+                    ..
+                }
+            ),
+            "panicked Goal run did not fail closed to paused: {:?}",
+            record.state
+        );
+        let store = orca_runtime::goal_store::GoalStore::open(home.join("goals.sqlite3")).unwrap();
+        assert_eq!(
+            store.audit_snapshot(&goal.goal_id).unwrap().in_flight_runs,
+            0,
+            "panicked Goal turn left an in-flight run behind"
+        );
+
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn failing_goal_run_settles_outer_turn_and_fails_closed_to_paused() {
+    with_orca_home(|home| {
+        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+            message: "failing goal turn".to_string(),
+            status: RunStatus::Failed,
+        }]));
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(executor).unwrap();
+        let mut config = test_config(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host.start_thread(config, "failing goal run").unwrap();
+        let session_id = thread.session_id().unwrap().to_string();
+        let runtime = thread.goal_runtime().unwrap();
+        let goal = runtime
+            .create(orca_runtime::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "fail closed".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new("start goal")
+                    .with_operation_kind(HostedOperationKind::GoalRun)
+                    .with_goal_tools(true)
+                    .with_goal_usage_tracking(true),
+                io::sink(),
+            )
+            .unwrap();
+        assert_eq!(
+            operation.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
+            &OperationOutcome::Completed(RunStatus::Failed)
+        );
+
+        let record = runtime.read(&session_id).unwrap().unwrap();
+        assert!(
+            record.current_run.is_none(),
+            "failed Goal turn left its run open: {:?}",
+            record.current_run
+        );
+        assert!(
+            matches!(
+                record.state,
+                orca_core::goal_runtime::GoalState::Paused { .. }
+            ),
+            "failed Goal run did not fail closed to paused: {:?}",
+            record.state
+        );
+        let store = orca_runtime::goal_store::GoalStore::open(home.join("goals.sqlite3")).unwrap();
+        assert_eq!(
+            store.audit_snapshot(&goal.goal_id).unwrap().in_flight_runs,
+            0,
+            "failed Goal turn left an in-flight run behind"
+        );
+
+        host.shutdown().unwrap();
+    });
+}
+
+#[test]
 fn shutting_down_active_goal_run_persists_pause_before_cancel_and_join() {
     with_orca_home(|home| {
         let gate = CancelJoinGate::new();

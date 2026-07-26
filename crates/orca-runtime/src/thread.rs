@@ -207,13 +207,13 @@ impl RuntimeThread {
         evidence: TurnProgressEvidence,
         config: &RunConfig,
         cancel: CancelToken,
-    ) {
+    ) -> io::Result<()> {
         let Some(binding) = binding else {
-            return;
+            return Ok(());
         };
         let Some(turn) = binding.turn.as_ref() else {
             self.thread_extensions.remove::<GoalRuntimeBinding>();
-            return;
+            return Ok(());
         };
         let goal_status = match status {
             RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
@@ -243,6 +243,31 @@ impl RuntimeThread {
                 .then(|| crate::goal_tracker::NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT.to_string()),
             now_timestamp(),
         );
+        // A failed settlement leaves the outer turn in flight. Surfacing it lets
+        // the caller keep the binding for the supervisor-side settler instead of
+        // silently stranding the Goal as active with an unfinished turn.
+        let action: Result<_, crate::goal_actor::GoalActorError> = match action {
+            Ok(action) => Ok(action),
+            Err(error) => {
+                if let Some(events) = events.as_deref_mut() {
+                    let _ = orca_core::event_sink::observe_event(
+                        observer,
+                        events.goal_turn_finished(
+                            &turn.outer_turn_id,
+                            goal_status,
+                            &usage,
+                            &orca_core::goal_runtime::GoalNextAction::Pause {
+                                reason: orca_core::goal_runtime::GoalPauseReason::Infrastructure,
+                                message: error.to_string(),
+                            },
+                        ),
+                    );
+                }
+                return Err(io::Error::other(format!(
+                    "goal outer turn settlement failed: {error}"
+                )));
+            }
+        };
         let mut final_action = action.clone().ok();
         if let Ok(orca_core::goal_runtime::GoalNextAction::Verify { intent }) = action {
             let record = binding.handle.read(&turn.session_id).ok().flatten();
@@ -375,6 +400,7 @@ impl RuntimeThread {
             }
         }
         self.thread_extensions.remove::<GoalRuntimeBinding>();
+        Ok(())
     }
 
     pub(crate) fn emit_goal_turn_started(
@@ -474,7 +500,7 @@ impl RuntimeThread {
         .run_request(request, writer);
         let evidence =
             turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
-        self.finish_goal_turn(
+        let settled = self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
@@ -485,7 +511,7 @@ impl RuntimeThread {
             config,
             CancelToken::new(),
         );
-        result
+        result.and_then(|status| settled.map(|()| status))
     }
 
     pub fn run_request_with_cancel<W: io::Write>(
@@ -511,7 +537,7 @@ impl RuntimeThread {
         .run_request_with_cancel(request, writer, cancel);
         let evidence =
             turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
-        self.finish_goal_turn(
+        let settled = self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
@@ -522,7 +548,7 @@ impl RuntimeThread {
             config,
             verifier_cancel,
         );
-        result
+        result.and_then(|status| settled.map(|()| status))
     }
 
     pub fn run_request_with_event_factory<W: io::Write>(
@@ -567,7 +593,7 @@ impl RuntimeThread {
         .run_request_with_event_factory_and_cancel(request, writer, events, cancel);
         let evidence =
             turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
-        self.finish_goal_turn(
+        let settled = self.finish_goal_turn(
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
@@ -578,7 +604,7 @@ impl RuntimeThread {
             config,
             verifier_cancel,
         );
-        result
+        result.and_then(|status| settled.map(|()| status))
     }
 
     pub(crate) fn run_request_with_event_factory_and_cancel_outcome_unbound<W: io::Write>(
@@ -620,7 +646,7 @@ impl RuntimeThread {
         );
         let evidence =
             turn_progress_evidence_since(self.session.conversation(), &progress_baseline);
-        self.finish_goal_turn(
+        let settled = self.finish_goal_turn(
             binding.as_ref(),
             match &result {
                 Ok(ThreadTurnOutcome::Completed { status, .. }) => *status,
@@ -641,7 +667,7 @@ impl RuntimeThread {
             config,
             verifier_cancel,
         );
-        result
+        result.and_then(|outcome| settled.map(|()| outcome))
     }
 
     fn next_turn_extension_id(&mut self) -> String {
@@ -1029,5 +1055,98 @@ mod tests {
                 .is_none(),
             "turn-scoped marker must not leak into later turns"
         );
+    }
+
+    fn with_orca_home<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("temp ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe {
+            std::env::set_var("ORCA_HOME", home.path());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("ORCA_HOME", previous);
+            } else {
+                std::env::remove_var("ORCA_HOME");
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn finishing_a_goal_turn_surfaces_a_failed_settlement() {
+        with_orca_home(|| {
+            let cwd = tempfile::tempdir().unwrap();
+            let mut config = test_config(cwd.path().to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let mut thread = RuntimeThread::start(&config, "settlement failure").unwrap();
+            let session_id = thread
+                .session()
+                .session_id()
+                .expect("recorded thread has a session")
+                .to_string();
+            let handle = thread.goal_runtime_handle().unwrap();
+            handle
+                .create(crate::goal_store::CreateGoalInput {
+                    session_id: session_id.clone(),
+                    objective: "surface settlement failures".to_string(),
+                    token_budget: None,
+                    now: 1,
+                })
+                .unwrap();
+            let turn = handle
+                .begin_outer_turn(
+                    &session_id,
+                    orca_core::goal_runtime::GoalTurnOrigin::User,
+                    "turn-1".to_string(),
+                    2,
+                )
+                .unwrap();
+            let binding = GoalRuntimeBinding {
+                handle,
+                turn: Some(turn),
+            };
+            let evidence = TurnProgressEvidence::default();
+
+            thread
+                .finish_goal_turn(
+                    Some(&binding),
+                    RunStatus::Success,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    orca_core::goal_runtime::GoalUsage::default(),
+                    None,
+                    None,
+                    evidence,
+                    &config,
+                    CancelToken::new(),
+                )
+                .expect("first settlement succeeds");
+
+            // The turn is already settled, so the actor has no active outer turn
+            // left to finish. That failure must reach the caller rather than
+            // being dropped, which would strand the Goal as active in flight.
+            let error = thread
+                .finish_goal_turn(
+                    Some(&binding),
+                    RunStatus::Success,
+                    crate::lifecycle::TurnEndReason::Unclassified,
+                    orca_core::goal_runtime::GoalUsage::default(),
+                    None,
+                    None,
+                    evidence,
+                    &config,
+                    CancelToken::new(),
+                )
+                .expect_err("a failed settlement must not be swallowed");
+            assert!(
+                error.to_string().contains("settlement failed"),
+                "unexpected settlement error: {error}"
+            );
+        });
     }
 }
