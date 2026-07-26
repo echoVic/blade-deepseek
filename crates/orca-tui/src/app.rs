@@ -570,13 +570,13 @@ fn spawn_legacy_feature_test_runtime(
     let agent_config = Arc::clone(&config);
     let agent_preloaded = Arc::clone(&preloaded);
     let agent_events = event_tx.clone();
+    let legacy_controller = controller.clone();
     TuiAgentRuntime::spawn_hosted(
         action_rx,
         event_tx,
         8,
         controller,
-        move |controller, commands, host| {
-            let control = controller.surface_task_control();
+        move |control, commands, host| {
             hosted_tui_controller_loop_with_ordinary_turn_runner(
                 agent_config,
                 agent_preloaded,
@@ -586,7 +586,7 @@ fn spawn_legacy_feature_test_runtime(
                 pending,
                 registry,
                 host,
-                OrdinaryTurnRunner::Legacy(controller),
+                OrdinaryTurnRunner::Legacy(legacy_controller),
             );
         },
     )
@@ -5176,12 +5176,11 @@ fn hosted_tui_controller_loop(
     preloaded: Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: mpsc::Sender<TuiEvent>,
     action_rx: mpsc::Receiver<UserAction>,
-    controller: TuiOperationController,
+    control: TuiSurfaceTaskControl,
     pending_workflow_notifications: bridge::PendingWorkflowNotifications,
     mcp_registry: orca_mcp::McpRegistry,
     host: RuntimeHostHandle,
 ) {
-    let control = controller.surface_task_control();
     hosted_tui_controller_loop_with_ordinary_turn_runner(
         config,
         preloaded,

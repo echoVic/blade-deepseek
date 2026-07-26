@@ -5,6 +5,7 @@ const MANIFEST: &str = include_str!(
 );
 const TYPES: &str = include_str!("types.rs");
 const APP: &str = include_str!("app.rs");
+const AGENT_RUNTIME: &str = include_str!("agent_runtime.rs");
 const ACTION_DISPATCHER: &str = include_str!("action_dispatcher.rs");
 const SURFACE_ACTIONS: &str = include_str!("surface_actions.rs");
 const SURFACE_CLIENT: &str = include_str!("surface_client.rs");
@@ -662,6 +663,37 @@ fn production_app_inner_loop_owns_only_one_typed_surface_control() {
         !production_loop.contains("TuiOperationController")
             && !production_loop.contains(".surface_task_control()"),
         "production app control flow must carry one TuiSurfaceTaskControl directly"
+    );
+}
+
+#[test]
+fn production_agent_runtime_owns_only_typed_surface_control() {
+    let struct_start = AGENT_RUNTIME
+        .find("pub(crate) struct TuiAgentRuntime")
+        .expect("agent runtime struct");
+    let struct_end = AGENT_RUNTIME[struct_start..]
+        .find("\n}\n\nimpl TuiAgentRuntime")
+        .map(|offset| struct_start + offset)
+        .expect("agent runtime struct end");
+    let runtime_state = &AGENT_RUNTIME[struct_start..struct_end];
+
+    let spawn_start = AGENT_RUNTIME
+        .find("fn spawn_with_dispatch_capacities(")
+        .expect("typed agent runtime spawn");
+    let spawn_end = AGENT_RUNTIME[spawn_start..]
+        .find("\n    #[cfg(test)]")
+        .map(|offset| spawn_start + offset)
+        .expect("typed agent runtime spawn end");
+    let typed_spawn = &AGENT_RUNTIME[spawn_start..spawn_end];
+
+    assert!(
+        runtime_state.contains("controller: TuiSurfaceTaskControl")
+            && !runtime_state.contains("TuiOperationController")
+            && typed_spawn.contains("control: TuiSurfaceTaskControl")
+            && typed_spawn
+                .contains("FnOnce(TuiSurfaceTaskControl, Receiver<UserAction>, RuntimeHostHandle)")
+            && !typed_spawn.contains("TuiOperationController"),
+        "production agent runtime state and worker must own only TuiSurfaceTaskControl"
     );
 }
 

@@ -252,7 +252,7 @@ pub(crate) fn manual_compact(
     controller.install_surface(attachment.client.clone(), operation_id.clone())?;
     activation.disarm();
     guard.controller_installed();
-    let result = drain_operation(
+    let result = drain_operation_with_boundary(
         &surface,
         &attachment.client,
         &operation_id,
@@ -260,6 +260,7 @@ pub(crate) fn manual_compact(
         &mut projection,
         controller,
         event_tx,
+        true,
     );
     if result.is_ok() {
         guard.terminal_observed();
@@ -1817,6 +1818,28 @@ fn drain_operation(
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<TuiHostedOperationOutcome> {
+    drain_operation_with_boundary(
+        surface,
+        client,
+        operation_id,
+        subscription,
+        projection,
+        controller,
+        event_tx,
+        false,
+    )
+}
+
+fn drain_operation_with_boundary(
+    surface: &RuntimeSurfaceHandle,
+    client: &RuntimeSurfaceClientHandle,
+    operation_id: &SurfaceOperationId,
+    subscription: &mut orca_runtime::surface::SurfaceSubscriptionReceiver,
+    projection: &mut TuiSurfaceProjection,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    defer_compacted_until_terminal: bool,
+) -> io::Result<TuiHostedOperationOutcome> {
     let (wait_tx, wait_rx) = mpsc::bounded(1);
     let waiter_client = client.clone();
     let waiter_operation_id = operation_id.clone();
@@ -1831,6 +1854,7 @@ fn drain_operation(
     let mut failure: Option<io::Error> = None;
     let mut waiter_finished = false;
     let mut projected_terminal_event = None;
+    let mut projected_compacted_event = None;
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
         if projection.active_generation_fence(operation_id).is_some()
             && controller.begin_surface_background_handoff(operation_id)
@@ -1938,6 +1962,10 @@ fn drain_operation(
                             for event in events {
                                 if matches!(event, TuiEvent::SessionCompleted { .. }) {
                                     projected_terminal_event = Some(event);
+                                } else if defer_compacted_until_terminal
+                                    && matches!(&event, TuiEvent::Compacted { .. })
+                                {
+                                    projected_compacted_event = Some(event);
                                 } else {
                                     let _ = event_tx.send(event);
                                 }
@@ -2016,6 +2044,9 @@ fn drain_operation(
             projection.delivery_watermark(operation_id),
         );
         controller.remember_surface_terminal_delivery(operation_id.clone());
+        if let Some(compacted) = projected_compacted_event.take() {
+            let _ = event_tx.send(compacted);
+        }
         let terminal_event =
             projected_terminal_event.unwrap_or_else(|| TuiEvent::SessionCompleted {
                 status: terminal_status(terminal.terminal.clone()).to_string(),
@@ -2039,6 +2070,9 @@ fn drain_operation(
                     if &value.operation_id == operation_id =>
                 {
                     controller.complete_surface(operation_id);
+                    if let Some(compacted) = projected_compacted_event.take() {
+                        let _ = event_tx.send(compacted);
+                    }
                     let terminal_event =
                         projected_terminal_event.unwrap_or_else(|| TuiEvent::SessionCompleted {
                             status: terminal_status(value.terminal.clone()).to_string(),
