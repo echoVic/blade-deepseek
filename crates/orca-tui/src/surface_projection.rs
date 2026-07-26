@@ -10,14 +10,14 @@ use orca_core::task_types::{
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_runtime::surface::{
-    AssistantChannel, AssistantPatch, OperationPatch, OperationTerminal, SurfaceAssistantStream,
-    SurfaceAssistantStreamState, SurfaceCommitBatch, SurfaceCompletedModelResponse, SurfaceCursor,
-    SurfaceEvent, SurfaceFileChange, SurfaceGoal, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
-    SurfaceGoalState, SurfaceHistoryMessage, SurfaceInputPresentation, SurfaceItem,
-    SurfaceOperationFence, SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult,
-    SurfaceReducerErrorCode, SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus,
-    SurfaceToolResultKind, SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus,
-    SurfaceWorkflowStatus, ToolPatch, UnixMillis,
+    AssistantChannel, AssistantPatch, ByteOffset, OperationPatch, OperationTerminal,
+    SurfaceAssistantStream, SurfaceAssistantStreamState, SurfaceCommitBatch,
+    SurfaceCompletedModelResponse, SurfaceCursor, SurfaceEvent, SurfaceFileChange, SurfaceGoal,
+    SurfaceGoalPauseReason, SurfaceGoalReceiptState, SurfaceGoalState, SurfaceHistoryMessage,
+    SurfaceInputPresentation, SurfaceItem, SurfaceOperationFence, SurfaceOperationId,
+    SurfaceReduceMode, SurfaceReduceResult, SurfaceReducerErrorCode, SurfaceReducerState,
+    SurfaceStreamId, SurfaceTaskStatus, SurfaceToolResultKind, SurfaceUserInputState,
+    SurfaceWorkflow, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, ToolPatch, UnixMillis,
 };
 
 use crate::types::{TuiEvent, TuiTaskLifecycle};
@@ -177,11 +177,19 @@ pub(crate) enum SurfaceProjectionError {
     ReducerRejected {
         code: SurfaceReducerErrorCode,
     },
+    InvalidDeliveryWatermark {
+        stream_id: SurfaceStreamId,
+        offset: ByteOffset,
+    },
 }
+
+pub(crate) type TuiStreamDeliveryWatermark = BTreeMap<SurfaceStreamId, ByteOffset>;
 
 pub(crate) struct TuiSurfaceProjection {
     cursor: SurfaceCursor,
     assistant_streams: BTreeMap<SurfaceStreamId, SurfaceAssistantStream>,
+    completed_items: Vec<SurfaceItem>,
+    operation_turn_ids: BTreeMap<SurfaceOperationId, Vec<orca_runtime::surface::SurfaceTurnId>>,
     focused_operation: Option<SurfaceOperationId>,
     pending_turn_started: Option<TuiTaskLifecycle>,
     goal: Option<SurfaceGoal>,
@@ -198,6 +206,8 @@ impl TuiSurfaceProjection {
                 .iter()
                 .map(|stream| (stream.stream_id.clone(), stream.clone()))
                 .collect(),
+            completed_items: Vec::new(),
+            operation_turn_ids: BTreeMap::new(),
             focused_operation: None,
             pending_turn_started: None,
             goal: None,
@@ -228,6 +238,30 @@ impl TuiSurfaceProjection {
                 turn: turn.ordinal,
             });
         projection.goal = snapshot.goal.clone();
+        projection.completed_items = snapshot.items.clone();
+        projection.operation_turn_ids = snapshot
+            .operation_history
+            .iter()
+            .map(|operation| {
+                let mut turn_ids = operation
+                    .generations
+                    .iter()
+                    .map(|generation| generation.logical_turn_id.clone())
+                    .chain(
+                        operation
+                            .agent_loop_turns
+                            .iter()
+                            .map(|turn| turn.turn_id.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                if let Some(turn_id) = operation.initial_logical_turn_id.clone() {
+                    turn_ids.push(turn_id);
+                }
+                turn_ids.sort();
+                turn_ids.dedup();
+                (operation.operation_id.clone(), turn_ids)
+            })
+            .collect();
         projection.thread_created_at = snapshot.thread.created_at;
         projection.thread_updated_at = snapshot.thread.updated_at;
         projection.reducer_state = Some(SurfaceReducerState::new(snapshot.clone()));
@@ -264,6 +298,159 @@ impl TuiSurfaceProjection {
                 .collect::<Vec<_>>(),
         );
         projected
+    }
+
+    pub(crate) fn delivery_watermark(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> TuiStreamDeliveryWatermark {
+        self.assistant_streams
+            .values()
+            .filter(|stream| {
+                &stream.fence.operation_id == operation_id
+                    && stream.state != SurfaceAssistantStreamState::Discarded
+            })
+            .map(|stream| (stream.stream_id.clone(), stream.next_offset))
+            .collect()
+    }
+
+    pub(crate) fn hydrate_after_delivery_watermark(
+        &self,
+        operation_id: &SurfaceOperationId,
+        watermark: &TuiStreamDeliveryWatermark,
+    ) -> Result<Vec<TuiEvent>, SurfaceProjectionError> {
+        let mut projected = self
+            .assistant_streams
+            .values()
+            .filter(|stream| {
+                &stream.fence.operation_id == operation_id
+                    && stream.state != SurfaceAssistantStreamState::Discarded
+            })
+            .filter_map(|stream| {
+                let offset = watermark
+                    .get(&stream.stream_id)
+                    .copied()
+                    .unwrap_or_else(|| ByteOffset::new(0));
+                let Ok(offset_usize) = usize::try_from(offset.get()) else {
+                    return Some(Err(SurfaceProjectionError::InvalidDeliveryWatermark {
+                        stream_id: stream.stream_id.clone(),
+                        offset,
+                    }));
+                };
+                let text = stream.text.as_str();
+                if offset_usize > text.len() || !text.is_char_boundary(offset_usize) {
+                    return Some(Err(SurfaceProjectionError::InvalidDeliveryWatermark {
+                        stream_id: stream.stream_id.clone(),
+                        offset,
+                    }));
+                }
+                let suffix = &text[offset_usize..];
+                if suffix.is_empty() {
+                    return None;
+                }
+                Some(Ok(match stream.channel {
+                    AssistantChannel::Message => TuiEvent::MessageDelta(suffix.to_string()),
+                    AssistantChannel::Reasoning => TuiEvent::ReasoningDelta(suffix.to_string()),
+                    AssistantChannel::Plan => TuiEvent::Notice(suffix.to_string()),
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(turn_ids) = self.operation_turn_ids.get(operation_id) else {
+            return Ok(projected);
+        };
+        let streamed_item_ids = self
+            .assistant_streams
+            .values()
+            .filter(|stream| &stream.fence.operation_id == operation_id)
+            .map(|stream| &stream.item_id)
+            .collect::<Vec<_>>();
+        projected.extend(self.completed_items.iter().filter_map(|item| match item {
+            SurfaceItem::AssistantMessage {
+                id, turn_id, text, ..
+            } if turn_ids.contains(turn_id)
+                && !streamed_item_ids.iter().any(|streamed| *streamed == id)
+                && !text.as_str().is_empty() =>
+            {
+                Some(TuiEvent::MessageDelta(text.as_str().to_string()))
+            }
+            SurfaceItem::AssistantReasoning {
+                id,
+                turn_id,
+                summary,
+                content,
+                ..
+            } if turn_ids.contains(turn_id)
+                && !streamed_item_ids.iter().any(|streamed| *streamed == id) =>
+            {
+                let text = if content.as_str().is_empty() {
+                    summary.as_str()
+                } else {
+                    content.as_str()
+                };
+                (!text.is_empty()).then(|| TuiEvent::ReasoningDelta(text.to_string()))
+            }
+            SurfaceItem::AssistantPlan {
+                id, turn_id, text, ..
+            } if turn_ids.contains(turn_id)
+                && !streamed_item_ids.iter().any(|streamed| *streamed == id)
+                && !text.as_str().is_empty() =>
+            {
+                Some(TuiEvent::Notice(text.as_str().to_string()))
+            }
+            _ => None,
+        }));
+        for turn_id in turn_ids {
+            let discarded_item_ids = self
+                .assistant_streams
+                .values()
+                .filter(|stream| {
+                    &stream.fence.operation_id == operation_id
+                        && &stream.turn_id == turn_id
+                        && stream.state == SurfaceAssistantStreamState::Discarded
+                })
+                .map(|stream| &stream.item_id)
+                .collect::<Vec<_>>();
+            if discarded_item_ids.is_empty() {
+                continue;
+            }
+            let message = self.completed_items.iter().find_map(|item| match item {
+                SurfaceItem::AssistantMessage { id, text, .. }
+                    if discarded_item_ids.iter().any(|discarded| *discarded == id) =>
+                {
+                    Some(text.as_str().to_string())
+                }
+                _ => None,
+            });
+            let reasoning = self.completed_items.iter().find_map(|item| match item {
+                SurfaceItem::AssistantReasoning {
+                    id,
+                    summary,
+                    content,
+                    ..
+                } if discarded_item_ids.iter().any(|discarded| *discarded == id) => Some(
+                    if content.as_str().is_empty() {
+                        summary.as_str()
+                    } else {
+                        content.as_str()
+                    }
+                    .to_string(),
+                ),
+                _ => None,
+            });
+            if message.is_some() || reasoning.is_some() {
+                projected.push(TuiEvent::AssistantResponseCompleted(message, reasoning));
+            }
+            projected.extend(self.completed_items.iter().filter_map(|item| match item {
+                SurfaceItem::AssistantPlan { id, text, .. }
+                    if discarded_item_ids.iter().any(|discarded| *discarded == id)
+                        && !text.as_str().is_empty() =>
+                {
+                    Some(TuiEvent::Notice(text.as_str().to_string()))
+                }
+                _ => None,
+            }));
+        }
+        Ok(projected)
     }
 
     #[allow(dead_code)]
@@ -621,15 +808,48 @@ impl TuiSurfaceProjection {
         &self,
         operation_id: &SurfaceOperationId,
     ) -> Option<SurfaceOperationFence> {
-        self.reducer_state
-            .as_ref()?
-            .snapshot()
+        let snapshot = self.reducer_state.as_ref()?.snapshot();
+        snapshot
             .foreground_operation
             .as_ref()
-            .filter(|operation| &operation.operation_id == operation_id)?
-            .generations
-            .last()
+            .filter(|operation| &operation.operation_id == operation_id)
+            .and_then(|operation| operation.generations.last())
             .map(|generation| generation.fence.clone())
+            .or_else(|| {
+                snapshot
+                    .background_operations
+                    .iter()
+                    .find(|operation| &operation.operation_id == operation_id)
+                    .map(|operation| operation.fence.operation_fence.clone())
+            })
+    }
+
+    pub(crate) fn operation_is_runtime_backgrounded(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> bool {
+        self.reducer_state.as_ref().is_some_and(|state| {
+            state
+                .snapshot()
+                .background_operations
+                .iter()
+                .any(|operation| &operation.operation_id == operation_id)
+        })
+    }
+
+    pub(crate) fn terminal_status_for_operation(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<&'static str> {
+        let snapshot = self.reducer_state.as_ref()?.snapshot();
+        snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| &operation.operation_id == operation_id)
+            .and_then(|operation| operation.terminal.as_ref())
+            .and_then(|record| operation_terminal_status(&record.terminal))
     }
 }
 
@@ -989,8 +1209,9 @@ mod tests {
         ByteOffset, CommitClass, CursorSourceRevision, DisplayText, DurableRevision, NonEmptyVec,
         SequenceNumber, Sha256Digest, SurfaceCommitId, SurfaceEventEnvelope, SurfaceEventId,
         SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope,
-        SurfaceThreadId, SurfaceTurnId,
+        SurfaceThreadId, SurfaceTurnId, ThreadOwnerEpoch,
     };
+    use orca_runtime::unstable_surface::SurfaceGenerationId;
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
         let mut bytes = [seed; 16];
@@ -1007,6 +1228,15 @@ mod tests {
             source_revision: CursorSourceRevision::Recorded {
                 durable_revision: DurableRevision::try_new(revision).unwrap(),
             },
+        }
+    }
+
+    fn operation_fence(seed: u8) -> SurfaceOperationFence {
+        SurfaceOperationFence {
+            thread_id: SurfaceThreadId::try_from_bytes(uuid_v7_bytes(1)).unwrap(),
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            operation_id: SurfaceOperationId::try_from_bytes(uuid_v7_bytes(seed)).unwrap(),
+            generation_id: SurfaceGenerationId::new(u64::from(seed)),
         }
     }
 
@@ -1254,6 +1484,8 @@ mod tests {
         let mut projection = TuiSurfaceProjection {
             cursor: cursor(0, 1),
             assistant_streams: BTreeMap::new(),
+            completed_items: Vec::new(),
+            operation_turn_ids: BTreeMap::new(),
             focused_operation: None,
             pending_turn_started: Some(TuiTaskLifecycle {
                 id: "task-1".to_string(),
@@ -1275,5 +1507,130 @@ mod tests {
             }] if id == "task-1" && status == "running"
         ));
         assert!(projection.hydrate_open_streams().is_empty());
+    }
+
+    #[test]
+    fn foreground_hydration_emits_only_undelivered_bytes_for_the_selected_operation() {
+        let fence = operation_fence(10);
+        let other_fence = operation_fence(20);
+        let message_stream_id =
+            SurfaceStreamId::try_from_bytes(uuid_v7_bytes(30)).expect("message stream id");
+        let reasoning_stream_id =
+            SurfaceStreamId::try_from_bytes(uuid_v7_bytes(31)).expect("reasoning stream id");
+        let other_stream_id =
+            SurfaceStreamId::try_from_bytes(uuid_v7_bytes(32)).expect("other stream id");
+        let streams = vec![
+            SurfaceAssistantStream {
+                stream_id: message_stream_id.clone(),
+                fence: fence.clone(),
+                turn_id: SurfaceTurnId::new(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Message,
+                next_offset: ByteOffset::new(12),
+                text: DisplayText::new("hello world!"),
+                state: SurfaceAssistantStreamState::Completed,
+            },
+            SurfaceAssistantStream {
+                stream_id: reasoning_stream_id.clone(),
+                fence: fence.clone(),
+                turn_id: SurfaceTurnId::new(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Reasoning,
+                next_offset: ByteOffset::new(6),
+                text: DisplayText::new("reason"),
+                state: SurfaceAssistantStreamState::Open,
+            },
+            SurfaceAssistantStream {
+                stream_id: other_stream_id,
+                fence: other_fence,
+                turn_id: SurfaceTurnId::new(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Message,
+                next_offset: ByteOffset::new(5),
+                text: DisplayText::new("other"),
+                state: SurfaceAssistantStreamState::Open,
+            },
+        ];
+        let initial_stream = SurfaceAssistantStream {
+            stream_id: message_stream_id.clone(),
+            fence: fence.clone(),
+            turn_id: streams[0].turn_id.clone(),
+            item_id: streams[0].item_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(5),
+            text: DisplayText::new("hello"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let initial = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &[initial_stream]);
+        let watermark = initial.delivery_watermark(&fence.operation_id);
+        let projection = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &streams);
+
+        let hydrated = projection
+            .hydrate_after_delivery_watermark(&fence.operation_id, &watermark)
+            .expect("valid delivery watermark");
+        assert!(matches!(
+            hydrated.as_slice(),
+            [TuiEvent::MessageDelta(message), TuiEvent::ReasoningDelta(reasoning)]
+                if message == " world!" && reasoning == "reason"
+        ));
+        assert_eq!(
+            projection
+                .delivery_watermark(&fence.operation_id)
+                .get(&message_stream_id),
+            Some(&ByteOffset::new(12))
+        );
+        assert_eq!(
+            projection
+                .delivery_watermark(&fence.operation_id)
+                .get(&reasoning_stream_id),
+            Some(&ByteOffset::new(6))
+        );
+    }
+
+    #[test]
+    fn foreground_hydration_reconciles_completed_item_for_discarded_stream() {
+        let fence = operation_fence(40);
+        let turn_id = SurfaceTurnId::new();
+        let item_id = SurfaceItemId::new();
+        let stream = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(41))
+                .expect("discarded stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: item_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(7),
+            text: DisplayText::new("partial"),
+            state: SurfaceAssistantStreamState::Discarded,
+        };
+        let projection = TuiSurfaceProjection {
+            cursor: cursor(0, 1),
+            assistant_streams: BTreeMap::from([(stream.stream_id.clone(), stream)]),
+            completed_items: vec![SurfaceItem::AssistantMessage {
+                id: item_id,
+                turn_id: turn_id.clone(),
+                text: DisplayText::new("corrected full response"),
+                pinned: false,
+            }],
+            operation_turn_ids: BTreeMap::from([(fence.operation_id.clone(), vec![turn_id])]),
+            focused_operation: None,
+            pending_turn_started: None,
+            goal: None,
+            thread_created_at: UnixMillis::new(0),
+            thread_updated_at: UnixMillis::new(0),
+            reducer_state: None,
+        };
+
+        assert!(matches!(
+            projection
+                .hydrate_after_delivery_watermark(
+                    &fence.operation_id,
+                    &TuiStreamDeliveryWatermark::new(),
+                )
+                .expect("discarded stream hydration")
+                .as_slice(),
+            [TuiEvent::AssistantResponseCompleted(Some(message), None)]
+                if message == "corrected full response"
+        ));
     }
 }

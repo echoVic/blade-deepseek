@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -31,10 +33,14 @@ use crate::lifecycle::{
 use crate::model_response::RuntimeModelResponse;
 use crate::thread_store::redact_sensitive_text;
 
+#[cfg(test)]
+static TYPED_PROVIDER_OUTCOME_WRITE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Clone, Debug)]
 pub struct TaskRegistry {
     session_id: String,
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
+    typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
     persistence: Option<Arc<TaskPersistence>>,
 }
 
@@ -181,6 +187,27 @@ struct PersistedTaskRecord {
     command: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DurableTypedProviderOutcome {
+    pub status: TaskStatus,
+    pub response: Option<RuntimeModelResponse>,
+    pub error: Option<String>,
+    pub usage: Option<UsageTotals>,
+    pub completed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedTypedProviderOutcome {
+    status: TaskStatus,
+    #[serde(default)]
+    response: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    usage: Option<UsageTotals>,
+    completed_at_ms: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedProviderResponse {
     #[serde(default)]
@@ -205,20 +232,29 @@ enum PersistedProviderStep {
 }
 
 impl TaskRegistry {
+    #[cfg(test)]
+    pub(crate) fn inject_typed_provider_outcome_write_failures(count: usize) {
+        TYPED_PROVIDER_OUTCOME_WRITE_FAILURES.store(count, Ordering::SeqCst);
+    }
+
     pub fn new(session_id: String) -> Self {
         Self {
             session_id,
             inner: Arc::new(Mutex::new(HashMap::new())),
+            typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
         }
     }
 
     pub fn new_persistent(session_id: String, root: PathBuf) -> io::Result<Self> {
         let persistence = Arc::new(TaskPersistence::new(root, session_id.clone()));
+        let typed_provider_outcomes = persistence.load_typed_provider_outcomes(&session_id)?;
         let mut records = persistence.load_session_records(&session_id)?;
         let mut changed = false;
-        for record in records.values_mut() {
-            changed |= mark_interrupted_if_active(record);
+        for (task_id, record) in &mut records {
+            if !typed_provider_outcomes.contains_key(task_id) {
+                changed |= mark_interrupted_if_active(record);
+            }
         }
         if changed {
             persistence.write_session_records(&session_id, &records)?;
@@ -226,6 +262,7 @@ impl TaskRegistry {
         Ok(Self {
             session_id,
             inner: Arc::new(Mutex::new(records)),
+            typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
             persistence: Some(persistence),
         })
     }
@@ -241,6 +278,61 @@ impl TaskRegistry {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub(crate) fn record_typed_provider_outcome(
+        &self,
+        task_id: &str,
+        outcome: DurableTypedProviderOutcome,
+    ) -> Result<(), String> {
+        let task = self
+            .get(task_id)
+            .ok_or_else(|| format!("task '{task_id}' not found"))?;
+        if task.task_type != TaskType::MainSession {
+            return Err("typed provider outcome requires a main session task".to_string());
+        }
+        let mut outcomes = self
+            .typed_provider_outcomes
+            .lock()
+            .map_err(|_| "typed provider outcome lock poisoned".to_string())?;
+        let previous = outcomes.insert(task_id.to_string(), outcome);
+        if let Err(error) = self.persist_typed_provider_outcomes(&outcomes) {
+            match previous {
+                Some(previous) => {
+                    outcomes.insert(task_id.to_string(), previous);
+                }
+                None => {
+                    outcomes.remove(task_id);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn typed_provider_outcome(
+        &self,
+        task_id: &str,
+    ) -> Option<DurableTypedProviderOutcome> {
+        self.typed_provider_outcomes
+            .lock()
+            .ok()
+            .and_then(|outcomes| outcomes.get(task_id).cloned())
+    }
+
+    pub(crate) fn clear_typed_provider_outcome(&self, task_id: &str) -> Result<(), String> {
+        let mut outcomes = self
+            .typed_provider_outcomes
+            .lock()
+            .map_err(|_| "typed provider outcome lock poisoned".to_string())?;
+        let previous = outcomes.remove(task_id);
+        if let Err(error) = self.persist_typed_provider_outcomes(&outcomes) {
+            if let Some(previous) = previous {
+                outcomes.insert(task_id.to_string(), previous);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn create_workflow(
@@ -642,6 +734,22 @@ impl TaskRegistry {
 
             record.is_backgrounded = false;
             record.last_activity_at_ms = Some(now_ms());
+            Ok(())
+        })
+    }
+
+    pub(crate) fn reconcile_main_session_backgrounded(
+        &self,
+        id: &str,
+        is_backgrounded: bool,
+    ) -> Result<(), String> {
+        self.update_task(id, |record| {
+            if record.task_type != TaskType::MainSession {
+                return Err(
+                    "reconcile_main_session_backgrounded requires a main session task".to_string(),
+                );
+            }
+            record.is_backgrounded = is_backgrounded;
             Ok(())
         })
     }
@@ -1303,6 +1411,18 @@ impl TaskRegistry {
             .map_err(|error| error.to_string())
     }
 
+    fn persist_typed_provider_outcomes(
+        &self,
+        outcomes: &HashMap<String, DurableTypedProviderOutcome>,
+    ) -> Result<(), String> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        persistence
+            .write_typed_provider_outcomes(&self.session_id, outcomes)
+            .map_err(|error| error.to_string())
+    }
+
     fn with_tasks<R, F>(&self, f: F) -> Result<R, ()>
     where
         F: FnOnce(&mut HashMap<String, TaskRecord>) -> R,
@@ -1374,6 +1494,54 @@ impl TaskPersistence {
         write_json_pretty(&self.session_tasks_path(session_id), &persisted)
     }
 
+    fn load_typed_provider_outcomes(
+        &self,
+        session_id: &str,
+    ) -> io::Result<HashMap<String, DurableTypedProviderOutcome>> {
+        let path = self.session_typed_provider_outcomes_path(session_id);
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let persisted: HashMap<String, PersistedTypedProviderOutcome> = read_json(&path)?;
+        persisted
+            .into_iter()
+            .map(|(task_id, outcome)| {
+                DurableTypedProviderOutcome::try_from(outcome).map(|outcome| (task_id, outcome))
+            })
+            .collect()
+    }
+
+    fn write_typed_provider_outcomes(
+        &self,
+        session_id: &str,
+        outcomes: &HashMap<String, DurableTypedProviderOutcome>,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if TYPED_PROVIDER_OUTCOME_WRITE_FAILURES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(io::Error::other(
+                "injected typed provider outcome persistence failure",
+            ));
+        }
+        let persisted = outcomes
+            .iter()
+            .map(|(task_id, outcome)| {
+                (
+                    task_id.clone(),
+                    PersistedTypedProviderOutcome::from(outcome),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        write_json_pretty(
+            &self.session_typed_provider_outcomes_path(session_id),
+            &persisted,
+        )
+    }
+
     fn load_index(&self) -> io::Result<HashMap<String, String>> {
         let path = self.index_path();
         if !path.exists() {
@@ -1390,6 +1558,12 @@ impl TaskPersistence {
         self.root
             .join(safe_path_component(session_id))
             .join("tasks.json")
+    }
+
+    fn session_typed_provider_outcomes_path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(safe_path_component(session_id))
+            .join("typed-provider-outcomes.json")
     }
 
     fn index_path(&self) -> PathBuf {
@@ -1526,6 +1700,40 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             error: record.error.as_deref().map(redact_sensitive_text),
             worker_pid: record.worker_pid,
             command: record.command.clone(),
+        }
+    }
+}
+
+impl TryFrom<PersistedTypedProviderOutcome> for DurableTypedProviderOutcome {
+    type Error = io::Error;
+
+    fn try_from(outcome: PersistedTypedProviderOutcome) -> Result<Self, Self::Error> {
+        let response = outcome
+            .response
+            .map(|value| serde_json::from_value::<PersistedProviderResponse>(value))
+            .transpose()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .map(PersistedProviderResponse::into_runtime_response_with_migration_identity);
+        Ok(Self {
+            status: outcome.status,
+            response,
+            error: outcome.error,
+            usage: outcome.usage,
+            completed_at_ms: outcome.completed_at_ms,
+        })
+    }
+}
+
+impl From<&DurableTypedProviderOutcome> for PersistedTypedProviderOutcome {
+    fn from(outcome: &DurableTypedProviderOutcome) -> Self {
+        Self {
+            status: outcome.status,
+            response: outcome.response.as_ref().and_then(|response| {
+                serde_json::to_value(PersistedProviderResponse::from(response)).ok()
+            }),
+            error: outcome.error.as_deref().map(redact_sensitive_text),
+            usage: outcome.usage,
+            completed_at_ms: outcome.completed_at_ms,
         }
     }
 }

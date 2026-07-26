@@ -91,13 +91,13 @@ pub mod surface {
         SurfaceReduceResult, SurfaceReducerErrorCode, SurfaceReducerState, SurfaceRequestId,
         SurfaceResolvedInputFact, SurfaceScope, SurfaceSettingsSnapshot, SurfaceShutdownReason,
         SurfaceSnapshot, SurfaceStreamId, SurfaceSubscriptionHandle, SurfaceSubscriptionItem,
-        SurfaceSubscriptionReceiver, SurfaceTask, SurfaceTaskId, SurfaceTaskStatus,
-        SurfaceTaskType, SurfaceThreadId, SurfaceToolResultKind, SurfaceTurnId,
+        SurfaceSubscriptionReceiver, SurfaceTask, SurfaceTaskFence, SurfaceTaskId,
+        SurfaceTaskStatus, SurfaceTaskType, SurfaceThreadId, SurfaceToolResultKind, SurfaceTurnId,
         SurfaceUnavailableReason, SurfaceUserInputDecision, SurfaceUserInputState, SurfaceWorkflow,
-        SurfaceWorkflowAgentStatus, SurfaceWorkflowRunId, SurfaceWorkflowStatus, TaskPatch,
-        ThreadOwnerEpoch, ToolPatch, TransferBackgroundOutput, UnixMillis, UsageTotals,
-        WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction,
-        WorkflowControlOutput, WorkflowPatch, reduce_batch,
+        SurfaceWorkflowAgentStatus, SurfaceWorkflowRunId, SurfaceWorkflowStatus, TaskControlAction,
+        TaskControlOutput, TaskPatch, ThreadOwnerEpoch, ToolPatch, TransferBackgroundOutput,
+        UnixMillis, UsageTotals, WaitOperationTerminalResult, WorkflowCatalogRevision,
+        WorkflowControlAction, WorkflowControlOutput, WorkflowPatch, reduce_batch,
     };
 }
 mod runtime_tool_actor;

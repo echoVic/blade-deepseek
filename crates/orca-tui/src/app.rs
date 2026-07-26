@@ -1499,98 +1499,6 @@ mod tests {
         host.shutdown().expect("runtime host shutdown");
     }
 
-    #[test]
-    fn stop_task_for_tui_requests_stop_and_refreshes_tasks() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Running in background".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
-
-        let record = registry.get(&task.id).unwrap();
-        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopping);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopping
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message))
-                if message.contains("Task stop requested")
-                    && message.contains(&task.id)
-        ));
-        host.shutdown().expect("runtime host shutdown");
-    }
-
-    #[test]
-    fn stop_task_for_tui_stops_approval_required_task_immediately() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Needs approval".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        registry
-            .approval_required_for_pending_tool(
-                &task.id,
-                "approval_required".to_string(),
-                Some(orca_core::task_types::PendingToolCallSummary {
-                    id: "mock-tool-1".to_string(),
-                    name: "task_list".to_string(),
-                    action: orca_core::approval_types::ActionKind::Read,
-                    target: None,
-                    arguments: "{}".to_string(),
-                }),
-            )
-            .unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        assert!(stop_task_for_tui(Some(&actions), &task.id, &event_tx));
-
-        let record = registry.get(&task.id).unwrap();
-        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopped);
-        assert_eq!(record.result.as_deref(), Some("Task stopped"));
-        assert_eq!(record.pending_tool_call, None);
-        assert_eq!(record.pending_tool_approval_response, None);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1
-                    && tasks[0].status == orca_core::task_types::TaskStatus::Stopped
-                    && tasks[0].pending_tool_call.is_none()
-        ));
-        host.shutdown().expect("runtime host shutdown");
-    }
-
-    #[test]
-    fn foreground_task_for_tui_marks_backgrounded_task_and_refreshes_tasks() {
-        let (host, thread, actions) = test_task_surface();
-        let registry = thread.task_registry();
-        let task = registry.create_main_session("Long answer".to_string());
-        registry.mark_running(&task.id).unwrap();
-        registry.mark_backgrounded(&task.id).unwrap();
-        let (event_tx, event_rx) = mpsc::unbounded();
-
-        assert!(foreground_task_for_tui(Some(&actions), &task.id, &event_tx));
-
-        let record = registry.get(&task.id).unwrap();
-        assert!(!record.is_backgrounded);
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                if tasks.len() == 1 && !tasks[0].is_backgrounded
-        ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(TuiEvent::Notice(message)) if message.contains("returned to foreground")
-        ));
-        host.shutdown().expect("runtime host shutdown");
-    }
-
     fn transcript(session_id: &str) -> history::SessionTranscript {
         history::SessionTranscript {
             meta: history::SessionMeta {
@@ -2011,7 +1919,7 @@ mod tests {
     #[test]
     fn hosted_tui_backgrounded_canonical_provider_can_be_stopped_once() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
             harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
             harness.recv_until(|event| {
                 matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
@@ -2042,7 +1950,7 @@ mod tests {
                     .expect("stopped task update");
                 if let Some(task) = matching_task_update(event, |candidate| {
                     candidate.id == task.id
-                        && candidate.status == orca_core::task_types::TaskStatus::Stopped
+                        && candidate.status == orca_core::task_types::TaskStatus::Cancelled
                 }) {
                     break task;
                 }
@@ -2053,7 +1961,7 @@ mod tests {
                 task_id: task.id.clone(),
             });
             let duplicate_stop = harness.recv_until(
-                |event| matches!(event, TuiEvent::Error(message) if message.contains("already stopped")),
+                |event| matches!(event, TuiEvent::Error(message) if message.contains("already cancelled")),
             );
             assert!(matches!(duplicate_stop, TuiEvent::Error(_)));
             harness.shutdown();
@@ -2063,8 +1971,8 @@ mod tests {
     #[test]
     fn hosted_tui_backgrounded_canonical_provider_can_be_foregrounded_once() {
         with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
-            harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
+            let mut harness = HostedTuiHarness::start_typed(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 3000".to_string()));
             harness.recv_until(|event| {
                 matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
             });
@@ -2096,13 +2004,6 @@ mod tests {
                 .is_some()
             });
 
-            harness.send(UserAction::ForegroundTask {
-                task_id: task.id.clone(),
-            });
-            harness.recv_until(|event| {
-                matches!(event, TuiEvent::Error(message) if message.contains("requires a backgrounded task"))
-            });
-
             let mut saw_completed_delta = false;
             loop {
                 match harness
@@ -2123,6 +2024,18 @@ mod tests {
                 }
             }
             assert!(saw_completed_delta);
+
+            harness.send(UserAction::ForegroundTask {
+                task_id: task.id.clone(),
+            });
+            let duplicate = harness.recv_until(|event| matches!(event, TuiEvent::Error(_)));
+            assert!(
+                matches!(
+                    duplicate,
+                    TuiEvent::Error(ref message) if message.contains("already delivered")
+                ),
+                "unexpected duplicate foreground result: {duplicate:?}"
+            );
             harness.shutdown();
         });
     }
@@ -5388,13 +5301,13 @@ fn hosted_tui_controller_loop_with_ordinary_turn_runner(
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &event_tx);
+                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &controller, &event_tx);
             }
             Ok(UserAction::ForegroundTask { task_id }) => {
                 let actions = thread
                     .as_ref()
                     .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &event_tx);
+                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &controller, &event_tx);
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
                 let actions = thread

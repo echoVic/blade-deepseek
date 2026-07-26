@@ -1188,6 +1188,18 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.commit_batch(&permit, batch)
     }
 
+    pub(crate) fn commit_background_batch(
+        &mut self,
+        fence: super::SurfaceBackgroundFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let permit = self.register_permit(SurfacePublisherPermit::Background {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch(&permit, batch)
+    }
+
     pub(crate) fn commit_goal_batch(
         &mut self,
         goal_fence: super::SurfaceGoalFence,
@@ -4472,9 +4484,40 @@ fn provider_background_stop_authorized(
     {
         return false;
     }
-    let [task_event, stop_event, finalization_event] = batch.events.as_slice() else {
+    let events = batch.events.as_slice();
+    if events.len() < 3 {
+        return false;
+    }
+    let (response_events, terminalization_events) = events.split_at(events.len() - 3);
+    let [task_event, stop_event, finalization_event] = terminalization_events else {
         return false;
     };
+    let mut response_completed = 0usize;
+    for event in response_events {
+        let (
+            SurfaceScope::Background {
+                fence: response_scope,
+            },
+            super::SurfaceEvent::Assistant(patch),
+        ) = (&event.scope, &event.event)
+        else {
+            return false;
+        };
+        if response_scope != background_fence {
+            return false;
+        }
+        match patch {
+            super::AssistantPatch::Delta { .. } | super::AssistantPatch::StreamDiscarded { .. } => {
+            }
+            super::AssistantPatch::ResponseCompleted { .. } => {
+                response_completed = response_completed.saturating_add(1);
+            }
+            _ => return false,
+        }
+    }
+    if !response_events.is_empty() && response_completed != 1 {
+        return false;
+    }
     let (
         SurfaceScope::Thread,
         super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
@@ -4546,7 +4589,8 @@ fn provider_background_stop_authorized(
                     ..
                 }
             ))
-        && task.background_fence.as_ref() == Some(background_fence)
+        && (task.background_fence.as_ref() == Some(background_fence)
+            || (!task.backgrounded && task.background_fence.is_none()))
         && stop_scope == background_fence
         && finalization_scope == background_fence
         && stop_fence == &background_fence.operation_fence

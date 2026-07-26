@@ -250,6 +250,9 @@ pub enum TuiEvent {
     WorkflowTaskUpdated {
         task: BackgroundTaskSummary,
     },
+    BackgroundTaskOutputAttached {
+        task_id: String,
+    },
     WorkflowNotification {
         id: String,
         prompt: String,
@@ -1522,6 +1525,10 @@ impl AppState {
                 self.recoverable_operation_id = None;
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
+            }
+            TuiEvent::BackgroundTaskOutputAttached { .. } => {
+                self.suppress_background_main_session_output = false;
+                self.panel_mode = PanelMode::Conversation;
             }
             TuiEvent::ReasoningDelta(text) => {
                 if self.suppress_background_main_session_output {
@@ -4439,6 +4446,27 @@ mod tests {
         state.update(TuiEvent::WorkflowTasksUpdated { tasks: vec![task] });
 
         assert!(!state.suppress_background_main_session_output);
+    }
+
+    #[test]
+    fn background_output_attach_clears_suppression_before_replayed_delta() {
+        let mut state = state();
+        state.panel_mode = PanelMode::Workflows;
+        state.suppress_background_main_session_output = true;
+
+        state.update(TuiEvent::BackgroundTaskOutputAttached {
+            task_id: "task-main".to_string(),
+        });
+        state.update(TuiEvent::MessageDelta(
+            "missing foreground suffix".to_string(),
+        ));
+
+        assert!(!state.suppress_background_main_session_output);
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Assistant(text)) if text == "missing foreground suffix"
+        ));
     }
 
     #[test]

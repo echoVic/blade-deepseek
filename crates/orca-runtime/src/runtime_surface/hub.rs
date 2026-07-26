@@ -609,6 +609,10 @@ impl SurfaceHub {
         lock(&self.inner).subscriptions.len()
     }
 
+    pub(crate) fn has_live_attachment(&self, attachment_id: &SurfaceAttachmentId) -> bool {
+        lock(&self.inner).subscriptions.contains_key(attachment_id)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn admits_client(&self, client: &RuntimeSurfaceClientHandle) -> bool {
         let state = lock(&self.inner);

@@ -2499,6 +2499,12 @@ static SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = 
 static PENDING_SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static TASK_OWNERSHIP_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static BACKGROUND_TRANSFER_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
@@ -2783,6 +2789,33 @@ impl JsonlSurfaceCommitLedger {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_task_ownership_checkpoint_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_task_ownership_checkpoint_failures(path: impl Into<PathBuf>) {
+        let path = path.into();
+        TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+        PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
     }
 
     #[cfg(test)]
@@ -3338,6 +3371,48 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    fn arm_task_ownership_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        if !batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Task(TaskPatch::OwnershipChanged { .. })
+            )
+        }) {
+            return;
+        }
+        let mut failures = TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.remove(&self.path) {
+            PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(self.path.clone())
+                .and_modify(|pending| *pending += count)
+                .or_insert(count);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_task_ownership_checkpoint_failure(&self) -> bool {
+        let mut failures = PENDING_TASK_OWNERSHIP_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
     fn take_settings_checkpoint_failure(&self) -> bool {
         let mut failures = PENDING_SETTINGS_CHECKPOINT_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -3519,6 +3594,8 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         #[cfg(test)]
         self.arm_settings_checkpoint_failures(batch);
         #[cfg(test)]
+        self.arm_task_ownership_checkpoint_failures(batch);
+        #[cfg(test)]
         self.arm_background_transfer_checkpoint_failures(batch);
         #[cfg(test)]
         self.arm_provider_completion_checkpoint_failures(batch);
@@ -3561,6 +3638,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_settings_checkpoint_failure() {
+            return Err(SurfaceLedgerError::CheckpointFailed);
+        }
+        #[cfg(test)]
+        if self.take_task_ownership_checkpoint_failure() {
             return Err(SurfaceLedgerError::CheckpointFailed);
         }
         #[cfg(test)]

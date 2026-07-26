@@ -1,6 +1,9 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
-use std::{collections::HashMap, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
 use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
 use orca_runtime::provider_stream::RuntimeProviderSuspensionControl;
@@ -9,6 +12,7 @@ use orca_runtime::runtime_host::{InterruptOperationResult, OperationHandle};
 
 use crate::interaction_broker::TuiInteractionBroker;
 use crate::interaction_broker::TuiInteractionWaiter;
+use crate::surface_projection::TuiStreamDeliveryWatermark;
 use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 
 #[derive(Clone, Debug)]
@@ -32,6 +36,9 @@ struct HostedOperationInner {
     surface_activation_armed: bool,
     interrupt_requested: bool,
     background_requested: bool,
+    surface_delivery_watermarks:
+        HashMap<orca_runtime::surface::SurfaceOperationId, TuiStreamDeliveryWatermark>,
+    surface_terminal_deliveries: HashSet<orca_runtime::surface::SurfaceOperationId>,
     shutdown: bool,
 }
 
@@ -172,6 +179,8 @@ impl TuiOperationController {
         let hosted = {
             let mut hosted = self.lock_hosted();
             hosted.shutdown = true;
+            hosted.surface_delivery_watermarks.clear();
+            hosted.surface_terminal_deliveries.clear();
             hosted.active.clone()
         };
         if let Some(operation) = hosted {
@@ -454,6 +463,55 @@ impl TuiOperationController {
         hosted.interrupt_requested = false;
         drop(hosted);
         self.hosted.changed.notify_all();
+    }
+
+    pub(crate) fn remember_surface_delivery_watermark(
+        &self,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+        watermark: TuiStreamDeliveryWatermark,
+    ) {
+        self.lock_hosted()
+            .surface_delivery_watermarks
+            .insert(operation_id, watermark);
+    }
+
+    pub(crate) fn surface_delivery_watermark(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) -> TuiStreamDeliveryWatermark {
+        self.lock_hosted()
+            .surface_delivery_watermarks
+            .get(operation_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_surface_delivery_watermark(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        self.lock_hosted()
+            .surface_delivery_watermarks
+            .remove(operation_id);
+    }
+
+    pub(crate) fn surface_terminal_was_delivered(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) -> bool {
+        self.lock_hosted()
+            .surface_terminal_deliveries
+            .contains(operation_id)
+    }
+
+    pub(crate) fn remember_surface_terminal_delivery(
+        &self,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+    ) {
+        self.lock_hosted()
+            .surface_terminal_deliveries
+            .insert(operation_id);
     }
 
     pub(crate) fn register_surface_interaction(
@@ -786,8 +844,13 @@ fn permission_kind(
 mod tests {
     use std::io;
 
+    use super::TuiOperationController;
+    use crate::interaction_broker::TuiInteractionBroker;
     use crate::test_support::HostedOperationHarness;
     use crate::types::TuiInteractionKind;
+    use orca_runtime::surface::{ByteOffset, SurfaceOperationId, SurfaceStreamId};
+
+    use crate::surface_projection::TuiStreamDeliveryWatermark;
 
     #[test]
     fn completing_hosted_operation_clears_current_and_wakes_waiter() {
@@ -833,5 +896,34 @@ mod tests {
         assert!(controller.request_background_current());
         assert!(controller.take_background_current(operation.operation().id()));
         assert!(!controller.take_background_current(operation.operation().id()));
+    }
+
+    #[test]
+    fn surface_delivery_watermark_survives_background_detach_until_terminal_clear() {
+        let controller = TuiOperationController::hosted(TuiInteractionBroker::default());
+        let mut operation_bytes = [7; 16];
+        operation_bytes[6] = 0x77;
+        operation_bytes[8] = 0x87;
+        let operation_id =
+            SurfaceOperationId::try_from_bytes(operation_bytes).expect("operation id");
+        let mut stream_bytes = [8; 16];
+        stream_bytes[6] = 0x78;
+        stream_bytes[8] = 0x88;
+        let stream_id = SurfaceStreamId::try_from_bytes(stream_bytes).expect("stream id");
+        let watermark =
+            TuiStreamDeliveryWatermark::from([(stream_id.clone(), ByteOffset::new(17))]);
+
+        controller.remember_surface_delivery_watermark(operation_id.clone(), watermark.clone());
+        assert_eq!(
+            controller.surface_delivery_watermark(&operation_id),
+            watermark
+        );
+
+        controller.clear_surface_delivery_watermark(&operation_id);
+        assert!(
+            controller
+                .surface_delivery_watermark(&operation_id)
+                .is_empty()
+        );
     }
 }

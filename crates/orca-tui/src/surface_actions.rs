@@ -177,15 +177,22 @@ impl TuiSurfaceActions {
         self.thread.task_summaries()
     }
 
-    pub(crate) fn stop_task(&self, task_id: &str) -> Result<Vec<BackgroundTaskSummary>, String> {
-        crate::surface_client::stop_task(&self.thread, task_id)
+    pub(crate) fn stop_task(
+        &self,
+        task_id: &str,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> Result<Vec<BackgroundTaskSummary>, String> {
+        crate::surface_client::stop_task(&self.thread, task_id, controller, event_tx)
     }
 
     pub(crate) fn foreground_task(
         &self,
         task_id: &str,
+        controller: &TuiOperationController,
+        event_tx: &mpsc::Sender<TuiEvent>,
     ) -> Result<Vec<BackgroundTaskSummary>, String> {
-        self.thread.foreground_task(task_id)
+        crate::surface_client::foreground_task(&self.thread, task_id, controller, event_tx)
     }
 
     pub(crate) fn resolve_background_approval(
