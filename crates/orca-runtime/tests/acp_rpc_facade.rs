@@ -1,9 +1,11 @@
 #[path = "../src/acp/rpc_facade.rs"]
 mod rpc_facade;
 
+use std::cell::Cell;
 use std::future::pending;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -15,6 +17,7 @@ use rpc_facade::{
     ACP_SUPERVISOR_JOIN_DEADLINE_MS, BoundedLaneBudget, FrameDirection, HandlerCompletion,
     HandlerFuture, InboundFrame, LaneKind, OutboundReservationBarrier, ReaderAdmissionBarrier,
     RpcFacadeConfig, RpcFacadeError, SequenceScope, SequenceSeeds, TransportFrame, bounded_lane,
+    spawn_local_rpc_facade, spawn_local_rpc_facade_with_response_session_resolver,
     spawn_rpc_facade, spawn_rpc_facade_with_sequence_seeds,
     spawn_rpc_facade_with_sequence_seeds_and_outbound_reservation_barrier,
     spawn_rpc_facade_with_sequence_seeds_and_reader_admission_barrier,
@@ -23,6 +26,125 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::oneshot;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[test]
+fn local_facade_sequences_non_send_session_admission_before_cancel() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let seen = Rc::new(Cell::new(0_u64));
+        let admitted = Rc::new(tokio::sync::Notify::new());
+        let handler = {
+            let seen = seen.clone();
+            let admitted = admitted.clone();
+            Rc::new(move |frame: InboundFrame| {
+                let seen = seen.clone();
+                let admitted = admitted.clone();
+                Box::pin(async move {
+                    if frame.method() == Some("session/prompt") {
+                        tokio::task::yield_now().await;
+                        assert_eq!(seen.get(), 0);
+                        seen.set(1);
+                    } else if frame.method() == Some("session/cancel") {
+                        assert_eq!(seen.get(), 1);
+                        seen.set(2);
+                        admitted.notify_one();
+                    }
+                    Ok(Box::pin(async {}) as rpc_facade::LocalHandlerCompletion)
+                }) as rpc_facade::LocalHandlerFuture
+            })
+        };
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let (_handle, supervisor) = spawn_local_rpc_facade(
+            server_read,
+            RecordingWriter::short(usize::MAX),
+            handler,
+            RpcFacadeConfig::default(),
+        );
+        client
+            .write_all(&request("session/prompt", 1, "local-session"))
+            .await
+            .unwrap();
+        client
+            .write_all(&request("session/cancel", 2, "local-session"))
+            .await
+            .unwrap();
+        admitted.notified().await;
+        client.shutdown().await.unwrap();
+        supervisor.wait().await.unwrap();
+        assert_eq!(seen.get(), 2);
+    });
+}
+
+#[test]
+fn local_facade_orders_cancel_before_correlated_permission_response() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let seen = Rc::new(Cell::new(0_u64));
+        let response_seen = Rc::new(tokio::sync::Notify::new());
+        let handler = {
+            let seen = seen.clone();
+            let response_seen = response_seen.clone();
+            Rc::new(move |frame: InboundFrame| {
+                let seen = seen.clone();
+                let response_seen = response_seen.clone();
+                Box::pin(async move {
+                    if frame.method() == Some("session/cancel") {
+                        tokio::task::yield_now().await;
+                        assert_eq!(seen.get(), 0);
+                        seen.set(1);
+                    } else if frame.method().is_none() {
+                        assert_eq!(
+                            seen.get(),
+                            1,
+                            "permission response overtook earlier session cancel"
+                        );
+                        seen.set(2);
+                        response_seen.notify_one();
+                    }
+                    Ok(Box::pin(async {}) as rpc_facade::LocalHandlerCompletion)
+                }) as rpc_facade::LocalHandlerFuture
+            })
+        };
+        let resolver = Arc::new(|request_id: i64| {
+            (request_id == 41).then(|| "permission-session".to_string())
+        });
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let (_handle, supervisor) =
+            spawn_local_rpc_facade_with_response_session_resolver(
+                server_read,
+                RecordingWriter::short(usize::MAX),
+                handler,
+                resolver,
+                RpcFacadeConfig::default(),
+            );
+        client
+            .write_all(&request(
+                "session/cancel",
+                1,
+                "permission-session",
+            ))
+            .await
+            .unwrap();
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":41,\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n")
+            .await
+            .unwrap();
+        response_seen.notified().await;
+        client.shutdown().await.unwrap();
+        supervisor.wait().await.unwrap();
+        assert_eq!(seen.get(), 2);
+    });
+}
 
 fn request(method: &str, id: u64, session_id: &str) -> Vec<u8> {
     format!(
@@ -363,7 +485,7 @@ async fn stalled_handler_completions_hold_the_16_mib_ingress_byte_budget() {
 }
 
 #[tokio::test]
-async fn physically_pending_write_holds_its_outgoing_message_budget() {
+async fn outbound_capacity_rejection_seals_transport_instead_of_dropping_frame() {
     let (_client, server) = pending_input();
     let (server_read, _server_write) = tokio::io::split(server);
     let writer = RecordingWriter::pending();
@@ -410,8 +532,23 @@ async fn physically_pending_write_holds_its_outgoing_message_budget() {
             budget: BoundedLaneBudget::Messages,
         })
     ));
+    assert!(matches!(
+        handle.enqueue(TransportFrame::new(
+            FrameDirection::AgentToClient,
+            response(ACP_OUTGOING_MESSAGE_LIMIT as u64 + 1, "sealed"),
+        )),
+        Err(RpcFacadeError::Sealed)
+    ));
     drop(receipts);
-    supervisor.shutdown().await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(TEST_TIMEOUT, supervisor.wait())
+            .await
+            .expect("outbound saturation did not wake supervisor"),
+        Err(RpcFacadeError::Capacity {
+            lane: LaneKind::Outgoing,
+            budget: BoundedLaneBudget::Messages,
+        })
+    ));
 }
 
 #[tokio::test]
@@ -594,7 +731,7 @@ async fn inbound_frame_limit_stops_an_unbounded_line_without_waiting_for_eof() {
 }
 
 #[tokio::test]
-async fn outbound_frame_above_limit_is_rejected_before_queueing() {
+async fn outbound_frame_above_limit_seals_transport_instead_of_dropping_frame() {
     assert_eq!(ACP_MAX_OUTBOUND_FRAME_BYTES, 8_388_608);
     let (_client, server) = pending_input();
     let (server_read, _server_write) = tokio::io::split(server);
@@ -615,7 +752,22 @@ async fn outbound_frame_above_limit_is_rejected_before_queueing() {
             ..
         })
     ));
-    supervisor.shutdown().await.unwrap();
+    assert!(matches!(
+        handle.enqueue(TransportFrame::new(
+            FrameDirection::AgentToClient,
+            response(13, "sealed")
+        )),
+        Err(RpcFacadeError::Sealed)
+    ));
+    assert!(matches!(
+        tokio::time::timeout(TEST_TIMEOUT, supervisor.wait())
+            .await
+            .expect("oversize outbound frame did not seal transport"),
+        Err(RpcFacadeError::Oversize {
+            direction: FrameDirection::AgentToClient,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

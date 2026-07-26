@@ -419,7 +419,12 @@ fn collect_until(
     loop {
         while let Some(item) = receiver.try_recv() {
             match item {
-                SurfaceSubscriptionItem::Batch { batch } => batches.push(batch),
+                SurfaceSubscriptionItem::Batch { batch } => {
+                    batches.push(batch);
+                    if predicate(&batches) {
+                        return batches;
+                    }
+                }
                 SurfaceSubscriptionItem::Gap { required } => {
                     panic!("surface subscription gapped: {:?}", required.reason)
                 }

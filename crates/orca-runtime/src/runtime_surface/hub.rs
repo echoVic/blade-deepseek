@@ -49,6 +49,7 @@ pub struct SurfaceHub {
 
 struct SurfaceHubState {
     ready: bool,
+    seal_reason: Option<SurfaceSubscriptionSealReason>,
     snapshot: Arc<SurfaceSnapshot>,
     retained: VecDeque<Arc<SharedSurfaceBatch>>,
     retained_events: u64,
@@ -86,6 +87,7 @@ impl SharedSurfaceBatch {
 enum QueuedSubscriptionItem {
     Batch(Arc<SharedSurfaceBatch>),
     Gap(SnapshotRequired),
+    Sealed(SurfaceSubscriptionSealReason),
 }
 
 pub struct SurfaceSubscriptionReceiver {
@@ -132,6 +134,16 @@ impl SurfaceSubscriptionReceiver {
                 return item.map(materialize_subscription_item);
             }
         }
+    }
+
+    pub(crate) fn sealed_snapshot(&self) -> Option<SnapshotAtCursor> {
+        let hub = self.hub.upgrade()?;
+        let state = lock(&hub);
+        state.seal_reason?;
+        Some(SnapshotAtCursor {
+            snapshot: state.snapshot.clone(),
+            cursor: state.snapshot.cursor.clone(),
+        })
     }
 }
 
@@ -220,6 +232,7 @@ impl SurfaceHub {
         Ok(Self {
             inner: Arc::new(Mutex::new(SurfaceHubState {
                 ready: false,
+                seal_reason: None,
                 snapshot: Arc::new(snapshot),
                 retained: VecDeque::new(),
                 retained_events: 0,
@@ -491,6 +504,28 @@ impl SurfaceHub {
         };
         self.notify.notify_all();
         self.notify_interaction_capability_change(!lost.is_empty());
+    }
+
+    pub(crate) fn seal_subscriptions(&self, reason: SurfaceSubscriptionSealReason) {
+        let changed = {
+            let mut state = lock(&self.inner);
+            if state.seal_reason.is_some() {
+                false
+            } else {
+                state.seal_reason = Some(reason);
+                state.ready = false;
+                for subscriber in state.subscriptions.values_mut() {
+                    subscriber
+                        .queue
+                        .push_back(QueuedSubscriptionItem::Sealed(reason));
+                }
+                true
+            }
+        };
+        if changed {
+            self.notify.notify_all();
+            self.notify_interaction_capability_change(true);
+        }
     }
 
     fn notify_interaction_capability_change(&self, changed: bool) {
@@ -944,6 +979,7 @@ fn materialize_subscription_item(item: QueuedSubscriptionItem) -> SurfaceSubscri
             batch: batch.batch.clone(),
         },
         QueuedSubscriptionItem::Gap(required) => SurfaceSubscriptionItem::Gap { required },
+        QueuedSubscriptionItem::Sealed(reason) => SurfaceSubscriptionItem::Sealed { reason },
     }
 }
 
@@ -1257,6 +1293,9 @@ mod tests {
             QueuedSubscriptionItem::Gap(_) => {
                 panic!("locked dequeue did not return the shared batch")
             }
+            QueuedSubscriptionItem::Sealed(_) => {
+                panic!("locked dequeue did not return the shared batch")
+            }
         };
         assert!(Arc::ptr_eq(&queued_batch, &batch));
         let public = materialize_subscription_item(queued);
@@ -1269,6 +1308,7 @@ mod tests {
         snapshot.cursor = batch.batch.cursor_after.clone();
         let state = SurfaceHubState {
             ready: true,
+            seal_reason: None,
             snapshot: Arc::new(snapshot),
             retained: VecDeque::from([batch.clone()]),
             retained_events: batch.batch.event_count as u64,
@@ -1284,6 +1324,48 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert!(Arc::ptr_eq(&captured[0], &batch));
         assert!(materialize_replay(captured) == vec![batch.batch.clone()]);
+    }
+
+    #[test]
+    fn sealed_subscription_retains_runtime_snapshot_for_terminal_reconciliation() {
+        let snapshot = reducer_snapshot();
+        let host_incarnation = HostIncarnation::try_from_bytes(uuid_v7_bytes(220)).unwrap();
+        let hub = SurfaceHub::new_tui(
+            snapshot.clone(),
+            host_incarnation,
+            SurfaceHubConfig::default(),
+        )
+        .unwrap();
+        hub.repair_committed(Arc::new(snapshot.clone()), &[]);
+        let attachment = match hub.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("fresh attachment"),
+        };
+        let mut receiver = hub
+            .claim_subscription(&attachment.subscription)
+            .expect("subscription receiver");
+
+        hub.seal_subscriptions(SurfaceSubscriptionSealReason::HostShutdown);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Some(SurfaceSubscriptionItem::Sealed {
+                reason: SurfaceSubscriptionSealReason::HostShutdown,
+            })
+        ));
+        let retained = receiver
+            .sealed_snapshot()
+            .expect("sealed receiver retains runtime snapshot");
+        assert_eq!(retained.cursor, snapshot.cursor);
+        assert_eq!(
+            retained.snapshot.thread.thread_id,
+            snapshot.thread.thread_id
+        );
     }
 
     #[test]

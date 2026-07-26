@@ -21408,6 +21408,7 @@ impl ThreadActor {
         mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
         mut capability_change_rx: tokio_mpsc::Receiver<()>,
     ) {
+        let mut subscription_seal_reason = surface::SurfaceSubscriptionSealReason::ThreadClosed;
         loop {
             let Some(mut active) = self.active.take() else {
                 let surface_retry_at = self.next_surface_transition_retry_at();
@@ -21436,6 +21437,14 @@ impl ThreadActor {
                             break;
                         };
                         if let ThreadCommand::ShutdownThread { reply, reason } = command {
+                            subscription_seal_reason = match reason {
+                                surface::SurfaceShutdownReason::HostShutdown => {
+                                    surface::SurfaceSubscriptionSealReason::HostShutdown
+                                }
+                                surface::SurfaceShutdownReason::ThreadClose => {
+                                    surface::SurfaceSubscriptionSealReason::ThreadClosed
+                                }
+                            };
                             let bounded_goal_recovery =
                                 self.has_pending_goal_completion_recovery_owner();
                             let bounded_workflow_recovery =
@@ -21675,6 +21684,14 @@ impl ThreadActor {
                 command = command_rx.recv() => {
                     match command {
                         Some(ThreadCommand::ShutdownThread { reply, reason }) => {
+                            subscription_seal_reason = match reason {
+                                surface::SurfaceShutdownReason::HostShutdown => {
+                                    surface::SurfaceSubscriptionSealReason::HostShutdown
+                                }
+                                surface::SurfaceShutdownReason::ThreadClose => {
+                                    surface::SurfaceSubscriptionSealReason::ThreadClosed
+                                }
+                            };
                             if active.surface_manual_compaction_prepared.is_some() {
                                 if let Some(reply) = reply {
                                     let _ = reply.send(ThreadShutdownAck::Retry);
@@ -21847,6 +21864,9 @@ impl ThreadActor {
                     self.active = Some(active);
                 }
             }
+        }
+        if let Some(resident) = self.resident_surface.0.as_ref() {
+            resident.hub.seal_subscriptions(subscription_seal_reason);
         }
     }
 

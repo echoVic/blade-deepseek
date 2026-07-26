@@ -1,12 +1,11 @@
-//! ACP [`Agent`] implementation projected onto the Orca [`RuntimeHost`].
+//! ACP [`Agent`] implementation projected onto the runtime-owned typed surface.
 //!
-//! The adapter is intentionally thin: ACP sessions map to runtime threads,
-//! ACP prompts map to hosted turns, and runtime [`EventEnvelope`]s are
-//! projected to `session/update` notifications via [`event_map`].
+//! The adapter retains only ACP transport correlation. Runtime threads,
+//! operation lifecycle, interactions, cancellation and terminal facts remain
+//! owned by the runtime surface.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,13 +22,9 @@ use agent_client_protocol::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_core::event_sink::EventObserver;
-use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Notify, mpsc};
 
-use crate::runtime_host::{
-    HostedTurnRequest, OperationHandle, OperationOutcome, RuntimeHostHandle, RuntimeThreadHandle,
-    RuntimeThreadStartRequest,
-};
+use crate::runtime_host::RuntimeThreadStartRequest;
 use crate::surface::{
     AcpRequestId, AssistantPatch, AttachResult, DisplayText, FreshAttachRequest, MutationReply,
     NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
@@ -39,38 +34,62 @@ use crate::surface::{
     SurfaceEvent, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
     SurfaceInteractionRequest, SurfaceInteractionView, SurfaceOperationId,
     SurfacePermissionClientDecision, SurfacePermissionProfile, SurfaceRequestId,
-    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch, WaitOperationTerminalResult,
+    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch,
 };
 
-use super::event_map;
 use crate::runtime_surface::{
-    SurfaceItem, SurfacePlanPriority, SurfacePlanStatus, SurfaceToolAction, SurfaceToolViewState,
+    OperationPatch, SurfaceItem, SurfacePlanPriority, SurfacePlanStatus, SurfaceToolAction,
+    SurfaceToolViewState,
 };
+
+pub(crate) const ACP_NOTIFICATION_CAPACITY: usize = 256;
+const ACP_PERMISSION_REQUEST_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 pub(crate) enum AcpNotificationSender {
-    Unbounded(UnboundedSender<SessionNotification>),
-    Bounded(Sender<SessionNotification>),
+    Buffered(mpsc::Sender<SessionNotification>),
+    Acknowledged(mpsc::Sender<AcpNotificationDelivery>),
+}
+
+pub(crate) struct AcpNotificationDelivery {
+    pub(crate) notification: SessionNotification,
+    pub(crate) acknowledgement: std_mpsc::SyncSender<Result<(), String>>,
 }
 
 impl AcpNotificationSender {
     fn send(&self, notification: SessionNotification) -> Result<(), ()> {
         match self {
-            Self::Unbounded(sender) => sender.send(notification).map_err(|_| ()),
-            Self::Bounded(sender) => sender.blocking_send(notification).map_err(|_| ()),
+            Self::Buffered(sender) => sender.blocking_send(notification).map_err(|_| ()),
+            Self::Acknowledged(sender) => {
+                let (acknowledgement, receipt) = std_mpsc::sync_channel(1);
+                sender
+                    .blocking_send(AcpNotificationDelivery {
+                        notification,
+                        acknowledgement,
+                    })
+                    .map_err(|_| ())?;
+                receipt.recv().map_err(|_| ())?.map_err(|_| ())
+            }
         }
     }
 }
 
 /// Per-session runtime state held on the single-threaded ACP task.
 struct SessionEntry {
-    thread: RuntimeThreadHandle,
-    surface: Option<RuntimeSurfaceHandle>,
-    config: RunConfig,
-    current_op: Option<Arc<OperationHandle>>,
-    current_surface_op: Option<(RuntimeSurfaceClientHandle, SurfaceOperationId)>,
-    cancel_requested: bool,
+    surface: RuntimeSurfaceHandle,
+    prompt_binding: Option<AcpPromptBinding>,
     next_prompt_seq: u64,
+}
+
+enum AcpPromptBinding {
+    Decoded {
+        ready: Rc<Notify>,
+    },
+    Bound {
+        ready: Rc<Notify>,
+        client: RuntimeSurfaceClientHandle,
+        operation_id: SurfaceOperationId,
+    },
 }
 
 #[derive(Default)]
@@ -78,29 +97,9 @@ struct AgentState {
     sessions: HashMap<SessionId, SessionEntry>,
 }
 
-/// Event observer that forwards projected updates onto the notification
-/// channel. Runs synchronously on the runtime host thread; `send` is
-/// non-blocking, so it never stalls the runtime.
-struct AcpEventObserver {
-    note_tx: AcpNotificationSender,
-    session_id: SessionId,
-}
-
-impl EventObserver for AcpEventObserver {
-    fn observe(&self, event: &orca_core::event_schema::EventEnvelope) -> io::Result<()> {
-        if let Some(update) = event_map::event_to_session_update(event) {
-            let _ = self
-                .note_tx
-                .send(SessionNotification::new(self.session_id.clone(), update));
-        }
-        Ok(())
-    }
-}
-
 /// ACP agent backed by the Orca runtime host.
 pub struct OrcaAcpAgent {
-    host: Option<RuntimeHostHandle>,
-    surface_host: Option<RuntimeSurfaceHostHandle>,
+    surface_host: RuntimeSurfaceHostHandle,
     base_config: RunConfig,
     note_tx: AcpNotificationSender,
     state: Rc<RefCell<AgentState>>,
@@ -108,7 +107,7 @@ pub struct OrcaAcpAgent {
 }
 
 pub(crate) struct AcpClientBridge {
-    request_tx: UnboundedSender<AcpPermissionRequest>,
+    request_tx: mpsc::Sender<AcpPermissionRequest>,
     state: Mutex<AcpClientBridgeState>,
     next_key: AtomicU64,
 }
@@ -135,8 +134,8 @@ pub(crate) struct AcpPermissionRequest {
 }
 
 impl AcpClientBridge {
-    pub(crate) fn new() -> (Arc<Self>, UnboundedReceiver<AcpPermissionRequest>) {
-        let (request_tx, request_rx) = unbounded_channel();
+    pub(crate) fn new() -> (Arc<Self>, mpsc::Receiver<AcpPermissionRequest>) {
+        let (request_tx, request_rx) = mpsc::channel(ACP_PERMISSION_REQUEST_CAPACITY);
         (
             Arc::new(Self {
                 request_tx,
@@ -171,7 +170,7 @@ impl AcpClientBridge {
         state.pending.insert(key.clone(), reply_tx);
         drop(state);
         self.request_tx
-            .send(AcpPermissionRequest {
+            .try_send(AcpPermissionRequest {
                 request,
                 key: key.clone(),
             })
@@ -269,45 +268,28 @@ impl AcpClientBridge {
 
 impl OrcaAcpAgent {
     pub fn new(
-        host: RuntimeHostHandle,
+        host: RuntimeSurfaceHostHandle,
         base_config: RunConfig,
-        note_tx: UnboundedSender<SessionNotification>,
+        note_tx: mpsc::Sender<SessionNotification>,
     ) -> Self {
         Self {
-            host: Some(host),
-            surface_host: None,
+            surface_host: host,
             base_config,
-            note_tx: AcpNotificationSender::Unbounded(note_tx),
+            note_tx: AcpNotificationSender::Buffered(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
             client_bridge: None,
         }
     }
 
-    pub fn new_typed(
+    pub(crate) fn new_supervised(
         host: RuntimeSurfaceHostHandle,
         base_config: RunConfig,
-        note_tx: UnboundedSender<SessionNotification>,
+        note_tx: mpsc::Sender<AcpNotificationDelivery>,
     ) -> Self {
         Self {
-            host: None,
-            surface_host: Some(host),
+            surface_host: host,
             base_config,
-            note_tx: AcpNotificationSender::Unbounded(note_tx),
-            state: Rc::new(RefCell::new(AgentState::default())),
-            client_bridge: None,
-        }
-    }
-
-    pub(crate) fn new_typed_bounded(
-        host: RuntimeSurfaceHostHandle,
-        base_config: RunConfig,
-        note_tx: Sender<SessionNotification>,
-    ) -> Self {
-        Self {
-            host: None,
-            surface_host: Some(host),
-            base_config,
-            note_tx: AcpNotificationSender::Bounded(note_tx),
+            note_tx: AcpNotificationSender::Acknowledged(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
             client_bridge: None,
         }
@@ -331,76 +313,125 @@ impl OrcaAcpAgent {
         config
     }
 
-    async fn prompt_typed(
+    pub(crate) async fn admit_prompt(
         &self,
         args: PromptRequest,
-        surface: RuntimeSurfaceHandle,
-    ) -> Result<PromptResponse, Error> {
+        inbound_seq: Option<u64>,
+    ) -> Result<AdmittedAcpPrompt, Error> {
+        let ready = Rc::new(Notify::new());
+        let (surface, inbound_seq) = {
+            let mut state = self.state.borrow_mut();
+            let entry = state
+                .sessions
+                .get_mut(&args.session_id)
+                .ok_or_else(Error::invalid_params)?;
+            if entry.prompt_binding.is_some() {
+                return Err(Error::invalid_params().data("session already has an active prompt"));
+            }
+            let sequence = match inbound_seq {
+                Some(sequence) => sequence,
+                None => {
+                    let sequence = entry.next_prompt_seq;
+                    entry.next_prompt_seq =
+                        entry.next_prompt_seq.checked_add(1).ok_or_else(|| {
+                            Error::internal_error().data("ACP prompt sequence exhausted")
+                        })?;
+                    sequence
+                }
+            };
+            entry.prompt_binding = Some(AcpPromptBinding::Decoded {
+                ready: ready.clone(),
+            });
+            (entry.surface.clone(), sequence)
+        };
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.begin_session(&args.session_id);
         }
-        let prompt = flatten_prompt(&args.prompt)
-            .map_err(|message| Error::invalid_params().data(message))?;
+        let prompt = match flatten_prompt(&args.prompt) {
+            Ok(prompt) => prompt,
+            Err(message) => {
+                self.clear_prompt_binding(&args.session_id, &ready);
+                return Err(Error::invalid_params().data(message));
+            }
+        };
         let session_id = args.session_id.clone();
         let client_bridge = self.client_bridge.clone();
-        let inbound_seq = {
-            let mut state = self.state.borrow_mut();
-            let entry = state
-                .sessions
-                .get_mut(&args.session_id)
-                .ok_or_else(Error::invalid_params)?;
-            let sequence = entry.next_prompt_seq;
-            entry.next_prompt_seq = entry.next_prompt_seq.saturating_add(1);
-            sequence
-        };
-        let prepared = tokio::task::spawn_blocking(move || {
+        let prepared = match tokio::task::spawn_blocking(move || {
             prepare_surface_prompt(&surface, &session_id, &prompt, inbound_seq, client_bridge)
         })
         .await
-        .map_err(Error::into_internal_error)?
-        .map_err(|message| Error::internal_error().data(message))?;
+        {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(message)) => {
+                self.clear_prompt_binding(&args.session_id, &ready);
+                return Err(Error::internal_error().data(message));
+            }
+            Err(error) => {
+                self.clear_prompt_binding(&args.session_id, &ready);
+                return Err(Error::into_internal_error(error));
+            }
+        };
 
-        let cancel_requested = {
+        {
             let mut state = self.state.borrow_mut();
             let entry = state
                 .sessions
                 .get_mut(&args.session_id)
                 .ok_or_else(Error::invalid_params)?;
-            entry.current_surface_op =
-                Some((prepared.client.clone(), prepared.operation_id.clone()));
-            entry.cancel_requested
-        };
-        if cancel_requested {
-            let _ = prepared
-                .client
-                .cancel_operation(SurfaceRequestId::new(), prepared.operation_id.clone());
+            entry.prompt_binding = Some(AcpPromptBinding::Bound {
+                ready: ready.clone(),
+                client: prepared.client.clone(),
+                operation_id: prepared.operation_id.clone(),
+            });
         }
+        ready.notify_waiters();
+        Ok(AdmittedAcpPrompt {
+            session_id: args.session_id,
+            ready,
+            prepared,
+        })
+    }
 
+    pub(crate) async fn complete_prompt(
+        &self,
+        admitted: AdmittedAcpPrompt,
+    ) -> Result<PromptResponse, Error> {
         let note_tx = self.note_tx.clone();
-        let session_id = args.session_id.clone();
+        let session_id = admitted.session_id.clone();
         let result = tokio::task::spawn_blocking(move || {
-            drain_surface_prompt(prepared, session_id, note_tx)
+            drain_surface_prompt(admitted.prepared, session_id, note_tx)
         })
         .await;
 
-        if let Some(entry) = self.state.borrow_mut().sessions.get_mut(&args.session_id) {
-            entry.current_surface_op = None;
-        }
+        self.clear_prompt_binding(&admitted.session_id, &admitted.ready);
         let result = result
             .map_err(Error::into_internal_error)?
             .map_err(|message| Error::internal_error().data(message))?;
-        let cancelled = self
-            .state
-            .borrow()
-            .sessions
-            .get(&args.session_id)
-            .is_some_and(|entry| entry.cancel_requested);
-        Ok(PromptResponse::new(if cancelled {
-            StopReason::Cancelled
-        } else {
-            result
-        }))
+        Ok(PromptResponse::new(result))
     }
+
+    fn clear_prompt_binding(&self, session_id: &SessionId, ready: &Rc<Notify>) {
+        let mut state = self.state.borrow_mut();
+        if let Some(entry) = state.sessions.get_mut(session_id) {
+            let matches_prompt = match entry.prompt_binding.as_ref() {
+                Some(AcpPromptBinding::Decoded { ready: current })
+                | Some(AcpPromptBinding::Bound { ready: current, .. }) => {
+                    Rc::ptr_eq(current, ready)
+                }
+                None => false,
+            };
+            if matches_prompt {
+                entry.prompt_binding = None;
+            }
+        }
+        ready.notify_waiters();
+    }
+}
+
+pub(crate) struct AdmittedAcpPrompt {
+    session_id: SessionId,
+    ready: Rc<Notify>,
+    prepared: PreparedSurfacePrompt,
 }
 
 struct PreparedSurfacePrompt {
@@ -439,9 +470,6 @@ impl Drop for PreparedSurfacePrompt {
         if self.detached {
             return;
         }
-        let _ = self
-            .client
-            .cancel_operation(SurfaceRequestId::new(), self.operation_id.clone());
         self.detach_once();
     }
 }
@@ -924,104 +952,109 @@ fn drain_surface_prompt(
     session_id: SessionId,
     note_tx: AcpNotificationSender,
 ) -> Result<StopReason, String> {
-    let (wait_tx, wait_rx) = std_mpsc::sync_channel(1);
-    let waiter_client = prepared.client.clone();
-    let waiter_operation_id = prepared.operation_id.clone();
-    std::thread::spawn(move || {
-        let result =
-            waiter_client.wait_operation_terminal(SurfaceRequestId::new(), waiter_operation_id);
-        let _ = wait_tx.send(result);
-    });
-
-    let mut last_cursor = None;
     let terminal = loop {
-        while let Some(item) = prepared.subscription.try_recv() {
-            match item {
-                SurfaceSubscriptionItem::Batch { batch } => {
-                    last_cursor = Some(batch.cursor_after.clone());
-                    for envelope in batch.events.as_slice() {
-                        project_surface_event(
-                            &mut prepared,
-                            &session_id,
-                            &note_tx,
-                            &envelope.event,
-                        )?;
+        let Some(item) = prepared
+            .subscription
+            .recv_timeout(std::time::Duration::from_millis(100))
+        else {
+            continue;
+        };
+        match item {
+            SurfaceSubscriptionItem::Batch { batch } => {
+                let mut terminal = None;
+                for envelope in batch.events.as_slice() {
+                    project_surface_event(&mut prepared, &session_id, &note_tx, &envelope.event)?;
+                    if let SurfaceEvent::Operation(OperationPatch::Terminal { record }) =
+                        &envelope.event
+                        && record.operation_id == prepared.operation_id
+                    {
+                        terminal = Some(record.terminal.clone());
                     }
                 }
-                SurfaceSubscriptionItem::Gap { .. } => {
-                    return Err("ACP surface subscription requires snapshot reload".to_string());
-                }
-                SurfaceSubscriptionItem::Sealed { .. } => {
-                    return Err("ACP surface subscription sealed before terminal".to_string());
+                if let Some(terminal) = terminal {
+                    break terminal;
                 }
             }
-        }
-        match wait_rx.try_recv() {
-            Ok(result) => break result,
-            Err(std_mpsc::TryRecvError::Empty) => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            SurfaceSubscriptionItem::Gap { .. } => {
+                return reconcile_lost_subscription(&mut prepared, "gap");
             }
-            Err(std_mpsc::TryRecvError::Disconnected) => {
-                return Err("ACP surface terminal waiter disconnected".to_string());
+            SurfaceSubscriptionItem::Sealed { .. } => {
+                return reconcile_lost_subscription(&mut prepared, "sealed");
             }
         }
     };
-    let terminal = terminal.map_err(|error| format!("ACP surface wait failed: {error:?}"))?;
-    let terminal_cursor = match &terminal {
-        WaitOperationTerminalResult::Terminal { value } => Some(value.cursor.clone()),
-        _ => None,
-    };
-    if let Some(terminal_cursor) = terminal_cursor {
-        if last_cursor.as_ref() != Some(&terminal_cursor) {
-            loop {
-                let mut reached_terminal_cursor = false;
-                while let Some(item) = prepared.subscription.try_recv() {
-                    match item {
-                        SurfaceSubscriptionItem::Batch { batch } => {
-                            reached_terminal_cursor = batch.cursor_after == terminal_cursor;
-                            for envelope in batch.events.as_slice() {
-                                project_surface_event(
-                                    &mut prepared,
-                                    &session_id,
-                                    &note_tx,
-                                    &envelope.event,
-                                )?;
-                            }
-                        }
-                        SurfaceSubscriptionItem::Gap { .. } => {
-                            return Err(
-                                "ACP surface subscription requires snapshot reload".to_string()
-                            );
-                        }
-                        SurfaceSubscriptionItem::Sealed { .. } => {
-                            return Err(
-                                "ACP surface subscription sealed before terminal".to_string()
-                            );
-                        }
-                    }
-                    if reached_terminal_cursor {
-                        break;
-                    }
-                }
-                if reached_terminal_cursor {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        }
-    }
     prepared.detach_once();
+    terminal_to_stop_reason(&terminal)
+}
+
+fn reconcile_lost_subscription(
+    prepared: &mut PreparedSurfacePrompt,
+    loss: &str,
+) -> Result<StopReason, String> {
+    let sealed_snapshot = prepared.subscription.sealed_snapshot();
+    prepared.detach_once();
+    if let Some(snapshot) = sealed_snapshot {
+        return reconcile_operation_snapshot(prepared, loss, snapshot.snapshot.as_ref());
+    }
+    let attachment = match prepared.surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Acp,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { .. }
+        | AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. }
+        | AttachResult::ThreadClosed { .. }
+        | AttachResult::Unavailable { .. } => {
+            if let Some(snapshot) = prepared.subscription.sealed_snapshot() {
+                return reconcile_operation_snapshot(prepared, loss, snapshot.snapshot.as_ref());
+            }
+            return Err(format!(
+                "ACP surface subscription {loss}; durable snapshot reconciliation unavailable"
+            ));
+        }
+    };
+    let cleanup = SurfaceAttachmentGuard::new(&prepared.surface, attachment.client.clone());
+    let result =
+        reconcile_operation_snapshot(prepared, loss, attachment.baseline.snapshot.as_ref());
+    cleanup.disarm();
+    let _ = prepared.surface.detach(
+        &attachment.client,
+        crate::surface::DetachRequest {
+            request_id: SurfaceRequestId::new(),
+        },
+    );
+    result
+}
+
+fn reconcile_operation_snapshot(
+    prepared: &PreparedSurfacePrompt,
+    loss: &str,
+    snapshot: &crate::runtime_surface::SurfaceSnapshot,
+) -> Result<StopReason, String> {
+    let terminal = snapshot
+        .foreground_operation
+        .iter()
+        .chain(snapshot.queued_operations.iter())
+        .chain(snapshot.operation_history.iter())
+        .find(|operation| operation.operation_id == prepared.operation_id)
+        .and_then(|operation| operation.terminal.as_ref())
+        .map(|record| record.terminal.clone());
     match terminal {
-        WaitOperationTerminalResult::Terminal { value } => terminal_to_stop_reason(&value.terminal),
-        WaitOperationTerminalResult::TerminalCommitFailure { .. }
-        | WaitOperationTerminalResult::TerminalProjectionFailure { .. } => {
-            Err("ACP surface terminal requires runtime recovery".to_string())
+        Some(terminal) => {
+            let reason = terminal_to_stop_reason(&terminal)
+                .map(|reason| format!("{reason:?}"))
+                .unwrap_or_else(|error| error);
+            Err(format!(
+                "ACP surface subscription {loss} after durable terminal {reason}; reload session"
+            ))
         }
-        WaitOperationTerminalResult::UnknownOperation { .. }
-        | WaitOperationTerminalResult::WrongThread { .. }
-        | WaitOperationTerminalResult::WaitCancelled { .. } => {
-            Err("ACP surface operation became unavailable".to_string())
-        }
+        None => Err(format!(
+            "ACP surface subscription {loss} before terminal; reload session"
+        )),
     }
 }
 
@@ -1229,27 +1262,6 @@ fn cancel_surface_operation(prepared: &PreparedSurfacePrompt) -> Result<(), Stri
     }
 }
 
-/// Resolves the ACP stop reason from a completed operation, honoring an
-/// explicit cancellation request.
-fn outcome_to_stop_reason(
-    outcome: &OperationOutcome,
-    cancel_requested: bool,
-) -> Result<StopReason, Error> {
-    if cancel_requested {
-        return Ok(StopReason::Cancelled);
-    }
-    match outcome {
-        OperationOutcome::Completed(status) => Ok(event_map::run_status_to_stop_reason(*status)),
-        OperationOutcome::Backgrounded { .. } => Ok(StopReason::EndTurn),
-        OperationOutcome::ExecutionFailed { message, .. } => {
-            Err(Error::internal_error().data(message.clone()))
-        }
-        OperationOutcome::Panicked { message } => {
-            Err(Error::internal_error().data(message.clone()))
-        }
-    }
-}
-
 #[async_trait::async_trait(?Send)]
 impl Agent for OrcaAcpAgent {
     async fn initialize(&self, _args: InitializeRequest) -> Result<InitializeResponse, Error> {
@@ -1270,30 +1282,15 @@ impl Agent for OrcaAcpAgent {
 
     async fn new_session(&self, args: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         let config = self.build_session_config(args.cwd);
-        let session_config = config.clone();
-        let (thread, surface) = if let Some(surface_host) = self.surface_host.clone() {
-            let thread = tokio::task::spawn_blocking(move || {
-                surface_host.start_thread(config, "ACP session")
-            })
-            .await
-            .map_err(Error::into_internal_error)?
-            .map_err(Error::into_internal_error)?;
-            let surface = thread
-                .acp_surface()
-                .ok_or_else(|| Error::internal_error().data("ACP surface unavailable"))?;
-            (thread.legacy(), Some(surface))
-        } else {
-            let host = self
-                .host
-                .clone()
-                .ok_or_else(|| Error::internal_error().data("legacy ACP host unavailable"))?;
-            let thread =
-                tokio::task::spawn_blocking(move || host.start_thread(config, "ACP session"))
-                    .await
-                    .map_err(Error::into_internal_error)?
-                    .map_err(Error::into_internal_error)?;
-            (thread, None)
-        };
+        let surface_host = self.surface_host.clone();
+        let thread =
+            tokio::task::spawn_blocking(move || surface_host.start_thread(config, "ACP session"))
+                .await
+                .map_err(Error::into_internal_error)?
+                .map_err(Error::into_internal_error)?;
+        let surface = thread
+            .acp_surface()
+            .ok_or_else(|| Error::internal_error().data("ACP surface unavailable"))?;
 
         let session_id: SessionId = match thread.session_id() {
             Some(id) => SessionId::new(id),
@@ -1303,12 +1300,8 @@ impl Agent for OrcaAcpAgent {
         self.state.borrow_mut().sessions.insert(
             session_id.clone(),
             SessionEntry {
-                thread,
                 surface,
-                config: session_config,
-                current_op: None,
-                current_surface_op: None,
-                cancel_requested: false,
+                prompt_binding: None,
                 next_prompt_seq: 1,
             },
         );
@@ -1320,61 +1313,41 @@ impl Agent for OrcaAcpAgent {
             return Err(Error::invalid_params().data("ACP session is already loaded"));
         }
         let selector = args.session_id.to_string();
-        let transcript = tokio::task::spawn_blocking(move || orca_runtime_history_load(&selector))
-            .await
-            .map_err(Error::into_internal_error)?
-            .map_err(Error::into_internal_error)?;
+        let transcript = tokio::task::spawn_blocking(move || {
+            RuntimeSurfaceHostHandle::load_saved_session(&selector)
+        })
+        .await
+        .map_err(Error::into_internal_error)?
+        .map_err(Error::into_internal_error)?;
 
         let mut config = self.build_session_config(args.cwd);
         config.history_mode = HistoryMode::Resume(args.session_id.to_string());
-        let session_config = config.clone();
         let request =
             RuntimeThreadStartRequest::new(config, "ACP session").with_preloaded(transcript);
-        let (thread, surface) = if let Some(surface_host) = self.surface_host.clone() {
-            let thread = tokio::task::spawn_blocking(move || {
-                surface_host.start_thread_with_request(request)
-            })
-            .await
-            .map_err(Error::into_internal_error)?
-            .map_err(Error::into_internal_error)?;
-            let surface = thread
-                .acp_surface()
-                .ok_or_else(|| Error::internal_error().data("ACP surface unavailable"))?;
-            (thread.legacy(), Some(surface))
-        } else {
-            let host = self
-                .host
-                .clone()
-                .ok_or_else(|| Error::internal_error().data("legacy ACP host unavailable"))?;
-            let thread =
-                tokio::task::spawn_blocking(move || host.start_thread_with_request(request))
-                    .await
-                    .map_err(Error::into_internal_error)?
-                    .map_err(Error::into_internal_error)?;
-            (thread, None)
-        };
-
-        if let Some(surface) = surface.as_ref() {
-            let surface = surface.clone();
-            let session_id = args.session_id.clone();
-            let note_tx = self.note_tx.clone();
-            tokio::task::spawn_blocking(move || {
-                replay_surface_snapshot(&surface, &session_id, &note_tx)
-            })
-            .await
-            .map_err(Error::into_internal_error)?
-            .map_err(|message| Error::internal_error().data(message))?;
-        }
+        let surface_host = self.surface_host.clone();
+        let thread =
+            tokio::task::spawn_blocking(move || surface_host.start_thread_with_request(request))
+                .await
+                .map_err(Error::into_internal_error)?
+                .map_err(Error::into_internal_error)?;
+        let surface = thread
+            .acp_surface()
+            .ok_or_else(|| Error::internal_error().data("ACP surface unavailable"))?;
+        let replay_surface = surface.clone();
+        let session_id = args.session_id.clone();
+        let note_tx = self.note_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            replay_surface_snapshot(&replay_surface, &session_id, &note_tx)
+        })
+        .await
+        .map_err(Error::into_internal_error)?
+        .map_err(|message| Error::internal_error().data(message))?;
 
         self.state.borrow_mut().sessions.insert(
             args.session_id.clone(),
             SessionEntry {
-                thread,
                 surface,
-                config: session_config,
-                current_op: None,
-                current_surface_op: None,
-                cancel_requested: false,
+                prompt_binding: None,
                 next_prompt_seq: 1,
             },
         );
@@ -1382,113 +1355,93 @@ impl Agent for OrcaAcpAgent {
     }
 
     async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
-        let (thread, surface, config) = {
-            let mut state = self.state.borrow_mut();
-            let entry = state
-                .sessions
-                .get_mut(&args.session_id)
-                .ok_or_else(Error::invalid_params)?;
-            if entry.current_op.is_some() || entry.current_surface_op.is_some() {
-                return Err(Error::invalid_params().data("session already has an active prompt"));
-            }
-            entry.cancel_requested = false;
-            (
-                entry.thread.clone(),
-                entry.surface.clone(),
-                entry.config.clone(),
-            )
-        };
-
-        if let Some(surface) = surface {
-            return self.prompt_typed(args, surface).await;
-        }
-
-        let prompt = flatten_prompt(&args.prompt)
-            .map_err(|message| Error::invalid_params().data(message))?;
-        let observer: Arc<dyn EventObserver> = Arc::new(AcpEventObserver {
-            note_tx: self.note_tx.clone(),
-            session_id: args.session_id.clone(),
-        });
-
-        let request = HostedTurnRequest::new(prompt).with_event_observer(observer);
-        let op = tokio::task::spawn_blocking(move || {
-            thread.start_turn_with_config(request, io::sink(), config)
-        })
-        .await
-        .map_err(Error::into_internal_error)?
-        .map_err(Error::into_internal_error)?;
-        let op = Arc::new(op);
-
-        let cancel_requested = {
-            let mut state = self.state.borrow_mut();
-            let Some(entry) = state.sessions.get_mut(&args.session_id) else {
-                return Err(Error::invalid_params());
-            };
-            entry.current_op = Some(op.clone());
-            entry.cancel_requested
-        };
-        if cancel_requested {
-            let _ = op.interrupt();
-        }
-
-        let completion = op.completion();
-        let terminal = tokio::task::spawn_blocking(move || completion.wait())
-            .await
-            .map_err(Error::into_internal_error)?;
-
-        let cancel_requested = {
-            let mut state = self.state.borrow_mut();
-            let entry = state.sessions.get_mut(&args.session_id);
-            match entry {
-                Some(entry) => {
-                    entry.current_op = None;
-                    entry.cancel_requested
-                }
-                None => false,
-            }
-        };
-
-        let stop_reason = outcome_to_stop_reason(terminal.outcome(), cancel_requested)?;
-        Ok(PromptResponse::new(stop_reason))
+        let admitted = self.admit_prompt(args, None).await?;
+        self.complete_prompt(admitted).await
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
-        let (op, surface_op) = {
-            let mut state = self.state.borrow_mut();
-            match state.sessions.get_mut(&args.session_id) {
-                Some(entry) => {
-                    entry.cancel_requested = true;
-                    (entry.current_op.clone(), entry.current_surface_op.clone())
+        loop {
+            let binding = {
+                let state = self.state.borrow();
+                match state.sessions.get(&args.session_id) {
+                    Some(SessionEntry {
+                        prompt_binding:
+                            Some(AcpPromptBinding::Bound {
+                                client,
+                                operation_id,
+                                ..
+                            }),
+                        ..
+                    }) => Some(Ok((client.clone(), operation_id.clone()))),
+                    Some(SessionEntry {
+                        prompt_binding: Some(AcpPromptBinding::Decoded { ready }),
+                        ..
+                    }) => Some(Err(ready.clone())),
+                    Some(_) | None => None,
                 }
-                None => (None, None),
+            };
+            match binding {
+                Some(Ok((client, operation_id))) => {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        client.cancel_operation(SurfaceRequestId::new(), operation_id)
+                    })
+                    .await
+                    .map_err(Error::into_internal_error)?;
+                    break;
+                }
+                Some(Err(ready)) => ready.notified().await,
+                None => break,
             }
-        };
-        if let Some(op) = op {
-            let _ = op.interrupt();
         }
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.cancel_session(&args.session_id);
-        }
-        if let Some((client, operation_id)) = surface_op {
-            let _ = client.cancel_operation(SurfaceRequestId::new(), operation_id);
         }
         Ok(())
     }
 }
 
-/// Loads a session transcript by selector, reusing the runtime history layer.
-fn orca_runtime_history_load(selector: &str) -> io::Result<crate::thread_store::SessionTranscript> {
-    crate::history::load_session(selector)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
     use super::*;
+    use crate::runtime_host::{
+        GenerationContext, HostedTurnRequest, RuntimeHost, ThreadOperationExecutor,
+        ThreadOperationOutcome,
+    };
     use crate::runtime_surface::{
         SurfaceEvent, SurfaceToolRequest, SurfaceToolResult, SurfaceToolTerminal,
         ToolInvocationStarted, ToolTerminalSource,
     };
+    use crate::thread::RuntimeThread;
+    use orca_core::approval_types::ApprovalMode;
+    use orca_core::cancel::CancelToken;
+    use orca_core::config::{
+        HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
+        ToolConfig, WorkflowConfig,
+    };
+    use orca_core::event_schema::{EventFactory, RunStatus};
+    use orca_core::model::ModelSelection;
+    use orca_core::subagent_config::SubagentConfig;
     use orca_core::thread_identity::TurnId;
+
+    struct CompleteImmediatelyExecutor;
+
+    impl ThreadOperationExecutor for CompleteImmediatelyExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            Ok(RunStatus::Success.into())
+        }
+    }
 
     fn permission_request(session_id: &str, tool_call_id: &str) -> RequestPermissionRequest {
         RequestPermissionRequest::new(
@@ -1556,6 +1509,132 @@ mod tests {
     }
 
     #[test]
+    fn lost_subscription_reconciles_durable_terminal_without_cancelling_operation() {
+        let host = RuntimeHost::start_with_executor(Arc::new(CompleteImmediatelyExecutor)).unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let surface_host = host.surface_handle();
+        let config = test_run_config(cwd.path().to_path_buf());
+        let thread =
+            std::thread::spawn(move || surface_host.start_thread(config, "ACP reconcile").unwrap())
+                .join()
+                .unwrap();
+        let surface = thread.acp_surface().expect("ACP surface");
+        let mut prepared =
+            prepare_surface_prompt(&surface, &SessionId::new("reconcile"), "complete", 1, None)
+                .unwrap();
+        let operation_id = prepared.operation_id.clone();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "operation did not reach a terminal event"
+            );
+            let Some(item) = prepared
+                .subscription
+                .recv_timeout(Duration::from_millis(50))
+            else {
+                continue;
+            };
+            let SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            if batch.events.as_slice().iter().any(|envelope| {
+                matches!(
+                    &envelope.event,
+                    SurfaceEvent::Operation(OperationPatch::Terminal { record })
+                        if record.operation_id == operation_id
+                )
+            }) {
+                break;
+            }
+        }
+
+        let error = reconcile_lost_subscription(&mut prepared, "gap").unwrap_err();
+        assert!(error.contains("after durable terminal EndTurn"));
+        drop(prepared);
+
+        let snapshot = match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Acp,
+            requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment.baseline.snapshot,
+            _ => panic!("unexpected snapshot attachment"),
+        };
+        let terminal = snapshot
+            .operation_history
+            .iter()
+            .chain(snapshot.foreground_operation.iter())
+            .find(|operation| operation.operation_id == operation_id)
+            .and_then(|operation| operation.terminal.as_ref())
+            .expect("durable operation terminal");
+        assert!(matches!(
+            terminal.terminal,
+            OperationTerminal::Succeeded { .. }
+        ));
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn sealed_subscription_reconciles_terminal_from_retained_runtime_snapshot() {
+        let host = RuntimeHost::start_with_executor(Arc::new(CompleteImmediatelyExecutor)).unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let surface_host = host.surface_handle();
+        let config = test_run_config(cwd.path().to_path_buf());
+        let thread =
+            std::thread::spawn(move || surface_host.start_thread(config, "ACP sealed").unwrap())
+                .join()
+                .unwrap();
+        let surface = thread.acp_surface().expect("ACP surface");
+        let mut prepared =
+            prepare_surface_prompt(&surface, &SessionId::new("sealed"), "complete", 1, None)
+                .unwrap();
+        let operation_id = prepared.operation_id.clone();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "operation did not reach terminal before shutdown"
+            );
+            let Some(item) = prepared
+                .subscription
+                .recv_timeout(Duration::from_millis(50))
+            else {
+                continue;
+            };
+            let SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            if batch.events.as_slice().iter().any(|envelope| {
+                matches!(
+                    &envelope.event,
+                    SurfaceEvent::Operation(OperationPatch::Terminal { record })
+                        if record.operation_id == operation_id
+                )
+            }) {
+                break;
+            }
+        }
+
+        host.shutdown().unwrap();
+        let sealed = prepared
+            .subscription
+            .recv_timeout(Duration::from_secs(5))
+            .expect("runtime shutdown seals the subscription");
+        assert!(matches!(
+            sealed,
+            SurfaceSubscriptionItem::Sealed {
+                reason: crate::runtime_surface::SurfaceSubscriptionSealReason::HostShutdown,
+            }
+        ));
+        let error = reconcile_lost_subscription(&mut prepared, "sealed").unwrap_err();
+        assert!(error.contains("after durable terminal EndTurn"));
+    }
+
+    #[test]
     fn tool_events_project_as_typed_acp_updates() {
         let request = SurfaceToolRequest {
             tool_call_id: crate::runtime_surface::SurfaceToolCallId::try_new("tool-typed").unwrap(),
@@ -1567,8 +1646,8 @@ mod tests {
             raw_arguments: DisplayText::new(r#"{"command":"cargo test"}"#),
             arguments_digest: crate::runtime_surface::Sha256Digest::new([0; 32]),
         };
-        let (note_tx, mut note_rx) = unbounded_channel();
-        let note_tx = AcpNotificationSender::Unbounded(note_tx);
+        let (note_tx, mut note_rx) = mpsc::channel(8);
+        let note_tx = AcpNotificationSender::Buffered(note_tx);
         let mut tool_outputs = HashMap::new();
         emit_surface_event(
             &SessionId::new("typed-tools"),
@@ -1641,6 +1720,42 @@ mod tests {
                 assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
             }
             other => panic!("expected typed tool completion, got {other:?}"),
+        }
+    }
+
+    fn test_run_config(cwd: PathBuf) -> RunConfig {
+        RunConfig {
+            app_version: "test".to_string(),
+            prompt: String::new(),
+            cwd: Some(cwd),
+            output_format: OutputFormat::Jsonl,
+            approval_mode: ApprovalMode::FullAuto,
+            provider: ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).unwrap(),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Record,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: HashMap::new(),
+            runtime_workspace_roots: None,
+            permission_rules: Default::default(),
+            additional_working_directories: Vec::new(),
+            max_budget_usd: None,
+            subagents: SubagentConfig::default(),
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::default(),
+            vim_mode: false,
+            update_check: false,
+            desktop_notifications: false,
+            auto_memory: false,
         }
     }
 }

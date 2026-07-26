@@ -106,8 +106,8 @@ fn acp_wire_round_trip_projects_typed_prompt_updates() {
         },
     ]));
     let host = RuntimeHost::start_with_executor(executor).expect("start host");
-    let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new_typed(
+    let (note_tx, mut note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
         host.surface_handle(),
         test_config(base_cwd.path().to_path_buf()),
         note_tx,
@@ -328,9 +328,7 @@ impl ThreadOperationExecutor for AcpTestExecutor {
 
 // --- Helper to drain notifications from the channel ---
 
-fn drain_notifications(
-    rx: &mut mpsc::UnboundedReceiver<SessionNotification>,
-) -> Vec<SessionUpdate> {
+fn drain_notifications(rx: &mut mpsc::Receiver<SessionNotification>) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
     while let Ok(notification) = rx.try_recv() {
         updates.push(notification.update);
@@ -346,9 +344,9 @@ fn acp_initialize_returns_v1_with_load_session_capability() {
     let cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![]));
     let host = RuntimeHost::start_with_executor(executor).expect("start host");
-    let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
     let agent = OrcaAcpAgent::new(
-        host.handle(),
+        host.surface_handle(),
         test_config(cwd.path().to_path_buf()),
         note_tx,
     );
@@ -391,9 +389,9 @@ fn acp_new_session_and_prompt_produces_message_chunk_notification() {
         },
     ]));
     let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
-    let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let (note_tx, mut note_rx) = mpsc::channel::<SessionNotification>(256);
     let agent = OrcaAcpAgent::new(
-        host.handle(),
+        host.surface_handle(),
         test_config(base_cwd.path().to_path_buf()),
         note_tx,
     );
@@ -453,8 +451,8 @@ fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
     let session_cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![]));
     let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
-    let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new_typed(
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
         host.surface_handle(),
         test_config(base_cwd.path().to_path_buf()),
         note_tx,
@@ -498,8 +496,8 @@ fn acp_typed_load_replays_surface_history_after_restart() {
         },
     ]));
     let first_host = RuntimeHost::start_with_executor(first_executor).expect("start first host");
-    let (first_note_tx, _first_note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let first_agent = OrcaAcpAgent::new_typed(
+    let (first_note_tx, _first_note_rx) = mpsc::channel::<SessionNotification>(256);
+    let first_agent = OrcaAcpAgent::new(
         first_host.surface_handle(),
         test_config(base_cwd.path().to_path_buf()),
         first_note_tx,
@@ -528,8 +526,8 @@ fn acp_typed_load_replays_surface_history_after_restart() {
     let second_executor = Arc::new(AcpTestExecutor::new(vec![]));
     let second_host =
         RuntimeHost::start_with_executor(second_executor.clone()).expect("start second host");
-    let (second_note_tx, mut second_note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let second_agent = OrcaAcpAgent::new_typed(
+    let (second_note_tx, mut second_note_rx) = mpsc::channel::<SessionNotification>(256);
+    let second_agent = OrcaAcpAgent::new(
         second_host.surface_handle(),
         test_config(base_cwd.path().to_path_buf()),
         second_note_tx,
@@ -573,8 +571,8 @@ fn acp_typed_surface_prompt_projects_runtime_batch_and_terminal() {
         },
     ]));
     let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
-    let (note_tx, mut note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new_typed(
+    let (note_tx, mut note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
         host.surface_handle(),
         test_config(base_cwd.path().to_path_buf()),
         note_tx,
@@ -623,8 +621,8 @@ fn acp_typed_surface_prompt_releases_session_after_terminal_error() {
         },
     ]));
     let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
-    let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
-    let agent = OrcaAcpAgent::new_typed(
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
+    let agent = OrcaAcpAgent::new(
         host.surface_handle(),
         test_config(cwd.path().to_path_buf()),
         note_tx,
@@ -669,9 +667,9 @@ fn acp_cancel_stops_in_flight_prompt() {
     let cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![TestBehavior::WaitForCancel]));
     let host = RuntimeHost::start_with_executor(executor.clone()).expect("start host");
-    let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
     let agent = OrcaAcpAgent::new(
-        host.handle(),
+        host.surface_handle(),
         test_config(cwd.path().to_path_buf()),
         note_tx,
     );
@@ -725,9 +723,9 @@ fn acp_prompt_on_unknown_session_returns_error() {
     let cwd = tempfile::tempdir().unwrap();
     let executor = Arc::new(AcpTestExecutor::new(vec![]));
     let host = RuntimeHost::start_with_executor(executor).expect("start host");
-    let (note_tx, _note_rx) = mpsc::unbounded_channel::<SessionNotification>();
+    let (note_tx, _note_rx) = mpsc::channel::<SessionNotification>(256);
     let agent = OrcaAcpAgent::new(
-        host.handle(),
+        host.surface_handle(),
         test_config(cwd.path().to_path_buf()),
         note_tx,
     );

@@ -1,14 +1,11 @@
 //! Stdio transport adapter for the ACP agent.
 
 use tokio::io::{stdin, stdout};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-/// Returns a `(reader, writer)` pair adapting tokio stdio to the
-/// `futures::io::{AsyncRead, AsyncWrite}` traits required by
-/// `AgentSideConnection`.
+/// Returns the native Tokio stdio pair consumed by the bounded ACP supervisor.
 pub fn stdio() -> (
-    impl futures::io::AsyncRead + Unpin,
-    impl futures::io::AsyncWrite + Unpin,
+    impl tokio::io::AsyncRead + Unpin + Send,
+    impl tokio::io::AsyncWrite + Unpin + Send,
 ) {
-    (stdin().compat(), stdout().compat_write())
+    (stdin(), stdout())
 }

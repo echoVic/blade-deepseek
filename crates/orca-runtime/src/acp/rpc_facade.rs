@@ -4,6 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -355,12 +356,21 @@ impl InboundFrame {
     pub(crate) fn method(&self) -> Option<&str> {
         self.method.as_deref()
     }
+
+    pub(crate) fn json_value(&self) -> Result<Value, RpcFacadeError> {
+        validate_jsonrpc_frame(&self.encoded)
+    }
 }
 
 pub(crate) type HandlerCompletion = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type HandlerFuture =
     Pin<Box<dyn Future<Output = Result<HandlerCompletion, RpcFacadeError>> + Send + 'static>>;
 type InboundHandler = Arc<dyn Fn(InboundFrame) -> HandlerFuture + Send + Sync>;
+pub(crate) type LocalHandlerCompletion = Pin<Box<dyn Future<Output = ()> + 'static>>;
+pub(crate) type LocalHandlerFuture =
+    Pin<Box<dyn Future<Output = Result<LocalHandlerCompletion, RpcFacadeError>> + 'static>>;
+type LocalInboundHandler = Rc<dyn Fn(InboundFrame) -> LocalHandlerFuture>;
+pub(crate) type ResponseSessionResolver = Arc<dyn Fn(i64) -> Option<String> + Send + Sync>;
 
 struct LaneState {
     admission_gate: Mutex<()>,
@@ -726,11 +736,14 @@ impl RpcFacadeHandle {
             });
         }
         if frame.encoded.len() > ACP_MAX_OUTBOUND_FRAME_BYTES {
-            return Err(RpcFacadeError::Oversize {
+            let error = RpcFacadeError::Oversize {
                 direction: FrameDirection::AgentToClient,
                 encoded_bytes: frame.encoded.len(),
                 limit: ACP_MAX_OUTBOUND_FRAME_BYTES,
-            });
+            };
+            self.state
+                .fail_transport(error.clone(), &self.ingress, &self.outgoing);
+            return Err(error);
         }
         validate_jsonrpc_frame(&frame.encoded)?;
 
@@ -761,6 +774,12 @@ impl RpcFacadeHandle {
             Err(
                 error @ RpcFacadeError::SequenceExhausted {
                     scope: SequenceScope::Outbound,
+                },
+            )
+            | Err(
+                error @ RpcFacadeError::Capacity {
+                    lane: LaneKind::Outgoing,
+                    ..
                 },
             ) => {
                 self.state
@@ -878,6 +897,140 @@ where
     )
 }
 
+/// Starts the same bounded facade on a [`tokio::task::LocalSet`].
+///
+/// ACP 0.10.4 exposes `?Send` handler futures, so the production adapter uses
+/// this entry point while retaining the same reader, writer, budgets,
+/// acknowledgements and joined shutdown as the `Send` test facade.
+pub(crate) fn spawn_local_rpc_facade<R, W>(
+    reader: R,
+    writer: W,
+    handler: LocalInboundHandler,
+    config: RpcFacadeConfig,
+) -> (RpcFacadeHandle, RpcSupervisor)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_local_rpc_facade_inner(reader, writer, handler, None, config)
+}
+
+pub(crate) fn spawn_local_rpc_facade_with_response_session_resolver<R, W>(
+    reader: R,
+    writer: W,
+    handler: LocalInboundHandler,
+    response_session_resolver: ResponseSessionResolver,
+    config: RpcFacadeConfig,
+) -> (RpcFacadeHandle, RpcSupervisor)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_local_rpc_facade_inner(
+        reader,
+        writer,
+        handler,
+        Some(response_session_resolver),
+        config,
+    )
+}
+
+fn spawn_local_rpc_facade_inner<R, W>(
+    reader: R,
+    writer: W,
+    handler: LocalInboundHandler,
+    response_session_resolver: Option<ResponseSessionResolver>,
+    config: RpcFacadeConfig,
+) -> (RpcFacadeHandle, RpcSupervisor)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (ingress_tx, ingress_rx) = bounded_lane(
+        LaneKind::Ingress,
+        ACP_INGRESS_MESSAGE_LIMIT,
+        ACP_INGRESS_BYTE_LIMIT,
+    );
+    let (outgoing_tx, outgoing_rx) = bounded_lane(
+        LaneKind::Outgoing,
+        ACP_OUTGOING_MESSAGE_LIMIT,
+        ACP_OUTGOING_BYTE_LIMIT,
+    );
+    let (transport_failure_tx, transport_failure_rx) = mpsc::channel(1);
+    let ingress_control = ingress_tx.control();
+    let state = Arc::new(ConnectionState {
+        sealed: AtomicBool::new(false),
+        outbound_sequence: SequenceCounter::new(0),
+        transport_failure: Mutex::new(None),
+        transport_failure_tx,
+        cleanup_complete: AtomicBool::new(false),
+        cleanup_notify: Notify::new(),
+    });
+    let shutdown = CancellationToken::new();
+    let reader_cancel = CancellationToken::new();
+    let writer_cancel = CancellationToken::new();
+    let handler_cancel = CancellationToken::new();
+
+    let reader_join = tokio::spawn(reader_loop(
+        reader,
+        ingress_tx.clone(),
+        state.clone(),
+        reader_cancel.clone(),
+        0,
+        0,
+        response_session_resolver,
+        #[cfg(test)]
+        None,
+    ));
+    let scheduler_join = tokio::task::spawn_local(local_scheduler_loop(
+        ingress_rx,
+        handler,
+        handler_cancel.clone(),
+    ));
+    let writer_join = tokio::spawn(writer_loop(
+        writer,
+        outgoing_rx,
+        writer_cancel.clone(),
+        config.write_flush_deadline,
+    ));
+
+    let coordinator_state = state.clone();
+    let coordinator_outgoing = outgoing_tx.clone();
+    let coordinator_shutdown = shutdown.clone();
+    let join = tokio::task::spawn_local(async move {
+        let _cleanup_complete = CleanupCompleteGuard(coordinator_state.clone());
+        supervise(
+            reader_join,
+            scheduler_join,
+            writer_join,
+            ingress_tx,
+            coordinator_outgoing,
+            coordinator_state,
+            coordinator_shutdown,
+            transport_failure_rx,
+            reader_cancel,
+            writer_cancel,
+            handler_cancel,
+            config.supervisor_join_deadline,
+        )
+        .await
+    });
+
+    (
+        RpcFacadeHandle {
+            ingress: ingress_control,
+            outgoing: outgoing_tx,
+            state,
+            #[cfg(test)]
+            outbound_reservation_barrier: None,
+        },
+        RpcSupervisor {
+            shutdown,
+            join: Some(join),
+        },
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn spawn_rpc_facade_with_sequence_seeds<R, W>(
     reader: R,
@@ -986,6 +1139,7 @@ where
         reader_cancel.clone(),
         seeds.inbound_global,
         seeds.inbound_session,
+        None,
         #[cfg(test)]
         reader_admission_barrier,
     ));
@@ -1041,6 +1195,7 @@ async fn reader_loop<R>(
     cancel: CancellationToken,
     global_sequence_seed: u64,
     session_sequence_seed: u64,
+    response_session_resolver: Option<ResponseSessionResolver>,
     #[cfg(test)] reader_admission_barrier: Option<ReaderAdmissionBarrier>,
 ) -> ReaderExit
 where
@@ -1100,6 +1255,7 @@ where
             &global_sequence,
             session_sequence_seed,
             &mut session_sequences,
+            response_session_resolver.as_deref(),
         ) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1164,6 +1320,7 @@ fn parse_inbound_frame(
     global_sequence: &SequenceCounter,
     session_sequence_seed: u64,
     session_sequences: &mut HashMap<String, SequenceCounter>,
+    response_session_resolver: Option<&(dyn Fn(i64) -> Option<String> + Send + Sync)>,
 ) -> Result<InboundFrame, RpcFacadeError> {
     let value = validate_jsonrpc_frame(&encoded)?;
     let sequence = global_sequence.reserve(SequenceScope::InboundGlobal)?;
@@ -1176,7 +1333,16 @@ fn parse_inbound_frame(
         .and_then(Value::as_object)
         .and_then(|params| params.get("sessionId").or_else(|| params.get("session_id")))
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            method
+                .is_none()
+                .then(|| value.get("id").and_then(Value::as_i64))
+                .flatten()
+                .and_then(|request_id| {
+                    response_session_resolver.and_then(|resolver| resolver(request_id))
+                })
+        });
     let session_sequence = session_id
         .as_ref()
         .map(|session_id| {
@@ -1233,6 +1399,60 @@ async fn scheduler_loop(
     let mut gates = HashMap::<String, Arc<SessionGate>>::new();
     let mut handlers =
         FuturesUnordered::<Pin<Box<dyn Future<Output = Result<(), RpcFacadeError>> + Send>>>::new();
+    let mut ingress_open = true;
+    loop {
+        if !ingress_open && handlers.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            held = ingress.recv_held(), if ingress_open => {
+                let Some(mut held) = held else {
+                    ingress_open = false;
+                    continue;
+                };
+                let frame = held.take_value();
+                let gate = frame.session_id.as_ref().map(|session_id| {
+                    let first_sequence = frame.session_sequence.unwrap_or(0);
+                    gates
+                        .entry(session_id.clone())
+                        .or_insert_with(|| Arc::new(SessionGate::new(first_sequence)))
+                        .clone()
+                });
+                let handler = handler.clone();
+                let handler_cancel = cancel.clone();
+                handlers.push(Box::pin(async move {
+                    let turn = match (gate, frame.session_sequence) {
+                        (Some(gate), Some(sequence)) => Some(gate.enter(sequence).await),
+                        _ => None,
+                    };
+                    let completion = tokio::select! {
+                        _ = handler_cancel.cancelled() => return Ok(()),
+                        admission = handler(frame) => admission?,
+                    };
+                    drop(turn);
+                    tokio::select! {
+                        _ = handler_cancel.cancelled() => {}
+                        _ = completion => {}
+                    }
+                    drop(held);
+                    Ok(())
+                }));
+            }
+            result = handlers.next(), if !handlers.is_empty() => {
+                result.expect("handler future present")?;
+            }
+        }
+    }
+}
+
+async fn local_scheduler_loop(
+    mut ingress: BoundedReceiver<InboundFrame>,
+    handler: LocalInboundHandler,
+    cancel: CancellationToken,
+) -> Result<(), RpcFacadeError> {
+    let mut gates = HashMap::<String, Arc<SessionGate>>::new();
+    let mut handlers =
+        FuturesUnordered::<Pin<Box<dyn Future<Output = Result<(), RpcFacadeError>>>>>::new();
     let mut ingress_open = true;
     loop {
         if !ingress_open && handlers.is_empty() {
