@@ -6,9 +6,12 @@ use std::time::Duration;
 
 mod command_exec_manager;
 mod command_exec_sandbox;
+mod connection_supervisor;
+mod direct_interaction_adapter;
 mod fuzzy_file_search_manager;
 mod mcp_elicitation_manager;
 mod mention_search_manager;
+mod opaque_permission_router;
 mod permission_manager;
 mod router;
 mod shell_manager;
@@ -42,9 +45,18 @@ use command_exec_manager::{
 };
 pub use command_exec_sandbox::{CommandExecSandbox, bash_sandbox_for_cwd};
 use command_exec_sandbox::{command_exec_sandbox_mode, materialize_workspace_roots_paths};
+use connection_supervisor::{
+    JsonlConnectionServices, JsonlConnectionSupervisor, JsonlNonIoCloseTrigger,
+    JsonlSupervisorCloseTrigger, JsonlSupervisorIoFailure,
+};
+use direct_interaction_adapter::JsonlDirectInteractionAdapter;
 use fuzzy_file_search_manager::FuzzyFileSearchManager;
 use mcp_elicitation_manager::PendingMcpElicitationManager;
 use mention_search_manager::MentionSearchManager;
+use opaque_permission_router::{
+    JsonlCommittedReplay, JsonlConnectionAdmission, JsonlOpaquePermissionRouter,
+    jsonl_response_digest,
+};
 use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use permission_manager::{
     PendingCommandExecPermissionRequest, PendingPermissionManager, PendingPermissionRequest,
@@ -75,21 +87,40 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
     let mut line = String::new();
     let mut state = ServerState::start()?;
     let writer = Arc::new(Mutex::new(writer));
+    let mut close_trigger = JsonlSupervisorCloseTrigger::NonIo(JsonlNonIoCloseTrigger::EndOfFile);
     let result = (|| -> io::Result<()> {
-        while reader.read_line(&mut line)? != 0 {
+        loop {
+            let bytes_read = match reader.read_line(&mut line) {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    close_trigger = JsonlSupervisorCloseTrigger::Io(
+                        JsonlSupervisorIoFailure::ReadFailed(error.to_string()),
+                    );
+                    return Err(error);
+                }
+            };
+            if bytes_read == 0 {
+                break;
+            }
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                handle_line(&config, &mut state, trimmed, Arc::clone(&writer))?;
+                if let Err(error) = handle_line(&config, &mut state, trimmed, Arc::clone(&writer)) {
+                    close_trigger = JsonlSupervisorCloseTrigger::Io(
+                        JsonlSupervisorIoFailure::WriteFailed(error.to_string()),
+                    );
+                    return Err(error);
+                }
             }
             line.clear();
         }
         Ok(())
     })();
-    let shutdown = state.shutdown();
+    let shutdown = state.shutdown(close_trigger);
     result.and(shutdown)
 }
 
 struct ServerState {
+    supervisor: JsonlConnectionSupervisor,
     threads: ServerThreadRuntime,
     shells: ServerShellManager,
     command_exec: CommandExecManager,
@@ -102,32 +133,58 @@ struct ServerState {
 
 impl ServerState {
     fn start() -> io::Result<Self> {
+        let threads = ServerThreadRuntime::start()?;
+        let connection_id = threads
+            .connection_id()
+            .ok_or_else(|| io::Error::other("JSONL surface connection is not bound"))?;
+        let admission = JsonlConnectionAdmission::new(connection_id);
+        let permission_router = JsonlOpaquePermissionRouter::new(admission.clone());
+        let direct_interactions = JsonlDirectInteractionAdapter::new(admission.clone());
+        let supervisor = JsonlConnectionSupervisor::new(
+            admission,
+            permission_router.clone(),
+            direct_interactions.clone(),
+        );
         Ok(Self {
-            threads: ServerThreadRuntime::start()?,
+            supervisor,
+            threads,
             shells: ServerShellManager::default(),
             command_exec: CommandExecManager::default(),
-            pending_permissions: PendingPermissionManager::default(),
-            pending_user_inputs: PendingUserInputManager::default(),
-            pending_mcp_elicitations: PendingMcpElicitationManager::default(),
+            pending_permissions: PendingPermissionManager::new(permission_router),
+            pending_user_inputs: PendingUserInputManager::new(direct_interactions.clone()),
+            pending_mcp_elicitations: PendingMcpElicitationManager::new(direct_interactions),
             fuzzy_file_searches: FuzzyFileSearchManager::default(),
             mention_searches: MentionSearchManager::default(),
         })
     }
 
-    fn shutdown(&mut self) -> io::Result<()> {
-        self.command_exec.terminate_all(self.shells.sessions_mut());
-        let _ = self.pending_permissions.close();
-        let _ = self.pending_user_inputs.close();
-        let _ = self.pending_mcp_elicitations.close();
-        self.shells.terminate_all();
-        self.terminate_searches();
-        let result = self.threads.shutdown();
-        result
-    }
-
-    fn terminate_searches(&mut self) {
-        self.fuzzy_file_searches.stop_all();
-        self.mention_searches.stop_all();
+    fn shutdown(self, trigger: JsonlSupervisorCloseTrigger) -> io::Result<()> {
+        let Self {
+            supervisor,
+            threads,
+            shells,
+            command_exec,
+            pending_permissions,
+            pending_user_inputs,
+            pending_mcp_elicitations,
+            fuzzy_file_searches,
+            mention_searches,
+        } = self;
+        supervisor
+            .close(
+                trigger,
+                JsonlConnectionServices {
+                    threads,
+                    shells,
+                    command_exec,
+                    pending_permissions,
+                    pending_user_inputs,
+                    pending_mcp_elicitations,
+                    fuzzy_file_searches,
+                    mention_searches,
+                },
+            )
+            .into_io_result()
     }
 }
 
@@ -1186,20 +1243,36 @@ fn request_command_exec_permission<W: Write>(
             .map(ToString::to_string)
             .unwrap_or_else(|| request.event_id.to_string())
     );
-    state
+    let request_id = state
         .pending_permissions
         .insert_command_exec(request_id.clone(), request)?;
+    let frame_digest = jsonl_response_digest(&json!({
+        "id": &request_id,
+        "event": "permission_request",
+        "requestId": &request_id,
+        "threadId": &thread_id,
+        "turnId": Value::Null,
+        "reason": &reason,
+        "permissions": &permissions,
+    }))?;
+    state
+        .pending_permissions
+        .mark_writing(&request_id, frame_digest)?;
     protocol::write_server_event(
         writer,
         &Value::from(request_id.clone()),
         ServerEvent::PermissionRequest {
-            request_id: json!(request_id),
+            request_id: json!(request_id.clone()),
             thread_id: json!(thread_id),
             turn_id: Value::Null,
             reason: json!(reason),
             permissions: serde_json::to_value(&permissions).unwrap_or(Value::Null),
         },
-    )
+    )?;
+    writer.flush()?;
+    state
+        .pending_permissions
+        .mark_published(&request_id, frame_digest)
 }
 
 fn append_sandbox_diagnostic_to_stderr(stderr: &mut String, diagnostic: &SandboxDenialDiagnostic) {
@@ -3041,12 +3114,32 @@ enabled = true
             handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
                 .expect("permission response");
             server.join().expect("server joined");
+            let retry = format!(
+                r#"{{"id":"perm-allow-retry","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"session","permissions":{{"network":{{"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#
+            );
+            handle_line(&server_config, &mut state, &retry, Arc::clone(&writer))
+                .expect("idempotent permission response retry");
+            let conflict = format!(
+                r#"{{"id":"perm-deny-conflict","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"deny","scope":"session","permissions":{{"network":{{"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#
+            );
+            handle_line(&server_config, &mut state, &conflict, Arc::clone(&writer))
+                .expect("conflicting permission response retry");
             let events = parse_jsonl(&writer.lock().expect("writer").clone());
             let resolved = events
                 .iter()
                 .find(|event| event["event"] == "permission_resolved")
                 .expect("permission resolved");
             assert_eq!(resolved["requestId"], request_id);
+            assert!(events.iter().any(|event| {
+                event["event"] == "permission_resolved" && event["id"] == "perm-allow-retry"
+            }));
+            assert!(events.iter().any(|event| {
+                event["event"] == "error"
+                    && event["id"] == "perm-deny-conflict"
+                    && event["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("different response"))
+            }));
             let completed = events
                 .iter()
                 .find(|event| event["event"] == "command_exec_completed")
@@ -6392,6 +6485,25 @@ enabled = true
             .expect("user input response");
             state.join_active_turns();
 
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"input-response-retry","method":"user_input/respond","params":{{"requestId":"{request_id}","answer":"yes"}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("idempotent user input response retry");
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"input-response-conflict","method":"user_input/respond","params":{{"requestId":"{request_id}","answer":"no"}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("conflicting user input response retry");
+
             let events = parse_jsonl(&writer.lock().expect("writer").clone());
             let resolved = events
                 .iter()
@@ -6400,6 +6512,16 @@ enabled = true
             assert_eq!(resolved["id"], "input-response");
             assert_eq!(resolved["requestId"], request_id);
             assert_eq!(resolved["answered"], true);
+            assert!(events.iter().any(|event| {
+                event["event"] == "user_input_resolved" && event["id"] == "input-response-retry"
+            }));
+            assert!(events.iter().any(|event| {
+                event["event"] == "error"
+                    && event["id"] == "input-response-conflict"
+                    && event["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("different response"))
+            }));
             assert!(
                 events
                     .iter()
@@ -6551,6 +6673,25 @@ rl.on("line", (line) => {
             .expect("MCP elicitation response");
             state.join_active_turns();
 
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"mcp-response-retry","method":"mcp_elicitation/respond","params":{{"requestId":"{request_id}","accepted":true,"contentJson":{{"code":"ABCD-1234"}}}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("idempotent MCP elicitation response retry");
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"mcp-response-conflict","method":"mcp_elicitation/respond","params":{{"requestId":"{request_id}","accepted":false}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .expect("conflicting MCP elicitation response retry");
+
             let events = parse_jsonl(&writer.lock().expect("writer").clone());
             let resolved = events
                 .iter()
@@ -6559,6 +6700,16 @@ rl.on("line", (line) => {
             assert_eq!(resolved["id"], "mcp-response");
             assert_eq!(resolved["requestId"], request_id);
             assert_eq!(resolved["accepted"], true);
+            assert!(events.iter().any(|event| {
+                event["event"] == "mcp_elicitation_resolved" && event["id"] == "mcp-response-retry"
+            }));
+            assert!(events.iter().any(|event| {
+                event["event"] == "error"
+                    && event["id"] == "mcp-response-conflict"
+                    && event["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("different response"))
+            }));
             assert!(
                 events
                     .iter()

@@ -11,8 +11,15 @@ use crate::protocol::ServerEvent;
 use crate::runtime_host::GenerationFence;
 use crate::unstable_surface::{RuntimeSurfaceClientHandle, SurfaceInteractionId};
 
+use super::direct_interaction_adapter::{
+    JsonlDirectInteractionAdapter, JsonlDirectInteractionKind, JsonlDirectInteractionRoute,
+};
+use super::opaque_permission_router::{
+    JsonlCommittedReplay, JsonlConnectionAdmission, JsonlResponseDigest,
+};
 use super::{lock_error, write_locked_event};
 
+#[derive(Clone)]
 pub(super) struct PendingUserInputRequest {
     pub(super) sender: mpsc::Sender<Option<String>>,
     pub(super) thread_id: String,
@@ -30,7 +37,6 @@ impl PendingUserInputRequest {
 struct PendingUserInputState {
     closed: bool,
     pending: HashMap<String, PendingUserInputRequest>,
-    surface_pending: HashMap<String, PendingSurfaceUserInputRequest>,
 }
 
 #[derive(Clone)]
@@ -39,12 +45,28 @@ pub(super) struct PendingSurfaceUserInputRequest {
     pub(super) interaction_id: SurfaceInteractionId,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct PendingUserInputManager {
     state: Arc<Mutex<PendingUserInputState>>,
+    direct: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>,
+}
+
+impl Default for PendingUserInputManager {
+    fn default() -> Self {
+        Self::new(JsonlDirectInteractionAdapter::new(
+            JsonlConnectionAdmission::new_ephemeral(),
+        ))
+    }
 }
 
 impl PendingUserInputManager {
+    pub(super) fn new(direct: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(PendingUserInputState::default())),
+            direct,
+        }
+    }
+
     pub(super) fn insert(
         &self,
         request_id: String,
@@ -67,56 +89,125 @@ impl PendingUserInputManager {
         Ok(())
     }
 
-    pub(super) fn remove(&self, request_id: &str) -> io::Result<Option<PendingUserInputRequest>> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        Ok(state.pending.remove(request_id))
+    pub(super) fn route_legacy(
+        &self,
+        request_id: &str,
+    ) -> io::Result<Option<PendingUserInputRequest>> {
+        let state = self.state.lock().map_err(lock_error)?;
+        Ok(state.pending.get(request_id).cloned())
+    }
+
+    pub(super) fn settle_legacy(&self, request_id: &str) -> io::Result<()> {
+        self.state
+            .lock()
+            .map_err(lock_error)?
+            .pending
+            .remove(request_id);
+        Ok(())
     }
 
     pub(super) fn insert_surface(
         &self,
         request_id: String,
         request: PendingSurfaceUserInputRequest,
-    ) -> io::Result<()> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        if state.closed {
+    ) -> io::Result<String> {
+        if self.state.lock().map_err(lock_error)?.closed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "server user input request manager is closed",
             ));
         }
-        if state.pending.contains_key(&request_id)
-            || state.surface_pending.contains_key(&request_id)
+        if self
+            .state
+            .lock()
+            .map_err(lock_error)?
+            .pending
+            .contains_key(&request_id)
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("duplicate pending user input request id: {request_id}"),
             ));
         }
-        state.surface_pending.insert(request_id, request);
-        Ok(())
+        self.direct.register(
+            request_id,
+            JsonlDirectInteractionKind::UserInput,
+            JsonlDirectInteractionRoute::UserInput {
+                client: request.client,
+                interaction_id: request.interaction_id,
+            },
+        )
     }
 
-    pub(super) fn remove_surface(
+    pub(super) fn surface_route(
         &self,
         request_id: &str,
     ) -> io::Result<Option<PendingSurfaceUserInputRequest>> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        Ok(state.surface_pending.remove(request_id))
+        Ok(
+            match self
+                .direct
+                .published_route(request_id, JsonlDirectInteractionKind::UserInput)?
+            {
+                Some(JsonlDirectInteractionRoute::UserInput {
+                    client,
+                    interaction_id,
+                }) => Some(PendingSurfaceUserInputRequest {
+                    client,
+                    interaction_id,
+                }),
+                Some(JsonlDirectInteractionRoute::McpElicitation { .. }) | None => None,
+            },
+        )
     }
 
-    pub(super) fn restore_surface(
+    pub(super) fn mark_surface_writing(
         &self,
-        request_id: String,
-        request: PendingSurfaceUserInputRequest,
+        request_id: &str,
+        frame_digest: JsonlResponseDigest,
     ) -> io::Result<()> {
-        self.insert_surface(request_id, request)
+        self.direct.mark_writing(request_id, frame_digest)
+    }
+
+    pub(super) fn mark_surface_published(
+        &self,
+        request_id: &str,
+        frame_digest: JsonlResponseDigest,
+    ) -> io::Result<()> {
+        self.direct.mark_published(request_id, frame_digest)
+    }
+
+    pub(super) fn settle_surface(
+        &self,
+        request_id: &str,
+        response_digest: JsonlResponseDigest,
+    ) -> io::Result<()> {
+        self.direct
+            .settle_committed(request_id, response_digest)
+            .map(|_| ())
+    }
+
+    pub(super) fn surface_committed_replay(
+        &self,
+        request_id: &str,
+        response_digest: JsonlResponseDigest,
+    ) -> io::Result<JsonlCommittedReplay> {
+        self.direct.committed_replay(request_id, response_digest)
+    }
+
+    pub(super) fn mark_surface_committed_pending(
+        &self,
+        request_id: &str,
+        mutation: &crate::unstable_surface::DeferredMutation,
+        response_digest: JsonlResponseDigest,
+    ) -> io::Result<()> {
+        self.direct
+            .mark_committed_pending(request_id, mutation, response_digest)
     }
 
     pub(super) fn close(&self) -> io::Result<()> {
         let pending = {
             let mut state = self.state.lock().map_err(lock_error)?;
             state.closed = true;
-            state.surface_pending.clear();
             std::mem::take(&mut state.pending)
         };
         for request in pending.into_values() {
@@ -185,12 +276,12 @@ impl<W: Write + Send + 'static> RuntimeUserInputHandler for ServerUserInputReque
                 choices: json!(request.choices),
             },
         ) {
-            let _ = self.pending.remove(&request_id);
+            let _ = self.pending.settle_legacy(&request_id);
             return Err(error);
         }
         loop {
             if self.cancel.is_cancelled() {
-                let _ = self.pending.remove(&request_id);
+                let _ = self.pending.settle_legacy(&request_id);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "user input request cancelled",
@@ -249,13 +340,16 @@ mod tests {
         );
 
         let pending = manager
-            .remove("user-input-turn-1-ask")
-            .expect("remove pending")
+            .route_legacy("user-input-turn-1-ask")
+            .expect("route pending")
             .expect("original request still pending");
         pending
             .sender
             .send(Some("first".to_string()))
             .expect("original sender still active");
+        manager
+            .settle_legacy("user-input-turn-1-ask")
+            .expect("settle pending");
         assert_eq!(
             first_receiver.recv().expect("first receiver"),
             Some("first".to_string())
@@ -333,8 +427,8 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(
             manager
-                .remove("user-input-turn-1-ask-generation-1")
-                .expect("remove pending")
+                .route_legacy("user-input-turn-1-ask-generation-1")
+                .expect("route pending")
                 .is_none()
         );
     }

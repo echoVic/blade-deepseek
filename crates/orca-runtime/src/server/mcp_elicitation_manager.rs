@@ -14,8 +14,15 @@ use crate::runtime_host::GenerationFence;
 use crate::runtime_pending_interaction::{RuntimeMcpElicitationMode, RuntimeMcpElicitationRequest};
 use crate::unstable_surface::{RuntimeSurfaceClientHandle, SurfaceInteractionId};
 
+use super::direct_interaction_adapter::{
+    JsonlDirectInteractionAdapter, JsonlDirectInteractionKind, JsonlDirectInteractionRoute,
+};
+use super::opaque_permission_router::{
+    JsonlCommittedReplay, JsonlConnectionAdmission, JsonlResponseDigest,
+};
 use super::{lock_error, write_locked_event};
 
+#[derive(Clone)]
 pub(super) struct PendingMcpElicitationRequest {
     pub(super) sender: mpsc::Sender<McpElicitationResponse>,
     pub(super) thread_id: String,
@@ -33,7 +40,6 @@ impl PendingMcpElicitationRequest {
 struct PendingMcpElicitationState {
     closed: bool,
     pending: HashMap<String, PendingMcpElicitationRequest>,
-    surface_pending: HashMap<String, PendingSurfaceMcpElicitationRequest>,
 }
 
 #[derive(Clone)]
@@ -42,12 +48,28 @@ pub(super) struct PendingSurfaceMcpElicitationRequest {
     pub(super) interaction_id: SurfaceInteractionId,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct PendingMcpElicitationManager {
     state: Arc<Mutex<PendingMcpElicitationState>>,
+    direct: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>,
+}
+
+impl Default for PendingMcpElicitationManager {
+    fn default() -> Self {
+        Self::new(JsonlDirectInteractionAdapter::new(
+            JsonlConnectionAdmission::new_ephemeral(),
+        ))
+    }
 }
 
 impl PendingMcpElicitationManager {
+    pub(super) fn new(direct: JsonlDirectInteractionAdapter<JsonlDirectInteractionRoute>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(PendingMcpElicitationState::default())),
+            direct,
+        }
+    }
+
     pub(super) fn insert(
         &self,
         request_id: String,
@@ -70,59 +92,125 @@ impl PendingMcpElicitationManager {
         Ok(())
     }
 
-    pub(super) fn remove(
+    pub(super) fn route_legacy(
         &self,
         request_id: &str,
     ) -> io::Result<Option<PendingMcpElicitationRequest>> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        Ok(state.pending.remove(request_id))
+        let state = self.state.lock().map_err(lock_error)?;
+        Ok(state.pending.get(request_id).cloned())
+    }
+
+    pub(super) fn settle_legacy(&self, request_id: &str) -> io::Result<()> {
+        self.state
+            .lock()
+            .map_err(lock_error)?
+            .pending
+            .remove(request_id);
+        Ok(())
     }
 
     pub(super) fn insert_surface(
         &self,
         request_id: String,
         request: PendingSurfaceMcpElicitationRequest,
-    ) -> io::Result<()> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        if state.closed {
+    ) -> io::Result<String> {
+        if self.state.lock().map_err(lock_error)?.closed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "server MCP elicitation manager is closed",
             ));
         }
-        if state.pending.contains_key(&request_id)
-            || state.surface_pending.contains_key(&request_id)
+        if self
+            .state
+            .lock()
+            .map_err(lock_error)?
+            .pending
+            .contains_key(&request_id)
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("duplicate pending MCP elicitation request id: {request_id}"),
             ));
         }
-        state.surface_pending.insert(request_id, request);
-        Ok(())
+        self.direct.register(
+            request_id,
+            JsonlDirectInteractionKind::McpElicitation,
+            JsonlDirectInteractionRoute::McpElicitation {
+                client: request.client,
+                interaction_id: request.interaction_id,
+            },
+        )
     }
 
-    pub(super) fn remove_surface(
+    pub(super) fn surface_route(
         &self,
         request_id: &str,
     ) -> io::Result<Option<PendingSurfaceMcpElicitationRequest>> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        Ok(state.surface_pending.remove(request_id))
+        Ok(
+            match self
+                .direct
+                .published_route(request_id, JsonlDirectInteractionKind::McpElicitation)?
+            {
+                Some(JsonlDirectInteractionRoute::McpElicitation {
+                    client,
+                    interaction_id,
+                }) => Some(PendingSurfaceMcpElicitationRequest {
+                    client,
+                    interaction_id,
+                }),
+                Some(JsonlDirectInteractionRoute::UserInput { .. }) | None => None,
+            },
+        )
     }
 
-    pub(super) fn restore_surface(
+    pub(super) fn mark_surface_writing(
         &self,
-        request_id: String,
-        request: PendingSurfaceMcpElicitationRequest,
+        request_id: &str,
+        frame_digest: JsonlResponseDigest,
     ) -> io::Result<()> {
-        self.insert_surface(request_id, request)
+        self.direct.mark_writing(request_id, frame_digest)
+    }
+
+    pub(super) fn mark_surface_published(
+        &self,
+        request_id: &str,
+        frame_digest: JsonlResponseDigest,
+    ) -> io::Result<()> {
+        self.direct.mark_published(request_id, frame_digest)
+    }
+
+    pub(super) fn settle_surface(
+        &self,
+        request_id: &str,
+        response_digest: JsonlResponseDigest,
+    ) -> io::Result<()> {
+        self.direct
+            .settle_committed(request_id, response_digest)
+            .map(|_| ())
+    }
+
+    pub(super) fn surface_committed_replay(
+        &self,
+        request_id: &str,
+        response_digest: JsonlResponseDigest,
+    ) -> io::Result<JsonlCommittedReplay> {
+        self.direct.committed_replay(request_id, response_digest)
+    }
+
+    pub(super) fn mark_surface_committed_pending(
+        &self,
+        request_id: &str,
+        mutation: &crate::unstable_surface::DeferredMutation,
+        response_digest: JsonlResponseDigest,
+    ) -> io::Result<()> {
+        self.direct
+            .mark_committed_pending(request_id, mutation, response_digest)
     }
 
     pub(super) fn close(&self) -> io::Result<()> {
         let pending = {
             let mut state = self.state.lock().map_err(lock_error)?;
             state.closed = true;
-            state.surface_pending.clear();
             std::mem::take(&mut state.pending)
         };
         for request in pending.into_values() {
@@ -222,12 +310,12 @@ impl<W: Write + Send + 'static> McpElicitationHandler for ServerMcpElicitationRe
                 requested_schema,
             },
         ) {
-            let _ = self.pending.remove(&runtime_request.id);
+            let _ = self.pending.settle_legacy(&runtime_request.id);
             return Err(error.to_string());
         }
         loop {
             if self.cancel.is_cancelled() {
-                let _ = self.pending.remove(&runtime_request.id);
+                let _ = self.pending.settle_legacy(&runtime_request.id);
                 return Err("MCP elicitation request cancelled".to_string());
             }
             match receiver.recv_timeout(Duration::from_millis(25)) {
@@ -287,13 +375,16 @@ mod tests {
         );
 
         let pending = manager
-            .remove("mcp_elicitation:github:device-flow")
-            .expect("remove pending")
+            .route_legacy("mcp_elicitation:github:device-flow")
+            .expect("route pending")
             .expect("original request still pending");
         pending
             .sender
             .send(McpElicitationResponse::accept(json!({"code": "first"})))
             .expect("original sender still active");
+        manager
+            .settle_legacy("mcp_elicitation:github:device-flow")
+            .expect("settle pending");
         assert_eq!(
             first_receiver.recv().expect("first receiver"),
             McpElicitationResponse::accept(json!({"code": "first"}))
@@ -380,13 +471,16 @@ mod tests {
         assert_eq!(request["requestedSchema"], json!({"type": "object"}));
 
         let pending = manager
-            .remove("mcp_elicitation:turn-1:github:device-flow")
-            .expect("remove pending")
+            .route_legacy("mcp_elicitation:turn-1:github:device-flow")
+            .expect("route pending")
             .expect("pending request");
         pending
             .sender
             .send(McpElicitationResponse::accept(json!({"code": "ABCD-1234"})))
             .expect("send response");
+        manager
+            .settle_legacy("mcp_elicitation:turn-1:github:device-flow")
+            .expect("settle pending");
 
         assert_eq!(
             worker.join().expect("handler thread"),
@@ -432,8 +526,8 @@ mod tests {
         );
         assert!(
             manager
-                .remove(request_id)
-                .expect("remove pending")
+                .route_legacy(request_id)
+                .expect("route pending")
                 .is_none(),
             "cancelled request should be removed from pending map"
         );

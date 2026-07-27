@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orca_file_search::{
     SearchMode, SearchPhase, SearchProgress, SearchSession, SearchSessionOptions, SessionGeneration,
@@ -22,6 +22,27 @@ pub(super) struct MentionSearchManager {
 }
 
 impl MentionSearchManager {
+    pub(super) fn settle_until(
+        mut self,
+        deadline: Instant,
+    ) -> super::connection_supervisor::JsonlServiceSettlementState {
+        for (_, session) in self.sessions.drain() {
+            self.reapers.push(session.stop_async());
+        }
+        while let Some(reaper) = self.reapers.pop() {
+            while !reaper.is_finished() {
+                if Instant::now() >= deadline {
+                    return super::connection_supervisor::JsonlServiceSettlementState::CleanupUnconfirmed;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if reaper.join().is_err() {
+                return super::connection_supervisor::JsonlServiceSettlementState::CleanupUnconfirmed;
+            }
+        }
+        super::connection_supervisor::JsonlServiceSettlementState::Joined
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start<W: Write + Send + 'static>(
         &mut self,

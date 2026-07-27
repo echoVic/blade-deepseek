@@ -98,6 +98,10 @@ impl JsonlSurfaceAdapter {
         host.shutdown().map_err(runtime_host_error)
     }
 
+    pub(crate) fn connection_id(&self) -> Option<crate::unstable_surface::SurfaceConnectionId> {
+        self.surface_host.connection_id().cloned()
+    }
+
     pub(crate) fn start_thread(&mut self, config: &RunConfig) -> io::Result<String> {
         let config = jsonl_thread_config(config);
         self.start_record(config, "(empty prompt)")
@@ -1300,76 +1304,127 @@ fn project_surface_event<W: Write>(
             );
             match &interaction.request {
                 SurfaceInteractionRequest::ToolApproval { description, .. } => {
-                    transport.permissions.insert_surface(
-                        request_id.clone(),
-                        projector.client.clone(),
-                        interaction.interaction_id.clone(),
-                        interaction.kind,
-                        projector.thread_id.clone(),
-                        projector.runtime_workspace_roots.clone(),
-                    )?;
+                    let Some(request_id) = register_or_settle_unavailable(
+                        transport.permissions.insert_surface(
+                            request_id.clone(),
+                            projector.client.clone(),
+                            interaction.interaction_id.clone(),
+                            interaction.kind,
+                            projector.thread_id.clone(),
+                            projector.runtime_workspace_roots.clone(),
+                        ),
+                        projector,
+                        interaction,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "thread_id": projector.thread_id,
+                        "turn_id": projector.turn_id.to_string(),
+                        "reason": description.as_str(),
+                        "permissions": {},
+                    });
+                    let frame_digest =
+                        super::opaque_permission_router::jsonl_response_digest(&payload)?;
+                    transport
+                        .permissions
+                        .mark_writing(&request_id, frame_digest)?;
                     write_runtime_event(
                         writer,
                         "surface.permission.requested",
                         &projector.thread_id,
-                        serde_json::json!({
-                            "request_id": request_id,
-                            "thread_id": projector.thread_id,
-                            "turn_id": projector.turn_id.to_string(),
-                            "reason": description.as_str(),
-                            "permissions": {},
-                        }),
+                        payload,
                     )?;
+                    writer.flush()?;
+                    transport
+                        .permissions
+                        .mark_published(&request_id, frame_digest)?;
                 }
                 SurfaceInteractionRequest::PermissionRequest {
                     reason,
                     permissions,
                     ..
                 } => {
-                    transport.permissions.insert_surface(
-                        request_id.clone(),
-                        projector.client.clone(),
-                        interaction.interaction_id.clone(),
-                        interaction.kind,
-                        projector.thread_id.clone(),
-                        projector.runtime_workspace_roots.clone(),
-                    )?;
+                    let Some(request_id) = register_or_settle_unavailable(
+                        transport.permissions.insert_surface(
+                            request_id.clone(),
+                            projector.client.clone(),
+                            interaction.interaction_id.clone(),
+                            interaction.kind,
+                            projector.thread_id.clone(),
+                            projector.runtime_workspace_roots.clone(),
+                        ),
+                        projector,
+                        interaction,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "thread_id": projector.thread_id,
+                        "turn_id": projector.turn_id.to_string(),
+                        "reason": reason.as_ref().map(DisplayText::as_str),
+                        "permissions": surface_permissions_wire(permissions),
+                    });
+                    let frame_digest =
+                        super::opaque_permission_router::jsonl_response_digest(&payload)?;
+                    transport
+                        .permissions
+                        .mark_writing(&request_id, frame_digest)?;
                     write_runtime_event(
                         writer,
                         "surface.permission.requested",
                         &projector.thread_id,
-                        serde_json::json!({
-                            "request_id": request_id,
-                            "thread_id": projector.thread_id,
-                            "turn_id": projector.turn_id.to_string(),
-                            "reason": reason.as_ref().map(DisplayText::as_str),
-                            "permissions": surface_permissions_wire(permissions),
-                        }),
+                        payload,
                     )?;
+                    writer.flush()?;
+                    transport
+                        .permissions
+                        .mark_published(&request_id, frame_digest)?;
                 }
                 SurfaceInteractionRequest::UserInput {
                     question,
                     suggestions,
                 } => {
-                    transport.user_inputs.insert_surface(
-                        request_id.clone(),
-                        PendingSurfaceUserInputRequest {
-                            client: projector.client.clone(),
-                            interaction_id: interaction.interaction_id.clone(),
-                        },
-                    )?;
+                    let Some(request_id) = register_or_settle_unavailable(
+                        transport.user_inputs.insert_surface(
+                            request_id.clone(),
+                            PendingSurfaceUserInputRequest {
+                                client: projector.client.clone(),
+                                interaction_id: interaction.interaction_id.clone(),
+                            },
+                        ),
+                        projector,
+                        interaction,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "thread_id": projector.thread_id,
+                        "turn_id": projector.turn_id.to_string(),
+                        "question": question.as_str(),
+                        "choices": suggestions.iter().map(DisplayText::as_str).collect::<Vec<_>>(),
+                    });
+                    let frame_digest =
+                        super::opaque_permission_router::jsonl_response_digest(&payload)?;
+                    transport
+                        .user_inputs
+                        .mark_surface_writing(&request_id, frame_digest)?;
                     write_runtime_event(
                         writer,
                         "surface.user_input.requested",
                         &projector.thread_id,
-                        serde_json::json!({
-                            "request_id": request_id,
-                            "thread_id": projector.thread_id,
-                            "turn_id": projector.turn_id.to_string(),
-                            "question": question.as_str(),
-                            "choices": suggestions.iter().map(DisplayText::as_str).collect::<Vec<_>>(),
-                        }),
+                        payload,
                     )?;
+                    writer.flush()?;
+                    transport
+                        .user_inputs
+                        .mark_surface_published(&request_id, frame_digest)?;
                 }
                 SurfaceInteractionRequest::McpElicitation {
                     server_name,
@@ -1377,13 +1432,20 @@ fn project_surface_event<W: Write>(
                     request,
                     ..
                 } => {
-                    transport.mcp_elicitations.insert_surface(
-                        request_id.clone(),
-                        PendingSurfaceMcpElicitationRequest {
-                            client: projector.client.clone(),
-                            interaction_id: interaction.interaction_id.clone(),
-                        },
-                    )?;
+                    let Some(request_id) = register_or_settle_unavailable(
+                        transport.mcp_elicitations.insert_surface(
+                            request_id.clone(),
+                            PendingSurfaceMcpElicitationRequest {
+                                client: projector.client.clone(),
+                                interaction_id: interaction.interaction_id.clone(),
+                            },
+                        ),
+                        projector,
+                        interaction,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
                     let (mode, url, requested_schema) = match request {
                         crate::unstable_surface::SurfaceMcpElicitationRequest::Form {
                             requested_schema,
@@ -1411,21 +1473,31 @@ fn project_surface_event<W: Write>(
                                 .unwrap_or(serde_json::Value::Null),
                         ),
                     };
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "thread_id": projector.thread_id,
+                        "turn_id": projector.turn_id.to_string(),
+                        "server_name": server_name.as_str(),
+                        "mode": mode,
+                        "message": message.as_str(),
+                        "url": url,
+                        "requested_schema": requested_schema,
+                    });
+                    let frame_digest =
+                        super::opaque_permission_router::jsonl_response_digest(&payload)?;
+                    transport
+                        .mcp_elicitations
+                        .mark_surface_writing(&request_id, frame_digest)?;
                     write_runtime_event(
                         writer,
                         "surface.mcp_elicitation.requested",
                         &projector.thread_id,
-                        serde_json::json!({
-                            "request_id": request_id,
-                            "thread_id": projector.thread_id,
-                            "turn_id": projector.turn_id.to_string(),
-                            "server_name": server_name.as_str(),
-                            "mode": mode,
-                            "message": message.as_str(),
-                            "url": url,
-                            "requested_schema": requested_schema,
-                        }),
+                        payload,
                     )?;
+                    writer.flush()?;
+                    transport
+                        .mcp_elicitations
+                        .mark_surface_published(&request_id, frame_digest)?;
                 }
                 _ => {}
             }
@@ -1433,6 +1505,57 @@ fn project_surface_event<W: Write>(
         _ => {}
     }
     Ok(false)
+}
+
+fn register_or_settle_unavailable(
+    registration: io::Result<String>,
+    projector: &JsonlSurfaceProjector,
+    interaction: &crate::unstable_surface::SurfaceInteractionView,
+) -> io::Result<Option<String>> {
+    let Err(registration_error) = registration else {
+        return Ok(registration.ok());
+    };
+    let answer = match &interaction.request {
+        SurfaceInteractionRequest::ToolApproval { .. } => {
+            crate::unstable_surface::SurfaceClientInteractionAnswer::ToolApproval {
+                decision: crate::unstable_surface::SurfaceAllowDeny::Deny,
+            }
+        }
+        SurfaceInteractionRequest::PermissionRequest { permissions, .. } => {
+            crate::unstable_surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: crate::unstable_surface::SurfacePermissionClientDecision::Deny {
+                    scope: crate::unstable_surface::PermissionGrantScope::Turn,
+                    permissions: permissions.clone(),
+                    strict_auto_review: false,
+                },
+            }
+        }
+        SurfaceInteractionRequest::UserInput { .. } => {
+            crate::unstable_surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: crate::unstable_surface::SurfaceUserInputDecision::Cancel,
+            }
+        }
+        SurfaceInteractionRequest::McpElicitation { .. } => {
+            crate::unstable_surface::SurfaceClientInteractionAnswer::McpElicitation {
+                decision: crate::unstable_surface::SurfaceMcpElicitationDecision::Decline,
+            }
+        }
+        SurfaceInteractionRequest::BackgroundApproval { .. } => {
+            return Err(io::Error::other(format!(
+                "{registration_error}; JSONL background approval routing is not active"
+            )));
+        }
+    };
+    match projector.client.respond_interaction_by_id(
+        SurfaceRequestId::new(),
+        interaction.interaction_id.clone(),
+        answer,
+    ) {
+        Ok(MutationReply::Committed { .. }) | Ok(MutationReply::Deferred { .. }) => Ok(None),
+        Ok(MutationReply::Uncommitted { .. }) | Err(_) => Err(io::Error::other(format!(
+            "{registration_error}; runtime retained recovery ownership for rejected JSONL interaction"
+        ))),
+    }
 }
 
 fn surface_data_wire(value: &crate::unstable_surface::SurfaceDataValue) -> serde_json::Value {

@@ -243,6 +243,10 @@ impl ServerThreadRuntime {
         result
     }
 
+    pub(crate) fn connection_id(&self) -> Option<crate::surface::SurfaceConnectionId> {
+        self.adapter.connection_id()
+    }
+
     pub fn start_thread(&mut self, config: &RunConfig) -> io::Result<String> {
         self.adapter.start_thread(config)
     }

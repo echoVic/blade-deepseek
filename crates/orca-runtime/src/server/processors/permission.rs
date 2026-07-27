@@ -48,13 +48,41 @@ fn run_permission_respond<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let pending = state.pending_permissions.remove(request_id)?;
+    let response_digest = jsonl_response_digest(&json!({
+        "decision": decision,
+        "scope": scope,
+        "permissions": &permissions,
+        "strictAutoReview": strict_auto_review,
+    }))?;
+    let pending = state.pending_permissions.published_route(request_id)?;
     let Some(pending) = pending else {
-        return protocol::write_server_event(
-            writer,
-            &id,
-            ServerEvent::error(format!("unknown permission request: {request_id}")),
-        );
+        return match state
+            .pending_permissions
+            .committed_replay(request_id, response_digest)?
+        {
+            JsonlCommittedReplay::SameResponse => protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::PermissionResolved {
+                    request_id: json!(request_id),
+                    decision: json!(decision),
+                    scope: json!(scope),
+                    strict_auto_review: json!(strict_auto_review),
+                },
+            ),
+            JsonlCommittedReplay::ConflictingResponse => protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!(
+                    "permission request already resolved with a different response: {request_id}"
+                )),
+            ),
+            JsonlCommittedReplay::NotCommitted => protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!("unknown permission request: {request_id}")),
+            ),
+        };
     };
     if let Some((pending_thread_id, pending_turn_id, generation)) = pending.runtime_generation()
         && !state
@@ -99,18 +127,6 @@ fn run_permission_respond<W: Write>(
         runtime_workspace_roots,
     } = pending
     {
-        let restore = |state: &mut ServerState| {
-            state.pending_permissions.restore(
-                request_id.to_string(),
-                PendingPermissionRequest::Surface {
-                    client: client.clone(),
-                    interaction_id: interaction_id.clone(),
-                    target: target.clone(),
-                    thread_id: thread_id.clone(),
-                    runtime_workspace_roots: runtime_workspace_roots.clone(),
-                },
-            )
-        };
         let permissions = materialize_surface_permission_profile(
             state,
             &thread_id,
@@ -127,7 +143,6 @@ fn run_permission_respond<W: Write>(
                 &permissions,
             )
         {
-            restore(state)?;
             return protocol::write_server_event(
                 writer,
                 &id,
@@ -174,7 +189,6 @@ fn run_permission_respond<W: Write>(
                 }
             }
             _ => {
-                restore(state)?;
                 return protocol::write_server_event(
                     writer,
                     &id,
@@ -184,14 +198,16 @@ fn run_permission_respond<W: Write>(
                 );
             }
         };
-        match client.respond_interaction_by_id(
-            crate::unstable_surface::SurfaceRequestId::new(),
-            interaction_id.clone(),
-            answer,
-        ) {
+        let response_request_id = crate::unstable_surface::SurfaceRequestId::new();
+        match client.respond_interaction_by_id(response_request_id, interaction_id.clone(), answer)
+        {
             Ok(crate::unstable_surface::MutationReply::Committed { .. }) => {}
-            Ok(crate::unstable_surface::MutationReply::Deferred { .. }) => {
-                restore(state)?;
+            Ok(crate::unstable_surface::MutationReply::Deferred { mutation, .. }) => {
+                state.pending_permissions.mark_committed_pending(
+                    request_id,
+                    &mutation,
+                    response_digest,
+                )?;
                 return protocol::write_server_event(
                     writer,
                     &id,
@@ -201,7 +217,6 @@ fn run_permission_respond<W: Write>(
                 );
             }
             Ok(crate::unstable_surface::MutationReply::Uncommitted { .. }) => {
-                restore(state)?;
                 return protocol::write_server_event(
                     writer,
                     &id,
@@ -211,7 +226,6 @@ fn run_permission_respond<W: Write>(
                 );
             }
             Err(_) => {
-                restore(state)?;
                 return protocol::write_server_event(
                     writer,
                     &id,
@@ -221,6 +235,9 @@ fn run_permission_respond<W: Write>(
                 );
             }
         }
+        state
+            .pending_permissions
+            .settle(request_id, response_digest)?;
         return protocol::write_server_event(
             writer,
             &id,
@@ -242,6 +259,9 @@ fn run_permission_respond<W: Write>(
             strict_auto_review: json!(strict_auto_review),
         },
     )?;
+    state
+        .pending_permissions
+        .settle(request_id, response_digest)?;
     match pending {
         PendingPermissionRequest::Runtime { sender, .. } => {
             if sender
